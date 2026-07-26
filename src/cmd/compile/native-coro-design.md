@@ -5,8 +5,11 @@ Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 
 Last updated: 2026-07-27
 
-Development branch: `cpunion/go:main`, which periodically merges the Go
+Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
+
+Integration branch: `cpunion/go:coro/main`, which receives upstream updates
+from `main` and is the base for coroutine pull requests
 
 Topic branch: `coro/native-state-machine`
 
@@ -894,9 +897,10 @@ With the experiment enabled:
 - incompatible archives are rejected;
 - the coroutine runtime and ABI version are checked at link time.
 
-The `cpunion/go:main` branch should continue to merge Go development versions.
-Coroutine changes should remain in reviewable packages and hooks so upstream
-merges resolve policy differences locally.
+The `cpunion/go:main` branch should remain aligned with the Go development
+branch. `cpunion/go:coro/main` periodically merges it. Coroutine changes should
+remain in reviewable packages and hooks so upstream merges resolve policy
+differences locally.
 
 ## 14. MVP
 
