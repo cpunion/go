@@ -173,6 +173,42 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteTimer,
 		Effect: MaySuspend,
 	},
+	"runtime/coro.FileRead": {
+		Kind:   SiteFile,
+		Effect: MaySuspend,
+	},
+	"runtime/coro.SocketRead": {
+		Kind:   SitePoll,
+		Effect: MaySuspend,
+	},
+	"os.(*File).Read": {
+		Kind:   SiteFile,
+		Effect: MaySuspend,
+	},
+	"net.(*TCPConn).Read": {
+		Kind:   SitePoll,
+		Effect: MaySuspend,
+	},
+	"net.(*conn).Read": {
+		Kind:   SitePoll,
+		Effect: MaySuspend,
+	},
+	"runtime/coro.DirectAdd": {
+		Kind:    SiteForeign,
+		Exec:    NeedsSystemABI,
+		Foreign: DirectNoBlock,
+	},
+	"runtime/coro.DirectBlock": {
+		Kind:    SiteForeign,
+		Exec:    NeedsSystemABI | MayBlockThread,
+		Foreign: DirectMayBlock,
+	},
+	"runtime/coro.AsyncDouble": {
+		Kind:    SiteForeign,
+		Effect:  MaySuspend,
+		Exec:    NeedsSystemABI,
+		Foreign: AsyncOperation,
+	},
 }
 
 func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {

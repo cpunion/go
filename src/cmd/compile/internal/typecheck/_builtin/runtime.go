@@ -196,6 +196,15 @@ func block()
 func coroRun(func(unsafe.Pointer) uint8)
 func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)
+func coroSleep(unsafe.Pointer, int64)
+func coroFileRead(unsafe.Pointer, int, []byte, *int, *uintptr)
+func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
+func coroCallRead(unsafe.Pointer, func())
+func coroEnterForeign()
+func coroExitForeign()
+func coroEnterBlocking()
+func coroExitBlocking()
+func coroAsyncDouble(unsafe.Pointer, int, int, uint64, *uint64, *uintptr)
 
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer
 func makeslice64(typ *byte, len int64, cap int64) unsafe.Pointer

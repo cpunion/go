@@ -310,6 +310,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			}
 			fmt.Fprintf(os.Stderr, "coro: phase=lower lowered=%d skipped=%d\n",
 				result.Lowered, result.Skipped)
+			for _, diagnostic := range result.Diagnostics {
+				fmt.Fprintf(os.Stderr, "coro: skip %s\n", diagnostic)
+			}
 		}
 		plan.PublishSummaries()
 	}

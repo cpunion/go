@@ -9,6 +9,7 @@ import (
 	"internal/testenv"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -199,7 +200,14 @@ func TestYieldLowering(t *testing.T) {
 	src := filepath.Join(tmp, "main.go")
 	program := `package main
 
-import "runtime"
+import (
+	"net"
+	"os"
+	"runtime"
+	corort "runtime/coro"
+	"syscall"
+	"time"
+)
 
 var trace [2]int
 var next int
@@ -208,6 +216,26 @@ var childStage int
 var parentSaw int
 var spawnStage int
 var spawnSaw int
+var slept bool
+var fileFD int
+var fileBuffer = make([]byte, 4)
+var fileN int
+var fileErrno uintptr
+var ordinaryFile *os.File
+var ordinaryFileBuffer = make([]byte, 4)
+var ordinaryFileN int
+var ordinaryFileErr error
+var socketFD int
+var socketBuffer = make([]byte, 4)
+var socketN int
+var socketErrno uintptr
+var ordinarySocket *net.TCPConn
+var ordinarySocketBuffer = make([]byte, 4)
+var ordinarySocketN int
+var ordinarySocketErr error
+var parameterResult int
+var returnedResult int
+var controlResult int
 
 //go:noinline
 func machine() {
@@ -250,6 +278,69 @@ func spawner() {
 	spawnSaw = spawnStage
 }
 
+//go:noinline
+func sleeper() {
+	time.Sleep(5 * time.Millisecond)
+	slept = true
+}
+
+//go:noinline
+func fileReader() {
+	corort.FileRead(fileFD, fileBuffer, &fileN, &fileErrno)
+}
+
+//go:noinline
+func socketReader() {
+	corort.SocketRead(socketFD, socketBuffer, &socketN, &socketErrno)
+}
+
+//go:noinline
+func ordinaryFileReader() {
+	ordinaryFileN, ordinaryFileErr = ordinaryFile.Read(ordinaryFileBuffer)
+}
+
+//go:noinline
+func ordinarySocketReader() {
+	ordinarySocketN, ordinarySocketErr = ordinarySocket.Read(ordinarySocketBuffer)
+}
+
+//go:noinline
+func parameterized(value int) {
+	runtime.Gosched()
+	parameterResult = value
+}
+
+//go:noinline
+func parameterCaller() {
+	value := 40
+	parameterized(value + 2)
+}
+
+//go:noinline
+func yieldingValue(value int) int {
+	runtime.Gosched()
+	return value + 1
+}
+
+//go:noinline
+func resultCaller() {
+	returnedResult = yieldingValue(41)
+}
+
+//go:noinline
+func controlled() {
+	total := 0
+	for i := 0; i < 4; i++ {
+		if i%2 == 0 {
+			total += i
+		}
+	}
+	runtime.Gosched()
+	if total == 2 {
+		controlResult = 42
+	}
+}
+
 func main() {
 	gcDone := make(chan struct{})
 	go func() {
@@ -259,10 +350,90 @@ func main() {
 	machine()
 	parent()
 	spawner()
+	parameterCaller()
+	resultCaller()
+	controlled()
+	sleepStart := time.Now()
+	sleeper()
+	sleepElapsed := time.Since(sleepStart)
+
+	file, err := os.CreateTemp("", "coro-file")
+	if err != nil {
+		panic(err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.WriteString("file"); err != nil {
+		panic(err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	fileFD = int(file.Fd())
+	fileReader()
+	if _, err := file.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	ordinaryFile = file
+	ordinaryFileReader()
+
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		panic(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			panic(err)
+		}
+		accepted <- conn
+	}()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+	raw, err := server.SyscallConn()
+	if err != nil {
+		panic(err)
+	}
+	if err := raw.Control(func(fd uintptr) {
+		socketFD, err = syscall.Dup(int(fd))
+	}); err != nil || socketFD < 0 {
+		panic("dup failed")
+	}
+	defer syscall.Close(socketFD)
+	if err := syscall.SetNonblock(socketFD, true); err != nil {
+		panic(err)
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_, _ = client.Write([]byte("poll"))
+	}()
+	socketReader()
+	ordinarySocket = server
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_, _ = client.Write([]byte("net!"))
+	}()
+	ordinarySocketReader()
+
 	<-gcDone
 	if next != 2 || trace != [2]int{1, 2} || result != 42 ||
 		childStage != 2 || parentSaw != 2 ||
-		spawnStage != 2 || spawnSaw != 2 {
+		spawnStage != 2 || spawnSaw != 2 ||
+		parameterResult != 42 ||
+		returnedResult != 42 ||
+		controlResult != 42 ||
+		!slept || sleepElapsed < 5*time.Millisecond ||
+		fileN != 4 || fileErrno != 0 || string(fileBuffer) != "file" ||
+		ordinaryFileN != 4 || ordinaryFileErr != nil || string(ordinaryFileBuffer) != "file" ||
+		socketN != 4 || socketErrno != 0 || string(socketBuffer) != "poll" ||
+		ordinarySocketN != 4 || ordinarySocketErr != nil || string(ordinarySocketBuffer) != "net!" {
 		panic("bad coroutine trace")
 	}
 	println("stackless-coro-ok")
@@ -287,7 +458,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=5"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=15"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
@@ -298,6 +469,220 @@ func main() {
 	}
 	if want := "stackless-coro-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+}
+
+func TestDirectSystemABI(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("direct System ABI fixture is only implemented on Darwin and Linux")
+	}
+	if runtime.GOARCH != "arm64" && runtime.GOARCH != "amd64" {
+		t.Skip("direct System ABI fixture is only implemented on arm64 and amd64")
+	}
+
+	tmp := t.TempDir()
+	writeFile := func(name, contents string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(tmp, name), []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("go.mod", "module example.com/corodirect\n\ngo 1.28\n")
+	writeFile("main.go", `package main
+
+import (
+	"runtime"
+	corort "runtime/coro"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+var sum uint64
+var gate uint32
+var asyncReadFD int
+var asyncWriteFD int
+var asyncResult uint64
+var asyncErrno uintptr
+
+//go:noinline
+func foreign() {
+	sum = corort.DirectAdd(19, 23)
+	runtime.Gosched()
+	corort.DirectBlock(&gate)
+	corort.AsyncDouble(asyncReadFD, asyncWriteFD, 21, &asyncResult, &asyncErrno)
+}
+
+func main() {
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+	var pipe [2]int
+	if err := syscall.Pipe(pipe[:]); err != nil {
+		panic(err)
+	}
+	asyncReadFD, asyncWriteFD = pipe[0], pipe[1]
+	defer syscall.Close(asyncReadFD)
+	defer syscall.Close(asyncWriteFD)
+	if err := syscall.SetNonblock(asyncReadFD, true); err != nil {
+		panic(err)
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		atomic.StoreUint32(&gate, 1)
+	}()
+	foreign()
+	if sum != 42 || atomic.LoadUint32(&gate) != 1 ||
+		asyncResult != 42 || asyncErrno != 0 {
+		panic("bad direct System ABI result")
+	}
+	println("direct-system-abi-ok")
+}
+`)
+	csrc := filepath.Join(tmp, "fixture.c")
+	writeFile("fixture.c", `#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+struct coro_request {
+	uint64_t id;
+	uint64_t value;
+	int fd;
+};
+
+uint64_t coro_add_u64(uint64_t a, uint64_t b) {
+	return a + b;
+}
+
+void coro_block_until(uint32_t *gate) {
+	while (__atomic_load_n(gate, __ATOMIC_ACQUIRE) == 0) {
+	}
+}
+
+static void *coro_double_worker(void *arg) {
+	struct coro_request *request = arg;
+	uint64_t packet[2] = {request->id, request->value * 2};
+	int fd = request->fd;
+	free(request);
+	while (write(fd, packet, sizeof(packet)) < 0 && errno == EINTR) {
+	}
+	return NULL;
+}
+
+int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
+	struct coro_request *request = malloc(sizeof(*request));
+	if (request == NULL) {
+		return ENOMEM;
+	}
+	request->id = id;
+	request->value = value;
+	request->fd = fd;
+
+	pthread_t thread;
+	int error = pthread_create(&thread, NULL, coro_double_worker, request);
+	if (error != 0) {
+		free(request);
+		return error;
+	}
+	error = pthread_detach(thread);
+	if (error != 0) {
+		return error;
+	}
+	return 0;
+}
+`)
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "env", "CC")
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go env CC failed: %v\n%s", err, data)
+	}
+	cc := strings.TrimSpace(string(data))
+	obj := filepath.Join(tmp, "fixture.syso")
+	cmd = testenv.Command(t, cc, "-pthread", "-c", csrc, "-o", obj)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compiling C fixture failed: %v\n%s", err, data)
+	}
+	if err := os.Remove(csrc); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "direct")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/corodirect=-l -d=coro=4",
+		"-ldflags=-linkmode=external -extldflags=-pthread",
+		".")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"CGO_ENABLED=1",
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err = cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building direct fixture failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=1"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("direct fixture failed: %v\n%s", err, data)
+	}
+	if want := "direct-system-abi-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `runtime/coro\.Direct(Add|Block)`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, forbidden := range []string{
+		"runtime.cgocall",
+		"runtime.asmcgocall",
+		"runtime.morestack",
+		"_cgo_Cfunc_",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("direct call disassembly contains %q\n%s", forbidden, disassembly)
+		}
+	}
+	for _, want := range []string{
+		"DirectAdd",
+		"DirectBlock",
+		"coro_add_u64",
+		"coro_block_until",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("direct call disassembly does not contain %q\n%s", want, disassembly)
+		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `runtime\.coroSubmit`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of async submit failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly, "coro_submit_u64") {
+		t.Errorf("async submit disassembly does not call coro_submit_u64\n%s", disassembly)
+	}
+	for _, forbidden := range []string{"runtime.cgocall", "runtime.asmcgocall", "_cgo_Cfunc_"} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("async submit disassembly contains %q\n%s", forbidden, disassembly)
+		}
 	}
 }
 
