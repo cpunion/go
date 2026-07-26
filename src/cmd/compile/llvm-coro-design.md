@@ -1,12 +1,17 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
+> 路线状态（2026-07-26）：LLVM backend 实现已暂停。当前方案改为复用 Go
+> 原生 backend、由编译器生成显式 state machine；LLVM 文档保留为调研和语义设计
+> 基线。新的 active design 与 MVP 见
+> [`native-coro-design.md`](native-coro-design.md)。
+
 状态：架构设计稿；已完成 Phase 0 前端与 pre-lower handoff PoC，尚未接入 LLVM emitter
 
 更新时间：2026-07-26
 
 目标开发线：`cpunion/go:main`（持续 merge Go 官方 `master`）
 
-当前 topic/worktree：`dev.coro`（向 `cpunion/go:main` 提交）
+LLVM 路线历史 topic/worktree：`dev.coro`（向 `cpunion/go:main` 提交）
 
 ## 1. 调研基线
 
