@@ -1,9 +1,9 @@
 # Native Stackless Coroutine Design
 
-Status: proposed design and MVP plan; no native state-machine lowering has been
-implemented
+Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
+`-d=coro=4`; not production-ready
 
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 Development branch: `cpunion/go:main`, which periodically merges the Go
 development branch
@@ -242,11 +242,11 @@ stack in two ways:
 - it is the native OS thread stack and is never copied or grown;
 - its size is charged per executor, not per logical goroutine.
 
-This requires a runtime layout change. At M initialization, the runtime starts
-on the OS stack as it does today. Before managed coroutine execution, it must
-provide a separate internal scheduler stack for `g0`, associate the OS stack
-with the executor G, and switch between them at runtime scheduling boundaries.
-The exact bootstrap and teardown sequence is an MVP feasibility task.
+The MVP implements this runtime layout change. At M initialization, the
+runtime starts on the OS stack as it does today. Before managed coroutine
+execution, it provides a separate internal scheduler stack for `g0`,
+associates the OS stack with the executor G, and switches between them at
+runtime scheduling boundaries.
 
 The reason to prefer the OS stack is stronger than stack size alone. The
 current `asmcgocall` path documents that `g0` is expected to be an
@@ -571,7 +571,7 @@ O(logical G count * reserved native stack)
 
 ### 9.2 Native executor stack
 
-The recommended target adds a runtime-supported executor G whose fixed,
+The MVP adds a runtime-supported executor G whose fixed,
 guard-paged, noncopying stack is the OS thread stack. Generated coroutine code
 and its allowed plain callees run on this stack. Runtime scheduler work runs on
 a separate internal `g0` stack.
@@ -595,9 +595,9 @@ replace controlled stack growth with unchecked overflow.
 
 ### 9.3 MVP stack gate
 
-For the complete MVP, use the OS thread stack and discover its real bounds
-through the existing per-platform runtime initialization. Add a separately
-allocated, bounded runtime scheduler stack for `g0`.
+The MVP uses the OS thread stack and discovers its real bounds through the
+existing per-platform runtime initialization. It allocates a separate bounded
+runtime scheduler stack for `g0`.
 
 A preliminary compiler or ABI fixture may run on a separately mapped stack,
 but its result proves only the restricted functions under test. It is not the
@@ -1135,7 +1135,132 @@ The MVP is accepted only if:
 - unsupported behavior is rejected rather than silently falling back;
 - the implementation has no LLVM build or runtime dependency.
 
-## 15. Work after the MVP
+## 15. MVP implementation report
+
+The restricted MVP implements M0 through M6 without an LLVM build or runtime
+dependency. It is an architecture proof, not a claim that arbitrary Go
+programs can use stackless goroutines.
+
+### 15.1 Implemented path
+
+The compiler:
+
+- computes suspend effects and System ABI execution requirements before
+  lowering;
+- lowers only when both `GOEXPERIMENT=coro` and internal level `-d=coro=4`
+  are selected;
+- generates typed heap frames and `NOSPLIT` resume functions before escape
+  analysis;
+- supports closed structured calls, `go` spawn, parameters and results,
+  exact expression evaluation, `if`, simple `for`, and nested normal returns;
+- rejects unsupported control flow deterministically and removes callers whose
+  stackless dependencies cannot be lowered;
+- recognizes the narrow `time.Sleep`, `os.File.Read`, and
+  `net.(*TCPConn).Read` source paths used by the end-to-end probes.
+
+The runtime:
+
+- uses a push-driven ready queue and generation-checked operation registry;
+- runs resume episodes on a fixed pool of four executor Gs, each using its
+  native OS thread stack, while `m.g0` uses a separate scheduler stack;
+- prevents executor stack copy, growth, and shrink, and handles signal stack
+  discovery, asynchronous preemption, GC scanning, traceback, and trace events
+  on that stack;
+- changes `m.g0` identity and resumes the target G in one architecture
+  assembly sequence, so GC cannot observe a half-completed switch;
+- uses common operation ownership for timer, regular-file worker, nonblocking
+  socket, and asynchronous C completion;
+- makes timer completion and cancellation race for the same operation record,
+  so exactly one path readies the waiter;
+- issues the MVP scalar C calls through System ABI assembly shims without
+  `runtime.cgocall`, `runtime.asmcgocall`, or a cgo-generated wrapper;
+- releases scheduler capacity around a blocking C call, allowing another
+  stackless logical goroutine to run at `GOMAXPROCS=1`.
+
+The race build retains the operation-state tests but deliberately uses the
+managed-stack fallback. The race runtime is not yet prepared to instrument
+arbitrary Go code running on the fixed native executor stack.
+
+### 15.2 Validation
+
+The following gates pass locally on Darwin/arm64 and Linux/amd64:
+
+- compiler analysis, summary, lowering, archive identity, and end-to-end tests;
+- all `TestStacklessCoro` runtime tests;
+- operation tests under `-race`;
+- GC with typed pointers live across suspension;
+- native stack bounds, fixed four-executor pool, `SIGURG` asynchronous
+  preemption, traceback, trace output, and deterministic fixed-stack overflow;
+- 10,000 native-context reuse cycles concurrent with forced GC, repeated 20
+  times on each target;
+- yield, structured child await, 100,000 spawned logical goroutines, timer
+  fire/cancel races, regular-file success/error/EOF, socket
+  success/EOF/deadline/close, and asynchronous C success/error paths;
+- direct C symbol inspection proving the absence of the general cgo
+  transition symbols in the supported hot path.
+
+The Linux/amd64 local run used an amd64 OrbStack guest translated on Apple
+Silicon. Its correctness and allocation results are useful, but its latency
+must not be compared directly with a native amd64 host. Native Linux and
+Darwin jobs remain CI acceptance gates.
+
+Changed Go production statements are 93.2% covered by the focused compiler and
+runtime profiles. The changed lowering statements are 92.0% covered. The
+remaining lines are defensive invariant failures or platform signal branches;
+the corresponding behavior is also exercised by integration tests where
+coverage instrumentation cannot be used.
+
+### 15.3 Measurements
+
+The runtime benchmarks use a 100 ms sample. Values are representative local
+runs, not stable performance promises.
+
+| Operation | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | ---: | ---: | ---: |
+| yield transition | 15.97 ns | 23.22 ns | 0 B |
+| spawn and complete | 50.28 ns | 70.29 ns | 32 B |
+| child await | 49.83 ns | 70.49 ns | 32 B |
+| zero-duration timer wake | 9.14 us | 27.34 us | 248 B |
+| one-byte regular-file read | 10.47 us | 25.28 us | 144 B |
+| one-byte socket read | 10.78 us | 25.35 us | 144 B |
+
+A burst of 100,000 logical tasks allocates 3,200,272 bytes and 100,006
+objects on both targets: approximately 32 bytes per task plus 272 bytes and
+six scheduler allocations. The native executor count remains four. The
+one-task and 1,000-task burst measurements are 1,328 and 32,272 bytes,
+respectively.
+
+The direct-call microbenchmark performs the same non-inlined scalar addition
+through the stackless System ABI path, ordinary cgo, and pure Go. The compiler
+reported two lowered functions and no skipped functions.
+
+| Call path | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | ---: | ---: | ---: |
+| direct System ABI | 3.84-3.96 ns | 8.49-8.89 ns | 0 B/op |
+| ordinary cgo | 16.53-16.62 ns | 26.81-26.97 ns | 0 B/op |
+| pure Go reference | 0.767-0.772 ns | 1.04-1.06 ns | 0 B/op |
+
+For a `println` program whose `work` function calls `runtime.Gosched`, the
+Darwin executable is 1,833,458 bytes with the coroutine experiment and
+1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
+executables are 1,195,746 and 1,128,066 bytes, a 67,680-byte (6.0%) increase.
+Summed text symbols are 474,448 and 444,176 bytes, a 30,272-byte (6.8%)
+increase. The compiler reported two lowered functions and no skips. Most of
+this fixed delta is the experimental runtime; per-logical-task memory is
+reported separately above.
+
+### 15.4 Remaining restrictions
+
+The MVP does not yet support range loops, labeled control flow, dynamic calls,
+interfaces, escaping closures, defer, panic/recover, Goexit, implicit faults,
+channels, select, mutex parking, reflection, callbacks, variadic C calls, or
+general C ABI type classification. Direct foreign declarations are a fixed
+internal fixture rather than a user-facing cgo facility. Logical traceback,
+debugger, profiler, race instrumentation on native executor stacks, dynamic
+executor sizing, cancellation of in-flight file work, and broad standard
+library compatibility remain future work.
+
+## 16. Work after the MVP
 
 The likely order is:
 
@@ -1154,9 +1279,9 @@ The likely order is:
 10. add other targets only after their platform operation sources and stack
     contracts are explicit.
 
-## 16. Decisions to confirm before implementation
+## 17. Confirmed MVP decisions
 
-The recommended MVP choices are:
+The implemented MVP choices are:
 
 1. Use a dedicated executor G on the OS thread stack, give `g0` a separate
    runtime stack, and do not run arbitrary Go code under the `g0` identity.

@@ -53,8 +53,13 @@ jobs:
         working-directory: src
         run: ./make.bash
 
-      - name: Test default compiler
-        run: ./bin/go test -count=1 cmd/compile/... internal/pkgbits internal/buildcfg
+      - name: Test default compiler and runtime
+        run: >-
+          ./bin/go test -count=1
+          cmd/compile/...
+          internal/pkgbits
+          internal/buildcfg
+          runtime
 
       - name: Build coroutine experiment toolchain
         working-directory: src
@@ -62,7 +67,7 @@ jobs:
           GOEXPERIMENT: coro
         run: ./make.bash
 
-      - name: Test coroutine compiler
+      - name: Test coroutine compiler and runtime
         env:
           GOEXPERIMENT: coro
         run: >-
@@ -70,6 +75,12 @@ jobs:
           cmd/compile/...
           internal/pkgbits
           internal/buildcfg
+          runtime
+
+      - name: Test coroutine operation races
+        env:
+          GOEXPERIMENT: coro
+        run: ./bin/go test -race -count=1 runtime -run '^TestStacklessCoro'
 
   native-full:
     name: Native all.bash (Linux)
