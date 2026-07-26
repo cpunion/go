@@ -192,6 +192,115 @@ func TestPreLowerHandoff(t *testing.T) {
 	}
 }
 
+func TestYieldLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var trace [2]int
+var next int
+var result int
+var childStage int
+var parentSaw int
+var spawnStage int
+var spawnSaw int
+
+//go:noinline
+func machine() {
+	value := new(int)
+	*value = 41
+	trace[next] = 1
+	next++
+	runtime.Gosched()
+	runtime.Gosched()
+	result = *value + 1
+	trace[next] = 2
+	next++
+}
+
+//go:noinline
+func child() {
+	childStage = 1
+	runtime.Gosched()
+	childStage = 2
+}
+
+//go:noinline
+func parent() {
+	child()
+	parentSaw = childStage
+}
+
+//go:noinline
+func spawnedChild() {
+	spawnStage = 1
+	runtime.Gosched()
+	spawnStage = 2
+}
+
+//go:noinline
+func spawner() {
+	go spawnedChild()
+	runtime.Gosched()
+	runtime.Gosched()
+	spawnSaw = spawnStage
+}
+
+func main() {
+	gcDone := make(chan struct{})
+	go func() {
+		runtime.GC()
+		close(gcDone)
+	}()
+	machine()
+	parent()
+	spawner()
+	<-gcDone
+	if next != 2 || trace != [2]int{1, 2} || result != 42 ||
+		childStage != 2 || parentSaw != 2 ||
+		spawnStage != 2 || spawnSaw != 2 {
+		panic("bad coroutine trace")
+	}
+	println("stackless-coro-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=5"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("lowered coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+}
+
 func TestInliningCompatibility(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

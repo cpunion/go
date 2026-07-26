@@ -303,6 +303,14 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			fmt.Fprintln(os.Stderr, "coro: phase=final")
 			plan.Dump(os.Stderr)
 		}
+		if base.Debug.Coro > 3 {
+			result, err := coro.Lower(plan)
+			if err != nil {
+				base.Fatalf("lowering coroutine plan: %v", err)
+			}
+			fmt.Fprintf(os.Stderr, "coro: phase=lower lowered=%d skipped=%d\n",
+				result.Lowered, result.Skipped)
+		}
 		plan.PublishSummaries()
 	}
 
