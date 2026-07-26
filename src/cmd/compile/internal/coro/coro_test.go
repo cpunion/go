@@ -470,6 +470,20 @@ func main() {
 	if want := "stackless-coro-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\..*\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of resume functions failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, ".coro.func") {
+		t.Fatalf("objdump did not find generated resume functions\n%s", disassembly)
+	}
+	if strings.Contains(disassembly, "runtime.morestack") {
+		t.Fatalf("generated resume function contains runtime.morestack\n%s", disassembly)
+	}
 }
 
 func TestDirectSystemABI(t *testing.T) {
@@ -541,7 +555,8 @@ func main() {
 }
 `)
 	csrc := filepath.Join(tmp, "fixture.c")
-	writeFile("fixture.c", `#include <errno.h>
+	writeFile("fixture.c", `#define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -553,7 +568,36 @@ struct coro_request {
 	int fd;
 };
 
+static int coro_on_native_thread_stack(void) {
+	char local;
+	uintptr_t sp = (uintptr_t)&local;
+#if defined(__APPLE__)
+	pthread_t self = pthread_self();
+	uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(self);
+	size_t size = pthread_get_stacksize_np(self);
+	return sp >= hi - size && sp < hi;
+#elif defined(__linux__)
+	pthread_attr_t attr;
+	void *base;
+	size_t size;
+	if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+		return 0;
+	}
+	if (pthread_attr_getstack(&attr, &base, &size) != 0) {
+		pthread_attr_destroy(&attr);
+		return 0;
+	}
+	pthread_attr_destroy(&attr);
+	return sp >= (uintptr_t)base && sp < (uintptr_t)base + size;
+#else
+	return 0;
+#endif
+}
+
 uint64_t coro_add_u64(uint64_t a, uint64_t b) {
+	if (!coro_on_native_thread_stack()) {
+		return UINT64_MAX;
+	}
 	return a + b;
 }
 

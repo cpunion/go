@@ -1144,6 +1144,10 @@ func newstack() {
 		// Act like goroutine called runtime.Gosched.
 		gopreempt_m(gp) // never return
 	}
+	if gp.stackFixed {
+		print("runtime: fixed stack overflow: sp=", hex(sp), " stack=[", hex(gp.stack.lo), ", ", hex(gp.stack.hi), "]\n")
+		throw("runtime: stackless coroutine executor stack overflow")
+	}
 
 	// Allocate a bigger segment and move the stack.
 	oldsize := gp.stack.hi - gp.stack.lo
@@ -1214,6 +1218,9 @@ func gostartcallfn(gobuf *gobuf, fv *funcval) {
 // pointer maps for all frames on the stack. The caller must hold the
 // _Gscan bit for gp or must be running gp itself.
 func isShrinkStackSafe(gp *g) bool {
+	if gp.stackFixed {
+		return false
+	}
 	// We can't copy the stack if we're in a syscall.
 	// The syscall might have pointers into the stack and
 	// often we don't have precise pointer maps for the innermost

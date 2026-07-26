@@ -521,6 +521,7 @@ type g struct {
 	paniconfault bool // panic (instead of crash) on unexpected fault address
 	gcscandone   bool // g has scanned stack; protected by _Gscan bit in status
 	throwsplit   bool // must not split stack
+	stackFixed   bool // stack must not be copied, grown, or shrunk
 	// activeStackChans indicates that there are unlocked channels
 	// pointing into this goroutine's stack. If true, stack
 	// copying needs to acquire channel locks to protect these
@@ -571,6 +572,8 @@ type g struct {
 
 	coroarg *coro // argument during coroutine transfers
 	bubble  *synctestBubble
+
+	stacklessCoro unsafe.Pointer // native stackless coroutine executor context
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.

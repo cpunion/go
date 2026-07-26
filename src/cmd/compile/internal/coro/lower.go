@@ -384,6 +384,10 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
+	// A native executor stack is fixed and cannot satisfy morestack. Calls
+	// made by the resume function retain their own stack checks, so exhausting
+	// the executor budget fails in the runtime instead of copying the stack.
+	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
 	ctx := resume.Dcl[0]
 

@@ -298,6 +298,15 @@ func TestLowerStateMachines(t *testing.T) {
 	if result.Lowered != 10 || result.Skipped != 0 {
 		t.Fatalf("Lower result = %+v, want 10 lowered and 0 skipped", result)
 	}
+	var noSplitResumes int
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.Pragma&ir.Nosplit != 0 {
+			noSplitResumes++
+		}
+	}
+	if noSplitResumes != result.Lowered {
+		t.Fatalf("nosplit resume functions = %d, want %d", noSplitResumes, result.Lowered)
+	}
 
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,

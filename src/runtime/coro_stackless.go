@@ -88,6 +88,13 @@ func coroRun(resume stacklessCoroResume) {
 	s.root = root
 	s.ready(root, false)
 
+	if coroRunOnNativeStack(s) {
+		return
+	}
+	s.run(false)
+}
+
+func (s *stacklessCoroScheduler) run(native bool) {
 	for !s.rootComplete() {
 		task := s.take()
 		if task == nil {
@@ -101,9 +108,11 @@ func coroRun(resume stacklessCoroResume) {
 		switch action {
 		case stacklessCoroActionYield:
 			s.yield(task)
-			// Cooperate with the host scheduler until native executors own
-			// independent fixed stacks.
-			Gosched()
+			if !native {
+				// Cooperate with the host scheduler when this target has no
+				// native executor implementation.
+				Gosched()
+			}
 		case stacklessCoroActionWait:
 			s.waiting(task)
 		case stacklessCoroActionComplete:
