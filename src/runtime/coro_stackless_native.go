@@ -32,6 +32,7 @@ type stacklessCoroNativeContext struct {
 	lockedG    guintptr
 	lockedInt  uint32
 	g0Accurate bool
+	sigmask    sigset
 }
 
 var stacklessCoroNativePool struct {
@@ -39,6 +40,10 @@ var stacklessCoroNativePool struct {
 	count     int
 	available chan *stacklessCoroNativeContext
 }
+
+// coroNativeGogo installs newG0 and resumes buf in one assembly sequence. No
+// Go safe point may observe the old current G with the new m.g0.
+func coroNativeGogo(buf *gobuf, newG0 *g)
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
@@ -68,6 +73,7 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) bool {
 	ctx.caller = gp
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
+	msigrestore(ctx.sigmask)
 
 	if gp.param != unsafe.Pointer(ctx) {
 		throw("runtime: lost stackless coroutine native context")
@@ -153,7 +159,6 @@ func coroNativeStart(caller *g) {
 	executor.stack = stack{lo: nativeG0.stack.lo, hi: hi}
 	executor.stackguard0 = executor.stack.lo + stackGuard
 	executor.stackguard1 = ^uintptr(0)
-	executor.stackFixed = true
 	executor.m = mp
 	executor.stacklessCoro = unsafe.Pointer(ctx)
 
@@ -191,8 +196,6 @@ func coroNativeStart(caller *g) {
 	casgstatus(caller, _Grunning, _Gwaiting)
 	caller.m = nil
 
-	mp.g0 = schedulerG
-	mp.g0StackAccurate = true
 	mp.curg = executor
 	mp.lockedInt++
 	if mp.lockedInt == 0 {
@@ -205,7 +208,15 @@ func coroNativeStart(caller *g) {
 		trace.GoStart()
 		traceRelease(trace)
 	}
-	gogo(&executor.sched)
+
+	// Keep nativeG0 installed as m.g0 until every runtime call above has
+	// completed. Between changing m.g0 and gogo, the current G would otherwise
+	// be neither m.g0 nor m.curg, so a concurrent GC transition could fail in
+	// systemstack.
+	sigsave(&ctx.sigmask)
+	sigblock(false)
+	mp.g0StackAccurate = true
+	coroNativeGogo(&executor.sched, schedulerG)
 }
 
 func coroNativeMain() {
@@ -214,6 +225,7 @@ func coroNativeMain() {
 	if ctx == nil || ctx.executor != gp {
 		throw("runtime: invalid stackless coroutine executor context")
 	}
+	msigrestore(ctx.sigmask)
 	ctx.scheduler.run(true)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
@@ -247,11 +259,8 @@ func coroNativeFinish(executor *g) {
 	executor.stackguard0 = 0
 	executor.stackguard1 = 0
 	executor.stktopsp = 0
-	executor.stackFixed = false
 	memclrNoHeapPointers(unsafe.Pointer(&executor.sched), unsafe.Sizeof(executor.sched))
 
-	mp.g0 = ctx.nativeG0
-	mp.g0StackAccurate = ctx.g0Accurate
 	mp.curg = caller
 	mp.lockedg = ctx.lockedG
 	mp.lockedInt = ctx.lockedInt
@@ -267,10 +276,18 @@ func coroNativeFinish(executor *g) {
 		traceRelease(trace)
 	}
 
+	nativeG0 := ctx.nativeG0
+	g0Accurate := ctx.g0Accurate
 	ctx.nativeG0 = nil
 	ctx.lockedG = 0
 	ctx.lockedInt = 0
 	ctx.g0Accurate = false
+
+	// Keep schedulerG installed as m.g0 while teardown calls runtime helpers.
+	// Change m.g0 only for the final non-returning switch to caller.
+	sigsave(&ctx.sigmask)
+	sigblock(false)
+	mp.g0StackAccurate = g0Accurate
 	schedulerG.m = nil
-	gogo(&caller.sched)
+	coroNativeGogo(&caller.sched, nativeG0)
 }

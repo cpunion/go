@@ -588,7 +588,7 @@ func adjustSignalStack(sig uint32, mp *m, gsigStack *gsignalStack) bool {
 		setGsignalStack(&st, gsigStack)
 		return true
 	}
-	if gp := mp.curg; gp != nil && gp.stackFixed && sp >= gp.stack.lo && sp < gp.stack.hi {
+	if gp := mp.curg; gp != nil && gp.stackIsFixed() && sp >= gp.stack.lo && sp < gp.stack.hi {
 		// A stackless coroutine executor uses the native thread stack while
 		// m.g0 uses a separate runtime scheduler stack.
 		st := stackt{ss_size: gp.stack.hi - gp.stack.lo}

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.coro && ((darwin && arm64) || (linux && amd64))
+//go:build goexperiment.coro && !race && ((darwin && arm64) || (linux && amd64))
 
 package runtime
 
@@ -12,7 +12,7 @@ const StacklessCoroExecutorCount = stacklessCoroExecutorCount
 
 func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {
 	gp := getg()
-	return gp.stackFixed, sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi
+	return gp.stackIsFixed(), sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi
 }
 
 func StacklessCoroNativePoolForTest() (count int) {

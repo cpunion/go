@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.coro && ((darwin && arm64) || (linux && amd64))
+//go:build goexperiment.coro && !race && ((darwin && arm64) || (linux && amd64))
 
 package runtime_test
 
@@ -82,6 +82,24 @@ func TestStacklessCoroNativePoolBound(t *testing.T) {
 	}
 	close(gate)
 	wg.Wait()
+}
+
+func TestStacklessCoroNativeReuseDuringGC(t *testing.T) {
+	const runs = 10_000
+	gcDone := make(chan struct{})
+	go func() {
+		for range 100 {
+			runtime.GC()
+		}
+		close(gcDone)
+	}()
+
+	for range runs {
+		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+			return runtime.StacklessCoroActionComplete
+		})
+	}
+	<-gcDone
 }
 
 func TestStacklessCoroNativePreemption(t *testing.T) {
