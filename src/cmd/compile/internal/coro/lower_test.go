@@ -13,6 +13,7 @@ import (
 	"cmd/internal/obj/x86"
 	"cmd/internal/src"
 	"go/constant"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -178,6 +179,38 @@ func TestLowerStateMachines(t *testing.T) {
 		directCall, blockCall, foreignYield, newLowerTestReturn(),
 	}
 
+	structured := newLowerTestFunc(pkg, "structured")
+	loopVar := structured.NewLocal(src.NoXPos, pkg.Lookup("loop"), types.Types[types.TINT])
+	loopDecl := ir.NewDecl(src.NoXPos, ir.ODCL, loopVar)
+	loopInit := ir.NewAssignStmt(src.NoXPos, loopVar,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT], constant.MakeInt64(0)))
+	loopInit.Def = true
+	loopVar.Defn = loopInit
+	thenYield := newLowerTestCall(yield)
+	elseYield := newLowerTestCall(yield)
+	ifStmt := ir.NewIfStmt(src.NoXPos,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL], constant.MakeBool(true)),
+		ir.Nodes{thenYield, newLowerTestReturn()}, ir.Nodes{elseYield})
+	ifStmt.SetTypecheck(1)
+	structuredTimer := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, timerOp.Nname,
+		[]ir.Node{ir.NewBasicLit(src.NoXPos, types.Types[types.TINT64],
+			constant.MakeInt64(1))})
+	structuredTimer.SetTypecheck(1)
+	loopPost := ir.NewAssignOpStmt(src.NoXPos, ir.OADD, loopVar,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT], constant.MakeInt64(1)))
+	loopPost.IncDec = true
+	loopPost.SetTypecheck(1)
+	loop := ir.NewForStmt(src.NoXPos, loopInit,
+		nil,
+		loopPost, ir.Nodes{structuredTimer}, false)
+	loop.SetTypecheck(1)
+	structured.Body = []ir.Node{
+		loopDecl,
+		ir.NewBlockStmt(src.NoXPos, ir.Nodes{ifStmt}),
+		loop,
+		newLowerTestReturn(),
+	}
+
 	functions := map[*ir.Func]*Function{
 		child: {
 			Func:    child,
@@ -290,13 +323,24 @@ func TestLowerStateMachines(t *testing.T) {
 				{ID: 3, Kind: SiteYield, Node: foreignYield},
 			},
 		},
+		structured: {
+			Func:    structured,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Sites: []Site{
+				{ID: 1, Kind: SiteYield, Node: thenYield},
+				{ID: 2, Kind: SiteYield, Node: elseYield},
+				{ID: 3, Kind: SiteTimer, Node: structuredTimer},
+			},
+		},
 	}
 	result, err := Lower(&Plan{Functions: functions})
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 10 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 10 lowered and 0 skipped", result)
+	if result.Lowered != 11 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 11 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -310,7 +354,7 @@ func TestLowerStateMachines(t *testing.T) {
 
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
-		ordinaryFileReader, asyncCaller, foreignCaller,
+		ordinaryFileReader, asyncCaller, foreignCaller, structured,
 	} {
 		if len(fn.Body) != 2 {
 			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
@@ -391,6 +435,124 @@ func TestLowerRejectsUnsupportedDependency(t *testing.T) {
 	}
 	if result.Lowered != 0 || result.Skipped != 2 {
 		t.Fatalf("Lower result = %+v, want 0 lowered and 2 skipped", result)
+	}
+}
+
+func TestLowerRejectsUnsupportedControl(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowercontrol", "lowercontrol")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+		types.NewSignature(nil, nil, nil))
+	yield.DeclareParams(true)
+	branch := func() ir.Node {
+		return ir.NewBranchStmt(src.NoXPos, ir.OBREAK, nil)
+	}
+	cases := []struct {
+		name string
+		body func(*ir.CallExpr) ir.Nodes
+		want string
+	}{
+		{
+			name: "init",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				call.SetInit(ir.Nodes{branch()})
+				return ir.Nodes{call}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "defer",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)}
+			},
+			want: "defer is not supported",
+		},
+		{
+			name: "block",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewBlockStmt(src.NoXPos, ir.Nodes{branch()})}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "if-body",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewIfStmt(src.NoXPos, nil,
+					ir.Nodes{branch()}, nil)}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "if-else",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewIfStmt(src.NoXPos, nil,
+					nil, ir.Nodes{branch()})}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "labeled-for",
+			body: func(*ir.CallExpr) ir.Nodes {
+				loop := ir.NewForStmt(src.NoXPos, nil, nil, nil, nil, false)
+				loop.Label = pkg.Lookup("loop")
+				return ir.Nodes{loop}
+			},
+			want: "labeled for loop",
+		},
+		{
+			name: "for-post",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
+					branch(), nil, false)}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "for-body",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
+					nil, ir.Nodes{branch()}, false)}
+			},
+			want: "control flow break",
+		},
+		{
+			name: "return",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewReturnStmt(src.NoXPos, ir.Nodes{
+					ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+						constant.MakeInt64(1)),
+				})}
+			},
+			want: "return has 1 results, want 0",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := newLowerTestFunc(pkg, tc.name)
+			call := newLowerTestCall(yield)
+			fn.Body = tc.body(call)
+			_, err := newLowerCandidate(&Function{
+				Func: fn,
+				Sites: []Site{{
+					ID: 1, Kind: SiteYield, Node: call,
+				}},
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("newLowerCandidate error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

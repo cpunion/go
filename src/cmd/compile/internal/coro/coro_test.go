@@ -233,9 +233,17 @@ var ordinarySocket *net.TCPConn
 var ordinarySocketBuffer = make([]byte, 4)
 var ordinarySocketN int
 var ordinarySocketErr error
+var ordinarySocketReadOK bool
+var ordinarySocketDeadlineOK bool
+var ordinarySocketCloseOK bool
+var socketProgress int
 var parameterResult int
 var returnedResult int
 var controlResult int
+var nestedResult int
+var nestedElseResult int
+var nestedReturnResult int
+var nestedEvaluationCount int
 
 //go:noinline
 func machine() {
@@ -301,7 +309,14 @@ func ordinaryFileReader() {
 
 //go:noinline
 func ordinarySocketReader() {
+	go socketProgressor()
 	ordinarySocketN, ordinarySocketErr = ordinarySocket.Read(ordinarySocketBuffer)
+}
+
+//go:noinline
+func socketProgressor() {
+	socketProgress++
+	runtime.Gosched()
 }
 
 //go:noinline
@@ -341,6 +356,39 @@ func controlled() {
 	}
 }
 
+//go:noinline
+func nestedDelay() time.Duration {
+	nestedEvaluationCount++
+	return 0
+}
+
+//go:noinline
+func nestedControl(limit int) int {
+	total := 0
+	if limit > 0 {
+		runtime.Gosched()
+		total++
+	} else {
+		runtime.Gosched()
+		total--
+	}
+	for i := 0; i < limit; i++ {
+		time.Sleep(nestedDelay())
+		total += i
+	}
+	return total
+}
+
+//go:noinline
+func nestedReturn(value int) int {
+	if value < 0 {
+		runtime.Gosched()
+		return -1
+	}
+	runtime.Gosched()
+	return value + 1
+}
+
 func main() {
 	gcDone := make(chan struct{})
 	go func() {
@@ -353,6 +401,9 @@ func main() {
 	parameterCaller()
 	resultCaller()
 	controlled()
+	nestedResult = nestedControl(4)
+	nestedElseResult = nestedControl(-1)
+	nestedReturnResult = nestedReturn(41) + nestedReturn(-1)
 	sleepStart := time.Now()
 	sleeper()
 	sleepElapsed := time.Since(sleepStart)
@@ -421,6 +472,28 @@ func main() {
 		_, _ = client.Write([]byte("net!"))
 	}()
 	ordinarySocketReader()
+	ordinarySocketReadOK = ordinarySocketN == 4 && ordinarySocketErr == nil &&
+		string(ordinarySocketBuffer) == "net!"
+
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
+		panic(err)
+	}
+	ordinarySocketN = -1
+	ordinarySocketErr = nil
+	ordinarySocketReader()
+	ordinarySocketDeadlineOK = ordinarySocketN == 0 && ordinarySocketErr != nil
+
+	if err := server.SetReadDeadline(time.Time{}); err != nil {
+		panic(err)
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_ = server.Close()
+	}()
+	ordinarySocketN = -1
+	ordinarySocketErr = nil
+	ordinarySocketReader()
+	ordinarySocketCloseOK = ordinarySocketN == 0 && ordinarySocketErr != nil
 
 	<-gcDone
 	if next != 2 || trace != [2]int{1, 2} || result != 42 ||
@@ -429,11 +502,20 @@ func main() {
 		parameterResult != 42 ||
 		returnedResult != 42 ||
 		controlResult != 42 ||
+		nestedResult != 7 ||
+		nestedElseResult != -1 ||
+		nestedReturnResult != 41 ||
+		nestedEvaluationCount != 4 ||
 		!slept || sleepElapsed < 5*time.Millisecond ||
 		fileN != 4 || fileErrno != 0 || string(fileBuffer) != "file" ||
 		ordinaryFileN != 4 || ordinaryFileErr != nil || string(ordinaryFileBuffer) != "file" ||
 		socketN != 4 || socketErrno != 0 || string(socketBuffer) != "poll" ||
-		ordinarySocketN != 4 || ordinarySocketErr != nil || string(ordinarySocketBuffer) != "net!" {
+		!ordinarySocketReadOK ||
+		!ordinarySocketDeadlineOK ||
+		!ordinarySocketCloseOK ||
+		socketProgress != 3 {
+		println("nested", nestedResult, nestedElseResult, nestedReturnResult, nestedEvaluationCount)
+		println("basic", next, result, childStage, parentSaw, spawnStage, spawnSaw)
 		panic("bad coroutine trace")
 	}
 	println("stackless-coro-ok")
@@ -458,7 +540,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=15"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=18"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
@@ -520,6 +602,8 @@ var asyncReadFD int
 var asyncWriteFD int
 var asyncResult uint64
 var asyncErrno uintptr
+var logicalProgress uint32
+var watchdogUsed uint32
 
 //go:noinline
 func foreign() {
@@ -527,6 +611,13 @@ func foreign() {
 	runtime.Gosched()
 	corort.DirectBlock(&gate)
 	corort.AsyncDouble(asyncReadFD, asyncWriteFD, 21, &asyncResult, &asyncErrno)
+}
+
+//go:noinline
+func replacement() {
+	atomic.StoreUint32(&logicalProgress, 1)
+	runtime.Gosched()
+	atomic.StoreUint32(&gate, 1)
 }
 
 func main() {
@@ -542,12 +633,17 @@ func main() {
 	if err := syscall.SetNonblock(asyncReadFD, true); err != nil {
 		panic(err)
 	}
+	go replacement()
 	go func() {
-		time.Sleep(5 * time.Millisecond)
-		atomic.StoreUint32(&gate, 1)
+		time.Sleep(2 * time.Second)
+		if atomic.CompareAndSwapUint32(&gate, 0, 1) {
+			atomic.StoreUint32(&watchdogUsed, 1)
+		}
 	}()
 	foreign()
 	if sum != 42 || atomic.LoadUint32(&gate) != 1 ||
+		atomic.LoadUint32(&logicalProgress) != 1 ||
+		atomic.LoadUint32(&watchdogUsed) != 0 ||
 		asyncResult != 42 || asyncErrno != 0 {
 		panic("bad direct System ABI result")
 	}
@@ -672,7 +768,7 @@ int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
 	if err != nil {
 		t.Fatalf("building direct fixture failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=1"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=2"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 

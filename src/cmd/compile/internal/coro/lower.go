@@ -46,12 +46,17 @@ type lowerState struct {
 	transition SiteKind
 	call       *ir.CallExpr
 	statement  ir.Node
+	next       int
+	condition  ir.Node
+	thenState  int
+	elseState  int
+	complete   bool
 }
 
 // Lower rewrites supported coroutine primaries into explicit state machines.
-// The initial lowering accepts linear, parameterless functions containing
-// yield, structured call, and spawn sites. Unsupported functions remain
-// unchanged.
+// The MVP lowering accepts closed calls, if statements, simple for loops,
+// normal returns, and the supported operation sites. Unsupported functions
+// remain unchanged.
 func Lower(plan *Plan) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
@@ -173,56 +178,88 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
 
-	topCalls := make(map[*ir.CallExpr]bool)
+	statementCalls := make(map[*ir.CallExpr]bool)
 	goCalls := make(map[*ir.CallExpr]bool)
-	for i, stmt := range fn.Body {
-		switch stmt := stmt.(type) {
-		case *ir.CallExpr:
-			topCalls[stmt] = true
-		case *ir.AssignStmt:
-			ir.Visit(stmt, func(node ir.Node) {
-				if call, ok := node.(*ir.CallExpr); ok {
-					topCalls[call] = true
+	var collectStatements func(ir.Nodes) error
+	collectStatements = func(list ir.Nodes) error {
+		for _, stmt := range list {
+			if init := stmt.Init(); len(init) != 0 {
+				if err := collectStatements(init); err != nil {
+					return err
 				}
-			})
-		case *ir.AssignListStmt:
-			ir.Visit(stmt, func(node ir.Node) {
-				if call, ok := node.(*ir.CallExpr); ok {
-					topCalls[call] = true
+			}
+			switch stmt := stmt.(type) {
+			case *ir.CallExpr:
+				statementCalls[stmt] = true
+			case *ir.AssignStmt:
+				if call, ok := stmt.Y.(*ir.CallExpr); ok {
+					statementCalls[call] = true
 				}
-			})
-		case *ir.Decl, *ir.AssignOpStmt:
-		case *ir.GoDeferStmt:
-			if stmt.Op() != ir.OGO {
-				return nil, fmt.Errorf("defer is not supported")
-			}
-			call, ok := stmt.Call.(*ir.CallExpr)
-			if !ok {
-				return nil, fmt.Errorf("non-call go statement")
-			}
-			goCalls[call] = true
-		case *ir.ReturnStmt:
-			if i != len(fn.Body)-1 ||
-				len(stmt.Results) != 0 && len(stmt.Results) != sig.NumResults() {
-				return nil, fmt.Errorf("non-terminal return")
-			}
-		default:
-			switch stmt.Op() {
-			case ir.OBLOCK, ir.OFOR, ir.OIF, ir.ORANGE, ir.OSWITCH:
-				hasReturn := false
+			case *ir.AssignListStmt:
+				if len(stmt.Rhs) == 1 {
+					if call, ok := stmt.Rhs[0].(*ir.CallExpr); ok {
+						statementCalls[call] = true
+					}
+				}
+				// Multi-result method calls may have already been normalized
+				// into an assignment form whose call is below the RHS root.
+				// The MVP recognizes only the ordinary read methods handled
+				// by the typed worker adapter in that form.
 				ir.Visit(stmt, func(node ir.Node) {
-					if node.Op() == ir.ORETURN {
-						hasReturn = true
+					call, ok := node.(*ir.CallExpr)
+					if ok && ordinaryReadOperation(call) {
+						statementCalls[call] = true
 					}
 				})
-				if hasReturn {
-					return nil, fmt.Errorf("nested return")
+			case *ir.GoDeferStmt:
+				if stmt.Op() != ir.OGO {
+					return fmt.Errorf("defer is not supported")
 				}
-			case ir.OBREAK, ir.OCONTINUE, ir.OFALL, ir.OGOTO,
-				ir.OLABEL, ir.OSELECT:
-				return nil, fmt.Errorf("control flow %s", stmt.Op())
+				call, ok := stmt.Call.(*ir.CallExpr)
+				if !ok {
+					return fmt.Errorf("non-call go statement")
+				}
+				goCalls[call] = true
+			case *ir.BlockStmt:
+				if err := collectStatements(stmt.List); err != nil {
+					return err
+				}
+			case *ir.IfStmt:
+				if err := collectStatements(stmt.Body); err != nil {
+					return err
+				}
+				if err := collectStatements(stmt.Else); err != nil {
+					return err
+				}
+			case *ir.ForStmt:
+				if stmt.Label != nil {
+					return fmt.Errorf("labeled for loop")
+				}
+				if stmt.Post != nil {
+					if err := collectStatements(ir.Nodes{stmt.Post}); err != nil {
+						return err
+					}
+				}
+				if err := collectStatements(stmt.Body); err != nil {
+					return err
+				}
+			case *ir.ReturnStmt:
+				if len(stmt.Results) != 0 && len(stmt.Results) != sig.NumResults() {
+					return fmt.Errorf("return has %d results, want %d",
+						len(stmt.Results), sig.NumResults())
+				}
+			default:
+				switch stmt.Op() {
+				case ir.OBREAK, ir.OCONTINUE, ir.OFALL, ir.OGOTO,
+					ir.OLABEL, ir.OSELECT:
+					return fmt.Errorf("control flow %v", stmt.Op())
+				}
 			}
 		}
+		return nil
+	}
+	if err := collectStatements(fn.Body); err != nil {
+		return nil, err
 	}
 
 	edges := make(map[*ir.CallExpr]Edge)
@@ -242,11 +279,11 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 		}
 		switch site.Kind {
 		case SiteYield, SiteTimer, SiteFile, SitePoll:
-			if !topCalls[call] {
+			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested %s site %d", site.Kind, site.ID)
 			}
 		case SiteAwait:
-			if !topCalls[call] {
+			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
@@ -268,7 +305,7 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 				site.Foreign != AsyncOperation {
 				return nil, fmt.Errorf("unsupported foreign site %s", site.Foreign)
 			}
-			if site.Foreign != DirectNoBlock && !topCalls[call] {
+			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested %s foreign site %d",
 					site.Foreign, site.ID)
 			}
@@ -348,37 +385,6 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		}
 	}
 
-	states := []lowerState{{}}
-	for i, stmt := range fn.Body {
-		if call := transitionCall(stmt, candidate.transitions); call != nil {
-			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
-				state := &states[len(states)-1]
-				state.transition = candidate.transitions[call]
-				state.call = call
-				state.statement = stmt
-				states = append(states, lowerState{})
-				continue
-			}
-		}
-		switch stmt := stmt.(type) {
-		case *ir.Decl:
-			addDeclaration(stmt)
-			continue
-		case *ir.ReturnStmt:
-			if i == len(fn.Body)-1 {
-				for j, value := range stmt.Results {
-					result, _ := fn.Type().Result(j).Nname.(*ir.Name)
-					states[len(states)-1].body = append(
-						states[len(states)-1].body,
-						ir.NewAssignStmt(stmt.Pos(), result, value))
-				}
-				continue
-			}
-		}
-		states[len(states)-1].body = append(states[len(states)-1].body, stmt)
-	}
-
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, pc))
 
@@ -405,6 +411,143 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		return closure
 	}
 	resumePC := capture(pc)
+
+	states := []lowerState{{
+		next:      -1,
+		thenState: -1,
+		elseState: -1,
+		complete:  true,
+	}}
+	addState := func(state lowerState) int {
+		stateIndex := len(states)
+		states = append(states, state)
+		return stateIndex
+	}
+	newBodyState := func(body ir.Nodes, next int) int {
+		filtered := make(ir.Nodes, 0, len(body))
+		for _, stmt := range body {
+			if decl, ok := stmt.(*ir.Decl); ok {
+				addDeclaration(decl)
+				continue
+			}
+			filtered = append(filtered, stmt)
+		}
+		if len(filtered) == 0 {
+			return next
+		}
+		return addState(lowerState{
+			body:      filtered,
+			next:      next,
+			thenState: -1,
+			elseState: -1,
+		})
+	}
+	requiresControlLowering := func(node ir.Node) bool {
+		required := false
+		ir.Visit(node, func(node ir.Node) {
+			if required {
+				return
+			}
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			if candidate.transitions[call] != SiteInvalid ||
+				candidate.foreignCalls[call] != NotForeign {
+				required = true
+			}
+		})
+		return required
+	}
+	isBoundary := func(stmt ir.Node) bool {
+		switch stmt := stmt.(type) {
+		case *ir.ReturnStmt:
+			return true
+		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt:
+			return requiresControlLowering(stmt)
+		}
+		if call := transitionCall(stmt, candidate.transitions); call != nil {
+			switch candidate.transitions[call] {
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
+				return true
+			}
+		}
+		return false
+	}
+
+	var lowerStatements func(ir.Nodes, int) int
+	var lowerStatement func(ir.Node, int) int
+	lowerStatements = func(list ir.Nodes, next int) int {
+		end := len(list)
+		for i := len(list) - 1; i >= 0; i-- {
+			if !isBoundary(list[i]) {
+				continue
+			}
+			next = newBodyState(list[i+1:end], next)
+			next = lowerStatement(list[i], next)
+			end = i
+		}
+		return newBodyState(list[:end], next)
+	}
+	lowerStatement = func(stmt ir.Node, next int) int {
+		switch stmt := stmt.(type) {
+		case *ir.ReturnStmt:
+			body := make(ir.Nodes, 0, len(stmt.Results))
+			for i, value := range stmt.Results {
+				result, _ := fn.Type().Result(i).Nname.(*ir.Name)
+				body = append(body, ir.NewAssignStmt(stmt.Pos(), result, value))
+			}
+			entry := newBodyState(body, 0)
+			return lowerStatements(stmt.Init(), entry)
+
+		case *ir.BlockStmt:
+			entry := lowerStatements(stmt.List, next)
+			return lowerStatements(stmt.Init(), entry)
+
+		case *ir.IfStmt:
+			thenState := lowerStatements(stmt.Body, next)
+			elseState := lowerStatements(stmt.Else, next)
+			branch := addState(lowerState{
+				condition: stmt.Cond,
+				next:      -1,
+				thenState: thenState,
+				elseState: elseState,
+			})
+			return lowerStatements(stmt.Init(), branch)
+
+		case *ir.ForStmt:
+			conditionState := addState(lowerState{
+				condition: stmt.Cond,
+				next:      -1,
+				thenState: -1,
+				elseState: next,
+			})
+			postState := conditionState
+			if stmt.Post != nil {
+				postState = lowerStatements(ir.Nodes{stmt.Post}, conditionState)
+			}
+			bodyState := lowerStatements(stmt.Body, postState)
+			states[conditionState].thenState = bodyState
+			return lowerStatements(stmt.Init(), conditionState)
+		}
+		if call := transitionCall(stmt, candidate.transitions); call != nil {
+			switch candidate.transitions[call] {
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
+				return addState(lowerState{
+					transition: candidate.transitions[call],
+					call:       call,
+					statement:  stmt,
+					next:       next,
+					thenState:  -1,
+					elseState:  -1,
+				})
+			}
+		}
+		panic(fmt.Sprintf("unexpected coroutine lowering boundary %s", stmt.Op()))
+	}
+	entryState := lowerStatements(fn.Body, 0)
+	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
+		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
 	var edit func(ir.Node) ir.Node
 	factoryCall := func(call *ir.CallExpr, statement ir.Node) (ir.Node, error) {
@@ -463,25 +606,17 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
 		for _, stmt := range state.body {
-			if call, ok := stmt.(*ir.CallExpr); ok &&
-				candidate.foreignCalls[call] == DirectMayBlock {
-				body = append(body,
-					typecheck.Call(call.Pos(),
-						typecheck.LookupRuntime("coroEnterBlocking"),
-						nil, false),
-					edit(call),
-					typecheck.Call(call.Pos(),
-						typecheck.LookupRuntime("coroExitBlocking"),
-						nil, false),
-				)
-				continue
-			}
-			direct := false
+			foreign := NotForeign
 			ir.Visit(stmt, func(node ir.Node) {
 				call, ok := node.(*ir.CallExpr)
-				if ok && candidate.foreignCalls[call] == DirectNoBlock {
-					direct = true
+				if !ok || candidate.foreignCalls[call] == NotForeign {
+					return
 				}
+				if foreign != NotForeign && foreign != candidate.foreignCalls[call] {
+					foreign = AsyncOperation
+					return
+				}
+				foreign = candidate.foreignCalls[call]
 			})
 			if goStmt, ok := stmt.(*ir.GoDeferStmt); ok {
 				if call, ok := goStmt.Call.(*ir.CallExpr); ok &&
@@ -497,7 +632,10 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 				}
 			}
 			edited := edit(stmt)
-			if direct {
+			switch foreign {
+			case NotForeign:
+				body = append(body, edited)
+			case DirectNoBlock:
 				body = append(body,
 					typecheck.Call(stmt.Pos(),
 						typecheck.LookupRuntime("coroEnterForeign"),
@@ -507,15 +645,39 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 						typecheck.LookupRuntime("coroExitForeign"),
 						nil, false),
 				)
-			} else {
-				body = append(body, edited)
+			case DirectMayBlock:
+				body = append(body,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroEnterBlocking"),
+						nil, false),
+					edited,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroExitBlocking"),
+						nil, false),
+				)
+			default:
+				return fmt.Errorf("%s: multiple foreign calls in one statement",
+					ir.PkgFuncName(fn))
 			}
 		}
 
-		action := actionComplete
-		if i+1 < len(states) {
-			next := typedInt(pos, types.Types[types.TUINT32], int64(i+1))
+		if state.complete {
+			for j, value := range candidate.resultValues {
+				pointer := capture(candidate.resultPtrs[j])
+				body = append(body, ir.NewAssignStmt(pos,
+					ir.NewStarExpr(pos, pointer), capture(value)))
+			}
+			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
+				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
+			}))
+		} else if state.transition != SiteInvalid {
+			if state.next < 0 {
+				return fmt.Errorf("%s: state %d transition has no continuation",
+					ir.PkgFuncName(fn), i)
+			}
+			next := typedInt(pos, types.Types[types.TUINT32], int64(state.next))
 			body = append(body, ir.NewAssignStmt(pos, resumePC, next))
+			action := actionInvalid
 			switch state.transition {
 			case SiteYield:
 				action = actionYield
@@ -645,25 +807,45 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 				return fmt.Errorf("%s: state %d has no transition",
 					ir.PkgFuncName(fn), i)
 			}
-		} else {
-			for j, value := range candidate.resultValues {
-				pointer := capture(candidate.resultPtrs[j])
-				body = append(body, ir.NewAssignStmt(pos,
-					ir.NewStarExpr(pos, pointer), capture(value)))
+			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
+				typedInt(pos, types.Types[types.TUINT8], int64(action)),
+			}))
+		} else if state.thenState >= 0 {
+			thenPC := ir.NewAssignStmt(pos, resumePC,
+				typedInt(pos, types.Types[types.TUINT32], int64(state.thenState)))
+			if state.condition == nil {
+				body = append(body, thenPC)
+			} else {
+				if state.elseState < 0 {
+					return fmt.Errorf("%s: state %d branch has no false continuation",
+						ir.PkgFuncName(fn), i)
+				}
+				elsePC := ir.NewAssignStmt(pos, resumePC,
+					typedInt(pos, types.Types[types.TUINT32], int64(state.elseState)))
+				body = append(body, ir.NewIfStmt(pos, edit(state.condition),
+					ir.Nodes{thenPC}, ir.Nodes{elsePC}))
 			}
+			body = append(body, ir.NewBranchStmt(pos, ir.OCONTINUE, nil))
+		} else if state.next >= 0 {
+			body = append(body,
+				ir.NewAssignStmt(pos, resumePC,
+					typedInt(pos, types.Types[types.TUINT32], int64(state.next))),
+				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
+			)
+		} else {
+			return fmt.Errorf("%s: state %d has no terminator",
+				ir.PkgFuncName(fn), i)
 		}
-		body = append(body, ir.NewReturnStmt(pos, []ir.Node{
-			typedInt(pos, types.Types[types.TUINT8], int64(action)),
-		}))
 		label := typedInt(pos, types.Types[types.TUINT32], int64(i))
 		cases[i] = ir.NewCaseStmt(pos, []ir.Node{label}, body)
 	}
-	resume.Body = []ir.Node{
-		ir.NewSwitchStmt(pos, resumePC, cases),
+	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
+	resume.Body = []ir.Node{ir.NewForStmt(pos, nil, nil, nil, []ir.Node{
+		dispatch,
 		ir.NewReturnStmt(pos, []ir.Node{
 			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)),
 		}),
-	}
+	}, false)}
 
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = resume
