@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"internal/testenv"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -150,6 +152,178 @@ func TestPreLowerHandoff(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
 		}
+	}
+}
+
+func emitBasicLLVM(t *testing.T) (module, output string) {
+	t.Helper()
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	module = filepath.Join(tmp, "basic.ll")
+	src := filepath.Join(testenv.GOROOT(t), "src", "cmd", "compile", "internal", "coro", "testdata", "basic.go")
+	cmd := testenv.Command(t, testenv.GoToolPath(t),
+		"tool", "compile", "-l", "-p=basic",
+		"-d=corobasic="+module,
+		"-o", filepath.Join(tmp, "basic.o"), src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=coro")
+	data, err := cmd.CombinedOutput()
+	output = string(data)
+	if err != nil {
+		t.Fatalf("compile failed: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"coro: phase=pre-lower-ssa func=leaf,",
+		" action=emit-basic-llvm path=" + module,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("compiler output does not contain %q\n%s", want, output)
+		}
+	}
+	return module, output
+}
+
+func TestBasicLLVMEmission(t *testing.T) {
+	module, _ := emitBasicLLVM(t)
+	data, err := os.ReadFile(module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"define ptr @leaf(i64 %x) presplitcoroutine",
+		"call i8 @llvm.coro.suspend(token %save, i1 false)",
+		"call i8 @llvm.coro.suspend(token none, i1 true)",
+		"%answer.ok = icmp eq i64 %result.second, 43",
+		"call void @llvm.coro.destroy(ptr %hdl)",
+		"%destroyed.ok = icmp eq i64 %destroyed.value, 1",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("LLVM module does not contain %q", want)
+		}
+	}
+	if strings.Contains(text, "{{") {
+		t.Errorf("LLVM module contains an unreplaced template marker")
+	}
+}
+
+func llvmTool(t *testing.T, env string, names ...string) string {
+	t.Helper()
+	if path := os.Getenv(env); path != "" {
+		return path
+	}
+	for _, name := range names {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	t.Skipf("LLVM execution test requires one of %s (or %s)", strings.Join(names, ", "), env)
+	return ""
+}
+
+func TestBasicLLVMExecution(t *testing.T) {
+	module, _ := emitBasicLLVM(t)
+	opt := llvmTool(t, "LLVM_OPT", "opt", "opt-20", "opt-19", "opt-18")
+	clang := llvmTool(t, "LLVM_CLANG", "clang", "clang-20", "clang-19", "clang-18")
+
+	tmp := filepath.Dir(module)
+	split := filepath.Join(tmp, "basic.split.ll")
+	cmd := testenv.Command(t, opt, "-S",
+		"-passes=coro-early,coro-split,coro-cleanup,verify",
+		module, "-o", split)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("LLVM coroutine lowering failed: %v\n%s", err, data)
+	}
+	data, err := os.ReadFile(split)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"@leaf.resume", "@leaf.destroy", "%leaf.Frame = type"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("split LLVM module does not contain %q", want)
+		}
+	}
+
+	exe := filepath.Join(tmp, "basic-coro")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	cmd = testenv.Command(t, clang, "-O1", split, "-o", exe)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("linking LLVM coroutine example failed: %v\n%s", err, data)
+	}
+	cmd = testenv.Command(t, exe)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("LLVM coroutine example failed: %v\n%s", err, data)
+	} else if got, want := strings.TrimSpace(string(data)), "coro-basic-ok"; got != want {
+		t.Fatalf("LLVM coroutine example output = %q, want %q", got, want)
+	}
+}
+
+func TestBasicLLVMRejectsUnsupportedShape(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "bad.go")
+	program := `package bad
+
+var suspend = make(chan struct{})
+var before, after int64
+
+//go:noinline
+func yieldOnce() {
+	<-suspend
+}
+
+//go:noinline
+func leaf(x int64) int64 {
+	before++
+	yieldOnce()
+	yieldOnce()
+	after++
+	return x + 3
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	module := filepath.Join(tmp, "bad.ll")
+	cmd := testenv.Command(t, testenv.GoToolPath(t),
+		"tool", "compile", "-l", "-p=bad",
+		"-d=corobasic="+module,
+		"-o", filepath.Join(tmp, "bad.o"), src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=coro")
+	data, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("unsupported coroutine shape unexpectedly compiled\n%s", data)
+	}
+	if want := "basic LLVM coroutine: found 2 yieldOnce calls, want exactly 1"; !strings.Contains(string(data), want) {
+		t.Fatalf("compiler output does not contain %q\n%s", want, data)
+	}
+	if _, err := os.Stat(module); !os.IsNotExist(err) {
+		t.Fatalf("unsupported coroutine emitted module: stat error %v", err)
+	}
+}
+
+func TestBasicLLVMExperimentGate(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "p.go")
+	if err := os.WriteFile(src, []byte("package p\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	cmd := testenv.Command(t, testenv.GoToolPath(t),
+		"tool", "compile",
+		"-d=corobasic="+filepath.Join(tmp, "p.ll"),
+		"-o", filepath.Join(tmp, "p.o"), src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=nocoro")
+	data, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("compile unexpectedly succeeded\n%s", data)
+	}
+	if want := "-d=corobasic requires GOEXPERIMENT=coro"; !strings.Contains(string(data), want) {
+		t.Fatalf("compiler output does not contain %q\n%s", want, data)
 	}
 }
 

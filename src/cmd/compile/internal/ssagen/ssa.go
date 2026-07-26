@@ -592,13 +592,25 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	s.insertPhis()
 
 	// Main call to ssa package to compile function.
-	if buildcfg.Experiment.Coro && base.Debug.Coro > 2 {
+	if buildcfg.Experiment.Coro && (base.Debug.Coro > 2 || base.Debug.CoroBasic != "") {
 		handled := ssa.CompileWithLoweringHook(s.f, func(f *ssa.Func) bool {
-			coro.DumpPreLowerSSA(os.Stderr, f)
+			if base.Debug.Coro > 2 {
+				coro.DumpPreLowerSSA(os.Stderr, f)
+			}
+			if base.Debug.CoroBasic != "" {
+				matched, err := coro.WriteBasicLLVM(base.Debug.CoroBasic, f)
+				if err != nil {
+					s.Fatalf("basic LLVM coroutine: %v", err)
+				}
+				if matched {
+					fmt.Fprintf(os.Stderr, "coro: phase=pre-lower-ssa func=%s action=emit-basic-llvm path=%s\n",
+						f.NameABI(), base.Debug.CoroBasic)
+				}
+			}
 			return false
 		})
 		if handled {
-			s.Fatalf("report-only coroutine backend unexpectedly handled %s", s.f.Name)
+			s.Fatalf("side-artifact coroutine backend unexpectedly handled %s", s.f.Name)
 		}
 	} else {
 		ssa.Compile(s.f)

@@ -1,6 +1,7 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
-状态：架构设计稿；已完成 Phase 0 前端与 pre-lower handoff PoC，尚未接入 LLVM emitter
+状态：架构设计稿；已完成 Phase 0、pre-lower handoff 与受限可执行 LLVM coroutine
+basic example，尚未接入 Go object/linker 的正式 LLVM backend
 
 更新时间：2026-07-26
 
@@ -55,6 +56,9 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
 - 增加 `ssa.CompileWithLoweringHook`：在 generic SSA pass 完成、首个 target `lower`
   前调用可替代 backend；hook 声明 handled 时 native lowering 不再运行。当前
   `-d=coro=3` consumer 只报告 blocks/values 并继续 native backend。
+- 增加 `-d=corobasic=<file.ll>` 的窄纵向例子：从同一个 pre-lower hook 验证固定
+  scalar SSA recipe，生成可独立执行的 LLVM coroutine module；Go 函数本身仍继续
+  native lowering，这个输出不是 Go object。
 
 截至 2026-07-26 的实测结果如下：
 
@@ -67,6 +71,7 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
 | 三包 summary round trip、mixed archive negative、native executable smoke | 通过 |
 | 本机 LLVM 19.1.7 上 LLGo `go test ./ssa -run TestCoro` | 通过 |
 | 实验模式完整 `go test cmd/compile/...` | 通过 |
+| basic module 的 pre/post-CoroSplit verify、link、suspend/resume/destroy | 通过 |
 
 初版 PoC 曾直接把 provisional `MaySuspend` 复用为 `Noinline`/call-site `NoInline`。
 这使开放函数值、interface call 或缺 summary 的 bodyless call 保守染色后阻止正常
@@ -77,13 +82,15 @@ caller 的 channel seed。删除提前 barrier 并增加 inlining compatibility 
 candidate set 和明确的 plan ownership 增加窄 barrier，不能恢复按 unknown effect
 全局禁止内联的做法。
 
-这个 PoC 只验证了 Phase 0 的一部分，不满足第 19 节 executable vertical slice 的
-go/no-go 条件。它尚未实现：
+这个 PoC 已验证 Phase 0 和第 19 节中“pre-lower SSA 能进入 LLVM”以及“LLVM
+coroutine 能真实 suspend/resume/destroy”的窄 basic case，但仍不满足完整
+executable vertical slice 的 go/no-go 条件。它尚未实现：
 
 - stable FunctionID、SiteID、summary digest、primary ABI、FuncRep、Demand 或 SitePlan；
 - compiler-owned `YieldOnce`/`Await` semantic op；
 - alternate backend 从 ssagen 到 object/link 的完整 ownership handoff；
-- LLVM IR emitter、CoroSplit、scheduler、frame、真实 suspend/resume/destroy；
+- 通用 LLVM IR emitter、Go object/link ownership、scheduler/runtime 和跨包
+  coroutine codegen；
 - coroutine ABI、GC/debug metadata 或标准库/runtime 兼容。
 
 对 Go `master` 的代码路径复核确认：`ssagen.buildssa` 建立 generic SSA 后立即调用
@@ -92,11 +99,69 @@ regalloc。PoC 为第一个 `lower` pass 增加显式 boundary marker 和窄
 `CompileWithLoweringHook` API；单元测试验证 hook 看到 generic `Add64`、尚未 schedule
 或 regalloc，并验证 continue-native 后该 op 已 lowering。默认 `Compile` 仍走原路径。
 
-这只回答“能否在正确时点交出 generic SSA”。当前 ssagen consumer 为 report-only，
-若 hook 返回 handled 会主动报错，因为 `ssagen.Compile` 后续仍假设 native
-`AllocFrame`、`genssa` 和 object emission。下一个 vertical slice 需要把 handled
-结果提升为明确的 backend ownership，并由 LLVM emitter 提供 object、symbol 与
-linker 所需产物；不能在最终机器 SSA 后反译 LLVM。
+handoff 回答了“能否在正确时点交出 generic SSA”；basic example 进一步证明这个
+输入能生成并运行 LLVM switched-resume coroutine。当前 ssagen consumer 仍是
+side-artifact 模式，若 hook 返回 handled 会主动报错，因为 `ssagen.Compile` 后续仍
+假设 native `AllocFrame`、`genssa` 和 object emission。下一个 vertical slice 需要把
+handled 结果提升为明确的 backend ownership，并由 LLVM emitter 提供 object、symbol
+与 linker 所需产物；不能在最终机器 SSA 后反译 LLVM。
+
+### 1.2 可执行 basic LLVM 纵向例子
+
+固定输入位于 `cmd/compile/internal/coro/testdata/basic.go`。它只包含一个 `int64`
+参数、一次 suspend、一个跨 suspend 使用的 scalar result，以及 suspend 前后的两个
+全局自增。pre-lower recognizer 只接受以下闭合 recipe：
+
+```text
+single Ret block
+  InitMem
+  before = load(before) + 1
+  StaticCall(yieldOnce)
+  after = load(after) + 1
+  result = int64 argument + constant
+  MakeResult(result, memory)
+```
+
+当前 `yieldOnce` 通过私有 testdata 中的精确 link-symbol suffix 识别。这是为了把
+SSA handoff 到 LLVM execution 的机械路径压缩到最小而采用的临时限制，不是第 8、9
+节所要求的最终 SiteID/typed semantic op。任何额外 block、第二次 marker call、
+其他 call/load/store 或不匹配的 memory chain 都 fail closed。
+
+生成模块包含一个 `presplitcoroutine` 的 `leaf` 和一个独立 `main` driver。driver
+逐项验证：
+
+1. 首次调用停在 initial suspend，`before == 1`、`after == 0`、result 尚未发布，
+   且 `coro.done == false`。
+2. 调用 `coro.resume` 后到达 final suspend，`before` 仍为 1、`after == 1`、
+   `leaf(40) == 43`，且 `coro.done == true`。
+3. 调用 `coro.destroy`，确认 destroy cleanup marker 已写入并释放 frame，最后输出
+   `coro-basic-ok`。
+
+本机验证使用 LLVM 19.1.7：
+
+```text
+GOEXPERIMENT=coro ./bin/go tool compile -l -p=basic \
+  -d=corobasic=/tmp/basic.ll -o /tmp/basic.o \
+  src/cmd/compile/internal/coro/testdata/basic.go
+
+opt -S -passes=coro-early,coro-split,coro-cleanup,verify \
+  /tmp/basic.ll -o /tmp/basic.split.ll
+clang -O1 /tmp/basic.split.ll -o /tmp/basic-coro
+/tmp/basic-coro
+```
+
+`TestBasicLLVMExecution` 固化了同一流程，并检查 split 后存在 `leaf.resume`、
+`leaf.destroy` 和 coroutine frame；Linux CI 显式安装 LLVM 后运行，不能以缺少工具
+为由跳过。`basic_llvm.go` 的 recognizer、negative branches、writer 和 renderer
+另有直接单元测试，文件内各函数 statement coverage 均为 100%。
+
+这个例子明确不做三件事：
+
+- `-d=corobasic` 不是影响 ABI 的主开关；主开关仍只有 `GOEXPERIMENT=coro`。
+- 生成的 `.ll` 是 standalone side artifact，原 Go function 仍由 native backend
+  生成 object。
+- driver 直接调用 resume/destroy，不代表 scheduler、Go runtime、跨包 coroutine
+  ABI 或 linker ownership 已经完成。
 
 ## 2. 结论
 
@@ -1304,7 +1369,9 @@ recover、Goexit 和 cancel 竞态。
 
 ## 18. 建议的第一步
 
-先只完成 Phase 0，不立即生成 LLVM coroutine。它能最低成本验证三个决定：
+Phase 0 已完成；第 1.2 节的 basic example 也已把单函数 scalar SSA 送入 LLVM 并
+实际运行。下一步仍不应扩大到 channel、panic、GC 或标准库，而应先把以下三个
+Phase 0 决定补齐成稳定 Program/SitePlan：
 
 1. Unified IR 是否保留了当前 `llvm-coro` 分支分析所需的全部语义。
 2. 两阶段染色是否能与官方内联、wrapper、逃逸顺序稳定共存。
@@ -1324,15 +1391,31 @@ PrimaryKind
 SummaryDigest
 ```
 
-当它与 `llvm-coro` 现有规则在 direct/defer/go、递归、动态调用和抢占 corpus 上一致后，
-再开始 Phase 1 的 LLVM backend vertical slice。这样可以先验证自动染色和包边界，
-避免把分析错误、LLVM lowering 和 runtime 生命周期问题同时引入。
+当它与 `llvm-coro` 现有规则在 direct/defer/go、递归、动态调用和抢占 corpus 上一致
+后，再把已通过的 standalone basic emitter 提升为 Phase 1 的 backend ownership、
+object/link 和三包 direct-call vertical slice。这样仍能把自动染色、包边界、LLVM
+lowering 和 runtime 生命周期分层验证。
 
 ## 19. 最小可行性验证范围
 
 Phase 0 只能证明分析和跨包数据可接入，不能证明官方 compiler 到 LLVM coroutine 的
 物理路径可行。建议用一个严格 timebox 的 executable vertical slice 作为最终
 go/no-go 验证。
+
+当前完成度应明确区分：
+
+| 能力 | 当前状态 |
+| --- | --- |
+| 默认关闭 experiment、native compiler gate | 已验证 |
+| 跨包 effect summary 与 mixed archive fail-closed | 已验证 |
+| generic SSA 在 target lower 前 handoff | 已验证 |
+| 单函数 scalar SSA 生成 standalone LLVM coroutine | 已验证 |
+| initial/final suspend、resume、done、result、destroy | 已在 LLVM 19.1.7 执行验证 |
+| typed `YieldOnce`/SiteID、三包 coroutine primary/await | 未实现 |
+| Go object、linker ownership、reentry scheduler/runtime | 未实现 |
+
+因此 basic example 已窄化回答第 19.1 节的第 4、5 个问题，但不能替代第 19.4 节的
+完整验收；尤其不能把 standalone `main` driver 当成 Go linker/runtime 已接通。
 
 ### 19.1 必须回答的问题
 

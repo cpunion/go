@@ -88,6 +88,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	if base.Debug.Coro != 0 && !buildcfg.Experiment.Coro {
 		base.Fatalf("-d=coro requires GOEXPERIMENT=coro")
 	}
+	if base.Debug.CoroBasic != "" && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=corobasic requires GOEXPERIMENT=coro")
+	}
 
 	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
 		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap

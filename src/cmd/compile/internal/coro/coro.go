@@ -11,8 +11,9 @@
 //
 // The current experiment exports the analysis result. Its provisional result
 // observes the program before inlining, but does not constrain the inliner
-// until a coroutine ABI and stable site plan consume that constraint. It does
-// not yet change the native backend or generate LLVM coroutine operations.
+// until a coroutine ABI and stable site plan consume that constraint. A
+// restricted vertical-slice example can emit a standalone LLVM coroutine
+// module, but normal compilation still continues through the native backend.
 package coro
 
 import (
