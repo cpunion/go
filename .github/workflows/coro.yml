@@ -3,7 +3,7 @@ name: Coroutine compiler
 on:
   pull_request:
     branches:
-      - main
+      - coro/main
   push:
     branches:
       - main
