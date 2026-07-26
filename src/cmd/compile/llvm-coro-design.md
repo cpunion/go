@@ -1,6 +1,6 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
-状态：架构设计稿；已完成 Phase 0 前端 PoC，尚未接入 LLVM backend
+状态：架构设计稿；已完成 Phase 0 前端与 pre-lower handoff PoC，尚未接入 LLVM emitter
 
 更新时间：2026-07-26
 
@@ -52,6 +52,9 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
   最终程序仍由官方 native backend 构建并运行。
 - provisional result 用于观察内联前的 effect 和 call edge；final analysis 对内联后
   IR 重新染色。Phase 0 尚未改变 ABI，也没有冻结 SitePlan，因此不提前限制正常内联。
+- 增加 `ssa.CompileWithLoweringHook`：在 generic SSA pass 完成、首个 target `lower`
+  前调用可替代 backend；hook 声明 handled 时 native lowering 不再运行。当前
+  `-d=coro=3` consumer 只报告 blocks/values 并继续 native backend。
 
 截至 2026-07-26 的实测结果如下：
 
@@ -60,7 +63,7 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
 | 默认 `make.bash` / `all.bash` | 通过 |
 | 默认 `go test cmd/compile/...` | 通过 |
 | `GOEXPERIMENT=coro make.bash`，工具链版本含 `X:coro` | 通过 |
-| 实验模式 `coro`、`pkgbits`、`buildcfg`、`noder` 聚焦测试 | 通过 |
+| 实验模式 `coro`、`ssa`、`pkgbits`、`buildcfg`、`noder` 聚焦测试 | 通过 |
 | 三包 summary round trip、mixed archive negative、native executable smoke | 通过 |
 | 本机 LLVM 19.1.7 上 LLGo `go test ./ssa -run TestCoro` | 通过 |
 | 实验模式完整 `go test cmd/compile/...` | 通过 |
@@ -79,16 +82,21 @@ go/no-go 条件。它尚未实现：
 
 - stable FunctionID、SiteID、summary digest、primary ABI、FuncRep、Demand 或 SitePlan；
 - compiler-owned `YieldOnce`/`Await` semantic op；
-- generic SSA 的 pre-lower backend handoff；
+- alternate backend 从 ssagen 到 object/link 的完整 ownership handoff；
 - LLVM IR emitter、CoroSplit、scheduler、frame、真实 suspend/resume/destroy；
 - coroutine ABI、GC/debug metadata 或标准库/runtime 兼容。
 
-对 Go `master` 的代码路径复核还确认了一个具体集成点：`ssagen.buildssa` 建立 generic
-SSA 后立即调用 `ssa.Compile`，而 `ssa.Compile` 的静态 pass list 随后进入
-arch-specific `lower`、schedule 和 regalloc。当前没有可复用的 pre-lower backend
-接口。因此下一个 vertical slice 不能在最终机器 SSA 后反译 LLVM；应先把
-`ssa.Compile` 拆成机器无关优化与 native backend 两段，或增加等价的窄 backend
-handoff，再接入最小 LLVM emitter。
+对 Go `master` 的代码路径复核确认：`ssagen.buildssa` 建立 generic SSA 后立即调用
+`ssa.Compile`，而其静态 pass list 随后进入 arch-specific `lower`、schedule 和
+regalloc。PoC 为第一个 `lower` pass 增加显式 boundary marker 和窄
+`CompileWithLoweringHook` API；单元测试验证 hook 看到 generic `Add64`、尚未 schedule
+或 regalloc，并验证 continue-native 后该 op 已 lowering。默认 `Compile` 仍走原路径。
+
+这只回答“能否在正确时点交出 generic SSA”。当前 ssagen consumer 为 report-only，
+若 hook 返回 handled 会主动报错，因为 `ssagen.Compile` 后续仍假设 native
+`AllocFrame`、`genssa` 和 object emission。下一个 vertical slice 需要把 handled
+结果提升为明确的 backend ownership，并由 LLVM emitter 提供 object、symbol 与
+linker 所需产物；不能在最终机器 SSA 后反译 LLVM。
 
 ## 2. 结论
 

@@ -31,6 +31,24 @@ import (
 //   - the order of b.Values is the order to emit the Values in each Block
 //   - f has a non-nil regAlloc field
 func Compile(f *Func) {
+	compile(f, nil)
+}
+
+// LoweringHook is called after all machine-independent SSA passes and
+// immediately before the first target lowering pass. If the hook returns
+// handled=true, the native SSA pipeline stops before lowering and the caller
+// becomes responsible for consuming f.
+type LoweringHook func(f *Func) (handled bool)
+
+// CompileWithLoweringHook is like Compile, but offers f to hook immediately
+// before target lowering. It returns handled=true if hook consumed f. In that
+// case, f does not satisfy Compile's native postconditions and must not be
+// passed to the native assembler.
+func CompileWithLoweringHook(f *Func, hook LoweringHook) (handled bool) {
+	return compile(f, hook)
+}
+
+func compile(f *Func, hook LoweringHook) (handled bool) {
 	// TODO: debugging - set flags to control verbosity of compiler,
 	// which phases to dump IR before/after, etc.
 	if f.Log() {
@@ -71,6 +89,13 @@ func Compile(f *Func) {
 	}
 	const logMemStats = false
 	for _, p := range passes {
+		if p.loweringStart && hook != nil {
+			phaseName = "lowering handoff"
+			if hook(f) {
+				handled = true
+				break
+			}
+		}
 		if !f.Config.optimize && !p.required || p.disabled {
 			continue
 		}
@@ -165,6 +190,7 @@ func Compile(f *Func) {
 
 	// Squash error printing defer
 	phaseName = ""
+	return handled
 }
 
 // DumpFileForPhase creates a file from the function name and phase name,
@@ -205,14 +231,16 @@ type pass struct {
 	fn       func(*Func)
 	required bool
 	disabled bool
-	time     bool             // report time to run pass
-	mem      bool             // report mem stats to run pass
-	stats    int              // pass reports own "stats" (e.g., branches removed)
-	debug    int              // pass performs some debugging. =1 should be in error-testing-friendly Warnl format.
-	test     int              // pass-specific ad-hoc option, perhaps useful in development
-	dump     map[string]bool  // dump if function name matches
-	keywords map[string]int64 // ad hoc parameters, typically for experiments/tuning
-	usedKW   map[string]bool  // if a keyword is supplied to a phase, note that it was used.
+	// loweringStart marks the first target-specific lowering pass.
+	loweringStart bool
+	time          bool             // report time to run pass
+	mem           bool             // report mem stats to run pass
+	stats         int              // pass reports own "stats" (e.g., branches removed)
+	debug         int              // pass performs some debugging. =1 should be in error-testing-friendly Warnl format.
+	test          int              // pass-specific ad-hoc option, perhaps useful in development
+	dump          map[string]bool  // dump if function name matches
+	keywords      map[string]int64 // ad hoc parameters, typically for experiments/tuning
+	usedKW        map[string]bool  // if a keyword is supplied to a phase, note that it was used.
 }
 
 func (p *pass) addDump(s string) {
@@ -523,7 +551,7 @@ var passes = [...]pass{
 		disabled: !buildcfg.Experiment.PreemptibleLoops}, // insert resched checks in loops.
 	{name: "cpufeatures", fn: cpufeatures, required: buildcfg.Experiment.SIMD, disabled: !buildcfg.Experiment.SIMD},
 	{name: "rewrite tern", fn: rewriteTern, required: false, disabled: !buildcfg.Experiment.SIMD},
-	{name: "lower", fn: lower, required: true},
+	{name: "lower", fn: lower, required: true, loweringStart: true},
 	{name: "addressing modes", fn: addressingModes, required: false},
 	{name: "late lower", fn: lateLower, required: true},
 	{name: "pair", fn: pair},
@@ -659,6 +687,16 @@ func PostCompile() {
 }
 
 func init() {
+	loweringStarts := 0
+	for _, p := range passes {
+		if p.loweringStart {
+			loweringStarts++
+		}
+	}
+	if loweringStarts != 1 {
+		log.Panicf("expected exactly one SSA lowering boundary, found %d", loweringStarts)
+	}
+
 	for _, c := range passOrder {
 		a, b := c.a, c.b
 		i := -1

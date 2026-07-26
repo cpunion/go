@@ -5,6 +5,7 @@
 package coro_test
 
 import (
+	"fmt"
 	"internal/testenv"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func launchedDynamic(f func()) {
 }
 `
 
-func compile(t *testing.T, experiment string, debug bool) (string, error) {
+func compile(t *testing.T, experiment string, debug int) (string, error) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
 
@@ -79,8 +80,8 @@ func compile(t *testing.T, experiment string, debug bool) (string, error) {
 	}
 
 	args := []string{"tool", "compile", "-l", "-p=p", "-o", filepath.Join(tmp, "p.o")}
-	if debug {
-		args = append(args, "-d=coro=1")
+	if debug != 0 {
+		args = append(args, fmt.Sprintf("-d=coro=%d", debug))
 	}
 	args = append(args, src)
 
@@ -91,7 +92,7 @@ func compile(t *testing.T, experiment string, debug bool) (string, error) {
 }
 
 func TestAnalysis(t *testing.T) {
-	out, err := compile(t, "coro", true)
+	out, err := compile(t, "coro", 1)
 	if err != nil {
 		t.Fatalf("compile failed: %v\n%s", err, out)
 	}
@@ -120,7 +121,7 @@ func TestAnalysis(t *testing.T) {
 }
 
 func TestExperimentGate(t *testing.T) {
-	out, err := compile(t, "nocoro", true)
+	out, err := compile(t, "nocoro", 1)
 	if err == nil {
 		t.Fatalf("compile unexpectedly succeeded\n%s", out)
 	}
@@ -128,12 +129,27 @@ func TestExperimentGate(t *testing.T) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
-	out, err = compile(t, "nocoro", false)
+	out, err = compile(t, "nocoro", 0)
 	if err != nil {
 		t.Fatalf("compile without experiment failed: %v\n%s", err, out)
 	}
 	if strings.Contains(out, "coro:") {
 		t.Fatalf("disabled experiment produced analysis output\n%s", out)
+	}
+}
+
+func TestPreLowerHandoff(t *testing.T) {
+	out, err := compile(t, "coro", 3)
+	if err != nil {
+		t.Fatalf("compile failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"coro: phase=pre-lower-ssa func=",
+		" action=continue-native",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
 	}
 }
 

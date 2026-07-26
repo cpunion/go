@@ -17,10 +17,12 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/ssa"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // Effect describes whether a function may suspend its caller.
@@ -52,6 +54,8 @@ const SummaryVersion uint64 = 1
 // compilation state and do not require synchronization.
 var summaries = make(map[*ir.Func]Effect)
 
+var dumpMu sync.Mutex
+
 // SetSummary records a function effect read from Unified IR export data.
 func SetSummary(fn *ir.Func, effect Effect) {
 	if fn != nil {
@@ -63,6 +67,21 @@ func SetSummary(fn *ir.Func, effect Effect) {
 func Summary(fn *ir.Func) (Effect, bool) {
 	effect, ok := summaries[fn]
 	return effect, ok
+}
+
+// DumpPreLowerSSA reports the SSA shape presented at the target lowering
+// boundary. The report-only PoC always continues into the native backend.
+func DumpPreLowerSSA(w io.Writer, f *ssa.Func) {
+	values := 0
+	for _, block := range f.Blocks {
+		values += len(block.Values)
+	}
+
+	// Backend compilation is parallel, so keep each diagnostic line intact.
+	dumpMu.Lock()
+	defer dumpMu.Unlock()
+	fmt.Fprintf(w, "coro: phase=pre-lower-ssa func=%s blocks=%d values=%d action=continue-native\n",
+		f.NameABI(), len(f.Blocks), values)
 }
 
 // EdgeKind describes how a call is executed.
