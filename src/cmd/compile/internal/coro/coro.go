@@ -12,7 +12,7 @@
 // The current experiment exports the analysis result. Its provisional result
 // observes the program before inlining, but does not constrain the inliner
 // until a coroutine ABI and stable site plan consume that constraint. It does
-// not yet change the native backend or generate LLVM coroutine operations.
+// not yet change the native backend or generate coroutine state machines.
 package coro
 
 import (
@@ -48,25 +48,25 @@ func (e Effect) String() string {
 
 // SummaryVersion is the version of the coroutine function summary stored in
 // the compiler-private Unified IR extension.
-const SummaryVersion uint64 = 1
+const SummaryVersion uint64 = 2
 
 // The compiler processes one package per process, so summaries are package
 // compilation state and do not require synchronization.
-var summaries = make(map[*ir.Func]Effect)
+var summaries = make(map[*ir.Func]FuncSummary)
 
 var dumpMu sync.Mutex
 
-// SetSummary records a function effect read from Unified IR export data.
-func SetSummary(fn *ir.Func, effect Effect) {
+// SetSummary records a function summary read from Unified IR export data.
+func SetSummary(fn *ir.Func, summary FuncSummary) {
 	if fn != nil {
-		summaries[fn] = effect
+		summaries[fn] = summary
 	}
 }
 
-// Summary returns the recorded cross-package effect for fn.
-func Summary(fn *ir.Func) (Effect, bool) {
-	effect, ok := summaries[fn]
-	return effect, ok
+// Summary returns the recorded cross-package summary for fn.
+func Summary(fn *ir.Func) (FuncSummary, bool) {
+	summary, ok := summaries[fn]
+	return summary, ok
 }
 
 // DumpPreLowerSSA reports the SSA shape presented at the target lowering
@@ -114,6 +114,8 @@ const (
 	ChannelReceive
 	ChannelSelect
 	ChannelRange
+	SchedulerYield
+	TimerWait
 	UnknownCall
 )
 
@@ -127,6 +129,10 @@ func (s Seed) String() string {
 		return "channel-select"
 	case ChannelRange:
 		return "channel-range"
+	case SchedulerYield:
+		return "scheduler-yield"
+	case TimerWait:
+		return "timer-wait"
 	case UnknownCall:
 		return "unknown-call"
 	default:
@@ -140,8 +146,10 @@ type Edge struct {
 	Kind       EdgeKind
 	Callee     *ir.Func
 	CalleeName string
-	Imported   Effect
+	Imported   FuncSummary
 	Unknown    bool
+	Recipe     OperationRecipe
+	Node       *ir.CallExpr
 }
 
 // Function is the coroutine analysis result for one function.
@@ -149,9 +157,13 @@ type Function struct {
 	Func      *ir.Func
 	Local     Effect
 	Effect    Effect
+	LocalExec ExecFlags
+	Exec      ExecFlags
+	Primary   PrimaryKind
 	Recursive bool
 	Seeds     []Seed
 	Edges     []Edge
+	Sites     []Site
 }
 
 // Plan is the result of analyzing one package.
@@ -163,7 +175,7 @@ type Plan struct {
 // Unified IR export writer.
 func (p *Plan) PublishSummaries() {
 	for fn, function := range p.Functions {
-		SetSummary(fn, function.Effect)
+		SetSummary(fn, FuncSummary{Effect: function.Effect, Exec: function.Exec})
 	}
 }
 
@@ -183,23 +195,43 @@ func Analyze(funcs []*ir.Func) *Plan {
 				function.Recursive = recursive
 			}
 		}
+	})
 
-		// A component can contain mutually recursive functions and closures.
-		// Iterate to a fixed point so effects flow across every cycle.
-		for changed := true; changed; {
-			changed = false
-			for _, fn := range funcs {
-				function := p.Functions[fn]
-				if function == nil || function.Effect == MaySuspend {
-					continue
-				}
-				if function.Local == MaySuspend || p.callsSuspending(function) {
-					function.Effect = MaySuspend
-					changed = true
-				}
+	// Some compiler-generated closures are package functions but are not
+	// reachable from VisitFuncsBottomUp roots. Iterate over the complete
+	// package plan so effects and execution flags also reach those functions.
+	for changed := true; changed; {
+		changed = false
+		for _, function := range p.Functions {
+			if function.Effect != MaySuspend &&
+				(function.Local == MaySuspend || p.callsSuspending(function)) {
+				function.Effect = MaySuspend
+				changed = true
+			}
+			exec := function.LocalExec | p.calledExec(function)
+			if exec != function.Exec {
+				function.Exec = exec
+				changed = true
 			}
 		}
-	})
+	}
+
+	for _, function := range p.Functions {
+		function.Primary = (FuncSummary{
+			Effect: function.Effect,
+			Exec:   function.Exec,
+		}).Primary()
+		for _, edge := range function.Edges {
+			if edge.Kind != GoCall && edge.Recipe.Kind == SiteInvalid &&
+				p.edgeMaySuspend(edge) {
+				function.Sites = append(function.Sites, Site{
+					ID:   SiteID(len(function.Sites) + 1),
+					Kind: SiteAwait,
+					Node: edge.Node,
+				})
+			}
+		}
+	}
 
 	return p
 }
@@ -224,21 +256,33 @@ func (p *Plan) scan(function *Function) {
 			function.Seeds = append(function.Seeds, seed)
 		}
 	}
+	addSite := func(kind SiteKind, node ir.Node, foreign ForeignCallClass) {
+		function.Sites = append(function.Sites, Site{
+			ID:      SiteID(len(function.Sites) + 1),
+			Kind:    kind,
+			Node:    node,
+			Foreign: foreign,
+		})
+	}
 
 	ir.Visit(function.Func, func(n ir.Node) {
 		switch n.Op() {
 		case ir.OSEND:
 			addSeed(ChannelSend)
+			addSite(SiteChannel, n, NotForeign)
 		case ir.ORECV:
 			addSeed(ChannelReceive)
+			addSite(SiteChannel, n, NotForeign)
 		case ir.OSELECT:
 			// This is intentionally conservative for the PoC: a select with
 			// a default case does not block, but treating it as a seed is safe.
 			addSeed(ChannelSelect)
+			addSite(SiteChannel, n, NotForeign)
 		case ir.ORANGE:
 			n := n.(*ir.RangeStmt)
 			if n.X != nil && n.X.Type() != nil && n.X.Type().IsChan() {
 				addSeed(ChannelRange)
+				addSite(SiteChannel, n, NotForeign)
 			}
 		}
 
@@ -257,7 +301,7 @@ func (p *Plan) scan(function *Function) {
 			kind = goDeferKind
 		}
 
-		edge := Edge{Kind: kind}
+		edge := Edge{Kind: kind, Node: call}
 		if call.Op() == ir.OCALLFUNC {
 			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
 				edge.Callee = name.Func
@@ -274,6 +318,26 @@ func (p *Plan) scan(function *Function) {
 		} else {
 			edge.CalleeName = "<interface>"
 			edge.Unknown = true
+		}
+		if recipe, ok := operationRecipe(edge.Callee); ok {
+			edge.Recipe = recipe
+			edge.Imported = FuncSummary{Effect: recipe.Effect, Exec: recipe.Exec}
+			edge.Unknown = false
+			function.LocalExec |= recipe.Exec
+			if recipe.Effect == MaySuspend && kind != GoCall {
+				switch recipe.Kind {
+				case SiteYield:
+					addSeed(SchedulerYield)
+				case SiteTimer:
+					addSeed(TimerWait)
+				}
+			}
+			if kind != GoCall {
+				addSite(recipe.Kind, call, recipe.Foreign)
+			}
+		}
+		if kind == GoCall {
+			addSite(SiteSpawn, call, edge.Recipe.Foreign)
 		}
 		function.Edges = append(function.Edges, edge)
 		if edge.Unknown && kind != GoCall {
@@ -301,7 +365,22 @@ func (p *Plan) edgeMaySuspend(edge Edge) bool {
 	if callee := p.Functions[edge.Callee]; callee != nil {
 		return callee.Effect == MaySuspend
 	}
-	return edge.Imported == MaySuspend
+	return edge.Imported.Effect == MaySuspend
+}
+
+func (p *Plan) calledExec(function *Function) ExecFlags {
+	var flags ExecFlags
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			continue
+		}
+		if callee := p.Functions[edge.Callee]; callee != nil {
+			flags |= callee.Exec
+		} else if !edge.Unknown {
+			flags |= edge.Imported.Exec
+		}
+	}
+	return flags
 }
 
 func symbolName(name *ir.Name) string {
@@ -334,9 +413,14 @@ func (p *Plan) Dump(w io.Writer) {
 		if len(seeds) == 0 {
 			seeds = append(seeds, "-")
 		}
-		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t seeds=%s\n",
+		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t seeds=%s primary=%s exec=%s\n",
 			ir.PkgFuncName(function.Func), function.Effect, function.Local,
-			function.Recursive, strings.Join(seeds, ","))
+			function.Recursive, strings.Join(seeds, ","), function.Primary, function.Exec)
+
+		for _, site := range function.Sites {
+			fmt.Fprintf(w, "coro: site=%d func=%s kind=%s foreign=%s\n",
+				site.ID, ir.PkgFuncName(function.Func), site.Kind, site.Foreign)
+		}
 
 		edges := slices.Clone(function.Edges)
 		slices.SortFunc(edges, func(a, b Edge) int {
@@ -360,5 +444,5 @@ func (p *Plan) edgeEffect(edge Edge) Effect {
 	if callee := p.Functions[edge.Callee]; callee != nil {
 		return callee.Effect
 	}
-	return edge.Imported
+	return edge.Imported.Effect
 }

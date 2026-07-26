@@ -296,6 +296,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
 		plan := coro.Analyze(typecheck.Target.Funcs)
+		if err := plan.Verify(); err != nil {
+			base.Fatalf("invalid coroutine plan: %v", err)
+		}
 		if base.Debug.Coro != 0 {
 			fmt.Fprintln(os.Stderr, "coro: phase=final")
 			plan.Dump(os.Stderr)

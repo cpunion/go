@@ -1265,11 +1265,12 @@ func (r *reader) funcExt(name *ir.Name, method *types.Sym) {
 		switch version := r.Uint64(); version {
 		case 0:
 		case coro.SummaryVersion:
-			effect := coro.NoSuspend
-			if r.Bool() {
-				effect = coro.MaySuspend
+			effect := coro.Effect(r.Uint64())
+			if effect != coro.NoSuspend && effect != coro.MaySuspend {
+				base.FatalfAt(fn.Pos(), "invalid coroutine effect %d for %v", effect, name)
 			}
-			coro.SetSummary(fn, effect)
+			exec := coro.ExecFlags(r.Uint64())
+			coro.SetSummary(fn, coro.FuncSummary{Effect: effect, Exec: exec})
 		default:
 			base.FatalfAt(fn.Pos(), "unsupported coroutine summary version %d for %v", version, name)
 		}

@@ -308,9 +308,10 @@ func (l *linker) relocFuncExt(w *pkgbits.Encoder, name *ir.Name) {
 	}
 
 	if w.Version().Has(pkgbits.CoroFuncSummary) {
-		if effect, ok := coro.Summary(name.Func); ok {
+		if summary, ok := coro.Summary(name.Func); ok {
 			w.Uint64(coro.SummaryVersion)
-			w.Bool(effect == coro.MaySuspend)
+			w.Uint64(uint64(summary.Effect))
+			w.Uint64(uint64(summary.Exec))
 		} else {
 			w.Uint64(0)
 		}

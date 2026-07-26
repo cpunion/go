@@ -15,6 +15,11 @@ import (
 
 const testProgram = `package p
 
+import (
+	"runtime"
+	"time"
+)
+
 var ch chan int
 
 func leaf() {
@@ -67,6 +72,18 @@ func dynamic(f func()) {
 func launchedDynamic(f func()) {
 	go f()
 }
+
+func yielding() {
+	runtime.Gosched()
+}
+
+func yieldCaller() {
+	yielding()
+}
+
+func sleeping() {
+	time.Sleep(0)
+}
 `
 
 func compile(t *testing.T, experiment string, debug int) (string, error) {
@@ -79,7 +96,23 @@ func compile(t *testing.T, experiment string, debug int) (string, error) {
 		t.Fatal(err)
 	}
 
-	args := []string{"tool", "compile", "-l", "-p=p", "-o", filepath.Join(tmp, "p.o")}
+	importcfg := filepath.Join(tmp, "importcfg")
+	list := testenv.Command(t, testenv.GoToolPath(t), "list", "-export",
+		"-f=packagefile {{.ImportPath}}={{.Export}}", "runtime", "time")
+	list.Env = append(list.Environ(),
+		"GOEXPERIMENT="+experiment,
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+	)
+	data, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("listing imports failed: %v\n%s", err, data)
+	}
+	if err := os.WriteFile(importcfg, data, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{"tool", "compile", "-l", "-p=p", "-importcfg=" + importcfg,
+		"-o", filepath.Join(tmp, "p.o")}
 	if debug != 0 {
 		args = append(args, fmt.Sprintf("-d=coro=%d", debug))
 	}
@@ -109,6 +142,12 @@ func TestAnalysis(t *testing.T) {
 		"coro: func=p.selecting effect=may-suspend local=may-suspend recursive=false seeds=channel-receive,channel-select",
 		"coro: func=p.dynamic effect=may-suspend local=may-suspend recursive=false seeds=unknown-call",
 		"coro: func=p.launchedDynamic effect=nosuspend local=nosuspend recursive=false seeds=-",
+		"coro: func=p.yielding effect=may-suspend local=may-suspend recursive=false seeds=scheduler-yield primary=coro",
+		"coro: func=p.yieldCaller effect=may-suspend local=nosuspend recursive=false seeds=- primary=coro",
+		"coro: func=p.sleeping effect=may-suspend local=may-suspend recursive=false seeds=timer-wait primary=coro",
+		"coro: site=1 func=p.yielding kind=yield foreign=-",
+		"coro: site=1 func=p.yieldCaller kind=await foreign=-",
+		"coro: site=1 func=p.sleeping kind=timer foreign=-",
 		"coro: edge=direct caller=p.direct callee=p.leaf unknown=false",
 		"coro: edge=defer caller=p.deferred callee=p.leaf unknown=false",
 		"coro: edge=go caller=p.launched callee=p.leaf unknown=false",
