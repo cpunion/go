@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/bloop"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/coverage"
 	"cmd/compile/internal/deadlocals"
 	"cmd/compile/internal/dwarfgen"
@@ -84,6 +85,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	base.DebugSSA = ssa.PhaseOption
 	base.ParseFlags()
+	if base.Debug.Coro != 0 && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=coro requires GOEXPERIMENT=coro")
+	}
 
 	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
 		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap
@@ -254,9 +258,23 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Apply bloop markings.
 	bloop.Walk(typecheck.Target)
 
+	var restoreCoroPragmas func()
+	if buildcfg.Experiment.Coro {
+		base.Timer.Start("fe", "coro-provisional")
+		plan := coro.Analyze(typecheck.Target.Funcs)
+		if base.Debug.Coro > 1 {
+			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
+			plan.Dump(os.Stderr)
+		}
+		restoreCoroPragmas = plan.DisallowInlining()
+	}
+
 	// Interleaved devirtualization and inlining.
 	base.Timer.Start("fe", "devirtualize-and-inline")
 	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
+	if restoreCoroPragmas != nil {
+		restoreCoroPragmas()
+	}
 
 	for _, fn := range typecheck.Target.Funcs {
 		if ir.MatchAstDump(fn, "devirtualize-and-inline") {
@@ -279,6 +297,16 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Generate ABI wrappers. Must happen before escape analysis
 	// and doesn't benefit from dead-coding or inlining.
 	symABIs.GenABIWrappers()
+
+	if buildcfg.Experiment.Coro {
+		base.Timer.Start("fe", "coro")
+		plan := coro.Analyze(typecheck.Target.Funcs)
+		if base.Debug.Coro != 0 {
+			fmt.Fprintln(os.Stderr, "coro: phase=final")
+			plan.Dump(os.Stderr)
+		}
+		plan.PublishSummaries()
+	}
 
 	deadlocals.Funcs(typecheck.Target.Funcs)
 

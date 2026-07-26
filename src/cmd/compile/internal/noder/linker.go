@@ -10,6 +10,7 @@ import (
 	"io"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/types"
@@ -303,6 +304,15 @@ func (l *linker) relocFuncExt(w *pkgbits.Encoder, name *ir.Name) {
 		w.Bool(inl.CanDelayResults)
 		if buildcfg.Experiment.NewInliner {
 			w.String(inl.Properties)
+		}
+	}
+
+	if w.Version().Has(pkgbits.CoroFuncSummary) {
+		if effect, ok := coro.Summary(name.Func); ok {
+			w.Uint64(coro.SummaryVersion)
+			w.Bool(effect == coro.MaySuspend)
+		} else {
+			w.Uint64(0)
 		}
 	}
 
