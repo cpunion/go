@@ -258,7 +258,6 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Apply bloop markings.
 	bloop.Walk(typecheck.Target)
 
-	var restoreCoroPragmas func()
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
 		plan := coro.Analyze(typecheck.Target.Funcs)
@@ -266,15 +265,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
 			plan.Dump(os.Stderr)
 		}
-		restoreCoroPragmas = plan.DisallowInlining()
 	}
 
 	// Interleaved devirtualization and inlining.
 	base.Timer.Start("fe", "devirtualize-and-inline")
 	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
-	if restoreCoroPragmas != nil {
-		restoreCoroPragmas()
-	}
 
 	for _, fn := range typecheck.Target.Funcs {
 		if ir.MatchAstDump(fn, "devirtualize-and-inline") {

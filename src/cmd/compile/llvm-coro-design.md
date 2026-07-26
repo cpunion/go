@@ -50,8 +50,8 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
   archive 会被拒绝。
 - 增加三包 `leaf -> mid -> root` 测试，证明 effect 经过真实 package archive 传播，
   最终程序仍由官方 native backend 构建并运行。
-- provisional result 暂时复用现有 `Noinline`/call-site `NoInline` 机制，不在通用
-  inliner 中散布 coroutine policy。
+- provisional result 用于观察内联前的 effect 和 call edge；final analysis 对内联后
+  IR 重新染色。Phase 0 尚未改变 ABI，也没有冻结 SitePlan，因此不提前限制正常内联。
 
 截至 2026-07-26 的实测结果如下：
 
@@ -63,14 +63,16 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
 | 实验模式 `coro`、`pkgbits`、`buildcfg`、`noder` 聚焦测试 | 通过 |
 | 三包 summary round trip、mixed archive negative、native executable smoke | 通过 |
 | 本机 LLVM 19.1.7 上 LLGo `go test ./ssa -run TestCoro` | 通过 |
-| 实验模式完整 `go test cmd/compile/...` | 未通过：保守 unknown/dynamic effect 改变现有 inliner golden |
+| 实验模式完整 `go test cmd/compile/...` | 通过 |
 
-最后一项不是 archive 版本混用：使用带 `X:coro` 的完整实验工具链后，嵌套 `go`
-调用的版本问题已经消失。剩余失败集中在 `cmd/compile/internal/inline/inlheur` 和
-`cmd/compile/internal/test`；当前 fail-closed 策略会把开放的函数值、interface call
-或缺 summary 的 bodyless call 视为 `MaySuspend`，继而禁止原本预期发生的内联。进入
-Phase 1 前必须增加 FuncRep/candidate-set 闭合，或定义更细的 unknown boundary
-contract，不能简单把这些 golden 改成接受全局退化。
+初版 PoC 曾直接把 provisional `MaySuspend` 复用为 `Noinline`/call-site `NoInline`。
+这使开放函数值、interface call 或缺 summary 的 bodyless call 保守染色后阻止正常
+内联，导致现有 inliner golden 失配。它不是 Phase 0 的正确约束：当前没有 coroutine
+ABI 或稳定 SitePlan 消费这些 barrier，final analysis 又能在内联后重新发现被复制到
+caller 的 channel seed。删除提前 barrier 并增加 inlining compatibility test 后，
+完整实验 compiler suite 通过。Phase 1 真正改变 ABI 时，应基于稳定 SiteID、已闭合
+candidate set 和明确的 plan ownership 增加窄 barrier，不能恢复按 unknown effect
+全局禁止内联的做法。
 
 这个 PoC 只验证了 Phase 0 的一部分，不满足第 19 节 executable vertical slice 的
 go/no-go 条件。它尚未实现：

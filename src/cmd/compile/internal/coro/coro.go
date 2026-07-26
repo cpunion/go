@@ -9,9 +9,10 @@
 // suspension seeds. The effect propagates through ordinary calls and defer,
 // but not from the target of a go statement back to its caller.
 //
-// The current experiment exports the analysis result and uses a provisional
-// result to constrain inlining. It does not yet change the native backend or
-// generate LLVM coroutine operations.
+// The current experiment exports the analysis result. Its provisional result
+// observes the program before inlining, but does not constrain the inliner
+// until a coroutine ABI and stable site plan consume that constraint. It does
+// not yet change the native backend or generate LLVM coroutine operations.
 package coro
 
 import (
@@ -118,7 +119,6 @@ func (s Seed) String() string {
 // call. Unknown is true when the callee has no effect summary in this package.
 type Edge struct {
 	Kind       EdgeKind
-	Call       *ir.CallExpr
 	Callee     *ir.Func
 	CalleeName string
 	Imported   Effect
@@ -138,37 +138,6 @@ type Function struct {
 // Plan is the result of analyzing one package.
 type Plan struct {
 	Functions map[*ir.Func]*Function
-}
-
-// DisallowInlining temporarily marks every suspending function as not
-// inlinable. It returns a function that restores the original pragma bits.
-//
-// This reuses the inliner's existing eligibility mechanism without making the
-// coroutine experiment part of its core policy. The final analysis must run
-// after restore.
-func (p *Plan) DisallowInlining() func() {
-	var changedFuncs []*ir.Func
-	var changedCalls []*ir.CallExpr
-	for _, function := range p.Functions {
-		if function.Effect == MaySuspend && function.Func.Pragma&ir.Noinline == 0 {
-			function.Func.Pragma |= ir.Noinline
-			changedFuncs = append(changedFuncs, function.Func)
-		}
-		for _, edge := range function.Edges {
-			if edge.Kind == DirectCall && edge.Call != nil && !edge.Call.NoInline && p.edgeMaySuspend(edge) {
-				edge.Call.NoInline = true
-				changedCalls = append(changedCalls, edge.Call)
-			}
-		}
-	}
-	return func() {
-		for _, fn := range changedFuncs {
-			fn.Pragma &^= ir.Noinline
-		}
-		for _, call := range changedCalls {
-			call.NoInline = false
-		}
-	}
 }
 
 // PublishSummaries makes this package's final effects available to the
@@ -269,7 +238,7 @@ func (p *Plan) scan(function *Function) {
 			kind = goDeferKind
 		}
 
-		edge := Edge{Kind: kind, Call: call}
+		edge := Edge{Kind: kind}
 		if call.Op() == ir.OCALLFUNC {
 			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
 				edge.Callee = name.Func

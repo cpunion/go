@@ -78,7 +78,7 @@ func compile(t *testing.T, experiment string, debug bool) (string, error) {
 		t.Fatal(err)
 	}
 
-	args := []string{"tool", "compile", "-p=p", "-o", filepath.Join(tmp, "p.o")}
+	args := []string{"tool", "compile", "-l", "-p=p", "-o", filepath.Join(tmp, "p.o")}
 	if debug {
 		args = append(args, "-d=coro=1")
 	}
@@ -134,6 +134,49 @@ func TestExperimentGate(t *testing.T) {
 	}
 	if strings.Contains(out, "coro:") {
 		t.Fatalf("disabled experiment produced analysis output\n%s", out)
+	}
+}
+
+func TestInliningCompatibility(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "p.go")
+	program := `package p
+
+func leaf(ch chan int) {
+	ch <- 1
+}
+
+func caller(ch chan int) {
+	leaf(ch)
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t),
+		"tool", "compile", "-m=2", "-d=coro=2",
+		"-p=p", "-o", filepath.Join(tmp, "p.o"), src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=coro")
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("compile failed: %v\n%s", err, out)
+	}
+
+	for _, want := range []string{
+		"can inline leaf",
+		"inlining call to leaf",
+		"coro: phase=provisional",
+		"coro: func=p.caller effect=may-suspend local=nosuspend",
+		"coro: phase=final",
+		"coro: func=p.caller effect=may-suspend local=may-suspend recursive=false seeds=channel-send",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
 	}
 }
 
@@ -198,7 +241,7 @@ func main() {
 	exe := filepath.Join(tmp, "coropoc")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=example.com/coropoc/...=-d=coro=2", "./root")
+		"-gcflags=example.com/coropoc/...=-l -d=coro=2", "./root")
 	cmd.Dir = tmp
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
