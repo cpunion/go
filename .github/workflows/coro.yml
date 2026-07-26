@@ -62,15 +62,14 @@ jobs:
           GOEXPERIMENT: coro
         run: ./make.bash
 
-      - name: Test coroutine analysis and summaries
+      - name: Test coroutine compiler
         env:
           GOEXPERIMENT: coro
         run: >-
           ./bin/go test -count=1
-          cmd/compile/internal/coro
+          cmd/compile/...
           internal/pkgbits
           internal/buildcfg
-          cmd/compile/internal/noder
 
   native-full:
     name: Native all.bash (Linux)
