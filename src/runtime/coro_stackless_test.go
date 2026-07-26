@@ -142,6 +142,58 @@ func TestStacklessCoroSleep(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSleepCancel(t *testing.T) {
+	var state int
+	var id uint64
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			id = runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
+			if !runtime.CancelSleepStacklessCoroForTest(id) {
+				t.Fatal("canceling live timer failed")
+			}
+			if runtime.CancelSleepStacklessCoroForTest(id) {
+				t.Fatal("canceling stale timer succeeded")
+			}
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroSleepCancelRace(t *testing.T) {
+	const rounds = 100
+	for range rounds {
+		state := 0
+		cancelDone := make(chan struct{})
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				id := runtime.StartSleepStacklessCoroForTest(ctx, 0)
+				go func() {
+					runtime.CancelSleepStacklessCoroForTest(id)
+					close(cancelDone)
+				}()
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		<-cancelDone
+	}
+}
+
 func TestStacklessCoroOperationRegistry(t *testing.T) {
 	if !runtime.CheckStacklessCoroOperationRegistryForTest() {
 		t.Fatal("operation registry did not reject stale or duplicate completion")

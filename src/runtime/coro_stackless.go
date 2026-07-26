@@ -61,6 +61,7 @@ type stacklessCoroOperation struct {
 	errno     *uintptr
 	poll      bool
 	valueOut  *uint64
+	packet    [2]uint64
 	async     bool
 	next      *stacklessCoroOperation
 	workNext  *stacklessCoroOperation
@@ -166,6 +167,10 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 
 // coroSleep starts a timer operation for the current logical goroutine.
 func coroSleep(ctx unsafe.Pointer, ns int64) {
+	startStacklessCoroTimer(ctx, ns)
+}
+
+func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
 	s := (*stacklessCoroScheduler)(ctx)
 	task := s.startOperation("sleep")
 
@@ -183,6 +188,21 @@ func coroSleep(ctx unsafe.Pointer, ns int64) {
 		}
 	}
 	t.reset(when, 0)
+	return op.id
+}
+
+func cancelStacklessCoroTimer(id uint64) bool {
+	op := takeStacklessCoroOperation(id)
+	if op == nil {
+		return false
+	}
+	if op.timer == nil {
+		throw("runtime: canceled stackless coroutine operation is not a timer")
+	}
+	op.timer.stop()
+	op.timer = nil
+	op.scheduler.ready(op.task, true)
+	return true
 }
 
 //go:nosplit

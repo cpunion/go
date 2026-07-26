@@ -245,20 +245,19 @@ func stacklessCoroAsyncWorker(id uint64) {
 	if op == nil {
 		return
 	}
-	var packet [2]uint64
 	n, errno := stacklessCoroPollRead(op.fd,
-		unsafe.Pointer(&packet[0]), int32(unsafe.Sizeof(packet)))
+		unsafe.Pointer(&op.packet[0]), int32(unsafe.Sizeof(op.packet)))
 
 	op = takeStacklessCoroOperation(id)
 	if op == nil {
 		return
 	}
-	if n != int32(unsafe.Sizeof(packet)) || packet[0] != id {
+	if n != int32(unsafe.Sizeof(op.packet)) || op.packet[0] != id {
 		if errno == 0 {
 			errno = stacklessCoroBadCompletion
 		}
 	} else if op.valueOut != nil {
-		*op.valueOut = packet[1]
+		*op.valueOut = op.packet[1]
 	}
 	if op.errno != nil {
 		*op.errno = errno

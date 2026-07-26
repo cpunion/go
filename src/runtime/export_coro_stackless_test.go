@@ -31,6 +31,14 @@ func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) {
 	coroSleep(ctx, ns)
 }
 
+func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) uint64 {
+	return startStacklessCoroTimer(ctx, ns)
+}
+
+func CancelSleepStacklessCoroForTest(id uint64) bool {
+	return cancelStacklessCoroTimer(id)
+}
+
 func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	coroFileRead(ctx, fd, buffer, n, errno)
 }
