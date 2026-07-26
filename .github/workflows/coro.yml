@@ -1,0 +1,99 @@
+name: Coroutine compiler
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coro-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  focused:
+    name: Focused (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Build default toolchain
+        working-directory: src
+        run: ./make.bash
+
+      - name: Test default compiler
+        run: ./bin/go test -count=1 cmd/compile/... internal/pkgbits internal/buildcfg
+
+      - name: Build coroutine experiment toolchain
+        working-directory: src
+        env:
+          GOEXPERIMENT: coro
+        run: ./make.bash
+
+      - name: Test coroutine analysis and summaries
+        env:
+          GOEXPERIMENT: coro
+        run: >-
+          ./bin/go test -count=1
+          cmd/compile/internal/coro
+          internal/pkgbits
+          internal/buildcfg
+          cmd/compile/internal/noder
+
+  native-full:
+    name: Native all.bash (Linux)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Run native full test suite
+        working-directory: src
+        run: ./all.bash
