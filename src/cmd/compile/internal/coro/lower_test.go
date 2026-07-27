@@ -211,6 +211,52 @@ func TestLowerStateMachines(t *testing.T) {
 		newLowerTestReturn(),
 	}
 
+	cleanupParam := types.NewField(src.NoXPos, pkg.Lookup("value"),
+		types.Types[types.TINT])
+	cleanup := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("cleanup"),
+		types.NewSignature(nil, []*types.Field{cleanupParam}, nil))
+	cleanup.DeclareParams(true)
+	deferred := newLowerTestFunc(pkg, "deferred")
+	deferValue := deferred.NewLocal(src.NoXPos, pkg.Lookup("deferValue"),
+		types.Types[types.TINT])
+	deferDecl := ir.NewDecl(src.NoXPos, ir.ODCL, deferValue)
+	deferAssign := ir.NewAssignStmt(src.NoXPos, deferValue,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(42)))
+	deferAssign.Def = true
+	deferValue.Defn = deferAssign
+	deferWrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+		types.NewSignature(nil, nil, nil), deferred, typecheck.Target, 0)
+	deferWrapper.DeclareParams(true)
+	deferWrapper.SetWrapper(true)
+	deferWrapper.WrappedFunc = cleanup
+	deferCapture := ir.NewClosureVar(src.NoXPos, deferWrapper, deferValue)
+	deferCleanupCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		cleanup.Nname, ir.Nodes{deferCapture})
+	deferCleanupCall.SetTypecheck(1)
+	deferWrapper.Body = ir.Nodes{deferCleanupCall}
+	deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		deferWrapper.OClosure, nil)
+	deferCall.SetTypecheck(1)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	deferStmt.SetInit(ir.Nodes{deferAssign})
+	deferIf := ir.NewIfStmt(src.NoXPos,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(true)),
+		ir.Nodes{deferStmt}, nil)
+	deferIf.SetTypecheck(1)
+	cleanupNoArgs := newLowerTestFunc(pkg, "cleanupNoArgs")
+	deferNoArgsCall := newLowerTestCall(cleanupNoArgs)
+	deferNoArgsStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER,
+		deferNoArgsCall)
+	deferNoArgsStmt.SetTypecheck(1)
+	deferredYield := newLowerTestCall(yield)
+	deferred.Body = ir.Nodes{
+		deferDecl, deferIf, deferNoArgsStmt, deferredYield,
+		newLowerTestReturn(),
+	}
+
 	functions := map[*ir.Func]*Function{
 		child: {
 			Func:    child,
@@ -334,13 +380,37 @@ func TestLowerStateMachines(t *testing.T) {
 				{ID: 3, Kind: SiteTimer, Node: structuredTimer},
 			},
 		},
+		deferred: {
+			Func:    deferred,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{
+				{
+					Kind: DeferCall, Callee: deferWrapper,
+					CalleeName: symbolName(deferWrapper.Nname), Node: deferCall,
+				},
+				{
+					Kind: DeferCall, Callee: cleanupNoArgs,
+					CalleeName: symbolName(cleanupNoArgs.Nname),
+					Node:       deferNoArgsCall,
+				},
+			},
+			Sites: []Site{{
+				ID: 1, Kind: SiteYield, Node: deferredYield,
+			}},
+		},
+		deferWrapper: {
+			Func:    deferWrapper,
+			Primary: PlainPrimary,
+		},
 	}
 	result, err := Lower(&Plan{Functions: functions})
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 11 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 11 lowered and 0 skipped", result)
+	if result.Lowered != 12 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 12 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -354,7 +424,7 @@ func TestLowerStateMachines(t *testing.T) {
 
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
-		ordinaryFileReader, asyncCaller, foreignCaller, structured,
+		ordinaryFileReader, asyncCaller, foreignCaller, structured, deferred,
 	} {
 		if len(fn.Body) != 2 {
 			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
@@ -476,7 +546,15 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 			body: func(call *ir.CallExpr) ir.Nodes {
 				return ir.Nodes{ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)}
 			},
-			want: "defer is not supported",
+			want: "suspending defer",
+		},
+		{
+			name: "non-call-defer",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewGoDeferStmt(src.NoXPos,
+					ir.ODEFER, call.Fun)}
+			},
+			want: "non-call go or defer statement",
 		},
 		{
 			name: "block",
@@ -527,6 +605,34 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 			want: "control flow break",
 		},
 		{
+			name: "defer-in-loop",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
+				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
+					nil, ir.Nodes{deferStmt}, false)}
+			},
+			want: "defer in loop",
+		},
+		{
+			name: "non-normalized-defer",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				call.Args = ir.Nodes{ir.NewBasicLit(src.NoXPos,
+					types.Types[types.TINT], constant.MakeInt64(1))}
+				return ir.Nodes{ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)}
+			},
+			want: "non-normalized defer call",
+		},
+		{
+			name: "defer-in-switch",
+			body: func(call *ir.CallExpr) ir.Nodes {
+				deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
+				clause := ir.NewCaseStmt(src.NoXPos, nil, ir.Nodes{deferStmt})
+				return ir.Nodes{ir.NewSwitchStmt(src.NoXPos, nil,
+					[]*ir.CaseClause{clause})}
+			},
+			want: "defer in unsupported control flow switch",
+		},
+		{
 			name: "return",
 			body: func(*ir.CallExpr) ir.Nodes {
 				return ir.Nodes{ir.NewReturnStmt(src.NoXPos, ir.Nodes{
@@ -543,12 +649,136 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 			fn := newLowerTestFunc(pkg, tc.name)
 			call := newLowerTestCall(yield)
 			fn.Body = tc.body(call)
-			_, err := newLowerCandidate(&Function{
+			function := &Function{
 				Func: fn,
 				Sites: []Site{{
 					ID: 1, Kind: SiteYield, Node: call,
 				}},
-			})
+			}
+			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+			_, err := newLowerCandidate(plan, function)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("newLowerCandidate error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLowerRejectsUnsupportedDefers(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowerdefer", "lowerdefer")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	tests := []struct {
+		name    string
+		edge    func(*ir.Func, *ir.CallExpr) []Edge
+		closure bool
+		want    string
+	}{
+		{
+			name: "missing-plan",
+			edge: func(*ir.Func, *ir.CallExpr) []Edge {
+				return nil
+			},
+			want: "defer has no static call plan",
+		},
+		{
+			name: "wrong-edge-kind",
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DirectCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname), Node: call,
+				}}
+			},
+			want: "defer has no static call plan",
+		},
+		{
+			name: "unknown-effect",
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DeferCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname), Unknown: true,
+					Node: call,
+				}}
+			},
+			want: "defer target has unknown effects",
+		},
+		{
+			name: "suspending",
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DeferCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname),
+					Imported:   FuncSummary{Effect: MaySuspend}, Node: call,
+				}}
+			},
+			want: "suspending defer",
+		},
+		{
+			name: "execution-constraint",
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DeferCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname),
+					Imported:   FuncSummary{Exec: NeedsPreempt}, Node: call,
+				}}
+			},
+			want: "defer target has execution constraints preempt",
+		},
+		{
+			name:    "closure",
+			closure: true,
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DeferCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname), Node: call,
+				}}
+			},
+			want: "defer target is not a fixed direct call",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			yield := newLowerTestFunc(pkg, tc.name+"Yield")
+			callee := newLowerTestFunc(pkg, tc.name+"Cleanup")
+			var fun ir.Node = callee.Nname
+			if tc.closure {
+				callee = ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+					ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+					newLowerTestFunc(pkg, tc.name+"Outer"),
+					typecheck.Target, 0)
+				callee.DeclareParams(true)
+				fun = callee.OClosure
+			}
+			deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, fun, nil)
+			deferCall.SetTypecheck(1)
+			deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+			deferStmt.SetTypecheck(1)
+			yieldCall := newLowerTestCall(yield)
+			fn := newLowerTestFunc(pkg, tc.name)
+			fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+			function := &Function{
+				Func:    fn,
+				Local:   MaySuspend,
+				Effect:  MaySuspend,
+				Primary: CoroPrimary,
+				Edges:   tc.edge(callee, deferCall),
+				Sites: []Site{{
+					ID: 1, Kind: SiteYield, Node: yieldCall,
+				}},
+			}
+			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+			_, err := newLowerCandidate(plan, function)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("newLowerCandidate error = %v, want %q", err, tc.want)
 			}

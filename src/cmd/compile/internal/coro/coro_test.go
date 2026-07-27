@@ -568,6 +568,121 @@ func main() {
 	}
 }
 
+func TestFixedDeferLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var trace [6]int
+var traceIndex int
+var evaluated int
+
+//go:noinline
+func argument(value int) int {
+	evaluated = evaluated*10 + value
+	return value
+}
+
+//go:noinline
+func record(value int) {
+	trace[traceIndex] = value
+	traceIndex++
+}
+
+//go:noinline
+func add(target *int, value int) {
+	*target += value
+}
+
+//go:noinline
+func fixed(cond bool) (result int) {
+	defer record(argument(1))
+	if cond {
+		defer record(argument(2))
+	}
+	runtime.Gosched()
+	defer record(argument(3))
+	runtime.Gosched()
+	defer add(&result, 2)
+	result = 40
+	return
+}
+
+//go:noinline
+func early() int {
+	defer record(argument(4))
+	runtime.Gosched()
+	return 7
+}
+
+func main() {
+	first := fixed(true)
+	second := fixed(false)
+	earlyResult := early()
+	if first != 42 || second != 42 || earlyResult != 7 ||
+		evaluated != 123134 || traceIndex != len(trace) ||
+		trace != [6]int{3, 2, 1, 3, 1, 4} {
+		panic("bad fixed defer result")
+	}
+	println("stackless-coro-defer-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-defer")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building fixed defer coroutine failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=3 skipped=0"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fixed defer coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-defer-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(fixed|early)\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of fixed defer resume functions failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, ".coro.func") {
+		t.Fatalf("objdump did not find fixed defer resume functions\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{"runtime.deferproc", "runtime.deferreturn"} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("fixed defer resume contains %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
 func TestDirectSystemABI(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	testenv.MustHaveCGO(t)

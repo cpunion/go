@@ -1,7 +1,8 @@
 # Native Stackless Coroutine Design
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
-`-d=coro=4`; not production-ready
+`-d=coro=4`; fixed direct defer normal-completion follow-up implemented; not
+production-ready
 
 Last updated: 2026-07-27
 
@@ -11,7 +12,7 @@ development branch
 Integration branch: `cpunion/go:coro/main`, which receives upstream updates
 from `main` and is the base for coroutine pull requests
 
-Topic branch: `coro/native-state-machine`
+Topic branch: `coro/fixed-defer`
 
 ## 1. Decision
 
@@ -762,15 +763,20 @@ These controls cannot rely on native stack unwinding across a suspension.
 Every frame eventually needs explicit cleanup states and a typed terminal
 outcome.
 
-The MVP initially supports normal return only and rejects a suspendable
-function containing unsupported defer, recover, Goexit, or panic edges. Later
-phases add:
+The first post-MVP cleanup slice supports fixed direct defer sites on normal
+completion. Encountering a defer evaluates its call operands immediately and
+arms one frame-owned site. Every return enters a shared completion state that
+invokes armed sites in reverse order before copying results to the caller.
+Conditional sites are supported, but a site cannot repeat in a loop.
 
-1. fixed direct defer sites;
-2. dynamic frame-owned defer records;
-3. panic propagation and recover;
-4. Goexit cleanup;
-5. implicit faults and complete standard-library behavior.
+The compiler rejects a suspending, dynamic, repeated, unknown-effect, or
+execution-constrained defer. Panic, recover, Goexit, and implicit faults still
+need a typed terminal outcome and cleanup protocol. The remaining phases are:
+
+1. dynamic frame-owned defer records;
+2. panic propagation and recover;
+3. Goexit cleanup;
+4. implicit faults and complete standard-library behavior.
 
 ### 11.2 Channels and synchronization
 
@@ -1256,19 +1262,21 @@ reported separately above.
 ### 15.4 Remaining restrictions
 
 The MVP does not yet support range loops, labeled control flow, dynamic calls,
-interfaces, escaping closures, defer, panic/recover, Goexit, implicit faults,
-channels, select, mutex parking, reflection, callbacks, variadic C calls, or
-general C ABI type classification. Direct foreign declarations are a fixed
-internal fixture rather than a user-facing cgo facility. Logical traceback,
-debugger, profiler, race instrumentation on native executor stacks, dynamic
-executor sizing, cancellation of in-flight file work, and broad standard
-library compatibility remain future work.
+interfaces, escaping closures, dynamic or repeated defer, panic/recover,
+Goexit, implicit faults, channels, select, mutex parking, reflection,
+callbacks, variadic C calls, or general C ABI type classification. Direct
+foreign declarations are a fixed internal fixture rather than a user-facing
+cgo facility. Logical traceback, debugger, profiler, race instrumentation on
+native executor stacks, dynamic executor sizing, cancellation of in-flight
+file work, and broad standard-library compatibility remain future work.
 
 ## 16. Work after the MVP
 
 The likely order is:
 
-1. complete panic, defer, recover, Goexit, and implicit fault lowering;
+1. complete panic, defer, recover, Goexit, and implicit fault lowering; the
+   fixed direct defer normal-completion slice is implemented, while typed
+   terminal outcomes and dynamic defer records remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
 4. let `cmd/cgo` emit typed fast-path metadata for safe declarations;

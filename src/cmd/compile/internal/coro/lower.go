@@ -34,11 +34,18 @@ type lowerCandidate struct {
 	transitions  map[*ir.CallExpr]SiteKind
 	foreignCalls map[*ir.CallExpr]ForeignCallClass
 	dependencies map[*ir.Func]bool
+	defers       []*lowerDefer
 	parameters   map[*ir.Name]*ir.Name
 	results      map[*ir.Name]*ir.Name
 	resultValues []*ir.Name
 	resultPtrs   []*ir.Name
 	factory      *ir.Func
+}
+
+type lowerDefer struct {
+	statement *ir.GoDeferStmt
+	call      *ir.CallExpr
+	armed     *ir.Name
 }
 
 type lowerState struct {
@@ -54,9 +61,9 @@ type lowerState struct {
 }
 
 // Lower rewrites supported coroutine primaries into explicit state machines.
-// The MVP lowering accepts closed calls, if statements, simple for loops,
-// normal returns, and the supported operation sites. Unsupported functions
-// remain unchanged.
+// The lowering accepts closed calls, if statements, simple for loops, normal
+// returns, fixed direct defers, and the supported operation sites. Unsupported
+// functions remain unchanged.
 func Lower(plan *Plan) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
@@ -75,7 +82,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if function.Primary != CoroPrimary {
 			continue
 		}
-		candidate, err := newLowerCandidate(function)
+		candidate, err := newLowerCandidate(plan, function)
 		if err != nil {
 			result.Diagnostics = append(result.Diagnostics,
 				fmt.Sprintf("%s: %v", ir.PkgFuncName(function.Func), err))
@@ -159,7 +166,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 	return result, nil
 }
 
-func newLowerCandidate(function *Function) (*lowerCandidate, error) {
+func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) {
 	fn := function.Func
 	if fn == nil || fn.OClosure != nil {
 		return nil, fmt.Errorf("not a top-level function")
@@ -180,11 +187,12 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 
 	statementCalls := make(map[*ir.CallExpr]bool)
 	goCalls := make(map[*ir.CallExpr]bool)
-	var collectStatements func(ir.Nodes) error
-	collectStatements = func(list ir.Nodes) error {
+	var defers []*lowerDefer
+	var collectStatements func(ir.Nodes, bool) error
+	collectStatements = func(list ir.Nodes, inLoop bool) error {
 		for _, stmt := range list {
 			if init := stmt.Init(); len(init) != 0 {
-				if err := collectStatements(init); err != nil {
+				if err := collectStatements(init, inLoop); err != nil {
 					return err
 				}
 			}
@@ -212,23 +220,36 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 					}
 				})
 			case *ir.GoDeferStmt:
-				if stmt.Op() != ir.OGO {
-					return fmt.Errorf("defer is not supported")
-				}
 				call, ok := stmt.Call.(*ir.CallExpr)
 				if !ok {
-					return fmt.Errorf("non-call go statement")
+					return fmt.Errorf("non-call go or defer statement")
+				}
+				if stmt.Op() == ir.ODEFER {
+					if inLoop {
+						return fmt.Errorf("defer in loop")
+					}
+					if call.Op() != ir.OCALLFUNC || call.Fun == nil ||
+						call.Fun.Type() == nil || len(call.Args) != 0 ||
+						call.Fun.Type().NumParams() != 0 ||
+						call.Fun.Type().NumResults() != 0 {
+						return fmt.Errorf("non-normalized defer call")
+					}
+					defers = append(defers, &lowerDefer{
+						statement: stmt,
+						call:      call,
+					})
+					continue
 				}
 				goCalls[call] = true
 			case *ir.BlockStmt:
-				if err := collectStatements(stmt.List); err != nil {
+				if err := collectStatements(stmt.List, inLoop); err != nil {
 					return err
 				}
 			case *ir.IfStmt:
-				if err := collectStatements(stmt.Body); err != nil {
+				if err := collectStatements(stmt.Body, inLoop); err != nil {
 					return err
 				}
-				if err := collectStatements(stmt.Else); err != nil {
+				if err := collectStatements(stmt.Else, inLoop); err != nil {
 					return err
 				}
 			case *ir.ForStmt:
@@ -236,11 +257,11 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 					return fmt.Errorf("labeled for loop")
 				}
 				if stmt.Post != nil {
-					if err := collectStatements(ir.Nodes{stmt.Post}); err != nil {
+					if err := collectStatements(ir.Nodes{stmt.Post}, true); err != nil {
 						return err
 					}
 				}
-				if err := collectStatements(stmt.Body); err != nil {
+				if err := collectStatements(stmt.Body, true); err != nil {
 					return err
 				}
 			case *ir.ReturnStmt:
@@ -249,6 +270,17 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 						len(stmt.Results), sig.NumResults())
 				}
 			default:
+				hasDefer := false
+				ir.Visit(stmt, func(node ir.Node) {
+					if deferStmt, ok := node.(*ir.GoDeferStmt); ok &&
+						deferStmt.Op() == ir.ODEFER {
+						hasDefer = true
+					}
+				})
+				if hasDefer {
+					return fmt.Errorf("defer in unsupported control flow %v",
+						stmt.Op())
+				}
 				switch stmt.Op() {
 				case ir.OBREAK, ir.OCONTINUE, ir.OFALL, ir.OGOTO,
 					ir.OLABEL, ir.OSELECT:
@@ -258,7 +290,7 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 		}
 		return nil
 	}
-	if err := collectStatements(fn.Body); err != nil {
+	if err := collectStatements(fn.Body, false); err != nil {
 		return nil, err
 	}
 
@@ -271,11 +303,17 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 		transitions:  make(map[*ir.CallExpr]SiteKind),
 		foreignCalls: make(map[*ir.CallExpr]ForeignCallClass),
 		dependencies: make(map[*ir.Func]bool),
+		defers:       defers,
 	}
 	for _, site := range function.Sites {
 		call, ok := site.Node.(*ir.CallExpr)
 		if !ok {
 			return nil, fmt.Errorf("non-call site %d", site.ID)
+		}
+		if slices.ContainsFunc(defers, func(deferred *lowerDefer) bool {
+			return deferred.call == call
+		}) {
+			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
 		case SiteYield, SiteTimer, SiteFile, SitePoll:
@@ -317,6 +355,30 @@ func newLowerCandidate(function *Function) (*lowerCandidate, error) {
 			return nil, fmt.Errorf("unsupported site %s", site.Kind)
 		}
 		candidate.transitions[call] = site.Kind
+	}
+	for _, deferred := range defers {
+		edge, ok := edges[deferred.call]
+		if !ok || edge.Kind != DeferCall || edge.Callee == nil {
+			return nil, fmt.Errorf("defer has no static call plan")
+		}
+		if edge.Unknown {
+			return nil, fmt.Errorf("defer target has unknown effects")
+		}
+		summary := edge.Imported
+		if callee := plan.Functions[edge.Callee]; callee != nil {
+			summary = FuncSummary{Effect: callee.Effect, Exec: callee.Exec}
+		}
+		if summary.Effect != NoSuspend {
+			return nil, fmt.Errorf("suspending defer")
+		}
+		if summary.Exec != 0 {
+			return nil, fmt.Errorf("defer target has execution constraints %s",
+				summary.Exec)
+		}
+		if edge.Callee.OClosure != nil &&
+			(!edge.Callee.Wrapper() || edge.Callee.WrappedFunc == nil) {
+			return nil, fmt.Errorf("defer target is not a fixed direct call")
+		}
 	}
 	return candidate, nil
 }
@@ -375,6 +437,15 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 	var declarations []ir.Node
 	for _, result := range candidate.resultValues {
 		declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, result))
+	}
+	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
+		len(candidate.defers))
+	for _, deferred := range candidate.defers {
+		deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
+			types.Types[types.TBOOL])
+		declarations = append(declarations,
+			ir.NewDecl(deferred.statement.Pos(), ir.ODCL, deferred.armed))
+		deferByStatement[deferred.statement] = deferred
 	}
 	declared := make(map[*ir.Name]bool)
 	addDeclaration := func(decl *ir.Decl) {
@@ -446,6 +517,11 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		required := false
 		ir.Visit(node, func(node ir.Node) {
 			if required {
+				return
+			}
+			if stmt, ok := node.(*ir.GoDeferStmt); ok &&
+				stmt.Op() == ir.ODEFER {
+				required = true
 				return
 			}
 			call, ok := node.(*ir.CallExpr)
@@ -601,11 +677,47 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		return node
 	}
 
+	// Go/defer normalization has already moved each deferred call into a
+	// parameterless wrapper and placed its argument evaluation in the defer
+	// statement's init list. Reparent those wrappers to the generated resume
+	// function and route their captures through the typed coroutine frame.
+	for _, deferred := range candidate.defers {
+		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
+		if !ok {
+			continue
+		}
+		closure.Func.ClosureParent = resume
+		for _, variable := range closure.Func.ClosureVars {
+			outer, ok := edit(variable.Outer).(*ir.Name)
+			if !ok {
+				return fmt.Errorf("%s: defer capture is not a variable",
+					ir.PkgFuncName(fn))
+			}
+			variable.Outer = outer
+		}
+	}
+
 	cases := make([]*ir.CaseClause, len(states))
 	var readAssignments []*ir.AssignListStmt
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
 		for _, stmt := range state.body {
+			if deferStmt, ok := stmt.(*ir.GoDeferStmt); ok &&
+				deferStmt.Op() == ir.ODEFER {
+				deferred := deferByStatement[deferStmt]
+				if deferred == nil {
+					return fmt.Errorf("%s: missing defer plan",
+						ir.PkgFuncName(fn))
+				}
+				for _, init := range deferStmt.Init() {
+					body = append(body, edit(init))
+				}
+				body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
+					capture(deferred.armed),
+					ir.NewBasicLit(deferStmt.Pos(), types.Types[types.TBOOL],
+						constant.MakeBool(true))))
+				continue
+			}
 			foreign := NotForeign
 			ir.Visit(stmt, func(node ir.Node) {
 				call, ok := node.(*ir.CallExpr)
@@ -662,6 +774,17 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		}
 
 		if state.complete {
+			for j := len(candidate.defers) - 1; j >= 0; j-- {
+				deferred := candidate.defers[j]
+				armed := capture(deferred.armed)
+				clear := ir.NewAssignStmt(deferred.statement.Pos(), armed,
+					ir.NewBasicLit(deferred.statement.Pos(),
+						types.Types[types.TBOOL], constant.MakeBool(false)))
+				call := typecheck.Call(deferred.call.Pos(),
+					edit(deferred.call.Fun), nil, false)
+				body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
+					armed, ir.Nodes{clear, call}, nil))
+			}
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
 				body = append(body, ir.NewAssignStmt(pos,
