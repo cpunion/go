@@ -71,8 +71,15 @@ func TestResumeFactorySupported(t *testing.T) {
 		types.NewStruct(nil))
 	method := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("M"),
 		types.NewSignature(recv, nil, nil))
-	if resumeFactorySupported(method) {
-		t.Fatal("method supports a resume factory")
+	method.DeclareParams(true)
+	if !resumeFactorySupported(method) {
+		t.Fatal("method does not support a resume factory")
+	}
+	methodFactory := resumeFactoryType(method)
+	if methodFactory.NumRecvs() != 0 || methodFactory.NumParams() != 1 ||
+		methodFactory.Param(0).Type != recv.Type {
+		t.Fatalf("method factory type = %v, want explicit receiver parameter",
+			methodFactory)
 	}
 	results := []*types.Field{
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
@@ -93,6 +100,91 @@ func TestResumeFactorySupported(t *testing.T) {
 		!strings.Contains(err.Error(), "generic shape") {
 		t.Fatalf("newLowerCandidate error = %v, want generic-shape rejection",
 			err)
+	}
+}
+
+func TestLowerMethodReceiver(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/methodreceiver", "methodreceiver")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+		types.NewSignature(nil, nil, nil))
+	yield.DeclareParams(true)
+
+	recv := types.NewField(src.NoXPos, pkg.Lookup("receiver"),
+		types.NewPtr(types.Types[types.TINT]))
+	param := types.NewField(src.NoXPos, pkg.Lookup("value"),
+		types.Types[types.TINT])
+	method := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Method"),
+		types.NewSignature(recv, []*types.Field{param}, nil))
+	method.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, method)
+
+	receiverName := recv.Nname.(*ir.Name)
+	paramName := param.Nname.(*ir.Name)
+	receiverCopy := method.NewLocal(src.NoXPos, pkg.Lookup("receiverCopy"),
+		recv.Type)
+	paramCopy := method.NewLocal(src.NoXPos, pkg.Lookup("paramCopy"),
+		param.Type)
+	copyReceiver := ir.NewAssignStmt(src.NoXPos, receiverCopy, receiverName)
+	copyReceiver.SetTypecheck(1)
+	copyParam := ir.NewAssignStmt(src.NoXPos, paramCopy, paramName)
+	copyParam.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	method.Body = ir.Nodes{
+		yieldCall, copyReceiver, copyParam, newLowerTestReturn(),
+	}
+
+	function := &Function{
+		Func:    method,
+		Local:   MaySuspend,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Sites: []Site{{
+			ID: 1, Kind: SiteYield, Node: yieldCall,
+		}},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		method: function,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		function.Factory != FactoryABI1 {
+		t.Fatalf("Lower result = %+v, factory = %v", result, function.Factory)
+	}
+
+	wantFactory := symbolName(method.Nname) + ".coro"
+	var factoryCall *ir.CallExpr
+	ir.Visit(method, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		if got := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))); got == wantFactory {
+			factoryCall = call
+		}
+	})
+	if factoryCall == nil {
+		t.Fatalf("method wrapper does not call %s", wantFactory)
+	}
+	if len(factoryCall.Args) != 2 || factoryCall.Args[0] != receiverName ||
+		factoryCall.Args[1] != paramName {
+		t.Fatalf("method factory arguments = %v, want receiver and parameter",
+			factoryCall.Args)
 	}
 }
 

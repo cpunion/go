@@ -827,6 +827,9 @@ func(P0, ..., Pn) (R0, ..., Rm)
 
 func(P0, ..., Pn)
     -> func(P0, ..., Pn) func(unsafe.Pointer) uint8
+
+func (T) M(P0, ..., Pn) (R0, ..., Rm)
+    -> func(T, P0, ..., Pn, *R0, ..., *Rm) func(unsafe.Pointer) uint8
 ```
 
 The emitted symbol is the ordinary package symbol plus the compiler-reserved
@@ -834,19 +837,21 @@ The emitted symbol is the ordinary package symbol plus the compiler-reserved
 worker policy, or source annotation. The importer reconstructs the type and
 symbol only after validating the capability.
 
-Factory ABI 1 is intentionally narrow. It supports top-level, non-variadic,
-non-generic functions and derives one typed result pointer per result. Methods,
-closures, generic shapes, missing capabilities, and the legacy summary format
-do not produce an imported factory reference. The caller is removed from the
-lowering candidate fixed point and retains its ordinary source body. The same
-fallback propagates to its lowered callers, so an unsupported leaf cannot
-leave a partially transformed call chain.
+Factory ABI 1 is intentionally narrow. It supports package functions and
+concrete methods that are non-variadic and non-generic. A method receiver is
+the first explicit factory parameter, followed by the ordinary parameters and
+one typed pointer per result. Interface calls, method values, closures, generic
+shapes, missing capabilities, and the legacy summary format do not produce an
+imported factory reference. The caller is removed from the lowering candidate
+fixed point and retains its ordinary source body. The same fallback propagates
+to its lowered callers, so an unsupported leaf cannot leave a partially
+transformed call chain.
 
 This extension does not require another summary ABI value. An older importer
-already rejects a version-1 factory when the Go signature has multiple
-results, while older archives never advertise a factory for such a function.
-Mixed compiler versions therefore retain the ordinary entry in either
-direction.
+already rejects a version-1 factory when the Go signature has multiple results
+or a receiver, while older archives never advertise a factory for either
+extension. Mixed compiler versions therefore retain the ordinary entry in
+either direction.
 
 No-result calls and discarded results are supported. A discarded awaited
 result uses a typed parent-frame slot. Direct assignments may receive multiple
@@ -1366,10 +1371,11 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
-- a real three-package call chain covering single and multiple results, blank
-  and discarded results, a no-result call, and reuse of one imported factory;
-  disassembly verifies private factory calls and the absence of ordinary
-  wrappers or `runtime.coroRun` inside the lowered resumes;
+- a real three-package call chain covering package functions, concrete pointer
+  and value methods, single and multiple results, blank and discarded results,
+  a no-result call, and reuse of one imported factory; disassembly verifies
+  private factory calls and the absence of ordinary wrappers or
+  `runtime.coroRun` inside the lowered resumes;
 - ordinary callers, missing capabilities, nested multi-result expressions,
   and complex multi-result targets retain the public Go entry and execute
   correctly; decoder tests verify that the legacy summary format carries no
@@ -1470,11 +1476,11 @@ Goexit, implicit faults, channels, select, mutex parking, reflection,
 callbacks, variadic C calls, or general C ABI type classification. Direct
 foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
-ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes methods,
-closures, variadic functions, and generic shapes. Nested expression calls and
-complex result targets remain on the ordinary entry until the corresponding
-general expression and assignment lowering exists. Logical traceback,
-debugger, profiler, race
+ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
+method-value calls, closures, variadic functions, and generic shapes. Nested
+expression calls and complex result targets remain on the ordinary entry
+until the corresponding general expression and assignment lowering exists.
+Logical traceback, debugger, profiler, race
 instrumentation on native executor stacks, dynamic executor sizing,
 cancellation of in-flight file work, and broad standard-library compatibility
 remain future work.
@@ -1489,8 +1495,8 @@ The likely order is:
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
 4. extend the compiler-private factory ABI only with the matching general
-   expression, method, closure, and generic lowering; do not add source
-   annotations or per-call policy metadata;
+   expression, closure, and generic lowering; do not add source annotations or
+   per-call policy metadata;
 5. add dynamic function values, interfaces, closures, generics, and reflect;
 6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;

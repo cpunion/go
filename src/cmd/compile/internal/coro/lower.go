@@ -131,14 +131,15 @@ func Lower(plan *Plan) (LowerResult, error) {
 		factories[function.Func] = candidate.factory
 		candidate.parameters = make(map[*ir.Name]*ir.Name)
 		candidate.results = make(map[*ir.Name]*ir.Name)
-		for i, field := range candidate.function.Func.Type().Params() {
+		inputs := candidate.function.Func.Type().RecvParams()
+		for i, field := range inputs {
 			source, _ := field.Nname.(*ir.Name)
 			target, _ := candidate.factory.Type().Param(i).Nname.(*ir.Name)
 			if source != nil && target != nil {
 				candidate.parameters[source.Canonical()] = target
 			}
 		}
-		paramCount := candidate.function.Func.Type().NumParams()
+		paramCount := len(inputs)
 		for i, field := range candidate.function.Func.Type().Results() {
 			source, _ := field.Nname.(*ir.Name)
 			value := typecheck.TempAt(candidate.function.Func.Pos(),
@@ -188,9 +189,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		return nil, fmt.Errorf("recursive function")
 	}
 	sig := fn.Type()
-	if sig.NumRecvs() != 0 {
-		return nil, fmt.Errorf("receiver")
-	}
 	if sig.IsVariadic() {
 		return nil, fmt.Errorf("variadic parameters")
 	}
@@ -456,15 +454,16 @@ func resumeFactorySupported(fn *ir.Func) bool {
 		return false
 	}
 	sig := fn.Type()
-	return sig.NumRecvs() == 0 && !sig.IsVariadic() && !sig.HasShape()
+	return !sig.IsVariadic() && !sig.HasShape()
 }
 
 func resumeFactoryType(fn *ir.Func) *types.Type {
 	pos := fn.Pos()
 	resumeType := stacklessResumeType()
 	result := types.NewField(pos, nil, resumeType)
-	params := make([]*types.Field, fn.Type().NumParams())
-	for i, field := range fn.Type().Params() {
+	inputs := fn.Type().RecvParams()
+	params := make([]*types.Field, len(inputs))
+	for i, field := range inputs {
 		params[i] = types.NewField(field.Pos, field.Sym, field.Type)
 	}
 	for i, field := range fn.Type().Results() {
@@ -1467,8 +1466,9 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	typecheck.Stmts(factory.Body)
 
 	ir.CurFunc = fn
-	args := make(ir.Nodes, fn.Type().NumParams())
-	for i, field := range fn.Type().Params() {
+	inputs := fn.Type().RecvParams()
+	args := make(ir.Nodes, len(inputs))
+	for i, field := range inputs {
 		args[i], _ = field.Nname.(ir.Node)
 	}
 	for _, field := range fn.Type().Results() {
