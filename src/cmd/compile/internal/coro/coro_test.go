@@ -1891,6 +1891,217 @@ func main() {
 	}
 }
 
+func TestRecursiveFactory(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"),
+		[]byte("module example.com/cororecursive\n\ngo 1.28\n"),
+		0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(`package main
+
+import "runtime"
+
+const depth = 4096
+
+//go:noinline
+func sum(n int) int {
+	if n == 0 {
+		runtime.Gosched()
+		return 0
+	}
+	child := sum(n - 1)
+	return n + child
+}
+
+//go:noinline
+func even(n int) bool {
+	if n == 0 {
+		runtime.Gosched()
+		return true
+	}
+	result := odd(n - 1)
+	return result
+}
+
+//go:noinline
+func odd(n int) bool {
+	if n == 0 {
+		runtime.Gosched()
+		return false
+	}
+	result := even(n - 1)
+	return result
+}
+
+type counter struct {
+	value int
+}
+
+//go:noinline
+func (c *counter) descend(n int) {
+	if n == 0 {
+		runtime.Gosched()
+		return
+	}
+	c.value++
+	c.descend(n - 1)
+}
+
+func main() {
+	got := sum(depth)
+	want := depth * (depth + 1) / 2
+	if got != want {
+		panic("bad recursive sum")
+	}
+	gotEven := even(depth)
+	gotOdd := even(depth + 1)
+	if !gotEven || gotOdd {
+		panic("bad mutual recursion")
+	}
+	var c counter
+	c.descend(depth)
+	if c.value != depth {
+		panic("bad recursive method")
+	}
+	println("recursive-factory-ok")
+}
+`), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "recursive")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/cororecursive=-l -d=coro=4", ".")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("recursive factory build failed: %v\n%s", err, data)
+	}
+	buildOutput := string(data)
+	for _, name := range []string{"sum", "even", "odd", "(*counter).descend"} {
+		found := false
+		for _, line := range strings.Split(buildOutput, "\n") {
+			if strings.Contains(line, "coro: func=main."+name+" ") &&
+				strings.Contains(line, "effect=may-suspend") &&
+				strings.Contains(line, "recursive=true") &&
+				strings.Contains(line, "primary=coro") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("build output does not report recursive function %s\n%s",
+				name, buildOutput)
+		}
+	}
+	if want := "coro: phase=lower lowered=5 skipped=0"; !strings.Contains(buildOutput, want) {
+		t.Errorf("build output does not contain %q\n%s", want, buildOutput)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("recursive factory executable failed: %v\n%s", err, data)
+	}
+	if want := "recursive-factory-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	for _, test := range []struct {
+		resume  string
+		factory string
+		public  string
+	}{
+		{
+			`main\.sum\.coro\.func[0-9]+$`,
+			"main.sum.coro",
+			"main.sum(SB)",
+		},
+		{
+			`main\.even\.coro\.func[0-9]+$`,
+			"main.odd.coro",
+			"main.odd(SB)",
+		},
+		{
+			`main\.odd\.coro\.func[0-9]+$`,
+			"main.even.coro",
+			"main.even(SB)",
+		},
+		{
+			`main\.\(\*counter\)\.descend\.coro\.func[0-9]+$`,
+			"main.(*counter).descend.coro",
+			"main.(*counter).descend(SB)",
+		},
+	} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", test.resume, exe)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of %s failed: %v\n%s",
+				test.resume, err, data)
+		}
+		disassembly := string(data)
+		if !strings.Contains(disassembly, test.factory) {
+			t.Errorf("%s does not call recursive factory %s\n%s",
+				test.resume, test.factory, disassembly)
+		}
+		for _, forbidden := range []string{test.public, "runtime.coroRun"} {
+			if strings.Contains(disassembly, forbidden) {
+				t.Errorf("%s contains %q\n%s",
+					test.resume, forbidden, disassembly)
+			}
+		}
+	}
+
+	ordinary := filepath.Join(tmp, "ordinary")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", ordinary, "-gcflags=example.com/cororecursive=-l", ".")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=none",
+		"GOCACHE="+filepath.Join(tmp, "ordinary-cache"),
+		"GOWORK=off",
+	)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ordinary recursive build failed: %v\n%s", err, data)
+	}
+	cmd = testenv.Command(t, ordinary)
+	if data, err = cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ordinary recursive executable failed: %v\n%s", err, data)
+	}
+	if want := "recursive-factory-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("ordinary output does not contain %q\n%s", want, data)
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", ordinary)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm of ordinary recursive executable failed: %v\n%s",
+			err, data)
+	}
+	symbols := string(data)
+	for _, name := range []string{
+		"main.sum.coro",
+		"main.even.coro",
+		"main.odd.coro",
+		"main.(*counter).descend.coro",
+	} {
+		if strings.Contains(symbols, name) {
+			t.Fatalf("ordinary executable contains private symbol %s\n%s",
+				name, data)
+		}
+	}
+}
+
 func TestRejectMixedArchive(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

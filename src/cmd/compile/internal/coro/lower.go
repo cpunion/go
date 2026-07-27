@@ -185,9 +185,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if fn == nil || fn.OClosure != nil {
 		return nil, fmt.Errorf("not a top-level function")
 	}
-	if function.Recursive {
-		return nil, fmt.Errorf("recursive function")
-	}
 	sig := fn.Type()
 	if sig.HasShape() {
 		return nil, fmt.Errorf("generic shape")
