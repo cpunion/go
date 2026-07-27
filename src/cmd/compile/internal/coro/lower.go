@@ -195,8 +195,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
+	awaitContainers := make(map[*ir.CallExpr]ir.Node)
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
+	recordAssignmentCall := func(node ir.Node) *ir.CallExpr {
+		switch node := node.(type) {
+		case *ir.AssignStmt:
+			if call, ok := node.Y.(*ir.CallExpr); ok {
+				statementCalls[call] = true
+				awaitStatements[call] = node
+				return call
+			}
+		case *ir.AssignListStmt:
+			if len(node.Rhs) == 1 {
+				if call, ok := node.Rhs[0].(*ir.CallExpr); ok {
+					statementCalls[call] = true
+					awaitStatements[call] = node
+					return call
+				}
+			}
+		}
+		return nil
+	}
 	var collectStatements func(ir.Nodes, bool) error
 	collectStatements = func(list ir.Nodes, inLoop bool) error {
 		for _, stmt := range list {
@@ -205,36 +225,23 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return err
 				}
 			}
+			// Calls returning multiple results inside an expression are
+			// normalized into assignments attached to that expression's
+			// Init list. Record the assignment that directly owns each call
+			// so lowering can detach that Init list without treating the
+			// surrounding statement as the result destination.
+			ir.Visit(stmt, func(node ir.Node) {
+				call := recordAssignmentCall(node)
+				if call != nil && awaitContainers[call] == nil {
+					awaitContainers[call] = stmt
+				}
+			})
 			switch stmt := stmt.(type) {
 			case *ir.CallExpr:
 				statementCalls[stmt] = true
 				awaitStatements[stmt] = stmt
-			case *ir.AssignStmt:
-				if call, ok := stmt.Y.(*ir.CallExpr); ok {
-					statementCalls[call] = true
-					awaitStatements[call] = stmt
-				}
-			case *ir.AssignListStmt:
-				if len(stmt.Rhs) == 1 {
-					if call, ok := stmt.Rhs[0].(*ir.CallExpr); ok {
-						statementCalls[call] = true
-						awaitStatements[call] = stmt
-					}
-				}
-				// Multi-result method calls may have already been normalized
-				// into an assignment form whose call is below the RHS root.
-				// Keep the containing assignment for either typed worker
-				// adaptation or result-projection validation.
-				ir.Visit(stmt, func(node ir.Node) {
-					call, ok := node.(*ir.CallExpr)
-					if !ok {
-						return
-					}
-					awaitStatements[call] = stmt
-					if ordinaryReadOperation(call) {
-						statementCalls[call] = true
-					}
-				})
+				awaitContainers[stmt] = stmt
+			case *ir.AssignStmt, *ir.AssignListStmt:
 			case *ir.GoDeferStmt:
 				call, ok := stmt.Call.(*ir.CallExpr)
 				if !ok {
@@ -357,6 +364,15 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			edge := edges[call]
 			if edge.Callee == nil {
 				return nil, fmt.Errorf("dynamic await site %d", site.ID)
+			}
+			container := awaitContainers[call]
+			if statement != container && !supportsAwaitInit(container) {
+				_, err := callResultTargets(call, container,
+					edge.Callee.Type().NumResults())
+				if err == nil {
+					err = fmt.Errorf("nested result expression")
+				}
+				return nil, fmt.Errorf("await site %d: %v", site.ID, err)
 			}
 			targets, err := callResultTargets(call, statement,
 				edge.Callee.Type().NumResults())
@@ -986,7 +1002,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				result, _ := fn.Type().Result(i).Nname.(*ir.Name)
 				body = append(body, ir.NewAssignStmt(stmt.Pos(), result, value))
 			}
-			entry := newBodyState(body, 0)
+			entry := lowerStatements(body, 0)
 			return lowerStatements(stmt.Init(), entry)
 
 		case *ir.BlockStmt:
@@ -1537,6 +1553,25 @@ func callResultTargets(call *ir.CallExpr, stmt ir.Node,
 	}
 	return nil, fmt.Errorf("coroutine call has %d results without matching assignment",
 		count)
+}
+
+// supportsAwaitInit reports whether an expression Init list may be detached
+// ahead of stmt without reordering evaluation of an assignment destination.
+func supportsAwaitInit(stmt ir.Node) bool {
+	switch stmt := stmt.(type) {
+	case *ir.CallExpr, *ir.ReturnStmt:
+		return true
+	case *ir.AssignStmt:
+		return ir.IsBlank(stmt.X) || stmt.X.Op() == ir.ONAME
+	case *ir.AssignListStmt:
+		for _, target := range stmt.Lhs {
+			if !ir.IsBlank(target) && target.Op() != ir.ONAME {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,

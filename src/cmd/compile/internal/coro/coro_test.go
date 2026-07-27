@@ -1420,12 +1420,64 @@ func NestedPair(value *int) int {
 	return total
 }
 
+var nestedPairCallResult int
+
+//go:noinline
+func recordPair(left, right int) {
+	nestedPairCallResult = left + right
+}
+
+//go:noinline
+func NestedPairCall(value *int) int {
+	nestedPairCallResult = 0
+	recordPair(leaf.Pair(value))
+	return nestedPairCallResult
+}
+
+//go:noinline
+func NestedPairAssign(value *int) int {
+	total := 0
+	total = sum(leaf.Pair(value))
+	return total
+}
+
+//go:noinline
+func split(left, right int) (int, int) {
+	return left + 10, right + 20
+}
+
+//go:noinline
+func NestedPairList(value *int) (int, int) {
+	var left, right int
+	left, right = split(leaf.Pair(value))
+	return left, right
+}
+
+var complexOrder int
+
+//go:noinline
+func complexTarget(results []int) []int {
+	complexOrder = complexOrder*10 + 1
+	return results
+}
+
+//go:noinline
+func complexValue(value *int) *int {
+	complexOrder = complexOrder*10 + 2
+	return value
+}
+
 //go:noinline
 func ComplexPair(value *int) int {
 	results := []int{0}
 	index := 0
-	results[index], index = leaf.Pair(value)
+	complexOrder = 0
+	complexTarget(results)[index], index = leaf.Pair(complexValue(value))
 	return results[0] + index
+}
+
+func ComplexOrder() int {
+	return complexOrder
 }
 
 //go:noinline
@@ -1497,6 +1549,27 @@ func main() {
 		println("multi-result-discard-bad")
 		return
 	}
+	value = 0
+	if nested := mid.NestedPair(&value); value != 42 || nested != 3 {
+		println("multi-result-return-expression-bad")
+		return
+	}
+	value = 0
+	if nested := mid.NestedPairCall(&value); value != 42 || nested != 3 {
+		println("multi-result-call-expression-bad")
+		return
+	}
+	value = 0
+	if nested := mid.NestedPairAssign(&value); value != 42 || nested != 3 {
+		println("multi-result-assignment-expression-bad")
+		return
+	}
+	value = 0
+	left, right = mid.NestedPairList(&value)
+	if value != 42 || left != 11 || right != 22 {
+		println("multi-result-assignment-list-expression-bad")
+		return
+	}
 	println("multi-result-factory-ok")
 }
 `)
@@ -1510,7 +1583,7 @@ func main() {
 	nested := mid.NestedPair(&nestedValue)
 	complex := mid.ComplexPair(&complexValue)
 	if nestedValue != 42 || complexValue != 42 ||
-		nested != 3 || complex != 3 {
+		nested != 3 || complex != 3 || mid.ComplexOrder() != 12 {
 		println("multi-result-fallback-bad")
 		return
 	}
@@ -1678,6 +1751,23 @@ func main() {
 		"example.com/corofactory/mid.Variadic(SB)") {
 		t.Fatalf("root uses public variadic entry\n%s", disassembly)
 	}
+	for _, name := range []string{
+		"NestedPair",
+		"NestedPairCall",
+		"NestedPairAssign",
+		"NestedPairList",
+	} {
+		factory := "example.com/corofactory/mid." + name + ".coro"
+		if !strings.Contains(disassembly, factory) {
+			t.Fatalf("root does not use nested expression factory %s\n%s",
+				factory, disassembly)
+		}
+		if strings.Contains(disassembly,
+			"example.com/corofactory/mid."+name+"(SB)") {
+			t.Fatalf("root uses public nested expression entry %s\n%s",
+				name, disassembly)
+		}
+	}
 
 	for _, method := range []struct {
 		resume string
@@ -1728,6 +1818,33 @@ func main() {
 		t.Fatalf("variadic resume uses public leaf entry\n%s", disassembly)
 	}
 
+	for _, name := range []string{
+		"NestedPair",
+		"NestedPairCall",
+		"NestedPairAssign",
+		"NestedPairList",
+	} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", `example.com/corofactory/mid\.`+name+
+				`\.coro\.func[0-9]+$`, pair)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of nested expression resume %s failed: %v\n%s",
+				name, err, data)
+		}
+		disassembly = string(data)
+		if !strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair.coro") {
+			t.Fatalf("nested expression resume %s does not use leaf factory\n%s",
+				name, disassembly)
+		}
+		if strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair(SB)") {
+			t.Fatalf("nested expression resume %s uses public leaf entry\n%s",
+				name, disassembly)
+		}
+	}
+
 	multiFallback := filepath.Join(tmp, "multi-fallback")
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", multiFallback,
@@ -1745,7 +1862,6 @@ func main() {
 		t.Fatalf("multi-result fallback build failed: %v\n%s", err, data)
 	}
 	for _, want := range []string{
-		"NestedPair: nested await site 1",
 		"ComplexPair: await site 1: coroutine call has 2 results without matching assignment",
 		"unsupported coroutine dependency example.com/corofactory/mid.ComplexPair",
 	} {
@@ -1753,6 +1869,10 @@ func main() {
 			t.Fatalf("multi-result fallback output does not contain %q\n%s",
 				want, data)
 		}
+	}
+	if unwanted := "NestedPair: nested await site"; strings.Contains(string(data), unwanted) {
+		t.Fatalf("multi-result expression output contains %q\n%s",
+			unwanted, data)
 	}
 
 	cmd = testenv.Command(t, multiFallback)
@@ -1764,25 +1884,23 @@ func main() {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
 
-	for _, caller := range []string{"NestedPair", "ComplexPair"} {
-		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-			"-s", `example.com/corofactory/mid\.`+caller+`$`, multiFallback)
-		data, err = cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("objdump of fallback %s failed: %v\n%s",
-				caller, err, data)
-		}
-		disassembly := string(data)
-		if !strings.Contains(disassembly,
-			"example.com/corofactory/leaf.Pair(SB)") {
-			t.Fatalf("%s fallback does not use the public entry\n%s",
-				caller, disassembly)
-		}
-		if strings.Contains(disassembly,
-			"example.com/corofactory/leaf.Pair.coro") {
-			t.Fatalf("%s fallback uses the private factory\n%s",
-				caller, disassembly)
-		}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.ComplexPair$`, multiFallback)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of fallback ComplexPair failed: %v\n%s",
+			err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Pair(SB)") {
+		t.Fatalf("ComplexPair fallback does not use the public entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Pair.coro") {
+		t.Fatalf("ComplexPair fallback uses the private factory\n%s",
+			disassembly)
 	}
 
 	ordinary := filepath.Join(tmp, "ordinary")
