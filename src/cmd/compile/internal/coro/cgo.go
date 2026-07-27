@@ -37,6 +37,23 @@ type cgoDirectCall struct {
 	errno   bool
 }
 
+func (call cgoDirectCall) recipe() OperationRecipe {
+	recipe := OperationRecipe{
+		Kind:    SiteForeign,
+		Foreign: call.class,
+	}
+	switch call.class {
+	case DirectNoBlock:
+		recipe.Exec = NeedsSystemABI
+	case DirectMayBlock:
+		recipe.Exec = NeedsSystemABI | MayBlockThread
+	case AsyncOperation:
+		recipe.Effect = MaySuspend
+		recipe.Exec = NeedsSystemABI
+	}
+	return recipe
+}
+
 func parseCgoDirectives(directives [][]string) (map[string]cgoDirectCall, error) {
 	calls := make(map[string]cgoDirectCall)
 	for _, directive := range directives {

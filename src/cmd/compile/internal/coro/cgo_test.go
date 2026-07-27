@@ -5,6 +5,7 @@
 package coro
 
 import (
+	"cmd/compile/internal/ir"
 	"strings"
 	"testing"
 )
@@ -90,5 +91,78 @@ func TestParseCgoDirectDirectiveErrors(t *testing.T) {
 	_, err := parseCgoDirectives([][]string{valid, valid})
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate error = %v", err)
+	}
+}
+
+func TestCgoDirectRecipe(t *testing.T) {
+	tests := []struct {
+		class  ForeignCallClass
+		effect Effect
+		exec   ExecFlags
+	}{
+		{DirectNoBlock, NoSuspend, NeedsSystemABI},
+		{DirectMayBlock, NoSuspend, NeedsSystemABI | MayBlockThread},
+		{AsyncOperation, MaySuspend, NeedsSystemABI},
+		{NotForeign, NoSuspend, 0},
+	}
+	for _, test := range tests {
+		call := cgoDirectCall{class: test.class}
+		recipe := call.recipe()
+		if recipe.Kind != SiteForeign || recipe.Foreign != test.class ||
+			recipe.Effect != test.effect || recipe.Exec != test.exec {
+			t.Errorf("%v recipe = %+v", test.class, recipe)
+		}
+	}
+}
+
+func TestCgoDirectRecipeOverridesWrapper(t *testing.T) {
+	wrapper := testFunc("_Cfunc_add")
+	caller := testFunc("caller")
+	recipe := cgoDirectCall{class: DirectMayBlock}.recipe()
+	edge := Edge{
+		Callee: wrapper,
+		Recipe: recipe,
+	}
+	function := &Function{
+		Func:  caller,
+		Edges: []Edge{edge},
+	}
+	plan := &Plan{
+		Functions: map[*ir.Func]*Function{
+			wrapper: {Func: wrapper, Effect: MaySuspend, Exec: ThreadAffine},
+			caller:  function,
+		},
+		cgoDirect: map[string]cgoDirectCall{
+			"_Cfunc_add": {class: DirectMayBlock},
+		},
+	}
+
+	got, ok := plan.operationRecipe(wrapper)
+	if !ok || got != recipe {
+		t.Fatalf("operationRecipe = (%+v, %t), want (%+v, true)",
+			got, ok, recipe)
+	}
+	if plan.edgeMaySuspend(edge) {
+		t.Fatal("cgo recipe inherited suspension from its fallback wrapper")
+	}
+	if got, want := plan.calledExec(function),
+		NeedsSystemABI|MayBlockThread; got != want {
+		t.Fatalf("calledExec = %v, want %v", got, want)
+	}
+	if got := plan.edgeEffect(edge); got != NoSuspend {
+		t.Fatalf("edgeEffect = %v, want %v", got, NoSuspend)
+	}
+}
+
+func TestAnalyzeCgoDirectives(t *testing.T) {
+	if _, err := Analyze(nil, [][]string{{"cgo_direct"}}); err == nil {
+		t.Fatal("Analyze accepted invalid cgo metadata")
+	}
+	plan, err := Analyze(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Functions) != 0 || len(plan.cgoDirect) != 0 {
+		t.Fatalf("empty plan = %+v", plan)
 	}
 }

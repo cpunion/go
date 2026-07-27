@@ -5,15 +5,18 @@ mkdir direct
 go tool cgo -objdir=direct main.go
 grep '//go:cgo_direct v1 _Cfunc_add_u64 _Cdirect_add_u64 add_u64 mayblock u64,u64 u64 -' direct/_cgo_gotypes.go
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
+go build -gcflags=-d=coro=1 -o program .
+stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=plain exec=block-thread,system-abi'
+stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
 go run .
-stdout '^42$'
+stderr '^42$'
 
 env GOEXPERIMENT=nocoro
 mkdir ordinary
 go tool cgo -objdir=ordinary main.go
 ! grep 'cgo_direct' ordinary/_cgo_gotypes.go
 go run .
-stdout '^42$'
+stderr '^42$'
 
 -- go.mod --
 module example.com/direct
@@ -36,10 +39,9 @@ static uint64_t may_callback(uint64_t value) {
 }
 */
 import "C"
-import "fmt"
 
 func main() {
-	fmt.Println(C.add_u64(19, 23))
+	println(C.add_u64(19, 23))
 }
 
 -- add.c --

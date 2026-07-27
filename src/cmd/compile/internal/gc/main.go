@@ -260,7 +260,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := coro.Analyze(typecheck.Target.Funcs,
+			typecheck.Target.CgoDirectives)
+		if err != nil {
+			base.Fatalf("analyzing coroutine plan: %v", err)
+		}
 		if base.Debug.Coro > 1 {
 			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
 			plan.Dump(os.Stderr)
@@ -295,7 +299,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := coro.Analyze(typecheck.Target.Funcs,
+			typecheck.Target.CgoDirectives)
+		if err != nil {
+			base.Fatalf("analyzing coroutine plan: %v", err)
+		}
 		if err := plan.Verify(); err != nil {
 			base.Fatalf("invalid coroutine plan: %v", err)
 		}
