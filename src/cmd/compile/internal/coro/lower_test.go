@@ -55,6 +55,47 @@ func newLowerTestReturn() *ir.ReturnStmt {
 	return ret
 }
 
+func TestResumeFactorySupported(t *testing.T) {
+	prepareLowerTest(t)
+
+	if resumeFactorySupported(nil) {
+		t.Fatal("nil function supports a resume factory")
+	}
+	pkg := types.NewPkg("example.com/coro/factorysupport", "factorysupport")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("F"),
+		types.NewSignature(nil, nil, nil))
+	if !resumeFactorySupported(fn) {
+		t.Fatal("plain function does not support a resume factory")
+	}
+	recv := types.NewField(src.NoXPos, pkg.Lookup("recv"),
+		types.NewStruct(nil))
+	method := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("M"),
+		types.NewSignature(recv, nil, nil))
+	if resumeFactorySupported(method) {
+		t.Fatal("method supports a resume factory")
+	}
+	results := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+	}
+	pair := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Pair"),
+		types.NewSignature(nil, nil, results))
+	if resumeFactorySupported(pair) {
+		t.Fatal("multi-result function supports a resume factory")
+	}
+	shapeType := types.NewSignature(nil, nil, nil)
+	shapeType.SetHasShape(true)
+	shape := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Shape"), shapeType)
+	if resumeFactorySupported(shape) {
+		t.Fatal("generic shape supports a resume factory")
+	}
+	if _, err := newLowerCandidate(&Plan{}, &Function{Func: shape}); err == nil ||
+		!strings.Contains(err.Error(), "generic shape") {
+		t.Fatalf("newLowerCandidate error = %v, want generic-shape rejection",
+			err)
+	}
+}
+
 func TestLowerStateMachines(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -883,7 +924,7 @@ func TestLowerRejectsUnsupportedDependency(t *testing.T) {
 	}
 }
 
-func TestLowerRejectsNestedSystemABIRoot(t *testing.T) {
+func TestLowerNestedSystemABIUsesFactory(t *testing.T) {
 	prepareLowerTest(t)
 
 	oldTarget := typecheck.Target
@@ -950,6 +991,8 @@ func TestLowerRejectsNestedSystemABIRoot(t *testing.T) {
 			Sites: []Site{{
 				ID: 1, Kind: SiteForeign, Node: parentForeign,
 				Foreign: DirectNoBlock,
+			}, {
+				ID: 2, Kind: SiteAwait, Node: childCall,
 			}},
 		},
 	}}
@@ -957,16 +1000,275 @@ func TestLowerRejectsNestedSystemABIRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 1 || result.Skipped != 1 {
-		t.Fatalf("Lower result = %+v, want 1 lowered and 1 skipped", result)
+	if result.Lowered != 2 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 2 lowered and none skipped", result)
 	}
-	if len(result.Diagnostics) != 1 ||
-		!strings.Contains(result.Diagnostics[0], "requires coroutine factory entry") {
-		t.Fatalf("Lower diagnostics = %q, want factory-entry rejection",
-			result.Diagnostics)
+	if len(result.Diagnostics) != 0 {
+		t.Fatalf("Lower diagnostics = %q, want none", result.Diagnostics)
 	}
-	if len(parent.Body) != 3 {
-		t.Fatalf("rejected parent body has %d statements, want 3", len(parent.Body))
+
+	wantFactory := symbolName(child.Nname) + ".coro"
+	var factoryCalls, wrapperCalls int
+	for _, fn := range typecheck.Target.Funcs {
+		if fn.ClosureParent == nil || fn.ClosureParent.Sym() == nil ||
+			fn.ClosureParent.Sym().Name != parent.Sym().Name+".coro" {
+			continue
+		}
+		ir.Visit(fn, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			switch symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) {
+			case wantFactory:
+				factoryCalls++
+			case symbolName(child.Nname):
+				wrapperCalls++
+			}
+		})
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("generated IR has %d calls to %s, want 1",
+			factoryCalls, wantFactory)
+	}
+	if wrapperCalls != 0 {
+		t.Fatalf("generated IR has %d calls to ordinary child wrapper, want 0",
+			wrapperCalls)
+	}
+}
+
+func TestLowerImportedFactory(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	for _, test := range []struct {
+		name       string
+		factory    FactoryABI
+		lowered    int
+		skipped    int
+		callers    int
+		diagnostic string
+	}{
+		{
+			name: "available", factory: FactoryABI1,
+			lowered: 2, callers: 2,
+		},
+		{
+			name: "missing", skipped: 1, callers: 1,
+			diagnostic: "unsupported coroutine dependency",
+		},
+		{
+			name: "unknown", factory: FactoryABI(2),
+			skipped: 1, callers: 1,
+			diagnostic: "unsupported coroutine dependency",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pkg := types.NewPkg("example.com/coro/factorycaller/"+test.name,
+				"factorycaller")
+			leafPkg := types.NewPkg("example.com/coro/factoryleaf/"+test.name,
+				"factoryleaf")
+			types.LocalPkg = pkg
+			typecheck.Target = new(ir.Package)
+			ir.CurFunc = nil
+
+			param := types.NewField(src.NoXPos, leafPkg.Lookup("value"),
+				types.Types[types.TINT])
+			resultField := types.NewField(src.NoXPos, nil,
+				types.Types[types.TINT])
+			leaf := ir.NewFunc(src.NoXPos, src.NoXPos,
+				leafPkg.Lookup("Suspend"),
+				types.NewSignature(nil, []*types.Field{param},
+					[]*types.Field{resultField}))
+			leaf.DeclareParams(true)
+			summary := FuncSummary{
+				Effect: MaySuspend, Factory: test.factory,
+			}
+			SetSummary(leaf, summary)
+
+			plan := &Plan{
+				Functions: make(map[*ir.Func]*Function),
+			}
+			var functions []*Function
+			for i := 0; i < test.callers; i++ {
+				call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, leaf.Nname,
+					ir.Nodes{ir.NewBasicLit(src.NoXPos,
+						types.Types[types.TINT], constant.MakeInt64(41))})
+				call.SetType(types.Types[types.TINT])
+				call.SetTypecheck(1)
+				output := ir.NewNameAt(src.NoXPos,
+					pkg.LookupNum("output", i), types.Types[types.TINT])
+				output.Class = ir.PEXTERN
+				assign := ir.NewAssignStmt(src.NoXPos, output, call)
+				assign.SetTypecheck(1)
+
+				caller := newLowerTestFunc(pkg,
+					pkg.LookupNum("caller", i).Name)
+				statement := ir.Node(assign)
+				if test.factory == FactoryABI1 && i == 1 {
+					statement = call
+				}
+				caller.Body = ir.Nodes{statement, newLowerTestReturn()}
+				function := &Function{
+					Func:    caller,
+					Effect:  MaySuspend,
+					Primary: CoroPrimary,
+					Edges: []Edge{{
+						Kind: DirectCall, Callee: leaf,
+						CalleeName: symbolName(leaf.Nname),
+						Imported:   summary, Node: call,
+					}},
+					Sites: []Site{{
+						ID: 1, Kind: SiteAwait, Node: call,
+					}},
+				}
+				plan.Functions[caller] = function
+				functions = append(functions, function)
+			}
+
+			result, err := Lower(plan)
+			if err != nil {
+				t.Fatalf("Lower failed: %v", err)
+			}
+			if result.Lowered != test.lowered ||
+				result.Skipped != test.skipped {
+				t.Fatalf("Lower result = %+v, want %d lowered and %d skipped",
+					result, test.lowered, test.skipped)
+			}
+			if test.diagnostic != "" {
+				if len(result.Diagnostics) != 1 ||
+					!strings.Contains(result.Diagnostics[0], test.diagnostic) {
+					t.Fatalf("Lower diagnostics = %q, want %q",
+						result.Diagnostics, test.diagnostic)
+				}
+				for _, function := range functions {
+					if function.Factory != NoFactory {
+						t.Fatalf("skipped function factory = %v, want none",
+							function.Factory)
+					}
+				}
+				return
+			}
+			if len(result.Diagnostics) != 0 {
+				t.Fatalf("Lower diagnostics = %q, want none",
+					result.Diagnostics)
+			}
+			for _, function := range functions {
+				if function.Factory != FactoryABI1 {
+					t.Fatalf("lowered function factory = %v, want v1",
+						function.Factory)
+				}
+			}
+
+			wantFactory := symbolName(leaf.Nname) + ".coro"
+			var factoryCalls, wrapperCalls int
+			for _, fn := range typecheck.Target.Funcs {
+				ir.Visit(fn, func(node ir.Node) {
+					call, ok := node.(*ir.CallExpr)
+					if !ok {
+						return
+					}
+					name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
+					switch symbolName(name) {
+					case wantFactory:
+						factoryCalls++
+					case symbolName(leaf.Nname):
+						wrapperCalls++
+					}
+				})
+			}
+			if factoryCalls != test.callers {
+				t.Fatalf("generated IR has %d calls to %s, want %d",
+					factoryCalls, wantFactory, test.callers)
+			}
+			if wrapperCalls != 0 {
+				t.Fatalf("generated IR has %d calls to ordinary wrapper, want 0",
+					wrapperCalls)
+			}
+		})
+	}
+}
+
+func TestLowerRejectsSpawnResults(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/spawnresults", "spawnresults")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	child := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("child"),
+		types.NewSignature(nil, nil, []*types.Field{result}))
+	child.DeclareParams(true)
+	call := newLowerTestCall(child)
+	spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, call)
+	spawn.SetTypecheck(1)
+	parent := newLowerTestFunc(pkg, "parent")
+	parent.Body = ir.Nodes{spawn, newLowerTestReturn()}
+	function := &Function{
+		Func: parent,
+		Edges: []Edge{{
+			Kind: GoCall, Callee: child,
+			CalleeName: symbolName(child.Nname), Node: call,
+		}},
+		Sites: []Site{{
+			ID: 1, Kind: SiteSpawn, Node: call,
+		}},
+	}
+	plan := &Plan{Functions: map[*ir.Func]*Function{parent: function}}
+	if _, err := newLowerCandidate(plan, function); err == nil ||
+		!strings.Contains(err.Error(), "spawn target returns values") {
+		t.Fatalf("newLowerCandidate error = %v, want result rejection", err)
+	}
+}
+
+func TestCallResultTargets(t *testing.T) {
+	prepareLowerTest(t)
+
+	pkg := types.NewPkg("example.com/coro/resulttargets", "resulttargets")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("call"),
+		types.NewSignature(nil, nil, nil))
+	call := newLowerTestCall(fn)
+	if got, err := callResultTargets(call, 1); err != nil ||
+		len(got) != 1 || got[0] != nil {
+		t.Fatalf("discarded call targets = %v, %v, want one empty target",
+			got, err)
+	}
+
+	target := ir.NewNameAt(src.NoXPos, pkg.Lookup("target"),
+		types.Types[types.TINT])
+	assign := ir.NewAssignStmt(src.NoXPos, target, call)
+	if got, err := callResultTargets(assign, 1); err != nil ||
+		len(got) != 1 || got[0] != target {
+		t.Fatalf("assignment targets = %v, %v, want %v", got, err, target)
+	}
+
+	list := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{target, ir.BlankNode}, ir.Nodes{call})
+	if got, err := callResultTargets(list, 2); err != nil ||
+		len(got) != 2 || got[0] != target || got[1] != nil {
+		t.Fatalf("list targets = %v, %v, want [%v <nil>]",
+			got, err, target)
+	}
+
+	if _, err := callResultTargets(assign, 2); err == nil ||
+		!strings.Contains(err.Error(), "without matching assignment") {
+		t.Fatalf("mismatched target error = %v", err)
 	}
 }
 

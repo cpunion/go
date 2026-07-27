@@ -46,15 +46,57 @@ func (e Effect) String() string {
 	}
 }
 
-// SummaryVersion is the version of the coroutine function summary stored in
-// the compiler-private Unified IR extension.
-const SummaryVersion uint64 = 2
+const (
+	// legacySummaryVersion is the coroutine summary format before factory
+	// capabilities were recorded.
+	legacySummaryVersion uint64 = 2
+
+	// SummaryVersion is the current coroutine function summary format stored
+	// in the compiler-private Unified IR extension.
+	SummaryVersion uint64 = 3
+)
 
 // The compiler processes one package per process, so summaries are package
 // compilation state and do not require synchronization.
 var summaries = make(map[*ir.Func]FuncSummary)
 
 var dumpMu sync.Mutex
+
+// DecodeFuncSummary reads one versioned function summary. The callback is
+// invoked only for fields present in version.
+func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, error) {
+	if version == 0 {
+		return FuncSummary{}, false, nil
+	}
+	if version != legacySummaryVersion && version != SummaryVersion {
+		return FuncSummary{}, false,
+			fmt.Errorf("unsupported coroutine summary version %d", version)
+	}
+
+	effectValue := next()
+	if effectValue > uint64(MaySuspend) {
+		return FuncSummary{}, false,
+			fmt.Errorf("invalid coroutine effect %d", effectValue)
+	}
+	execValue := next()
+	if execValue > uint64(^ExecFlags(0)) {
+		return FuncSummary{}, false,
+			fmt.Errorf("invalid coroutine execution flags %d", execValue)
+	}
+	summary := FuncSummary{
+		Effect: Effect(effectValue),
+		Exec:   ExecFlags(execValue),
+	}
+	if version == SummaryVersion {
+		factoryValue := next()
+		if factoryValue > uint64(^FactoryABI(0)) {
+			return FuncSummary{}, false,
+				fmt.Errorf("invalid coroutine factory ABI %d", factoryValue)
+		}
+		summary.Factory = FactoryABI(factoryValue)
+	}
+	return summary, true, nil
+}
 
 // SetSummary records a function summary read from Unified IR export data.
 func SetSummary(fn *ir.Func, summary FuncSummary) {
@@ -165,6 +207,7 @@ type Function struct {
 	Seeds     []Seed
 	Edges     []Edge
 	Sites     []Site
+	Factory   FactoryABI
 }
 
 // Plan is the result of analyzing one package.
@@ -178,7 +221,11 @@ type Plan struct {
 // Unified IR export writer.
 func (p *Plan) PublishSummaries() {
 	for fn, function := range p.Functions {
-		SetSummary(fn, FuncSummary{Effect: function.Effect, Exec: function.Exec})
+		SetSummary(fn, FuncSummary{
+			Effect:  function.Effect,
+			Exec:    function.Exec,
+			Factory: function.Factory,
+		})
 	}
 }
 
@@ -242,7 +289,7 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		}).Primary()
 		for _, edge := range function.Edges {
 			if edge.Kind != GoCall && edge.Recipe.Kind == SiteInvalid &&
-				p.edgeMaySuspend(edge) {
+				p.edgeNeedsCoroEntry(edge) {
 				function.Sites = append(function.Sites, Site{
 					ID:   SiteID(len(function.Sites) + 1),
 					Kind: SiteAwait,
@@ -388,16 +435,16 @@ func (p *Plan) callsSuspending(function *Function) bool {
 }
 
 func (p *Plan) edgeMaySuspend(edge Edge) bool {
-	if edge.Recipe.Kind != SiteInvalid {
-		return edge.Recipe.Effect == MaySuspend
-	}
-	if edge.Unknown {
+	summary, known := p.edgeSummary(edge)
+	if !known {
 		return true
 	}
-	if callee := p.Functions[edge.Callee]; callee != nil {
-		return callee.Effect == MaySuspend
-	}
-	return edge.Imported.Effect == MaySuspend
+	return summary.Effect == MaySuspend
+}
+
+func (p *Plan) edgeNeedsCoroEntry(edge Edge) bool {
+	summary, known := p.edgeSummary(edge)
+	return !known || summary.Primary() == CoroPrimary
 }
 
 func (p *Plan) calledExec(function *Function) ExecFlags {
@@ -406,19 +453,31 @@ func (p *Plan) calledExec(function *Function) ExecFlags {
 		if edge.Kind == GoCall {
 			continue
 		}
-		if edge.Recipe.Kind != SiteInvalid {
-			flags |= edge.Recipe.Exec
-			continue
-		}
-		if callee := p.Functions[edge.Callee]; callee != nil {
-			flags |= callee.Exec
-			continue
-		}
-		if !edge.Unknown {
-			flags |= edge.Imported.Exec
+		if summary, known := p.edgeSummary(edge); known {
+			flags |= summary.Exec
 		}
 	}
 	return flags
+}
+
+func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
+	if edge.Recipe.Kind != SiteInvalid {
+		return FuncSummary{
+			Effect: edge.Recipe.Effect,
+			Exec:   edge.Recipe.Exec,
+		}, true
+	}
+	if edge.Unknown {
+		return FuncSummary{}, false
+	}
+	if callee := p.Functions[edge.Callee]; callee != nil {
+		return FuncSummary{
+			Effect:  callee.Effect,
+			Exec:    callee.Exec,
+			Factory: callee.Factory,
+		}, true
+	}
+	return edge.Imported, true
 }
 
 func (p *Plan) operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
@@ -488,11 +547,8 @@ func (p *Plan) Dump(w io.Writer) {
 }
 
 func (p *Plan) edgeEffect(edge Edge) Effect {
-	if edge.Recipe.Kind != SiteInvalid {
-		return edge.Recipe.Effect
+	if summary, known := p.edgeSummary(edge); known {
+		return summary.Effect
 	}
-	if callee := p.Functions[edge.Callee]; callee != nil {
-		return callee.Effect
-	}
-	return edge.Imported.Effect
+	return NoSuspend
 }

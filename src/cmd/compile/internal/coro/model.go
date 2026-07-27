@@ -141,10 +141,22 @@ type Site struct {
 	Foreign ForeignCallClass
 }
 
+// FactoryABI identifies a compiler-generated coroutine entry ABI. A zero
+// value means that callers must use the ordinary Go entry.
+type FactoryABI uint8
+
+const (
+	NoFactory FactoryABI = iota
+	// FactoryABI1 is available for top-level, non-variadic,
+	// non-generic functions with at most one result.
+	FactoryABI1
+)
+
 // FuncSummary is the portion of a function plan exported across packages.
 type FuncSummary struct {
-	Effect Effect
-	Exec   ExecFlags
+	Effect  Effect
+	Exec    ExecFlags
+	Factory FactoryABI
 }
 
 func (s FuncSummary) Primary() PrimaryKind {

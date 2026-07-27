@@ -312,6 +312,7 @@ func (l *linker) relocFuncExt(w *pkgbits.Encoder, name *ir.Name) {
 			w.Uint64(coro.SummaryVersion)
 			w.Uint64(uint64(summary.Effect))
 			w.Uint64(uint64(summary.Exec))
+			w.Uint64(uint64(summary.Factory))
 		} else {
 			w.Uint64(0)
 		}
