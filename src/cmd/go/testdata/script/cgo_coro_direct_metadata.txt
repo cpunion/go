@@ -1,0 +1,50 @@
+[!cgo] skip
+
+env GOEXPERIMENT=coro
+mkdir direct
+go tool cgo -objdir=direct main.go
+grep '//go:cgo_direct v1 _Cfunc_add_u64 _Cdirect_add_u64 add_u64 mayblock u64,u64 u64 -' direct/_cgo_gotypes.go
+! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
+go run .
+stdout '^42$'
+
+env GOEXPERIMENT=nocoro
+mkdir ordinary
+go tool cgo -objdir=ordinary main.go
+! grep 'cgo_direct' ordinary/_cgo_gotypes.go
+go run .
+stdout '^42$'
+
+-- go.mod --
+module example.com/direct
+
+go 1.26
+
+-- main.go --
+package main
+
+/*
+#include <stdint.h>
+
+#cgo noescape add_u64
+#cgo nocallback add_u64
+
+uint64_t add_u64(uint64_t, uint64_t);
+
+static uint64_t may_callback(uint64_t value) {
+	return value;
+}
+*/
+import "C"
+import "fmt"
+
+func main() {
+	fmt.Println(C.add_u64(19, 23))
+}
+
+-- add.c --
+#include <stdint.h>
+
+uint64_t add_u64(uint64_t a, uint64_t b) {
+	return a + b;
+}

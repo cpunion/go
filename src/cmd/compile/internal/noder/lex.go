@@ -137,6 +137,17 @@ func (p *noder) pragcgo(pos syntax.Pos, text string) {
 			p.error(syntax.Error{Pos: pos, Msg: `usage: //go:cgo_ldflag "arg"`})
 			return
 		}
+	case "cgo_direct":
+		if len(f) != 9 {
+			p.error(syntax.Error{Pos: pos, Msg: `usage: //go:cgo_direct version wrapper direct symbol class params result errno`})
+			return
+		}
+		for _, field := range f[1:] {
+			if isQuoted(field) {
+				p.error(syntax.Error{Pos: pos, Msg: `usage: //go:cgo_direct version wrapper direct symbol class params result errno`})
+				return
+			}
+		}
 	default:
 		return
 	}

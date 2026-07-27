@@ -71,6 +71,7 @@ func TestPragcgo(t *testing.T) {
 		{`go:cgo_dynamic_linker "/p ath/"`, []string{`cgo_dynamic_linker`, `/p ath/`}},
 		{`go:cgo_ldflag "arg"`, []string{`cgo_ldflag`, `arg`}},
 		{`go:cgo_ldflag "a rg"`, []string{`cgo_ldflag`, `a rg`}},
+		{`go:cgo_direct v1 _Cfunc_add _Cdirect_add add mayblock u64,u64 u64 -`, []string{`cgo_direct`, `v1`, `_Cfunc_add`, `_Cdirect_add`, `add`, `mayblock`, `u64,u64`, `u64`, `-`}},
 	}
 
 	if runtime.GOOS != "aix" {

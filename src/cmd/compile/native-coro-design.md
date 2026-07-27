@@ -12,7 +12,7 @@ development branch
 Integration branch: `cpunion/go:coro/main`, which receives upstream updates
 from `main` and is the base for coroutine pull requests
 
-Topic branch: `coro/io-progress`
+Topic branch: `coro/cgo-direct-mvp`
 
 ## 1. Decision
 
@@ -728,15 +728,28 @@ is necessary for correctness and for eventual direct call-site lowering.
 
 ### 10.6 Declaration frontend
 
-The MVP uses compiler-internal metadata for a fixed set of test declarations.
-It does not introduce a public `//go:` directive.
+The first MVP used compiler-owned declarations for fixed test fixtures. The
+transparent-call follow-up keeps `cmd/cgo` as the source and C declaration
+frontend. For a supported declaration, `cmd/cgo` emits versioned,
+compiler-private metadata containing:
 
-A later design can let `cmd/cgo` remain a header and declaration frontend while
-emitting typed direct-call metadata for safe `nocallback` signatures. That
-would remove runtime cgo call overhead without requiring users to abandon
-`import "C"`. Unsupported declarations may retain the ordinary cgo path only
-when explicitly selected; the coroutine direct-call mode should not silently
-fall back and invalidate performance or stack assumptions.
+- the generated Go wrapper and direct-entry identities;
+- the external C symbol;
+- the conservative call class;
+- the scalar and pointer System ABI shape;
+- whether the two-result form captures errno.
+
+This metadata is generated only for `GOEXPERIMENT=coro`. It is consumed by the
+compiler and is not passed to the linker as a cgo directive. It does not change
+the ordinary cgo path until native lowering has selected the direct entry.
+
+The first generated metadata is limited to non-variadic integer and pointer
+signatures with at most six parameters and one result. A declaration must use
+the existing `#cgo nocallback` contract. `#cgo noescape` remains an independent
+escape-analysis optimization. Unsupported declarations retain the ordinary
+cgo path in compatibility mode. Tests and benchmarks that require a direct
+call use a strict mode that rejects fallback, so the performance result cannot
+silently measure cgo.
 
 ### 10.7 Pointer and callback safety
 
@@ -754,6 +767,24 @@ For later typed calls:
 - callbacks are separate root adapters with explicit reentry and affinity
   rules;
 - C must not unwind or `longjmp` through a Go frame.
+
+### 10.8 Annotation policy
+
+The Go implementation does not adopt LLGo's distributed `//llgo:coro`
+directives. Suspension and executor requirements propagate through Go calls
+from compiler-owned operations and generated C-boundary metadata.
+
+Most synchronous supported C calls are conservatively `DirectMayBlock`.
+Neither a C signature nor `#cgo nocallback` proves bounded execution time. The
+first transparent-call MVP therefore adds no public nonblocking directive.
+`DirectNoBlock` is measured with compiler-owned fixtures. A later proposal may
+add one optional C-boundary contract if the measured benefit justifies it.
+
+Asynchronous completion semantics cannot be inferred from a C signature.
+Those APIs use small typed adapters that create an operation record and become
+suspension seeds. Their Go callers are still colored automatically. Worker
+arity, result projection, and propagation are derived from types and operation
+recipes, not maintained as source annotations.
 
 ## 11. Language and runtime integration
 

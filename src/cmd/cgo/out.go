@@ -629,6 +629,10 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 		return
 	}
 
+	if call, ok := p.directCall(n); ok {
+		call.writeDirective(fgo2)
+	}
+
 	// Wrapper calls into gcc, passing a pointer to the argument frame.
 	fmt.Fprintf(fgo2, "//go:cgo_import_static %s\n", cname)
 	fmt.Fprintf(fgo2, "//go:linkname __cgofn_%s %s\n", cname, cname)
