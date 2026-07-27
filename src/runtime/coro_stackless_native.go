@@ -50,18 +50,20 @@ func init() {
 }
 
 // coroRunOnNativeStack runs s on a fixed portion of the current operating
-// system thread stack. The race runtime has its own stack and goroutine
-// bookkeeping, so race builds retain the managed-stack driver for now.
-func coroRunOnNativeStack(s *stacklessCoroScheduler, stopReplacements bool) bool {
+// system thread stack. It returns s reloaded from the heap context after a
+// successful stack switch; callers must not reuse their pre-switch local.
+// The race runtime has its own stack and goroutine bookkeeping, so race builds
+// retain the managed-stack driver for now.
+func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if raceenabled {
-		return false
+		return nil
 	}
 
 	ctx := acquireStacklessCoroNativeContext()
 	gp := getg()
 	if gp != gp.m.curg || gp == gp.m.g0 || gp == gp.m.gsignal {
 		releaseStacklessCoroNativeContext(ctx)
-		return false
+		return nil
 	}
 	if gp.param != nil {
 		releaseStacklessCoroNativeContext(ctx)
@@ -78,16 +80,11 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler, stopReplacements bool) bool
 		throw("runtime: lost stackless coroutine native context")
 	}
 	gp.param = nil
-	if stopReplacements {
-		// Use the scheduler saved in the heap context across the synthetic
-		// stack switch. In particular, do not reload the caller's pre-switch
-		// local on amd64.
-		ctx.scheduler.stopReplacementExecutors()
-	}
+	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
 	releaseStacklessCoroNativeContext(ctx)
-	return true
+	return scheduler
 }
 
 func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
