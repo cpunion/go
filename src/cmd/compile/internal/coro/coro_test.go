@@ -1313,6 +1313,20 @@ func Add(value int) int {
 }
 
 //go:noinline
+func Variadic(base int, values ...int) int {
+	runtime.Gosched()
+	return base + sumValues(values)
+}
+
+func sumValues(values []int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+//go:noinline
 func (counter *Counter) Add(delta int) (int, int) {
 	runtime.Gosched()
 	*counter += Counter(delta)
@@ -1351,6 +1365,12 @@ type Calculator int
 func Add(value int) int {
 	next := leaf.Add(value)
 	return next + 1
+}
+
+//go:noinline
+func Variadic(values ...int) int {
+	total := leaf.Variadic(10, values...)
+	return total + 1
 }
 
 //go:noinline
@@ -1451,6 +1471,15 @@ func main() {
 		println("value-method-factory-bad")
 		return
 	}
+	if got := mid.Variadic(1, 2, 3); got != 17 {
+		println("variadic-factory-bad")
+		return
+	}
+	values := []int{4, 5}
+	if got := mid.Variadic(values...); got != 20 {
+		println("variadic-slice-factory-bad")
+		return
+	}
 	value := 0
 	left, right := mid.Pair(&value)
 	if value != 42 || left != 11 || right != 22 {
@@ -1504,6 +1533,10 @@ func main() {
 	var runner mid.Runner
 	if got := runner.Run(41); got != 42 || runner.Value != 41 {
 		println("ordinary-method-entry-bad")
+		return
+	}
+	if got := mid.Variadic(1, 2, 3); got != 17 {
+		println("ordinary-variadic-entry-bad")
 		return
 	}
 	println("ordinary-entry-ok")
@@ -1636,6 +1669,15 @@ func main() {
 				method, disassembly)
 		}
 	}
+	variadicFactory := "example.com/corofactory/mid.Variadic.coro"
+	if !strings.Contains(disassembly, variadicFactory) {
+		t.Fatalf("root does not use variadic factory %s\n%s",
+			variadicFactory, disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/mid.Variadic(SB)") {
+		t.Fatalf("root uses public variadic entry\n%s", disassembly)
+	}
 
 	for _, method := range []struct {
 		resume string
@@ -1666,6 +1708,24 @@ func main() {
 			t.Fatalf("method resume uses public method entry %s\n%s",
 				method.callee, disassembly)
 		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.Variadic`+
+			`\.coro\.func[0-9]+$`, pair)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of variadic resume failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Variadic.coro") {
+		t.Fatalf("variadic resume does not use leaf factory\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Variadic(SB)") {
+		t.Fatalf("variadic resume uses public leaf entry\n%s", disassembly)
 	}
 
 	multiFallback := filepath.Join(tmp, "multi-fallback")
@@ -1772,6 +1832,16 @@ func main() {
 	if strings.Contains(disassembly,
 		"example.com/corofactory/mid.(*Runner).Run.coro") {
 		t.Fatalf("ordinary caller uses the private method factory\n%s",
+			disassembly)
+	}
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/mid.Variadic(SB)") {
+		t.Fatalf("ordinary caller does not use the public variadic entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/mid.Variadic.coro") {
+		t.Fatalf("ordinary caller uses the private variadic factory\n%s",
 			disassembly)
 	}
 
