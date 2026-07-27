@@ -564,6 +564,8 @@ func NextArenaHint() (uintptr, bool) {
 
 type G = g
 
+const StacklessCoroGSize = unsafe.Sizeof(stacklessCoroG{})
+
 type Sudog = sudog
 
 type XRegPerG = xRegPerG

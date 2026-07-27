@@ -377,6 +377,13 @@ func normalizeGoDeferCall(pos src.XPos, op ir.Op, call ir.Node, init *ir.Nodes) 
 	return Call(call.Pos(), wrapperFn.OClosure, nil, false).(*ir.CallExpr)
 }
 
+// MakeCallClosure evaluates call's operands into init and returns a
+// parameterless closure that invokes call. It is intended for transformations
+// that transfer a call to another execution context.
+func MakeCallClosure(pos src.XPos, call ir.Node, init *ir.Nodes) ir.Node {
+	return normalizeGoDeferCall(pos, ir.OCLOSURE, call, init).Fun
+}
+
 // tcIf typechecks an OIF node.
 func tcIf(n *ir.IfStmt) ir.Node {
 	Stmts(n.Init())

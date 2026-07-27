@@ -21,6 +21,7 @@ import (
 
 	"cmd/compile/internal/abi"
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/liveness"
 	"cmd/compile/internal/objw"
@@ -590,8 +591,18 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 
 	s.insertPhis()
 
-	// Main call to ssa package to compile function
-	ssa.Compile(s.f)
+	// Main call to ssa package to compile function.
+	if buildcfg.Experiment.Coro && base.Debug.Coro > 2 {
+		handled := ssa.CompileWithLoweringHook(s.f, func(f *ssa.Func) bool {
+			coro.DumpPreLowerSSA(os.Stderr, f)
+			return false
+		})
+		if handled {
+			s.Fatalf("report-only coroutine backend unexpectedly handled %s", s.f.Name)
+		}
+	} else {
+		ssa.Compile(s.f)
+	}
 
 	fe.AllocFrame(s.f)
 

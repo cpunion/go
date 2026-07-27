@@ -572,6 +572,8 @@ type g struct {
 	coroarg *coro // argument during coroutine transfers
 	bubble  *synctestBubble
 
+	stacklessCoroG
+
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
 	xRegs xRegPerG

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/dwarfgen"
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/inline/interleaved"
@@ -1259,6 +1260,20 @@ func (r *reader) funcExt(name *ir.Name, method *types.Sym) {
 		}
 	} else {
 		r.addBody(name.Func, method)
+	}
+	if r.Version().Has(pkgbits.CoroFuncSummary) {
+		switch version := r.Uint64(); version {
+		case 0:
+		case coro.SummaryVersion:
+			effect := coro.Effect(r.Uint64())
+			if effect != coro.NoSuspend && effect != coro.MaySuspend {
+				base.FatalfAt(fn.Pos(), "invalid coroutine effect %d for %v", effect, name)
+			}
+			exec := coro.ExecFlags(r.Uint64())
+			coro.SetSummary(fn, coro.FuncSummary{Effect: effect, Exec: exec})
+		default:
+			base.FatalfAt(fn.Pos(), "unsupported coroutine summary version %d for %v", version, name)
+		}
 	}
 	r.Sync(pkgbits.SyncEOF)
 }

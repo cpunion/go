@@ -944,7 +944,7 @@ func scanstack(gp *g, gcw *gcWork) int64 {
 	if isShrinkStackSafe(gp) {
 		// Shrink the stack if not much of it is being used.
 		shrinkstack(gp)
-	} else {
+	} else if !gp.stackIsFixed() {
 		// Otherwise, shrink the stack at the next sync safe point.
 		gp.preemptShrink = true
 	}

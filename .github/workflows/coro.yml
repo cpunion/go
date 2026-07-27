@@ -1,0 +1,107 @@
+name: Coroutine compiler
+
+on:
+  pull_request:
+    branches:
+      - coro/main
+  push:
+    branches:
+      - coro/main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coro-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  focused:
+    name: Focused (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Build default toolchain
+        working-directory: src
+        run: ./make.bash
+
+      - name: Test default compiler and runtime
+        run: >-
+          ./bin/go test -count=1
+          cmd/compile/...
+          internal/pkgbits
+          internal/buildcfg
+          runtime
+
+      - name: Build coroutine experiment toolchain
+        working-directory: src
+        env:
+          GOEXPERIMENT: coro
+        run: ./make.bash
+
+      - name: Test coroutine compiler and runtime
+        env:
+          GOEXPERIMENT: coro
+        run: >-
+          ./bin/go test -count=1
+          cmd/compile/...
+          internal/pkgbits
+          internal/buildcfg
+          runtime
+
+      - name: Test coroutine operation races
+        env:
+          GOEXPERIMENT: coro
+        run: ./bin/go test -race -count=1 runtime -run '^TestStacklessCoro'
+
+  native-full:
+    name: Native all.bash (Linux)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Run native full test suite
+        working-directory: src
+        run: ./all.bash
