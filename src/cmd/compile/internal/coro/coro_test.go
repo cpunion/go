@@ -1398,6 +1398,60 @@ func Discard(value int) {
 }
 
 //go:noinline
+func NestedAddReturn(value int) int {
+	return leaf.Add(value) + 1
+}
+
+var nestedAddCallResult int
+
+//go:noinline
+func recordAdd(value int) {
+	nestedAddCallResult = value
+}
+
+//go:noinline
+func NestedAddCall(value int) int {
+	nestedAddCallResult = 0
+	recordAdd(leaf.Add(value))
+	return nestedAddCallResult
+}
+
+//go:noinline
+func NestedAddAssign(value int) int {
+	result := 0
+	result = leaf.Add(value) + 1
+	return result
+}
+
+//go:noinline
+func NestedAddTwice(value int) int {
+	return leaf.Add(value) + leaf.Add(value+1)
+}
+
+//go:noinline
+func NestedAddChain(value int) int {
+	return Add(leaf.Add(value))
+}
+
+var unsafeNestedAddOrder int
+
+//go:noinline
+func beforeNestedAdd() int {
+	unsafeNestedAddOrder = unsafeNestedAddOrder*10 + 1
+	return 1
+}
+
+//go:noinline
+func UnsafeNestedAdd(value int) int {
+	unsafeNestedAddOrder = 0
+	return beforeNestedAdd() + leaf.Add(value)
+}
+
+func UnsafeNestedAddOrder() int {
+	return unsafeNestedAddOrder
+}
+
+//go:noinline
 func DiscardPair(value *int) {
 	leaf.Pair(value)
 }
@@ -1505,6 +1559,26 @@ func main() {
 		return
 	}
 	mid.Discard(40)
+	if got := mid.NestedAddReturn(40); got != 42 {
+		println("nested-single-return-bad")
+		return
+	}
+	if got := mid.NestedAddCall(40); got != 41 {
+		println("nested-single-call-bad")
+		return
+	}
+	if got := mid.NestedAddAssign(40); got != 42 {
+		println("nested-single-assign-bad")
+		return
+	}
+	if got := mid.NestedAddTwice(40); got != 83 {
+		println("nested-single-twice-bad")
+		return
+	}
+	if got := mid.NestedAddChain(39); got != 42 {
+		println("nested-single-chain-bad")
+		return
+	}
 	mid.Yield()
 	println("cross-package-factory-ok")
 }
@@ -1582,8 +1656,10 @@ func main() {
 	complexValue := 0
 	nested := mid.NestedPair(&nestedValue)
 	complex := mid.ComplexPair(&complexValue)
+	unsafe := mid.UnsafeNestedAdd(40)
 	if nestedValue != 42 || complexValue != 42 ||
-		nested != 3 || complex != 3 || mid.ComplexOrder() != 12 {
+		nested != 3 || complex != 3 || mid.ComplexOrder() != 12 ||
+		unsafe != 42 || mid.UnsafeNestedAddOrder() != 1 {
 		println("multi-result-fallback-bad")
 		return
 	}
@@ -1649,6 +1725,11 @@ func main() {
 		{"Add", "Add"},
 		{"AddAgain", "Add"},
 		{"Discard", "Add"},
+		{"NestedAddReturn", "Add"},
+		{"NestedAddCall", "Add"},
+		{"NestedAddAssign", "Add"},
+		{"NestedAddTwice", "Add"},
+		{"NestedAddChain", "Add"},
 		{"Yield", "Yield"},
 	} {
 		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
@@ -1674,6 +1755,26 @@ func main() {
 					test.caller, forbidden, disassembly)
 			}
 		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.NestedAddChain`+
+			`\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of nested coroutine chain failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/mid.Add.coro") {
+		t.Fatalf("nested coroutine chain does not call mid factory\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/mid.Add(SB)") {
+		t.Fatalf("nested coroutine chain calls public mid entry\n%s",
+			disassembly)
 	}
 
 	pair := filepath.Join(tmp, "pair")
@@ -1726,7 +1827,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("objdump of method factory caller failed: %v\n%s", err, data)
 	}
-	disassembly := string(data)
+	disassembly = string(data)
 	for _, method := range []string{
 		"(*Runner).Run",
 		"Calculator.Sum",
@@ -1864,6 +1965,7 @@ func main() {
 	for _, want := range []string{
 		"ComplexPair: await site 1: coroutine call has 2 results without matching assignment",
 		"unsupported coroutine dependency example.com/corofactory/mid.ComplexPair",
+		"UnsafeNestedAdd: nested await site 1",
 	} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("multi-result fallback output does not contain %q\n%s",
@@ -1900,6 +2002,26 @@ func main() {
 	if strings.Contains(disassembly,
 		"example.com/corofactory/leaf.Pair.coro") {
 		t.Fatalf("ComplexPair fallback uses the private factory\n%s",
+			disassembly)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.UnsafeNestedAdd$`,
+		multiFallback)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of fallback UnsafeNestedAdd failed: %v\n%s",
+			err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add(SB)") {
+		t.Fatalf("UnsafeNestedAdd fallback does not use the public entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add.coro") {
+		t.Fatalf("UnsafeNestedAdd fallback uses the private factory\n%s",
 			disassembly)
 	}
 

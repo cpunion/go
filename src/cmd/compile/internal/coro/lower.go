@@ -80,6 +80,9 @@ func Lower(plan *Plan) (LowerResult, error) {
 		return strings.Compare(ir.PkgFuncName(a.Func), ir.PkgFuncName(b.Func))
 	})
 	for _, function := range functions {
+		normalizeSingleResultCalls(function)
+	}
+	for _, function := range functions {
 		if function.Primary != CoroPrimary {
 			continue
 		}
