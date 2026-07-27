@@ -148,7 +148,7 @@ type FactoryABI uint8
 const (
 	NoFactory FactoryABI = iota
 	// FactoryABI1 is available for top-level, non-variadic,
-	// non-generic functions with at most one result.
+	// non-generic functions. Each result is returned through a typed pointer.
 	FactoryABI1
 )
 

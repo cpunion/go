@@ -1347,6 +1347,37 @@ func DiscardPair(value *int) {
 }
 
 //go:noinline
+func Pair(value *int) (int, int) {
+	left, right := leaf.Pair(value)
+	return left + 10, right + 20
+}
+
+//go:noinline
+func First(value *int) int {
+	first, _ := leaf.Pair(value)
+	return first
+}
+
+//go:noinline
+func NestedPair(value *int) int {
+	total := sum(leaf.Pair(value))
+	return total
+}
+
+//go:noinline
+func ComplexPair(value *int) int {
+	results := []int{0}
+	index := 0
+	results[index], index = leaf.Pair(value)
+	return results[0] + index
+}
+
+//go:noinline
+func sum(left, right int) int {
+	return left + right
+}
+
+//go:noinline
 func Yield() {
 	leaf.Yield()
 }
@@ -1376,8 +1407,36 @@ import "example.com/corofactory/mid"
 
 func main() {
 	value := 0
+	left, right := mid.Pair(&value)
+	if value != 42 || left != 11 || right != 22 {
+		println("multi-result-assignment-bad")
+		return
+	}
+	value = 0
+	if first := mid.First(&value); value != 42 || first != 1 {
+		println("multi-result-blank-bad")
+		return
+	}
+	value = 0
 	mid.DiscardPair(&value)
 	if value != 42 {
+		println("multi-result-discard-bad")
+		return
+	}
+	println("multi-result-factory-ok")
+}
+`)
+	writeFile("rootfallback/main.go", `package main
+
+import "example.com/corofactory/mid"
+
+func main() {
+	nestedValue := 0
+	complexValue := 0
+	nested := mid.NestedPair(&nestedValue)
+	complex := mid.ComplexPair(&complexValue)
+	if nestedValue != 42 || complexValue != 42 ||
+		nested != 3 || complex != 3 {
 		println("multi-result-fallback-bad")
 		return
 	}
@@ -1467,11 +1526,61 @@ func main() {
 	cmd.Env = append(cmd.Environ(), env...)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
+		t.Fatalf("multi-result factory build failed: %v\n%s", err, data)
+	}
+	pairBuild := string(data)
+
+	cmd = testenv.Command(t, pair)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("multi-result factory executable failed: %v\n%s", err, data)
+	}
+	if want := "multi-result-factory-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	for _, caller := range []string{"Pair", "First", "DiscardPair"} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", `example.com/corofactory/mid\.`+caller+
+				`\.coro\.func[0-9]+$`, pair)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of multi-result %s failed: %v\n%s",
+				caller, err, data)
+		}
+		disassembly := string(data)
+		if !strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair.coro") {
+			t.Fatalf("%s does not use the multi-result factory\n%s\nbuild:\n%s",
+				caller, disassembly, pairBuild)
+		}
+		if strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair(SB)") {
+			t.Fatalf("%s uses the public multi-result entry\n%s",
+				caller, disassembly)
+		}
+	}
+
+	multiFallback := filepath.Join(tmp, "multi-fallback")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", multiFallback,
+		"-gcflags=example.com/corofactory/...=-l -d=coro=4",
+		"./rootfallback")
+	cmd.Dir = tmp
+	fallbackEnv := []string{
+		"GOEXPERIMENT=coro",
+		"GOCACHE=" + filepath.Join(tmp, "fallback-gocache"),
+		"GOWORK=off",
+	}
+	cmd.Env = append(cmd.Environ(), fallbackEnv...)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("multi-result fallback build failed: %v\n%s", err, data)
 	}
 	for _, want := range []string{
-		"unsupported coroutine dependency example.com/corofactory/leaf.Pair",
-		"unsupported coroutine dependency example.com/corofactory/mid.DiscardPair",
+		"NestedPair: nested await site 1",
+		"ComplexPair: await site 1: coroutine call has 2 results without matching assignment",
+		"unsupported coroutine dependency example.com/corofactory/mid.ComplexPair",
 	} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("multi-result fallback output does not contain %q\n%s",
@@ -1479,7 +1588,7 @@ func main() {
 		}
 	}
 
-	cmd = testenv.Command(t, pair)
+	cmd = testenv.Command(t, multiFallback)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("multi-result fallback executable failed: %v\n%s", err, data)
@@ -1488,23 +1597,25 @@ func main() {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
 
-	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `example.com/corofactory/mid\.DiscardPair$`, pair)
-	data, err = cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("objdump of multi-result fallback failed: %v\n%s",
-			err, data)
-	}
-	disassembly := string(data)
-	if !strings.Contains(disassembly,
-		"example.com/corofactory/leaf.Pair(SB)") {
-		t.Fatalf("multi-result fallback does not use the public entry\n%s",
-			disassembly)
-	}
-	if strings.Contains(disassembly,
-		"example.com/corofactory/leaf.Pair.coro") {
-		t.Fatalf("multi-result fallback uses the private factory\n%s",
-			disassembly)
+	for _, caller := range []string{"NestedPair", "ComplexPair"} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", `example.com/corofactory/mid\.`+caller+`$`, multiFallback)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of fallback %s failed: %v\n%s",
+				caller, err, data)
+		}
+		disassembly := string(data)
+		if !strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair(SB)") {
+			t.Fatalf("%s fallback does not use the public entry\n%s",
+				caller, disassembly)
+		}
+		if strings.Contains(disassembly,
+			"example.com/corofactory/leaf.Pair.coro") {
+			t.Fatalf("%s fallback uses the private factory\n%s",
+				caller, disassembly)
+		}
 	}
 
 	ordinary := filepath.Join(tmp, "ordinary")
@@ -1535,7 +1646,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("objdump of ordinary entry failed: %v\n%s", err, data)
 	}
-	disassembly = string(data)
+	disassembly := string(data)
 	if !strings.Contains(disassembly,
 		"example.com/corofactory/leaf.Add(SB)") {
 		t.Fatalf("ordinary caller does not use the public Go entry\n%s",
