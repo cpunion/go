@@ -153,6 +153,9 @@ var depsRules = `
 	< internal/syscall/execenv
 	< SYSCALL;
 
+	SYSCALL
+	< runtime/coro;
+
 	# TIME is SYSCALL plus the core packages about time, including context.
 	SYSCALL
 	< time/tzdata
@@ -860,7 +863,7 @@ var depsRules = `
 	regexp, internal/testenv, internal/trace, internal/trace/raw, internal/txtar, testing
 	< internal/trace/testtrace;
 
-	C, CGO
+	C, CGO, runtime/coro
 	< internal/runtime/cgobench;
 
 	# Generate-only packages can have anything they want.
