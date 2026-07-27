@@ -6,7 +6,11 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
+	"unsafe"
+)
 
 // A stacklessCoroResume executes one state-machine transition. The context is
 // valid only for the duration of the call and must not be retained.
@@ -19,6 +23,8 @@ const (
 	stacklessCoroActionComplete
 )
 
+const stacklessCoroExecutorCount = 4
+
 type stacklessCoroTaskState uint8
 
 const (
@@ -30,21 +36,29 @@ const (
 )
 
 type stacklessCoroTask struct {
-	resume stacklessCoroResume
-	parent *stacklessCoroTask
-	next   *stacklessCoroTask
-	state  stacklessCoroTaskState
+	resume  stacklessCoroResume
+	parent  *stacklessCoroTask
+	next    *stacklessCoroTask
+	state   stacklessCoroTaskState
+	context stacklessCoroContext
+}
+
+type stacklessCoroContext struct {
+	scheduler *stacklessCoroScheduler
+	task      *stacklessCoroTask
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
 // work through scheduler operations; they never invoke a continuation.
 type stacklessCoroScheduler struct {
-	lock    mutex
-	head    *stacklessCoroTask
-	tail    *stacklessCoroTask
-	current *stacklessCoroTask
-	root    *stacklessCoroTask
-	wake    chan struct{}
+	lock           mutex
+	head           *stacklessCoroTask
+	tail           *stacklessCoroTask
+	root           *stacklessCoroTask
+	wake           chan struct{}
+	executorWake   chan struct{}
+	executorDone   chan struct{}
+	executorsReady atomic.Uint32
 }
 
 // A stacklessCoroOperation is owned by the runtime registry until its source
@@ -83,16 +97,22 @@ func coroRun(resume stacklessCoroResume) {
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
-	s := &stacklessCoroScheduler{wake: make(chan struct{}, 1)}
+	s := &stacklessCoroScheduler{
+		wake:         make(chan struct{}, stacklessCoroExecutorCount),
+		executorWake: make(chan struct{}, stacklessCoroExecutorCount-1),
+		executorDone: make(chan struct{}, stacklessCoroExecutorCount-1),
+	}
 	lockInit(&s.lock, lockRankLeafRank)
 	root := &stacklessCoroTask{resume: resume}
 	s.root = root
 	s.ready(root, false)
 
-	if coroRunOnNativeStack(s) {
+	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
+		nativeScheduler.stopReplacementExecutors()
 		return
 	}
 	s.run(false)
+	s.stopReplacementExecutors()
 }
 
 func (s *stacklessCoroScheduler) run(native bool) {
@@ -102,9 +122,11 @@ func (s *stacklessCoroScheduler) run(native bool) {
 			<-s.wake
 			continue
 		}
-		s.current = task
-		action := task.resume(unsafe.Pointer(s))
-		s.current = nil
+		task.context.scheduler = s
+		task.context.task = task
+		action := task.resume(unsafe.Pointer(&task.context))
+		task.context.scheduler = nil
+		task.context.task = nil
 
 		switch action {
 		case stacklessCoroActionYield:
@@ -134,11 +156,13 @@ func (s *stacklessCoroScheduler) rootComplete() bool {
 // coroAwait transfers execution to child. Completion makes the current task
 // runnable; it does not call the parent continuation.
 func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
-	s := (*stacklessCoroScheduler)(ctx)
-	if s == nil || s.current == nil || child == nil {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil ||
+		child == nil {
 		throw("runtime: invalid stackless coroutine await")
 	}
-	parent := s.current
+	s := context.scheduler
+	parent := context.task
 	lock(&s.lock)
 	if parent.state != stacklessCoroTaskRunning {
 		unlock(&s.lock)
@@ -152,17 +176,20 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 // coroSpawn enqueues an independent logical goroutine. The current task keeps
 // running until it returns its next scheduler action.
 func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
-	s := (*stacklessCoroScheduler)(ctx)
-	if s == nil || s.current == nil || child == nil {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil ||
+		child == nil {
 		throw("runtime: invalid stackless coroutine spawn")
 	}
+	s := context.scheduler
 	lock(&s.lock)
-	if s.current.state != stacklessCoroTaskRunning {
+	if context.task.state != stacklessCoroTaskRunning {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine spawn outside resume")
 	}
 	s.readyLocked(&stacklessCoroTask{resume: child})
 	unlock(&s.lock)
+	s.prepareReplacementExecutors()
 }
 
 // coroSleep starts a timer operation for the current logical goroutine.
@@ -171,8 +198,7 @@ func coroSleep(ctx unsafe.Pointer, ns int64) {
 }
 
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
-	s := (*stacklessCoroScheduler)(ctx)
-	task := s.startOperation("sleep")
+	s, task := stacklessCoroStartOperation(ctx, "sleep")
 
 	op := &stacklessCoroOperation{scheduler: s, task: task}
 	op.id = registerStacklessCoroOperation(op)
@@ -207,29 +233,56 @@ func cancelStacklessCoroTimer(id uint64) bool {
 
 //go:nosplit
 func coroEnterForeign() {
-	mp := getg().m
-	if mp.incgo {
+	gp := getg()
+	mp := gp.m
+	if mp.incgo || gp.nocgocallback {
 		throw("runtime: nested stackless coroutine foreign call")
 	}
 	osPreemptExtEnter(mp)
+	mp.ncgocall++
+	if mp.cgoCallers != nil {
+		mp.cgoCallers[0] = 0
+	}
+	gp.nocgocallback = true
 	mp.incgo = true
 	mp.ncgo++
 }
 
 //go:nosplit
 func coroExitForeign() {
-	mp := getg().m
-	if !mp.incgo || mp.ncgo == 0 {
+	gp := getg()
+	mp := gp.m
+	if !mp.incgo || mp.ncgo == 0 || !gp.nocgocallback {
 		throw("runtime: unmatched stackless coroutine foreign call")
 	}
+	gp.nocgocallback = false
 	mp.incgo = false
 	mp.ncgo--
 	osPreemptExtExit(mp)
+	if sys.DITSupported {
+		ditEnabled := sys.DITEnabled()
+		if !gp.ditWanted && ditEnabled {
+			sys.DisableDIT()
+		} else if gp.ditWanted && !ditEnabled {
+			sys.EnableDIT()
+		}
+	}
 }
 
 //go:nosplit
-func coroEnterBlocking() {
-	entersyscallblock()
+func coroEnterBlocking(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine blocking call")
+	}
+	context.scheduler.wakeReplacementExecutor()
+	// coroExitBlocking returns through a different helper frame. Save the
+	// continuation frame so exitsyscall never refers to an unwound entry
+	// frame. This is the same reentry protocol used by cgo callbacks.
+	pc := sys.GetCallerPC()
+	sp := sys.GetCallerSP()
+	bp := getcallerfp()
+	reentersyscall(pc, sp, bp)
 	coroEnterForeign()
 }
 
@@ -239,11 +292,13 @@ func coroExitBlocking() {
 	exitsyscall()
 }
 
-func (s *stacklessCoroScheduler) startOperation(name string) *stacklessCoroTask {
-	if s == nil || s.current == nil {
+func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCoroScheduler, *stacklessCoroTask) {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine " + name)
 	}
-	task := s.current
+	s := context.scheduler
+	task := context.task
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning {
 		unlock(&s.lock)
@@ -251,7 +306,7 @@ func (s *stacklessCoroScheduler) startOperation(name string) *stacklessCoroTask 
 	}
 	task.state = stacklessCoroTaskWaiting
 	unlock(&s.lock)
-	return task
+	return s, task
 }
 
 func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
@@ -332,6 +387,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	task.parent = nil
 	if parent == nil {
 		unlock(&s.lock)
+		s.signalAll()
 		return
 	}
 	if parent.state != stacklessCoroTaskWaiting {
@@ -346,6 +402,56 @@ func (s *stacklessCoroScheduler) signal() {
 	select {
 	case s.wake <- struct{}{}:
 	default:
+	}
+}
+
+func (s *stacklessCoroScheduler) signalAll() {
+	for range stacklessCoroExecutorCount {
+		s.signal()
+	}
+}
+
+func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
+	if !s.executorsReady.CompareAndSwap(0, 1) {
+		return
+	}
+
+	for range stacklessCoroExecutorCount - 1 {
+		go s.replacementExecutor()
+	}
+}
+
+func (s *stacklessCoroScheduler) replacementExecutor() {
+	<-s.executorWake
+	if !s.rootComplete() {
+		if coroRunOnNativeStack(s) == nil {
+			s.run(false)
+		}
+	}
+	s.executorDone <- struct{}{}
+}
+
+//go:nosplit
+func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
+	if s == nil || s.executorsReady.Load() == 0 {
+		return
+	}
+	select {
+	case s.executorWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *stacklessCoroScheduler) stopReplacementExecutors() {
+	if s.executorsReady.Load() == 0 {
+		return
+	}
+	for range stacklessCoroExecutorCount - 1 {
+		s.wakeReplacementExecutor()
+	}
+	s.signalAll()
+	for range stacklessCoroExecutorCount - 1 {
+		<-s.executorDone
 	}
 }
 

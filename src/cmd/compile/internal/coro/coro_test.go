@@ -911,6 +911,7 @@ import (
 
 var sum uint64
 var gate uint32
+var entered uint32
 var asyncReadFD int
 var asyncWriteFD int
 var asyncResult uint64
@@ -922,14 +923,17 @@ var watchdogUsed uint32
 func foreign() {
 	sum = corort.DirectAdd(19, 23)
 	runtime.Gosched()
+	atomic.StoreUint32(&entered, 1)
 	corort.DirectBlock(&gate)
 	corort.AsyncDouble(asyncReadFD, asyncWriteFD, 21, &asyncResult, &asyncErrno)
 }
 
 //go:noinline
 func replacement() {
+	for atomic.LoadUint32(&entered) == 0 {
+		runtime.Gosched()
+	}
 	atomic.StoreUint32(&logicalProgress, 1)
-	runtime.Gosched()
 	atomic.StoreUint32(&gate, 1)
 }
 
@@ -955,6 +959,7 @@ func main() {
 	}()
 	foreign()
 	if sum != 42 || atomic.LoadUint32(&gate) != 1 ||
+		atomic.LoadUint32(&entered) != 1 ||
 		atomic.LoadUint32(&logicalProgress) != 1 ||
 		atomic.LoadUint32(&watchdogUsed) != 0 ||
 		asyncResult != 42 || asyncErrno != 0 {

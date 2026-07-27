@@ -51,6 +51,35 @@ func CallReadStacklessCoroForTest(ctx unsafe.Pointer, call func()) {
 	coroCallRead(ctx, call)
 }
 
+func EnterForeignStacklessCoroForTest() {
+	coroEnterForeign()
+}
+
+func ExitForeignStacklessCoroForTest() {
+	coroExitForeign()
+}
+
+func ForeignStateStacklessCoroForTest() (incgo, noCallback bool, ncgo int32) {
+	gp := getg()
+	return gp.m.incgo, gp.nocgocallback, gp.m.ncgo
+}
+
+func BlockingReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte) int {
+	if len(buffer) == 0 {
+		return 0
+	}
+	coroEnterBlocking(ctx)
+	n := read(int32(fd), unsafe.Pointer(&buffer[0]), int32(len(buffer)))
+	coroExitBlocking()
+	KeepAlive(buffer)
+	return int(n)
+}
+
+func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
+	coroEnterBlocking(ctx)
+	coroExitBlocking()
+}
+
 func CheckStacklessCoroOperationRegistryForTest() bool {
 	first := new(stacklessCoroOperation)
 	second := new(stacklessCoroOperation)

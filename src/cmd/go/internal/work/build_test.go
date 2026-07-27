@@ -5,6 +5,7 @@
 package work
 
 import (
+	"internal/buildcfg"
 	"internal/testenv"
 	"io/fs"
 	"os"
@@ -18,6 +19,75 @@ import (
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 )
+
+func TestCgoDirectAssembly(t *testing.T) {
+	oldToolchain := cfg.BuildToolchainName
+	oldExperiment := cfg.Experiment
+	oldGoos := cfg.Goos
+	oldGoarch := cfg.Goarch
+	defer func() {
+		cfg.BuildToolchainName = oldToolchain
+		cfg.Experiment = oldExperiment
+		cfg.Goos = oldGoos
+		cfg.Goarch = oldGoarch
+	}()
+
+	experiment := new(buildcfg.ExperimentFlags)
+	experiment.Coro = true
+	p := &load.Package{PackagePublic: load.PackagePublic{
+		CgoFiles: []string{"cgo.go"},
+	}}
+	cfg.BuildToolchainName = "gc"
+	cfg.Experiment = experiment
+
+	for _, test := range []struct {
+		goos, goarch string
+		want         bool
+	}{
+		{"darwin", "arm64", true},
+		{"linux", "amd64", true},
+		{"darwin", "amd64", false},
+		{"linux", "arm64", false},
+	} {
+		cfg.Goos, cfg.Goarch = test.goos, test.goarch
+		if got := cgoDirectAssembly(p); got != test.want {
+			t.Errorf("cgoDirectAssembly(%s/%s) = %t, want %t",
+				test.goos, test.goarch, got, test.want)
+		}
+	}
+
+	cfg.Goos, cfg.Goarch = "darwin", "arm64"
+	cfg.BuildToolchainName = "gccgo"
+	if cgoDirectAssembly(p) {
+		t.Error("cgoDirectAssembly accepted gccgo")
+	}
+	cfg.BuildToolchainName = "gc"
+	cfg.Experiment = nil
+	if cgoDirectAssembly(p) {
+		t.Error("cgoDirectAssembly accepted a nil experiment")
+	}
+	cfg.Experiment = new(buildcfg.ExperimentFlags)
+	if cgoDirectAssembly(p) {
+		t.Error("cgoDirectAssembly accepted a disabled experiment")
+	}
+	cfg.Experiment = experiment
+	if cgoDirectAssembly(new(load.Package)) {
+		t.Error("cgoDirectAssembly accepted a package without cgo")
+	}
+}
+
+func TestAsmSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	p := &load.Package{PackagePublic: load.PackagePublic{Dir: dir}}
+	if got, want := asmSourcePath(p, "source.s"),
+		filepath.Join(dir, "source.s"); got != want {
+		t.Errorf("asmSourcePath(relative) = %q, want %q", got, want)
+	}
+	absolute := filepath.Join(t.TempDir(), "generated.s")
+	if got := asmSourcePath(p, absolute); got != absolute {
+		t.Errorf("asmSourcePath(absolute) = %q, want %q", got, absolute)
+	}
+}
 
 func TestRemoveDevNull(t *testing.T) {
 	fi, err := os.Lstat(os.DevNull)

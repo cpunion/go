@@ -6,6 +6,6 @@
 
 package runtime
 
-func coroRunOnNativeStack(*stacklessCoroScheduler) bool {
-	return false
+func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
+	return nil
 }

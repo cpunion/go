@@ -258,9 +258,19 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Apply bloop markings.
 	bloop.Walk(typecheck.Target)
 
+	cgoDirectives := typecheck.Target.CgoDirectives
+	if base.Flag.Race || base.Flag.MSan || base.Flag.ASan {
+		// The direct foreign path does not yet reproduce the synchronization
+		// and shadow-memory hooks supplied by the general cgo path.
+		cgoDirectives = nil
+	}
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := coro.Analyze(typecheck.Target.Funcs,
+			cgoDirectives)
+		if err != nil {
+			base.Fatalf("analyzing coroutine plan: %v", err)
+		}
 		if base.Debug.Coro > 1 {
 			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
 			plan.Dump(os.Stderr)
@@ -295,7 +305,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := coro.Analyze(typecheck.Target.Funcs,
+			cgoDirectives)
+		if err != nil {
+			base.Fatalf("analyzing coroutine plan: %v", err)
+		}
 		if err := plan.Verify(); err != nil {
 			base.Fatalf("invalid coroutine plan: %v", err)
 		}

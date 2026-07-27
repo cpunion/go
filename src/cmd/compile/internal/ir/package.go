@@ -31,6 +31,10 @@ type Package struct {
 	// Cgo directives.
 	CgoPragmas [][]string
 
+	// CgoDirectives contains compiler-private direct-call metadata generated
+	// by cmd/cgo. These directives are not passed to the linker.
+	CgoDirectives [][]string
+
 	// Variables with //go:embed lines.
 	Embeds []*Name
 

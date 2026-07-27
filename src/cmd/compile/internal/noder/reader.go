@@ -3529,13 +3529,24 @@ func (r *reader) pkgInit(self *types.Pkg, target *ir.Package) {
 	for i := range cgoPragmas {
 		cgoPragmas[i] = r.Strings()
 	}
-	target.CgoPragmas = cgoPragmas
+	target.CgoPragmas, target.CgoDirectives = partitionCgoPragmas(cgoPragmas)
 
 	r.pkgInitOrder(target)
 
 	r.pkgDecls(target)
 
 	r.Sync(pkgbits.SyncEOF)
+}
+
+func partitionCgoPragmas(pragmas [][]string) (linker, compiler [][]string) {
+	for _, pragma := range pragmas {
+		if len(pragma) != 0 && pragma[0] == "cgo_direct" {
+			compiler = append(compiler, pragma)
+		} else {
+			linker = append(linker, pragma)
+		}
+	}
+	return linker, compiler
 }
 
 // pkgInitOrder creates a synthetic init function to handle any

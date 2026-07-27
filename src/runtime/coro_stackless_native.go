@@ -14,7 +14,6 @@ import (
 )
 
 const (
-	stacklessCoroExecutorCount = 4
 	stacklessCoroSchedulerSize = 64 << 10
 
 	// coroNativeStart runs in a frame entered by mcall on the original g0
@@ -51,18 +50,20 @@ func init() {
 }
 
 // coroRunOnNativeStack runs s on a fixed portion of the current operating
-// system thread stack. The race runtime has its own stack and goroutine
-// bookkeeping, so race builds retain the managed-stack driver for now.
-func coroRunOnNativeStack(s *stacklessCoroScheduler) bool {
+// system thread stack. It returns s reloaded from the heap context after a
+// successful stack switch; callers must not reuse their pre-switch local.
+// The race runtime has its own stack and goroutine bookkeeping, so race builds
+// retain the managed-stack driver for now.
+func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if raceenabled {
-		return false
+		return nil
 	}
 
 	ctx := acquireStacklessCoroNativeContext()
 	gp := getg()
 	if gp != gp.m.curg || gp == gp.m.g0 || gp == gp.m.gsignal {
 		releaseStacklessCoroNativeContext(ctx)
-		return false
+		return nil
 	}
 	if gp.param != nil {
 		releaseStacklessCoroNativeContext(ctx)
@@ -79,10 +80,11 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) bool {
 		throw("runtime: lost stackless coroutine native context")
 	}
 	gp.param = nil
+	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
 	releaseStacklessCoroNativeContext(ctx)
-	return true
+	return scheduler
 }
 
 func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
@@ -251,6 +253,7 @@ func coroNativeFinish(executor *g) {
 	}
 	casgstatus(executor, _Grunning, _Gdead)
 	gcController.addScannableStack(mp.p.ptr(), -int64(executor.stack.hi-executor.stack.lo))
+	resetStacklessCoroExecutor(executor)
 
 	executor.m = nil
 	executor.lockedm = 0
@@ -290,4 +293,20 @@ func coroNativeFinish(executor *g) {
 	mp.g0StackAccurate = g0Accurate
 	schedulerG.m = nil
 	coroNativeGogo(&caller.sched, nativeG0)
+}
+
+// resetStacklessCoroExecutor clears state that execute and gdestroy normally
+// reset for a reused G. In particular, a concurrent stack scan may request a
+// synchronous preemption immediately before the executor becomes dead. That
+// request has no owner after suspendG observes the dead G and must not survive
+// into the next use of this synthetic executor.
+func resetStacklessCoroExecutor(executor *g) {
+	executor.preempt = false
+	executor.preemptStop = false
+	executor.preemptShrink = false
+	executor.syncSafePoint = false
+	executor.asyncSafePoint = false
+	executor.throwsplit = false
+	executor.waitreason = waitReasonZero
+	executor.waitsince = 0
 }

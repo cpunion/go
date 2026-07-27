@@ -33,6 +33,7 @@ type lowerCandidate struct {
 	function     *Function
 	transitions  map[*ir.CallExpr]SiteKind
 	foreignCalls map[*ir.CallExpr]ForeignCallClass
+	directCalls  map[*ir.CallExpr]*ir.Func
 	dependencies map[*ir.Func]bool
 	defers       []*lowerDefer
 	parameters   map[*ir.Name]*ir.Name
@@ -152,7 +153,13 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if candidate == nil {
 			continue
 		}
-		if err := lowerFunction(candidate, candidates); err != nil {
+		var err error
+		if canLowerRunToCompletion(candidate) {
+			err = lowerRunToCompletion(candidate)
+		} else {
+			err = lowerFunction(candidate, candidates)
+		}
+		if err != nil {
 			return result, err
 		}
 		result.Lowered++
@@ -297,11 +304,25 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	edges := make(map[*ir.CallExpr]Edge)
 	for _, edge := range function.Edges {
 		edges[edge.Node] = edge
+		if edge.Kind != DirectCall || edge.Recipe.Kind != SiteInvalid {
+			continue
+		}
+		summary := edge.Imported
+		if callee := plan.Functions[edge.Callee]; callee != nil {
+			summary = FuncSummary{Effect: callee.Effect, Exec: callee.Exec}
+		}
+		if summary.Effect == NoSuspend &&
+			summary.Exec&NeedsSystemABI != 0 {
+			return nil, fmt.Errorf(
+				"direct call to %s requires coroutine factory entry",
+				edge.CalleeName)
+		}
 	}
 	candidate := &lowerCandidate{
 		function:     function,
 		transitions:  make(map[*ir.CallExpr]SiteKind),
 		foreignCalls: make(map[*ir.CallExpr]ForeignCallClass),
+		directCalls:  make(map[*ir.CallExpr]*ir.Func),
 		dependencies: make(map[*ir.Func]bool),
 		defers:       defers,
 	}
@@ -348,6 +369,14 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					site.Foreign, site.ID)
 			}
 			candidate.foreignCalls[call] = site.Foreign
+			edge := edges[call]
+			if edge.Recipe.Direct != "" {
+				if edge.Direct == nil {
+					return nil, fmt.Errorf("missing direct entry %s",
+						edge.Recipe.Direct)
+				}
+				candidate.directCalls[call] = edge.Direct
+			}
 			if site.Foreign != AsyncOperation {
 				continue
 			}
@@ -411,6 +440,318 @@ func newResumeFactory(fn *ir.Func) *ir.Func {
 	factory.DeclareParams(true)
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, factory)
 	return factory
+}
+
+// canLowerRunToCompletion reports whether candidate has to enter a native ABI
+// but never yields logical control. Such functions can retain their structured
+// control flow instead of paying for a state-machine dispatch around every
+// loop iteration.
+func canLowerRunToCompletion(candidate *lowerCandidate) bool {
+	if candidate.function.Effect != NoSuspend || len(candidate.defers) != 0 ||
+		len(candidate.foreignCalls) == 0 {
+		return false
+	}
+	for _, site := range candidate.function.Sites {
+		if site.Kind != SiteForeign ||
+			(site.Foreign != DirectNoBlock && site.Foreign != DirectMayBlock) {
+			return false
+		}
+	}
+
+	// A for post statement cannot be expanded into the enter/call/exit
+	// sequence without changing continue semantics. Keep using the general
+	// lowering until the IR has a dedicated representation for that case.
+	supported := true
+	ir.Visit(candidate.function.Func, func(node ir.Node) {
+		if !supported {
+			return
+		}
+		loop, ok := node.(*ir.ForStmt)
+		if !ok || loop.Post == nil {
+			return
+		}
+		ir.Visit(loop.Post, func(node ir.Node) {
+			if call, ok := node.(*ir.CallExpr); ok &&
+				candidate.foreignCalls[call] != NotForeign {
+				supported = false
+			}
+		})
+	})
+	return supported
+}
+
+// lowerRunToCompletion builds a single-invocation resume closure. Foreign
+// calls are instrumented in place, so ordinary blocks, branches, and loops
+// retain their source control flow.
+func lowerRunToCompletion(candidate *lowerCandidate) error {
+	fn := candidate.function.Func
+	factory := candidate.factory
+	resumeType := factory.Type().Result(0).Type
+	pos := fn.Pos()
+
+	// Source locals become factory locals. Returning the closure then places
+	// the captured slots in a typed, GC-scanned heap object.
+	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
+	for _, name := range fn.Dcl {
+		switch name.Class {
+		case ir.PAUTO, ir.PAUTOHEAP:
+			name.Curfn = factory
+			factory.Dcl = append(factory.Dcl, name)
+		default:
+			fnDcl = append(fnDcl, name)
+		}
+	}
+	fn.Dcl = fnDcl
+
+	var declarations ir.Nodes
+	for _, result := range candidate.resultValues {
+		declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, result))
+	}
+	declared := make(map[*ir.Name]bool)
+	addDeclaration := func(decl *ir.Decl) {
+		name := decl.X.Canonical()
+		if !declared[name] {
+			declared[name] = true
+			declarations = append(declarations, decl)
+		}
+	}
+
+	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
+		typecheck.Target, 0)
+	// A native executor stack is fixed and cannot satisfy morestack. Calls
+	// made by the resume function retain their own stack checks, so exhausting
+	// the executor budget fails in the runtime instead of copying the stack.
+	resume.Pragma |= ir.Nosplit
+	resume.DeclareParams(true)
+	ctx := resume.Dcl[0]
+
+	captured := make(map[*ir.Name]*ir.Name)
+	capture := func(name *ir.Name) *ir.Name {
+		name = name.Canonical()
+		if closure := captured[name]; closure != nil {
+			return closure
+		}
+		// Initializers execute after the closure has been created. Force
+		// capture by reference, rather than loading an uninitialized slot.
+		name.Defn = nil
+		closure := ir.NewClosureVar(name.Pos(), resume, name)
+		captured[name] = closure
+		return closure
+	}
+
+	var edit func(ir.Node) ir.Node
+	edit = func(node ir.Node) ir.Node {
+		switch node := node.(type) {
+		case *ir.Decl:
+			addDeclaration(node)
+			return ir.NewBlockStmt(node.Pos(), nil)
+		case *ir.AssignStmt:
+			node.Def = false
+		case *ir.AssignListStmt:
+			node.Def = false
+		case *ir.CallExpr:
+			if direct := candidate.directCalls[node]; direct != nil {
+				node.Fun = direct.Nname
+			}
+		}
+		if name, ok := node.(*ir.Name); ok {
+			if parameter := candidate.parameters[name.Canonical()]; parameter != nil {
+				return capture(parameter)
+			}
+			if result := candidate.results[name.Canonical()]; result != nil {
+				return capture(result)
+			}
+			switch name.Class {
+			case ir.PAUTO, ir.PAUTOHEAP, ir.PPARAM, ir.PPARAMOUT:
+				if name.Curfn == factory || name.Canonical().Curfn == factory {
+					return capture(name)
+				}
+			}
+			return node
+		}
+		ir.EditChildren(node, edit)
+		return node
+	}
+
+	complete := func(at src.XPos) ir.Nodes {
+		body := make(ir.Nodes, 0, len(candidate.resultValues)+1)
+		for i, value := range candidate.resultValues {
+			pointer := capture(candidate.resultPtrs[i])
+			body = append(body, ir.NewAssignStmt(at,
+				ir.NewStarExpr(at, pointer), capture(value)))
+		}
+		return append(body, ir.NewReturnStmt(at, []ir.Node{
+			typedInt(at, types.Types[types.TUINT8], int64(actionComplete)),
+		}))
+	}
+
+	var rewriteList func(ir.Nodes) (ir.Nodes, error)
+	rewriteList = func(list ir.Nodes) (ir.Nodes, error) {
+		body := make(ir.Nodes, 0, len(list))
+		for _, stmt := range list {
+			switch stmt := stmt.(type) {
+			case *ir.Decl:
+				addDeclaration(stmt)
+				continue
+
+			case *ir.ReturnStmt:
+				init, err := rewriteList(ir.TakeInit(stmt))
+				if err != nil {
+					return nil, err
+				}
+				body = append(body, init...)
+				if len(stmt.Results) != 0 {
+					lhs := make(ir.Nodes, len(candidate.resultValues))
+					rhs := make(ir.Nodes, len(stmt.Results))
+					for i, result := range candidate.resultValues {
+						lhs[i] = capture(result)
+						rhs[i] = edit(stmt.Results[i])
+					}
+					if len(lhs) == 1 {
+						body = append(body, ir.NewAssignStmt(stmt.Pos(),
+							lhs[0], rhs[0]))
+					} else {
+						body = append(body, ir.NewAssignListStmt(stmt.Pos(),
+							ir.OAS2, lhs, rhs))
+					}
+				}
+				body = append(body, complete(stmt.Pos())...)
+				continue
+
+			case *ir.BlockStmt:
+				init, err := rewriteList(ir.TakeInit(stmt))
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetInit(init)
+				stmt.List, err = rewriteList(stmt.List)
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetTypecheck(0)
+				body = append(body, stmt)
+				continue
+
+			case *ir.IfStmt:
+				init, err := rewriteList(ir.TakeInit(stmt))
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetInit(init)
+				stmt.Cond = edit(stmt.Cond)
+				stmt.Body, err = rewriteList(stmt.Body)
+				if err != nil {
+					return nil, err
+				}
+				stmt.Else, err = rewriteList(stmt.Else)
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetTypecheck(0)
+				body = append(body, stmt)
+				continue
+
+			case *ir.ForStmt:
+				init, err := rewriteList(ir.TakeInit(stmt))
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetInit(init)
+				if stmt.Cond != nil {
+					stmt.Cond = edit(stmt.Cond)
+				}
+				if stmt.Post != nil {
+					stmt.Post = edit(stmt.Post)
+				}
+				stmt.Body, err = rewriteList(stmt.Body)
+				if err != nil {
+					return nil, err
+				}
+				stmt.SetTypecheck(0)
+				body = append(body, stmt)
+				continue
+			}
+
+			init, err := rewriteList(ir.TakeInit(stmt))
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, init...)
+
+			foreign := NotForeign
+			var foreignCall *ir.CallExpr
+			multipleForeignCalls := false
+			ir.Visit(stmt, func(node ir.Node) {
+				call, ok := node.(*ir.CallExpr)
+				if !ok || candidate.foreignCalls[call] == NotForeign {
+					return
+				}
+				if foreignCall != nil {
+					multipleForeignCalls = true
+					return
+				}
+				foreignCall = call
+				foreign = candidate.foreignCalls[call]
+			})
+			if multipleForeignCalls {
+				return nil, fmt.Errorf("%s: multiple foreign calls in one statement",
+					ir.PkgFuncName(fn))
+			}
+			if foreignCall == nil {
+				body = append(body, edit(stmt))
+				continue
+			}
+
+			callInit, err := rewriteList(ir.TakeInit(foreignCall))
+			if err != nil {
+				return nil, err
+			}
+			body = append(body, callInit...)
+			for i, arg := range foreignCall.Args {
+				arg = edit(arg)
+				if arg.Type() == nil {
+					return nil, fmt.Errorf("%s: foreign argument %d has no type",
+						ir.PkgFuncName(fn), i)
+				}
+				temp := typecheck.TempAt(arg.Pos(), resume, arg.Type())
+				body = append(body, ir.NewAssignStmt(arg.Pos(), temp, arg))
+				foreignCall.Args[i] = temp
+			}
+
+			edited := edit(stmt)
+			switch foreign {
+			case DirectNoBlock:
+				body = append(body,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroEnterForeign"), nil, false),
+					edited,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroExitForeign"), nil, false),
+				)
+			case DirectMayBlock:
+				body = append(body,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroEnterBlocking"),
+						ir.Nodes{ctx}, false),
+					edited,
+					typecheck.Call(stmt.Pos(),
+						typecheck.LookupRuntime("coroExitBlocking"), nil, false),
+				)
+			default:
+				return nil, fmt.Errorf("%s: unsupported foreign call %s",
+					ir.PkgFuncName(fn), foreign)
+			}
+		}
+		return body, nil
+	}
+
+	body, err := rewriteList(fn.Body)
+	if err != nil {
+		return err
+	}
+	resume.Body = append(body, complete(pos)...)
+	finishLowering(candidate, resume, declarations, nil)
+	return nil
 }
 
 func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCandidate) error {
@@ -657,6 +998,10 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 			node.Def = false
 		case *ir.AssignListStmt:
 			node.Def = false
+		case *ir.CallExpr:
+			if direct := candidate.directCalls[node]; direct != nil {
+				node.Fun = direct.Nname
+			}
 		}
 		if name, ok := node.(*ir.Name); ok {
 			if parameter := candidate.parameters[name.Canonical()]; parameter != nil {
@@ -675,6 +1020,27 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		}
 		ir.EditChildren(node, edit)
 		return node
+	}
+
+	prepareForeignCall := func(stmt ir.Node, call *ir.CallExpr) (ir.Nodes, error) {
+		var before ir.Nodes
+		for _, init := range ir.TakeInit(stmt) {
+			before = append(before, edit(init))
+		}
+		for _, init := range ir.TakeInit(call) {
+			before = append(before, edit(init))
+		}
+		for i, arg := range call.Args {
+			arg = edit(arg)
+			if arg.Type() == nil {
+				return nil, fmt.Errorf("%s: foreign argument %d has no type",
+					ir.PkgFuncName(fn), i)
+			}
+			temp := typecheck.TempAt(arg.Pos(), resume, arg.Type())
+			before = append(before, ir.NewAssignStmt(arg.Pos(), temp, arg))
+			call.Args[i] = temp
+		}
+		return before, nil
 	}
 
 	// Go/defer normalization has already moved each deferred call into a
@@ -719,17 +1085,24 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 				continue
 			}
 			foreign := NotForeign
+			var foreignCall *ir.CallExpr
+			multipleForeignCalls := false
 			ir.Visit(stmt, func(node ir.Node) {
 				call, ok := node.(*ir.CallExpr)
 				if !ok || candidate.foreignCalls[call] == NotForeign {
 					return
 				}
-				if foreign != NotForeign && foreign != candidate.foreignCalls[call] {
-					foreign = AsyncOperation
+				if foreignCall != nil {
+					multipleForeignCalls = true
 					return
 				}
+				foreignCall = call
 				foreign = candidate.foreignCalls[call]
 			})
+			if multipleForeignCalls {
+				return fmt.Errorf("%s: multiple foreign calls in one statement",
+					ir.PkgFuncName(fn))
+			}
 			if goStmt, ok := stmt.(*ir.GoDeferStmt); ok {
 				if call, ok := goStmt.Call.(*ir.CallExpr); ok &&
 					candidate.transitions[call] == SiteSpawn {
@@ -742,6 +1115,13 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 						ir.Nodes{ctx, child}, false))
 					continue
 				}
+			}
+			if foreignCall != nil {
+				before, err := prepareForeignCall(stmt, foreignCall)
+				if err != nil {
+					return err
+				}
+				body = append(body, before...)
 			}
 			edited := edit(stmt)
 			switch foreign {
@@ -761,15 +1141,15 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 				body = append(body,
 					typecheck.Call(stmt.Pos(),
 						typecheck.LookupRuntime("coroEnterBlocking"),
-						nil, false),
+						ir.Nodes{ctx}, false),
 					edited,
 					typecheck.Call(stmt.Pos(),
 						typecheck.LookupRuntime("coroExitBlocking"),
 						nil, false),
 				)
 			default:
-				return fmt.Errorf("%s: multiple foreign calls in one statement",
-					ir.PkgFuncName(fn))
+				return fmt.Errorf("%s: unsupported foreign call %s",
+					ir.PkgFuncName(fn), foreign)
 			}
 		}
 
@@ -970,6 +1350,16 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		}),
 	}, false)}
 
+	finishLowering(candidate, resume, declarations, readAssignments)
+	return nil
+}
+
+func finishLowering(candidate *lowerCandidate, resume *ir.Func,
+	declarations ir.Nodes, readAssignments []*ir.AssignListStmt) {
+	fn := candidate.function.Func
+	factory := candidate.factory
+	pos := fn.Pos()
+
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = resume
 	typecheck.Stmts(resume.Body)
@@ -1000,7 +1390,6 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 
 	// The source inline body no longer describes the physical primary.
 	fn.Inl = nil
-	return nil
 }
 
 func edgeForCall(function *Function, call *ir.CallExpr) Edge {

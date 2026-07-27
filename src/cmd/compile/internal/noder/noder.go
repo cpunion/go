@@ -161,6 +161,7 @@ var allowedStdPragmas = map[string]bool{
 	"go:cgo_import_dynamic": true,
 	"go:cgo_ldflag":         true,
 	"go:cgo_dynamic_linker": true,
+	"go:cgo_direct":         true,
 	"go:embed":              true,
 	"go:fix":                true,
 	"go:generate":           true,
