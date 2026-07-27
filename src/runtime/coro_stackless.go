@@ -107,8 +107,7 @@ func coroRun(resume stacklessCoroResume) {
 	s.root = root
 	s.ready(root, false)
 
-	if coroRunOnNativeStack(s) {
-		s.stopReplacementExecutors()
+	if coroRunOnNativeStack(s, true) {
 		return
 	}
 	s.run(false)
@@ -424,7 +423,7 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 func (s *stacklessCoroScheduler) replacementExecutor() {
 	<-s.executorWake
 	if !s.rootComplete() {
-		if !coroRunOnNativeStack(s) {
+		if !coroRunOnNativeStack(s, false) {
 			s.run(false)
 		}
 	}

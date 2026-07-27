@@ -52,7 +52,7 @@ func init() {
 // coroRunOnNativeStack runs s on a fixed portion of the current operating
 // system thread stack. The race runtime has its own stack and goroutine
 // bookkeeping, so race builds retain the managed-stack driver for now.
-func coroRunOnNativeStack(s *stacklessCoroScheduler) bool {
+func coroRunOnNativeStack(s *stacklessCoroScheduler, stopReplacements bool) bool {
 	if raceenabled {
 		return false
 	}
@@ -78,6 +78,12 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) bool {
 		throw("runtime: lost stackless coroutine native context")
 	}
 	gp.param = nil
+	if stopReplacements {
+		// Use the scheduler saved in the heap context across the synthetic
+		// stack switch. In particular, do not reload the caller's pre-switch
+		// local on amd64.
+		ctx.scheduler.stopReplacementExecutors()
+	}
 	ctx.scheduler = nil
 	ctx.caller = nil
 	releaseStacklessCoroNativeContext(ctx)
