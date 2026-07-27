@@ -55,6 +55,8 @@ jobs:
         run: >-
           ./bin/go test -count=1
           cmd/compile/...
+          cmd/cgo
+          cmd/go/internal/work
           internal/pkgbits
           internal/buildcfg
           runtime
@@ -71,9 +73,19 @@ jobs:
         run: >-
           ./bin/go test -count=1
           cmd/compile/...
+          cmd/cgo
+          cmd/go/internal/work
           internal/pkgbits
           internal/buildcfg
           runtime
+
+      - name: Test transparent cgo direct calls
+        env:
+          GOEXPERIMENT: coro
+        run: |
+          ./bin/go test -count=1 cmd/go -run '^TestScript/cgo_coro_direct_metadata$'
+          ./bin/go test -count=1 internal/runtime/cgobench -run '^TestCalls$' \
+            -gcflags=internal/runtime/cgobench='-l -d=coro=4'
 
       - name: Test coroutine operation races
         env:

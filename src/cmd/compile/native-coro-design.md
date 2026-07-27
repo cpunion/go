@@ -1,8 +1,9 @@
 # Native Stackless Coroutine Design
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
-`-d=coro=4`; fixed direct defer normal-completion and operation-progress
-validation follow-ups implemented; not production-ready
+`-d=coro=4`; transparent scalar cgo direct calls, fixed direct defer
+normal-completion, and operation-progress follow-ups implemented; not
+production-ready
 
 Last updated: 2026-07-27
 
@@ -49,8 +50,9 @@ frame or logical goroutine pointer. It publishes a stable operation identity
 and requests scheduler service. Only the scheduler can resume or destroy a
 frame.
 
-The design deliberately retains the semantic contracts developed for the
-LLGo coroutine runtime:
+LLGo is used as a risk inventory, not as a contract or implementation source.
+The Go experiment keeps only the minimal execution invariants that are needed
+for correctness:
 
 - a logical goroutine is a chain of stackless frames;
 - the scheduler is the sole continuation executor;
@@ -60,8 +62,12 @@ LLGo coroutine runtime:
   transactions;
 - blocking foreign calls may occupy native threads, while replacement native
   threads continue managed work;
-- timer, poll, worker, channel, and host completion all publish facts through
-  the same scheduler boundary.
+- a completion source publishes a fact through one scheduler boundary.
+
+Capabilities are added only when an executable example demonstrates the need.
+They should use existing Go compiler and runtime mechanisms, or one small
+typed internal interface. The experiment does not copy LLGo's annotation
+vocabulary, per-call policy matrix, or parallel runtime abstraction.
 
 The physical implementation is different. LLVM handles and CoroSplit frames
 are replaced by typed Go heap objects, a program counter, generated resume
@@ -105,7 +111,7 @@ micro-optimization.
 For a supported direct call, the generated path must:
 
 - use the platform C ABI;
-- avoid a cgo-generated Go wrapper and C wrapper;
+- avoid the general cgo Go and C argument-frame wrappers;
 - avoid `runtime.cgocall`;
 - avoid `runtime.asmcgocall` and its per-call switch to `m.g0`;
 - avoid the general cgo callback path when completion only needs to wake a
@@ -747,9 +753,21 @@ The first generated metadata is limited to non-variadic integer and pointer
 signatures with at most six parameters and one result. A declaration must use
 the existing `#cgo nocallback` contract. `#cgo noescape` remains an independent
 escape-analysis optimization. Unsupported declarations retain the ordinary
-cgo path in compatibility mode. Tests and benchmarks that require a direct
-call use a strict mode that rejects fallback, so the performance result cannot
-silently measure cgo.
+cgo path in compatibility mode. Integration tests assert both the metadata and
+the selected symbols in disassembly, so a fallback cannot silently become a
+direct-call performance result.
+
+`cmd/cgo` emits a typed external bridge in the same C translation unit as the
+preamble. This makes `static` and inline declarations visible to the generated
+assembly entry without using the general argument-frame wrapper. The bridge
+has the exact C signature and is expected to tail-call the declaration; object
+inspection verifies that the hot path still contains no `runtime.cgocall` or
+`runtime.asmcgocall`.
+
+The transparent path is currently emitted only for Darwin/arm64 and
+Linux/amd64. Race, memory-sanitizer, and address-sanitizer builds deliberately
+ignore the direct metadata and retain ordinary cgo, because the direct
+executor path does not yet provide equivalent sanitizer hooks.
 
 ### 10.7 Pointer and callback safety
 
@@ -771,8 +789,16 @@ For later typed calls:
 ### 10.8 Annotation policy
 
 The Go implementation does not adopt LLGo's distributed `//llgo:coro`
-directives. Suspension and executor requirements propagate through Go calls
-from compiler-owned operations and generated C-boundary metadata.
+directives. Review of `cpunion/llgo:llvm-coro` found that scheduler, worker,
+reentry, affinity, memory, result, and foreign-progress policy had spread into
+source annotations and a multi-part contract vocabulary. Porting that
+vocabulary would move its maintenance burden into the Go tree.
+
+Instead, suspension and executor requirements propagate through the compiler
+call graph from compiler-owned operations and versioned C-boundary metadata.
+The frontend reuses only the existing `#cgo nocallback` and `#cgo noescape`
+contracts. No Go source annotation is required for coloring, scheduler waits,
+worker dispatch, or result projection.
 
 Most synchronous supported C calls are conservatively `DirectMayBlock`.
 Neither a C signature nor `#cgo nocallback` proves bounded execution time. The
@@ -785,6 +811,33 @@ Those APIs use small typed adapters that create an operation record and become
 suspension seeds. Their Go callers are still colored automatically. Worker
 arity, result projection, and propagation are derived from types and operation
 recipes, not maintained as source annotations.
+
+### 10.9 Cross-package entry boundary
+
+The current safe cross-package behavior calls the ordinary exported wrapper,
+which creates and runs one coroutine root. It preserves the normal Go ABI and
+requires no extra source contract, but root allocation dominates a small C
+leaf when repeated for every call.
+
+A function that is itself being lowered must not call that wrapper recursively
+from a native executor. Until a factory entry exists, analysis rejects such a
+candidate and leaves its source body on the ordinary compatibility path. This
+prevents hidden nested roots from exhausting the fixed native-context pool.
+
+The measured implementation must not hide this cost by batching only. The
+benchmark therefore separates:
+
+- `Steady`: many foreign calls inside one already-created root;
+- `Entry`: one exported Go call and one new root per foreign call.
+
+A possible later optimization is a versioned compiler-private capability in
+Unified IR that states that a deterministic coroutine factory symbol was
+emitted. A coroutine caller could call that factory directly, while ordinary
+callers retain the normal wrapper. Missing, stale, generic, or incompatible
+capabilities would fail closed to the wrapper. This would not require a source
+annotation, but it is a new internal ABI and is intentionally not implemented
+in this change. Factory reachability, results, generics, inlining, and nested
+root behavior need a separate design review before selecting it.
 
 ## 11. Language and runtime integration
 
@@ -1083,7 +1136,7 @@ Go/no-go evidence:
 - disassembly shows a direct C symbol call or a compiler-generated leaf ABI
   shim;
 - the hot path has no `runtime.cgocall`, `runtime.asmcgocall`, `_cgo_Cfunc_*`,
-  or cgo-generated C wrapper;
+  or general cgo argument-frame wrapper;
 - a blocking C call does not stop another logical G at an execution quota of
   one;
 - callback or worker completion carries only operation identity and scalar
@@ -1140,8 +1193,13 @@ The direct-call benchmark compares the same non-inlined scalar C function
 through:
 
 - ordinary cgo;
-- the new `DirectNoBlock` path;
-- a pure Go call as a lower-bound reference.
+- transparent `DirectMayBlock`, which is the conservative default;
+- compiler-owned `DirectNoBlock`, as the upper bound for a future explicit
+  bounded-call contract.
+
+Each path is measured both in steady state inside one root and, where
+applicable, with root entry on every exported call. Mixing the two would make
+the result depend more on benchmark shape than on the foreign boundary.
 
 Report at least:
 
@@ -1173,7 +1231,9 @@ The MVP is accepted only if:
 - blocking C compensation works at managed execution quota one;
 - GC stress and operation-race tests pass;
 - timer, file, and TCP probes use the common operation protocol;
-- unsupported behavior is rejected rather than silently falling back;
+- unsupported coroutine semantics are rejected rather than miscompiled;
+  unsupported direct-cgo declarations retain the ordinary compatibility path
+  and direct-path tests assert symbol selection;
 - the implementation has no LLVM build or runtime dependency.
 
 ## 15. MVP implementation report
@@ -1216,10 +1276,22 @@ The runtime:
 - keeps the stackless scheduler runnable while a timer, file worker, or socket
   poll operation is pending; blocking file work releases its P and socket work
   parks through netpoll;
-- issues the MVP scalar C calls through System ABI assembly shims without
-  `runtime.cgocall`, `runtime.asmcgocall`, or a cgo-generated wrapper;
+- issues supported scalar C calls through System ABI assembly shims and typed
+  visibility bridges without `runtime.cgocall`, `runtime.asmcgocall`, or the
+  general cgo argument-frame wrappers;
 - releases scheduler capacity around a blocking C call, allowing another
   stackless logical goroutine to run at `GOMAXPROCS=1`.
+
+The transparent cgo frontend:
+
+- emits versioned direct-call metadata and assembly only under the coroutine
+  experiment on Darwin/arm64 and Linux/amd64;
+- requires the existing `#cgo nocallback` declaration and conservatively
+  classifies it as `DirectMayBlock`;
+- supports up to six integer or pointer parameters and one scalar result;
+- preserves ordinary cgo for unsupported declarations and sanitizer builds;
+- emits a typed bridge in the preamble translation unit, so `static`
+  declarations work without exposing a new user annotation.
 
 The race build retains the operation-state tests but deliberately uses the
 managed-stack fallback. The race runtime is not yet prepared to instrument
@@ -1237,6 +1309,9 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   preemption, traceback, trace output, and deterministic fixed-stack overflow;
 - 10,000 native-context reuse cycles concurrent with forced GC, repeated 20
   times on each target;
+- 50,000 blocking-boundary root entries concurrent with 100 forced GCs,
+  repeated 10 times on Darwin/arm64; this covers stale preemption state when a
+  synthetic executor becomes dead and is reused;
 - yield, structured child await, 100,000 spawned logical goroutines, timer
   fire/cancel races, regular-file success/error/EOF, socket
   success/EOF/deadline/close, and asynchronous C success/error paths;
@@ -1255,11 +1330,13 @@ Silicon. Its correctness and allocation results are useful, but its latency
 must not be compared directly with a native amd64 host. Native Linux and
 Darwin jobs remain CI acceptance gates.
 
-Changed Go production statements are 93.2% covered by the focused compiler and
-runtime profiles. The changed lowering statements are 92.0% covered. The
-remaining lines are defensive invariant failures or platform signal branches;
-the corresponding behavior is also exercised by integration tests where
-coverage instrumentation cannot be used.
+The focused profiles cover 90.7% of instrumentable changed production lines
+across `cmd/cgo`, the compiler, runtime, and `cmd/go` plumbing. Excluding the
+small `cmd/go` execution hooks that are exercised in a subprocess by the
+end-to-end script, core coverage is 92.0%. The new generated-call helpers and
+benchmark wrappers are 99.5% and 100% covered; run-to-completion lowering is
+88.4% covered and its eligibility predicate is 100% covered. Remaining lines
+are defensive invariant failures or subprocess-only build plumbing.
 
 ### 15.3 Measurements
 
@@ -1291,6 +1368,27 @@ reported two lowered functions and no skipped functions.
 | ordinary cgo | 16.53-16.62 ns | 26.81-26.97 ns | 0 B/op |
 | pure Go reference | 0.767-0.772 ns | 1.04-1.06 ns | 0 B/op |
 
+The transparent-cgo follow-up adds a separate benchmark in
+`internal/runtime/cgobench`. A Darwin/arm64 sample on an Apple M4 Max used five
+300 ms runs for latency and three 200 ms runs for allocation:
+
+| Shape | Path | Median | Allocation |
+| --- | --- | ---: | ---: |
+| steady | ordinary cgo | 13.49 ns | 0 B/op, 0 allocs/op |
+| steady | transparent `DirectMayBlock` | 13.96 ns | 0 B/op, 0 allocs/op |
+| steady | compiler-owned `DirectNoBlock` | 4.46 ns | 0 B/op, 0 allocs/op |
+| entry | ordinary cgo | 14.27 ns | 0 B/op, 0 allocs/op |
+| entry | transparent `DirectMayBlock` | 1.08 us | 448 B/op, 5 allocs/op |
+| entry | compiler-owned `DirectNoBlock` | 1.07 us | 504 B/op, 8 allocs/op |
+
+The conservative transparent path is therefore near ordinary cgo in steady
+state, not a demonstrated speedup. `DirectNoBlock` shows that avoiding syscall
+scheduler accounting can materially reduce the boundary cost, but a public
+bounded-call contract has not been selected. The entry measurements expose a
+larger unresolved root-creation cost; they are evidence for the separate
+cross-package entry design question in section 10.9, not justification for
+adding source annotations.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
@@ -1306,10 +1404,12 @@ The MVP does not yet support range loops, labeled control flow, dynamic calls,
 interfaces, escaping closures, dynamic or repeated defer, panic/recover,
 Goexit, implicit faults, channels, select, mutex parking, reflection,
 callbacks, variadic C calls, or general C ABI type classification. Direct
-foreign declarations are a fixed internal fixture rather than a user-facing
-cgo facility. Logical traceback, debugger, profiler, race instrumentation on
-native executor stacks, dynamic executor sizing, cancellation of in-flight
-file work, and broad standard-library compatibility remain future work.
+foreign declarations now have a restricted transparent cgo path, but
+floating-point, aggregate, variadic, callback-capable, errno, and non-target
+ABIs retain ordinary cgo. Cross-package factory entry, logical traceback,
+debugger, profiler, race instrumentation on native executor stacks, dynamic
+executor sizing, cancellation of in-flight file work, and broad
+standard-library compatibility remain future work.
 
 ## 16. Work after the MVP
 
@@ -1320,7 +1420,9 @@ The likely order is:
    terminal outcomes and dynamic defer records remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
-4. let `cmd/cgo` emit typed fast-path metadata for safe declarations;
+4. design cross-package factory entry separately, without adding source
+   annotations; transparent `cmd/cgo` metadata for the initial scalar subset
+   is implemented;
 5. add dynamic function values, interfaces, closures, generics, and reflect;
 6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;
@@ -1340,13 +1442,16 @@ The implemented MVP choices are:
    runtime stack, and do not run arbitrary Go code under the `g0` identity.
 2. Keep the existing Go scheduler as the physical M/P/GC scheduler during the
    MVP and add a bounded stackless scheduler above it.
-3. Use internal typed foreign metadata in the MVP; do not freeze a public
-   directive.
+3. Use versioned compiler-private typed foreign metadata; do not port the
+   distributed LLGo annotation vocabulary or freeze a public directive.
 4. Support only scalar and foreign-pointer C signatures without callbacks.
-5. Classify supported unknown-duration C calls as `DirectMayBlock`; reject
-   unsupported signatures instead of silently using cgo.
-6. Permit a compiler-generated leaf ABI shim in the first direct-call slice,
-   while making direct call-site System ABI lowering the long-term target.
+5. Classify supported unknown-duration C calls as `DirectMayBlock`; retain
+   ordinary cgo for unsupported signatures and verify direct-path selection in
+   tests that depend on it.
+6. Permit a compiler-generated leaf ABI shim and typed C visibility bridge in
+   the first direct-call slice, while excluding the general cgo argument-frame
+   wrappers and keeping direct call-site System ABI lowering as the long-term
+   target.
 7. Require timer, regular-file, and TCP paths before calling the work an MVP.
 
 The most important technical risk is the executor stack. It must be a normal
