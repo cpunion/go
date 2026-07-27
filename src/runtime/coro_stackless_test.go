@@ -142,6 +142,40 @@ func TestStacklessCoroSleep(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSleepProgress(t *testing.T) {
+	const delay = 5 * time.Second
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var state int
+	var id uint64
+	var progressed, canceled bool
+	progress := func(unsafe.Pointer) uint8 {
+		progressed = true
+		canceled = runtime.CancelSleepStacklessCoroForTest(id)
+		return runtime.StacklessCoroActionComplete
+	}
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SpawnStacklessCoroForTest(ctx, progress)
+			id = runtime.StartSleepStacklessCoroForTest(ctx, int64(delay))
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if !progressed || !canceled {
+		t.Fatalf("sibling progress = (%v, %v), want (true, true)",
+			progressed, canceled)
+	}
+}
+
 func TestStacklessCoroSleepCancel(t *testing.T) {
 	var state int
 	var id uint64
@@ -237,18 +271,22 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		_, _ = syscall.Write(fds[1], []byte("file"))
-	}()
+
+	progress := make(chan struct{})
+	writeDone := stacklessCoroProgressWrite(fds[1], progress, "file")
 
 	var state, n int
 	var errno uintptr
 	buffer := make([]byte, 4)
+	sibling := func(unsafe.Pointer) uint8 {
+		close(progress)
+		return runtime.StacklessCoroActionComplete
+	}
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
 			state = 1
+			runtime.SpawnStacklessCoroForTest(ctx, sibling)
 			runtime.FileReadStacklessCoroForTest(ctx, fds[0], buffer, &n, &errno)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -259,6 +297,13 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+	write := <-writeDone
+	if write.err != nil {
+		t.Fatal(write.err)
+	}
+	if write.rescued {
+		t.Fatal("file read blocked sibling scheduling")
+	}
 	if n != 4 || errno != 0 || string(buffer) != "file" {
 		t.Fatalf("read = (%d, %d, %q), want (4, 0, %q)",
 			n, errno, buffer, "file")
@@ -312,7 +357,7 @@ func TestStacklessCoroFileReadEmpty(t *testing.T) {
 	}
 }
 
-func TestStacklessCoroSocketRead(t *testing.T) {
+func TestStacklessCoroSocketReadProgress(t *testing.T) {
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -322,18 +367,25 @@ func TestStacklessCoroSocketRead(t *testing.T) {
 	if err := syscall.SetNonblock(fds[0], true); err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		_, _ = syscall.Write(fds[1], []byte("poll"))
-	}()
+
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	progress := make(chan struct{})
+	writeDone := stacklessCoroProgressWrite(fds[1], progress, "poll")
 
 	var state, n int
 	var errno uintptr
 	buffer := make([]byte, 4)
+	sibling := func(unsafe.Pointer) uint8 {
+		close(progress)
+		return runtime.StacklessCoroActionComplete
+	}
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
 			state = 1
+			runtime.SpawnStacklessCoroForTest(ctx, sibling)
 			runtime.SocketReadStacklessCoroForTest(ctx, fds[0], buffer, &n, &errno)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -344,6 +396,13 @@ func TestStacklessCoroSocketRead(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+	write := <-writeDone
+	if write.err != nil {
+		t.Fatal(write.err)
+	}
+	if write.rescued {
+		t.Fatal("socket read blocked sibling scheduling")
+	}
 	if n != 4 || errno != 0 || string(buffer) != "poll" {
 		t.Fatalf("read = (%d, %d, %q), want (4, 0, %q)",
 			n, errno, buffer, "poll")
@@ -485,4 +544,25 @@ func stacklessCoroPipe(t *testing.T) [2]int {
 		t.Fatal(err)
 	}
 	return fds
+}
+
+type stacklessCoroWriteResult struct {
+	err     error
+	rescued bool
+}
+
+func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string) <-chan stacklessCoroWriteResult {
+	done := make(chan stacklessCoroWriteResult, 1)
+	go func() {
+		rescued := false
+		select {
+		case <-progress:
+		case <-time.After(5 * time.Second):
+			// Keep a scheduling regression from hanging the runtime test.
+			rescued = true
+		}
+		_, err := syscall.Write(fd, []byte(data))
+		done <- stacklessCoroWriteResult{err: err, rescued: rescued}
+	}()
+	return done
 }

@@ -568,6 +568,204 @@ func main() {
 	}
 }
 
+func TestOperationProgressLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"net"
+	"os"
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+var timerProgress int32
+var timerObserved int32
+var timerOK bool
+
+var fileProgress int32
+var fileRescued int32
+var fileReader *os.File
+var fileBuffer = make([]byte, 4)
+var fileN int
+var fileErr error
+
+var netProgress int32
+var netRescued int32
+var netReader *net.TCPConn
+var netBuffer = make([]byte, 4)
+var netN int
+var netErr error
+
+//go:noinline
+func timerProgressor() {
+	atomic.StoreInt32(&timerProgress, 1)
+	runtime.Gosched()
+}
+
+//go:noinline
+func timerWaiter() {
+	go timerProgressor()
+	time.Sleep(time.Second)
+	timerOK = atomic.LoadInt32(&timerObserved) != 0
+}
+
+//go:noinline
+func fileProgressor() {
+	atomic.StoreInt32(&fileProgress, 1)
+	runtime.Gosched()
+}
+
+//go:noinline
+func fileWaiter() {
+	go fileProgressor()
+	fileN, fileErr = fileReader.Read(fileBuffer)
+}
+
+//go:noinline
+func netProgressor() {
+	atomic.StoreInt32(&netProgress, 1)
+	runtime.Gosched()
+}
+
+//go:noinline
+func netWaiter() {
+	go netProgressor()
+	netN, netErr = netReader.Read(netBuffer)
+}
+
+func main() {
+	go func() {
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(&timerProgress) != 0 {
+				atomic.StoreInt32(&timerObserved, 1)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	timerWaiter()
+
+	readFile, writeFile, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	defer readFile.Close()
+	defer writeFile.Close()
+	fileReader = readFile
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for atomic.LoadInt32(&fileProgress) == 0 && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if atomic.LoadInt32(&fileProgress) == 0 {
+			atomic.StoreInt32(&fileRescued, 1)
+		}
+		if _, err := writeFile.Write([]byte("file")); err != nil {
+			panic(err)
+		}
+	}()
+	fileWaiter()
+
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		panic(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			panic(err)
+		}
+		accepted <- conn
+	}()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+	server := <-accepted
+	defer server.Close()
+	netReader = server
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for atomic.LoadInt32(&netProgress) == 0 && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if atomic.LoadInt32(&netProgress) == 0 {
+			atomic.StoreInt32(&netRescued, 1)
+		}
+		if _, err := client.Write([]byte("net!")); err != nil {
+			panic(err)
+		}
+	}()
+	netWaiter()
+
+	if !timerOK ||
+		atomic.LoadInt32(&fileRescued) != 0 ||
+		fileN != 4 || fileErr != nil || string(fileBuffer) != "file" ||
+		atomic.LoadInt32(&netRescued) != 0 ||
+		netN != 4 || netErr != nil || string(netBuffer) != "net!" {
+		panic("operation blocked stackless scheduling")
+	}
+	println("stackless-coro-operation-progress-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-progress")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building operation progress test failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered="; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("operation progress test failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-operation-progress-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("listing operation progress symbols failed: %v\n%s", err, data)
+	}
+	symbols := string(data)
+	for _, want := range []string{
+		"main.timerWaiter.coro.func",
+		"main.fileWaiter.coro.func",
+		"main.netWaiter.coro.func",
+	} {
+		if !strings.Contains(symbols, want) {
+			t.Errorf("symbols do not contain %q", want)
+		}
+	}
+}
+
 func TestFixedDeferLowering(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

@@ -1,8 +1,8 @@
 # Native Stackless Coroutine Design
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
-`-d=coro=4`; fixed direct defer normal-completion follow-up implemented; not
-production-ready
+`-d=coro=4`; fixed direct defer normal-completion and operation-progress
+validation follow-ups implemented; not production-ready
 
 Last updated: 2026-07-27
 
@@ -12,7 +12,7 @@ development branch
 Integration branch: `cpunion/go:coro/main`, which receives upstream updates
 from `main` and is the base for coroutine pull requests
 
-Topic branch: `coro/fixed-defer`
+Topic branch: `coro/io-progress`
 
 ## 1. Decision
 
@@ -1182,6 +1182,9 @@ The runtime:
   socket, and asynchronous C completion;
 - makes timer completion and cancellation race for the same operation record,
   so exactly one path readies the waiter;
+- keeps the stackless scheduler runnable while a timer, file worker, or socket
+  poll operation is pending; blocking file work releases its P and socket work
+  parks through netpoll;
 - issues the MVP scalar C calls through System ABI assembly shims without
   `runtime.cgocall`, `runtime.asmcgocall`, or a cgo-generated wrapper;
 - releases scheduler capacity around a blocking C call, allowing another
@@ -1206,6 +1209,13 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - yield, structured child await, 100,000 spawned logical goroutines, timer
   fire/cancel races, regular-file success/error/EOF, socket
   success/EOF/deadline/close, and asynchronous C success/error paths;
+- at `GOMAXPROCS=1`, a sibling stackless task must run before it can cancel a
+  pending timer or release the writer that completes a blocked file or socket
+  read; a five-second rescue makes a scheduling regression fail instead of
+  hanging the runtime test;
+- end-to-end programs apply the same progress gate to ordinary `time.Sleep`,
+  `os.File.Read`, and `net.(*TCPConn).Read` calls and verify that all three
+  waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path.
 
