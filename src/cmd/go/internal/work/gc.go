@@ -413,9 +413,10 @@ func (gcToolchain) asm(b *Builder, a *Action, sfiles []string) ([]string, error)
 
 	var ofiles []string
 	for _, sfile := range sfiles {
-		ofile := a.Objdir + sfile[:len(sfile)-len(".s")] + ".o"
+		name := filepath.Base(sfile)
+		ofile := a.Objdir + name[:len(name)-len(".s")] + ".o"
 		ofiles = append(ofiles, ofile)
-		args1 := append(args, "-o", ofile, fsys.Actual(mkAbs(p.Dir, sfile)))
+		args1 := append(args, "-o", ofile, asmSourcePath(p, sfile))
 		if err := b.Shell(a).run(p.Dir, p.ImportPath, cfgChangedEnv, args1...); err != nil {
 			return nil, err
 		}
@@ -433,7 +434,7 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 			if p.ImportPath == "runtime/cgo" && strings.HasPrefix(sfile, "gcc_") {
 				continue
 			}
-			args = append(args, fsys.Actual(mkAbs(p.Dir, sfile)))
+			args = append(args, asmSourcePath(p, sfile))
 		}
 
 		// Supply an empty go_asm.h as if the compiler had been run.
@@ -456,6 +457,13 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 	}
 
 	return symabis, nil
+}
+
+func asmSourcePath(p *load.Package, file string) string {
+	if filepath.IsAbs(file) {
+		return file
+	}
+	return fsys.Actual(mkAbs(p.Dir, file))
 }
 
 func (gcToolchain) pack(b *Builder, a *Action, afile string, ofiles []string) error {

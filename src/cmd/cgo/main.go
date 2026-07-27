@@ -52,6 +52,7 @@ type Package struct {
 	Preamble    string          // collected preamble for _cgo_export.h
 	noCallbacks map[string]bool // C function names with #cgo nocallback directive
 	noEscapes   map[string]bool // C function names with #cgo noescape directive
+	directCalls []cgoDirectCall // System ABI shims emitted for the coro experiment
 }
 
 // A typedefInfo is an element on Package.typedefList: a typedef name

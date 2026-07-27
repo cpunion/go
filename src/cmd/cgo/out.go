@@ -241,6 +241,7 @@ func (p *Package) writeDefs() {
 			p.writeDefsFunc(fgo2, n, &callsMalloc)
 		}
 	}
+	p.writeDirectAssembly()
 
 	fgcc := creat("_cgo_export.c")
 	fgcch := creat("_cgo_export.h")
@@ -631,6 +632,19 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 
 	if call, ok := p.directCall(n); ok {
 		call.writeDirective(fgo2)
+		direct := *d
+		direct.Name = ast.NewIdent(call.direct)
+		directType := *d.Type
+		direct.Type = &directType
+		if call.result == cgoDirectVoid {
+			direct.Type.Results = nil
+		}
+		if p.noEscapes[n.C] {
+			fmt.Fprintln(fgo2, "//go:noescape")
+		}
+		conf.Fprint(fgo2, fset, &direct)
+		fmt.Fprintln(fgo2)
+		p.directCalls = append(p.directCalls, call)
 	}
 
 	// Wrapper calls into gcc, passing a pointer to the argument frame.
@@ -770,6 +784,9 @@ func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 	if *gccgo {
 		p.writeGccgoOutputFunc(fgcc, n)
 		return
+	}
+	if call, ok := p.directCall(n); ok {
+		p.writeDirectCBridge(fgcc, n, call)
 	}
 
 	ctype, _ := p.structType(n)

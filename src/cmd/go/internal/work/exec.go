@@ -305,7 +305,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 		base.Fatalf("buildActionID: unknown build toolchain %q", cfg.BuildToolchainName)
 	case "gc":
 		fmt.Fprintf(h, "compile %s %q %q\n", b.toolID("compile"), forcedGcflags, p.Internal.Gcflags)
-		if len(p.SFiles) > 0 {
+		if len(p.SFiles) > 0 || cgoDirectAssembly(p) {
 			fmt.Fprintf(h, "asm %q %q %q\n", b.toolID("asm"), forcedAsmflags, p.Internal.Asmflags)
 		}
 
@@ -815,6 +815,7 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 		}
 		cgoObjects = append(cgoObjects, outObj...)
 		gofiles = append(gofiles, outGo...)
+		sfiles = append(sfiles, runCgoPr.goAsmFiles...)
 
 		switch cfg.BuildBuildmode {
 		case "c-archive", "c-shared":
@@ -3002,6 +3003,7 @@ type runCgoProvider struct {
 	notCompatibleForInternalLinking   bool
 	nonGoOverlay                      map[string]string
 	goFiles                           []string // processed cgo files for the compiler
+	goAsmFiles                        []string // generated files for the Go assembler
 }
 
 func (pr *runCgoProvider) cflags() []string {
@@ -3218,7 +3220,7 @@ func (b *Builder) runCgo(ctx context.Context, a *Action) error {
 		return err
 	}
 
-	a.Provider = &runCgoProvider{
+	runCgoPr := &runCgoProvider{
 		CFLAGS:                          str.StringList(cgoCPPFLAGS, cgoCFLAGS),
 		CXXFLAGS:                        str.StringList(cgoCPPFLAGS, cgoCXXFLAGS),
 		FFLAGS:                          str.StringList(cgoCPPFLAGS, cgoFFLAGS),
@@ -3227,8 +3229,21 @@ func (b *Builder) runCgo(ctx context.Context, a *Action) error {
 		nonGoOverlay:                    a.nonGoOverlay,
 		goFiles:                         gofiles,
 	}
+	if cgoDirectAssembly(p) {
+		runCgoPr.goAsmFiles = []string{objdir + "_cgo_direct.s"}
+	}
+	a.Provider = runCgoPr
 
 	return nil
+}
+
+func cgoDirectAssembly(p *load.Package) bool {
+	if cfg.BuildToolchainName != "gc" || cfg.Experiment == nil ||
+		!cfg.Experiment.Coro || !p.UsesCgo() {
+		return false
+	}
+	return cfg.Goos == "darwin" && cfg.Goarch == "arm64" ||
+		cfg.Goos == "linux" && cfg.Goarch == "amd64"
 }
 
 func (b *Builder) processCgoOutputs(a *Action, runCgoProvider *runCgoProvider, cgoExe, objdir string) (outGo, outObj []string, err error) {
