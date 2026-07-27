@@ -1302,10 +1302,27 @@ func TestCrossPackageFactory(t *testing.T) {
 
 import "runtime"
 
+type Counter int
+
+type Base int
+
 //go:noinline
 func Add(value int) int {
 	runtime.Gosched()
 	return value + 1
+}
+
+//go:noinline
+func (counter *Counter) Add(delta int) (int, int) {
+	runtime.Gosched()
+	*counter += Counter(delta)
+	return int(*counter), delta
+}
+
+//go:noinline
+func (base Base) Sum(delta int) int {
+	runtime.Gosched()
+	return int(base) + delta
 }
 
 //go:noinline
@@ -1324,10 +1341,29 @@ func Yield() {
 
 import "example.com/corofactory/leaf"
 
+type Runner struct {
+	Value leaf.Counter
+}
+
+type Calculator int
+
 //go:noinline
 func Add(value int) int {
 	next := leaf.Add(value)
 	return next + 1
+}
+
+//go:noinline
+func (runner *Runner) Run(delta int) int {
+	counter := &runner.Value
+	total, _ := counter.Add(delta)
+	return total + 1
+}
+
+//go:noinline
+func (calculator Calculator) Sum(delta int) int {
+	total := leaf.Base(calculator).Sum(delta)
+	return total + 1
 }
 
 //go:noinline
@@ -1406,6 +1442,15 @@ func main() {
 import "example.com/corofactory/mid"
 
 func main() {
+	var runner mid.Runner
+	if got := runner.Run(41); got != 42 || runner.Value != 41 {
+		println("method-factory-bad")
+		return
+	}
+	if got := mid.Calculator(10).Sum(30); got != 41 {
+		println("value-method-factory-bad")
+		return
+	}
 	value := 0
 	left, right := mid.Pair(&value)
 	if value != 42 || left != 11 || right != 22 {
@@ -1445,12 +1490,20 @@ func main() {
 `)
 	writeFile("rootplain/main.go", `package main
 
-import "example.com/corofactory/leaf"
+import (
+	"example.com/corofactory/leaf"
+	"example.com/corofactory/mid"
+)
 
 func main() {
 	got := leaf.Add(41)
 	if got != 42 {
 		println("ordinary-entry-bad")
+		return
+	}
+	var runner mid.Runner
+	if got := runner.Run(41); got != 42 || runner.Value != 41 {
+		println("ordinary-method-entry-bad")
 		return
 	}
 	println("ordinary-entry-ok")
@@ -1561,6 +1614,60 @@ func main() {
 		}
 	}
 
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.main\.coro\.func[0-9]+$`, pair)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of method factory caller failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, method := range []string{
+		"(*Runner).Run",
+		"Calculator.Sum",
+	} {
+		factory := "example.com/corofactory/mid." + method + ".coro"
+		if !strings.Contains(disassembly, factory) {
+			t.Fatalf("root does not use method factory %s\n%s",
+				factory, disassembly)
+		}
+		if strings.Contains(disassembly,
+			"example.com/corofactory/mid."+method+"(SB)") {
+			t.Fatalf("root uses public method entry %s\n%s",
+				method, disassembly)
+		}
+	}
+
+	for _, method := range []struct {
+		resume string
+		callee string
+	}{
+		{
+			`example.com/corofactory/mid\.\(\*Runner\)\.Run`,
+			"example.com/corofactory/leaf.(*Counter).Add",
+		},
+		{
+			`example.com/corofactory/mid\.Calculator\.Sum`,
+			"example.com/corofactory/leaf.Base.Sum",
+		},
+	} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", method.resume+`\.coro\.func[0-9]+$`, pair)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of method resume failed: %v\n%s", err, data)
+		}
+		disassembly = string(data)
+		factory := method.callee + ".coro"
+		if !strings.Contains(disassembly, factory) {
+			t.Fatalf("method resume does not use method factory %s\n%s",
+				factory, disassembly)
+		}
+		if strings.Contains(disassembly, method.callee+"(SB)") {
+			t.Fatalf("method resume uses public method entry %s\n%s",
+				method.callee, disassembly)
+		}
+	}
+
 	multiFallback := filepath.Join(tmp, "multi-fallback")
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", multiFallback,
@@ -1646,7 +1753,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("objdump of ordinary entry failed: %v\n%s", err, data)
 	}
-	disassembly := string(data)
+	disassembly = string(data)
 	if !strings.Contains(disassembly,
 		"example.com/corofactory/leaf.Add(SB)") {
 		t.Fatalf("ordinary caller does not use the public Go entry\n%s",
@@ -1655,6 +1762,16 @@ func main() {
 	if strings.Contains(disassembly,
 		"example.com/corofactory/leaf.Add.coro") {
 		t.Fatalf("ordinary caller uses the private factory entry\n%s",
+			disassembly)
+	}
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/mid.(*Runner).Run(SB)") {
+		t.Fatalf("ordinary caller does not use the public method entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/mid.(*Runner).Run.coro") {
+		t.Fatalf("ordinary caller uses the private method factory\n%s",
 			disassembly)
 	}
 
