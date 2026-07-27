@@ -57,6 +57,7 @@ jobs:
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
+          go/build
           internal/pkgbits
           internal/buildcfg
           runtime
@@ -75,6 +76,7 @@ jobs:
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
+          go/build
           internal/pkgbits
           internal/buildcfg
           runtime
