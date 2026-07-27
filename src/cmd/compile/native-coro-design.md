@@ -822,8 +822,8 @@ The current Unified IR summary format records one `FactoryABI` value. Version
 1 derives all other information from the imported Go function type:
 
 ```text
-func(P0, ..., Pn) R
-    -> func(P0, ..., Pn, *R) func(unsafe.Pointer) uint8
+func(P0, ..., Pn) (R0, ..., Rm)
+    -> func(P0, ..., Pn, *R0, ..., *Rm) func(unsafe.Pointer) uint8
 
 func(P0, ..., Pn)
     -> func(P0, ..., Pn) func(unsafe.Pointer) uint8
@@ -835,18 +835,26 @@ worker policy, or source annotation. The importer reconstructs the type and
 symbol only after validating the capability.
 
 Factory ABI 1 is intentionally narrow. It supports top-level, non-variadic,
-non-generic functions with zero or one result. Methods, closures, generic
-shapes, multiple results, missing capabilities, and the legacy summary format
+non-generic functions and derives one typed result pointer per result. Methods,
+closures, generic shapes, missing capabilities, and the legacy summary format
 do not produce an imported factory reference. The caller is removed from the
 lowering candidate fixed point and retains its ordinary source body. The same
 fallback propagates to its lowered callers, so an unsupported leaf cannot
 leave a partially transformed call chain.
 
-No-result calls and discarded single results are supported. A discarded
-awaited result uses a typed parent-frame slot. A spawned call with results is
-rejected because the child may outlive the parent slot. Multiple results need
-the general expression-init suspension lowering; they are not added to this
-ABI as a special case.
+This extension does not require another summary ABI value. An older importer
+already rejects a version-1 factory when the Go signature has multiple
+results, while older archives never advertise a factory for such a function.
+Mixed compiler versions therefore retain the ordinary entry in either
+direction.
+
+No-result calls and discarded results are supported. A discarded awaited
+result uses a typed parent-frame slot. Direct assignments may receive multiple
+results when every non-blank target is a variable. Calls nested in another
+expression and assignments with complex left operands retain the ordinary
+entry until general expression-init and assignment suspension lowering
+preserves their evaluation order. A spawned call with results is rejected
+because the child may outlive the parent slot.
 
 The previous summary version is decoded as an effect and execution summary
 with no factory capability. An unknown factory ABI is treated as unavailable;
@@ -1358,13 +1366,14 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
-- a real three-package call chain covering a returned value, a discarded
-  value, a no-result call, and reuse of one imported factory; disassembly
-  verifies private factory calls and the absence of ordinary wrappers or
-  `runtime.coroRun` inside the lowered resumes;
-- ordinary callers, missing capabilities, and a multiple-result function
-  retain the public Go entry and execute correctly; decoder tests verify that
-  the legacy summary format carries no factory capability.
+- a real three-package call chain covering single and multiple results, blank
+  and discarded results, a no-result call, and reuse of one imported factory;
+  disassembly verifies private factory calls and the absence of ordinary
+  wrappers or `runtime.coroRun` inside the lowered resumes;
+- ordinary callers, missing capabilities, nested multi-result expressions,
+  and complex multi-result targets retain the public Go entry and execute
+  correctly; decoder tests verify that the legacy summary format carries no
+  factory capability.
 
 The Linux/amd64 local run used an amd64 OrbStack guest translated on Apple
 Silicon. Its correctness and allocation results are useful, but its latency
@@ -1462,9 +1471,10 @@ callbacks, variadic C calls, or general C ABI type classification. Direct
 foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
 ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes methods,
-closures, variadic functions, generic shapes, and multiple results; those
-remain on the ordinary entry until the corresponding general call and
-expression lowering exists. Logical traceback, debugger, profiler, race
+closures, variadic functions, and generic shapes. Nested expression calls and
+complex result targets remain on the ordinary entry until the corresponding
+general expression and assignment lowering exists. Logical traceback,
+debugger, profiler, race
 instrumentation on native executor stacks, dynamic executor sizing,
 cancellation of in-flight file work, and broad standard-library compatibility
 remain future work.

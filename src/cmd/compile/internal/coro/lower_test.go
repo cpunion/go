@@ -80,8 +80,8 @@ func TestResumeFactorySupported(t *testing.T) {
 	}
 	pair := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Pair"),
 		types.NewSignature(nil, nil, results))
-	if resumeFactorySupported(pair) {
-		t.Fatal("multi-result function supports a resume factory")
+	if !resumeFactorySupported(pair) {
+		t.Fatal("multi-result function does not support a resume factory")
 	}
 	shapeType := types.NewSignature(nil, nil, nil)
 	shapeType.SetHasShape(true)
@@ -1237,6 +1237,105 @@ func TestLowerRejectsSpawnResults(t *testing.T) {
 	}
 }
 
+func TestLowerRejectsAwaitResults(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/awaitresults", "awaitresults")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	results := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+	}
+	pair := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("pair"),
+		types.NewSignature(nil, nil, results))
+	pair.DeclareParams(true)
+	single := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("single"),
+		types.NewSignature(nil, nil, results[:1]))
+	single.DeclareParams(true)
+
+	for _, test := range []struct {
+		name string
+		body func(*ir.Func) (*ir.CallExpr, ir.Nodes)
+		want string
+	}{
+		{
+			name: "complex-normalized",
+			body: func(caller *ir.Func) (*ir.CallExpr, ir.Nodes) {
+				call := newLowerTestCall(pair)
+				call.SetType(pair.Type().ResultsTuple())
+				first := caller.NewLocal(src.NoXPos, pkg.Lookup("first"),
+					types.Types[types.TINT])
+				second := caller.NewLocal(src.NoXPos, pkg.Lookup("second"),
+					types.Types[types.TINT])
+				inner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+					ir.Nodes{first, second}, ir.Nodes{call})
+				projection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+					types.Types[types.TINT], first)
+				projection.SetInit(ir.Nodes{inner})
+				target := caller.NewLocal(src.NoXPos, pkg.Lookup("target"),
+					types.Types[types.TINT])
+				outer := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+					ir.Nodes{ir.NewStarExpr(src.NoXPos, target), second},
+					ir.Nodes{projection, second})
+				return call, ir.Nodes{outer, newLowerTestReturn()}
+			},
+			want: "without matching assignment",
+		},
+		{
+			name: "direct-complex",
+			body: func(caller *ir.Func) (*ir.CallExpr, ir.Nodes) {
+				call := newLowerTestCall(single)
+				call.SetType(types.Types[types.TINT])
+				target := caller.NewLocal(src.NoXPos, pkg.Lookup("pointer"),
+					types.NewPtr(types.Types[types.TINT]))
+				assign := ir.NewAssignStmt(src.NoXPos,
+					ir.NewStarExpr(src.NoXPos, target), call)
+				return call, ir.Nodes{assign, newLowerTestReturn()}
+			},
+			want: "result 0 is not a variable",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caller := newLowerTestFunc(pkg, test.name)
+			call, body := test.body(caller)
+			caller.Body = body
+			callee := pair
+			if test.name == "direct-complex" {
+				callee = single
+			}
+			function := &Function{
+				Func:    caller,
+				Effect:  MaySuspend,
+				Primary: CoroPrimary,
+				Edges: []Edge{{
+					Kind: DirectCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname), Node: call,
+				}},
+				Sites: []Site{{
+					ID: 1, Kind: SiteAwait, Node: call,
+				}},
+			}
+			plan := &Plan{Functions: map[*ir.Func]*Function{
+				caller: function,
+			}}
+			if _, err := newLowerCandidate(plan, function); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("newLowerCandidate error = %v, want %q",
+					err, test.want)
+			}
+		})
+	}
+}
+
 func TestCallResultTargets(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -1244,7 +1343,20 @@ func TestCallResultTargets(t *testing.T) {
 	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("call"),
 		types.NewSignature(nil, nil, nil))
 	call := newLowerTestCall(fn)
-	if got, err := callResultTargets(call, 1); err != nil ||
+	if got, err := callResultTargets(call, call, 0); err != nil ||
+		len(got) != 0 {
+		t.Fatalf("no-result call targets = %v, %v, want none", got, err)
+	}
+	if got, err := callResultTargets(call, nil, 0); err != nil ||
+		len(got) != 0 {
+		t.Fatalf("spawn targets = %v, %v, want none", got, err)
+	}
+	nestedNoResult := newLowerTestCall(fn)
+	if _, err := callResultTargets(call, nestedNoResult, 0); err == nil ||
+		!strings.Contains(err.Error(), "nested in another statement") {
+		t.Fatalf("nested no-result error = %v", err)
+	}
+	if got, err := callResultTargets(call, call, 1); err != nil ||
 		len(got) != 1 || got[0] != nil {
 		t.Fatalf("discarded call targets = %v, %v, want one empty target",
 			got, err)
@@ -1253,22 +1365,97 @@ func TestCallResultTargets(t *testing.T) {
 	target := ir.NewNameAt(src.NoXPos, pkg.Lookup("target"),
 		types.Types[types.TINT])
 	assign := ir.NewAssignStmt(src.NoXPos, target, call)
-	if got, err := callResultTargets(assign, 1); err != nil ||
+	if got, err := callResultTargets(call, assign, 1); err != nil ||
 		len(got) != 1 || got[0] != target {
 		t.Fatalf("assignment targets = %v, %v, want %v", got, err, target)
 	}
 
 	list := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
 		ir.Nodes{target, ir.BlankNode}, ir.Nodes{call})
-	if got, err := callResultTargets(list, 2); err != nil ||
+	if got, err := callResultTargets(call, list, 2); err != nil ||
 		len(got) != 2 || got[0] != target || got[1] != nil {
 		t.Fatalf("list targets = %v, %v, want [%v <nil>]",
 			got, err, target)
 	}
 
-	if _, err := callResultTargets(assign, 2); err == nil ||
+	if _, err := callResultTargets(call, assign, 2); err == nil ||
 		!strings.Contains(err.Error(), "without matching assignment") {
 		t.Fatalf("mismatched target error = %v", err)
+	}
+
+	outer := newLowerTestCall(fn)
+	outer.SetInit(ir.Nodes{list})
+	if _, err := callResultTargets(call, outer, 2); err == nil ||
+		!strings.Contains(err.Error(), "without matching assignment") {
+		t.Fatalf("nested target error = %v", err)
+	}
+
+	multiCall := newLowerTestCall(fn)
+	second := ir.NewNameAt(src.NoXPos, pkg.Lookup("second"),
+		types.Types[types.TINT])
+	inner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{target, second}, ir.Nodes{multiCall})
+	projection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+		types.Types[types.TINT], target)
+	projection.SetInit(ir.Nodes{inner})
+	outerTarget := ir.NewNameAt(src.NoXPos, pkg.Lookup("outer"),
+		types.Types[types.TINT])
+	normalized := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{outerTarget, ir.BlankNode}, ir.Nodes{projection, second})
+	if got, err := callResultTargets(multiCall, normalized, 2); err != nil ||
+		len(got) != 2 || got[0] != target || got[1] != second {
+		t.Fatalf("normalized targets = %v, %v, want [%v %v]",
+			got, err, target, second)
+	}
+
+	inner.Lhs[1] = ir.BlankNode
+	normalized.Rhs[1] = ir.BlankNode
+	if got, err := callResultTargets(multiCall, normalized, 2); err != nil ||
+		len(got) != 2 || got[0] != target || got[1] != nil {
+		t.Fatalf("normalized blank targets = %v, %v, want [%v <nil>]",
+			got, err, target)
+	}
+	inner.Lhs[1] = second
+	normalized.Rhs[1] = second
+
+	missing := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{outerTarget, ir.BlankNode}, ir.Nodes{target, second})
+	if _, err := callResultTargets(multiCall, missing, 2); err == nil ||
+		!strings.Contains(err.Error(), "without matching assignment") {
+		t.Fatalf("missing normalized assignment error = %v", err)
+	}
+	notInitialized := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{outerTarget}, ir.Nodes{multiCall})
+	if _, ok := normalizedResultAssignment(multiCall, notInitialized, 1); ok {
+		t.Fatal("direct assignment is a normalized result assignment")
+	}
+
+	normalized.Rhs[1] = target
+	if _, err := callResultTargets(multiCall, normalized, 2); err == nil ||
+		!strings.Contains(err.Error(), "without matching assignment") {
+		t.Fatalf("mismatched normalized projection error = %v", err)
+	}
+	normalized.Rhs[1] = second
+
+	normalized.Lhs[0] = ir.NewStarExpr(src.NoXPos, outerTarget)
+	if _, err := callResultTargets(multiCall, normalized, 2); err == nil ||
+		!strings.Contains(err.Error(), "without matching assignment") {
+		t.Fatalf("complex normalized target error = %v", err)
+	}
+	normalized.Lhs[0] = outerTarget
+
+	unsupported := ir.NewConvExpr(src.NoXPos, ir.OCONVIFACE,
+		types.Types[types.TINT], target)
+	if isResultProjection(unsupported, target) {
+		t.Fatal("interface conversion is a result projection")
+	}
+
+	if got := takeCallInit(normalized, multiCall); len(got) != 1 ||
+		got[0] != inner {
+		t.Fatalf("normalized call init = %v, want [%v]", got, inner)
+	}
+	if got := takeCallInit(normalized, multiCall); len(got) != 0 {
+		t.Fatalf("normalized call init after take = %v, want none", got)
 	}
 }
 
@@ -1622,5 +1809,153 @@ func TestLowerParametersAndResults(t *testing.T) {
 	}
 	if result.Lowered != 2 || result.Skipped != 0 {
 		t.Fatalf("Lower result = %+v, want 2 lowered and 0 skipped", result)
+	}
+}
+
+func TestLowerNormalizedResults(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/normalizedresult",
+		"normalizedresult")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+		types.NewSignature(nil, nil, nil))
+	yield.DeclareParams(true)
+
+	resultFields := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+	}
+	leaf := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("leaf"),
+		types.NewSignature(nil, nil, resultFields))
+	leaf.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, leaf)
+	yieldCall := newLowerTestCall(yield)
+	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(1)),
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(2)),
+	})
+	ret.SetTypecheck(1)
+	leaf.Body = ir.Nodes{yieldCall, ret}
+
+	caller := newLowerTestFunc(pkg, "caller")
+	first := caller.NewLocal(src.NoXPos, pkg.Lookup("first"),
+		types.Types[types.TINT])
+	second := caller.NewLocal(src.NoXPos, pkg.Lookup("second"),
+		types.Types[types.TINT])
+	resultFirst := caller.NewLocal(src.NoXPos, pkg.Lookup("resultFirst"),
+		types.Types[types.TINT])
+	resultSecond := caller.NewLocal(src.NoXPos, pkg.Lookup("resultSecond"),
+		types.Types[types.TINT])
+	directFirst := caller.NewLocal(src.NoXPos, pkg.Lookup("directFirst"),
+		types.Types[types.TINT])
+	directSecond := caller.NewLocal(src.NoXPos, pkg.Lookup("directSecond"),
+		types.Types[types.TINT])
+	initTemp := caller.NewLocal(src.NoXPos, pkg.Lookup("initTemp"),
+		types.Types[types.TINT])
+
+	leafCall := newLowerTestCall(leaf)
+	leafCall.SetType(leaf.Type().ResultsTuple())
+	inner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{first, second}, ir.Nodes{leafCall})
+	inner.SetTypecheck(1)
+	firstProjection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+		types.Types[types.TINT], first)
+	firstProjection.SetTypecheck(1)
+	firstProjection.SetInit(ir.Nodes{inner})
+	outer := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{resultFirst, resultSecond},
+		ir.Nodes{firstProjection, second})
+	outer.SetTypecheck(1)
+	outer.SetInit(ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, initTemp)})
+	discardCall := newLowerTestCall(leaf)
+	discardCall.SetType(leaf.Type().ResultsTuple())
+	prelude := ir.NewAssignStmt(src.NoXPos, resultFirst,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(0)))
+	prelude.SetTypecheck(1)
+	prelude.SetInit(ir.Nodes{discardCall})
+	directCall := newLowerTestCall(leaf)
+	directCall.SetType(leaf.Type().ResultsTuple())
+	direct := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{directFirst, directSecond}, ir.Nodes{directCall})
+	direct.SetTypecheck(1)
+	caller.Body = ir.Nodes{prelude, direct, outer, newLowerTestReturn()}
+
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		leaf: {
+			Func:    leaf,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Sites: []Site{{
+				ID: 1, Kind: SiteYield, Node: yieldCall,
+			}},
+		},
+		caller: {
+			Func:    caller,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: leaf,
+				CalleeName: symbolName(leaf.Nname), Node: leafCall,
+			}, {
+				Kind: DirectCall, Callee: leaf,
+				CalleeName: symbolName(leaf.Nname), Node: discardCall,
+			}, {
+				Kind: DirectCall, Callee: leaf,
+				CalleeName: symbolName(leaf.Nname), Node: directCall,
+			}},
+			Sites: []Site{
+				{ID: 1, Kind: SiteAwait, Node: discardCall},
+				{ID: 2, Kind: SiteAwait, Node: directCall},
+				{ID: 3, Kind: SiteAwait, Node: leafCall},
+			},
+		},
+	}}
+	result, err := Lower(plan)
+	if err != nil {
+		t.Fatalf("Lower failed: %v", err)
+	}
+	if result.Lowered != 2 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 2 lowered and 0 skipped", result)
+	}
+
+	wantFactory := symbolName(leaf.Nname) + ".coro"
+	var factoryCalls, wrapperCalls int
+	for _, fn := range typecheck.Target.Funcs {
+		ir.Visit(fn, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			switch symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) {
+			case wantFactory:
+				factoryCalls++
+			case symbolName(leaf.Nname):
+				wrapperCalls++
+			}
+		})
+	}
+	if factoryCalls != 4 {
+		t.Fatalf("generated IR has %d calls to %s, want 4",
+			factoryCalls, wantFactory)
+	}
+	if wrapperCalls != 0 {
+		t.Fatalf("generated IR has %d calls to ordinary wrapper, want 0",
+			wrapperCalls)
 	}
 }

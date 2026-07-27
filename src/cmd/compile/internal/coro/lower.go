@@ -202,6 +202,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 
 	statementCalls := make(map[*ir.CallExpr]bool)
+	awaitStatements := make(map[*ir.CallExpr]ir.Node)
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	var collectStatements func(ir.Nodes, bool) error
@@ -215,23 +216,30 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			switch stmt := stmt.(type) {
 			case *ir.CallExpr:
 				statementCalls[stmt] = true
+				awaitStatements[stmt] = stmt
 			case *ir.AssignStmt:
 				if call, ok := stmt.Y.(*ir.CallExpr); ok {
 					statementCalls[call] = true
+					awaitStatements[call] = stmt
 				}
 			case *ir.AssignListStmt:
 				if len(stmt.Rhs) == 1 {
 					if call, ok := stmt.Rhs[0].(*ir.CallExpr); ok {
 						statementCalls[call] = true
+						awaitStatements[call] = stmt
 					}
 				}
 				// Multi-result method calls may have already been normalized
 				// into an assignment form whose call is below the RHS root.
-				// The MVP recognizes only the ordinary read methods handled
-				// by the typed worker adapter in that form.
+				// Keep the containing assignment for either typed worker
+				// adaptation or result-projection validation.
 				ir.Visit(stmt, func(node ir.Node) {
 					call, ok := node.(*ir.CallExpr)
-					if ok && ordinaryReadOperation(call) {
+					if !ok {
+						return
+					}
+					awaitStatements[call] = stmt
+					if ordinaryReadOperation(call) {
 						statementCalls[call] = true
 					}
 				})
@@ -350,12 +358,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested %s site %d", site.Kind, site.ID)
 			}
 		case SiteAwait:
-			if !statementCalls[call] {
+			statement := awaitStatements[call]
+			if statement == nil {
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
 			if edge.Callee == nil {
 				return nil, fmt.Errorf("dynamic await site %d", site.ID)
+			}
+			targets, err := callResultTargets(call, statement,
+				edge.Callee.Type().NumResults())
+			if err != nil {
+				return nil, fmt.Errorf("await site %d: %v", site.ID, err)
+			}
+			for i, target := range targets {
+				if target == nil {
+					continue
+				}
+				if _, ok := target.(*ir.Name); !ok {
+					return nil, fmt.Errorf(
+						"await site %d result %d is not a variable",
+						site.ID, i)
+				}
 			}
 			candidate.dependencies[edge.Callee] = true
 		case SiteSpawn:
@@ -432,8 +456,7 @@ func resumeFactorySupported(fn *ir.Func) bool {
 		return false
 	}
 	sig := fn.Type()
-	return sig.NumRecvs() == 0 && sig.NumResults() <= 1 &&
-		!sig.IsVariadic() && !sig.HasShape()
+	return sig.NumRecvs() == 0 && !sig.IsVariadic() && !sig.HasShape()
 }
 
 func resumeFactoryType(fn *ir.Func) *types.Type {
@@ -1002,7 +1025,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			states[conditionState].thenState = bodyState
 			return lowerStatements(stmt.Init(), conditionState)
 		}
+		if init := ir.TakeInit(stmt); len(init) != 0 {
+			continuation := next
+			if transitionCall(stmt, candidate.transitions) != nil {
+				continuation = lowerStatement(stmt, next)
+			} else {
+				continuation = newBodyState(ir.Nodes{stmt}, next)
+			}
+			return lowerStatements(init, continuation)
+		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
+			if init := takeCallInit(stmt, call); len(init) != 0 {
+				continuation := newBodyState(ir.Nodes{stmt}, next)
+				return lowerStatements(init, continuation)
+			}
 			switch candidate.transitions[call] {
 			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
 				return addState(lowerState{
@@ -1033,7 +1069,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		for i, arg := range call.Args {
 			args[i] = edit(arg)
 		}
-		targets, err := callResultTargets(statement,
+		targets, err := callResultTargets(call, statement,
 			edge.Callee.Type().NumResults())
 		if err != nil {
 			return nil, fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
@@ -1462,23 +1498,31 @@ func edgeForCall(function *Function, call *ir.CallExpr) Edge {
 	return Edge{}
 }
 
-func callResultTargets(stmt ir.Node, count int) (ir.Nodes, error) {
+func callResultTargets(call *ir.CallExpr, stmt ir.Node,
+	count int) (ir.Nodes, error) {
 	if count == 0 {
-		return nil, nil
+		if stmt == nil || stmt == call {
+			return nil, nil
+		}
+		return nil, fmt.Errorf(
+			"coroutine call has no results but is nested in another statement")
 	}
 	targets := make(ir.Nodes, count)
 	switch stmt := stmt.(type) {
 	case *ir.CallExpr:
-		return targets, nil
+		if stmt == call {
+			return targets, nil
+		}
 	case *ir.AssignStmt:
-		if count == 1 {
+		if stmt.Y == call && count == 1 {
 			if !ir.IsBlank(stmt.X) {
 				targets[0] = stmt.X
 			}
 			return targets, nil
 		}
 	case *ir.AssignListStmt:
-		if len(stmt.Lhs) == count {
+		if len(stmt.Rhs) == 1 && stmt.Rhs[0] == call &&
+			len(stmt.Lhs) == count {
 			for i, target := range stmt.Lhs {
 				if !ir.IsBlank(target) {
 					targets[i] = target
@@ -1487,8 +1531,106 @@ func callResultTargets(stmt ir.Node, count int) (ir.Nodes, error) {
 			return targets, nil
 		}
 	}
+	if assignment, ok := normalizedResultAssignment(call, stmt, count); ok {
+		targets := slices.Clone(assignment.Lhs)
+		for i, target := range targets {
+			if ir.IsBlank(target) {
+				targets[i] = nil
+			}
+		}
+		return targets, nil
+	}
 	return nil, fmt.Errorf("coroutine call has %d results without matching assignment",
 		count)
+}
+
+func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
+	count int) (*ir.AssignListStmt, bool) {
+	outer, ok := stmt.(*ir.AssignListStmt)
+	if !ok || len(outer.Lhs) != count || len(outer.Rhs) != count {
+		return nil, false
+	}
+	for _, target := range outer.Lhs {
+		if ir.IsBlank(target) {
+			continue
+		}
+		if _, ok := target.(*ir.Name); !ok {
+			return nil, false
+		}
+	}
+
+	var inner *ir.AssignListStmt
+	ir.Visit(outer, func(node ir.Node) {
+		if inner != nil {
+			return
+		}
+		assignment, ok := node.(*ir.AssignListStmt)
+		if !ok || len(assignment.Rhs) != 1 ||
+			assignment.Rhs[0] != call || len(assignment.Lhs) != count {
+			return
+		}
+		inner = assignment
+	})
+	if inner == nil {
+		return nil, false
+	}
+	if callInitNode(outer, call) == nil {
+		return nil, false
+	}
+	for i, result := range outer.Rhs {
+		if !isResultProjection(result, inner.Lhs[i]) {
+			return nil, false
+		}
+	}
+	return inner, true
+}
+
+// isResultProjection reports whether node only converts a temporary result.
+// Other expressions need general evaluation-order lowering around suspension.
+func isResultProjection(node, result ir.Node) bool {
+	for {
+		conversion, ok := node.(*ir.ConvExpr)
+		if !ok {
+			return node == result
+		}
+		switch conversion.Op() {
+		case ir.OCONV, ir.OCONVNOP:
+			node = conversion.X
+		default:
+			return false
+		}
+	}
+}
+
+func callInitNode(node ir.Node, call *ir.CallExpr) ir.Node {
+	if init := node.Init(); len(init) != 0 {
+		found := false
+		ir.VisitList(init, func(node ir.Node) {
+			if node == call {
+				found = true
+			}
+		})
+		if found {
+			return node
+		}
+	}
+
+	var result ir.Node
+	ir.DoChildren(node, func(child ir.Node) bool {
+		result = callInitNode(child, call)
+		return result != nil
+	})
+	return result
+}
+
+// takeCallInit detaches the containing initialization list that evaluates
+// call. Its surrounding expression then reads the result temporaries after
+// resume.
+func takeCallInit(node ir.Node, call *ir.CallExpr) ir.Nodes {
+	if init := callInitNode(node, call); init != nil {
+		return ir.TakeInit(init)
+	}
+	return nil
 }
 
 func transitionCall(stmt ir.Node, transitions map[*ir.CallExpr]SiteKind) *ir.CallExpr {
