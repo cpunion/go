@@ -2,8 +2,8 @@
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed direct defer
-normal-completion, and operation-progress follow-ups implemented; not
-production-ready
+normal-completion, operation-progress follow-ups, and a restricted
+compiler-private cross-package factory entry implemented; not production-ready
 
 Last updated: 2026-07-27
 
@@ -12,8 +12,6 @@ development branch
 
 Integration branch: `cpunion/go:coro/main`, which receives upstream updates
 from `main` and is the base for coroutine pull requests
-
-Topic branch: `coro/cgo-direct-mvp`
 
 ## 1. Decision
 
@@ -814,15 +812,46 @@ recipes, not maintained as source annotations.
 
 ### 10.9 Cross-package entry boundary
 
-The current safe cross-package behavior calls the ordinary exported wrapper,
-which creates and runs one coroutine root. It preserves the normal Go ABI and
-requires no extra source contract, but root allocation dominates a small C
-leaf when repeated for every call.
+Ordinary callers continue to call the exported Go entry, which creates and
+runs one coroutine root. A lowered caller instead uses a compiler-private
+factory entry when the imported function summary advertises a compatible
+capability. This avoids recursively entering an ordinary wrapper from a native
+executor while preserving the normal Go ABI for all existing callers.
 
-A function that is itself being lowered must not call that wrapper recursively
-from a native executor. Until a factory entry exists, analysis rejects such a
-candidate and leaves its source body on the ordinary compatibility path. This
-prevents hidden nested roots from exhausting the fixed native-context pool.
+The current Unified IR summary format records one `FactoryABI` value. Version
+1 derives all other information from the imported Go function type:
+
+```text
+func(P0, ..., Pn) R
+    -> func(P0, ..., Pn, *R) func(unsafe.Pointer) uint8
+
+func(P0, ..., Pn)
+    -> func(P0, ..., Pn) func(unsafe.Pointer) uint8
+```
+
+The emitted symbol is the ordinary package symbol plus the compiler-reserved
+`.coro` suffix. The summary does not carry a symbol string, arity, call policy,
+worker policy, or source annotation. The importer reconstructs the type and
+symbol only after validating the capability.
+
+Factory ABI 1 is intentionally narrow. It supports top-level, non-variadic,
+non-generic functions with zero or one result. Methods, closures, generic
+shapes, multiple results, missing capabilities, and the legacy summary format
+do not produce an imported factory reference. The caller is removed from the
+lowering candidate fixed point and retains its ordinary source body. The same
+fallback propagates to its lowered callers, so an unsupported leaf cannot
+leave a partially transformed call chain.
+
+No-result calls and discarded single results are supported. A discarded
+awaited result uses a typed parent-frame slot. A spawned call with results is
+rejected because the child may outlive the parent slot. Multiple results need
+the general expression-init suspension lowering; they are not added to this
+ABI as a special case.
+
+The previous summary version is decoded as an effect and execution summary
+with no factory capability. An unknown factory ABI is treated as unavailable;
+an unknown summary format version is rejected as incompatible. This keeps
+stale objects safe without growing a compatibility policy matrix.
 
 The measured implementation must not hide this cost by batching only. The
 benchmark therefore separates:
@@ -830,14 +859,9 @@ benchmark therefore separates:
 - `Steady`: many foreign calls inside one already-created root;
 - `Entry`: one exported Go call and one new root per foreign call.
 
-A possible later optimization is a versioned compiler-private capability in
-Unified IR that states that a deterministic coroutine factory symbol was
-emitted. A coroutine caller could call that factory directly, while ordinary
-callers retain the normal wrapper. Missing, stale, generic, or incompatible
-capabilities would fail closed to the wrapper. This would not require a source
-annotation, but it is a new internal ABI and is intentionally not implemented
-in this change. Factory reachability, results, generics, inlining, and nested
-root behavior need a separate design review before selecting it.
+The factory removes nested root creation inside a successfully lowered call
+chain. It does not remove the one root at an ordinary program boundary, so the
+`Entry` benchmark remains a separate cost and compatibility measurement.
 
 ## 11. Language and runtime integration
 
@@ -1254,6 +1278,12 @@ The compiler:
   analysis;
 - supports closed structured calls, `go` spawn, parameters and results,
   exact expression evaluation, `if`, simple `for`, and nested normal returns;
+- exports a versioned, compiler-private factory capability for the restricted
+  cross-package signature subset and reconstructs its deterministic typed
+  entry without changing the ordinary Go entry;
+- explicitly declares source locals moved into generated factories, ensuring
+  that locals captured across a child suspension receive typed heap storage
+  even when the source declaration was implicit;
 - rejects unsupported control flow deterministically and removes callers whose
   stackless dependencies cannot be lowered;
 - recognizes the narrow `time.Sleep`, `os.File.Read`, and
@@ -1327,7 +1357,14 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   `os.File.Read`, and `net.(*TCPConn).Read` calls and verify that all three
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
-  transition symbols in the supported hot path.
+  transition symbols in the supported hot path;
+- a real three-package call chain covering a returned value, a discarded
+  value, a no-result call, and reuse of one imported factory; disassembly
+  verifies private factory calls and the absence of ordinary wrappers or
+  `runtime.coroRun` inside the lowered resumes;
+- ordinary callers, missing capabilities, and a multiple-result function
+  retain the public Go entry and execute correctly; decoder tests verify that
+  the legacy summary format carries no factory capability.
 
 The Linux/amd64 local run used an amd64 OrbStack guest translated on Apple
 Silicon. Its correctness and allocation results are useful, but its latency
@@ -1424,10 +1461,13 @@ Goexit, implicit faults, channels, select, mutex parking, reflection,
 callbacks, variadic C calls, or general C ABI type classification. Direct
 foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
-ABIs retain ordinary cgo. Cross-package factory entry, logical traceback,
-debugger, profiler, race instrumentation on native executor stacks, dynamic
-executor sizing, cancellation of in-flight file work, and broad
-standard-library compatibility remain future work.
+ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes methods,
+closures, variadic functions, generic shapes, and multiple results; those
+remain on the ordinary entry until the corresponding general call and
+expression lowering exists. Logical traceback, debugger, profiler, race
+instrumentation on native executor stacks, dynamic executor sizing,
+cancellation of in-flight file work, and broad standard-library compatibility
+remain future work.
 
 ## 16. Work after the MVP
 
@@ -1438,9 +1478,9 @@ The likely order is:
    terminal outcomes and dynamic defer records remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
-4. design cross-package factory entry separately, without adding source
-   annotations; transparent `cmd/cgo` metadata for the initial scalar subset
-   is implemented;
+4. extend the compiler-private factory ABI only with the matching general
+   expression, method, closure, and generic lowering; do not add source
+   annotations or per-call policy metadata;
 5. add dynamic function values, interfaces, closures, generics, and reflect;
 6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;
@@ -1471,6 +1511,9 @@ The implemented MVP choices are:
    wrappers and keeping direct call-site System ABI lowering as the long-term
    target.
 7. Require timer, regular-file, and TCP paths before calling the work an MVP.
+8. Use one versioned, compiler-private factory capability for lowered
+   cross-package calls; derive its symbol and type from the Go function and
+   fail closed to the ordinary entry for unsupported signatures.
 
 The most important technical risk is the executor stack. It must be a normal
 GC-visible Go execution context on the native OS stack, fixed and C-compatible,

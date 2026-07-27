@@ -92,6 +92,8 @@ func Lower(plan *Plan) (LowerResult, error) {
 		candidates[function.Func] = candidate
 	}
 
+	factories := make(map[*ir.Func]*ir.Func)
+
 	// Remove callers whose structured children cannot use this ABI. Iterate to
 	// a fixed point so one unsupported leaf removes every dependent caller.
 	for changed := true; changed; {
@@ -104,7 +106,8 @@ func Lower(plan *Plan) (LowerResult, error) {
 			}
 			var unsupported []string
 			for dependency := range candidate.dependencies {
-				if candidates[dependency] == nil {
+				if !hasResumeFactory(plan, candidates, factories,
+					dependency) {
 					unsupported = append(unsupported, ir.PkgFuncName(dependency))
 				}
 			}
@@ -119,13 +122,13 @@ func Lower(plan *Plan) (LowerResult, error) {
 			changed = true
 		}
 	}
-
 	for _, function := range functions {
 		candidate := candidates[function.Func]
 		if candidate == nil {
 			continue
 		}
 		candidate.factory = newResumeFactory(candidate.function.Func)
+		factories[function.Func] = candidate.factory
 		candidate.parameters = make(map[*ir.Name]*ir.Name)
 		candidate.results = make(map[*ir.Name]*ir.Name)
 		for i, field := range candidate.function.Func.Type().Params() {
@@ -157,10 +160,13 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if canLowerRunToCompletion(candidate) {
 			err = lowerRunToCompletion(candidate)
 		} else {
-			err = lowerFunction(candidate, candidates)
+			err = lowerFunction(candidate, factories)
 		}
 		if err != nil {
 			return result, err
+		}
+		if resumeFactorySupported(function.Func) {
+			function.Factory = FactoryABI1
 		}
 		result.Lowered++
 	}
@@ -187,6 +193,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	if sig.IsVariadic() {
 		return nil, fmt.Errorf("variadic parameters")
+	}
+	if sig.HasShape() {
+		return nil, fmt.Errorf("generic shape")
 	}
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
@@ -307,12 +316,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if edge.Kind != DirectCall || edge.Recipe.Kind != SiteInvalid {
 			continue
 		}
-		summary := edge.Imported
-		if callee := plan.Functions[edge.Callee]; callee != nil {
-			summary = FuncSummary{Effect: callee.Effect, Exec: callee.Exec}
-		}
-		if summary.Effect == NoSuspend &&
-			summary.Exec&NeedsSystemABI != 0 {
+		summary, known := plan.edgeSummary(edge)
+		hasAwait := slices.ContainsFunc(function.Sites, func(site Site) bool {
+			return site.Kind == SiteAwait && site.Node == edge.Node
+		})
+		if known && summary.Primary() == CoroPrimary && !hasAwait {
 			return nil, fmt.Errorf(
 				"direct call to %s requires coroutine factory entry",
 				edge.CalleeName)
@@ -358,6 +366,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if edge.Callee == nil {
 				return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
 			}
+			if edge.Callee.Type().NumResults() != 0 {
+				return nil, fmt.Errorf("spawn target returns values")
+			}
 			candidate.dependencies[edge.Callee] = true
 		case SiteForeign:
 			if site.Foreign != DirectNoBlock && site.Foreign != DirectMayBlock &&
@@ -393,10 +404,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if edge.Unknown {
 			return nil, fmt.Errorf("defer target has unknown effects")
 		}
-		summary := edge.Imported
-		if callee := plan.Functions[edge.Callee]; callee != nil {
-			summary = FuncSummary{Effect: callee.Effect, Exec: callee.Exec}
-		}
+		summary, _ := plan.edgeSummary(edge)
 		if summary.Effect != NoSuspend {
 			return nil, fmt.Errorf("suspending defer")
 		}
@@ -419,7 +427,16 @@ func stacklessResumeType() *types.Type {
 	return types.NewSignature(nil, []*types.Field{ctx}, []*types.Field{action})
 }
 
-func newResumeFactory(fn *ir.Func) *ir.Func {
+func resumeFactorySupported(fn *ir.Func) bool {
+	if fn == nil || fn.OClosure != nil || fn.Type() == nil {
+		return false
+	}
+	sig := fn.Type()
+	return sig.NumRecvs() == 0 && sig.NumResults() <= 1 &&
+		!sig.IsVariadic() && !sig.HasShape()
+}
+
+func resumeFactoryType(fn *ir.Func) *types.Type {
 	pos := fn.Pos()
 	resumeType := stacklessResumeType()
 	result := types.NewField(pos, nil, resumeType)
@@ -432,14 +449,48 @@ func newResumeFactory(fn *ir.Func) *ir.Func {
 		params = append(params,
 			types.NewField(field.Pos, sym, types.NewPtr(field.Type)))
 	}
-	typ := types.NewSignature(nil, params, []*types.Field{result})
-	sym := fn.Sym().Pkg.Lookup(fn.Sym().Name + ".coro")
+	return types.NewSignature(nil, params, []*types.Field{result})
+}
+
+func resumeFactorySymbol(fn *ir.Func) *types.Sym {
+	return fn.Sym().Pkg.Lookup(fn.Sym().Name + ".coro")
+}
+
+func newResumeFactory(fn *ir.Func) *ir.Func {
+	pos := fn.Pos()
+	typ := resumeFactoryType(fn)
+	sym := resumeFactorySymbol(fn)
 	factory := ir.NewFunc(pos, pos, sym, typ)
 	factory.SetDupok(fn.Dupok())
 	factory.Nname.Defn = factory
 	factory.DeclareParams(true)
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, factory)
 	return factory
+}
+
+func importedResumeFactory(fn *ir.Func) (*ir.Func, bool) {
+	summary, ok := Summary(fn)
+	if !ok || summary.Factory != FactoryABI1 || !resumeFactorySupported(fn) {
+		return nil, false
+	}
+	pos := fn.Pos()
+	return ir.NewFunc(pos, pos, resumeFactorySymbol(fn),
+		resumeFactoryType(fn)), true
+}
+
+func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
+	factories map[*ir.Func]*ir.Func, fn *ir.Func) bool {
+	if _, local := plan.Functions[fn]; local {
+		return candidates[fn] != nil
+	}
+	if factories[fn] != nil {
+		return true
+	}
+	factory, ok := importedResumeFactory(fn)
+	if ok {
+		factories[fn] = factory
+	}
+	return ok
 }
 
 // canLowerRunToCompletion reports whether candidate has to enter a native ABI
@@ -489,6 +540,16 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	resumeType := factory.Type().Result(0).Type
 	pos := fn.Pos()
 
+	var declarations []ir.Node
+	declared := make(map[*ir.Name]bool)
+	addDeclaration := func(decl *ir.Decl) {
+		name := decl.X.Canonical()
+		if !declared[name] {
+			declared[name] = true
+			declarations = append(declarations, decl)
+		}
+	}
+
 	// Source locals become factory locals. Returning the closure then places
 	// the captured slots in a typed, GC-scanned heap object.
 	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
@@ -497,23 +558,15 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		case ir.PAUTO, ir.PAUTOHEAP:
 			name.Curfn = factory
 			factory.Dcl = append(factory.Dcl, name)
+			addDeclaration(ir.NewDecl(name.Pos(), ir.ODCL, name))
 		default:
 			fnDcl = append(fnDcl, name)
 		}
 	}
 	fn.Dcl = fnDcl
 
-	var declarations ir.Nodes
 	for _, result := range candidate.resultValues {
-		declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, result))
-	}
-	declared := make(map[*ir.Name]bool)
-	addDeclaration := func(decl *ir.Decl) {
-		name := decl.X.Canonical()
-		if !declared[name] {
-			declared[name] = true
-			declarations = append(declarations, decl)
-		}
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, result))
 	}
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
@@ -754,40 +807,14 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	return nil
 }
 
-func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCandidate) error {
+func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
 	factory := candidate.factory
 	resumeType := factory.Type().Result(0).Type
 	pos := fn.Pos()
 
-	// Source locals become factory locals. Returning the closure then places
-	// the captured slots in a typed, GC-scanned heap object.
-	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
-	for _, name := range fn.Dcl {
-		switch name.Class {
-		case ir.PAUTO, ir.PAUTOHEAP:
-			name.Curfn = factory
-			factory.Dcl = append(factory.Dcl, name)
-		default:
-			fnDcl = append(fnDcl, name)
-		}
-	}
-	fn.Dcl = fnDcl
-
 	var declarations []ir.Node
-	for _, result := range candidate.resultValues {
-		declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, result))
-	}
-	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
-		len(candidate.defers))
-	for _, deferred := range candidate.defers {
-		deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
-			types.Types[types.TBOOL])
-		declarations = append(declarations,
-			ir.NewDecl(deferred.statement.Pos(), ir.ODCL, deferred.armed))
-		deferByStatement[deferred.statement] = deferred
-	}
 	declared := make(map[*ir.Name]bool)
 	addDeclaration := func(decl *ir.Decl) {
 		name := decl.X.Canonical()
@@ -797,8 +824,36 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 		}
 	}
 
+	// Source locals become factory locals. Returning the closure then places
+	// the captured slots in a typed, GC-scanned heap object.
+	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
+	for _, name := range fn.Dcl {
+		switch name.Class {
+		case ir.PAUTO, ir.PAUTOHEAP:
+			name.Curfn = factory
+			factory.Dcl = append(factory.Dcl, name)
+			addDeclaration(ir.NewDecl(name.Pos(), ir.ODCL, name))
+		default:
+			fnDcl = append(fnDcl, name)
+		}
+	}
+	fn.Dcl = fnDcl
+
+	for _, result := range candidate.resultValues {
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, result))
+	}
+	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
+		len(candidate.defers))
+	for _, deferred := range candidate.defers {
+		deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
+			types.Types[types.TBOOL])
+		addDeclaration(ir.NewDecl(deferred.statement.Pos(), ir.ODCL,
+			deferred.armed))
+		deferByStatement[deferred.statement] = deferred
+	}
+
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
-	declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, pc))
+	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -969,7 +1024,7 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 	var edit func(ir.Node) ir.Node
 	factoryCall := func(call *ir.CallExpr, statement ir.Node) (ir.Node, error) {
 		edge := edgeForCall(function, call)
-		child := candidates[edge.Callee]
+		child := factories[edge.Callee]
 		if child == nil {
 			return nil, fmt.Errorf("%s: missing factory for %s",
 				ir.PkgFuncName(fn), edge.CalleeName)
@@ -979,14 +1034,20 @@ func lowerFunction(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCand
 			args[i] = edit(arg)
 		}
 		targets, err := callResultTargets(statement,
-			child.function.Func.Type().NumResults())
+			edge.Callee.Type().NumResults())
 		if err != nil {
 			return nil, fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 		}
-		for _, target := range targets {
+		for i, target := range targets {
+			if target == nil {
+				temp := typecheck.TempAt(call.Pos(), factory,
+					edge.Callee.Type().Result(i).Type)
+				addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+				target = temp
+			}
 			args = append(args, typecheck.NodAddr(edit(target)))
 		}
-		return typecheck.Call(call.Pos(), child.factory.Nname, args, false), nil
+		return typecheck.Call(call.Pos(), child.Nname, args, false), nil
 	}
 
 	edit = func(node ir.Node) ir.Node {
@@ -1405,19 +1466,25 @@ func callResultTargets(stmt ir.Node, count int) (ir.Nodes, error) {
 	if count == 0 {
 		return nil, nil
 	}
+	targets := make(ir.Nodes, count)
 	switch stmt := stmt.(type) {
+	case *ir.CallExpr:
+		return targets, nil
 	case *ir.AssignStmt:
 		if count == 1 {
-			return ir.Nodes{stmt.X}, nil
+			if !ir.IsBlank(stmt.X) {
+				targets[0] = stmt.X
+			}
+			return targets, nil
 		}
 	case *ir.AssignListStmt:
 		if len(stmt.Lhs) == count {
-			for _, target := range stmt.Lhs {
-				if ir.IsBlank(target) {
-					return nil, fmt.Errorf("discarded coroutine result")
+			for i, target := range stmt.Lhs {
+				if !ir.IsBlank(target) {
+					targets[i] = target
 				}
 			}
-			return stmt.Lhs, nil
+			return targets, nil
 		}
 	}
 	return nil, fmt.Errorf("coroutine call has %d results without matching assignment",

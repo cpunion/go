@@ -1282,6 +1282,317 @@ func main() {
 	}
 }
 
+func TestCrossPackageFactory(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	writeFile := func(name, contents string) {
+		t.Helper()
+		name = filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(name), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFile("go.mod", "module example.com/corofactory\n\ngo 1.28\n")
+	writeFile("leaf/leaf.go", `package leaf
+
+import "runtime"
+
+//go:noinline
+func Add(value int) int {
+	runtime.Gosched()
+	return value + 1
+}
+
+//go:noinline
+func Pair(value *int) (int, int) {
+	runtime.Gosched()
+	*value = 42
+	return 1, 2
+}
+
+//go:noinline
+func Yield() {
+	runtime.Gosched()
+}
+`)
+	writeFile("mid/mid.go", `package mid
+
+import "example.com/corofactory/leaf"
+
+//go:noinline
+func Add(value int) int {
+	next := leaf.Add(value)
+	return next + 1
+}
+
+//go:noinline
+func AddAgain(value int) int {
+	next := leaf.Add(value)
+	return next + 2
+}
+
+//go:noinline
+func Discard(value int) {
+	leaf.Add(value)
+}
+
+//go:noinline
+func DiscardPair(value *int) {
+	leaf.Pair(value)
+}
+
+//go:noinline
+func Yield() {
+	leaf.Yield()
+}
+`)
+	writeFile("root/main.go", `package main
+
+import "example.com/corofactory/mid"
+
+func main() {
+	got := mid.Add(40)
+	if got != 42 {
+		println("cross-package-factory-bad")
+		return
+	}
+	if got := mid.AddAgain(40); got != 43 {
+		println("cross-package-factory-reuse-bad")
+		return
+	}
+	mid.Discard(40)
+	mid.Yield()
+	println("cross-package-factory-ok")
+}
+`)
+	writeFile("rootpair/main.go", `package main
+
+import "example.com/corofactory/mid"
+
+func main() {
+	value := 0
+	mid.DiscardPair(&value)
+	if value != 42 {
+		println("multi-result-fallback-bad")
+		return
+	}
+	println("multi-result-fallback-ok")
+}
+`)
+	writeFile("rootplain/main.go", `package main
+
+import "example.com/corofactory/leaf"
+
+func main() {
+	got := leaf.Add(41)
+	if got != 42 {
+		println("ordinary-entry-bad")
+		return
+	}
+	println("ordinary-entry-ok")
+}
+`)
+
+	env := []string{
+		"GOEXPERIMENT=coro",
+		"GOCACHE=" + filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	}
+	exe := filepath.Join(tmp, "factory")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/corofactory/...=-l -d=coro=4",
+		"./root")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(), env...)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cross-package factory build failed: %v\n%s", err, data)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cross-package factory executable failed: %v\n%s", err, data)
+	}
+	if want := "cross-package-factory-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	for _, test := range []struct {
+		caller string
+		callee string
+	}{
+		{"Add", "Add"},
+		{"AddAgain", "Add"},
+		{"Discard", "Add"},
+		{"Yield", "Yield"},
+	} {
+		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+			"-s", `example.com/corofactory/mid\.`+test.caller+
+				`\.coro\.func[0-9]+$`, exe)
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("objdump of %s resume function failed: %v\n%s",
+				test.caller, err, data)
+		}
+		disassembly := string(data)
+		factory := "example.com/corofactory/leaf." + test.callee + ".coro"
+		if !strings.Contains(disassembly, factory) {
+			t.Fatalf("%s resume does not call %s\n%s",
+				test.caller, factory, disassembly)
+		}
+		for _, forbidden := range []string{
+			"example.com/corofactory/leaf." + test.callee + "(SB)",
+			"runtime.coroRun",
+		} {
+			if strings.Contains(disassembly, forbidden) {
+				t.Errorf("%s resume contains %q\n%s",
+					test.caller, forbidden, disassembly)
+			}
+		}
+	}
+
+	pair := filepath.Join(tmp, "pair")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", pair,
+		"-gcflags=example.com/corofactory/...=-l -d=coro=4",
+		"./rootpair")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(), env...)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("multi-result fallback build failed: %v\n%s", err, data)
+	}
+	for _, want := range []string{
+		"unsupported coroutine dependency example.com/corofactory/leaf.Pair",
+		"unsupported coroutine dependency example.com/corofactory/mid.DiscardPair",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("multi-result fallback output does not contain %q\n%s",
+				want, data)
+		}
+	}
+
+	cmd = testenv.Command(t, pair)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("multi-result fallback executable failed: %v\n%s", err, data)
+	}
+	if want := "multi-result-fallback-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.DiscardPair$`, pair)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of multi-result fallback failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Pair(SB)") {
+		t.Fatalf("multi-result fallback does not use the public entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Pair.coro") {
+		t.Fatalf("multi-result fallback uses the private factory\n%s",
+			disassembly)
+	}
+
+	ordinary := filepath.Join(tmp, "ordinary")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", ordinary,
+		"-gcflags=example.com/corofactory/...=-l -d=coro=4",
+		"-gcflags=example.com/corofactory/rootplain=-l -d=coro=2",
+		"./rootplain")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(), env...)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ordinary-entry build failed: %v\n%s", err, data)
+	}
+
+	cmd = testenv.Command(t, ordinary)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ordinary-entry executable failed: %v\n%s", err, data)
+	}
+	if want := "ordinary-entry-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.main$`, ordinary)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of ordinary entry failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add(SB)") {
+		t.Fatalf("ordinary caller does not use the public Go entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add.coro") {
+		t.Fatalf("ordinary caller uses the private factory entry\n%s",
+			disassembly)
+	}
+
+	fallback := filepath.Join(tmp, "fallback")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", fallback,
+		"-gcflags=example.com/corofactory/...=-l -d=coro=4",
+		"-gcflags=example.com/corofactory/leaf=-l -d=coro=2",
+		"./root")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(), env...)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("missing-capability build failed: %v\n%s", err, data)
+	}
+	if want := "unsupported coroutine dependency example.com/corofactory/leaf.Add"; !strings.Contains(string(data), want) {
+		t.Fatalf("missing-capability output does not contain %q\n%s",
+			want, data)
+	}
+
+	cmd = testenv.Command(t, fallback)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("missing-capability executable failed: %v\n%s", err, data)
+	}
+	if want := "cross-package-factory-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.Add$`, fallback)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of missing-capability fallback failed: %v\n%s",
+			err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add(SB)") {
+		t.Fatalf("fallback caller does not use the public Go entry\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly,
+		"example.com/corofactory/leaf.Add.coro") {
+		t.Fatalf("fallback caller uses the unavailable factory entry\n%s",
+			disassembly)
+	}
+}
+
 func TestRejectMixedArchive(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
