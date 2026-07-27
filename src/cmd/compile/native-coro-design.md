@@ -2,9 +2,9 @@
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed direct defer
-normal-completion, operation-progress follow-ups, nested multi-result
-expressions, and a restricted compiler-private cross-package factory entry
-implemented; not production-ready
+normal-completion, operation-progress follow-ups, nested multi-result and
+conservatively normalized single-result expressions, and a restricted
+compiler-private cross-package factory entry implemented; not production-ready
 
 Last updated: 2026-07-28
 
@@ -876,12 +876,22 @@ expression with the same result temporaries. This covers nested multi-result
 calls in returns, call statements, and assignments to variables without
 changing Factory ABI 1.
 
-Single-result calls that have no frontend-generated `Init` assignment and
-assignments with complex left operands retain the ordinary entry. Moving a
-hidden call ahead of an index, dereference, or other effectful destination
-would change Go evaluation order; those forms require explicit destination
-stabilization before suspension. A spawned call with results is rejected
-because the child may outlive the parent slot.
+Single-result calls do not have a frontend-generated `Init` assignment.
+Before escape analysis, the coroutine package conservatively normalizes a
+nested awaited call into a typed temporary assignment on the enclosing
+statement's `Init` list. Calls are considered in postorder, so sibling awaits
+and nested coroutine call chains become an explicit sequence without invoking
+the later `walk.order` pass. The ordinary escape and walk passes then see the
+same typed calls and temporaries as the coroutine transform.
+
+The normalization proceeds only when no observable operation precedes the
+hidden call. A short-circuit right operand, a nested call following an
+effectful operand, a `for` condition or post statement, and an assignment with
+an effectful left operand retain the ordinary entry. Moving a hidden call
+ahead of an index, dereference, or other effectful destination would change Go
+evaluation order; those forms require explicit destination stabilization or
+control-flow splitting before suspension. A spawned call with results is
+rejected because the child may outlive the parent slot.
 
 The previous summary version is decoded as an effect and execution summary
 with no factory capability. An unknown factory ABI is treated as unavailable;
@@ -1316,6 +1326,9 @@ The compiler:
 - splits frontend-generated expression `Init` assignments at an awaited
   multi-result call and resumes the enclosing expression from typed result
   temporaries;
+- normalizes single-result awaits in returns, call arguments, and simple
+  assignments into pre-escape typed temporary assignments when doing so
+  preserves every observable prefix operation;
 - exports a versioned, compiler-private factory capability for the restricted
   cross-package signature subset and reconstructs its deterministic typed
   entry without changing the ordinary Go entry;
@@ -1411,6 +1424,10 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   assignment, and variable-list assignment through two package boundaries;
   disassembly verifies private factories at both edges and no recursive
   `runtime.coroRun`;
+- nested single-result expressions in a return, call statement, simple
+  assignment, two-await expression, and nested coroutine call chain;
+  disassembly verifies that both inner and outer edges use private factories
+  and never re-enter a public wrapper;
 - ordinary callers, missing capabilities, and complex multi-result targets
   retain the public Go entry and execute correctly; an effectful destination
   probe verifies left-before-right evaluation order, and decoder tests verify
@@ -1513,12 +1530,13 @@ foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
 ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
 method-value calls, closures, and generic shapes. Frontend-normalized nested
-multi-result calls are supported, while nested single-result calls and complex
-result targets remain on the ordinary entry until general expression and
-assignment lowering exists. Logical traceback, debugger, profiler, race
-instrumentation on native executor stacks, dynamic executor sizing,
-cancellation of in-flight file work, and broad standard-library compatibility
-remain future work.
+multi-result calls and conservatively normalized single-result calls are
+supported. Short-circuit right operands, loop condition and post expressions,
+effectful expression prefixes, and complex result targets remain on the
+ordinary entry until general expression, control-flow, and assignment lowering
+exists. Logical traceback, debugger, profiler, race instrumentation on native
+executor stacks, dynamic executor sizing, cancellation of in-flight file
+work, and broad standard-library compatibility remain future work.
 
 ## 16. Work after the MVP
 
@@ -1529,9 +1547,10 @@ The likely order is:
    terminal outcomes and dynamic defer records remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
-4. extend the compiler-private factory ABI only with the matching general
-   expression, closure, and generic lowering; do not add source annotations or
-   per-call policy metadata;
+4. extend expression and assignment normalization to short-circuit control,
+   loop conditions, and effectful destinations, then extend the
+   compiler-private factory ABI only with matching closure and generic
+   lowering; do not add source annotations or per-call policy metadata;
 5. add dynamic function values, interfaces, closures, generics, and reflect;
 6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;
