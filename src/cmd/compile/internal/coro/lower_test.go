@@ -1570,6 +1570,50 @@ func TestCallResultTargets(t *testing.T) {
 	}
 }
 
+func TestSupportsAwaitInit(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/awaitinit", "awaitinit")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	fn := newLowerTestFunc(pkg, "call")
+	target := ir.NewNameAt(src.NoXPos, pkg.Lookup("target"),
+		types.Types[types.TINT])
+	complex := ir.NewStarExpr(src.NoXPos, target)
+
+	tests := []struct {
+		name string
+		stmt ir.Node
+		want bool
+	}{
+		{"call", newLowerTestCall(fn), true},
+		{"return", newLowerTestReturn(), true},
+		{"assignment", ir.NewAssignStmt(src.NoXPos, target, ir.NewInt(src.NoXPos, 1)), true},
+		{"complex-assignment", ir.NewAssignStmt(src.NoXPos, complex, ir.NewInt(src.NoXPos, 1)), false},
+		{"assignment-list", ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+			ir.Nodes{target, ir.BlankNode}, ir.Nodes{ir.NewInt(src.NoXPos, 1)}), true},
+		{"complex-assignment-list", ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+			ir.Nodes{complex}, ir.Nodes{ir.NewInt(src.NoXPos, 1)}), false},
+		{"other", ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), nil, nil), false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := supportsAwaitInit(test.stmt); got != test.want {
+				t.Fatalf("supportsAwaitInit(%v) = %t, want %t",
+					test.stmt.Op(), got, test.want)
+			}
+		})
+	}
+}
+
 func TestLowerRejectsUnsupportedControl(t *testing.T) {
 	prepareLowerTest(t)
 

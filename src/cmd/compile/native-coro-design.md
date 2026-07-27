@@ -2,10 +2,11 @@
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed direct defer
-normal-completion, operation-progress follow-ups, and a restricted
-compiler-private cross-package factory entry implemented; not production-ready
+normal-completion, operation-progress follow-ups, nested multi-result
+expressions, and a restricted compiler-private cross-package factory entry
+implemented; not production-ready
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -867,10 +868,19 @@ ordinary entry in either direction.
 
 No-result calls and discarded results are supported. A discarded awaited
 result uses a typed parent-frame slot. Direct assignments may receive multiple
-results when every non-blank target is a variable. Calls nested in another
-expression and assignments with complex left operands retain the ordinary
-entry until general expression-init and assignment suspension lowering
-preserves their evaluation order. A spawned call with results is rejected
+results when every non-blank target is a variable. The Go frontend represents
+a multi-result call used as another call's argument list with a typed
+assignment in the surrounding expression's `Init` list. Lowering recognizes
+that direct owner, suspends at the inner call, and resumes the enclosing
+expression with the same result temporaries. This covers nested multi-result
+calls in returns, call statements, and assignments to variables without
+changing Factory ABI 1.
+
+Single-result calls that have no frontend-generated `Init` assignment and
+assignments with complex left operands retain the ordinary entry. Moving a
+hidden call ahead of an index, dereference, or other effectful destination
+would change Go evaluation order; those forms require explicit destination
+stabilization before suspension. A spawned call with results is rejected
 because the child may outlive the parent slot.
 
 The previous summary version is decoded as an effect and execution summary
@@ -1303,6 +1313,9 @@ The compiler:
   analysis;
 - supports closed structured calls, `go` spawn, parameters and results,
   exact expression evaluation, `if`, simple `for`, and nested normal returns;
+- splits frontend-generated expression `Init` assignments at an awaited
+  multi-result call and resumes the enclosing expression from typed result
+  temporaries;
 - exports a versioned, compiler-private factory capability for the restricted
   cross-package signature subset and reconstructs its deterministic typed
   entry without changing the ordinary Go entry;
@@ -1394,10 +1407,14 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - direct recursion, mutual recursion, and a concrete recursive method through
   4,096 logical frames; disassembly verifies that every recursive edge calls a
   private factory rather than a public wrapper;
-- ordinary callers, missing capabilities, nested multi-result expressions,
-  and complex multi-result targets retain the public Go entry and execute
-  correctly; decoder tests verify that the legacy summary format carries no
-  factory capability.
+- nested multi-result expressions in a return, call statement, variable
+  assignment, and variable-list assignment through two package boundaries;
+  disassembly verifies private factories at both edges and no recursive
+  `runtime.coroRun`;
+- ordinary callers, missing capabilities, and complex multi-result targets
+  retain the public Go entry and execute correctly; an effectful destination
+  probe verifies left-before-right evaluation order, and decoder tests verify
+  that the legacy summary format carries no factory capability.
 
 The Linux/amd64 local run used an amd64 OrbStack guest translated on Apple
 Silicon. Its correctness and allocation results are useful, but its latency
@@ -1495,10 +1512,10 @@ callbacks, variadic C calls, or general C ABI type classification. Direct
 foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
 ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
-method-value calls, closures, and generic shapes. Nested expression calls and
-complex result targets remain on the ordinary entry until the corresponding
-general expression and assignment lowering exists. Logical traceback,
-debugger, profiler, race
+method-value calls, closures, and generic shapes. Frontend-normalized nested
+multi-result calls are supported, while nested single-result calls and complex
+result targets remain on the ordinary entry until general expression and
+assignment lowering exists. Logical traceback, debugger, profiler, race
 instrumentation on native executor stacks, dynamic executor sizing,
 cancellation of in-flight file work, and broad standard-library compatibility
 remain future work.
