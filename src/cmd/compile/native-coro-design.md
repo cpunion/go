@@ -591,7 +591,8 @@ budget.
 
 The production problem is broader:
 
-- direct recursion must be state-machined, statically bounded, or rejected;
+- direct and mutually recursive calls in a lowered Go call component use child
+  factories instead of native recursion;
 - indirect calls need a summary bound or a conservative capability;
 - assembly needs an explicit stack bound;
 - foreign calls need a documented C-stack bound or a sufficiently large
@@ -851,6 +852,12 @@ imported factory reference. The caller is removed from the lowering candidate
 fixed point and retains its ordinary source body. The same fallback propagates
 to its lowered callers, so an unsupported leaf cannot leave a partially
 transformed call chain.
+
+Factories for every accepted function in a local recursive call component are
+created before any body is lowered. Direct recursion, mutual recursion, and
+concrete recursive methods therefore await another factory-produced child
+without recursively entering a public wrapper or consuming native stack per
+logical frame.
 
 This extension does not require another summary ABI value. An older importer
 already rejects a version-1 factory when the Go signature has multiple
@@ -1299,6 +1306,8 @@ The compiler:
 - exports a versioned, compiler-private factory capability for the restricted
   cross-package signature subset and reconstructs its deterministic typed
   entry without changing the ordinary Go entry;
+- creates all factories in a local recursive call component before lowering
+  their bodies, so direct and mutual recursive edges remain stackless;
 - explicitly declares source locals moved into generated factories, ensuring
   that locals captured across a child suspension receive typed heap storage
   even when the source declaration was implicit;
@@ -1382,6 +1391,9 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   of one imported factory; disassembly verifies private factory calls and the
   absence of ordinary wrappers or `runtime.coroRun` inside the lowered
   resumes;
+- direct recursion, mutual recursion, and a concrete recursive method through
+  4,096 logical frames; disassembly verifies that every recursive edge calls a
+  private factory rather than a public wrapper;
 - ordinary callers, missing capabilities, nested multi-result expressions,
   and complex multi-result targets retain the public Go entry and execute
   correctly; decoder tests verify that the legacy summary format carries no
