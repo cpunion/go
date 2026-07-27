@@ -830,6 +830,9 @@ func(P0, ..., Pn)
 
 func (T) M(P0, ..., Pn) (R0, ..., Rm)
     -> func(T, P0, ..., Pn, *R0, ..., *Rm) func(unsafe.Pointer) uint8
+
+func(P0, ..., Pn, values ...V) R
+    -> func(P0, ..., Pn, values []V, *R) func(unsafe.Pointer) uint8
 ```
 
 The emitted symbol is the ordinary package symbol plus the compiler-reserved
@@ -838,20 +841,22 @@ worker policy, or source annotation. The importer reconstructs the type and
 symbol only after validating the capability.
 
 Factory ABI 1 is intentionally narrow. It supports package functions and
-concrete methods that are non-variadic and non-generic. A method receiver is
-the first explicit factory parameter, followed by the ordinary parameters and
-one typed pointer per result. Interface calls, method values, closures, generic
-shapes, missing capabilities, and the legacy summary format do not produce an
+concrete methods without generic shapes. A method receiver is the first
+explicit factory parameter, followed by the ordinary parameters and one typed
+pointer per result. Type checking has already normalized a variadic `...V`
+parameter and every call site to an explicit `[]V`, which is the factory
+parameter type. Interface calls, method values, closures, generic shapes,
+missing capabilities, and the legacy summary format do not produce an
 imported factory reference. The caller is removed from the lowering candidate
 fixed point and retains its ordinary source body. The same fallback propagates
 to its lowered callers, so an unsupported leaf cannot leave a partially
 transformed call chain.
 
 This extension does not require another summary ABI value. An older importer
-already rejects a version-1 factory when the Go signature has multiple results
-or a receiver, while older archives never advertise a factory for either
-extension. Mixed compiler versions therefore retain the ordinary entry in
-either direction.
+already rejects a version-1 factory when the Go signature has multiple
+results, has a receiver, or is variadic, while older archives never advertise
+a factory for these extensions. Mixed compiler versions therefore retain the
+ordinary entry in either direction.
 
 No-result calls and discarded results are supported. A discarded awaited
 result uses a typed parent-frame slot. Direct assignments may receive multiple
@@ -1072,7 +1077,7 @@ It initially rejects:
 - defer, recover, Goexit, and suspension across panic handling;
 - reflection;
 - closures with escaping environments;
-- variadic Go or C calls;
+- variadic C calls;
 - assembly with unknown stack or suspend effects;
 - C callbacks into arbitrary Go;
 - C++ exceptions and `longjmp`.
@@ -1372,10 +1377,11 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
 - a real three-package call chain covering package functions, concrete pointer
-  and value methods, single and multiple results, blank and discarded results,
-  a no-result call, and reuse of one imported factory; disassembly verifies
-  private factory calls and the absence of ordinary wrappers or
-  `runtime.coroRun` inside the lowered resumes;
+  and value methods, packed and explicit-slice variadic calls, single and
+  multiple results, blank and discarded results, a no-result call, and reuse
+  of one imported factory; disassembly verifies private factory calls and the
+  absence of ordinary wrappers or `runtime.coroRun` inside the lowered
+  resumes;
 - ordinary callers, missing capabilities, nested multi-result expressions,
   and complex multi-result targets retain the public Go entry and execute
   correctly; decoder tests verify that the legacy summary format carries no
@@ -1477,10 +1483,10 @@ callbacks, variadic C calls, or general C ABI type classification. Direct
 foreign declarations now have a restricted transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
 ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
-method-value calls, closures, variadic functions, and generic shapes. Nested
-expression calls and complex result targets remain on the ordinary entry
-until the corresponding general expression and assignment lowering exists.
-Logical traceback, debugger, profiler, race
+method-value calls, closures, and generic shapes. Nested expression calls and
+complex result targets remain on the ordinary entry until the corresponding
+general expression and assignment lowering exists. Logical traceback,
+debugger, profiler, race
 instrumentation on native executor stacks, dynamic executor sizing,
 cancellation of in-flight file work, and broad standard-library compatibility
 remain future work.

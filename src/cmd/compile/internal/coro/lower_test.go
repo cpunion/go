@@ -90,6 +90,21 @@ func TestResumeFactorySupported(t *testing.T) {
 	if !resumeFactorySupported(pair) {
 		t.Fatal("multi-result function does not support a resume factory")
 	}
+	values := types.NewField(src.NoXPos, pkg.Lookup("values"),
+		types.NewSlice(types.Types[types.TINT]))
+	values.SetIsDDD(true)
+	variadic := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Variadic"),
+		types.NewSignature(nil, []*types.Field{values}, nil))
+	variadic.DeclareParams(true)
+	if !resumeFactorySupported(variadic) {
+		t.Fatal("variadic function does not support a resume factory")
+	}
+	variadicFactory := resumeFactoryType(variadic)
+	if variadicFactory.IsVariadic() || variadicFactory.NumParams() != 1 ||
+		variadicFactory.Param(0).Type != values.Type {
+		t.Fatalf("variadic factory type = %v, want explicit slice parameter",
+			variadicFactory)
+	}
 	shapeType := types.NewSignature(nil, nil, nil)
 	shapeType.SetHasShape(true)
 	shape := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Shape"), shapeType)
@@ -125,8 +140,9 @@ func TestLowerMethodReceiver(t *testing.T) {
 
 	recv := types.NewField(src.NoXPos, pkg.Lookup("receiver"),
 		types.NewPtr(types.Types[types.TINT]))
-	param := types.NewField(src.NoXPos, pkg.Lookup("value"),
-		types.Types[types.TINT])
+	param := types.NewField(src.NoXPos, pkg.Lookup("values"),
+		types.NewSlice(types.Types[types.TINT]))
+	param.SetIsDDD(true)
 	method := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Method"),
 		types.NewSignature(recv, []*types.Field{param}, nil))
 	method.DeclareParams(true)
@@ -180,6 +196,9 @@ func TestLowerMethodReceiver(t *testing.T) {
 	})
 	if factoryCall == nil {
 		t.Fatalf("method wrapper does not call %s", wantFactory)
+	}
+	if factoryCall.Fun.Type().IsVariadic() {
+		t.Fatalf("method factory call remains variadic: %v", factoryCall.Fun.Type())
 	}
 	if len(factoryCall.Args) != 2 || factoryCall.Args[0] != receiverName ||
 		factoryCall.Args[1] != paramName {

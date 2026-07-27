@@ -147,10 +147,10 @@ type FactoryABI uint8
 
 const (
 	NoFactory FactoryABI = iota
-	// FactoryABI1 is available for non-closure, non-variadic,
-	// non-generic functions and concrete methods. A method receiver is the
-	// first explicit factory parameter. Each result is returned through a
-	// typed pointer.
+	// FactoryABI1 is available for non-closure, non-generic functions and
+	// concrete methods. A method receiver is the first explicit factory
+	// parameter. A variadic parameter uses its normalized slice type. Each
+	// result is returned through a typed pointer.
 	FactoryABI1
 )
 

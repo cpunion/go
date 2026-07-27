@@ -189,9 +189,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		return nil, fmt.Errorf("recursive function")
 	}
 	sig := fn.Type()
-	if sig.IsVariadic() {
-		return nil, fmt.Errorf("variadic parameters")
-	}
 	if sig.HasShape() {
 		return nil, fmt.Errorf("generic shape")
 	}
@@ -453,8 +450,7 @@ func resumeFactorySupported(fn *ir.Func) bool {
 	if fn == nil || fn.OClosure != nil || fn.Type() == nil {
 		return false
 	}
-	sig := fn.Type()
-	return !sig.IsVariadic() && !sig.HasShape()
+	return !fn.Type().HasShape()
 }
 
 func resumeFactoryType(fn *ir.Func) *types.Type {
@@ -464,6 +460,8 @@ func resumeFactoryType(fn *ir.Func) *types.Type {
 	inputs := fn.Type().RecvParams()
 	params := make([]*types.Field, len(inputs))
 	for i, field := range inputs {
+		// Type checking has normalized a variadic argument to its slice.
+		// Deliberately leave IsDDD unset on the factory parameter.
 		params[i] = types.NewField(field.Pos, field.Sym, field.Type)
 	}
 	for i, field := range fn.Type().Results() {
