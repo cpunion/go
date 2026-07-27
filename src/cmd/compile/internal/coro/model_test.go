@@ -26,7 +26,7 @@ func TestFuncSummaryPrimary(t *testing.T) {
 		{FuncSummary{}, PlainPrimary},
 		{FuncSummary{Effect: MaySuspend}, CoroPrimary},
 		{FuncSummary{Exec: NeedsPreempt}, CoroPrimary},
-		{FuncSummary{Exec: NeedsSystemABI}, PlainPrimary},
+		{FuncSummary{Exec: NeedsSystemABI}, CoroPrimary},
 	}
 	for _, test := range tests {
 		if got := test.summary.Primary(); got != test.want {

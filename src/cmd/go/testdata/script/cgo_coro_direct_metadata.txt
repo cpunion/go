@@ -4,12 +4,41 @@ env GOEXPERIMENT=coro
 mkdir direct
 go tool cgo -objdir=direct main.go
 grep '//go:cgo_direct v1 _Cfunc_add_u64 _Cdirect_add_u64 add_u64 mayblock u64,u64 u64 -' direct/_cgo_gotypes.go
+grep 'func _Cdirect_add_u64' direct/_cgo_gotypes.go
+grep 'func _Cdirect_set_u32' direct/_cgo_gotypes.go
+! grep 'func _Cdirect_set_u32.*_Ctype_void' direct/_cgo_gotypes.go
+grep 'TEXT ·_Cdirect_add_u64' direct/_cgo_direct.s
+grep 'CALL.*_Cfunc_add_u64_direct' direct/_cgo_direct.s
+grep '_Cfunc_static_add_direct' direct/main.cgo2.c
+grep 'return static_add' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
-go build -gcflags=-d=coro=1 -o program .
-stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=plain exec=block-thread,system-abi'
+go build -gcflags='-l -d=coro=4' -o program .
+stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=coro exec=block-thread,system-abi'
 stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
-go run .
+stderr 'coro: phase=lower lowered=2 skipped=0'
+exec ./program
 stderr '^42$'
+go tool objdump -s 'main\._Cdirect_add_u64' program
+stdout '_Cdirect_add_u64'
+stdout 'add_u64'
+! stdout 'runtime.cgocall'
+! stdout 'runtime.asmcgocall'
+go tool objdump -s 'main\.main\.coro\.func1' program
+stdout '_Cdirect_add_u64'
+stdout '_Cfunc_may_callback'
+! stdout '_Cfunc_add_u64'
+! stdout 'runtime.cgocall'
+go tool objdump -s 'main\._Cfunc_may_callback' program
+stdout 'runtime.cgocall'
+
+[race] go build -race -gcflags='-l -d=coro=4' -o raceprogram .
+[race] exec ./raceprogram
+[race] stderr '^42$'
+[race] go tool objdump -s 'main\.main$' raceprogram
+[race] stdout '_Cfunc_add_u64'
+[race] ! stdout '_Cdirect_add_u64'
+[race] go tool objdump -s 'main\._Cfunc_add_u64' raceprogram
+[race] stdout 'runtime.cgocall'
 
 env GOEXPERIMENT=nocoro
 mkdir ordinary
@@ -28,25 +57,113 @@ package main
 
 /*
 #include <stdint.h>
+#include <time.h>
 
 #cgo noescape add_u64
 #cgo nocallback add_u64
+#cgo noescape mix_i
+#cgo nocallback mix_i
+#cgo noescape set_u32
+#cgo nocallback set_u32
+#cgo noescape narrow_i
+#cgo nocallback narrow_i
+#cgo noescape static_add
+#cgo nocallback static_add
+#cgo noescape block_until
+#cgo nocallback block_until
 
 uint64_t add_u64(uint64_t, uint64_t);
+int64_t mix_i(int8_t, uint16_t, int32_t, uint64_t);
+void set_u32(uint32_t *, uint32_t);
+int8_t narrow_i(int8_t);
+int32_t block_until(uint32_t *, uint32_t *);
+
+static uint32_t static_add(uint32_t a, uint32_t b) {
+	return a + b;
+}
 
 static uint64_t may_callback(uint64_t value) {
 	return value;
 }
 */
 import "C"
+import (
+	"runtime"
+	"sync/atomic"
+	"unsafe"
+)
+
+var gate uint32
+var entered uint32
+var argumentOrder uint32
+
+//go:noinline
+func orderedArgument(value C.uint64_t, before uint32) C.uint64_t {
+	if !atomic.CompareAndSwapUint32(&argumentOrder, before, before+1) {
+		panic("C arguments evaluated out of order")
+	}
+	return value
+}
+
+//go:noinline
+func replacement() {
+	for atomic.LoadUint32(&entered) == 0 {
+		runtime.Gosched()
+	}
+	atomic.StoreUint32(&gate, 1)
+}
 
 func main() {
-	println(C.add_u64(19, 23))
+	value := C.add_u64(orderedArgument(19, 0), orderedArgument(23, 1))
+	callbackValue := C.may_callback(9)
+	mixed := C.mix_i(-5, 600, -70000, 80000)
+	var slot C.uint32_t
+	C.set_u32(&slot, 77)
+	narrow := C.narrow_i(-120)
+	staticValue := C.static_add(30, 12)
+	if argumentOrder != 2 || callbackValue != 9 || mixed != 10595 ||
+		slot != 77 || narrow != -120 || staticValue != 42 {
+		panic("bad direct C ABI result")
+	}
+	go replacement()
+	progress := C.block_until(
+		(*C.uint32_t)(unsafe.Pointer(&gate)),
+		(*C.uint32_t)(unsafe.Pointer(&entered)),
+	)
+	if progress != 1 || atomic.LoadUint32(&gate) != 1 ||
+		atomic.LoadUint32(&entered) != 1 {
+		panic("blocking C call stopped scheduler progress")
+	}
+	println(value)
 }
 
 -- add.c --
 #include <stdint.h>
+#include <time.h>
 
 uint64_t add_u64(uint64_t a, uint64_t b) {
 	return a + b;
+}
+
+int64_t mix_i(int8_t a, uint16_t b, int32_t c, uint64_t d) {
+	return (int64_t)a + (int64_t)b + (int64_t)c + (int64_t)d;
+}
+
+void set_u32(uint32_t *p, uint32_t value) {
+	*p = value;
+}
+
+int8_t narrow_i(int8_t value) {
+	return value;
+}
+
+int32_t block_until(uint32_t *gate, uint32_t *entered) {
+	time_t deadline = time(NULL) + 3;
+	__atomic_store_n(entered, 1, __ATOMIC_RELEASE);
+	while (__atomic_load_n(gate, __ATOMIC_ACQUIRE) == 0) {
+		if (time(NULL) >= deadline) {
+			return 0;
+		}
+	}
+	return 1;
 }

@@ -13,6 +13,7 @@ import (
 	"cmd/internal/obj/x86"
 	"cmd/internal/src"
 	"go/constant"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -165,10 +166,32 @@ func TestLowerStateMachines(t *testing.T) {
 	asyncCaller := newLowerTestFunc(pkg, "asyncCaller")
 	asyncCaller.Body = []ir.Node{asyncCall, newLowerTestReturn()}
 
+	directParam := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	directType := types.NewSignature(nil, []*types.Field{directParam}, nil)
 	directOp := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("directOp"),
-		types.NewSignature(nil, nil, nil))
+		directType)
 	directOp.DeclareParams(true)
-	directCall := newLowerTestCall(directOp)
+	directEntry := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("directEntry"),
+		directType)
+	directEntry.DeclareParams(true)
+	directValueResult := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	directValueType := types.NewSignature(nil, []*types.Field{directParam},
+		[]*types.Field{directValueResult})
+	directValueOp := ir.NewFunc(src.NoXPos, src.NoXPos,
+		pkg.Lookup("directValueOp"), directValueType)
+	directValueOp.DeclareParams(true)
+	directValueEntry := ir.NewFunc(src.NoXPos, src.NoXPos,
+		pkg.Lookup("directValueEntry"), directValueType)
+	directValueEntry.DeclareParams(true)
+	argumentResult := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	argument := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("argument"),
+		types.NewSignature(nil, nil, []*types.Field{argumentResult}))
+	argument.DeclareParams(true)
+	argumentCall := newLowerTestCall(argument)
+	argumentCall.SetType(types.Types[types.TINT])
+	directCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, directOp.Nname,
+		ir.Nodes{argumentCall})
+	directCall.SetTypecheck(1)
 	blockOp := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("blockOp"),
 		types.NewSignature(nil, nil, nil))
 	blockOp.DeclareParams(true)
@@ -178,6 +201,84 @@ func TestLowerStateMachines(t *testing.T) {
 	foreignCaller.Body = []ir.Node{
 		directCall, blockCall, foreignYield, newLowerTestReturn(),
 	}
+
+	runDirectCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, directOp.Nname,
+		ir.Nodes{ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(1))})
+	runDirectCall.SetTypecheck(1)
+	runLoop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(false)),
+		nil, ir.Nodes{runDirectCall}, false)
+	runLoop.SetTypecheck(1)
+	runToCompletion := newLowerTestFunc(pkg, "runToCompletion")
+	runToCompletion.Body = ir.Nodes{runLoop, newLowerTestReturn()}
+
+	singleResult := types.NewField(src.NoXPos, pkg.Lookup("singleResult"),
+		types.Types[types.TINT])
+	runSingle := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("runSingle"),
+		types.NewSignature(nil, nil, []*types.Field{singleResult}))
+	runSingle.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, runSingle)
+	singleValue := runSingle.NewLocal(src.NoXPos, pkg.Lookup("singleValue"),
+		types.Types[types.TINT])
+	singleDecl := ir.NewDecl(src.NoXPos, ir.ODCL, singleValue)
+	singleCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		directValueOp.Nname, ir.Nodes{
+			ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(1)),
+		})
+	singleCall.SetType(types.Types[types.TINT])
+	singleCall.SetTypecheck(1)
+	singleAssign := ir.NewAssignStmt(src.NoXPos, singleValue, singleCall)
+	singleAssign.Def = true
+	singleValue.Defn = singleAssign
+	singleReturn := ir.NewReturnStmt(src.NoXPos, ir.Nodes{singleValue})
+	singleReturn.SetTypecheck(1)
+	runSingle.Body = ir.Nodes{singleDecl, singleAssign, singleReturn}
+
+	structuredResults := []*types.Field{
+		types.NewField(src.NoXPos, pkg.Lookup("first"), types.Types[types.TINT]),
+		types.NewField(src.NoXPos, pkg.Lookup("second"), types.Types[types.TINT]),
+	}
+	runStructured := ir.NewFunc(src.NoXPos, src.NoXPos,
+		pkg.Lookup("runStructured"),
+		types.NewSignature(nil, nil, structuredResults))
+	runStructured.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, runStructured)
+	runValue := runStructured.NewLocal(src.NoXPos, pkg.Lookup("runValue"),
+		types.Types[types.TINT])
+	runValueDecl := ir.NewDecl(src.NoXPos, ir.ODCL, runValue)
+	runValueInit := ir.NewAssignStmt(src.NoXPos, runValue,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(0)))
+	runValueInit.Def = true
+	runValue.Defn = runValueInit
+	runValueCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		directValueOp.Nname, ir.Nodes{
+			ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(2)),
+		})
+	runValueCall.SetType(types.Types[types.TINT])
+	runValueCall.SetTypecheck(1)
+	runValueAssign := ir.NewAssignStmt(src.NoXPos, runValue, runValueCall)
+	runElseAssign := ir.NewAssignStmt(src.NoXPos, runValue,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(3)))
+	runIf := ir.NewIfStmt(src.NoXPos,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(true)),
+		ir.Nodes{runValueAssign}, ir.Nodes{runElseAssign})
+	runIf.SetInit(ir.Nodes{runValueInit})
+	runIf.SetTypecheck(1)
+	runBlock := ir.NewBlockStmt(src.NoXPos, ir.Nodes{runIf})
+	runReturn := ir.NewReturnStmt(src.NoXPos, ir.Nodes{
+		runValue,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(4)),
+	})
+	runReturn.SetTypecheck(1)
+	runStructured.Body = ir.Nodes{runValueDecl, runBlock, runReturn}
 
 	structured := newLowerTestFunc(pkg, "structured")
 	loopVar := structured.NewLocal(src.NoXPos, pkg.Lookup("loop"), types.Types[types.TINT])
@@ -357,6 +458,15 @@ func TestLowerStateMachines(t *testing.T) {
 			Effect:  MaySuspend,
 			Exec:    NeedsSystemABI | MayBlockThread,
 			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: directOp,
+				CalleeName: symbolName(directOp.Nname),
+				Recipe: OperationRecipe{
+					Kind: SiteForeign, Foreign: DirectNoBlock,
+					Direct: symbolName(directEntry.Nname),
+				},
+				Node: directCall, Direct: directEntry,
+			}},
 			Sites: []Site{
 				{
 					ID: 1, Kind: SiteForeign, Node: directCall,
@@ -368,6 +478,63 @@ func TestLowerStateMachines(t *testing.T) {
 				},
 				{ID: 3, Kind: SiteYield, Node: foreignYield},
 			},
+		},
+		runToCompletion: {
+			Func:    runToCompletion,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI | MayBlockThread,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: directOp,
+				CalleeName: symbolName(directOp.Nname),
+				Recipe: OperationRecipe{
+					Kind: SiteForeign, Foreign: DirectMayBlock,
+					Direct: symbolName(directEntry.Nname),
+				},
+				Node: runDirectCall, Direct: directEntry,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: runDirectCall,
+				Foreign: DirectMayBlock,
+			}},
+		},
+		runSingle: {
+			Func:    runSingle,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: directValueOp,
+				CalleeName: symbolName(directValueOp.Nname),
+				Recipe: OperationRecipe{
+					Kind: SiteForeign, Foreign: DirectNoBlock,
+					Direct: symbolName(directValueEntry.Nname),
+				},
+				Node: singleCall, Direct: directValueEntry,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: singleCall,
+				Foreign: DirectNoBlock,
+			}},
+		},
+		runStructured: {
+			Func:    runStructured,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: directValueOp,
+				CalleeName: symbolName(directValueOp.Nname),
+				Recipe: OperationRecipe{
+					Kind: SiteForeign, Foreign: DirectNoBlock,
+					Direct: symbolName(directValueEntry.Nname),
+				},
+				Node: runValueCall, Direct: directValueEntry,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: runValueCall,
+				Foreign: DirectNoBlock,
+			}},
 		},
 		structured: {
 			Func:    structured,
@@ -409,8 +576,8 @@ func TestLowerStateMachines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 12 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 12 lowered and 0 skipped", result)
+	if result.Lowered != 15 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 15 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -422,9 +589,145 @@ func TestLowerStateMachines(t *testing.T) {
 		t.Fatalf("nosplit resume functions = %d, want %d", noSplitResumes, result.Lowered)
 	}
 
+	var foreignResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "foreignCaller.coro" {
+			foreignResume = generated
+			break
+		}
+	}
+	if foreignResume == nil {
+		t.Fatal("foreign caller has no generated resume function")
+	}
+	var callOrder []string
+	ir.Visit(foreignResume, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		name := ir.StaticCalleeName(call.Fun)
+		if name != nil && name.Sym() != nil {
+			callOrder = append(callOrder, name.Sym().Name)
+		}
+	})
+	callIndex := func(name string) int {
+		return slices.Index(callOrder, name)
+	}
+	argumentIndex := callIndex("argument")
+	enterIndex := callIndex("coroEnterForeign")
+	directIndex := callIndex("directEntry")
+	exitIndex := callIndex("coroExitForeign")
+	if argumentIndex < 0 || enterIndex < 0 || directIndex < 0 || exitIndex < 0 ||
+		!(argumentIndex < enterIndex && enterIndex < directIndex &&
+			directIndex < exitIndex) {
+		t.Errorf("foreign call order = %v, want argument, enter, direct, exit",
+			callOrder)
+	}
+	if callIndex("directOp") >= 0 {
+		t.Errorf("foreign call retained wrapper target: %v", callOrder)
+	}
+
+	var runResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "runToCompletion.coro" {
+			runResume = generated
+			break
+		}
+	}
+	if runResume == nil {
+		t.Fatal("run-to-completion caller has no generated resume function")
+	}
+	var runCalls []string
+	var runLoops, runSwitches int
+	ir.Visit(runResume, func(node ir.Node) {
+		switch node := node.(type) {
+		case *ir.ForStmt:
+			runLoops++
+		case *ir.SwitchStmt:
+			runSwitches++
+		case *ir.CallExpr:
+			name := ir.StaticCalleeName(node.Fun)
+			if name != nil && name.Sym() != nil {
+				runCalls = append(runCalls, name.Sym().Name)
+			}
+		}
+	})
+	if runLoops != 1 || runSwitches != 0 {
+		t.Errorf("run-to-completion control flow has %d loops and %d switches, want 1 and 0",
+			runLoops, runSwitches)
+	}
+	if want := []string{"coroEnterBlocking", "directEntry", "coroExitBlocking"}; !slices.Equal(runCalls, want) {
+		t.Errorf("run-to-completion calls = %v, want %v", runCalls, want)
+	}
+
+	for _, test := range []struct {
+		name       string
+		wantIf     bool
+		wantResult int
+	}{
+		{"runSingle", false, 1},
+		{"runStructured", true, 2},
+	} {
+		var resume *ir.Func
+		for _, generated := range typecheck.Target.Funcs {
+			if generated.OClosure != nil && generated.ClosureParent != nil &&
+				generated.ClosureParent.Sym().Name == test.name+".coro" {
+				resume = generated
+				break
+			}
+		}
+		if resume == nil {
+			t.Errorf("%s has no generated resume function", test.name)
+			continue
+		}
+		var calls []string
+		var ifs, blocks, switches, resultStores int
+		ir.Visit(resume, func(node ir.Node) {
+			switch node := node.(type) {
+			case *ir.IfStmt:
+				ifs++
+			case *ir.BlockStmt:
+				blocks++
+			case *ir.SwitchStmt:
+				switches++
+			case *ir.AssignStmt:
+				if _, ok := node.X.(*ir.StarExpr); ok {
+					resultStores++
+				}
+			case *ir.CallExpr:
+				name := ir.StaticCalleeName(node.Fun)
+				if name != nil && name.Sym() != nil {
+					calls = append(calls, name.Sym().Name)
+				}
+			}
+		})
+		wantCalls := []string{
+			"coroEnterForeign", "directValueEntry", "coroExitForeign",
+		}
+		if !slices.Equal(calls, wantCalls) {
+			t.Errorf("%s calls = %v, want %v", test.name, calls, wantCalls)
+		}
+		if switches != 0 {
+			t.Errorf("%s has %d switches, want none", test.name, switches)
+		}
+		if test.wantIf && (ifs == 0 || blocks == 0) {
+			t.Errorf("%s has %d ifs and %d blocks, want structured control",
+				test.name, ifs, blocks)
+		}
+		// Both an explicit return and the implicit fallthrough completion copy
+		// every result to the wrapper-owned slots.
+		if want := 2 * test.wantResult; resultStores != want {
+			t.Errorf("%s result stores = %d, want %d",
+				test.name, resultStores, want)
+		}
+	}
+
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
-		ordinaryFileReader, asyncCaller, foreignCaller, structured, deferred,
+		ordinaryFileReader, asyncCaller, foreignCaller, runToCompletion,
+		runSingle, runStructured, structured, deferred,
 	} {
 		if len(fn.Body) != 2 {
 			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
@@ -454,6 +757,78 @@ func TestLowerStateMachines(t *testing.T) {
 		if !hasFactory {
 			t.Errorf("%s has no resume factory", fn.Sym().Name)
 		}
+	}
+}
+
+func TestCanLowerRunToCompletion(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/runpredicate", "runpredicate")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	tests := []struct {
+		name   string
+		change func(*lowerCandidate, *ir.CallExpr)
+		want   bool
+	}{
+		{"direct no block", func(*lowerCandidate, *ir.CallExpr) {}, true},
+		{"direct may block", func(candidate *lowerCandidate, call *ir.CallExpr) {
+			candidate.function.Sites[0].Foreign = DirectMayBlock
+			candidate.foreignCalls[call] = DirectMayBlock
+		}, true},
+		{"may suspend", func(candidate *lowerCandidate, _ *ir.CallExpr) {
+			candidate.function.Effect = MaySuspend
+		}, false},
+		{"defer", func(candidate *lowerCandidate, _ *ir.CallExpr) {
+			candidate.defers = []*lowerDefer{{}}
+		}, false},
+		{"no foreign call", func(candidate *lowerCandidate, call *ir.CallExpr) {
+			delete(candidate.foreignCalls, call)
+		}, false},
+		{"non-foreign site", func(candidate *lowerCandidate, _ *ir.CallExpr) {
+			candidate.function.Sites[0].Kind = SiteYield
+		}, false},
+		{"async foreign site", func(candidate *lowerCandidate, call *ir.CallExpr) {
+			candidate.function.Sites[0].Foreign = AsyncOperation
+			candidate.foreignCalls[call] = AsyncOperation
+		}, false},
+		{"foreign call in for post", func(candidate *lowerCandidate, call *ir.CallExpr) {
+			loop := ir.NewForStmt(src.NoXPos, nil, nil, call, nil, false)
+			candidate.function.Func.Body = ir.Nodes{loop, newLowerTestReturn()}
+		}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := newLowerTestFunc(pkg, "target."+strings.ReplaceAll(test.name, " ", "."))
+			call := newLowerTestCall(target)
+			fn := newLowerTestFunc(pkg, "caller."+strings.ReplaceAll(test.name, " ", "."))
+			fn.Body = ir.Nodes{call, newLowerTestReturn()}
+			candidate := &lowerCandidate{
+				function: &Function{
+					Func:   fn,
+					Effect: NoSuspend,
+					Sites: []Site{{
+						ID: 1, Kind: SiteForeign, Node: call,
+						Foreign: DirectNoBlock,
+					}},
+				},
+				foreignCalls: map[*ir.CallExpr]ForeignCallClass{
+					call: DirectNoBlock,
+				},
+			}
+			test.change(candidate, call)
+			if got := canLowerRunToCompletion(candidate); got != test.want {
+				t.Errorf("canLowerRunToCompletion = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -505,6 +880,93 @@ func TestLowerRejectsUnsupportedDependency(t *testing.T) {
 	}
 	if result.Lowered != 0 || result.Skipped != 2 {
 		t.Fatalf("Lower result = %+v, want 0 lowered and 2 skipped", result)
+	}
+}
+
+func TestLowerRejectsNestedSystemABIRoot(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowernestedroot", "lowernestedroot")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	directOp := newLowerTestFunc(pkg, "directOp")
+	directEntry := newLowerTestFunc(pkg, "directEntry")
+	newForeignCall := func() *ir.CallExpr {
+		return newLowerTestCall(directOp)
+	}
+	newForeignEdge := func(call *ir.CallExpr) Edge {
+		return Edge{
+			Kind: DirectCall, Callee: directOp,
+			CalleeName: symbolName(directOp.Nname),
+			Recipe: OperationRecipe{
+				Kind: SiteForeign, Foreign: DirectNoBlock,
+				Direct: symbolName(directEntry.Nname),
+			},
+			Node: call, Direct: directEntry,
+		}
+	}
+
+	child := newLowerTestFunc(pkg, "child")
+	childForeign := newForeignCall()
+	child.Body = ir.Nodes{childForeign, newLowerTestReturn()}
+
+	parent := newLowerTestFunc(pkg, "parent")
+	parentForeign := newForeignCall()
+	childCall := newLowerTestCall(child)
+	parent.Body = ir.Nodes{parentForeign, childCall, newLowerTestReturn()}
+
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		child: {
+			Func:    child,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI,
+			Primary: CoroPrimary,
+			Edges:   []Edge{newForeignEdge(childForeign)},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: childForeign,
+				Foreign: DirectNoBlock,
+			}},
+		},
+		parent: {
+			Func:    parent,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI,
+			Primary: CoroPrimary,
+			Edges: []Edge{
+				newForeignEdge(parentForeign),
+				{
+					Kind: DirectCall, Callee: child,
+					CalleeName: symbolName(child.Nname), Node: childCall,
+				},
+			},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: parentForeign,
+				Foreign: DirectNoBlock,
+			}},
+		},
+	}}
+	result, err := Lower(plan)
+	if err != nil {
+		t.Fatalf("Lower failed: %v", err)
+	}
+	if result.Lowered != 1 || result.Skipped != 1 {
+		t.Fatalf("Lower result = %+v, want 1 lowered and 1 skipped", result)
+	}
+	if len(result.Diagnostics) != 1 ||
+		!strings.Contains(result.Diagnostics[0], "requires coroutine factory entry") {
+		t.Fatalf("Lower diagnostics = %q, want factory-entry rejection",
+			result.Diagnostics)
+	}
+	if len(parent.Body) != 3 {
+		t.Fatalf("rejected parent body has %d statements, want 3", len(parent.Body))
 	}
 }
 

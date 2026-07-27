@@ -150,6 +150,7 @@ type Edge struct {
 	Unknown    bool
 	Recipe     OperationRecipe
 	Node       *ir.CallExpr
+	Direct     *ir.Func
 }
 
 // Function is the coroutine analysis result for one function.
@@ -170,6 +171,7 @@ type Function struct {
 type Plan struct {
 	Functions map[*ir.Func]*Function
 	cgoDirect map[string]cgoDirectCall
+	localFunc map[string]*ir.Func
 }
 
 // PublishSummaries makes this package's final effects available to the
@@ -190,9 +192,17 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 	p := &Plan{
 		Functions: make(map[*ir.Func]*Function, len(funcs)),
 		cgoDirect: cgoDirect,
+		localFunc: make(map[string]*ir.Func, len(funcs)),
 	}
 	for _, fn := range funcs {
 		p.Functions[fn] = &Function{Func: fn}
+		if fn != nil && fn.Nname != nil && fn.Nname.Sym() != nil {
+			name := fn.Nname.Sym().Name
+			if old := p.localFunc[name]; old == nil ||
+				old.ABIWrapper() && !fn.ABIWrapper() {
+				p.localFunc[name] = fn
+			}
+		}
 	}
 	for _, function := range p.Functions {
 		p.scan(function)
@@ -246,6 +256,15 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 }
 
 func (p *Plan) scan(function *Function) {
+	// An ABI adapter for a generated cgo wrapper calls the wrapper with the
+	// same symbol name. The direct-call metadata describes source calls to
+	// that wrapper, not this compiler-generated adapter.
+	if fn := function.Func; fn.ABIWrapper() && fn.Nname != nil &&
+		fn.Nname.Sym() != nil {
+		if _, ok := p.cgoDirect[fn.Nname.Sym().Name]; ok {
+			return
+		}
+	}
 	goDefer := make(map[*ir.CallExpr]EdgeKind)
 	ir.Visit(function.Func, func(n ir.Node) {
 		if n, ok := n.(*ir.GoDeferStmt); ok {
@@ -330,6 +349,7 @@ func (p *Plan) scan(function *Function) {
 		}
 		if recipe, ok := p.operationRecipe(edge.Callee); ok {
 			edge.Recipe = recipe
+			edge.Direct = p.localFunc[recipe.Direct]
 			edge.Imported = FuncSummary{Effect: recipe.Effect, Exec: recipe.Exec}
 			edge.Unknown = false
 			function.LocalExec |= recipe.Exec

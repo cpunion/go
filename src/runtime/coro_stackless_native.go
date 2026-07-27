@@ -14,7 +14,6 @@ import (
 )
 
 const (
-	stacklessCoroExecutorCount = 4
 	stacklessCoroSchedulerSize = 64 << 10
 
 	// coroNativeStart runs in a frame entered by mcall on the original g0
@@ -251,6 +250,7 @@ func coroNativeFinish(executor *g) {
 	}
 	casgstatus(executor, _Grunning, _Gdead)
 	gcController.addScannableStack(mp.p.ptr(), -int64(executor.stack.hi-executor.stack.lo))
+	resetStacklessCoroExecutor(executor)
 
 	executor.m = nil
 	executor.lockedm = 0
@@ -290,4 +290,20 @@ func coroNativeFinish(executor *g) {
 	mp.g0StackAccurate = g0Accurate
 	schedulerG.m = nil
 	coroNativeGogo(&caller.sched, nativeG0)
+}
+
+// resetStacklessCoroExecutor clears state that execute and gdestroy normally
+// reset for a reused G. In particular, a concurrent stack scan may request a
+// synchronous preemption immediately before the executor becomes dead. That
+// request has no owner after suspendG observes the dead G and must not survive
+// into the next use of this synthetic executor.
+func resetStacklessCoroExecutor(executor *g) {
+	executor.preempt = false
+	executor.preemptStop = false
+	executor.preemptShrink = false
+	executor.syncSafePoint = false
+	executor.asyncSafePoint = false
+	executor.throwsplit = false
+	executor.waitreason = waitReasonZero
+	executor.waitsince = 0
 }

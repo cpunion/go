@@ -102,6 +102,25 @@ func TestStacklessCoroNativeReuseDuringGC(t *testing.T) {
 	<-gcDone
 }
 
+func TestStacklessCoroNativeBlockingReuseDuringGC(t *testing.T) {
+	const runs = 50_000
+	gcDone := make(chan struct{})
+	go func() {
+		for range 100 {
+			runtime.GC()
+		}
+		close(gcDone)
+	}()
+
+	for range runs {
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			runtime.BlockingBoundaryStacklessCoroForTest(ctx)
+			return runtime.StacklessCoroActionComplete
+		})
+	}
+	<-gcDone
+}
+
 func TestStacklessCoroNativePreemption(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)

@@ -6,6 +6,8 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/types"
+	"cmd/internal/src"
 	"strings"
 	"testing"
 )
@@ -164,5 +166,64 @@ func TestAnalyzeCgoDirectives(t *testing.T) {
 	}
 	if len(plan.Functions) != 0 || len(plan.cgoDirect) != 0 {
 		t.Fatalf("empty plan = %+v", plan)
+	}
+}
+
+func TestAnalyzeCgoDirectEntry(t *testing.T) {
+	pkg := types.NewPkg("example.com/coro/cgotest", "cgotest")
+	newFunc := func(name string) *ir.Func {
+		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name),
+			types.NewSignature(nil, nil, nil))
+		fn.DeclareParams(true)
+		return fn
+	}
+
+	// ABI wrappers can share the direct entry's linker symbol. The local
+	// lookup must retain the source body that cmd/cgo generated.
+	directABI := newFunc("_Cdirect_add")
+	directABI.SetABIWrapper(true)
+	direct := newFunc("_Cdirect_add")
+	wrapper := newFunc("_Cfunc_add")
+	wrapperABI := newFunc("_Cfunc_add")
+	wrapperABI.SetABIWrapper(true)
+	wrapperABICall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		wrapper.Nname, nil)
+	wrapperABICall.SetTypecheck(1)
+	wrapperABI.Body = ir.Nodes{wrapperABICall}
+	caller := newFunc("caller")
+	call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, wrapper.Nname, nil)
+	call.SetTypecheck(1)
+	caller.Body = ir.Nodes{call}
+
+	directive := []string{
+		"cgo_direct", "v1", "_Cfunc_add", "_Cdirect_add", "add",
+		"mayblock", "-", "void", "-",
+	}
+	plan, err := Analyze([]*ir.Func{
+		directABI, direct, wrapper, wrapperABI, caller,
+	},
+		[][]string{directive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	function := plan.Functions[caller]
+	if function == nil || len(function.Edges) != 1 || len(function.Sites) != 1 {
+		t.Fatalf("caller analysis = %+v", function)
+	}
+	edge := function.Edges[0]
+	if edge.Direct != direct {
+		t.Fatalf("direct entry = %v, want %v", edge.Direct, direct)
+	}
+	if edge.Recipe.Direct != "_Cdirect_add" ||
+		edge.Recipe.Foreign != DirectMayBlock {
+		t.Fatalf("direct recipe = %+v", edge.Recipe)
+	}
+	if got, want := function.Exec,
+		NeedsSystemABI|MayBlockThread; got != want {
+		t.Fatalf("caller execution requirements = %v, want %v", got, want)
+	}
+	if function := plan.Functions[wrapperABI]; len(function.Edges) != 0 ||
+		len(function.Sites) != 0 {
+		t.Fatalf("cgo ABI wrapper analysis = %+v, want no call sites", function)
 	}
 }

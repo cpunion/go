@@ -8,6 +8,7 @@ package runtime_test
 
 import (
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +38,31 @@ func TestStacklessCoroYield(t *testing.T) {
 	}
 	if got := len(trace); got != 2 || trace[0] != 1 || trace[1] != 2 {
 		t.Fatalf("trace = %v, want [1 2]", trace)
+	}
+}
+
+func TestStacklessCoroForeignState(t *testing.T) {
+	calls := runtime.NumCgoCall()
+	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+		if incgo, noCallback, ncgo := runtime.ForeignStateStacklessCoroForTest(); incgo || noCallback || ncgo != 0 {
+			t.Fatalf("initial foreign state = (%t, %t, %d), want (false, false, 0)",
+				incgo, noCallback, ncgo)
+		}
+		runtime.EnterForeignStacklessCoroForTest()
+		if incgo, noCallback, ncgo := runtime.ForeignStateStacklessCoroForTest(); !incgo || !noCallback || ncgo != 1 {
+			t.Fatalf("entered foreign state = (%t, %t, %d), want (true, true, 1)",
+				incgo, noCallback, ncgo)
+		}
+		runtime.ExitForeignStacklessCoroForTest()
+		if incgo, noCallback, ncgo := runtime.ForeignStateStacklessCoroForTest(); incgo || noCallback || ncgo != 0 {
+			t.Fatalf("exited foreign state = (%t, %t, %d), want (false, false, 0)",
+				incgo, noCallback, ncgo)
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+	if got := runtime.NumCgoCall(); got <= calls {
+		t.Errorf("NumCgoCall did not record direct foreign entry: before %d, after %d",
+			calls, got)
 	}
 }
 
@@ -255,6 +281,59 @@ func TestStacklessCoroCallRead(t *testing.T) {
 	})
 	if !called {
 		t.Fatal("read call did not run")
+	}
+}
+
+func TestStacklessCoroBlockingProgress(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var rescued atomic.Bool
+	rescue := time.AfterFunc(5*time.Second, func() {
+		rescued.Store(true)
+		syscall.Write(fds[1], []byte{'r'})
+	})
+	defer rescue.Stop()
+
+	var writeErr error
+	sibling := func(unsafe.Pointer) uint8 {
+		_, writeErr = syscall.Write(fds[1], []byte{'p'})
+		return runtime.StacklessCoroActionComplete
+	}
+	var state int
+	buffer := make([]byte, 1)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			runtime.SpawnStacklessCoroForTest(ctx, sibling)
+			if n := runtime.BlockingReadStacklessCoroForTest(ctx, fds[0], buffer); n != 1 {
+				t.Fatalf("blocking read = %d, want 1", n)
+			}
+			state = 1
+			return runtime.StacklessCoroActionYield
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if rescued.Load() {
+		t.Fatal("blocking foreign call stopped stackless sibling progress")
+	}
+	if got := string(buffer); got != "p" {
+		t.Fatalf("blocking read = %q, want %q", got, "p")
 	}
 }
 

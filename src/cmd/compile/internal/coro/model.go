@@ -148,7 +148,7 @@ type FuncSummary struct {
 }
 
 func (s FuncSummary) Primary() PrimaryKind {
-	if s.Effect == MaySuspend || s.Exec&NeedsPreempt != 0 {
+	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI) != 0 {
 		return CoroPrimary
 	}
 	return PlainPrimary
@@ -162,6 +162,7 @@ type OperationRecipe struct {
 	Effect  Effect
 	Exec    ExecFlags
 	Foreign ForeignCallClass
+	Direct  string
 }
 
 var operationRecipes = map[string]OperationRecipe{
