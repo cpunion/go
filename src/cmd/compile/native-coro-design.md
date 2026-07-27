@@ -1269,6 +1269,10 @@ The runtime:
   on that stack;
 - changes `m.g0` identity and resumes the target G in one architecture
   assembly sequence, so GC cannot observe a half-completed switch;
+- reloads the scheduler pointer from the heap-owned native context after that
+  switch and returns it to the root owner for replacement-executor shutdown;
+  the low-level switch helper does not own scheduler-lifecycle policy or reuse
+  a caller local saved on the pre-switch stack;
 - uses common operation ownership for timer, regular-file worker, nonblocking
   socket, and asynchronous C completion;
 - makes timer completion and cancellation race for the same operation record,
@@ -1328,15 +1332,27 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 The Linux/amd64 local run used an amd64 OrbStack guest translated on Apple
 Silicon. Its correctness and allocation results are useful, but its latency
 must not be compared directly with a native amd64 host. Native Linux and
-Darwin jobs remain CI acceptance gates.
+Darwin jobs remain CI acceptance gates. On the final topic head, the focused
+stackless runtime set passed three times, fixed-defer lowering passed ten
+times, transparent C calls passed three times, and the stackless runtime set
+passed under the race detector. A full translated-runtime invocation is not a
+reliable additional gate: Rosetta can terminate the test process while
+reserving its fixed address space. In particular, `TestCheckFDs` reports that
+mapping failure, and the deliberately racy `TestPanicRace` is sensitive to the
+translated scheduler timing even though disassembly confirms that its
+`main.main` and `PanicRace` paths contain no `runtime.coroRun` call. The
+workflow therefore runs the unfiltered runtime suite on native Ubuntu and
+macOS.
 
-The focused profiles cover 90.7% of instrumentable changed production lines
-across `cmd/cgo`, the compiler, runtime, and `cmd/go` plumbing. Excluding the
-small `cmd/go` execution hooks that are exercised in a subprocess by the
-end-to-end script, core coverage is 92.0%. The new generated-call helpers and
-benchmark wrappers are 99.5% and 100% covered; run-to-completion lowering is
-88.4% covered and its eligibility predicate is 100% covered. Remaining lines
-are defensive invariant failures or subprocess-only build plumbing.
+The focused profiles cover 632 of 697 instrumentable changed production lines,
+or 90.7%, across `cmd/cgo`, the compiler, runtime, and `cmd/go` plumbing.
+Excluding the small `cmd/go` execution hooks that are exercised in a
+subprocess by the end-to-end script, core coverage is 624 of 679 lines, or
+91.9%. The new generated-call helpers and benchmark wrappers are 99.5% and
+100% covered; run-to-completion lowering is 88.4% covered and its eligibility
+predicate is 100% covered. The final native-context return and root-owned
+cleanup success paths are covered on Darwin. Remaining lines are defensive
+invariant failures or subprocess-only build plumbing.
 
 ### 15.3 Measurements
 
@@ -1369,25 +1385,27 @@ reported two lowered functions and no skipped functions.
 | pure Go reference | 0.767-0.772 ns | 1.04-1.06 ns | 0 B/op |
 
 The transparent-cgo follow-up adds a separate benchmark in
-`internal/runtime/cgobench`. A Darwin/arm64 sample on an Apple M4 Max used five
-300 ms runs for latency and three 200 ms runs for allocation:
+`internal/runtime/cgobench`. The Darwin/arm64 sample ran on an Apple M4 Max.
+The Linux/amd64 sample ran in the translated VirtualApple guest described
+above. Both used five 300 ms runs for latency and three 200 ms runs for
+allocation:
 
-| Shape | Path | Median | Allocation |
-| --- | --- | ---: | ---: |
-| steady | ordinary cgo | 13.49 ns | 0 B/op, 0 allocs/op |
-| steady | transparent `DirectMayBlock` | 13.96 ns | 0 B/op, 0 allocs/op |
-| steady | compiler-owned `DirectNoBlock` | 4.46 ns | 0 B/op, 0 allocs/op |
-| entry | ordinary cgo | 14.27 ns | 0 B/op, 0 allocs/op |
-| entry | transparent `DirectMayBlock` | 1.08 us | 448 B/op, 5 allocs/op |
-| entry | compiler-owned `DirectNoBlock` | 1.07 us | 504 B/op, 8 allocs/op |
+| Shape | Path | Darwin/arm64 median | Linux/amd64 translated median | Allocation |
+| --- | --- | ---: | ---: | ---: |
+| steady | ordinary cgo | 13.49 ns | 21.32 ns | 0 B/op, 0 allocs/op |
+| steady | transparent `DirectMayBlock` | 13.96 ns | 20.47 ns | 0 B/op, 0 allocs/op |
+| steady | compiler-owned `DirectNoBlock` | 4.46 ns | 5.444 ns | 0 B/op, 0 allocs/op |
+| entry | ordinary cgo | 14.27 ns | 21.86 ns | 0 B/op, 0 allocs/op |
+| entry | transparent `DirectMayBlock` | 1.08 us | 872.2 ns | 448 B/op, 5 allocs/op |
+| entry | compiler-owned `DirectNoBlock` | 1.07 us | 927.5 ns | 504 B/op, 8 allocs/op |
 
 The conservative transparent path is therefore near ordinary cgo in steady
-state, not a demonstrated speedup. `DirectNoBlock` shows that avoiding syscall
-scheduler accounting can materially reduce the boundary cost, but a public
-bounded-call contract has not been selected. The entry measurements expose a
-larger unresolved root-creation cost; they are evidence for the separate
-cross-package entry design question in section 10.9, not justification for
-adding source annotations.
+state on both runs, not a demonstrated speedup. `DirectNoBlock` shows that
+avoiding syscall scheduler accounting can materially reduce the boundary
+cost, but a public bounded-call contract has not been selected. The entry
+measurements expose a larger unresolved root-creation cost; they are evidence
+for the separate cross-package entry design question in section 10.9, not
+justification for adding source annotations.
 
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
