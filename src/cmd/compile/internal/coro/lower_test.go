@@ -807,8 +807,8 @@ func TestLowerStateMachines(t *testing.T) {
 			}
 			name := ir.StaticCalleeName(call.Fun)
 			if name != nil && name.Sym() != nil &&
-				name.Sym().Name == "coroPanicPending" {
-				t.Errorf("%s checks for a panic outcome without a panic effect",
+				name.Sym().Name == "coroTerminalAction" {
+				t.Errorf("%s checks for a terminal outcome without a terminal effect",
 					generated.Sym().Name)
 			}
 		})
@@ -1166,7 +1166,7 @@ func TestLowerPanicOutcome(t *testing.T) {
 			calls = append(calls, name.Sym().Name)
 		}
 	})
-	for _, want := range []string{"coroPanicPending", "coroPanic"} {
+	for _, want := range []string{"coroTerminalAction", "coroPanic"} {
 		if !slices.Contains(calls, want) {
 			t.Errorf("generated resume calls = %v, want %s", calls, want)
 		}
@@ -1282,7 +1282,7 @@ func TestLowerDeferTerminal(t *testing.T) {
 	}
 	for _, want := range []string{
 		"coroDeferToken", "coroDeferPanic", "coroDeferRecover",
-		"coroPanicPending",
+		"coroTerminalAction",
 	} {
 		if !calls[want] {
 			t.Errorf("generated terminal defer calls = %v, want %s", calls, want)
@@ -1396,6 +1396,68 @@ func TestLowerRejectsCalledTerminalDefer(t *testing.T) {
 	}
 }
 
+func TestLowerGoexitOutcome(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowerterminal", "lowerterminal")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	goexit := newLowerTestFunc(pkg, "goexit")
+	call := newLowerTestCall(goexit)
+	fn := newLowerTestFunc(pkg, "exiting")
+	fn.Body = ir.Nodes{call}
+	function := &Function{
+		Func:          fn,
+		LocalTerminal: MayGoexit,
+		Terminal:      MayGoexit,
+		Primary:       CoroPrimary,
+		Sites:         []Site{{ID: 1, Kind: SiteGoexit, Node: call}},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	var calls []string
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure == nil || generated.ClosureParent == nil ||
+			generated.ClosureParent.Sym().Name != "exiting.coro" {
+			continue
+		}
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil {
+				calls = append(calls, name.Sym().Name)
+			}
+		})
+	}
+	for _, want := range []string{"coroGoexit", "coroTerminalAction"} {
+		if !slices.Contains(calls, want) {
+			t.Errorf("generated resume calls = %v, want %s", calls, want)
+		}
+	}
+	if slices.Contains(calls, "Goexit") {
+		t.Errorf("generated resume retains runtime.Goexit call: %v", calls)
+	}
+}
+
 func TestLowerRejectsTerminalControl(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -1406,34 +1468,10 @@ func TestLowerRejectsTerminalControl(t *testing.T) {
 		types.LocalPkg = oldLocalPkg
 	}()
 
-	pkg := types.NewPkg("example.com/coro/lowerterminal", "lowerterminal")
+	pkg := types.NewPkg("example.com/coro/lowerterminalreject",
+		"lowerterminalreject")
 	types.LocalPkg = pkg
 	typecheck.Target = new(ir.Package)
-
-	yield := newLowerTestFunc(pkg, "yield")
-	for _, test := range []struct {
-		name     string
-		terminal TerminalFlags
-		want     string
-	}{
-		{"goexit", MayGoexit, "unsupported terminal control goexit"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			call := newLowerTestCall(yield)
-			fn := newLowerTestFunc(pkg, test.name)
-			fn.Body = ir.Nodes{call, newLowerTestReturn()}
-			function := &Function{
-				Func: fn, Terminal: test.terminal,
-				Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}},
-			}
-			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
-			if _, err := newLowerCandidate(plan, function); err == nil ||
-				!strings.Contains(err.Error(), test.want) {
-				t.Fatalf("newLowerCandidate error = %v, want %q",
-					err, test.want)
-			}
-		})
-	}
 
 	t.Run("invalid-panic-site", func(t *testing.T) {
 		fn := newLowerTestFunc(pkg, "invalidPanic")

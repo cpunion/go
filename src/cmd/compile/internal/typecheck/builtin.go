@@ -272,6 +272,8 @@ var runtimeDecls = [...]struct {
 	{"coroDeferToken", funcTag, 175},
 	{"coroDeferPanic", funcTag, 126},
 	{"coroDeferRecover", funcTag, 176},
+	{"coroGoexit", funcTag, 132},
+	{"coroTerminalAction", funcTag, 123},
 }
 
 func runtimeTypes() []*types.Type {

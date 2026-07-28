@@ -424,9 +424,16 @@ func (p *Plan) scan(function *Function) {
 		if recipe, ok := p.operationRecipe(edge.Callee); ok {
 			edge.Recipe = recipe
 			edge.Direct = p.localFunc[recipe.Direct]
-			edge.Imported = FuncSummary{Effect: recipe.Effect, Exec: recipe.Exec}
+			edge.Imported = FuncSummary{
+				Effect:   recipe.Effect,
+				Exec:     recipe.Exec,
+				Terminal: recipe.Terminal,
+			}
 			edge.Unknown = false
 			function.LocalExec |= recipe.Exec
+			if kind != GoCall {
+				function.LocalTerminal |= recipe.Terminal
+			}
 			if recipe.Effect == MaySuspend && kind != GoCall {
 				switch recipe.Kind {
 				case SiteYield:
@@ -438,9 +445,6 @@ func (p *Plan) scan(function *Function) {
 			if kind != GoCall {
 				addSite(recipe.Kind, call, recipe.Foreign)
 			}
-		}
-		if edge.CalleeName == "runtime.Goexit" {
-			function.LocalTerminal |= MayGoexit
 		}
 		if kind == GoCall {
 			addSite(SiteSpawn, call, edge.Recipe.Foreign)
@@ -506,8 +510,9 @@ func (p *Plan) calledTerminal(function *Function) TerminalFlags {
 func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
 	if edge.Recipe.Kind != SiteInvalid {
 		return FuncSummary{
-			Effect: edge.Recipe.Effect,
-			Exec:   edge.Recipe.Exec,
+			Effect:   edge.Recipe.Effect,
+			Exec:     edge.Recipe.Exec,
+			Terminal: edge.Recipe.Terminal,
 		}, true
 	}
 	if edge.Unknown {
