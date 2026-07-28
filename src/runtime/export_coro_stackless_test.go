@@ -21,6 +21,31 @@ func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 	coroRun(resume)
 }
 
+func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroExecutorCount),
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	rootTask := &stacklessCoroTask{resume: resume}
+	s.root = rootTask
+	s.ready(rootTask, false)
+	s.run(false)
+	s.finish()
+}
+
+func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) {
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroExecutorCount),
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	rootTask := &stacklessCoroTask{resume: root}
+	s.root = rootTask
+	s.ready(rootTask, false)
+	s.ready(&stacklessCoroTask{resume: detached}, false)
+	s.run(false)
+	throw("runtime: detached stackless coroutine test returned")
+}
+
 func AwaitStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroAwait(ctx, resume)
 }

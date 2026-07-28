@@ -629,6 +629,85 @@ func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 	return supported
 }
 
+// needsTerminalEntry reports whether a generated resume can observe a
+// structured terminal outcome or panic while executing ordinary Go code.
+// Unknown IR operations are treated conservatively.
+func needsTerminalEntry(candidate *lowerCandidate) bool {
+	if candidate.function.Terminal != 0 || len(candidate.defers) != 0 {
+		return true
+	}
+	for _, transition := range candidate.transitions {
+		if transition == SiteAwait || transition == SiteGoexit {
+			return true
+		}
+	}
+
+	safeComparison := func(expr *ir.BinaryExpr) bool {
+		if ir.IsNil(expr.X) || ir.IsNil(expr.Y) {
+			return true
+		}
+		typ := expr.X.Type()
+		if typ == nil {
+			return false
+		}
+		if expr.Op() != ir.OEQ && expr.Op() != ir.ONE {
+			return typ.IsInteger() || typ.IsFloat() || typ.IsString()
+		}
+		return typ.IsScalar() || typ.IsString() || typ.IsPtr() ||
+			typ.IsUnsafePtr() || typ.IsChan()
+	}
+	safeAssignOp := func(stmt *ir.AssignOpStmt) bool {
+		if stmt.X.Type() != nil && stmt.X.Type().IsString() {
+			return false
+		}
+		switch stmt.AsOp {
+		case ir.OADD, ir.OSUB, ir.OOR, ir.OXOR, ir.OMUL, ir.OAND,
+			ir.OANDNOT:
+			return true
+		}
+		return false
+	}
+	mayPanic := func(node ir.Node) bool {
+		switch node := node.(type) {
+		case *ir.CallExpr:
+			return candidate.transitions[node] == SiteInvalid &&
+				candidate.foreignCalls[node] == NotForeign
+		case *ir.AssignOpStmt:
+			return !safeAssignOp(node)
+		case *ir.BinaryExpr:
+			switch node.Op() {
+			case ir.OADD:
+				return node.X.Type() != nil && node.X.Type().IsString()
+			case ir.OSUB, ir.OOR, ir.OXOR, ir.OMUL, ir.OAND, ir.OANDNOT:
+				return false
+			}
+			if node.Op().IsCmp() {
+				return !safeComparison(node)
+			}
+			return true
+		}
+
+		switch node.Op() {
+		case ir.ONAME, ir.OTYPE, ir.OLITERAL, ir.ONIL,
+			ir.OADDR, ir.OANDAND, ir.OAS, ir.OAS2, ir.OAS2DOTTYPE,
+			ir.OAS2FUNC, ir.OAS2MAPR, ir.OCAP, ir.OCLOSURE, ir.OCONV,
+			ir.OCONVIFACE, ir.OCONVNOP, ir.ODCL, ir.ODOT, ir.ODOTMETH,
+			ir.ODOTTYPE2, ir.OKEY, ir.OLEN, ir.OMETHEXPR, ir.ONOT,
+			ir.OBITNOT, ir.OPAREN, ir.OPLUS, ir.ONEG, ir.OOROR,
+			ir.OSTRUCTKEY, ir.OBLOCK, ir.OFOR, ir.OIF, ir.OGO,
+			ir.ORETURN:
+			return false
+		}
+		return true
+	}
+	for _, stmt := range candidate.function.Func.Body {
+		if ir.Any(stmt, mayPanic) {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteDeferTerminal replaces terminal builtins in a direct deferred
 // literal with task-owned runtime operations.
 func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
@@ -680,6 +759,7 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	factory := candidate.factory
 	resumeType := factory.Type().Result(0).Type
 	pos := fn.Pos()
+	terminalAware := needsTerminalEntry(candidate)
 
 	var declarations []ir.Node
 	declared := make(map[*ir.Name]bool)
@@ -943,7 +1023,24 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	if err != nil {
 		return err
 	}
-	resume.Body = append(body, complete(pos)...)
+	if terminalAware {
+		terminalAction := typecheck.TempAt(pos, resume,
+			types.Types[types.TUINT8])
+		resume.Body = append(resume.Body,
+			ir.NewAssignStmt(pos, terminalAction,
+				typecheck.Call(pos,
+					typecheck.LookupRuntime("coroTerminalAction"),
+					ir.Nodes{ctx}, false)))
+		hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
+			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
+		resume.Body = append(resume.Body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
+			ir.NewReturnStmt(pos, []ir.Node{
+				terminalAction,
+			}),
+		}, nil))
+	}
+	resume.Body = append(resume.Body, body...)
+	resume.Body = append(resume.Body, complete(pos)...)
 	finishLowering(candidate, resume, declarations, nil)
 	return nil
 }
@@ -1011,7 +1108,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
-	terminalAware := candidate.function.Terminal&(MayPanic|MayGoexit) != 0
+	terminalAware := needsTerminalEntry(candidate)
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -1050,6 +1147,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		cleanup:   true,
 	}}
 	if terminalAware {
+		// A recovered native panic enters cleanup directly. Keep normal
+		// completion distinct so both paths establish the cleanup state
+		// before invoking deferred calls.
 		completeState = len(states)
 		states = append(states, lowerState{
 			next:      cleanupState,

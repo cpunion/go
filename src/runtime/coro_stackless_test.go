@@ -148,6 +148,208 @@ func TestStacklessCoroPanic(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativePanic(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		setting    string
+		value      any
+		wantNil    bool
+		wantString bool
+	}{
+		{"value", "panicnil=0", "native panic", false, true},
+		{"nil", "panicnil=0", nil, false, false},
+		{"legacy-nil", "panicnil=1", nil, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("GODEBUG", test.setting)
+			state := 0
+			deferred := false
+			var recovered any
+			func() {
+				defer func() {
+					deferred = true
+					recovered = recover()
+				}()
+				runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+					switch state {
+					case 0:
+						state = 1
+						panic(test.value)
+					case 1:
+						if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+							t.Fatal("native panic is not pending")
+						}
+						state = 2
+						return runtime.StacklessCoroActionPanic
+					default:
+						t.Fatalf("unexpected resume state %d", state)
+						return runtime.StacklessCoroActionInvalid
+					}
+				})
+			}()
+			if !deferred {
+				t.Fatal("native panic did not unwind to recover")
+			}
+			if (recovered == nil) != test.wantNil {
+				t.Fatalf("recovered panic = %v, want nil %t",
+					recovered, test.wantNil)
+			}
+			if test.wantString && recovered != test.value {
+				t.Fatalf("recovered panic = %v, want %v",
+					recovered, test.value)
+			}
+			if state != 2 {
+				t.Fatalf("resume state = %d, want 2", state)
+			}
+		})
+	}
+}
+
+func TestStacklessCoroNativePanicReplacement(t *testing.T) {
+	state := 0
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.PanicStacklessCoroForTest(ctx, "original panic")
+				panic("replacement panic")
+			case 1:
+				if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("replacement panic is not pending")
+				}
+				state = 2
+				return runtime.StacklessCoroActionPanic
+			default:
+				t.Fatalf("unexpected resume state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	}()
+	if recovered != "replacement panic" {
+		t.Fatalf("recovered panic = %v, want %q",
+			recovered, "replacement panic")
+	}
+	if state != 2 {
+		t.Fatalf("resume state = %d, want 2", state)
+	}
+}
+
+func TestStacklessCoroNativeGoexit(t *testing.T) {
+	done := make(chan struct{})
+	returned := make(chan struct{}, 1)
+	go func() {
+		defer close(done)
+		// The inline test scheduler exercises the recovery boundary without
+		// asking a real Goexit to terminate an internal executor G.
+		runtime.RunStacklessCoroInlineForTest(func(unsafe.Pointer) uint8 {
+			runtime.Goexit()
+			return runtime.StacklessCoroActionInvalid
+		})
+		returned <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("native Goexit did not terminate its goroutine")
+	}
+	select {
+	case <-returned:
+		t.Fatal("native Goexit returned to its caller")
+	default:
+	}
+}
+
+func TestStacklessCoroNativePanicDuringGoexit(t *testing.T) {
+	done := make(chan struct{})
+	recovered := make(chan any, 1)
+	returned := make(chan struct{}, 1)
+	state := 0
+	recoverOutside := func() {
+		defer func() {
+			recovered <- recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.GoexitStacklessCoroForTest(ctx)
+				panic("native panic during Goexit")
+			case 1:
+				state = 2
+				return runtime.TerminalActionStacklessCoroForTest(ctx)
+			default:
+				panic("unexpected native Goexit resume state")
+			}
+		})
+	}
+	go func() {
+		defer close(done)
+		recoverOutside()
+		returned <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("native panic did not resume stackless coroutine Goexit")
+	}
+	if got := <-recovered; got != "native panic during Goexit" {
+		t.Fatalf("recovered panic = %v, want %q",
+			got, "native panic during Goexit")
+	}
+	if state != 2 {
+		t.Fatalf("resume state = %d, want 2", state)
+	}
+	select {
+	case <-returned:
+		t.Fatal("recovered native panic bypassed the pending Goexit")
+	default:
+	}
+}
+
+func TestStacklessCoroDetachedNativePanic(t *testing.T) {
+	state := 0
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunDetachedStacklessCoroForTest(
+			func(unsafe.Pointer) uint8 {
+				return runtime.StacklessCoroActionYield
+			},
+			func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					panic("detached native panic")
+				case 1:
+					if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+						t.Fatal("detached native panic is not pending")
+					}
+					state = 2
+					return runtime.StacklessCoroActionPanic
+				default:
+					t.Fatalf("unexpected detached resume state %d", state)
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+	}()
+	if recovered != "detached native panic" {
+		t.Fatalf("recovered panic = %v, want %q",
+			recovered, "detached native panic")
+	}
+	if state != 2 {
+		t.Fatalf("detached resume state = %d, want 2", state)
+	}
+}
+
 func TestStacklessCoroPanicAwait(t *testing.T) {
 	var parentState int
 	var cleanup bool

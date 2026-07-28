@@ -5,6 +5,7 @@
 package coro_test
 
 import (
+	"context"
 	"fmt"
 	"internal/testenv"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testProgram = `package p
@@ -590,9 +592,19 @@ func main() {
 	if strings.Contains(disassembly, "runtime.morestack") {
 		t.Fatalf("generated resume function contains runtime.morestack\n%s", disassembly)
 	}
-	if strings.Contains(disassembly, "runtime.coroTerminalAction") {
-		t.Fatalf("non-terminal resume function checks for a terminal outcome\n%s",
+	if !strings.Contains(disassembly, "runtime.coroTerminalAction") {
+		t.Fatalf("generated resume function does not check for a recovered panic\n%s",
 			disassembly)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.child\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of yield-only resume failed: %v\n%s", err, data)
+	}
+	if strings.Contains(string(data), "runtime.coroTerminalAction") {
+		t.Fatalf("yield-only resume contains a terminal query\n%s", data)
 	}
 }
 
@@ -1228,6 +1240,229 @@ func main() {
 	} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("panic resume contains %q\n%s", forbidden, disassembly)
+		}
+	}
+}
+
+func TestImplicitPanicOutcomeLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var trace [3]int
+var traceIndex int
+
+//go:noinline
+func record(value int) {
+	trace[traceIndex] = value
+	traceIndex++
+}
+
+//go:noinline
+func helperNil() int {
+	var pointer *int
+	return *pointer
+}
+
+//go:noinline
+func replaceWithDivide() {
+	zero := 0
+	traceIndex += 1 / zero
+}
+
+//go:noinline
+func fault(kind int) int {
+	defer record(1)
+	runtime.Gosched()
+	result := 0
+	if kind == 0 {
+		var pointer *int
+		result = *pointer
+	}
+	if kind == 1 {
+		zero := kind - kind
+		result = 1 / zero
+	}
+	if kind == 2 {
+		values := []int{1}
+		result = values[kind]
+	}
+	if kind == 3 {
+		result = helperNil()
+	}
+	if kind == 4 {
+		defer replaceWithDivide()
+		var pointer *int
+		result = *pointer
+	}
+	return result
+}
+
+//go:noinline
+func middle(kind int) int {
+	defer record(2)
+	return fault(kind)
+}
+
+//go:noinline
+func root(kind int) int {
+	defer record(3)
+	return middle(kind)
+}
+
+//go:noinline
+func invoke(kind int) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	_ = root(kind)
+	return "missing panic"
+}
+
+//go:noinline
+func check(kind int) {
+	trace = [3]int{}
+	traceIndex = 0
+	if recovered := invoke(kind); recovered == nil ||
+		trace != [3]int{1, 2, 3} || traceIndex != len(trace) {
+		panic("bad implicit panic outcome")
+	}
+}
+
+func main() {
+	check(0)
+	check(1)
+	check(2)
+	check(3)
+	check(4)
+	println("stackless-coro-implicit-panic-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-implicit-panic")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building implicit panic coroutine failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{"fault", "middle", "root", "invoke", "check"} {
+		want := "coro: func=main." + name + " "
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("implicit panic coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-implicit-panic-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(fault|middle|root|invoke)\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of implicit panic resume functions failed: %v\n%s",
+			err, data)
+	}
+	if want := "runtime.coroTerminalAction"; !strings.Contains(string(data), want) {
+		t.Errorf("implicit panic resume does not contain %q\n%s", want, data)
+	}
+}
+
+func TestImplicitPanicInSpawnedCoroutine(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var sink int
+
+//go:noinline
+func child() {
+	defer println("stackless-coro-spawn-cleanup")
+	runtime.Gosched()
+	var pointer *int
+	sink = *pointer
+}
+
+//go:noinline
+func root() {
+	go child()
+	for {
+		runtime.Gosched()
+	}
+}
+
+func main() {
+	root()
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-implicit-spawn-panic")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building spawned implicit panic failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{"child", "root"} {
+		want := "coro: func=main." + name + " "
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd = testenv.CommandContext(t, ctx, exe)
+	data, err = cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("spawned implicit panic timed out: %v\n%s", ctx.Err(), data)
+	}
+	if err == nil {
+		t.Fatalf("spawned implicit panic unexpectedly succeeded\n%s", data)
+	}
+	output := string(data)
+	for _, want := range []string{
+		"stackless-coro-spawn-cleanup",
+		"panic: runtime error: invalid memory address",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output does not contain %q\n%s", want, output)
 		}
 	}
 }
@@ -1883,6 +2118,22 @@ var asyncResult uint64
 var asyncErrno uintptr
 var logicalProgress uint32
 var watchdogUsed uint32
+var directFaultRecovered bool
+
+//go:noinline
+func directFault() {
+	_ = corort.DirectAdd(1, 2)
+	var pointer *int
+	sum += uint64(*pointer)
+}
+
+//go:noinline
+func checkDirectFault() {
+	defer func() {
+		directFaultRecovered = recover() != nil
+	}()
+	directFault()
+}
 
 //go:noinline
 func foreign() {
@@ -1915,6 +2166,7 @@ func main() {
 	if err := syscall.SetNonblock(asyncReadFD, true); err != nil {
 		panic(err)
 	}
+	checkDirectFault()
 	go replacement()
 	go func() {
 		time.Sleep(2 * time.Second)
@@ -1927,7 +2179,7 @@ func main() {
 		atomic.LoadUint32(&entered) != 1 ||
 		atomic.LoadUint32(&logicalProgress) != 1 ||
 		atomic.LoadUint32(&watchdogUsed) != 0 ||
-		asyncResult != 42 || asyncErrno != 0 {
+		asyncResult != 42 || asyncErrno != 0 || !directFaultRecovered {
 		panic("bad direct System ABI result")
 	}
 	println("direct-system-abi-ok")
@@ -2068,12 +2320,17 @@ int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
 	if err != nil {
 		t.Fatalf("building direct fixture failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=2"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=4"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
-	cmd = testenv.Command(t, exe)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd = testenv.CommandContext(t, ctx, exe)
 	data, err = cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("direct fixture timed out: %v\n%s", ctx.Err(), data)
+	}
 	if err != nil {
 		t.Fatalf("direct fixture failed: %v\n%s", err, data)
 	}

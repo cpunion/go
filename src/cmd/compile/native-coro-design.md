@@ -4,12 +4,13 @@ Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed and repeated
 simple-loop defer cleanup for normal return and explicit panic, direct recover
 and replacement panic in fixed local defer literals, typed structured panic
-propagation, sticky Goexit cleanup and propagation, operation-progress
+propagation, implicit runtime panic capture across lowered and ordinary
+synchronous calls, sticky Goexit cleanup and propagation, operation-progress
 follow-ups, nested multi-result and conservatively normalized single-result
 expressions, and a restricted
 compiler-private cross-package factory entry implemented; not production-ready
 
-Last updated: 2026-07-28
+Last updated: 2026-07-29
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -994,11 +995,27 @@ snapshots used by compiler-generated wrappers. The LIFO stack therefore
 contains only compiler-generated wrappers with statically validated
 provenance; it does not enable general dynamic source calls. A Goexit call
 inside a terminal defer target, and a `go` target that may explicitly panic,
-also retain the ordinary Go path. Implicit faults are not yet converted to
-terminal outcomes. The remaining phases are:
+also retain the ordinary Go path.
 
-1. general terminal defer targets and repeated-literal capture ownership;
-2. implicit faults and complete standard-library behavior.
+A native panic raised by an implicit fault or an ordinary synchronous callee
+is recovered at the queue-driving boundary, not by a defer installed around
+every resume call. The active resume unwinds completely, the runtime records
+the original panic value on its logical task, and that task is made runnable
+again. Every generated resume that may execute a faulting operation, call
+ordinary Go code, run a defer, or observe an awaited child's terminal outcome
+checks for a pending terminal outcome before dispatch and enters its
+frame-owned cleanup state. A conservative IR analysis retains the check for
+unknown operations; a proven yield-only resume does not pay for it. A
+structured child then transfers the panic to its parent as before. An
+independent stackless `go` target runs its logical cleanup and re-raises an
+unhandled panic on its executor, preserving process-terminating goroutine
+semantics. A native panic raised during cleanup replaces the active panic and
+overlays, without erasing, a pending Goexit. The recovery boundary does not
+consume the runtime's own Goexit unwind marker.
+
+The remaining phase is:
+
+1. general terminal defer targets and repeated-literal capture ownership.
 
 ### 11.2 Channels and synchronization
 
@@ -1169,6 +1186,8 @@ The first automatic lowering supports:
 - conditional fixed direct defer sites and repeated defer sites in simple
   loops;
 - explicit panic propagation through structured calls and fixed cleanup;
+- implicit nil, bounds, divide, and synchronous-callee panics through
+  structured calls;
 - direct recover and replacement panic in fixed local defer literals;
 - direct Goexit cleanup through structured calls and isolated spawned
   logical goroutines.
@@ -1177,8 +1196,8 @@ It initially rejects:
 
 - open interface or function-value calls;
 - open or named terminal defer targets, repeated source defer literals using
-  terminal control, Goexit inside a terminal defer target, implicit faults,
-  and a spawned target that may explicitly panic;
+  terminal control, Goexit inside a terminal defer target, and a spawned
+  target that may explicitly panic;
 - reflection;
 - closures with escaping environments;
 - variadic C calls;
@@ -1426,6 +1445,11 @@ The compiler:
 - lowers `runtime.Goexit` from a compiler-owned operation recipe, propagates
   its sticky outcome through structured calls, and isolates it at a detached
   stackless `go` boundary;
+- gives each state-machine or run-to-completion resume that may execute
+  faulting or ordinary Go code, run a defer, or await a child a terminal
+  entry, so a native panic recovered by the scheduler enters logical cleanup
+  without replaying the faulting state or a direct C call; unknown IR remains
+  terminal-aware, while a proven yield-only resume omits the hot-path query;
 - stores the terminal kind and Goexit state in existing task-header padding
   and allocates the panic-value map lazily, so normal logical tasks do not
   grow for these capabilities;
@@ -1443,6 +1467,12 @@ The runtime:
 - tracks one active resume owner per task, defers an early operation completion
   until that owner returns `Wait`, and gives the race detector explicit
   release-merge/acquire edges when a logical task changes executors;
+- installs one native-panic recovery boundary per queue-driving episode,
+  records the active task's original panic value after its native activation
+  unwinds, requeues that task for compiler-generated logical cleanup, and
+  applies ordinary replacement semantics when cleanup itself panics;
+- re-raises a detached task's unhandled panic only after its logical cleanup,
+  outside the resume recovery scope;
 - runs resume episodes on a fixed pool of four executor Gs, each using its
   native OS thread stack, while `m.g0` uses a separate scheduler stack;
 - prevents executor stack copy, growth, and shrink, and handles signal stack
@@ -1513,6 +1543,8 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
+- a run-to-completion direct C call followed by an implicit nil fault recovers
+  without replaying the C call;
 - the transparent C fixture evaluates two panic-capable argument helpers in
   source order, lowers their conditional panic without a native `gopanic`
   edge, and retains ordinary cgo with no native lowering under `-race`;
@@ -1537,6 +1569,11 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   fixed defers running in leaf-to-root order before an ordinary outer defer
   recovers the root outcome; object inspection verifies typed panic helpers
   and the absence of native `gopanic` and defer machinery in resume functions;
+- implicit nil dereference, integer divide, bounds, and ordinary
+  synchronous-callee panics through three lowered frames, with logical defers
+  running leaf-to-root before recover; an implicit divide fault in cleanup
+  replaces an earlier nil fault; a detached implicit panic runs cleanup and
+  then terminates its process as an unhandled goroutine panic;
 - repeated defer sites across scheduler yields, normal return, and explicit
   panic; the test verifies exact argument evaluation and LIFO order, scans
   4,096 independently captured heap pointers during 50 concurrent forced GCs,
@@ -1580,6 +1617,10 @@ translated scheduler timing even though disassembly confirms that its
 workflow therefore runs the unfiltered runtime suite on native Ubuntu and
 macOS.
 
+The implicit-panic follow-up's compiler, runtime, race, and transparent-cgo
+probes pass on Darwin/arm64 and translated Linux/amd64. Native Linux CI remains
+the acceptance gate for that target.
+
 The focused profiles cover 632 of 697 instrumentable changed production lines,
 or 90.7%, across `cmd/cgo`, the compiler, runtime, and `cmd/go` plumbing.
 Excluding the small `cmd/go` execution hooks that are exercised in a
@@ -1614,6 +1655,13 @@ statements (100%) and 80 of 91 changed runtime statements (87.9%), or 125 of
 statements are defensive invalid-context, invalid-state, and invalid-parent
 throws.
 
+For the implicit-panic follow-up, the complete coroutine compiler package is
+89.8% covered. The complete compiler profile covers all 46 changed production
+statements in `lower.go`; the focused runtime profile covers 32 of 34 changed
+statements in `coro_stackless.go`. Together they cover 78 of 80 changed core
+statements (97.5%). The two uncovered statements are the defensive invalid
+panic-requeue throw.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -1627,6 +1675,14 @@ runs, not stable performance promises.
 | zero-duration timer wake | 9.14 us | 27.34 us | 248 B |
 | one-byte regular-file read | 10.47 us | 25.28 us | 144 B |
 | one-byte socket read | 10.78 us | 25.35 us | 144 B |
+
+A compiler-generated yield loop was also compared with the integration branch
+using 20 interleaved 500 ms samples on Darwin/arm64. The baseline and
+implicit-panic builds had medians of 18.85 and 18.86 ns per yield,
+respectively; their means were 19.72 and 19.57 ns. The generated yield-resume
+instruction sequence is identical between the two binaries. Terminal-aware
+resumes retain the additional entry query, but a proven yield-only resume has
+no measurable regression.
 
 A current Darwin/arm64 burst of 100,000 logical tasks allocates approximately
 4.80 MB and 100,012 objects. The task-size regression test fixes the task
@@ -1721,10 +1777,11 @@ reported separately above.
 The MVP does not yet support range loops, labeled control flow, dynamic calls,
 interfaces, escaping closures, open or named terminal defer targets, terminal
 control in repeated source defer literals, Goexit inside a terminal defer
-target, implicit faults, panic from a non-structured spawned task, channels,
-select, mutex parking, reflection, callbacks, variadic C calls, or general C
-ABI type classification. Explicit panic and Goexit through structured calls,
-isolated Goexit from a spawned logical goroutine, fixed or
+target, explicit panic from a non-structured spawned task, channels, select,
+mutex parking, reflection, callbacks, variadic C calls, or general C ABI type
+classification. Explicit and implicit panic and Goexit through structured
+calls, implicit unhandled panic and isolated Goexit from a spawned logical
+goroutine, fixed or
 repeated-simple-loop defer cleanup, and direct recover or replacement panic in
 fixed local defer literals are supported. Direct foreign declarations now
 have a restricted transparent cgo path, but
@@ -1743,12 +1800,12 @@ work, and broad standard-library compatibility remain future work.
 
 The likely order is:
 
-1. complete panic, defer, recover, and implicit fault lowering; fixed and
-   repeated-simple-loop defer cleanup, explicit typed panic outcomes, direct
-   recover or replacement panic in fixed local defer literals, and sticky
-   Goexit propagation are implemented, while general terminal defer targets,
-   repeated-literal capture ownership, Goexit inside those defer targets, and
-   implicit faults remain;
+1. complete panic, defer, and recover lowering; fixed and
+   repeated-simple-loop defer cleanup, explicit typed panic outcomes, implicit
+   panic capture, direct recover or replacement panic in fixed local defer
+   literals, and sticky Goexit propagation are implemented, while general
+   terminal defer targets, repeated-literal capture ownership, and Goexit
+   inside those defer targets remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
 4. extend expression and assignment normalization to short-circuit control,
