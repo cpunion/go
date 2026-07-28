@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -131,9 +130,10 @@ func TestStacklessCoroNativePreemption(t *testing.T) {
 		ready.Store(true)
 	}()
 
-	_ = syscall.Kill(syscall.Getpid(), syscall.SIGURG)
 	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
-		for i := 0; i < 1<<28 && !ready.Load(); i++ {
+		// Keep this loop free of cooperative safe points. The large bound
+		// gives sysmon enough time to preempt on a loaded builder.
+		for i := 0; i < 1<<31 && !ready.Load(); i++ {
 		}
 		return runtime.StacklessCoroActionComplete
 	})
