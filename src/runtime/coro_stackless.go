@@ -38,13 +38,15 @@ const (
 )
 
 type stacklessCoroTask struct {
-	resume   stacklessCoroResume
-	parent   *stacklessCoroTask
-	next     *stacklessCoroTask
-	state    stacklessCoroTaskState
-	terminal stacklessCoroTerminalKind
-	goexit   bool
-	context  stacklessCoroContext
+	resume       stacklessCoroResume
+	parent       *stacklessCoroTask
+	next         *stacklessCoroTask
+	state        stacklessCoroTaskState
+	terminal     stacklessCoroTerminalKind
+	goexit       bool
+	resuming     bool
+	readyPending bool
+	context      stacklessCoroContext
 }
 
 type stacklessCoroTerminalKind uint8
@@ -130,6 +132,9 @@ func coroRun(resume stacklessCoroResume) {
 }
 
 func (s *stacklessCoroScheduler) finish() {
+	if raceenabled {
+		raceacquire(unsafe.Pointer(s.root))
+	}
 	kind := s.root.terminal
 	goexit := s.root.goexit
 	value, ok := s.terminalValues[s.root]
@@ -218,7 +223,8 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 	s := context.scheduler
 	parent := context.task
 	lock(&s.lock)
-	if parent.state != stacklessCoroTaskRunning ||
+	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+		parent.readyPending ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine await outside resume")
@@ -241,7 +247,8 @@ func coroPanic(ctx unsafe.Pointer, value any) {
 func recordStacklessCoroPanic(s *stacklessCoroScheduler,
 	task *stacklessCoroTask, value any, replace bool) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		(!replace && task.terminal != stacklessCoroTerminalNone) ||
 		(!replace && task.goexit) ||
 		(replace && task.terminal != stacklessCoroTerminalNone &&
@@ -265,7 +272,8 @@ func coroPanicPending(ctx unsafe.Pointer) bool {
 		throw("runtime: invalid stackless coroutine panic query")
 	}
 	task := context.task
-	if task.state != stacklessCoroTaskRunning {
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
 		throw("runtime: stackless coroutine panic query outside resume")
 	}
 	return task.terminal == stacklessCoroTerminalPanic
@@ -280,7 +288,8 @@ func coroGoexit(ctx unsafe.Pointer) {
 	s := context.scheduler
 	task := context.task
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine Goexit transition")
@@ -296,7 +305,8 @@ func coroTerminalAction(ctx unsafe.Pointer) uint8 {
 		throw("runtime: invalid stackless coroutine terminal query")
 	}
 	task := context.task
-	if task.state != stacklessCoroTaskRunning {
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
 		throw("runtime: stackless coroutine terminal query outside resume")
 	}
 	switch task.terminal {
@@ -319,7 +329,8 @@ func coroTerminalAction(ctx unsafe.Pointer) uint8 {
 func coroDeferToken(ctx unsafe.Pointer) unsafe.Pointer {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task == nil ||
-		context.task.state != stacklessCoroTaskRunning {
+		context.task.state != stacklessCoroTaskRunning ||
+		!context.task.resuming || context.task.readyPending {
 		throw("runtime: invalid stackless coroutine defer token")
 	}
 	return unsafe.Pointer(context.task)
@@ -345,7 +356,8 @@ func coroDeferRecover(token unsafe.Pointer) any {
 	}
 	s := task.context.scheduler
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning {
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine defer recover outside resume")
 	}
@@ -383,6 +395,8 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 	s := context.scheduler
 	lock(&s.lock)
 	if context.task.state != stacklessCoroTaskRunning ||
+		!context.task.resuming ||
+		context.task.readyPending ||
 		context.task.terminal != stacklessCoroTerminalNone ||
 		context.task.goexit {
 		unlock(&s.lock)
@@ -501,7 +515,8 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCor
 	s := context.scheduler
 	task := context.task
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine operation outside resume")
@@ -521,10 +536,26 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 }
 
 func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
+	if task.resuming {
+		if task.state != stacklessCoroTaskWaiting || task.readyPending {
+			throw("runtime: invalid stackless coroutine early ready transition")
+		}
+		// An operation may finish before the active resume call returns Wait.
+		// Defer publication until the scheduler consumes that action, so two
+		// executors cannot enter the same resume function concurrently.
+		task.readyPending = true
+		if raceenabled {
+			racereleasemerge(unsafe.Pointer(task))
+		}
+		return
+	}
 	switch task.state {
 	case stacklessCoroTaskNew, stacklessCoroTaskRunning, stacklessCoroTaskWaiting:
 	default:
 		throw("runtime: invalid stackless coroutine ready transition")
+	}
+	if task.readyPending {
+		throw("runtime: stackless coroutine has pending ready transition")
 	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
@@ -534,6 +565,12 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
 		s.tail.next = task
 	}
 	s.tail = task
+	if raceenabled {
+		// Runtime mutex operations are invisible to the race detector.
+		// Merge both the previous resume episode and the producer that made
+		// this task runnable into the next executor's acquire.
+		racereleasemerge(unsafe.Pointer(task))
+	}
 }
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
@@ -548,45 +585,68 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 		s.tail = nil
 	}
 	task.next = nil
-	if task.state != stacklessCoroTaskRunnable {
+	if task.state != stacklessCoroTaskRunnable || task.resuming ||
+		task.readyPending {
 		unlock(&s.lock)
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
 	task.state = stacklessCoroTaskRunning
+	task.resuming = true
 	unlock(&s.lock)
+	if raceenabled {
+		raceacquire(unsafe.Pointer(task))
+	}
 	return task
 }
 
 func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine yield")
 	}
+	task.resuming = false
 	s.readyLocked(task)
 	unlock(&s.lock)
 }
 
 func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskWaiting &&
-		task.state != stacklessCoroTaskRunnable {
+	if task.state != stacklessCoroTaskWaiting || !task.resuming {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine wait without operation")
 	}
+	task.resuming = false
+	ready := task.readyPending
+	task.readyPending = false
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(task))
+	}
+	if ready {
+		s.readyLocked(task)
+	}
 	unlock(&s.lock)
+	if ready {
+		s.signal()
+	}
 }
 
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
 	}
+	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(task))
+	}
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
@@ -606,13 +666,18 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	lock(&s.lock)
 	value, ok := s.terminalValues[task]
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalPanic || !ok {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine termination")
 	}
+	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(task))
+	}
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
@@ -641,13 +706,18 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 
 func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning ||
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || !task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine Goexit termination")
 	}
+	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(task))
+	}
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
