@@ -732,6 +732,11 @@ leaf ABI shim. Such a shim may rearrange registers and call the C symbol, but
 it must not allocate an argument-frame object, call a generic cgo wrapper,
 switch to `g0`, or invoke `runtime.cgocall`.
 
+On System V AMD64, each shim must dynamically align SP to 16 bytes before the
+C call and restore the Go SP afterward. The Go internal ABI only guarantees
+8-byte stack alignment, so a fixed-size shim frame cannot satisfy both possible
+caller alignments.
+
 The MVP must not freeze a generic `uintptr` call API. A typed call description
 is necessary for correctness and for eventual direct call-site lowering.
 

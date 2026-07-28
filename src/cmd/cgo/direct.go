@@ -151,13 +151,28 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 			cgoDirectLoad(buildcfg.GOARCH, param), i, offsets[i],
 			cgoDirectArgRegister(buildcfg.GOARCH, i))
 	}
-	fmt.Fprintf(w, "\tCALL\t%s(SB)\n", call.entry)
+	for _, instruction := range cgoDirectCallInstructions(buildcfg.GOARCH, call.entry) {
+		fmt.Fprintf(w, "\t%s\n", instruction)
+	}
 	if call.result != cgoDirectVoid {
 		fmt.Fprintf(w, "\t%s\t%s, ret+%d(FP)\n",
 			cgoDirectStore(buildcfg.GOARCH, call.result),
 			cgoDirectResultRegister(buildcfg.GOARCH), resultOffset)
 	}
 	fmt.Fprintln(w, "\tRET")
+}
+
+func cgoDirectCallInstructions(goarch, entry string) []string {
+	call := "CALL\t" + entry + "(SB)"
+	if goarch != "amd64" {
+		return []string{call}
+	}
+	return []string{
+		"MOVQ\tSP, R12",
+		"ANDQ\t$~15, SP",
+		call,
+		"MOVQ\tR12, SP",
+	}
 }
 
 // writeDirectCBridge gives every supported declaration an externally visible

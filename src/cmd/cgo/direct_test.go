@@ -361,6 +361,25 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 			t.Errorf("amd64 argument register %d = %s, want %s", i, got, want)
 		}
 	}
+	amd64Call := cgoDirectCallInstructions("amd64", "entry")
+	wantAMD64 := []string{
+		"MOVQ\tSP, R12",
+		"ANDQ\t$~15, SP",
+		"CALL\tentry(SB)",
+		"MOVQ\tR12, SP",
+	}
+	if len(amd64Call) != len(wantAMD64) {
+		t.Fatalf("amd64 call instructions = %q, want %q", amd64Call, wantAMD64)
+	}
+	for i, want := range wantAMD64 {
+		if got := amd64Call[i]; got != want {
+			t.Errorf("amd64 call instruction %d = %q, want %q", i, got, want)
+		}
+	}
+	if got, want := strings.Join(cgoDirectCallInstructions("arm64", "entry"), "\n"),
+		"CALL\tentry(SB)"; got != want {
+		t.Errorf("arm64 call instructions = %q, want %q", got, want)
+	}
 	if got := cgoDirectResultRegister("arm64"); got != "R0" {
 		t.Errorf("arm64 result register = %s, want R0", got)
 	}
