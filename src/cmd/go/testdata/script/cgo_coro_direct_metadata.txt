@@ -9,9 +9,9 @@ grep 'func _Cdirect_set_u32' direct/_cgo_gotypes.go
 ! grep 'func _Cdirect_set_u32.*_Ctype_void' direct/_cgo_gotypes.go
 grep 'TEXT ·_Cdirect_add_u64' direct/_cgo_direct.s
 grep 'CALL.*_Cfunc_add_u64_direct' direct/_cgo_direct.s
-[amd64] grep 'MOVQ.*SP, R12' direct/_cgo_direct.s
-[amd64] grep 'ANDQ.*SP' direct/_cgo_direct.s
-[amd64] grep 'MOVQ.*R12, SP' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVQ.*SP, R12' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'ANDQ.*SP' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVQ.*R12, SP' direct/_cgo_direct.s
 grep '_Cfunc_static_add_direct' direct/main.cgo2.c
 grep 'return static_add' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
