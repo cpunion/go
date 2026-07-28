@@ -15,7 +15,7 @@ grep 'return static_add' direct/main.cgo2.c
 go build -gcflags='-l -d=coro=4' -o program .
 stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=coro exec=block-thread,system-abi'
 stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
-stderr 'coro: phase=lower lowered=2 skipped=0'
+stderr 'coro: phase=lower lowered=3 skipped=0'
 exec ./program
 stderr '^42$'
 go tool objdump -s 'main\._Cdirect_add_u64' program
@@ -28,10 +28,14 @@ stdout '_Cdirect_add_u64'
 stdout '_Cfunc_may_callback'
 ! stdout '_Cfunc_add_u64'
 ! stdout 'runtime.cgocall'
+go tool objdump -s 'main\.orderedArgument\.coro\.func1' program
+stdout 'runtime.coroPanic'
+! stdout 'runtime.gopanic'
 go tool objdump -s 'main\._Cfunc_may_callback' program
 stdout 'runtime.cgocall'
 
 [race] go build -race -gcflags='-l -d=coro=4' -o raceprogram .
+[race] ! stderr 'coro: phase=lower'
 [race] exec ./raceprogram
 [race] stderr '^42$'
 [race] go tool objdump -s 'main\.main$' raceprogram

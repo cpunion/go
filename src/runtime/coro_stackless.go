@@ -21,6 +21,7 @@ const (
 	stacklessCoroActionYield
 	stacklessCoroActionWait
 	stacklessCoroActionComplete
+	stacklessCoroActionPanic
 )
 
 const stacklessCoroExecutorCount = 4
@@ -36,12 +37,20 @@ const (
 )
 
 type stacklessCoroTask struct {
-	resume  stacklessCoroResume
-	parent  *stacklessCoroTask
-	next    *stacklessCoroTask
-	state   stacklessCoroTaskState
-	context stacklessCoroContext
+	resume   stacklessCoroResume
+	parent   *stacklessCoroTask
+	next     *stacklessCoroTask
+	state    stacklessCoroTaskState
+	terminal stacklessCoroTerminalKind
+	context  stacklessCoroContext
 }
+
+type stacklessCoroTerminalKind uint8
+
+const (
+	stacklessCoroTerminalNone stacklessCoroTerminalKind = iota
+	stacklessCoroTerminalPanic
+)
 
 type stacklessCoroContext struct {
 	scheduler *stacklessCoroScheduler
@@ -55,6 +64,7 @@ type stacklessCoroScheduler struct {
 	head           *stacklessCoroTask
 	tail           *stacklessCoroTask
 	root           *stacklessCoroTask
+	terminalValues map[*stacklessCoroTask]any
 	wake           chan struct{}
 	executorWake   chan struct{}
 	executorDone   chan struct{}
@@ -109,10 +119,29 @@ func coroRun(resume stacklessCoroResume) {
 
 	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
 		nativeScheduler.stopReplacementExecutors()
+		nativeScheduler.finish()
 		return
 	}
 	s.run(false)
 	s.stopReplacementExecutors()
+	s.finish()
+}
+
+func (s *stacklessCoroScheduler) finish() {
+	kind := s.root.terminal
+	value, ok := s.terminalValues[s.root]
+	s.root.terminal = stacklessCoroTerminalNone
+	delete(s.terminalValues, s.root)
+	switch kind {
+	case stacklessCoroTerminalNone:
+	case stacklessCoroTerminalPanic:
+		if !ok {
+			throw("runtime: missing stackless coroutine panic value")
+		}
+		panic(value)
+	default:
+		throw("runtime: invalid stackless coroutine terminal outcome")
+	}
 }
 
 func (s *stacklessCoroScheduler) run(native bool) {
@@ -140,6 +169,8 @@ func (s *stacklessCoroScheduler) run(native bool) {
 			s.waiting(task)
 		case stacklessCoroActionComplete:
 			s.complete(task)
+		case stacklessCoroActionPanic:
+			s.terminate(task)
 		default:
 			throw("runtime: invalid stackless coroutine action")
 		}
@@ -164,13 +195,51 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 	s := context.scheduler
 	parent := context.task
 	lock(&s.lock)
-	if parent.state != stacklessCoroTaskRunning {
+	if parent.state != stacklessCoroTaskRunning ||
+		parent.terminal != stacklessCoroTerminalNone {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine await outside resume")
 	}
 	parent.state = stacklessCoroTaskWaiting
 	s.readyLocked(&stacklessCoroTask{resume: child, parent: parent})
 	unlock(&s.lock)
+}
+
+// coroPanic records a panic value before the compiler-generated resume enters
+// its frame-owned cleanup state.
+func coroPanic(ctx unsafe.Pointer, value any) {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine panic")
+	}
+	s := context.scheduler
+	task := context.task
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskRunning ||
+		task.terminal != stacklessCoroTerminalNone {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine panic transition")
+	}
+	task.terminal = stacklessCoroTerminalPanic
+	if s.terminalValues == nil {
+		s.terminalValues = make(map[*stacklessCoroTask]any)
+	}
+	s.terminalValues[task] = value
+	unlock(&s.lock)
+}
+
+// coroPanicPending reports whether an awaited child transferred a panic to the
+// current frame.
+func coroPanicPending(ctx unsafe.Pointer) bool {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine panic query")
+	}
+	task := context.task
+	if task.state != stacklessCoroTaskRunning {
+		throw("runtime: stackless coroutine panic query outside resume")
+	}
+	return task.terminal == stacklessCoroTerminalPanic
 }
 
 // coroSpawn enqueues an independent logical goroutine. The current task keeps
@@ -377,7 +446,8 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
 
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning {
+	if task.state != stacklessCoroTaskRunning ||
+		task.terminal != stacklessCoroTerminalNone {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
 	}
@@ -394,6 +464,40 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine completed for non-waiting parent")
 	}
+	s.readyLocked(parent)
+	unlock(&s.lock)
+}
+
+func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
+	lock(&s.lock)
+	value, ok := s.terminalValues[task]
+	if task.state != stacklessCoroTaskRunning ||
+		task.terminal != stacklessCoroTerminalPanic || !ok {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine termination")
+	}
+	task.state = stacklessCoroTaskComplete
+	task.resume = nil
+	parent := task.parent
+	task.parent = nil
+	if parent == nil {
+		if task != s.root {
+			unlock(&s.lock)
+			throw("runtime: unstructured stackless coroutine panic")
+		}
+		unlock(&s.lock)
+		s.signalAll()
+		return
+	}
+	if parent.state != stacklessCoroTaskWaiting ||
+		parent.terminal != stacklessCoroTerminalNone {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine terminated for invalid parent")
+	}
+	delete(s.terminalValues, task)
+	parent.terminal = task.terminal
+	task.terminal = stacklessCoroTerminalNone
+	s.terminalValues[parent] = value
 	s.readyLocked(parent)
 	unlock(&s.lock)
 }

@@ -44,6 +44,40 @@ func (f ExecFlags) String() string {
 	return joinNames(names)
 }
 
+// TerminalFlags describe non-local control that must cross coroutine frames.
+// They are independent of suspension and physical execution constraints.
+type TerminalFlags uint8
+
+const (
+	MayPanic TerminalFlags = 1 << iota
+	UsesRecover
+	MayGoexit
+)
+
+func (f TerminalFlags) String() string {
+	if f == 0 {
+		return "-"
+	}
+	names := make([]string, 0, 3)
+	for _, flag := range []struct {
+		flag TerminalFlags
+		name string
+	}{
+		{MayPanic, "panic"},
+		{UsesRecover, "recover"},
+		{MayGoexit, "goexit"},
+	} {
+		if f&flag.flag != 0 {
+			names = append(names, flag.name)
+			f &^= flag.flag
+		}
+	}
+	if f != 0 {
+		names = append(names, fmt.Sprintf("TerminalFlags(%#x)", uint8(f)))
+	}
+	return joinNames(names)
+}
+
 // ForeignCallClass describes how a typed foreign call interacts with an
 // executor.
 type ForeignCallClass uint8
@@ -102,6 +136,7 @@ const (
 	SiteFile
 	SitePoll
 	SiteForeign
+	SitePanic
 )
 
 func (k SiteKind) String() string {
@@ -124,6 +159,8 @@ func (k SiteKind) String() string {
 		return "poll"
 	case SiteForeign:
 		return "foreign"
+	case SitePanic:
+		return "panic"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -156,13 +193,15 @@ const (
 
 // FuncSummary is the portion of a function plan exported across packages.
 type FuncSummary struct {
-	Effect  Effect
-	Exec    ExecFlags
-	Factory FactoryABI
+	Effect   Effect
+	Exec     ExecFlags
+	Terminal TerminalFlags
+	Factory  FactoryABI
 }
 
 func (s FuncSummary) Primary() PrimaryKind {
-	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI) != 0 {
+	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI) != 0 ||
+		s.Terminal&MayPanic != 0 {
 		return CoroPrimary
 	}
 	return PlainPrimary

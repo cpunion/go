@@ -19,12 +19,14 @@ func (p *Plan) Verify() error {
 			return fmt.Errorf("invalid coroutine function entry")
 		}
 		wantPrimary := (FuncSummary{
-			Effect: function.Effect,
-			Exec:   function.Exec,
+			Effect:   function.Effect,
+			Exec:     function.Exec,
+			Terminal: function.Terminal,
 		}).Primary()
 		if function.Primary != wantPrimary {
-			return fmt.Errorf("%s: primary %s does not match effect %s and exec %s",
-				ir.PkgFuncName(fn), function.Primary, function.Effect, function.Exec)
+			return fmt.Errorf("%s: primary %s does not match effect %s, exec %s, and terminal %s",
+				ir.PkgFuncName(fn), function.Primary, function.Effect,
+				function.Exec, function.Terminal)
 		}
 		seen := make(map[SiteID]bool, len(function.Sites))
 		for _, site := range function.Sites {
@@ -37,6 +39,10 @@ func (p *Plan) Verify() error {
 			seen[site.ID] = true
 			if site.Kind == SiteInvalid || site.Node == nil {
 				return fmt.Errorf("%s: site %d is incomplete", ir.PkgFuncName(fn), site.ID)
+			}
+			if site.Kind == SitePanic && function.Terminal&MayPanic == 0 {
+				return fmt.Errorf("%s: panic site %d lacks panic terminal flag",
+					ir.PkgFuncName(fn), site.ID)
 			}
 			if site.Foreign == AsyncOperation && function.Effect != MaySuspend {
 				return fmt.Errorf("%s: async foreign site %d is not suspending",

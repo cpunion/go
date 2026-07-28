@@ -51,9 +51,13 @@ const (
 	// capabilities were recorded.
 	legacySummaryVersion uint64 = 2
 
+	// factorySummaryVersion is the coroutine summary format before terminal
+	// control flags were recorded.
+	factorySummaryVersion uint64 = 3
+
 	// SummaryVersion is the current coroutine function summary format stored
 	// in the compiler-private Unified IR extension.
-	SummaryVersion uint64 = 3
+	SummaryVersion uint64 = 4
 )
 
 // The compiler processes one package per process, so summaries are package
@@ -68,7 +72,8 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 	if version == 0 {
 		return FuncSummary{}, false, nil
 	}
-	if version != legacySummaryVersion && version != SummaryVersion {
+	if version != legacySummaryVersion && version != factorySummaryVersion &&
+		version != SummaryVersion {
 		return FuncSummary{}, false,
 			fmt.Errorf("unsupported coroutine summary version %d", version)
 	}
@@ -87,13 +92,21 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 		Effect: Effect(effectValue),
 		Exec:   ExecFlags(execValue),
 	}
-	if version == SummaryVersion {
+	if version >= factorySummaryVersion {
 		factoryValue := next()
 		if factoryValue > uint64(^FactoryABI(0)) {
 			return FuncSummary{}, false,
 				fmt.Errorf("invalid coroutine factory ABI %d", factoryValue)
 		}
 		summary.Factory = FactoryABI(factoryValue)
+	}
+	if version == SummaryVersion {
+		terminalValue := next()
+		if terminalValue > uint64(^TerminalFlags(0)) {
+			return FuncSummary{}, false,
+				fmt.Errorf("invalid coroutine terminal flags %d", terminalValue)
+		}
+		summary.Terminal = TerminalFlags(terminalValue)
 	}
 	return summary, true, nil
 }
@@ -197,17 +210,19 @@ type Edge struct {
 
 // Function is the coroutine analysis result for one function.
 type Function struct {
-	Func      *ir.Func
-	Local     Effect
-	Effect    Effect
-	LocalExec ExecFlags
-	Exec      ExecFlags
-	Primary   PrimaryKind
-	Recursive bool
-	Seeds     []Seed
-	Edges     []Edge
-	Sites     []Site
-	Factory   FactoryABI
+	Func          *ir.Func
+	Local         Effect
+	Effect        Effect
+	LocalExec     ExecFlags
+	Exec          ExecFlags
+	LocalTerminal TerminalFlags
+	Terminal      TerminalFlags
+	Primary       PrimaryKind
+	Recursive     bool
+	Seeds         []Seed
+	Edges         []Edge
+	Sites         []Site
+	Factory       FactoryABI
 }
 
 // Plan is the result of analyzing one package.
@@ -222,9 +237,10 @@ type Plan struct {
 func (p *Plan) PublishSummaries() {
 	for fn, function := range p.Functions {
 		SetSummary(fn, FuncSummary{
-			Effect:  function.Effect,
-			Exec:    function.Exec,
-			Factory: function.Factory,
+			Effect:   function.Effect,
+			Exec:     function.Exec,
+			Terminal: function.Terminal,
+			Factory:  function.Factory,
 		})
 	}
 }
@@ -279,13 +295,19 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 				function.Exec = exec
 				changed = true
 			}
+			terminal := function.LocalTerminal | p.calledTerminal(function)
+			if terminal != function.Terminal {
+				function.Terminal = terminal
+				changed = true
+			}
 		}
 	}
 
 	for _, function := range p.Functions {
 		function.Primary = (FuncSummary{
-			Effect: function.Effect,
-			Exec:   function.Exec,
+			Effect:   function.Effect,
+			Exec:     function.Exec,
+			Terminal: function.Terminal,
 		}).Primary()
 		for _, edge := range function.Edges {
 			if edge.Kind != GoCall && edge.Recipe.Kind == SiteInvalid &&
@@ -342,6 +364,11 @@ func (p *Plan) scan(function *Function) {
 
 	ir.Visit(function.Func, func(n ir.Node) {
 		switch n.Op() {
+		case ir.OPANIC:
+			function.LocalTerminal |= MayPanic
+			addSite(SitePanic, n, NotForeign)
+		case ir.ORECOVER:
+			function.LocalTerminal |= UsesRecover
 		case ir.OSEND:
 			addSeed(ChannelSend)
 			addSite(SiteChannel, n, NotForeign)
@@ -412,6 +439,9 @@ func (p *Plan) scan(function *Function) {
 				addSite(recipe.Kind, call, recipe.Foreign)
 			}
 		}
+		if edge.CalleeName == "runtime.Goexit" {
+			function.LocalTerminal |= MayGoexit
+		}
 		if kind == GoCall {
 			addSite(SiteSpawn, call, edge.Recipe.Foreign)
 		}
@@ -460,6 +490,19 @@ func (p *Plan) calledExec(function *Function) ExecFlags {
 	return flags
 }
 
+func (p *Plan) calledTerminal(function *Function) TerminalFlags {
+	var flags TerminalFlags
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			continue
+		}
+		if summary, known := p.edgeSummary(edge); known {
+			flags |= summary.Terminal
+		}
+	}
+	return flags
+}
+
 func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
 	if edge.Recipe.Kind != SiteInvalid {
 		return FuncSummary{
@@ -472,9 +515,10 @@ func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
 	}
 	if callee := p.Functions[edge.Callee]; callee != nil {
 		return FuncSummary{
-			Effect:  callee.Effect,
-			Exec:    callee.Exec,
-			Factory: callee.Factory,
+			Effect:   callee.Effect,
+			Exec:     callee.Exec,
+			Terminal: callee.Terminal,
+			Factory:  callee.Factory,
 		}, true
 	}
 	return edge.Imported, true
@@ -519,9 +563,10 @@ func (p *Plan) Dump(w io.Writer) {
 		if len(seeds) == 0 {
 			seeds = append(seeds, "-")
 		}
-		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t seeds=%s primary=%s exec=%s\n",
+		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t seeds=%s primary=%s exec=%s terminal=%s local-terminal=%s\n",
 			ir.PkgFuncName(function.Func), function.Effect, function.Local,
-			function.Recursive, strings.Join(seeds, ","), function.Primary, function.Exec)
+			function.Recursive, strings.Join(seeds, ","), function.Primary,
+			function.Exec, function.Terminal, function.LocalTerminal)
 
 		for _, site := range function.Sites {
 			fmt.Fprintf(w, "coro: site=%d func=%s kind=%s foreign=%s\n",

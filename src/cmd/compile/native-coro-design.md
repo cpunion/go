@@ -2,7 +2,8 @@
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed direct defer
-normal-completion, operation-progress follow-ups, nested multi-result and
+cleanup for normal return and explicit panic, typed structured panic
+propagation, operation-progress follow-ups, nested multi-result and
 conservatively normalized single-result expressions, and a restricted
 compiler-private cross-package factory entry implemented; not production-ready
 
@@ -289,6 +290,7 @@ const (
 	coroActionSpawn
 	coroActionYield
 	coroActionEnterForeign
+	coroActionPanic
 )
 ```
 
@@ -894,9 +896,13 @@ control-flow splitting before suspension. A spawned call with results is
 rejected because the child may outlive the parent slot.
 
 The previous summary version is decoded as an effect and execution summary
-with no factory capability. An unknown factory ABI is treated as unavailable;
-an unknown summary format version is rejected as incompatible. This keeps
-stale objects safe without growing a compatibility policy matrix.
+with no factory capability. The next version adds the factory capability but
+no terminal-control flags. The current version also exports `MayPanic`,
+`UsesRecover`, and `MayGoexit`, allowing explicit panic effects to propagate
+through imported structured calls and unsupported control to fail closed.
+An unknown factory ABI is treated as unavailable; an unknown summary format
+version is rejected as incompatible. This keeps stale objects safe without
+growing a compatibility policy matrix.
 
 The measured implementation must not hide this cost by batching only. The
 benchmark therefore separates:
@@ -916,18 +922,29 @@ These controls cannot rely on native stack unwinding across a suspension.
 Every frame eventually needs explicit cleanup states and a typed terminal
 outcome.
 
-The first post-MVP cleanup slice supports fixed direct defer sites on normal
-completion. Encountering a defer evaluates its call operands immediately and
-arms one frame-owned site. Every return enters a shared completion state that
-invokes armed sites in reverse order before copying results to the caller.
-Conditional sites are supported, but a site cannot repeat in a loop.
+The first post-MVP cleanup slices support fixed direct defer sites on normal
+completion and explicit panic. Encountering a defer evaluates its call
+operands immediately and arms one frame-owned site. Every return or explicit
+panic enters one shared cleanup state that invokes armed sites in reverse
+order. Normal return then copies results to the caller. Panic instead returns
+a typed terminal action without copying results.
 
-The compiler rejects a suspending, dynamic, repeated, unknown-effect, or
-execution-constrained defer. Panic, recover, Goexit, and implicit faults still
-need a typed terminal outcome and cleanup protocol. The remaining phases are:
+An awaited child's panic value is transferred under scheduler ownership to
+the waiting parent. The parent enters its own cleanup state rather than its
+post-call source state. The root re-raises the value only after native
+executors stop, on an ordinary caller Go stack, so an enclosing ordinary
+defer can recover it. A separate outcome kind preserves `panic(nil)` instead
+of confusing it with normal completion.
+
+Conditional fixed defer sites are supported, but a site cannot repeat in a
+loop. The compiler rejects a suspending, dynamic, repeated, unknown-effect,
+execution-constrained, or terminal defer target. A function using `recover`
+or `runtime.Goexit`, and a `go` target that may explicitly panic, retains the
+ordinary Go path. Implicit faults are not yet converted to terminal outcomes.
+The remaining phases are:
 
 1. dynamic frame-owned defer records;
-2. panic propagation and recover;
+2. lowered recover and replacement-panic semantics;
 3. Goexit cleanup;
 4. implicit faults and complete standard-library behavior.
 
@@ -1096,12 +1113,15 @@ The first automatic lowering supports:
   coroutine frame;
 - `if`, simple loops, ordinary return, and explicit compiler test operations;
 - one logical root and spawned roots;
-- normal completion.
+- normal completion;
+- conditional fixed direct defer sites;
+- explicit panic propagation through structured calls and fixed cleanup.
 
 It initially rejects:
 
 - open interface or function-value calls;
-- defer, recover, Goexit, and suspension across panic handling;
+- dynamic or repeated defer, recover, Goexit, implicit faults, and a spawned
+  target that may explicitly panic;
 - reflection;
 - closures with escaping environments;
 - variadic C calls;
@@ -1328,12 +1348,23 @@ The compiler:
   temporaries;
 - normalizes single-result awaits in returns, call arguments, and simple
   assignments into pre-escape typed temporary assignments when doing so
-  preserves every observable prefix operation;
+  preserves every observable prefix operation; an existing statement `Init`
+  prefix remains before the generated await assignments;
 - exports a versioned, compiler-private factory capability for the restricted
   cross-package signature subset and reconstructs its deterministic typed
   entry without changing the ordinary Go entry;
 - creates all factories in a local recursive call component before lowering
   their bodies, so direct and mutual recursive edges remain stackless;
+- exports terminal-control flags alongside factory capabilities and propagates
+  them through local and imported structured calls, but not across `go`
+  statements;
+- lowers explicit panic, including panic nested in supported structured
+  control flow, to a typed scheduler action, transfers an awaited child's
+  panic to its parent, runs each frame's fixed defers in one shared cleanup
+  state, and re-raises the root outcome on an ordinary Go stack;
+- stores only the terminal kind in existing task-header padding and allocates
+  the panic-value map lazily, so normal logical tasks do not grow for this
+  capability;
 - explicitly declares source locals moved into generated factories, ensuring
   that locals captured across a child suspension receive typed heap storage
   even when the source declaration was implicit;
@@ -1380,9 +1411,11 @@ The transparent cgo frontend:
 - emits a typed bridge in the preamble translation unit, so `static`
   declarations work without exposing a new user annotation.
 
-The race build retains the operation-state tests but deliberately uses the
-managed-stack fallback. The race runtime is not yet prepared to instrument
-arbitrary Go code running on the fixed native executor stack.
+Race, memory-sanitizer, and address-sanitizer builds still analyze and export
+coroutine summaries, but deliberately skip native lowering and direct cgo
+metadata. They retain the managed-stack and general-cgo paths because their
+instrumentation hooks do not yet cover arbitrary Go code on the fixed native
+executor stack.
 
 ### 15.2 Validation
 
@@ -1411,6 +1444,9 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
+- the transparent C fixture evaluates two panic-capable argument helpers in
+  source order, lowers their conditional panic without a native `gopanic`
+  edge, and retains ordinary cgo with no native lowering under `-race`;
 - a real three-package call chain covering package functions, concrete pointer
   and value methods, packed and explicit-slice variadic calls, single and
   multiple results, blank and discarded results, a no-result call, and reuse
@@ -1428,6 +1464,15 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   assignment, two-await expression, and nested coroutine call chain;
   disassembly verifies that both inner and outer edges use private factories
   and never re-enter a public wrapper;
+- explicit string and nil panic values through three lowered frames, with
+  fixed defers running in leaf-to-root order before an ordinary outer defer
+  recovers the root outcome; object inspection verifies typed panic helpers
+  and the absence of native `gopanic` and defer machinery in resume functions;
+- explicit panic propagation through a three-package factory chain, including
+  versioned terminal summaries and private factory symbols at both imported
+  edges;
+- deterministic ordinary-path fallback for lowered functions using recover or
+  Goexit and for a stackless `go` target that may explicitly panic;
 - ordinary callers, missing capabilities, and complex multi-result targets
   retain the public Go entry and execute correctly; an effectful destination
   probe verifies left-before-right evaluation order, and decoder tests verify
@@ -1458,6 +1503,12 @@ predicate is 100% covered. The final native-context return and root-owned
 cleanup success paths are covered on Darwin. Remaining lines are defensive
 invariant failures or subprocess-only build plumbing.
 
+For the terminal-outcome follow-up specifically, focused statement profiles
+cover 135 of 138 changed statements in `cmd/compile/internal/coro` (97.8%) and
+52 of 68 in `runtime/coro_stackless.go` (76.5%). Together they cover 187 of
+206 changed core statements (90.8%); the uncovered runtime statements are
+defensive invalid-state throws.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -1472,11 +1523,12 @@ runs, not stable performance promises.
 | one-byte regular-file read | 10.47 us | 25.28 us | 144 B |
 | one-byte socket read | 10.78 us | 25.35 us | 144 B |
 
-A burst of 100,000 logical tasks allocates 3,200,272 bytes and 100,006
-objects on both targets: approximately 32 bytes per task plus 272 bytes and
-six scheduler allocations. The native executor count remains four. The
-one-task and 1,000-task burst measurements are 1,328 and 32,272 bytes,
-respectively.
+A current Darwin/arm64 burst of 100,000 logical tasks allocates approximately
+4.80 MB and 100,012 objects. The task-size regression test fixes the task
+header at six pointer widths, or 48 bytes on the two MVP targets. Terminal
+payload storage is absent until a panic occurs; representative 100,000-task
+runs before and after this slice remained approximately 4.80 MB. The native
+executor count remains four.
 
 The direct-call microbenchmark performs the same non-inlined scalar addition
 through the stackless System ABI path, ordinary cgo, and pure Go. The compiler
@@ -1491,24 +1543,25 @@ reported two lowered functions and no skipped functions.
 The transparent-cgo follow-up adds a separate benchmark in
 `internal/runtime/cgobench`. The Darwin/arm64 sample ran on an Apple M4 Max.
 The Linux/amd64 sample ran in the translated VirtualApple guest described
-above. Both used five 300 ms runs for latency and three 200 ms runs for
-allocation:
+above. Both used five 300 ms runs with allocation reporting:
 
 | Shape | Path | Darwin/arm64 median | Linux/amd64 translated median | Allocation |
 | --- | --- | ---: | ---: | ---: |
-| steady | ordinary cgo | 13.49 ns | 21.32 ns | 0 B/op, 0 allocs/op |
-| steady | transparent `DirectMayBlock` | 13.96 ns | 20.47 ns | 0 B/op, 0 allocs/op |
-| steady | compiler-owned `DirectNoBlock` | 4.46 ns | 5.444 ns | 0 B/op, 0 allocs/op |
-| entry | ordinary cgo | 14.27 ns | 21.86 ns | 0 B/op, 0 allocs/op |
-| entry | transparent `DirectMayBlock` | 1.08 us | 872.2 ns | 448 B/op, 5 allocs/op |
-| entry | compiler-owned `DirectNoBlock` | 1.07 us | 927.5 ns | 504 B/op, 8 allocs/op |
+| steady | ordinary cgo | 13.27 ns | 22.53 ns | 0 B/op, 0 allocs/op |
+| steady | transparent `DirectMayBlock` | 14.26 ns | 20.98 ns | 0 B/op, 0 allocs/op |
+| steady | compiler-owned `DirectNoBlock` | 4.331 ns | 5.176 ns | 0 B/op, 0 allocs/op |
+| entry | ordinary cgo | 13.78 ns | 23.01 ns | 0 B/op, 0 allocs/op |
+| entry | transparent `DirectMayBlock` | 61.70 ns | 98.02 ns | 48 B/op, 1 alloc/op |
+| entry | compiler-owned `DirectNoBlock` | 1.042 us | 956.3 ns | 520 B/op, 8 allocs/op |
 
 The conservative transparent path is therefore near ordinary cgo in steady
 state on both runs, not a demonstrated speedup. `DirectNoBlock` shows that
 avoiding syscall scheduler accounting can materially reduce the boundary
-cost, but a public bounded-call contract has not been selected. The entry
-measurements expose a larger unresolved root-creation cost; they are evidence
-for the separate cross-package entry design question in section 10.9, not
+cost, but a public bounded-call contract has not been selected. Current
+run-to-completion lowering makes the no-result `DirectMayBlock` entry much
+smaller on both runs, while the result-returning `DirectNoBlock` entry still
+exposes the larger root-creation cost. The entry measurements are evidence for
+the separate cross-package entry design question in section 10.9, not
 justification for adding source annotations.
 
 For a `println` program whose `work` function calls `runtime.Gosched`, the
@@ -1523,10 +1576,12 @@ reported separately above.
 ### 15.4 Remaining restrictions
 
 The MVP does not yet support range loops, labeled control flow, dynamic calls,
-interfaces, escaping closures, dynamic or repeated defer, panic/recover,
-Goexit, implicit faults, channels, select, mutex parking, reflection,
-callbacks, variadic C calls, or general C ABI type classification. Direct
-foreign declarations now have a restricted transparent cgo path, but
+interfaces, escaping closures, dynamic or repeated defer, lowered recover,
+Goexit, implicit faults, panic from a non-structured spawned task, channels,
+select, mutex parking, reflection, callbacks, variadic C calls, or general C
+ABI type classification. Explicit panic through structured calls and fixed
+defer cleanup is supported. Direct foreign declarations now have a restricted
+transparent cgo path, but
 floating-point, aggregate, variadic, callback-capable, errno, and non-target
 ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
 method-value calls, closures, and generic shapes. Frontend-normalized nested
@@ -1543,8 +1598,9 @@ work, and broad standard-library compatibility remain future work.
 The likely order is:
 
 1. complete panic, defer, recover, Goexit, and implicit fault lowering; the
-   fixed direct defer normal-completion slice is implemented, while typed
-   terminal outcomes and dynamic defer records remain;
+   fixed direct defer and explicit typed panic-outcome slices are implemented,
+   while recover, Goexit, implicit faults, replacement panics, and dynamic
+   defer records remain;
 2. add channels, select, mutexes, semaphores, and runtime notes;
 3. generalize System ABI type classification and errno handling;
 4. extend expression and assignment normalization to short-circuit control,

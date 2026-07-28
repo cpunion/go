@@ -196,6 +196,8 @@ func block()
 func coroRun(func(unsafe.Pointer) uint8)
 func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)
+func coroPanic(unsafe.Pointer, interface{})
+func coroPanicPending(unsafe.Pointer) bool
 func coroSleep(unsafe.Pointer, int64)
 func coroFileRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
