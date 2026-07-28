@@ -207,6 +207,130 @@ func TestLowerMethodReceiver(t *testing.T) {
 	}
 }
 
+func TestNeedsTerminalEntry(t *testing.T) {
+	prepareLowerTest(t)
+
+	pkg := types.NewPkg("example.com/coro/terminalentry", "terminalentry")
+	sequence := 0
+	candidate := func(body ...ir.Node) *lowerCandidate {
+		sequence++
+		fn := ir.NewFunc(src.NoXPos, src.NoXPos,
+			pkg.LookupNum("candidate", sequence),
+			types.NewSignature(nil, nil, nil))
+		fn.Body = body
+		return &lowerCandidate{
+			function:     &Function{Func: fn},
+			transitions:  make(map[*ir.CallExpr]SiteKind),
+			foreignCalls: make(map[*ir.CallExpr]ForeignCallClass),
+		}
+	}
+	check := func(name string, candidate *lowerCandidate, want bool) {
+		t.Helper()
+		if got := needsTerminalEntry(candidate); got != want {
+			t.Errorf("%s: needsTerminalEntry = %v, want %v", name, got, want)
+		}
+	}
+	intValue := func(value int64) ir.Node {
+		return ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(value))
+	}
+	name := func(symbol string, typ *types.Type) *ir.Name {
+		return ir.NewNameAt(src.NoXPos, pkg.Lookup(symbol), typ)
+	}
+
+	terminal := candidate()
+	terminal.function.Terminal = MayPanic
+	check("terminal effect", terminal, true)
+
+	deferred := candidate()
+	deferred.defers = []*lowerDefer{{}}
+	check("defer", deferred, true)
+
+	awaited := candidate()
+	awaited.transitions[nil] = SiteAwait
+	check("await", awaited, true)
+
+	exiting := candidate()
+	exiting.transitions[nil] = SiteGoexit
+	check("goexit", exiting, true)
+
+	callTarget := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("callTarget"),
+		types.NewSignature(nil, nil, nil))
+	newCall := func() *ir.CallExpr {
+		return ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+			callTarget.Nname, nil)
+	}
+	yieldCall := newCall()
+	yieldOnly := candidate(yieldCall)
+	yieldOnly.transitions[yieldCall] = SiteYield
+	check("yield call", yieldOnly, false)
+
+	foreignCall := newCall()
+	foreignOnly := candidate(foreignCall)
+	foreignOnly.foreignCalls[foreignCall] = DirectNoBlock
+	check("foreign call", foreignOnly, false)
+
+	check("ordinary call", candidate(newCall()), true)
+
+	nilComparison := ir.NewBinaryExpr(src.NoXPos, ir.OEQ,
+		ir.NewNilExpr(src.NoXPos, types.NewPtr(types.Types[types.TINT])),
+		ir.NewNilExpr(src.NoXPos, types.NewPtr(types.Types[types.TINT])))
+	check("nil comparison", candidate(nilComparison), false)
+
+	missingTypeComparison := ir.NewBinaryExpr(src.NoXPos, ir.OEQ,
+		name("missingTypeLeft", nil), name("missingTypeRight", nil))
+	check("missing comparison type", candidate(missingTypeComparison), true)
+
+	orderedComparison := ir.NewBinaryExpr(src.NoXPos, ir.OLT,
+		intValue(1), intValue(2))
+	check("ordered comparison", candidate(orderedComparison), false)
+
+	scalarComparison := ir.NewBinaryExpr(src.NoXPos, ir.OEQ,
+		intValue(1), intValue(2))
+	check("scalar equality", candidate(scalarComparison), false)
+
+	interfaceType := types.NewInterface(nil)
+	interfaceComparison := ir.NewBinaryExpr(src.NoXPos, ir.OEQ,
+		name("interfaceLeft", interfaceType),
+		name("interfaceRight", interfaceType))
+	check("interface equality", candidate(interfaceComparison), true)
+
+	add := ir.NewAssignOpStmt(src.NoXPos, ir.OADD,
+		name("add", types.Types[types.TINT]), intValue(1))
+	check("add assignment", candidate(add), false)
+
+	stringAdd := ir.NewAssignOpStmt(src.NoXPos, ir.OADD,
+		name("stringAdd", types.Types[types.TSTRING]),
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TSTRING],
+			constant.MakeString("x")))
+	check("string add assignment", candidate(stringAdd), true)
+
+	shift := ir.NewAssignOpStmt(src.NoXPos, ir.OLSH,
+		name("shift", types.Types[types.TINT]), intValue(1))
+	check("shift assignment", candidate(shift), true)
+
+	binaryAdd := ir.NewBinaryExpr(src.NoXPos, ir.OADD,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TSTRING],
+			constant.MakeString("x")),
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TSTRING],
+			constant.MakeString("y")))
+	check("string addition", candidate(binaryAdd), true)
+
+	subtract := ir.NewBinaryExpr(src.NoXPos, ir.OSUB,
+		intValue(2), intValue(1))
+	check("subtraction", candidate(subtract), false)
+
+	divide := ir.NewBinaryExpr(src.NoXPos, ir.ODIV,
+		intValue(1), intValue(0))
+	check("division", candidate(divide), true)
+
+	dereference := ir.NewStarExpr(src.NoXPos,
+		name("pointer", types.NewPtr(types.Types[types.TINT])))
+	check("dereference", candidate(dereference), true)
+
+	check("empty", candidate(), false)
+}
+
 func TestLowerStateMachines(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -365,6 +489,28 @@ func TestLowerStateMachines(t *testing.T) {
 	runLoop.SetTypecheck(1)
 	runToCompletion := newLowerTestFunc(pkg, "runToCompletion")
 	runToCompletion.Body = ir.Nodes{runLoop, newLowerTestReturn()}
+
+	runFaultingCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		directOp.Nname, ir.Nodes{
+			ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(1)),
+		})
+	runFaultingCall.SetTypecheck(1)
+	runFaulting := newLowerTestFunc(pkg, "runFaulting")
+	runFaultingPointer := runFaulting.NewLocal(src.NoXPos,
+		pkg.Lookup("runFaultingPointer"),
+		types.NewPtr(types.Types[types.TINT]))
+	runFaultingValue := runFaulting.NewLocal(src.NoXPos,
+		pkg.Lookup("runFaultingValue"), types.Types[types.TINT])
+	runFaultingLoad := ir.NewAssignStmt(src.NoXPos, runFaultingValue,
+		ir.NewStarExpr(src.NoXPos, runFaultingPointer))
+	runFaulting.Body = ir.Nodes{
+		ir.NewDecl(src.NoXPos, ir.ODCL, runFaultingPointer),
+		ir.NewDecl(src.NoXPos, ir.ODCL, runFaultingValue),
+		runFaultingLoad,
+		runFaultingCall,
+		newLowerTestReturn(),
+	}
 
 	singleResult := types.NewField(src.NoXPos, pkg.Lookup("singleResult"),
 		types.Types[types.TINT])
@@ -688,6 +834,25 @@ func TestLowerStateMachines(t *testing.T) {
 				Foreign: DirectMayBlock,
 			}},
 		},
+		runFaulting: {
+			Func:    runFaulting,
+			Effect:  NoSuspend,
+			Exec:    NeedsSystemABI,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: directOp,
+				CalleeName: symbolName(directOp.Nname),
+				Recipe: OperationRecipe{
+					Kind: SiteForeign, Foreign: DirectNoBlock,
+					Direct: symbolName(directEntry.Nname),
+				},
+				Node: runFaultingCall, Direct: directEntry,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteForeign, Node: runFaultingCall,
+				Foreign: DirectNoBlock,
+			}},
+		},
 		runSingle: {
 			Func:    runSingle,
 			Effect:  NoSuspend,
@@ -784,8 +949,8 @@ func TestLowerStateMachines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 16 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 16 lowered and 0 skipped", result)
+	if result.Lowered != 17 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 17 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -796,22 +961,46 @@ func TestLowerStateMachines(t *testing.T) {
 	if noSplitResumes != result.Lowered {
 		t.Fatalf("nosplit resume functions = %d, want %d", noSplitResumes, result.Lowered)
 	}
-	for _, generated := range typecheck.Target.Funcs {
-		if generated.OClosure == nil {
-			continue
+	checksTerminal := func(fn *ir.Func) (bool, bool) {
+		for _, generated := range typecheck.Target.Funcs {
+			if generated.OClosure == nil || generated.ClosureParent == nil ||
+				generated.ClosureParent.Sym().Name != fn.Sym().Name+".coro" {
+				continue
+			}
+			found := false
+			ir.Visit(generated, func(node ir.Node) {
+				call, ok := node.(*ir.CallExpr)
+				if !ok || call.Fun == nil {
+					return
+				}
+				name := ir.StaticCalleeName(call.Fun)
+				if name != nil && name.Sym() != nil &&
+					name.Sym().Name == "coroTerminalAction" {
+					found = true
+				}
+			})
+			return found, true
 		}
-		ir.Visit(generated, func(node ir.Node) {
-			call, ok := node.(*ir.CallExpr)
-			if !ok || call.Fun == nil {
-				return
-			}
-			name := ir.StaticCalleeName(call.Fun)
-			if name != nil && name.Sym() != nil &&
-				name.Sym().Name == "coroTerminalAction" {
-				t.Errorf("%s checks for a terminal outcome without a terminal effect",
-					generated.Sym().Name)
-			}
-		})
+		return false, false
+	}
+	for _, test := range []struct {
+		fn   *ir.Func
+		want bool
+	}{
+		{child, false},
+		{parent, true},
+		{foreignCaller, true},
+		{runToCompletion, false},
+		{runFaulting, true},
+		{deferred, true},
+	} {
+		got, found := checksTerminal(test.fn)
+		if !found {
+			t.Errorf("%s has no generated resume function", test.fn.Sym().Name)
+		} else if got != test.want {
+			t.Errorf("%s terminal check = %v, want %v",
+				test.fn.Sym().Name, got, test.want)
+		}
 	}
 
 	var foreignResume *ir.Func

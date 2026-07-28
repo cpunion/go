@@ -172,7 +172,35 @@ func stacklessCoroGoexitPanic(value any) {
 
 func (s *stacklessCoroScheduler) run(native bool) {
 	for !s.rootComplete() {
-		task := s.take()
+		s.runTasks(native)
+	}
+}
+
+// runTasks drives the ready queue until the root completes or one resume
+// panics. A recovered panic returns to run, which starts another queue-driving
+// episode after this native activation has unwound.
+func (s *stacklessCoroScheduler) runTasks(native bool) {
+	var task *stacklessCoroTask
+	defer func() {
+		if task == nil || task.context.scheduler != s ||
+			task.context.task != task {
+			return
+		}
+		p := getg()._panic
+		if p == nil || p.goexit {
+			return
+		}
+		value := recover()
+		// A native panic can begin normal cleanup or replace a panic already
+		// being unwound. Replacement also preserves a pending Goexit.
+		recordStacklessCoroPanic(s, task, value, true)
+		task.context.scheduler = nil
+		task.context.task = nil
+		s.readyAfterPanic(task)
+	}()
+
+	for !s.rootComplete() {
+		task = s.take()
 		if task == nil {
 			<-s.wake
 			continue
@@ -633,6 +661,20 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
 	}
 }
 
+func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
+		task.terminal != stacklessCoroTerminalPanic {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine panic recovery")
+	}
+	task.resuming = false
+	s.readyLocked(task)
+	unlock(&s.lock)
+	s.signal()
+}
+
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
@@ -682,8 +724,11 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	task.parent = nil
 	if parent == nil {
 		if task != s.root {
+			delete(s.terminalValues, task)
+			task.terminal = stacklessCoroTerminalNone
+			task.goexit = false
 			unlock(&s.lock)
-			throw("runtime: unstructured stackless coroutine panic")
+			panic(value)
 		}
 		unlock(&s.lock)
 		s.signalAll()
