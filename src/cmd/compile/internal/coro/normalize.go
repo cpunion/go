@@ -54,18 +54,19 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 	if !ok {
 		return
 	}
-	init := ir.TakeInit(stmt)
-	normalizeCallList(init, fn, calls)
-	initNode.SetInit(init)
+	prefix := ir.TakeInit(stmt)
+	normalizeCallList(prefix, fn, calls)
 
 	var root ir.Node
 	switch stmt := stmt.(type) {
 	case *ir.BlockStmt:
+		initNode.SetInit(prefix)
 		normalizeCallList(stmt.List, fn, calls)
 		return
 	case *ir.IfStmt:
+		var init ir.Nodes
 		stmt.Cond, init = normalizeCallExpression(stmt.Cond, fn, calls, false)
-		stmt.PtrInit().Append(init...)
+		initNode.SetInit(append(prefix, init...))
 		normalizeCallList(stmt.Body, fn, calls)
 		normalizeCallList(stmt.Else, fn, calls)
 		return
@@ -73,6 +74,7 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		// A for condition is reevaluated on every iteration, whereas the
 		// statement Init list runs only once. Leave nested condition and post
 		// calls for a later control-flow normalization.
+		initNode.SetInit(prefix)
 		normalizeCallList(stmt.Body, fn, calls)
 		return
 	case *ir.ReturnStmt, *ir.AssignStmt, *ir.AssignListStmt:
@@ -80,11 +82,12 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 	case *ir.CallExpr:
 		root = stmt
 	default:
+		initNode.SetInit(prefix)
 		return
 	}
 
-	_, init = normalizeCallExpression(root, fn, calls, true)
-	initNode.PtrInit().Append(init...)
+	_, init := normalizeCallExpression(root, fn, calls, true)
+	initNode.SetInit(append(prefix, init...))
 }
 
 func normalizeCallExpression(root ir.Node, fn *ir.Func,

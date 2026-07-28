@@ -20,6 +20,7 @@ const (
 	actionYield
 	actionWait
 	actionComplete
+	actionPanic
 )
 
 // LowerResult summarizes one package lowering pass.
@@ -36,6 +37,7 @@ type lowerCandidate struct {
 	directCalls  map[*ir.CallExpr]*ir.Func
 	dependencies map[*ir.Func]bool
 	defers       []*lowerDefer
+	panics       map[*ir.UnaryExpr]bool
 	parameters   map[*ir.Name]*ir.Name
 	results      map[*ir.Name]*ir.Name
 	resultValues []*ir.Name
@@ -58,7 +60,9 @@ type lowerState struct {
 	condition  ir.Node
 	thenState  int
 	elseState  int
-	complete   bool
+	cleanup    bool
+	terminal   uint8
+	panicValue ir.Node
 }
 
 // Lower rewrites supported coroutine primaries into explicit state machines.
@@ -194,6 +198,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
+	}
+	if unsupported := function.Terminal & (UsesRecover | MayGoexit); unsupported != 0 {
+		return nil, fmt.Errorf("unsupported terminal control %s", unsupported)
 	}
 
 	statementCalls := make(map[*ir.CallExpr]bool)
@@ -343,8 +350,17 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		directCalls:  make(map[*ir.CallExpr]*ir.Func),
 		dependencies: make(map[*ir.Func]bool),
 		defers:       defers,
+		panics:       make(map[*ir.UnaryExpr]bool),
 	}
 	for _, site := range function.Sites {
+		if site.Kind == SitePanic {
+			panicExpr, ok := site.Node.(*ir.UnaryExpr)
+			if !ok || panicExpr.Op() != ir.OPANIC {
+				return nil, fmt.Errorf("invalid panic site %d", site.ID)
+			}
+			candidate.panics[panicExpr] = true
+			continue
+		}
 		call, ok := site.Node.(*ir.CallExpr)
 		if !ok {
 			return nil, fmt.Errorf("non-call site %d", site.ID)
@@ -404,6 +420,10 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if edge.Callee.Type().NumResults() != 0 {
 				return nil, fmt.Errorf("spawn target returns values")
 			}
+			if summary, known := plan.edgeSummary(edge); !known ||
+				summary.Terminal&MayPanic != 0 {
+				return nil, fmt.Errorf("spawn target may panic")
+			}
 			candidate.dependencies[edge.Callee] = true
 		case SiteForeign:
 			if site.Foreign != DirectNoBlock && site.Foreign != DirectMayBlock &&
@@ -446,6 +466,10 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if summary.Exec != 0 {
 			return nil, fmt.Errorf("defer target has execution constraints %s",
 				summary.Exec)
+		}
+		if summary.Terminal != 0 {
+			return nil, fmt.Errorf("defer target has terminal control %s",
+				summary.Terminal)
 		}
 		if edge.Callee.OClosure != nil &&
 			(!edge.Callee.Wrapper() || edge.Callee.WrappedFunc == nil) {
@@ -535,7 +559,7 @@ func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
 // loop iteration.
 func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 	if candidate.function.Effect != NoSuspend || len(candidate.defers) != 0 ||
-		len(candidate.foreignCalls) == 0 {
+		candidate.function.Terminal != 0 || len(candidate.foreignCalls) == 0 {
 		return false
 	}
 	for _, site := range candidate.function.Sites {
@@ -890,6 +914,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
+	panicAware := candidate.function.Terminal&MayPanic != 0
+	var terminal *ir.Name
+	if panicAware {
+		terminal = typecheck.TempAt(pos, factory, types.Types[types.TUINT8])
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, terminal))
+	}
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -914,13 +944,28 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return closure
 	}
 	resumePC := capture(pc)
+	var resumeTerminal *ir.Name
+	if panicAware {
+		resumeTerminal = capture(terminal)
+	}
 
+	const cleanupState = 0
+	completeState := cleanupState
 	states := []lowerState{{
 		next:      -1,
 		thenState: -1,
 		elseState: -1,
-		complete:  true,
+		cleanup:   true,
 	}}
+	if panicAware {
+		completeState = len(states)
+		states = append(states, lowerState{
+			next:      cleanupState,
+			thenState: -1,
+			elseState: -1,
+			terminal:  actionComplete,
+		})
+	}
 	addState := func(state lowerState) int {
 		stateIndex := len(states)
 		states = append(states, state)
@@ -951,6 +996,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if required {
 				return
 			}
+			if panicExpr, ok := node.(*ir.UnaryExpr); ok &&
+				panicExpr.Op() == ir.OPANIC && candidate.panics[panicExpr] {
+				required = true
+				return
+			}
 			if stmt, ok := node.(*ir.GoDeferStmt); ok &&
 				stmt.Op() == ir.ODEFER {
 				required = true
@@ -968,6 +1018,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return required
 	}
 	isBoundary := func(stmt ir.Node) bool {
+		if stmt.Op() == ir.OPANIC {
+			return true
+		}
 		switch stmt := stmt.(type) {
 		case *ir.ReturnStmt:
 			return true
@@ -999,13 +1052,26 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	lowerStatement = func(stmt ir.Node, next int) int {
 		switch stmt := stmt.(type) {
+		case *ir.UnaryExpr:
+			if stmt.Op() != ir.OPANIC || !candidate.panics[stmt] {
+				panic(fmt.Sprintf("unexpected coroutine unary boundary %s",
+					stmt.Op()))
+			}
+			entry := addState(lowerState{
+				next:       cleanupState,
+				thenState:  -1,
+				elseState:  -1,
+				panicValue: stmt.X,
+			})
+			return lowerStatements(stmt.Init(), entry)
+
 		case *ir.ReturnStmt:
 			body := make(ir.Nodes, 0, len(stmt.Results))
 			for i, value := range stmt.Results {
 				result, _ := fn.Type().Result(i).Nname.(*ir.Name)
 				body = append(body, ir.NewAssignStmt(stmt.Pos(), result, value))
 			}
-			entry := lowerStatements(body, 0)
+			entry := lowerStatements(body, completeState)
 			return lowerStatements(stmt.Init(), entry)
 
 		case *ir.BlockStmt:
@@ -1066,7 +1132,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		panic(fmt.Sprintf("unexpected coroutine lowering boundary %s", stmt.Op()))
 	}
-	entryState := lowerStatements(fn.Body, 0)
+	entryState := lowerStatements(fn.Body, completeState)
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
 		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
@@ -1263,7 +1329,37 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 		}
 
-		if state.complete {
+		if state.panicValue != nil {
+			if state.next < 0 {
+				return fmt.Errorf("%s: state %d panic has no cleanup state",
+					ir.PkgFuncName(fn), i)
+			}
+			body = append(body,
+				typecheck.Call(pos, typecheck.LookupRuntime("coroPanic"),
+					ir.Nodes{ctx, edit(state.panicValue)}, false),
+				ir.NewAssignStmt(pos, resumeTerminal,
+					typedInt(pos, types.Types[types.TUINT8],
+						int64(actionPanic))),
+				ir.NewAssignStmt(pos, resumePC,
+					typedInt(pos, types.Types[types.TUINT32],
+						int64(state.next))),
+				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
+			)
+		} else if state.terminal != actionInvalid {
+			if state.next < 0 {
+				return fmt.Errorf("%s: state %d terminal action has no cleanup state",
+					ir.PkgFuncName(fn), i)
+			}
+			body = append(body,
+				ir.NewAssignStmt(pos, resumeTerminal,
+					typedInt(pos, types.Types[types.TUINT8],
+						int64(state.terminal))),
+				ir.NewAssignStmt(pos, resumePC,
+					typedInt(pos, types.Types[types.TUINT32],
+						int64(state.next))),
+				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
+			)
+		} else if state.cleanup {
 			for j := len(candidate.defers) - 1; j >= 0; j-- {
 				deferred := candidate.defers[j]
 				armed := capture(deferred.armed)
@@ -1274,6 +1370,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					edit(deferred.call.Fun), nil, false)
 				body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
 					armed, ir.Nodes{clear, call}, nil))
+			}
+			if panicAware {
+				panicCondition := ir.NewBinaryExpr(pos, ir.OEQ, resumeTerminal,
+					typedInt(pos, types.Types[types.TUINT8], int64(actionPanic)))
+				body = append(body, ir.NewIfStmt(pos, panicCondition, ir.Nodes{
+					ir.NewReturnStmt(pos, []ir.Node{
+						typedInt(pos, types.Types[types.TUINT8],
+							int64(actionPanic)),
+					}),
+				}, nil))
 			}
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
@@ -1453,12 +1559,24 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		cases[i] = ir.NewCaseStmt(pos, []ir.Node{label}, body)
 	}
 	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
-	resume.Body = []ir.Node{ir.NewForStmt(pos, nil, nil, nil, []ir.Node{
-		dispatch,
-		ir.NewReturnStmt(pos, []ir.Node{
-			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)),
-		}),
-	}, false)}
+	resume.Body = ir.Nodes{}
+	if panicAware {
+		pendingPanic := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroPanicPending"), ir.Nodes{ctx}, false)
+		resume.Body = append(resume.Body, ir.NewIfStmt(pos, pendingPanic, ir.Nodes{
+			ir.NewAssignStmt(pos, resumeTerminal,
+				typedInt(pos, types.Types[types.TUINT8], int64(actionPanic))),
+			ir.NewAssignStmt(pos, resumePC,
+				typedInt(pos, types.Types[types.TUINT32], cleanupState)),
+		}, nil))
+	}
+	resume.Body = append(resume.Body,
+		ir.NewForStmt(pos, nil, nil, nil, []ir.Node{
+			dispatch,
+			ir.NewReturnStmt(pos, []ir.Node{
+				typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)),
+			}),
+		}, false))
 
 	finishLowering(candidate, resume, declarations, readAssignments)
 	return nil

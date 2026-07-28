@@ -52,6 +52,10 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 	outerCall.SetTypecheck(1)
 	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{outerCall})
 	ret.SetTypecheck(1)
+	prefixName := caller.NewLocal(src.NoXPos, pkg.Lookup("prefix"),
+		types.Types[types.TINT])
+	prefix := ir.NewDecl(src.NoXPos, ir.ODCL, prefixName)
+	ret.SetInit(ir.Nodes{prefix})
 	caller.Body = ir.Nodes{ret}
 
 	normalizeSingleResultCalls(&Function{
@@ -64,16 +68,20 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 		},
 	})
 
-	if len(ret.Init()) != 2 {
-		t.Fatalf("return Init has %d statements, want 2", len(ret.Init()))
+	if len(ret.Init()) != 3 {
+		t.Fatalf("return Init has %d statements, want 3", len(ret.Init()))
 	}
-	first, ok := ret.Init()[0].(*ir.AssignStmt)
+	if ret.Init()[0] != prefix {
+		t.Fatalf("first normalized statement = %v, want prefix %v",
+			ret.Init()[0], prefix)
+	}
+	first, ok := ret.Init()[1].(*ir.AssignStmt)
 	if !ok || first.Y != innerCall {
-		t.Fatalf("first normalized statement = %v, want inner call", ret.Init()[0])
+		t.Fatalf("second normalized statement = %v, want inner call", ret.Init()[1])
 	}
-	second, ok := ret.Init()[1].(*ir.AssignStmt)
+	second, ok := ret.Init()[2].(*ir.AssignStmt)
 	if !ok || second.Y != outerCall {
-		t.Fatalf("second normalized statement = %v, want outer call", ret.Init()[1])
+		t.Fatalf("third normalized statement = %v, want outer call", ret.Init()[2])
 	}
 	if outerCall.Args[0] != first.X || ret.Results[0] != second.X {
 		t.Fatalf("normalized temporaries are not used by the enclosing expressions")

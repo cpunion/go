@@ -259,9 +259,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	bloop.Walk(typecheck.Target)
 
 	cgoDirectives := typecheck.Target.CgoDirectives
-	if base.Flag.Race || base.Flag.MSan || base.Flag.ASan {
-		// The direct foreign path does not yet reproduce the synchronization
-		// and shadow-memory hooks supplied by the general cgo path.
+	instrumented := base.Flag.Race || base.Flag.MSan || base.Flag.ASan
+	if instrumented {
+		// The native executor and direct foreign paths do not yet reproduce
+		// the synchronization and shadow-memory hooks supplied by the
+		// instrumented Go and general cgo paths.
 		cgoDirectives = nil
 	}
 	if buildcfg.Experiment.Coro {
@@ -317,7 +319,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			fmt.Fprintln(os.Stderr, "coro: phase=final")
 			plan.Dump(os.Stderr)
 		}
-		if base.Debug.Coro > 3 {
+		if base.Debug.Coro > 3 && !instrumented {
 			result, err := coro.Lower(plan)
 			if err != nil {
 				base.Fatalf("lowering coroutine plan: %v", err)

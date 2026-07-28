@@ -116,6 +116,79 @@ func TestStacklessCoroAwait(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroPanic(t *testing.T) {
+	for _, value := range []any{"panic-value", nil} {
+		var recovered any
+		func() {
+			defer func() {
+				recovered = recover()
+			}()
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				if runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("new root has a pending panic")
+				}
+				runtime.PanicStacklessCoroForTest(ctx, value)
+				return runtime.StacklessCoroActionPanic
+			})
+		}()
+		if value == nil {
+			if recovered == nil {
+				t.Fatal("panic(nil) was not propagated")
+			}
+		} else if recovered != value {
+			t.Fatalf("recovered panic = %v, want %v", recovered, value)
+		}
+	}
+}
+
+func TestStacklessCoroPanicAwait(t *testing.T) {
+	var parentState int
+	var cleanup bool
+	child := func(ctx unsafe.Pointer) uint8 {
+		runtime.PanicStacklessCoroForTest(ctx, "child panic")
+		return runtime.StacklessCoroActionPanic
+	}
+
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				parentState = 1
+				runtime.AwaitStacklessCoroForTest(ctx, child)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("child panic was not transferred to its parent")
+				}
+				cleanup = true
+				parentState = 2
+				return runtime.StacklessCoroActionPanic
+			default:
+				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	}()
+	if recovered != "child panic" {
+		t.Fatalf("recovered panic = %v, want %q", recovered, "child panic")
+	}
+	if parentState != 2 || !cleanup {
+		t.Fatalf("parent state = (%d, %t), want (2, true)",
+			parentState, cleanup)
+	}
+}
+
+func TestStacklessCoroTaskSize(t *testing.T) {
+	ptrSize := unsafe.Sizeof(uintptr(0))
+	if got, want := runtime.StacklessCoroTaskSizeForTest(), 6*ptrSize; got != want {
+		t.Fatalf("stackless coroutine task size = %d, want %d", got, want)
+	}
+}
+
 func TestStacklessCoroSpawn(t *testing.T) {
 	const tasks = 100000
 	var completed int

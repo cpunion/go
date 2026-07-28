@@ -740,6 +740,23 @@ func TestLowerStateMachines(t *testing.T) {
 	if noSplitResumes != result.Lowered {
 		t.Fatalf("nosplit resume functions = %d, want %d", noSplitResumes, result.Lowered)
 	}
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure == nil {
+			continue
+		}
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil &&
+				name.Sym().Name == "coroPanicPending" {
+				t.Errorf("%s checks for a panic outcome without a panic effect",
+					generated.Sym().Name)
+			}
+		})
+	}
 
 	var foreignResume *ir.Func
 	for _, generated := range typecheck.Target.Funcs {
@@ -942,6 +959,9 @@ func TestCanLowerRunToCompletion(t *testing.T) {
 		{"defer", func(candidate *lowerCandidate, _ *ir.CallExpr) {
 			candidate.defers = []*lowerDefer{{}}
 		}, false},
+		{"terminal", func(candidate *lowerCandidate, _ *ir.CallExpr) {
+			candidate.function.Terminal = MayPanic
+		}, false},
 		{"no foreign call", func(candidate *lowerCandidate, call *ir.CallExpr) {
 			delete(candidate.foreignCalls, call)
 		}, false},
@@ -979,6 +999,185 @@ func TestCanLowerRunToCompletion(t *testing.T) {
 			test.change(candidate, call)
 			if got := canLowerRunToCompletion(candidate); got != test.want {
 				t.Errorf("canLowerRunToCompletion = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLowerPanicOutcome(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowerpanic", "lowerpanic")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+		types.NewSignature(nil, nil, nil))
+	yield.DeclareParams(true)
+	yieldCall := newLowerTestCall(yield)
+	panicStmt := ir.NewUnaryExpr(src.NoXPos, ir.OPANIC,
+		ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
+	panicStmt.SetTypecheck(1)
+	panicIf := ir.NewIfStmt(src.NoXPos,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(true)),
+		ir.Nodes{panicStmt}, nil)
+	panicIf.SetTypecheck(1)
+	fn := newLowerTestFunc(pkg, "panicking")
+	fn.Body = ir.Nodes{yieldCall, panicIf}
+	function := &Function{
+		Func:          fn,
+		Local:         MaySuspend,
+		Effect:        MaySuspend,
+		LocalTerminal: MayPanic,
+		Terminal:      MayPanic,
+		Primary:       CoroPrimary,
+		Sites: []Site{
+			{ID: 1, Kind: SiteYield, Node: yieldCall},
+			{ID: 2, Kind: SitePanic, Node: panicStmt},
+		},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn: function,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	var resume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "panicking.coro" {
+			resume = generated
+			break
+		}
+	}
+	if resume == nil {
+		t.Fatal("panicking function has no generated resume function")
+	}
+	var calls []string
+	ir.Visit(resume, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		name := ir.StaticCalleeName(call.Fun)
+		if name != nil && name.Sym() != nil {
+			calls = append(calls, name.Sym().Name)
+		}
+	})
+	for _, want := range []string{"coroPanicPending", "coroPanic"} {
+		if !slices.Contains(calls, want) {
+			t.Errorf("generated resume calls = %v, want %s", calls, want)
+		}
+	}
+	if slices.Contains(calls, "gopanic") {
+		t.Errorf("generated resume retains gopanic call: %v", calls)
+	}
+}
+
+func TestLowerRejectsTerminalControl(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowerterminal", "lowerterminal")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	for _, test := range []struct {
+		name     string
+		terminal TerminalFlags
+		want     string
+	}{
+		{"recover", UsesRecover, "unsupported terminal control recover"},
+		{"goexit", MayGoexit, "unsupported terminal control goexit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			call := newLowerTestCall(yield)
+			fn := newLowerTestFunc(pkg, test.name)
+			fn.Body = ir.Nodes{call, newLowerTestReturn()}
+			function := &Function{
+				Func: fn, Terminal: test.terminal,
+				Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}},
+			}
+			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+			if _, err := newLowerCandidate(plan, function); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("newLowerCandidate error = %v, want %q",
+					err, test.want)
+			}
+		})
+	}
+
+	t.Run("invalid-panic-site", func(t *testing.T) {
+		fn := newLowerTestFunc(pkg, "invalidPanic")
+		ret := newLowerTestReturn()
+		fn.Body = ir.Nodes{ret}
+		function := &Function{
+			Func: fn, Terminal: MayPanic,
+			Sites: []Site{{ID: 1, Kind: SitePanic, Node: ret}},
+		}
+		plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+		if _, err := newLowerCandidate(plan, function); err == nil ||
+			!strings.Contains(err.Error(), "invalid panic site 1") {
+			t.Fatalf("newLowerCandidate error = %v, want invalid panic site",
+				err)
+		}
+	})
+
+	for _, test := range []struct {
+		name    string
+		unknown bool
+	}{
+		{"panic", false},
+		{"unknown", true},
+	} {
+		t.Run("spawn-"+test.name, func(t *testing.T) {
+			child := newLowerTestFunc(pkg, "spawnChild"+test.name)
+			call := newLowerTestCall(child)
+			spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, call)
+			spawn.SetTypecheck(1)
+			parent := newLowerTestFunc(pkg, "spawnParent"+test.name)
+			parent.Body = ir.Nodes{spawn, newLowerTestReturn()}
+			edge := Edge{
+				Kind: GoCall, Callee: child,
+				CalleeName: symbolName(child.Nname), Node: call,
+				Unknown: test.unknown,
+			}
+			function := &Function{
+				Func: parent, Edges: []Edge{edge},
+				Sites: []Site{{ID: 1, Kind: SiteSpawn, Node: call}},
+			}
+			functions := map[*ir.Func]*Function{parent: function}
+			if !test.unknown {
+				functions[child] = &Function{
+					Func: child, Terminal: MayPanic,
+				}
+			}
+			plan := &Plan{Functions: functions}
+			if _, err := newLowerCandidate(plan, function); err == nil ||
+				!strings.Contains(err.Error(), "spawn target may panic") {
+				t.Fatalf("newLowerCandidate error = %v, want spawn rejection",
+					err)
 			}
 		})
 	}
@@ -1839,6 +2038,17 @@ func TestLowerRejectsUnsupportedDefers(t *testing.T) {
 				}}
 			},
 			want: "defer target has execution constraints preempt",
+		},
+		{
+			name: "terminal-control",
+			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
+				return []Edge{{
+					Kind: DeferCall, Callee: callee,
+					CalleeName: symbolName(callee.Nname),
+					Imported:   FuncSummary{Terminal: MayPanic}, Node: call,
+				}}
+			},
+			want: "defer target has terminal control panic",
 		},
 		{
 			name:    "closure",

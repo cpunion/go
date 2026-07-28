@@ -13,6 +13,7 @@ const (
 	StacklessCoroActionYield    = stacklessCoroActionYield
 	StacklessCoroActionWait     = stacklessCoroActionWait
 	StacklessCoroActionComplete = stacklessCoroActionComplete
+	StacklessCoroActionPanic    = stacklessCoroActionPanic
 )
 
 func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
@@ -21,6 +22,18 @@ func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 
 func AwaitStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroAwait(ctx, resume)
+}
+
+func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
+	coroPanic(ctx, value)
+}
+
+func PanicPendingStacklessCoroForTest(ctx unsafe.Pointer) bool {
+	return coroPanicPending(ctx)
+}
+
+func StacklessCoroTaskSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroTask{})
 }
 
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
