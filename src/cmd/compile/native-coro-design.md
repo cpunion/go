@@ -1543,24 +1543,23 @@ reported two lowered functions and no skipped functions.
 The transparent-cgo follow-up adds a separate benchmark in
 `internal/runtime/cgobench`. The Darwin/arm64 sample ran on an Apple M4 Max.
 The Linux/amd64 sample ran in the translated VirtualApple guest described
-above. Both used five 300 ms runs for latency and three 200 ms runs for
-allocation:
+above. Both used five 300 ms runs with allocation reporting:
 
 | Shape | Path | Darwin/arm64 median | Linux/amd64 translated median | Allocation |
 | --- | --- | ---: | ---: | ---: |
-| steady | ordinary cgo | 13.27 ns | 21.32 ns | 0 B/op, 0 allocs/op |
-| steady | transparent `DirectMayBlock` | 14.26 ns | 20.47 ns | 0 B/op, 0 allocs/op |
-| steady | compiler-owned `DirectNoBlock` | 4.331 ns | 5.444 ns | 0 B/op, 0 allocs/op |
-| entry | ordinary cgo | 13.78 ns | 21.86 ns | 0 B/op, 0 allocs/op |
-| entry | transparent `DirectMayBlock` | 61.70 ns | 872.2 ns | 48 B/op, 1 alloc/op |
-| entry | compiler-owned `DirectNoBlock` | 1.042 us | 927.5 ns | 520 B/op, 8 allocs/op |
+| steady | ordinary cgo | 13.27 ns | 22.53 ns | 0 B/op, 0 allocs/op |
+| steady | transparent `DirectMayBlock` | 14.26 ns | 20.98 ns | 0 B/op, 0 allocs/op |
+| steady | compiler-owned `DirectNoBlock` | 4.331 ns | 5.176 ns | 0 B/op, 0 allocs/op |
+| entry | ordinary cgo | 13.78 ns | 23.01 ns | 0 B/op, 0 allocs/op |
+| entry | transparent `DirectMayBlock` | 61.70 ns | 98.02 ns | 48 B/op, 1 alloc/op |
+| entry | compiler-owned `DirectNoBlock` | 1.042 us | 956.3 ns | 520 B/op, 8 allocs/op |
 
 The conservative transparent path is therefore near ordinary cgo in steady
 state on both runs, not a demonstrated speedup. `DirectNoBlock` shows that
 avoiding syscall scheduler accounting can materially reduce the boundary
 cost, but a public bounded-call contract has not been selected. Current
 run-to-completion lowering makes the no-result `DirectMayBlock` entry much
-smaller on Darwin, while the result-returning `DirectNoBlock` entry still
+smaller on both runs, while the result-returning `DirectNoBlock` entry still
 exposes the larger root-creation cost. The entry measurements are evidence for
 the separate cross-package entry design question in section 10.9, not
 justification for adding source annotations.
