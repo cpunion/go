@@ -31,24 +31,31 @@ type LowerResult struct {
 }
 
 type lowerCandidate struct {
-	function     *Function
-	transitions  map[*ir.CallExpr]SiteKind
-	foreignCalls map[*ir.CallExpr]ForeignCallClass
-	directCalls  map[*ir.CallExpr]*ir.Func
-	dependencies map[*ir.Func]bool
-	defers       []*lowerDefer
-	panics       map[*ir.UnaryExpr]bool
-	parameters   map[*ir.Name]*ir.Name
-	results      map[*ir.Name]*ir.Name
-	resultValues []*ir.Name
-	resultPtrs   []*ir.Name
-	factory      *ir.Func
+	function      *Function
+	transitions   map[*ir.CallExpr]SiteKind
+	foreignCalls  map[*ir.CallExpr]ForeignCallClass
+	directCalls   map[*ir.CallExpr]*ir.Func
+	dependencies  map[*ir.Func]bool
+	defers        []*lowerDefer
+	dynamicDefers bool
+	panics        map[*ir.UnaryExpr]bool
+	parameters    map[*ir.Name]*ir.Name
+	results       map[*ir.Name]*ir.Name
+	resultValues  []*ir.Name
+	resultPtrs    []*ir.Name
+	factory       *ir.Func
 }
 
 type lowerDefer struct {
 	statement *ir.GoDeferStmt
 	call      *ir.CallExpr
 	armed     *ir.Name
+	captures  []lowerDeferCapture
+}
+
+type lowerDeferCapture struct {
+	source   *ir.Name
+	snapshot *ir.Name
 }
 
 type lowerState struct {
@@ -67,8 +74,8 @@ type lowerState struct {
 
 // Lower rewrites supported coroutine primaries into explicit state machines.
 // The lowering accepts closed calls, if statements, simple for loops, normal
-// returns, fixed direct defers, and the supported operation sites. Unsupported
-// functions remain unchanged.
+// returns, statically resolved defers, and the supported operation sites.
+// Unsupported functions remain unchanged.
 func Lower(plan *Plan) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
@@ -208,6 +215,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
+	dynamicDefers := false
 	recordAssignmentCall := func(node ir.Node) *ir.CallExpr {
 		switch node := node.(type) {
 		case *ir.AssignStmt:
@@ -259,7 +267,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				if stmt.Op() == ir.ODEFER {
 					if inLoop {
-						return fmt.Errorf("defer in loop")
+						dynamicDefers = true
 					}
 					if call.Op() != ir.OCALLFUNC || call.Fun == nil ||
 						call.Fun.Type() == nil || len(call.Args) != 0 ||
@@ -344,13 +352,14 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		}
 	}
 	candidate := &lowerCandidate{
-		function:     function,
-		transitions:  make(map[*ir.CallExpr]SiteKind),
-		foreignCalls: make(map[*ir.CallExpr]ForeignCallClass),
-		directCalls:  make(map[*ir.CallExpr]*ir.Func),
-		dependencies: make(map[*ir.Func]bool),
-		defers:       defers,
-		panics:       make(map[*ir.UnaryExpr]bool),
+		function:      function,
+		transitions:   make(map[*ir.CallExpr]SiteKind),
+		foreignCalls:  make(map[*ir.CallExpr]ForeignCallClass),
+		directCalls:   make(map[*ir.CallExpr]*ir.Func),
+		dependencies:  make(map[*ir.Func]bool),
+		defers:        defers,
+		dynamicDefers: dynamicDefers,
+		panics:        make(map[*ir.UnaryExpr]bool),
 	}
 	for _, site := range function.Sites {
 		if site.Kind == SitePanic {
@@ -904,11 +913,21 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
 		len(candidate.defers))
+	var deferStack *ir.Name
+	if candidate.dynamicDefers {
+		// Use one stack for every site so fixed and repeated registrations
+		// retain their global LIFO order.
+		deferType := candidate.defers[0].call.Fun.Type()
+		deferStack = typecheck.TempAt(pos, factory, types.NewSlice(deferType))
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferStack))
+	}
 	for _, deferred := range candidate.defers {
-		deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
-			types.Types[types.TBOOL])
-		addDeclaration(ir.NewDecl(deferred.statement.Pos(), ir.ODCL,
-			deferred.armed))
+		if !candidate.dynamicDefers {
+			deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
+				types.Types[types.TBOOL])
+			addDeclaration(ir.NewDecl(deferred.statement.Pos(), ir.ODCL,
+				deferred.armed))
+		}
 		deferByStatement[deferred.statement] = deferred
 	}
 
@@ -1223,6 +1242,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// parameterless wrapper and placed its argument evaluation in the defer
 	// statement's init list. Reparent those wrappers to the generated resume
 	// function and route their captures through the typed coroutine frame.
+	// A repeated site snapshots each capture before constructing its wrapper;
+	// otherwise every registration would observe the last value written to
+	// the shared frame slot.
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
 		if !ok {
@@ -1235,7 +1257,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return fmt.Errorf("%s: defer capture is not a variable",
 					ir.PkgFuncName(fn))
 			}
-			variable.Outer = outer
+			if candidate.dynamicDefers {
+				snapshot := typecheck.TempAt(variable.Pos(), resume,
+					outer.Type())
+				deferred.captures = append(deferred.captures,
+					lowerDeferCapture{source: outer, snapshot: snapshot})
+				variable.Outer = snapshot
+				variable.Defn = snapshot
+			} else {
+				variable.Outer = outer
+			}
 		}
 	}
 
@@ -1254,10 +1285,30 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				for _, init := range deferStmt.Init() {
 					body = append(body, edit(init))
 				}
-				body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
-					capture(deferred.armed),
-					ir.NewBasicLit(deferStmt.Pos(), types.Types[types.TBOOL],
-						constant.MakeBool(true))))
+				if candidate.dynamicDefers {
+					for _, deferredCapture := range deferred.captures {
+						snapshot := deferredCapture.snapshot
+						assignment := ir.NewAssignStmt(deferStmt.Pos(),
+							snapshot, deferredCapture.source)
+						assignment.Def = true
+						snapshot.Defn = assignment
+						body = append(body,
+							ir.NewDecl(deferStmt.Pos(), ir.ODCL, snapshot),
+							assignment)
+					}
+					stack := capture(deferStack)
+					appendCall := typecheck.Call(deferStmt.Pos(),
+						types.BuiltinPkg.Lookup("append").Def.(*ir.Name),
+						ir.Nodes{stack, edit(deferred.call.Fun)}, false)
+					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
+						stack, appendCall))
+				} else {
+					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
+						capture(deferred.armed),
+						ir.NewBasicLit(deferStmt.Pos(),
+							types.Types[types.TBOOL],
+							constant.MakeBool(true))))
+				}
 				continue
 			}
 			foreign := NotForeign
@@ -1360,16 +1411,44 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
 			)
 		} else if state.cleanup {
-			for j := len(candidate.defers) - 1; j >= 0; j-- {
-				deferred := candidate.defers[j]
-				armed := capture(deferred.armed)
-				clear := ir.NewAssignStmt(deferred.statement.Pos(), armed,
-					ir.NewBasicLit(deferred.statement.Pos(),
-						types.Types[types.TBOOL], constant.MakeBool(false)))
-				call := typecheck.Call(deferred.call.Pos(),
-					edit(deferred.call.Fun), nil, false)
-				body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
-					armed, ir.Nodes{clear, call}, nil))
+			if candidate.dynamicDefers {
+				stack := capture(deferStack)
+				deferType := candidate.defers[0].call.Fun.Type()
+				deferredCall := typecheck.TempAt(pos, resume, deferType)
+				stackLen := func() ir.Node {
+					return ir.NewUnaryExpr(pos, ir.OLEN, stack)
+				}
+				lastIndex := func() ir.Node {
+					return ir.NewBinaryExpr(pos, ir.OSUB, stackLen(),
+						ir.NewInt(pos, 1))
+				}
+				load := ir.NewAssignStmt(pos, deferredCall,
+					ir.NewIndexExpr(pos, stack, lastIndex()))
+				clear := ir.NewAssignStmt(pos,
+					ir.NewIndexExpr(pos, stack, lastIndex()),
+					typecheck.NodNil())
+				pop := ir.NewAssignStmt(pos, stack,
+					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
+						lastIndex(), nil))
+				call := typecheck.Call(pos, deferredCall, nil, false)
+				condition := ir.NewBinaryExpr(pos, ir.ONE, stackLen(),
+					ir.NewInt(pos, 0))
+				// Pop before calling so a later replacement-panic path cannot
+				// invoke the same deferred call twice.
+				body = append(body, ir.NewForStmt(pos, nil, condition, nil,
+					ir.Nodes{load, clear, pop, call}, false))
+			} else {
+				for j := len(candidate.defers) - 1; j >= 0; j-- {
+					deferred := candidate.defers[j]
+					armed := capture(deferred.armed)
+					clear := ir.NewAssignStmt(deferred.statement.Pos(), armed,
+						ir.NewBasicLit(deferred.statement.Pos(),
+							types.Types[types.TBOOL], constant.MakeBool(false)))
+					call := typecheck.Call(deferred.call.Pos(),
+						edit(deferred.call.Fun), nil, false)
+					body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
+						armed, ir.Nodes{clear, call}, nil))
+				}
 			}
 			if panicAware {
 				panicCondition := ir.NewBinaryExpr(pos, ir.OEQ, resumeTerminal,

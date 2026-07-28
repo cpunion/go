@@ -510,6 +510,44 @@ func TestLowerStateMachines(t *testing.T) {
 		newLowerTestReturn(),
 	}
 
+	dynamicDeferred := newLowerTestFunc(pkg, "dynamicDeferred")
+	dynamicDeferValue := dynamicDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("dynamicDeferValue"), types.Types[types.TINT])
+	dynamicDeferDecl := ir.NewDecl(src.NoXPos, ir.ODCL, dynamicDeferValue)
+	dynamicDeferAssign := ir.NewAssignStmt(src.NoXPos, dynamicDeferValue,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(7)))
+	dynamicDeferAssign.Def = true
+	dynamicDeferValue.Defn = dynamicDeferAssign
+	dynamicDeferWrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+		ir.ODEFER, types.NewSignature(nil, nil, nil), dynamicDeferred,
+		typecheck.Target, 0)
+	dynamicDeferWrapper.DeclareParams(true)
+	dynamicDeferWrapper.SetWrapper(true)
+	dynamicDeferWrapper.WrappedFunc = cleanup
+	dynamicDeferCapture := ir.NewClosureVar(src.NoXPos,
+		dynamicDeferWrapper, dynamicDeferValue)
+	dynamicCleanupCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		cleanup.Nname, ir.Nodes{dynamicDeferCapture})
+	dynamicCleanupCall.SetTypecheck(1)
+	dynamicDeferWrapper.Body = ir.Nodes{dynamicCleanupCall}
+	dynamicDeferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		dynamicDeferWrapper.OClosure, nil)
+	dynamicDeferCall.SetTypecheck(1)
+	dynamicDeferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER,
+		dynamicDeferCall)
+	dynamicDeferStmt.SetTypecheck(1)
+	dynamicDeferStmt.SetInit(ir.Nodes{dynamicDeferAssign})
+	dynamicYield := newLowerTestCall(yield)
+	dynamicLoop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(false)),
+		nil, ir.Nodes{dynamicDeferStmt, dynamicYield}, false)
+	dynamicLoop.SetTypecheck(1)
+	dynamicDeferred.Body = ir.Nodes{
+		dynamicDeferDecl, dynamicLoop, newLowerTestReturn(),
+	}
+
 	functions := map[*ir.Func]*Function{
 		child: {
 			Func:    child,
@@ -723,13 +761,31 @@ func TestLowerStateMachines(t *testing.T) {
 			Func:    deferWrapper,
 			Primary: PlainPrimary,
 		},
+		dynamicDeferred: {
+			Func:    dynamicDeferred,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DeferCall, Callee: dynamicDeferWrapper,
+				CalleeName: symbolName(dynamicDeferWrapper.Nname),
+				Node:       dynamicDeferCall,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteYield, Node: dynamicYield,
+			}},
+		},
+		dynamicDeferWrapper: {
+			Func:    dynamicDeferWrapper,
+			Primary: PlainPrimary,
+		},
 	}
 	result, err := Lower(&Plan{Functions: functions})
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 15 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 15 lowered and 0 skipped", result)
+	if result.Lowered != 16 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 16 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -746,7 +802,7 @@ func TestLowerStateMachines(t *testing.T) {
 		}
 		ir.Visit(generated, func(node ir.Node) {
 			call, ok := node.(*ir.CallExpr)
-			if !ok {
+			if !ok || call.Fun == nil {
 				return
 			}
 			name := ir.StaticCalleeName(call.Fun)
@@ -795,6 +851,38 @@ func TestLowerStateMachines(t *testing.T) {
 	}
 	if callIndex("directOp") >= 0 {
 		t.Errorf("foreign call retained wrapper target: %v", callOrder)
+	}
+
+	var dynamicDeferResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "dynamicDeferred.coro" {
+			dynamicDeferResume = generated
+			break
+		}
+	}
+	if dynamicDeferResume == nil {
+		t.Fatal("dynamic defer caller has no generated resume function")
+	}
+	var appends, clearedEntries int
+	ir.Visit(dynamicDeferResume, func(node ir.Node) {
+		switch node := node.(type) {
+		case *ir.CallExpr:
+			if node.Op() == ir.OAPPEND {
+				appends++
+			}
+		case *ir.AssignStmt:
+			if node.X.Op() == ir.OINDEX && ir.IsNil(node.Y) {
+				clearedEntries++
+			}
+		}
+		if node.Op() == ir.ODEFER {
+			t.Errorf("dynamic defer resume retains ODEFER")
+		}
+	})
+	if appends != 1 || clearedEntries != 1 {
+		t.Errorf("dynamic defer resume has %d appends and %d cleared entries, want 1 and 1",
+			appends, clearedEntries)
 	}
 
 	var runResume *ir.Func
@@ -896,7 +984,7 @@ func TestLowerStateMachines(t *testing.T) {
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
 		ordinaryFileReader, asyncCaller, foreignCaller, runToCompletion,
-		runSingle, runStructured, structured, deferred,
+		runSingle, runStructured, structured, deferred, dynamicDeferred,
 	} {
 		if len(fn.Body) != 2 {
 			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
@@ -1908,15 +1996,6 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 					nil, ir.Nodes{branch()}, false)}
 			},
 			want: "control flow break",
-		},
-		{
-			name: "defer-in-loop",
-			body: func(call *ir.CallExpr) ir.Nodes {
-				deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
-				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
-					nil, ir.Nodes{deferStmt}, false)}
-			},
-			want: "defer in loop",
 		},
 		{
 			name: "non-normalized-defer",
