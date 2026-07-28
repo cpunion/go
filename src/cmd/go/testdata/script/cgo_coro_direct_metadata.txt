@@ -9,6 +9,9 @@ grep 'func _Cdirect_set_u32' direct/_cgo_gotypes.go
 ! grep 'func _Cdirect_set_u32.*_Ctype_void' direct/_cgo_gotypes.go
 grep 'TEXT ·_Cdirect_add_u64' direct/_cgo_direct.s
 grep 'CALL.*_Cfunc_add_u64_direct' direct/_cgo_direct.s
+[amd64] grep 'MOVQ.*SP, R12' direct/_cgo_direct.s
+[amd64] grep 'ANDQ.*SP' direct/_cgo_direct.s
+[amd64] grep 'MOVQ.*R12, SP' direct/_cgo_direct.s
 grep '_Cfunc_static_add_direct' direct/main.cgo2.c
 grep 'return static_add' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
@@ -146,6 +149,12 @@ func main() {
 #include <time.h>
 
 uint64_t add_u64(uint64_t a, uint64_t b) {
+#if defined(__x86_64__)
+	uintptr_t entry_sp = (uintptr_t)__builtin_frame_address(0) + sizeof(void *);
+	if ((entry_sp & 15) != 8) {
+		return UINT64_MAX;
+	}
+#endif
 	return a + b;
 }
 
