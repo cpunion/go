@@ -909,6 +909,191 @@ func main() {
 	}
 }
 
+func TestDynamicDeferLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+type entry struct {
+	value int
+}
+
+type largeValue [32]int
+
+var evaluated [9]int
+var evaluatedIndex int
+var trace [9]int
+var traceIndex int
+var retained int
+var largeTrace [4]int
+var largeTraceIndex int
+
+//go:noinline
+func argument(value int) *entry {
+	evaluated[evaluatedIndex] = value
+	evaluatedIndex++
+	return &entry{value: value}
+}
+
+//go:noinline
+func record(value *entry) {
+	if value.value >= 1000 {
+		retained += value.value - 1000
+		return
+	}
+	trace[traceIndex] = value.value
+	traceIndex++
+}
+
+//go:noinline
+func recordLarge(value largeValue) {
+	largeTrace[largeTraceIndex] = value[0]
+	largeTraceIndex++
+}
+
+//go:noinline
+func dynamic(count int, fail bool) {
+	defer record(argument(10))
+	for i := 0; i < count; i++ {
+		defer record(argument(20 + i))
+		runtime.Gosched()
+	}
+	defer record(argument(30))
+	if fail {
+		panic("dynamic defer panic")
+	}
+}
+
+//go:noinline
+func retain(count int) {
+	for i := 0; i < count; i++ {
+		value := &entry{value: 1000 + i}
+		defer record(value)
+		runtime.Gosched()
+	}
+}
+
+//go:noinline
+func retainLarge() {
+	for i := 0; i < len(largeTrace); i++ {
+		var value largeValue
+		value[0] = i + 1
+		defer recordLarge(value)
+		value[0] = 100
+		runtime.Gosched()
+	}
+}
+
+//go:noinline
+func collect(ready, begin, done chan struct{}) {
+	close(ready)
+	<-begin
+	for i := 0; i < 50; i++ {
+		runtime.GC()
+	}
+	close(done)
+}
+
+//go:noinline
+func invoke() (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	dynamic(2, true)
+	return "unreachable"
+}
+
+func main() {
+	oldProcs := runtime.GOMAXPROCS(2)
+
+	ready := make(chan struct{})
+	begin := make(chan struct{})
+	done := make(chan struct{})
+	go collect(ready, begin, done)
+	<-ready
+	close(begin)
+	const retainedCount = 4096
+	retain(retainedCount)
+	retainLarge()
+	<-done
+
+	dynamic(3, false)
+	recovered := invoke()
+	runtime.GOMAXPROCS(oldProcs)
+	if recovered != "dynamic defer panic" ||
+		retained != retainedCount*(retainedCount-1)/2 ||
+		largeTraceIndex != len(largeTrace) ||
+		largeTrace != [4]int{4, 3, 2, 1} ||
+		evaluatedIndex != len(evaluated) ||
+		evaluated != [9]int{10, 20, 21, 22, 30, 10, 20, 21, 30} ||
+		traceIndex != len(trace) ||
+		trace != [9]int{30, 22, 21, 20, 10, 30, 21, 20, 10} {
+		panic("bad dynamic defer result")
+	}
+	println("stackless-coro-dynamic-defer-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-dynamic-defer")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building dynamic defer coroutine failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=3 skipped=4"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	if want := "main.invoke: unsupported terminal control recover"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dynamic defer coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-dynamic-defer-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.dynamic\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of dynamic defer resume function failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, ".coro.func") {
+		t.Fatalf("objdump did not find dynamic defer resume function\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{
+		"runtime.deferproc", "runtime.deferreturn", "runtime.gopanic",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("dynamic defer resume contains %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
 func TestPanicOutcomeLowering(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
