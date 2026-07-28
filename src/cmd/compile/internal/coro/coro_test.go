@@ -1320,6 +1320,141 @@ func main() {
 	}
 }
 
+func TestDirectSystemABIStackAlignment(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("System V AMD64 stack alignment is only used on linux/amd64")
+	}
+
+	tmp := t.TempDir()
+	writeFile := func(name, contents string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(tmp, name), []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("go.mod", "module example.com/coroalignment\n\ngo 1.28\n")
+	writeFile("main.go", `package main
+
+import (
+	"runtime"
+	corort "runtime/coro"
+)
+
+//go:noinline
+func probe0() uint64 {
+	return corort.DirectAdd(0, 0)
+}
+
+//go:noinline
+func probe8() uint64 {
+	var scratch [8]byte
+	scratch[0] = 1
+	value := corort.DirectAdd(0, 0)
+	runtime.KeepAlive(&scratch)
+	return value
+}
+
+//go:noinline
+func probe16() uint64 {
+	var scratch [16]byte
+	scratch[0] = 1
+	value := corort.DirectAdd(0, 0)
+	runtime.KeepAlive(&scratch)
+	return value
+}
+
+//go:noinline
+func probe24() uint64 {
+	var scratch [24]byte
+	scratch[0] = 1
+	value := corort.DirectAdd(0, 0)
+	runtime.KeepAlive(&scratch)
+	return value
+}
+
+func main() {
+	values := [...]uint64{
+		corort.DirectAdd(0, 0),
+		probe0(),
+		probe8(),
+		probe16(),
+		probe24(),
+	}
+	for _, value := range values {
+		if value != 8 {
+			panic("misaligned System V AMD64 call")
+		}
+	}
+	println("direct-system-abi-alignment-ok")
+}
+`)
+	asm := filepath.Join(tmp, "fixture.s")
+	writeFile("fixture.s", `.text
+.globl coro_add_u64
+.type coro_add_u64,@function
+coro_add_u64:
+	movq %rsp, %rax
+	andl $15, %eax
+	ret
+.size coro_add_u64, .-coro_add_u64
+
+.section .note.GNU-stack,"",@progbits
+`)
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "env", "CC")
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go env CC failed: %v\n%s", err, data)
+	}
+	cc := strings.TrimSpace(string(data))
+	obj := filepath.Join(tmp, "fixture.syso")
+	cmd = testenv.Command(t, cc, "-c", asm, "-o", obj)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compiling alignment fixture failed: %v\n%s", err, data)
+	}
+	if err := os.Remove(asm); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "alignment")
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-ldflags=-linkmode=external",
+		".")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"CGO_ENABLED=1",
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("building alignment fixture failed: %v\n%s", err, data)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("alignment fixture failed: %v\n%s", err, data)
+	}
+	if want := "direct-system-abi-alignment-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `runtime/coro\.DirectAdd`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump failed: %v\n%s", err, data)
+	}
+	if disassembly := string(data); !strings.Contains(disassembly, "ANDQ $-0x10, SP") {
+		t.Errorf("direct call does not align SP for the System V ABI\n%s", disassembly)
+	}
+}
+
 func TestDirectSystemABI(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	testenv.MustHaveCGO(t)
@@ -1373,7 +1508,7 @@ func replacement() {
 		runtime.Gosched()
 	}
 	atomic.StoreUint32(&logicalProgress, 1)
-	atomic.StoreUint32(&gate, 1)
+	atomic.CompareAndSwapUint32(&gate, 0, 1)
 }
 
 func main() {
@@ -1421,6 +1556,13 @@ struct coro_request {
 	int fd;
 };
 
+#if defined(__x86_64__)
+#define CORO_SYSTEM_ABI_ALIGNED() \
+	((((uintptr_t)__builtin_frame_address(0) + sizeof(void *)) & 15) == 8)
+#else
+#define CORO_SYSTEM_ABI_ALIGNED() 1
+#endif
+
 static int coro_on_native_thread_stack(void) {
 	char local;
 	uintptr_t sp = (uintptr_t)&local;
@@ -1448,6 +1590,9 @@ static int coro_on_native_thread_stack(void) {
 }
 
 uint64_t coro_add_u64(uint64_t a, uint64_t b) {
+	if (!CORO_SYSTEM_ABI_ALIGNED()) {
+		return UINT64_MAX;
+	}
 	if (!coro_on_native_thread_stack()) {
 		return UINT64_MAX;
 	}
@@ -1455,6 +1600,10 @@ uint64_t coro_add_u64(uint64_t a, uint64_t b) {
 }
 
 void coro_block_until(uint32_t *gate) {
+	if (!CORO_SYSTEM_ABI_ALIGNED()) {
+		__atomic_store_n(gate, UINT32_MAX, __ATOMIC_RELEASE);
+		return;
+	}
 	while (__atomic_load_n(gate, __ATOMIC_ACQUIRE) == 0) {
 	}
 }
@@ -1470,6 +1619,9 @@ static void *coro_double_worker(void *arg) {
 }
 
 int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
+	if (!CORO_SYSTEM_ABI_ALIGNED()) {
+		return EINVAL;
+	}
 	struct coro_request *request = malloc(sizeof(*request));
 	if (request == NULL) {
 		return ENOMEM;
