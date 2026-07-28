@@ -212,11 +212,16 @@ func coroPanic(ctx unsafe.Pointer, value any) {
 	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine panic")
 	}
-	s := context.scheduler
-	task := context.task
+	recordStacklessCoroPanic(context.scheduler, context.task, value, false)
+}
+
+func recordStacklessCoroPanic(s *stacklessCoroScheduler,
+	task *stacklessCoroTask, value any, replace bool) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning ||
-		task.terminal != stacklessCoroTerminalNone {
+		(!replace && task.terminal != stacklessCoroTerminalNone) ||
+		(replace && task.terminal != stacklessCoroTerminalNone &&
+			task.terminal != stacklessCoroTerminalPanic) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine panic transition")
 	}
@@ -240,6 +245,65 @@ func coroPanicPending(ctx unsafe.Pointer) bool {
 		throw("runtime: stackless coroutine panic query outside resume")
 	}
 	return task.terminal == stacklessCoroTerminalPanic
+}
+
+// coroDeferToken returns a stable opaque task token for compiler-generated
+// defer closures. The token may outlive one resume call, but can only be used
+// while that task is actively running cleanup.
+func coroDeferToken(ctx unsafe.Pointer) unsafe.Pointer {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil ||
+		context.task.state != stacklessCoroTaskRunning {
+		throw("runtime: invalid stackless coroutine defer token")
+	}
+	return unsafe.Pointer(context.task)
+}
+
+// coroDeferPanic starts or replaces the panic owned by a running task.
+func coroDeferPanic(token unsafe.Pointer, value any) {
+	task := (*stacklessCoroTask)(token)
+	if task == nil || task.context.scheduler == nil ||
+		task.context.task != task {
+		throw("runtime: invalid stackless coroutine defer panic")
+	}
+	recordStacklessCoroPanic(task.context.scheduler, task, value, true)
+}
+
+// coroDeferRecover takes the panic owned by a running task. The compiler only
+// emits this call for a direct recover expression in the active defer body.
+func coroDeferRecover(token unsafe.Pointer) any {
+	task := (*stacklessCoroTask)(token)
+	if task == nil || task.context.scheduler == nil ||
+		task.context.task != task {
+		throw("runtime: invalid stackless coroutine defer recover")
+	}
+	s := task.context.scheduler
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskRunning {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine defer recover outside resume")
+	}
+	if task.terminal == stacklessCoroTerminalNone {
+		unlock(&s.lock)
+		return nil
+	}
+	value, ok := s.terminalValues[task]
+	if task.terminal != stacklessCoroTerminalPanic || !ok {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine defer recover state")
+	}
+	task.terminal = stacklessCoroTerminalNone
+	delete(s.terminalValues, task)
+	unlock(&s.lock)
+
+	if value == nil {
+		if debug.panicnil.Load() != 1 {
+			value = new(PanicNilError)
+		} else {
+			panicnil.IncNonDefault()
+		}
+	}
+	return value
 }
 
 // coroSpawn enqueues an independent logical goroutine. The current task keeps

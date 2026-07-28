@@ -32,6 +32,18 @@ func PanicPendingStacklessCoroForTest(ctx unsafe.Pointer) bool {
 	return coroPanicPending(ctx)
 }
 
+func DeferTokenStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
+	return coroDeferToken(ctx)
+}
+
+func DeferPanicStacklessCoroForTest(token unsafe.Pointer, value any) {
+	coroDeferPanic(token, value)
+}
+
+func DeferRecoverStacklessCoroForTest(token unsafe.Pointer) any {
+	return coroDeferRecover(token)
+}
+
 func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
 }

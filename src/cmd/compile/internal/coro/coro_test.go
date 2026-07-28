@@ -1056,10 +1056,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building dynamic defer coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=3 skipped=4"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain %q\n%s", want, out)
-	}
-	if want := "main.invoke: unsupported terminal control recover"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=4 skipped=3"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
@@ -1073,7 +1070,7 @@ func main() {
 	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `main\.dynamic\.coro\.func[0-9]+$`, exe)
+		"-s", `main\.(dynamic\.coro|invoke)\.func[0-9]+$`, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("objdump of dynamic defer resume function failed: %v\n%s",
@@ -1086,6 +1083,7 @@ func main() {
 	}
 	for _, forbidden := range []string{
 		"runtime.deferproc", "runtime.deferreturn", "runtime.gopanic",
+		"runtime.gorecover",
 	} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("dynamic defer resume contains %q\n%s",
@@ -1196,11 +1194,8 @@ func main() {
 	if err != nil {
 		t.Fatalf("building panic coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=4"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=7 skipped=0"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
-	}
-	if want := "unsupported terminal control recover"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain recover fallback %q\n%s", want, out)
 	}
 
 	cmd = testenv.Command(t, exe)
@@ -1213,22 +1208,226 @@ func main() {
 	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `main\.(leaf|middle|root|immediate)\.coro\.func[0-9]+$`, exe)
+		"-s", `main\.(leaf|middle|root|immediate)\.coro\.func[0-9]+$|main\.(invoke|invokeImmediate)\.func[0-9]+$`, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("objdump of panic resume functions failed: %v\n%s", err, data)
 	}
 	disassembly := string(data)
-	for _, want := range []string{"runtime.coroPanic", "runtime.coroPanicPending"} {
+	for _, want := range []string{
+		"runtime.coroPanic", "runtime.coroPanicPending",
+		"runtime.coroDeferRecover",
+	} {
 		if !strings.Contains(disassembly, want) {
 			t.Errorf("panic resume does not contain %q\n%s", want, disassembly)
 		}
 	}
 	for _, forbidden := range []string{
-		"runtime.gopanic", "runtime.deferproc", "runtime.deferreturn",
+		"runtime.gopanic", "runtime.gorecover",
+		"runtime.deferproc", "runtime.deferreturn",
 	} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("panic resume contains %q\n%s", forbidden, disassembly)
+		}
+	}
+}
+
+func TestRecoverAndReplacementPanicLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"os"
+	"runtime"
+)
+
+var trace [7]int
+var traceIndex int
+var namedValue any
+
+//go:noinline
+func record(value int) {
+	trace[traceIndex] = value
+	traceIndex++
+}
+
+//go:noinline
+func replacement() (original, replacement any) {
+	defer func() {
+		replacement = recover()
+		record(1)
+	}()
+	defer func() {
+		original = recover()
+		record(2)
+		panic("replacement")
+	}()
+	runtime.Gosched()
+	panic("original")
+}
+
+//go:noinline
+func normalCleanup() (recovered any) {
+	defer func() {
+		recovered = recover()
+		record(3)
+	}()
+	defer func() {
+		record(4)
+		panic("cleanup")
+	}()
+	runtime.Gosched()
+	return
+}
+
+//go:noinline
+func dynamicRecover() (recovered [3]any) {
+	for i := 0; i < len(recovered); i++ {
+		index := i
+		defer func() {
+			recovered[index] = recover()
+			record(10 + index)
+		}()
+		runtime.Gosched()
+	}
+	panic("dynamic")
+}
+
+//go:noinline
+func noPanic() (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	runtime.Gosched()
+	return
+}
+
+//go:noinline
+func nilPanic() (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	runtime.Gosched()
+	panic(nil)
+}
+
+//go:noinline
+func namedRecover() {
+	namedValue = recover()
+}
+
+//go:noinline
+func namedFallback() {
+	defer namedRecover()
+	runtime.Gosched()
+	panic("named")
+}
+
+func main() {
+	original, replacement := replacement()
+	cleanup := normalCleanup()
+	dynamic := dynamicRecover()
+	none := noPanic()
+	nilValue := nilPanic()
+	namedFallback()
+	expectNil := os.Getenv("EXPECT_PANICNIL") == "1"
+	if original != "original" ||
+		replacement != "replacement" ||
+		cleanup != "cleanup" ||
+		dynamic[2] != "dynamic" ||
+		dynamic[1] != nil || dynamic[0] != nil ||
+		none != nil || (nilValue == nil) != expectNil ||
+		namedValue != "named" ||
+		traceIndex != len(trace) ||
+		trace != [7]int{2, 1, 4, 3, 12, 11, 10} {
+		panic("bad recover or replacement panic result")
+	}
+	println("stackless-coro-recover-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-recover")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building recover coroutine failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=4 skipped=5"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	if want := "main.namedFallback: defer target has terminal control recover"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain named fallback %q\n%s", want, out)
+	}
+	if want := "main.dynamicRecover: repeated source defer literal"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain repeated literal fallback %q\n%s", want, out)
+	}
+	for _, name := range []string{
+		"replacement", "normalCleanup", "noPanic", "nilPanic",
+	} {
+		if diagnostic := "skip main." + name + ":"; strings.Contains(out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	cmd.Env = append(cmd.Environ(), "GODEBUG=panicnil=0")
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("recover coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-recover-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, exe)
+	cmd.Env = append(cmd.Environ(),
+		"GODEBUG=panicnil=1",
+		"EXPECT_PANICNIL=1",
+	)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("legacy panicnil recover coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-recover-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("legacy panicnil output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(replacement|normalCleanup|noPanic|nilPanic)(\.coro)?\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of recover functions failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, want := range []string{
+		"runtime.coroDeferPanic", "runtime.coroDeferRecover",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("recover functions do not contain %q\n%s", want, disassembly)
+		}
+	}
+	for _, forbidden := range []string{
+		"runtime.gopanic", "runtime.gorecover",
+		"runtime.deferproc", "runtime.deferreturn",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("recover functions contain %q\n%s", forbidden, disassembly)
 		}
 	}
 }
@@ -1301,8 +1500,8 @@ func main() {
 		t.Fatalf("building terminal fallback program failed: %v\n%s", err, out)
 	}
 	for _, want := range []string{
+		"coro: phase=lower lowered=2 skipped=4",
 		"main.spawn: spawn target may panic",
-		"main.recoverer: unsupported terminal control recover",
 		"main.goexit: unsupported terminal control goexit",
 	} {
 		if !strings.Contains(out, want) {
@@ -1799,7 +1998,7 @@ func main() {
 		"coro: func=example.com/coropanic/mid.Panic effect=may-suspend local=nosuspend",
 		"terminal=panic local-terminal=-",
 		"coro: site=1 func=example.com/coropanic/mid.Panic kind=await",
-		"unsupported terminal control recover",
+		"coro: phase=lower lowered=2 skipped=0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
@@ -1823,6 +2022,7 @@ func main() {
 	for _, want := range []string{
 		"example.com/coropanic/leaf.Panic.coro",
 		"example.com/coropanic/mid.Panic.coro",
+		"main.invoke.coro",
 	} {
 		if !strings.Contains(symbols, want) {
 			t.Errorf("symbols do not contain %q", want)
