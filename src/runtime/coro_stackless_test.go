@@ -182,6 +182,48 @@ func TestStacklessCoroPanicAwait(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroDeferTerminal(t *testing.T) {
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		token := runtime.DeferTokenStacklessCoroForTest(ctx)
+		if got := runtime.DeferRecoverStacklessCoroForTest(token); got != nil {
+			t.Fatalf("recover without panic = %v, want nil", got)
+		}
+
+		runtime.PanicStacklessCoroForTest(ctx, "original")
+		runtime.DeferPanicStacklessCoroForTest(token, "replacement")
+		if got := runtime.DeferRecoverStacklessCoroForTest(token); got != "replacement" {
+			t.Fatalf("recovered panic = %v, want replacement", got)
+		}
+		if runtime.PanicPendingStacklessCoroForTest(ctx) {
+			t.Fatal("recovered task retains a pending panic")
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+
+	for _, test := range []struct {
+		name    string
+		setting string
+		wantNil bool
+	}{
+		{"default", "panicnil=0", false},
+		{"legacy", "panicnil=1", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("GODEBUG", test.setting)
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				token := runtime.DeferTokenStacklessCoroForTest(ctx)
+				runtime.PanicStacklessCoroForTest(ctx, nil)
+				got := runtime.DeferRecoverStacklessCoroForTest(token)
+				if (got == nil) != test.wantNil {
+					t.Fatalf("recover of panic(nil) = %v, want nil %t",
+						got, test.wantNil)
+				}
+				return runtime.StacklessCoroActionComplete
+			})
+		})
+	}
+}
+
 func TestStacklessCoroTaskSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	if got, want := runtime.StacklessCoroTaskSizeForTest(), 6*ptrSize; got != want {

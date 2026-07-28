@@ -50,6 +50,7 @@ type lowerDefer struct {
 	statement *ir.GoDeferStmt
 	call      *ir.CallExpr
 	armed     *ir.Name
+	terminal  TerminalFlags
 	captures  []lowerDeferCapture
 }
 
@@ -206,7 +207,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
-	if unsupported := function.Terminal & (UsesRecover | MayGoexit); unsupported != 0 {
+	if unsupported := function.Terminal & MayGoexit; unsupported != 0 {
 		return nil, fmt.Errorf("unsupported terminal control %s", unsupported)
 	}
 
@@ -476,16 +477,47 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			return nil, fmt.Errorf("defer target has execution constraints %s",
 				summary.Exec)
 		}
-		if summary.Terminal != 0 {
-			return nil, fmt.Errorf("defer target has terminal control %s",
-				summary.Terminal)
+		closure, isClosure := deferred.call.Fun.(*ir.ClosureExpr)
+		if edge.Callee.OClosure != nil {
+			if !isClosure || closure.Func != edge.Callee {
+				return nil, fmt.Errorf("defer closure does not match call plan")
+			}
+			if edge.Callee.Wrapper() && edge.Callee.WrappedFunc == nil {
+				return nil, fmt.Errorf("defer wrapper has no target")
+			}
+			if !edge.Callee.Wrapper() && dynamicDefers {
+				return nil, fmt.Errorf("repeated source defer literal")
+			}
 		}
-		if edge.Callee.OClosure != nil &&
-			(!edge.Callee.Wrapper() || edge.Callee.WrappedFunc == nil) {
-			return nil, fmt.Errorf("defer target is not a fixed direct call")
+		if summary.Terminal != 0 {
+			if !isClosure ||
+				!canLowerDeferTerminal(plan, edge.Callee, summary) {
+				return nil, fmt.Errorf("defer target has terminal control %s",
+					summary.Terminal)
+			}
+			deferred.terminal = summary.Terminal
 		}
 	}
 	return candidate, nil
+}
+
+func canLowerDeferTerminal(plan *Plan, fn *ir.Func, summary FuncSummary) bool {
+	function := plan.Functions[fn]
+	if function == nil ||
+		summary.Terminal != function.LocalTerminal ||
+		summary.Terminal&^(MayPanic|UsesRecover) != 0 {
+		return false
+	}
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			continue
+		}
+		callSummary, known := plan.edgeSummary(edge)
+		if !known || callSummary.Terminal != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func stacklessResumeType() *types.Type {
@@ -598,6 +630,49 @@ func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 		})
 	})
 	return supported
+}
+
+// rewriteDeferTerminal replaces terminal builtins in a direct deferred
+// literal with task-owned runtime operations.
+func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
+	want TerminalFlags) error {
+	var found TerminalFlags
+	var edit func(ir.Node) ir.Node
+	edit = func(node ir.Node) ir.Node {
+		switch node := node.(type) {
+		case *ir.CallExpr:
+			if node.Op() == ir.ORECOVER {
+				found |= UsesRecover
+				return typecheck.Call(node.Pos(),
+					typecheck.LookupRuntime("coroDeferRecover"),
+					ir.Nodes{token}, false)
+			}
+		case *ir.UnaryExpr:
+			if node.Op() == ir.OPANIC {
+				found |= MayPanic
+				body := make(ir.Nodes, 0, len(node.Init())+2)
+				for _, init := range ir.TakeInit(node) {
+					body = append(body, edit(init))
+				}
+				value := edit(node.X)
+				record := typecheck.Call(node.Pos(),
+					typecheck.LookupRuntime("coroDeferPanic"),
+					ir.Nodes{token, value}, false)
+				body = append(body, record, ir.NewReturnStmt(node.Pos(), nil))
+				return ir.NewBlockStmt(node.Pos(), body)
+			}
+		}
+		ir.EditChildren(node, edit)
+		return node
+	}
+	for i, stmt := range fn.Body {
+		fn.Body[i] = edit(stmt)
+	}
+	if found != want {
+		return fmt.Errorf("%s: defer terminal body is %s, want %s",
+			ir.PkgFuncName(fn), found, want)
+	}
+	return nil
 }
 
 // lowerRunToCompletion builds a single-invocation resume closure. Foreign
@@ -914,6 +989,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
 		len(candidate.defers))
 	var deferStack *ir.Name
+	var deferToken *ir.Name
 	if candidate.dynamicDefers {
 		// Use one stack for every site so fixed and repeated registrations
 		// retain their global LIFO order.
@@ -922,6 +998,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferStack))
 	}
 	for _, deferred := range candidate.defers {
+		if deferred.terminal != 0 && deferToken == nil {
+			deferToken = typecheck.TempAt(pos, factory,
+				types.Types[types.TUNSAFEPTR])
+			addDeclaration(ir.NewDecl(pos, ir.ODCL, deferToken))
+		}
 		if !candidate.dynamicDefers {
 			deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
 				types.Types[types.TBOOL])
@@ -934,11 +1015,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
 	panicAware := candidate.function.Terminal&MayPanic != 0
-	var terminal *ir.Name
-	if panicAware {
-		terminal = typecheck.TempAt(pos, factory, types.Types[types.TUINT8])
-		addDeclaration(ir.NewDecl(pos, ir.ODCL, terminal))
-	}
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -963,9 +1039,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return closure
 	}
 	resumePC := capture(pc)
-	var resumeTerminal *ir.Name
-	if panicAware {
-		resumeTerminal = capture(terminal)
+	var resumeDeferToken *ir.Name
+	if deferToken != nil {
+		resumeDeferToken = capture(deferToken)
 	}
 
 	const cleanupState = 0
@@ -1251,6 +1327,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			continue
 		}
 		closure.Func.ClosureParent = resume
+		if deferred.terminal != 0 {
+			token := ir.NewClosureVar(deferred.statement.Pos(),
+				closure.Func, resumeDeferToken)
+			if err := rewriteDeferTerminal(closure.Func, token,
+				deferred.terminal); err != nil {
+				return err
+			}
+		}
 		for _, variable := range closure.Func.ClosureVars {
 			outer, ok := edit(variable.Outer).(*ir.Name)
 			if !ok {
@@ -1266,6 +1350,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				variable.Defn = snapshot
 			} else {
 				variable.Outer = outer
+				variable.Defn = outer.Canonical()
 			}
 		}
 	}
@@ -1388,9 +1473,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body,
 				typecheck.Call(pos, typecheck.LookupRuntime("coroPanic"),
 					ir.Nodes{ctx, edit(state.panicValue)}, false),
-				ir.NewAssignStmt(pos, resumeTerminal,
-					typedInt(pos, types.Types[types.TUINT8],
-						int64(actionPanic))),
 				ir.NewAssignStmt(pos, resumePC,
 					typedInt(pos, types.Types[types.TUINT32],
 						int64(state.next))),
@@ -1402,9 +1484,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					ir.PkgFuncName(fn), i)
 			}
 			body = append(body,
-				ir.NewAssignStmt(pos, resumeTerminal,
-					typedInt(pos, types.Types[types.TUINT8],
-						int64(state.terminal))),
 				ir.NewAssignStmt(pos, resumePC,
 					typedInt(pos, types.Types[types.TUINT32],
 						int64(state.next))),
@@ -1451,9 +1530,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 			}
 			if panicAware {
-				panicCondition := ir.NewBinaryExpr(pos, ir.OEQ, resumeTerminal,
-					typedInt(pos, types.Types[types.TUINT8], int64(actionPanic)))
-				body = append(body, ir.NewIfStmt(pos, panicCondition, ir.Nodes{
+				pendingPanic := typecheck.Call(pos,
+					typecheck.LookupRuntime("coroPanicPending"),
+					ir.Nodes{ctx}, false)
+				body = append(body, ir.NewIfStmt(pos, pendingPanic, ir.Nodes{
 					ir.NewReturnStmt(pos, []ir.Node{
 						typedInt(pos, types.Types[types.TUINT8],
 							int64(actionPanic)),
@@ -1639,12 +1719,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
 	resume.Body = ir.Nodes{}
+	if resumeDeferToken != nil {
+		token := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroDeferToken"), ir.Nodes{ctx}, false)
+		resume.Body = append(resume.Body,
+			ir.NewAssignStmt(pos, resumeDeferToken, token))
+	}
 	if panicAware {
 		pendingPanic := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroPanicPending"), ir.Nodes{ctx}, false)
 		resume.Body = append(resume.Body, ir.NewIfStmt(pos, pendingPanic, ir.Nodes{
-			ir.NewAssignStmt(pos, resumeTerminal,
-				typedInt(pos, types.Types[types.TUINT8], int64(actionPanic))),
 			ir.NewAssignStmt(pos, resumePC,
 				typedInt(pos, types.Types[types.TUINT32], cleanupState)),
 		}, nil))

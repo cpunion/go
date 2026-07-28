@@ -327,3 +327,8 @@ func asanregisterglobals(unsafe.Pointer, uintptr)
 
 // used by testing.B.Loop
 func KeepAlive(interface{})
+
+// stackless coroutine deferred terminal control
+func coroDeferToken(unsafe.Pointer) unsafe.Pointer
+func coroDeferPanic(unsafe.Pointer, interface{})
+func coroDeferRecover(unsafe.Pointer) interface{}

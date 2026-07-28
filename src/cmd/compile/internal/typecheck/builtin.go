@@ -269,10 +269,13 @@ var runtimeDecls = [...]struct {
 	{"riscv64HasZbb", varTag, 6},
 	{"asanregisterglobals", funcTag, 147},
 	{"KeepAlive", funcTag, 11},
+	{"coroDeferToken", funcTag, 175},
+	{"coroDeferPanic", funcTag, 126},
+	{"coroDeferRecover", funcTag, 176},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [175]*types.Type
+	var typs [177]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -448,6 +451,8 @@ func runtimeTypes() []*types.Type {
 	typs[172] = newSig(params(typs[30], typs[30], typs[15]), nil)
 	typs[173] = types.NewArray(typs[0], 16)
 	typs[174] = newSig(params(typs[7], typs[67], typs[173], typs[30], typs[13], typs[71], typs[71]), params(typs[67]))
+	typs[175] = newSig(params(typs[7]), params(typs[7]))
+	typs[176] = newSig(params(typs[7]), params(typs[10]))
 	return typs[:]
 }
 

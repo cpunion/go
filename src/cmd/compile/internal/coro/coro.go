@@ -310,7 +310,7 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 			Terminal: function.Terminal,
 		}).Primary()
 		for _, edge := range function.Edges {
-			if edge.Kind != GoCall && edge.Recipe.Kind == SiteInvalid &&
+			if edge.Kind == DirectCall && edge.Recipe.Kind == SiteInvalid &&
 				p.edgeNeedsCoroEntry(edge) {
 				function.Sites = append(function.Sites, Site{
 					ID:   SiteID(len(function.Sites) + 1),
