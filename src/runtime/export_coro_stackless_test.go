@@ -114,6 +114,39 @@ func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
 	coroExitBlocking()
 }
 
+func CheckEarlyReadyStacklessCoroForTest() bool {
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroExecutorCount),
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	task := &stacklessCoroTask{
+		state:    stacklessCoroTaskRunning,
+		resuming: true,
+	}
+	s.root = task
+	context := stacklessCoroContext{
+		scheduler: s,
+		task:      task,
+	}
+
+	stacklessCoroStartOperation(unsafe.Pointer(&context), "early ready test")
+	s.ready(task, true)
+
+	lock(&s.lock)
+	deferred := s.head == nil &&
+		task.state == stacklessCoroTaskWaiting &&
+		task.resuming && task.readyPending
+	unlock(&s.lock)
+	if !deferred {
+		return false
+	}
+
+	s.waiting(task)
+	return s.take() == task &&
+		task.state == stacklessCoroTaskRunning &&
+		task.resuming && !task.readyPending
+}
+
 func CheckStacklessCoroOperationRegistryForTest() bool {
 	first := new(stacklessCoroOperation)
 	second := new(stacklessCoroOperation)

@@ -197,13 +197,15 @@ smaller foreign-entry and foreign-exit protocols for each call class.
 The compiler and runtime must enforce these invariants in every phase.
 
 1. A suspended logical goroutine has no live native activation.
-2. A frame has exactly one scheduler owner.
+2. A frame has exactly one scheduler owner and at most one active resume
+   executor.
 3. A frame is resumed or destroyed only after an exact scheduler action is
    issued for it.
 4. A producer carries only pointer-free operation identity and payload allowed
    by its source contract.
 5. A producer cannot call `resume`, `destroy`, or a user callback.
-6. A completion fact is sticky until the owner acknowledges it.
+6. A completion fact is sticky until the owner acknowledges it. Completion
+   before an active resume returns cannot make the same task runnable early.
 7. A result has one terminal disposition: take, discard, or transfer.
 8. A child writes completion to storage owned by the parent before the child
    frame can be destroyed.
@@ -322,6 +324,19 @@ Only an executor that has claimed a runnable token may change `runnable` to
 `running`. Operation sources publish facts to owner mailboxes and set a
 coalescing scheduler request. The owner resolves the operation, materializes a
 typed resume packet, and then queues the logical G.
+
+The runtime records whether a resume call still owns the task. If an operation
+finishes after changing the task to `waiting` but before that call returns its
+`Wait` action, completion sets one sticky pending-ready bit. The task is not
+queued until the scheduler consumes the returned action and releases the
+resume owner. This closes the otherwise possible window in which two
+executors could enter the same resume function concurrently.
+
+Runtime mutexes are not synchronization events visible to the race detector.
+Every completed resume episode therefore release-merges its task identity, a
+completion producer release-merges its result publication, and the next
+executor acquires that identity after claiming the runnable token. The root
+owner also acquires the terminal task before returning to ordinary Go code.
 
 An executor entry has a deterministic reduction budget. Queue dequeue, resume,
 destroy, source fact, result reconciliation, and child completion each consume
@@ -1425,6 +1440,9 @@ The compiler:
 The runtime:
 
 - uses a push-driven ready queue and generation-checked operation registry;
+- tracks one active resume owner per task, defers an early operation completion
+  until that owner returns `Wait`, and gives the race detector explicit
+  release-merge/acquire edges when a logical task changes executors;
 - runs resume episodes on a fixed pool of four executor Gs, each using its
   native OS thread stack, while `m.g0` uses a separate scheduler stack;
 - prevents executor stack copy, growth, and shrink, and handles signal stack
@@ -1473,6 +1491,8 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - compiler analysis, summary, lowering, archive identity, and end-to-end tests;
 - all `TestStacklessCoro` runtime tests;
 - operation tests under `-race`;
+- deterministic early-completion publication and repeated cross-executor
+  handoff tests under `-race`;
 - GC with typed pointers live across suspension;
 - native stack bounds, fixed four-executor pool, `SIGURG` asynchronous
   preemption, traceback, trace output, and deterministic fixed-stack overflow;

@@ -124,11 +124,17 @@ func TestStacklessCoroPanic(t *testing.T) {
 				recovered = recover()
 			}()
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				if runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("new root has a pending panic")
+				}
 				if runtime.TerminalActionStacklessCoroForTest(ctx) ==
 					runtime.StacklessCoroActionPanic {
 					t.Fatal("new root has a pending panic")
 				}
 				runtime.PanicStacklessCoroForTest(ctx, value)
+				if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("recorded panic is not pending")
+				}
 				return runtime.StacklessCoroActionPanic
 			})
 		}()
@@ -162,6 +168,9 @@ func TestStacklessCoroPanicAwait(t *testing.T) {
 				runtime.AwaitStacklessCoroForTest(ctx, child)
 				return runtime.StacklessCoroActionWait
 			case 1:
+				if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+					t.Fatal("child panic is not pending in its parent")
+				}
 				if runtime.TerminalActionStacklessCoroForTest(ctx) !=
 					runtime.StacklessCoroActionPanic {
 					t.Fatal("child panic was not transferred to its parent")
@@ -577,6 +586,12 @@ func TestStacklessCoroSleepCancelRace(t *testing.T) {
 func TestStacklessCoroOperationRegistry(t *testing.T) {
 	if !runtime.CheckStacklessCoroOperationRegistryForTest() {
 		t.Fatal("operation registry did not reject stale or duplicate completion")
+	}
+}
+
+func TestStacklessCoroEarlyReady(t *testing.T) {
+	if !runtime.CheckEarlyReadyStacklessCoroForTest() {
+		t.Fatal("operation completion was published before resume returned")
 	}
 }
 
