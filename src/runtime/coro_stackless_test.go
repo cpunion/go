@@ -124,7 +124,8 @@ func TestStacklessCoroPanic(t *testing.T) {
 				recovered = recover()
 			}()
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-				if runtime.PanicPendingStacklessCoroForTest(ctx) {
+				if runtime.TerminalActionStacklessCoroForTest(ctx) ==
+					runtime.StacklessCoroActionPanic {
 					t.Fatal("new root has a pending panic")
 				}
 				runtime.PanicStacklessCoroForTest(ctx, value)
@@ -161,7 +162,8 @@ func TestStacklessCoroPanicAwait(t *testing.T) {
 				runtime.AwaitStacklessCoroForTest(ctx, child)
 				return runtime.StacklessCoroActionWait
 			case 1:
-				if !runtime.PanicPendingStacklessCoroForTest(ctx) {
+				if runtime.TerminalActionStacklessCoroForTest(ctx) !=
+					runtime.StacklessCoroActionPanic {
 					t.Fatal("child panic was not transferred to its parent")
 				}
 				cleanup = true
@@ -182,6 +184,208 @@ func TestStacklessCoroPanicAwait(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroGoexit(t *testing.T) {
+	done := make(chan struct{})
+	action := make(chan uint8, 1)
+	returned := make(chan struct{}, 1)
+	go func() {
+		defer close(done)
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			runtime.GoexitStacklessCoroForTest(ctx)
+			got := runtime.TerminalActionStacklessCoroForTest(ctx)
+			action <- got
+			return got
+		})
+		returned <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stackless coroutine Goexit did not terminate its goroutine")
+	}
+	if got := <-action; got != runtime.StacklessCoroActionGoexit {
+		t.Fatalf("terminal action = %d, want Goexit", got)
+	}
+	select {
+	case <-returned:
+		t.Fatal("stackless coroutine Goexit returned to its caller")
+	default:
+	}
+}
+
+func TestStacklessCoroGoexitAwait(t *testing.T) {
+	var parentState int
+	var childCleanup, parentCleanup bool
+	child := func(ctx unsafe.Pointer) uint8 {
+		runtime.GoexitStacklessCoroForTest(ctx)
+		childCleanup = true
+		return runtime.TerminalActionStacklessCoroForTest(ctx)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				parentState = 1
+				runtime.AwaitStacklessCoroForTest(ctx, child)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				parentState = 2
+				parentCleanup = true
+				return runtime.TerminalActionStacklessCoroForTest(ctx)
+			default:
+				panic("unexpected parent state")
+			}
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("awaited Goexit did not terminate the root goroutine")
+	}
+	if parentState != 2 || !childCleanup || !parentCleanup {
+		t.Fatalf("Goexit state = (%d, %t, %t), want (2, true, true)",
+			parentState, childCleanup, parentCleanup)
+	}
+}
+
+func TestStacklessCoroGoexitSpawn(t *testing.T) {
+	var rootState int
+	var childCleanup bool
+	child := func(ctx unsafe.Pointer) uint8 {
+		runtime.GoexitStacklessCoroForTest(ctx)
+		childCleanup = true
+		return runtime.TerminalActionStacklessCoroForTest(ctx)
+	}
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch rootState {
+		case 0:
+			rootState = 1
+			runtime.SpawnStacklessCoroForTest(ctx, child)
+			return runtime.StacklessCoroActionYield
+		case 1:
+			rootState = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected root state %d", rootState)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if rootState != 2 || !childCleanup {
+		t.Fatalf("spawn Goexit state = (%d, %t), want (2, true)",
+			rootState, childCleanup)
+	}
+}
+
+func TestStacklessCoroGoexitPanic(t *testing.T) {
+	done := make(chan struct{})
+	recovered := make(chan any, 1)
+	returned := make(chan struct{}, 1)
+	recoverOutside := func() {
+		defer func() {
+			recovered <- recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.GoexitStacklessCoroForTest(ctx)
+			runtime.DeferPanicStacklessCoroForTest(token, "panic during Goexit")
+			return runtime.TerminalActionStacklessCoroForTest(ctx)
+		})
+	}
+	go func() {
+		defer close(done)
+		recoverOutside()
+		returned <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovered panic did not resume stackless coroutine Goexit")
+	}
+	if got := <-recovered; got != "panic during Goexit" {
+		t.Fatalf("recovered panic = %v, want %q", got, "panic during Goexit")
+	}
+	select {
+	case <-returned:
+		t.Fatal("recovered panic bypassed the pending Goexit")
+	default:
+	}
+
+	done = make(chan struct{})
+	terminal := make(chan uint8, 1)
+	go func() {
+		defer close(done)
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.GoexitStacklessCoroForTest(ctx)
+			runtime.DeferPanicStacklessCoroForTest(token, "recovered")
+			if got := runtime.DeferRecoverStacklessCoroForTest(token); got != "recovered" {
+				panic("bad stackless coroutine recover")
+			}
+			got := runtime.TerminalActionStacklessCoroForTest(ctx)
+			terminal <- got
+			return got
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("task-owned recover did not resume stackless coroutine Goexit")
+	}
+	if got := <-terminal; got != runtime.StacklessCoroActionGoexit {
+		t.Fatalf("terminal action after recover = %d, want Goexit", got)
+	}
+
+	done = make(chan struct{})
+	recovered = make(chan any, 1)
+	terminal = make(chan uint8, 1)
+	go func() {
+		defer close(done)
+		parentState := 0
+		child := func(ctx unsafe.Pointer) uint8 {
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.GoexitStacklessCoroForTest(ctx)
+			runtime.DeferPanicStacklessCoroForTest(token,
+				"structured panic during Goexit")
+			return runtime.TerminalActionStacklessCoroForTest(ctx)
+		}
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				parentState = 1
+				runtime.AwaitStacklessCoroForTest(ctx, child)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				token := runtime.DeferTokenStacklessCoroForTest(ctx)
+				recovered <- runtime.DeferRecoverStacklessCoroForTest(token)
+				got := runtime.TerminalActionStacklessCoroForTest(ctx)
+				terminal <- got
+				return got
+			default:
+				panic("unexpected parent state")
+			}
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("structured recover did not resume stackless coroutine Goexit")
+	}
+	if got := <-recovered; got != "structured panic during Goexit" {
+		t.Fatalf("structured recovered panic = %v, want %q",
+			got, "structured panic during Goexit")
+	}
+	if got := <-terminal; got != runtime.StacklessCoroActionGoexit {
+		t.Fatalf("structured terminal action after recover = %d, want Goexit",
+			got)
+	}
+}
+
 func TestStacklessCoroDeferTerminal(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		token := runtime.DeferTokenStacklessCoroForTest(ctx)
@@ -194,7 +398,8 @@ func TestStacklessCoroDeferTerminal(t *testing.T) {
 		if got := runtime.DeferRecoverStacklessCoroForTest(token); got != "replacement" {
 			t.Fatalf("recovered panic = %v, want replacement", got)
 		}
-		if runtime.PanicPendingStacklessCoroForTest(ctx) {
+		if runtime.TerminalActionStacklessCoroForTest(ctx) ==
+			runtime.StacklessCoroActionPanic {
 			t.Fatal("recovered task retains a pending panic")
 		}
 		return runtime.StacklessCoroActionComplete

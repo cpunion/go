@@ -21,6 +21,7 @@ const (
 	actionWait
 	actionComplete
 	actionPanic
+	actionGoexit
 )
 
 // LowerResult summarizes one package lowering pass.
@@ -207,10 +208,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
-	if unsupported := function.Terminal & MayGoexit; unsupported != 0 {
-		return nil, fmt.Errorf("unsupported terminal control %s", unsupported)
-	}
-
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)
@@ -381,7 +378,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
-		case SiteYield, SiteTimer, SiteFile, SitePoll:
+		case SiteYield, SiteTimer, SiteFile, SitePoll, SiteGoexit:
 			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested %s site %d", site.Kind, site.ID)
 			}
@@ -1014,7 +1011,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
-	panicAware := candidate.function.Terminal&MayPanic != 0
+	terminalAware := candidate.function.Terminal&(MayPanic|MayGoexit) != 0
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -1052,7 +1049,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		elseState: -1,
 		cleanup:   true,
 	}}
-	if panicAware {
+	if terminalAware {
 		completeState = len(states)
 		states = append(states, lowerState{
 			next:      cleanupState,
@@ -1124,7 +1121,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
 			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign,
+				SiteGoexit:
 				return true
 			}
 		}
@@ -1214,12 +1212,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return lowerStatements(init, continuation)
 			}
 			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign:
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign,
+				SiteGoexit:
+				stateNext := next
+				if candidate.transitions[call] == SiteGoexit {
+					stateNext = cleanupState
+				}
 				return addState(lowerState{
 					transition: candidate.transitions[call],
 					call:       call,
 					statement:  stmt,
-					next:       next,
+					next:       stateNext,
 					thenState:  -1,
 					elseState:  -1,
 				})
@@ -1529,14 +1532,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						armed, ir.Nodes{clear, call}, nil))
 				}
 			}
-			if panicAware {
-				pendingPanic := typecheck.Call(pos,
-					typecheck.LookupRuntime("coroPanicPending"),
-					ir.Nodes{ctx}, false)
-				body = append(body, ir.NewIfStmt(pos, pendingPanic, ir.Nodes{
+			if terminalAware {
+				terminalAction := typecheck.TempAt(pos, resume,
+					types.Types[types.TUINT8])
+				body = append(body, ir.NewAssignStmt(pos, terminalAction,
+					typecheck.Call(pos,
+						typecheck.LookupRuntime("coroTerminalAction"),
+						ir.Nodes{ctx}, false)))
+				hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
+					typedInt(pos, types.Types[types.TUINT8],
+						int64(actionInvalid)))
+				body = append(body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
 					ir.NewReturnStmt(pos, []ir.Node{
-						typedInt(pos, types.Types[types.TUINT8],
-							int64(actionPanic)),
+						terminalAction,
 					}),
 				}, nil))
 			}
@@ -1559,6 +1567,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			switch state.transition {
 			case SiteYield:
 				action = actionYield
+			case SiteGoexit:
+				body = append(body,
+					typecheck.Call(state.call.Pos(),
+						typecheck.LookupRuntime("coroGoexit"),
+						ir.Nodes{ctx}, false),
+					ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil),
+				)
 			case SiteAwait:
 				for _, init := range state.call.Init() {
 					body = append(body, edit(init))
@@ -1725,10 +1740,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		resume.Body = append(resume.Body,
 			ir.NewAssignStmt(pos, resumeDeferToken, token))
 	}
-	if panicAware {
-		pendingPanic := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroPanicPending"), ir.Nodes{ctx}, false)
-		resume.Body = append(resume.Body, ir.NewIfStmt(pos, pendingPanic, ir.Nodes{
+	if terminalAware {
+		terminalAction := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)
+		hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
+			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
+		resume.Body = append(resume.Body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
 			ir.NewAssignStmt(pos, resumePC,
 				typedInt(pos, types.Types[types.TUINT32], cleanupState)),
 		}, nil))

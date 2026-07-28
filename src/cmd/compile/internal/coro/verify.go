@@ -44,6 +44,10 @@ func (p *Plan) Verify() error {
 				return fmt.Errorf("%s: panic site %d lacks panic terminal flag",
 					ir.PkgFuncName(fn), site.ID)
 			}
+			if site.Kind == SiteGoexit && function.Terminal&MayGoexit == 0 {
+				return fmt.Errorf("%s: Goexit site %d lacks Goexit terminal flag",
+					ir.PkgFuncName(fn), site.ID)
+			}
 			if site.Foreign == AsyncOperation && function.Effect != MaySuspend {
 				return fmt.Errorf("%s: async foreign site %d is not suspending",
 					ir.PkgFuncName(fn), site.ID)

@@ -332,3 +332,7 @@ func KeepAlive(interface{})
 func coroDeferToken(unsafe.Pointer) unsafe.Pointer
 func coroDeferPanic(unsafe.Pointer, interface{})
 func coroDeferRecover(unsafe.Pointer) interface{}
+
+// stackless coroutine terminal outcomes
+func coroGoexit(unsafe.Pointer)
+func coroTerminalAction(unsafe.Pointer) uint8

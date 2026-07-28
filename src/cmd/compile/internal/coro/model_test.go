@@ -29,6 +29,7 @@ func TestFuncSummaryPrimary(t *testing.T) {
 		{FuncSummary{Exec: NeedsPreempt}, CoroPrimary},
 		{FuncSummary{Exec: NeedsSystemABI}, CoroPrimary},
 		{FuncSummary{Terminal: MayPanic}, CoroPrimary},
+		{FuncSummary{Terminal: MayGoexit}, CoroPrimary},
 		{FuncSummary{Terminal: UsesRecover}, PlainPrimary},
 	}
 	for _, test := range tests {
@@ -193,6 +194,11 @@ func TestEdgeNeedsCoroEntry(t *testing.T) {
 	}) {
 		t.Fatal("panicking imported edge does not require a coroutine entry")
 	}
+	if !plan.edgeNeedsCoroEntry(Edge{
+		Imported: FuncSummary{Terminal: MayGoexit},
+	}) {
+		t.Fatal("Goexit imported edge does not require a coroutine entry")
+	}
 }
 
 func TestAnalyzeTerminalControl(t *testing.T) {
@@ -239,8 +245,16 @@ func TestAnalyzeTerminalControl(t *testing.T) {
 	goexitCall.SetTypecheck(1)
 	exiting.Body = ir.Nodes{goexitCall}
 
+	launchedGoexit := newFunc("launchedGoexit")
+	spawnGoexitCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		goexit.Nname, nil)
+	spawnGoexitCall.SetTypecheck(1)
+	spawnGoexit := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, spawnGoexitCall)
+	spawnGoexit.SetTypecheck(1)
+	launchedGoexit.Body = ir.Nodes{spawnGoexit}
+
 	plan, err := Analyze([]*ir.Func{
-		panicking, caller, launched, recovering, exiting,
+		panicking, caller, launched, recovering, exiting, launchedGoexit,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +269,8 @@ func TestAnalyzeTerminalControl(t *testing.T) {
 		{caller, 0, MayPanic, CoroPrimary, []SiteKind{SiteAwait}},
 		{launched, 0, 0, PlainPrimary, []SiteKind{SiteSpawn}},
 		{recovering, UsesRecover, UsesRecover, PlainPrimary, nil},
-		{exiting, MayGoexit, MayGoexit, CoroPrimary, []SiteKind{SiteAwait}},
+		{exiting, MayGoexit, MayGoexit, CoroPrimary, []SiteKind{SiteGoexit}},
+		{launchedGoexit, 0, 0, PlainPrimary, []SiteKind{SiteSpawn}},
 	} {
 		function := plan.Functions[test.fn]
 		if function.LocalTerminal != test.local ||
@@ -281,6 +296,9 @@ func TestAnalyzeTerminalControl(t *testing.T) {
 		"func=example.com/coro/terminaltest.panicking",
 		"terminal=panic local-terminal=panic",
 		"kind=panic",
+		"func=example.com/coro/terminaltest.exiting",
+		"terminal=goexit local-terminal=goexit",
+		"kind=goexit",
 	} {
 		if !strings.Contains(dump.String(), want) {
 			t.Errorf("analysis dump does not contain %q:\n%s", want, &dump)
@@ -365,5 +383,27 @@ func TestVerifyPanicSite(t *testing.T) {
 	function.Primary = CoroPrimary
 	if err := plan.Verify(); err != nil {
 		t.Fatalf("valid panic plan rejected: %v", err)
+	}
+}
+
+func TestVerifyGoexitSite(t *testing.T) {
+	fn := testFunc("goexit")
+	function := &Function{
+		Func: fn,
+		Sites: []Site{{
+			ID: 1, Kind: SiteGoexit,
+			Node: ir.NewReturnStmt(src.NoXPos, nil),
+		}},
+	}
+	plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+	if err := plan.Verify(); err == nil ||
+		!strings.Contains(err.Error(), "lacks Goexit terminal flag") {
+		t.Fatalf("Goexit site error = %v", err)
+	}
+
+	function.Terminal = MayGoexit
+	function.Primary = CoroPrimary
+	if err := plan.Verify(); err != nil {
+		t.Fatalf("valid Goexit plan rejected: %v", err)
 	}
 }

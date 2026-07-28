@@ -590,8 +590,8 @@ func main() {
 	if strings.Contains(disassembly, "runtime.morestack") {
 		t.Fatalf("generated resume function contains runtime.morestack\n%s", disassembly)
 	}
-	if strings.Contains(disassembly, "runtime.coroPanicPending") {
-		t.Fatalf("non-panicking resume function checks for a panic outcome\n%s",
+	if strings.Contains(disassembly, "runtime.coroTerminalAction") {
+		t.Fatalf("non-terminal resume function checks for a terminal outcome\n%s",
 			disassembly)
 	}
 }
@@ -1215,7 +1215,7 @@ func main() {
 	}
 	disassembly := string(data)
 	for _, want := range []string{
-		"runtime.coroPanic", "runtime.coroPanicPending",
+		"runtime.coroPanic", "runtime.coroTerminalAction",
 		"runtime.coroDeferRecover",
 	} {
 		if !strings.Contains(disassembly, want) {
@@ -1432,7 +1432,7 @@ func main() {
 	}
 }
 
-func TestTerminalControlFallback(t *testing.T) {
+func TestSpawnPanicFallback(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
 	tmp := t.TempDir()
@@ -1462,21 +1462,10 @@ func recoverer() (recovered any) {
 	panic("recovered")
 }
 
-//go:noinline
-func goexit(done chan struct{}) {
-	defer close(done)
-	runtime.Gosched()
-	runtime.Goexit()
-	panic("unreachable goexit")
-}
-
 func main() {
 	if recovered := recoverer(); recovered != "recovered" {
 		panic("bad recover fallback")
 	}
-	done := make(chan struct{})
-	go goexit(done)
-	<-done
 	println("stackless-coro-terminal-fallback-ok")
 }
 `
@@ -1500,9 +1489,8 @@ func main() {
 		t.Fatalf("building terminal fallback program failed: %v\n%s", err, out)
 	}
 	for _, want := range []string{
-		"coro: phase=lower lowered=2 skipped=4",
+		"coro: phase=lower lowered=3 skipped=1",
 		"main.spawn: spawn target may panic",
-		"main.goexit: unsupported terminal control goexit",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
@@ -1516,6 +1504,210 @@ func main() {
 	}
 	if want := "stackless-coro-terminal-fallback-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+}
+
+func TestGoexitOutcomeLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var trace string
+var overlayRecovered any
+var detachedExited bool
+var detachedParentObserved bool
+var detachedReturned bool
+var immediateReturned bool
+var immediateRecovered any
+
+//go:noinline
+func leaf() {
+	defer func() {
+		trace += "leaf;"
+	}()
+	runtime.Gosched()
+	runtime.Goexit()
+	panic("leaf returned after Goexit")
+}
+
+//go:noinline
+func middle() {
+	defer func() {
+		trace += "middle;"
+	}()
+	leaf()
+	panic("middle returned after Goexit")
+}
+
+//go:noinline
+func structured(done chan struct{}) {
+	defer func() {
+		trace += "root;"
+		close(done)
+	}()
+	middle()
+	panic("root returned after Goexit")
+}
+
+//go:noinline
+func overlay(done chan struct{}) {
+	defer func() {
+		close(done)
+	}()
+	defer func() {
+		overlayRecovered = recover()
+		trace += "recover;"
+	}()
+	defer func() {
+		panic("panic during Goexit")
+	}()
+	runtime.Gosched()
+	runtime.Goexit()
+	panic("overlay returned after Goexit")
+}
+
+//go:noinline
+func detached() {
+	defer func() {
+		detachedExited = true
+	}()
+	runtime.Gosched()
+	runtime.Goexit()
+	detachedReturned = true
+}
+
+//go:noinline
+func spawnRoot(done chan struct{}) {
+	defer func() {
+		close(done)
+	}()
+	go detached()
+	runtime.Gosched()
+	runtime.Gosched()
+	detachedParentObserved = detachedExited
+}
+
+//go:noinline
+func immediate(done chan struct{}) {
+	defer func() {
+		immediateRecovered = recover()
+		close(done)
+	}()
+	runtime.Goexit()
+	immediateReturned = true
+}
+
+func main() {
+	structuredDone := make(chan struct{})
+	go structured(structuredDone)
+	<-structuredDone
+	if trace != "leaf;middle;root;" {
+		panic("bad structured Goexit cleanup")
+	}
+
+	overlayDone := make(chan struct{})
+	go overlay(overlayDone)
+	<-overlayDone
+	if overlayRecovered != "panic during Goexit" ||
+		trace != "leaf;middle;root;recover;" {
+		panic("bad panic and recover during Goexit")
+	}
+
+	spawnDone := make(chan struct{})
+	go spawnRoot(spawnDone)
+	<-spawnDone
+	if !detachedExited || !detachedParentObserved || detachedReturned {
+		panic("detached Goexit terminated its parent")
+	}
+
+	immediateDone := make(chan struct{})
+	go immediate(immediateDone)
+	<-immediateDone
+	if immediateReturned || immediateRecovered != nil {
+		panic("bad immediate Goexit")
+	}
+	println("stackless-coro-goexit-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-goexit")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building Goexit coroutine failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered=7"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	for _, name := range []string{
+		"main.leaf", "main.middle", "main.structured",
+		"main.overlay", "main.detached", "main.spawnRoot", "main.immediate",
+	} {
+		if strings.Contains(out, "coro: skip "+name+":") {
+			t.Errorf("Goexit function %s was not lowered\n%s", name, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Goexit coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-goexit-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(leaf|middle|structured|overlay|detached|spawnRoot|immediate)\.coro\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of Goexit resume functions failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, want := range []string{
+		"runtime.coroGoexit", "runtime.coroTerminalAction",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("Goexit resume functions do not contain %q\n%s",
+				want, disassembly)
+		}
+	}
+	if strings.Contains(disassembly, "runtime.Goexit") {
+		t.Errorf("Goexit resume functions retain runtime.Goexit\n%s",
+			disassembly)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.overlay\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of Goexit defer functions failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	for _, want := range []string{
+		"runtime.coroDeferPanic", "runtime.coroDeferRecover",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("Goexit defer functions do not contain %q\n%s",
+				want, disassembly)
+		}
 	}
 }
 
@@ -2175,6 +2367,142 @@ func main() {
 		"example.com/coropanic/leaf.Panic.coro",
 		"example.com/coropanic/mid.Panic.coro",
 		"main.invoke.coro",
+	} {
+		if !strings.Contains(symbols, want) {
+			t.Errorf("symbols do not contain %q", want)
+		}
+	}
+}
+
+func TestCrossPackageGoexitOutcome(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	writeFile := func(name, contents string) {
+		t.Helper()
+		name = filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(name), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFile("go.mod", "module example.com/corogoexit\n\ngo 1.28\n")
+	writeFile("leaf/leaf.go", `package leaf
+
+import "runtime"
+
+//go:noinline
+func Exit(trace *string) {
+	defer func() {
+		*trace += "leaf;"
+	}()
+	runtime.Gosched()
+	runtime.Goexit()
+	panic("leaf returned after Goexit")
+}
+`)
+	writeFile("mid/mid.go", `package mid
+
+import "example.com/corogoexit/leaf"
+
+//go:noinline
+func Exit(trace *string) {
+	defer func() {
+		*trace += "mid;"
+	}()
+	leaf.Exit(trace)
+	panic("mid returned after Goexit")
+}
+`)
+	writeFile("root/main.go", `package main
+
+import "example.com/corogoexit/mid"
+
+var trace string
+
+//go:noinline
+func run(done chan struct{}) {
+	defer func() {
+		trace += "root;"
+		close(done)
+	}()
+	mid.Exit(&trace)
+	panic("root returned after Goexit")
+}
+
+func main() {
+	done := make(chan struct{})
+	go run(done)
+	<-done
+	if trace != "leaf;mid;root;" {
+		panic("bad cross-package Goexit cleanup")
+	}
+	println("stackless-coro-cross-goexit-ok")
+}
+`)
+
+	exe := filepath.Join(tmp, "coro-cross-goexit")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/corogoexit/...=-l -d=coro=4",
+		"./root")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("cross-package Goexit build failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"coro: func=example.com/corogoexit/leaf.Exit",
+		"terminal=panic,goexit local-terminal=panic,goexit",
+		"kind=goexit",
+		"coro: func=example.com/corogoexit/mid.Exit",
+		"terminal=panic,goexit local-terminal=panic",
+		"coro: site=2 func=example.com/corogoexit/mid.Exit kind=await",
+		"coro: func=main.run",
+		"terminal=panic,goexit local-terminal=panic",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+	for _, name := range []string{
+		"example.com/corogoexit/leaf.Exit",
+		"example.com/corogoexit/mid.Exit",
+		"main.run",
+	} {
+		if strings.Contains(out, "coro: skip "+name+":") {
+			t.Errorf("cross-package Goexit function %s was not lowered\n%s",
+				name, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-package Goexit executable failed: %v\n%s", err, data)
+	} else if want := "stackless-coro-cross-goexit-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("executable output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm of cross-package Goexit executable failed: %v\n%s",
+			err, data)
+	}
+	symbols := string(data)
+	for _, want := range []string{
+		"example.com/corogoexit/leaf.Exit.coro",
+		"example.com/corogoexit/mid.Exit.coro",
+		"main.run.coro",
 	} {
 		if !strings.Contains(symbols, want) {
 			t.Errorf("symbols do not contain %q", want)

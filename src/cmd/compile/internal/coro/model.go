@@ -137,6 +137,7 @@ const (
 	SitePoll
 	SiteForeign
 	SitePanic
+	SiteGoexit
 )
 
 func (k SiteKind) String() string {
@@ -161,6 +162,8 @@ func (k SiteKind) String() string {
 		return "foreign"
 	case SitePanic:
 		return "panic"
+	case SiteGoexit:
+		return "goexit"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -201,7 +204,7 @@ type FuncSummary struct {
 
 func (s FuncSummary) Primary() PrimaryKind {
 	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI) != 0 ||
-		s.Terminal&MayPanic != 0 {
+		s.Terminal&(MayPanic|MayGoexit) != 0 {
 		return CoroPrimary
 	}
 	return PlainPrimary
@@ -211,11 +214,12 @@ func (s FuncSummary) Primary() PrimaryKind {
 // It is keyed by a fully qualified static function identity, not inferred from
 // a call's spelling or from a code address.
 type OperationRecipe struct {
-	Kind    SiteKind
-	Effect  Effect
-	Exec    ExecFlags
-	Foreign ForeignCallClass
-	Direct  string
+	Kind     SiteKind
+	Effect   Effect
+	Exec     ExecFlags
+	Terminal TerminalFlags
+	Foreign  ForeignCallClass
+	Direct   string
 }
 
 var operationRecipes = map[string]OperationRecipe{
@@ -226,6 +230,10 @@ var operationRecipes = map[string]OperationRecipe{
 	"time.Sleep": {
 		Kind:   SiteTimer,
 		Effect: MaySuspend,
+	},
+	"runtime.Goexit": {
+		Kind:     SiteGoexit,
+		Terminal: MayGoexit,
 	},
 	"runtime/coro.FileRead": {
 		Kind:   SiteFile,
