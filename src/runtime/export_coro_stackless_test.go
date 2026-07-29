@@ -70,6 +70,10 @@ func DeferTokenStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	return coroDeferToken(ctx)
 }
 
+func DeferCallStacklessCoroForTest(token unsafe.Pointer, deferred func()) {
+	coroDeferCall(token, deferred)
+}
+
 func DeferPanicStacklessCoroForTest(token unsafe.Pointer, value any) {
 	coroDeferPanic(token, value)
 }

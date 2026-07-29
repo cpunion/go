@@ -1083,7 +1083,10 @@ func (p *_panic) initOpenCodedDefers(fn funcInfo, varp unsafe.Pointer) bool {
 func gorecover() any {
 	gp := getg()
 	p := gp._panic
-	if p == nil || p.goexit || p.recovered {
+	if p == nil {
+		return stacklessCoroRecover(gp)
+	}
+	if p.goexit || p.recovered {
 		return nil
 	}
 

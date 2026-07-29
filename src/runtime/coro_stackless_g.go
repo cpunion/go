@@ -8,10 +8,23 @@ package runtime
 
 import "unsafe"
 
+type stacklessCoroGState struct {
+	native    unsafe.Pointer
+	deferTask *stacklessCoroTask
+}
+
 type stacklessCoroG struct {
-	stacklessCoro unsafe.Pointer
+	stacklessCoro *stacklessCoroGState
 }
 
 func (gp *g) stackIsFixed() bool {
-	return gp.stacklessCoro != nil
+	return gp.stacklessCoro != nil && gp.stacklessCoro.native != nil
+}
+
+func stacklessCoroRecover(gp *g) any {
+	state := gp.stacklessCoro
+	if state == nil || state.deferTask == nil {
+		return nil
+	}
+	return coroDeferRecover(unsafe.Pointer(state.deferTask))
 }

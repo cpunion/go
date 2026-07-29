@@ -23,6 +23,7 @@ const (
 )
 
 type stacklessCoroNativeContext struct {
+	gState     stacklessCoroGState
 	scheduler  *stacklessCoroScheduler
 	schedulerG *g
 	executor   *g
@@ -110,6 +111,7 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 
 func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
 	ctx := new(stacklessCoroNativeContext)
+	ctx.gState.native = unsafe.Pointer(ctx)
 
 	schedulerG := malg(stacklessCoroSchedulerSize)
 	schedulerG.stackguard1 = schedulerG.stackguard0
@@ -162,7 +164,7 @@ func coroNativeStart(caller *g) {
 	executor.stackguard0 = executor.stack.lo + stackGuard
 	executor.stackguard1 = ^uintptr(0)
 	executor.m = mp
-	executor.stacklessCoro = unsafe.Pointer(ctx)
+	executor.stacklessCoro = &ctx.gState
 
 	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize)
 	totalSize = alignUp(totalSize, sys.StackAlign)
@@ -223,7 +225,7 @@ func coroNativeStart(caller *g) {
 
 func coroNativeMain() {
 	gp := getg()
-	ctx := (*stacklessCoroNativeContext)(gp.stacklessCoro)
+	ctx := stacklessCoroNativeContextFor(gp)
 	if ctx == nil || ctx.executor != gp {
 		throw("runtime: invalid stackless coroutine executor context")
 	}
@@ -236,9 +238,12 @@ func coroNativeMain() {
 // coroNativeFinish restores the original g0 and caller. It runs on the
 // separate scheduler stack and never returns.
 func coroNativeFinish(executor *g) {
-	ctx := (*stacklessCoroNativeContext)(executor.stacklessCoro)
+	ctx := stacklessCoroNativeContextFor(executor)
 	if ctx == nil || ctx.executor != executor {
 		throw("runtime: invalid stackless coroutine native finish")
+	}
+	if ctx.gState.deferTask != nil {
+		throw("runtime: active stackless coroutine defer during native finish")
 	}
 	schedulerG := getg()
 	mp := schedulerG.m
@@ -293,6 +298,14 @@ func coroNativeFinish(executor *g) {
 	mp.g0StackAccurate = g0Accurate
 	schedulerG.m = nil
 	coroNativeGogo(&caller.sched, nativeG0)
+}
+
+func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
+	state := gp.stacklessCoro
+	if state == nil {
+		return nil
+	}
+	return (*stacklessCoroNativeContext)(state.native)
 }
 
 // resetStacklessCoroExecutor clears state that execute and gdestroy normally

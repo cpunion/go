@@ -270,6 +270,7 @@ var runtimeDecls = [...]struct {
 	{"asanregisterglobals", funcTag, 147},
 	{"KeepAlive", funcTag, 11},
 	{"coroDeferToken", funcTag, 175},
+	{"coroDeferCall", funcTag, 131},
 	{"coroDeferPanic", funcTag, 126},
 	{"coroDeferRecover", funcTag, 176},
 	{"coroGoexit", funcTag, 132},

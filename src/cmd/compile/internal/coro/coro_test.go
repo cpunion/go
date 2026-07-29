@@ -1482,6 +1482,12 @@ import (
 var trace [7]int
 var traceIndex int
 var namedValue any
+var namedArgValue any
+var namedArgTag int
+var namedDynamicValue [3]any
+var namedOriginal any
+var namedMethodValue any
+var namedMethodTag int
 
 //go:noinline
 func record(value int) {
@@ -1561,6 +1567,65 @@ func namedFallback() {
 	panic("named")
 }
 
+//go:noinline
+func namedRecoverArg(value *any, tag int) {
+	*value = recover()
+	namedArgTag = tag
+}
+
+//go:noinline
+func namedArg() {
+	defer namedRecoverArg(&namedArgValue, 23)
+	runtime.Gosched()
+	panic("named-arg")
+}
+
+//go:noinline
+func namedRecoverIndex(index int) {
+	namedDynamicValue[index] = recover()
+}
+
+//go:noinline
+func namedDynamicRecover() {
+	for i := 0; i < len(namedDynamicValue); i++ {
+		defer namedRecoverIndex(i)
+		runtime.Gosched()
+	}
+	panic("named-dynamic")
+}
+
+//go:noinline
+func namedRecoverAndReplace() {
+	namedOriginal = recover()
+	panic("named-replacement")
+}
+
+//go:noinline
+func namedReplacement() (replacement any) {
+	defer func() {
+		replacement = recover()
+	}()
+	defer namedRecoverAndReplace()
+	runtime.Gosched()
+	panic("named-original")
+}
+
+type namedReceiver struct{}
+
+//go:noinline
+func (*namedReceiver) recover(value *any, tag int) {
+	*value = recover()
+	namedMethodTag = tag
+}
+
+//go:noinline
+func namedMethod() {
+	var receiver namedReceiver
+	defer receiver.recover(&namedMethodValue, 29)
+	runtime.Gosched()
+	panic("named-method")
+}
+
 func main() {
 	original, replacement := replacement()
 	cleanup := normalCleanup()
@@ -1568,6 +1633,10 @@ func main() {
 	none := noPanic()
 	nilValue := nilPanic()
 	namedFallback()
+	namedArg()
+	namedDynamicRecover()
+	namedReplacementValue := namedReplacement()
+	namedMethod()
 	expectNil := os.Getenv("EXPECT_PANICNIL") == "1"
 	if original != "original" ||
 		replacement != "replacement" ||
@@ -1576,6 +1645,11 @@ func main() {
 		dynamic[1] != nil || dynamic[0] != nil ||
 		none != nil || (nilValue == nil) != expectNil ||
 		namedValue != "named" ||
+		namedArgValue != "named-arg" || namedArgTag != 23 ||
+		namedDynamicValue != [3]any{nil, nil, "named-dynamic"} ||
+		namedOriginal != "named-original" ||
+		namedReplacementValue != "named-replacement" ||
+		namedMethodValue != "named-method" || namedMethodTag != 29 ||
 		traceIndex != len(trace) ||
 		trace != [7]int{2, 1, 4, 3, 12, 11, 10} {
 		panic("bad recover or replacement panic result")
@@ -1602,21 +1676,24 @@ func main() {
 	if err != nil {
 		t.Fatalf("building recover coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=4 skipped=5"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=9 skipped=5"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
-	}
-	if want := "main.namedFallback: defer target has terminal control recover"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain named fallback %q\n%s", want, out)
 	}
 	if want := "main.dynamicRecover: repeated source defer literal"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain repeated literal fallback %q\n%s", want, out)
 	}
 	for _, name := range []string{
 		"replacement", "normalCleanup", "noPanic", "nilPanic",
+		"namedFallback", "namedArg", "namedDynamicRecover",
+		"namedReplacement", "namedMethod",
 	} {
 		if diagnostic := "skip main." + name + ":"; strings.Contains(out, diagnostic) {
 			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
 		}
+	}
+	if want := "main.namedRecoverAndReplace: retained ordinary terminal defer entry"; !strings.Contains(out, want) {
+		t.Errorf("output does not contain retained named target %q\n%s",
+			want, out)
 	}
 
 	cmd = testenv.Command(t, exe)
@@ -1663,6 +1740,23 @@ func main() {
 	} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("recover functions contain %q\n%s", forbidden, disassembly)
+		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.named.*`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of named recover functions failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	for _, want := range []string{
+		"runtime.coroDeferCall", "runtime.gorecover",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("named recover functions do not contain %q\n%s",
+				want, disassembly)
 		}
 	}
 }
