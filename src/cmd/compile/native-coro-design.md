@@ -1918,19 +1918,20 @@ runs, not stable performance promises.
 | one-byte socket read | 10.78 us | 25.35 us | 144 B |
 
 The direct channel benchmark performs one unbuffered stackless send/receive
-handoff. Ten 1-second samples on Darwin/arm64 Apple M4 Max compare
-the operation-goroutine implementation at the preceding channel commit with
-the shared wait-queue implementation:
+handoff. Ten 1-second samples on Darwin/arm64 Apple M4 Max and translated
+Linux/amd64 VirtualApple compare the operation-goroutine implementation at the
+preceding channel commit with the shared wait-queue implementation:
 
-| Channel implementation | Median | B/op | allocs/op |
-| --- | ---: | ---: | ---: |
-| operation goroutine | 10.06 us | 384 | 4 |
-| direct runtime wait queue | 194.85 ns | 464 | 3 |
+| Channel implementation | Darwin median | Linux median | Darwin B/op | Linux B/op | allocs/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| operation goroutine | 10.06 us | 38.186 us | 384 | 385 | 4 |
+| direct runtime wait queue | 194.85 ns | 572.9 ns | 464 | 464 | 3 |
 
-The direct path is approximately 51.6 times faster in this microbenchmark and
-removes one allocation. Its dedicated 112-byte logical `sudog` increases
-bytes per handoff by 80 relative to the worker baseline; a coroutine-specific
-waiter pool is a separate optimization after the ownership model is stable.
+The direct path is approximately 51.6 times faster on Darwin and 66.7 times
+faster on translated Linux in this microbenchmark, and removes one allocation.
+Its dedicated 112-byte logical `sudog` increases bytes per handoff by about 80
+relative to the worker baseline; a coroutine-specific waiter pool is a
+separate optimization after the ownership model is stable.
 
 A compiler-generated yield loop was also compared with the integration branch
 using 20 interleaved 500 ms samples on Darwin/arm64. The baseline and
