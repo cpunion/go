@@ -414,12 +414,31 @@ func TestLowerStateMachines(t *testing.T) {
 	socketReader.Body = []ir.Node{socketCall, newLowerTestReturn()}
 
 	osPkg := types.NewPkg("os", "os")
+	ordinaryReadResults := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+		types.NewField(src.NoXPos, nil, types.ErrorType),
+	}
 	ordinaryRead := ir.NewFunc(src.NoXPos, src.NoXPos,
-		osPkg.Lookup("(*File).Read"), types.NewSignature(nil, nil, nil))
+		osPkg.Lookup("(*File).Read"),
+		types.NewSignature(nil, nil, ordinaryReadResults))
 	ordinaryRead.DeclareParams(true)
 	ordinaryReadCall := newLowerTestCall(ordinaryRead)
+	ordinaryReadCall.SetType(ordinaryRead.Type().ResultsTuple())
 	ordinaryFileReader := newLowerTestFunc(pkg, "ordinaryFileReader")
-	ordinaryFileReader.Body = []ir.Node{ordinaryReadCall, newLowerTestReturn()}
+	ordinaryReadN := ordinaryFileReader.NewLocal(src.NoXPos,
+		pkg.Lookup("ordinaryReadN"), types.Types[types.TINT])
+	ordinaryReadErr := ordinaryFileReader.NewLocal(src.NoXPos,
+		pkg.Lookup("ordinaryReadErr"), types.ErrorType)
+	ordinaryReadAssign := ir.NewAssignListStmt(src.NoXPos,
+		ir.OAS2FUNC, ir.Nodes{ordinaryReadN, ordinaryReadErr},
+		ir.Nodes{ordinaryReadCall})
+	ordinaryReadAssign.SetTypecheck(1)
+	ordinaryFileReader.Body = []ir.Node{
+		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadN),
+		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadErr),
+		ordinaryReadAssign,
+		newLowerTestReturn(),
+	}
 
 	asyncParams := []*types.Field{
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
@@ -694,6 +713,179 @@ func TestLowerStateMachines(t *testing.T) {
 		dynamicDeferDecl, dynamicLoop, newLowerTestReturn(),
 	}
 
+	repeatedParamField := types.NewField(src.NoXPos,
+		pkg.Lookup("repeatedParam"), types.Types[types.TINT])
+	repeatedResultField := types.NewField(src.NoXPos,
+		pkg.Lookup("repeatedResult"), types.Types[types.TINT])
+	repeatedDeferred := ir.NewFunc(src.NoXPos, src.NoXPos,
+		pkg.Lookup("repeatedDeferred"), types.NewSignature(nil,
+			[]*types.Field{repeatedParamField},
+			[]*types.Field{repeatedResultField}))
+	repeatedDeferred.DeclareParams(true)
+	repeatedParam := repeatedParamField.Nname.(*ir.Name)
+	repeatedResult := repeatedResultField.Nname.(*ir.Name)
+	repeatedLocal := repeatedDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedLocal"), types.Types[types.TINT])
+	repeatedDecl := ir.NewDecl(src.NoXPos, ir.ODCL, repeatedLocal)
+	repeatedAssign := ir.NewAssignStmt(src.NoXPos, repeatedLocal,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(7)))
+	repeatedAssign.Def = true
+	repeatedAssign.SetTypecheck(1)
+	repeatedLocal.Defn = repeatedAssign
+	repeatedInitLocal := repeatedDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedInitLocal"), types.Types[types.TINT])
+	repeatedInitDecl := ir.NewDecl(src.NoXPos, ir.ODCL,
+		repeatedInitLocal)
+	repeatedInitAssign := ir.NewAssignStmt(src.NoXPos,
+		repeatedInitLocal, ir.NewBasicLit(src.NoXPos,
+			types.Types[types.TINT], constant.MakeInt64(8)))
+	repeatedInitAssign.Def = true
+	repeatedInitAssign.SetTypecheck(1)
+	repeatedInitAssign.SetInit(ir.Nodes{repeatedInitDecl})
+	repeatedInitLocal.Defn = repeatedInitAssign
+	repeatedImplicit := repeatedDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedImplicit"), types.Types[types.TINT])
+	repeatedImplicitAssign := ir.NewAssignStmt(src.NoXPos,
+		repeatedImplicit, ir.NewBasicLit(src.NoXPos,
+			types.Types[types.TINT], constant.MakeInt64(9)))
+	repeatedImplicitAssign.Def = true
+	repeatedImplicitAssign.SetTypecheck(1)
+	repeatedImplicit.Defn = repeatedImplicitAssign
+	repeatedListFirst := repeatedDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedListFirst"), types.Types[types.TINT])
+	repeatedListSecond := repeatedDeferred.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedListSecond"), types.Types[types.TINT])
+	repeatedListAssign := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{repeatedListFirst, repeatedListSecond},
+		ir.Nodes{
+			ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(10)),
+			ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(11)),
+		})
+	repeatedListAssign.Def = true
+	repeatedListAssign.SetTypecheck(1)
+	repeatedListFirst.Defn = repeatedListAssign
+	repeatedListSecond.Defn = repeatedListAssign
+	repeatedResultAssign := ir.NewAssignStmt(src.NoXPos,
+		repeatedResult, repeatedParam)
+	repeatedResultAssign.SetTypecheck(1)
+
+	repeatedLiteral := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+		ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+		repeatedDeferred, typecheck.Target, 0)
+	repeatedLiteral.DeclareParams(true)
+	repeatedLocalCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedLocal)
+	repeatedParamCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedParam)
+	repeatedResultCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedResult)
+	repeatedInitCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedInitLocal)
+	repeatedImplicitCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedImplicit)
+	repeatedListFirstCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedListFirst)
+	repeatedListSecondCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedLiteral, repeatedListSecond)
+	repeatedTarget := ir.NewNameAt(src.NoXPos,
+		pkg.Lookup("repeatedTarget"), types.Types[types.TINT])
+	repeatedTarget.Class = ir.PEXTERN
+	for _, value := range []*ir.Name{
+		repeatedLocalCapture, repeatedParamCapture, repeatedResultCapture,
+		repeatedInitCapture, repeatedImplicitCapture,
+		repeatedListFirstCapture, repeatedListSecondCapture,
+	} {
+		assign := ir.NewAssignStmt(src.NoXPos, repeatedTarget, value)
+		assign.SetTypecheck(1)
+		repeatedLiteral.Body = append(repeatedLiteral.Body, assign)
+	}
+	repeatedDeferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		repeatedLiteral.OClosure, nil)
+	repeatedDeferCall.SetTypecheck(1)
+	repeatedDeferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER,
+		repeatedDeferCall)
+	repeatedDeferStmt.SetTypecheck(1)
+	repeatedSecondLiteral := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+		ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+		repeatedDeferred, typecheck.Target, 0)
+	repeatedSecondLiteral.DeclareParams(true)
+	repeatedSecondCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedSecondLiteral, repeatedLocal)
+	repeatedSecondStore := ir.NewAssignStmt(src.NoXPos,
+		repeatedTarget, repeatedSecondCapture)
+	repeatedSecondStore.SetTypecheck(1)
+	repeatedSecondLiteral.Body = ir.Nodes{repeatedSecondStore}
+	repeatedSecondCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		repeatedSecondLiteral.OClosure, nil)
+	repeatedSecondCall.SetTypecheck(1)
+	repeatedSecondStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER,
+		repeatedSecondCall)
+	repeatedSecondStmt.SetTypecheck(1)
+	repeatedYield := newLowerTestCall(yield)
+	repeatedLoop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(false)),
+		nil, ir.Nodes{
+			repeatedDecl, repeatedAssign, repeatedInitAssign,
+			repeatedImplicitAssign, repeatedListAssign,
+			repeatedDeferStmt, repeatedSecondStmt, repeatedYield,
+		}, false)
+	repeatedLoop.SetTypecheck(1)
+	repeatedDeferred.Body = ir.Nodes{
+		repeatedResultAssign, repeatedLoop, newLowerTestReturn(),
+	}
+
+	repeatedRead := newLowerTestFunc(pkg, "repeatedRead")
+	repeatedReadN := repeatedRead.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedReadN"), types.Types[types.TINT])
+	repeatedReadErr := repeatedRead.NewLocal(src.NoXPos,
+		pkg.Lookup("repeatedReadErr"), types.ErrorType)
+	repeatedReadNDecl := ir.NewDecl(src.NoXPos, ir.ODCL, repeatedReadN)
+	repeatedReadErrDecl := ir.NewDecl(src.NoXPos, ir.ODCL,
+		repeatedReadErr)
+	repeatedReadCall := newLowerTestCall(ordinaryRead)
+	repeatedReadCall.SetType(ordinaryRead.Type().ResultsTuple())
+	repeatedReadAssign := ir.NewAssignListStmt(src.NoXPos,
+		ir.OAS2FUNC, ir.Nodes{repeatedReadN, repeatedReadErr},
+		ir.Nodes{repeatedReadCall})
+	repeatedReadAssign.SetTypecheck(1)
+	repeatedReadLiteral := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+		ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+		repeatedRead, typecheck.Target, 0)
+	repeatedReadLiteral.DeclareParams(true)
+	repeatedReadNCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedReadLiteral, repeatedReadN)
+	repeatedReadErrCapture := ir.NewClosureVar(src.NoXPos,
+		repeatedReadLiteral, repeatedReadErr)
+	repeatedReadNStore := ir.NewAssignStmt(src.NoXPos,
+		repeatedTarget, repeatedReadNCapture)
+	repeatedReadNStore.SetTypecheck(1)
+	repeatedReadErrStore := ir.NewAssignStmt(src.NoXPos,
+		ir.BlankNode, repeatedReadErrCapture)
+	repeatedReadErrStore.SetTypecheck(1)
+	repeatedReadLiteral.Body = ir.Nodes{
+		repeatedReadNStore, repeatedReadErrStore,
+	}
+	repeatedReadDeferCall := ir.NewCallExpr(src.NoXPos,
+		ir.OCALLFUNC, repeatedReadLiteral.OClosure, nil)
+	repeatedReadDeferCall.SetTypecheck(1)
+	repeatedReadDeferStmt := ir.NewGoDeferStmt(src.NoXPos,
+		ir.ODEFER, repeatedReadDeferCall)
+	repeatedReadDeferStmt.SetTypecheck(1)
+	repeatedReadYield := newLowerTestCall(yield)
+	repeatedReadLoop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TBOOL],
+			constant.MakeBool(false)),
+		nil, ir.Nodes{
+			repeatedReadNDecl, repeatedReadErrDecl, repeatedReadAssign,
+			repeatedReadDeferStmt, repeatedReadYield,
+		}, false)
+	repeatedReadLoop.SetTypecheck(1)
+	repeatedRead.Body = ir.Nodes{repeatedReadLoop, newLowerTestReturn()}
+
 	functions := map[*ir.Func]*Function{
 		child: {
 			Func:    child,
@@ -944,13 +1136,61 @@ func TestLowerStateMachines(t *testing.T) {
 			Func:    dynamicDeferWrapper,
 			Primary: PlainPrimary,
 		},
+		repeatedDeferred: {
+			Func:    repeatedDeferred,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{
+				{
+					Kind: DeferCall, Callee: repeatedLiteral,
+					CalleeName: symbolName(repeatedLiteral.Nname),
+					Node:       repeatedDeferCall,
+				},
+				{
+					Kind: DeferCall, Callee: repeatedSecondLiteral,
+					CalleeName: symbolName(repeatedSecondLiteral.Nname),
+					Node:       repeatedSecondCall,
+				},
+			},
+			Sites: []Site{{
+				ID: 1, Kind: SiteYield, Node: repeatedYield,
+			}},
+		},
+		repeatedLiteral: {
+			Func:    repeatedLiteral,
+			Primary: PlainPrimary,
+		},
+		repeatedSecondLiteral: {
+			Func:    repeatedSecondLiteral,
+			Primary: PlainPrimary,
+		},
+		repeatedRead: {
+			Func:    repeatedRead,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DeferCall, Callee: repeatedReadLiteral,
+				CalleeName: symbolName(repeatedReadLiteral.Nname),
+				Node:       repeatedReadDeferCall,
+			}},
+			Sites: []Site{
+				{ID: 1, Kind: SiteFile, Node: repeatedReadCall},
+				{ID: 2, Kind: SiteYield, Node: repeatedReadYield},
+			},
+		},
+		repeatedReadLiteral: {
+			Func:    repeatedReadLiteral,
+			Primary: PlainPrimary,
+		},
 	}
 	result, err := Lower(&Plan{Functions: functions})
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 17 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want 17 lowered and 0 skipped", result)
+	if result.Lowered != 19 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want 19 lowered and 0 skipped", result)
 	}
 	var noSplitResumes int
 	for _, generated := range typecheck.Target.Funcs {
@@ -1074,6 +1314,85 @@ func TestLowerStateMachines(t *testing.T) {
 			appends, clearedEntries)
 	}
 
+	var repeatedFactory, repeatedResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.Sym().Name == "repeatedDeferred.coro" {
+			repeatedFactory = generated
+		}
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "repeatedDeferred.coro" {
+			repeatedResume = generated
+		}
+	}
+	if repeatedFactory == nil || repeatedResume == nil {
+		t.Fatalf("repeated source defer generated factory=%v resume=%v",
+			repeatedFactory, repeatedResume)
+	}
+	countNew := func(fn *ir.Func) int {
+		count := 0
+		ir.Visit(fn, func(node ir.Node) {
+			if node.Op() == ir.ONEW {
+				count++
+			}
+		})
+		return count
+	}
+	if got := countNew(repeatedFactory); got != 2 {
+		t.Errorf("repeated source defer factory allocations = %d, want 2", got)
+	}
+	if got := countNew(repeatedResume); got != 5 {
+		t.Errorf("repeated source defer resume allocations = %d, want 5", got)
+	}
+	if len(repeatedLiteral.ClosureVars) != 7 {
+		t.Fatalf("repeated literal captures = %d, want 7",
+			len(repeatedLiteral.ClosureVars))
+	}
+	for _, capture := range repeatedLiteral.ClosureVars {
+		if capture.Type() == nil || !capture.Type().IsPtr() ||
+			capture.Type().Elem() != types.Types[types.TINT] {
+			t.Errorf("repeated literal capture type = %v, want *int",
+				capture.Type())
+		}
+	}
+	if len(repeatedSecondLiteral.ClosureVars) != 1 ||
+		!repeatedSecondLiteral.ClosureVars[0].Type().IsPtr() {
+		t.Errorf("second repeated literal captures = %v, want one pointer",
+			repeatedSecondLiteral.ClosureVars)
+	}
+
+	var repeatedReadResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "repeatedRead.coro" {
+			repeatedReadResume = generated
+			break
+		}
+	}
+	if repeatedReadResume == nil {
+		t.Fatal("repeated read has no generated resume function")
+	}
+	var readResultStores int
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.ClosureParent != repeatedReadResume {
+			continue
+		}
+		ir.Visit(generated, func(node ir.Node) {
+			assign, ok := node.(*ir.AssignListStmt)
+			if !ok {
+				return
+			}
+			for _, target := range assign.Lhs {
+				if _, ok := target.(*ir.StarExpr); ok {
+					readResultStores++
+				}
+			}
+		})
+	}
+	if readResultStores != 2 {
+		t.Errorf("repeated read pointer result stores = %d, want 2",
+			readResultStores)
+	}
+
 	var runResume *ir.Func
 	for _, generated := range typecheck.Target.Funcs {
 		if generated.OClosure != nil && generated.ClosureParent != nil &&
@@ -1174,6 +1493,7 @@ func TestLowerStateMachines(t *testing.T) {
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
 		ordinaryFileReader, asyncCaller, foreignCaller, runToCompletion,
 		runSingle, runStructured, structured, deferred, dynamicDeferred,
+		repeatedDeferred, repeatedRead,
 	} {
 		if len(fn.Body) != 2 {
 			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
@@ -4169,18 +4489,6 @@ func TestLowerRejectsUnsupportedDefers(t *testing.T) {
 			},
 			want: "defer target has terminal control recover",
 		},
-		{
-			name:    "repeated-literal",
-			closure: true,
-			loop:    true,
-			edge: func(callee *ir.Func, call *ir.CallExpr) []Edge {
-				return []Edge{{
-					Kind: DeferCall, Callee: callee,
-					CalleeName: symbolName(callee.Nname), Node: call,
-				}}
-			},
-			want: "repeated source defer literal",
-		},
 	}
 
 	for _, tc := range tests {
@@ -4225,6 +4533,106 @@ func TestLowerRejectsUnsupportedDefers(t *testing.T) {
 				t.Fatalf("newLowerCandidate error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLowerRepeatedSourceLiteral(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/repeatedliteral",
+		"repeatedliteral")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	newCandidate := func(nested, missingType bool) (*lowerCandidate, error) {
+		fn := newLowerTestFunc(pkg, "caller")
+		sourceType := types.Types[types.TINT]
+		if missingType {
+			sourceType = nil
+		}
+		source := fn.NewLocal(src.NoXPos, pkg.Lookup("source"),
+			sourceType)
+		literal := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+			ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+			fn, typecheck.Target, 0)
+		literal.DeclareParams(true)
+		captured := ir.NewClosureVar(src.NoXPos, literal, source)
+
+		target := ir.NewNameAt(src.NoXPos, pkg.Lookup("target"),
+			types.Types[types.TINT])
+		target.Class = ir.PEXTERN
+		body := ir.Node(ir.NewAssignStmt(src.NoXPos, target, captured))
+		if nested {
+			closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos,
+				ir.OCLOSURE, types.NewSignature(nil, nil, nil),
+				literal, typecheck.Target, 0)
+			closure.DeclareParams(true)
+			nestedCapture := ir.NewClosureVar(src.NoXPos, closure, captured)
+			closure.Body = ir.Nodes{
+				ir.NewAssignStmt(src.NoXPos, target, nestedCapture),
+			}
+			call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+				closure.OClosure, nil)
+			call.SetTypecheck(1)
+			body = call
+		}
+		literal.Body = ir.Nodes{body}
+
+		deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+			literal.OClosure, nil)
+		deferCall.SetTypecheck(1)
+		deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER,
+			deferCall)
+		deferStmt.SetTypecheck(1)
+		loop := ir.NewForStmt(src.NoXPos, nil,
+			ir.NewBool(src.NoXPos, false), nil,
+			ir.Nodes{deferStmt}, false)
+		yield := newLowerTestFunc(pkg, "yield")
+		yieldCall := newLowerTestCall(yield)
+		fn.Body = ir.Nodes{loop, yieldCall, newLowerTestReturn()}
+
+		function := &Function{
+			Func:    fn,
+			Local:   MaySuspend,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+			Edges: []Edge{{
+				Kind: DeferCall, Callee: literal,
+				CalleeName: symbolName(literal.Nname), Node: deferCall,
+			}},
+			Sites: []Site{{
+				ID: 1, Kind: SiteYield, Node: yieldCall,
+			}},
+		}
+		plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+		return newLowerCandidate(plan, function)
+	}
+
+	candidate, err := newCandidate(false, false)
+	if err != nil {
+		t.Fatalf("newLowerCandidate rejected repeated literal: %v", err)
+	}
+	if len(candidate.defers) != 1 ||
+		!candidate.defers[0].sourceLiteral ||
+		len(candidate.defers[0].literalCaptures) != 1 {
+		t.Fatalf("repeated literal candidate = %+v", candidate.defers)
+	}
+
+	if _, err := newCandidate(true, false); err == nil ||
+		!strings.Contains(err.Error(), "nested repeated source defer capture") {
+		t.Fatalf("nested repeated literal error = %v", err)
+	}
+	if _, err := newCandidate(false, true); err == nil ||
+		!strings.Contains(err.Error(),
+			"repeated source defer capture has no type") {
+		t.Fatalf("untyped repeated literal error = %v", err)
 	}
 }
 
@@ -4300,6 +4708,74 @@ func TestLowerParametersAndResults(t *testing.T) {
 	}
 	if result.Lowered != 2 || result.Skipped != 0 {
 		t.Fatalf("Lower result = %+v, want 2 lowered and 0 skipped", result)
+	}
+}
+
+func TestLowerAcceptsAwaitInStructuredBody(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/structuredawait",
+		"structuredawait")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	resultField := types.NewField(src.NoXPos, nil,
+		types.Types[types.TINT])
+	leaf := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("leaf"),
+		types.NewSignature(nil, nil, []*types.Field{resultField}))
+	leaf.DeclareParams(true)
+	caller := newLowerTestFunc(pkg, "caller")
+	target := caller.NewLocal(src.NoXPos, pkg.Lookup("target"),
+		types.Types[types.TINT])
+	decl := ir.NewDecl(src.NoXPos, ir.ODCL, target)
+	call := newLowerTestCall(leaf)
+	call.SetType(types.Types[types.TINT])
+	assign := ir.NewAssignStmt(src.NoXPos, target, call)
+	assign.SetTypecheck(1)
+	ifStmt := ir.NewIfStmt(src.NoXPos,
+		ir.NewBool(src.NoXPos, true), ir.Nodes{decl, assign}, nil)
+	ifStmt.SetTypecheck(1)
+	block := ir.NewBlockStmt(src.NoXPos, ir.Nodes{ifStmt})
+	block.SetTypecheck(1)
+	loop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBool(src.NoXPos, false), nil, ir.Nodes{block}, false)
+	loop.SetTypecheck(1)
+	caller.Body = ir.Nodes{loop, newLowerTestReturn()}
+
+	function := &Function{
+		Func:    caller,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: leaf,
+			CalleeName: symbolName(leaf.Nname), Node: call,
+		}},
+		Sites: []Site{{
+			ID: 1, Kind: SiteAwait, Node: call,
+		}},
+	}
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		caller: function,
+		leaf: {
+			Func:    leaf,
+			Effect:  MaySuspend,
+			Primary: CoroPrimary,
+		},
+	}}
+	candidate, err := newLowerCandidate(plan, function)
+	if err != nil {
+		t.Fatalf("newLowerCandidate rejected structured await: %v", err)
+	}
+	if candidate.transitions[call] != SiteAwait {
+		t.Fatalf("structured await transition = %v, want await",
+			candidate.transitions[call])
 	}
 }
 

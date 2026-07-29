@@ -3,14 +3,15 @@
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
 `-d=coro=4`; transparent scalar cgo direct calls, fixed and repeated
 simple-loop defer cleanup for normal return and explicit panic, direct recover
-and replacement panic in fixed local defer literals and statically resolved
-local or imported named defer targets, typed structured panic propagation, and
-implicit runtime panic capture across lowered and ordinary synchronous calls;
-sticky Goexit cleanup and propagation including fixed local defer literals and
-statically resolved local or imported named defer targets; direct deferred
-Goexit; operation-progress follow-ups; nested multi-result and conservatively
-normalized single-result expressions; and restricted compiler-private
-cross-package factory and defer entries are implemented; not production-ready
+and replacement panic in fixed or repeated local defer literals and
+statically resolved local or imported named defer targets, typed structured
+panic propagation, and implicit runtime panic capture across lowered and
+ordinary synchronous calls; sticky Goexit cleanup and propagation including
+fixed or repeated local defer literals and statically resolved local or
+imported named defer targets; direct deferred Goexit; operation-progress
+follow-ups; nested multi-result and conservatively normalized single-result
+expressions; and restricted compiler-private cross-package factory and defer
+entries are implemented; not production-ready
 
 Last updated: 2026-07-29
 
@@ -1001,8 +1002,8 @@ ordinary outer recover cannot accidentally cancel Goexit.
 
 Conditional fixed defer sites and repeated sites in simple loops are
 supported. The compiler still rejects an open function-value target and a
-suspending, unknown-effect, or execution-constrained defer target. A fixed
-local defer literal may directly call `recover`, panic, or call
+suspending, unknown-effect, or execution-constrained defer target. A fixed or
+repeated local defer literal may directly call `recover`, panic, or call
 `runtime.Goexit`. Its terminal operations are rewritten to use a stable opaque
 task token during cleanup, so recover clears the pending structured panic and
 a later panic starts or replaces it. A rewritten Goexit clears the active
@@ -1053,14 +1054,40 @@ scope only while invoking the named defer target.
 Cleanup queries the runtime-owned outcome after every defer; `panic(nil)`
 follows the ordinary Go default and `GODEBUG=panicnil=1` semantics. Missing or
 unknown defer capabilities, open function values, invalid indirect recover,
-and targets with unsupported effects retain the ordinary Go path. Repeated
-source defer literals do too, because their by-reference and per-iteration
-capture identity is not equivalent to the evaluated-argument snapshots used
-by compiler-generated wrappers. The LIFO stack therefore contains only
-compiler-generated wrappers with statically validated provenance; it does not
-enable general dynamic source calls. A stackless `go` edge inside a terminal
-named target and a `go` target that may explicitly panic also retain the
-ordinary Go path.
+and targets with unsupported effects retain the ordinary Go path.
+
+Repeated source defer literals preserve Go's by-reference and
+per-declaration-execution capture identity with typed cells. For each captured
+logical variable, the factory owns a current `*T` cell slot. Parameter and
+named-result cells are allocated at factory entry; a local receives a new cell
+when its source declaration executes, including each loop iteration. All
+lowered uses of the logical variable dereference the current cell. Registering
+the defer snapshots the current cell pointer, not its value, into the literal.
+Consequently, registrations from different iterations retain different
+storage, literals registered in the same iteration share storage, mutations
+after registration remain visible, and taking the variable's address retains
+ordinary identity. The cells and snapshots remain typed GC roots.
+
+This first slice covers declarations already represented in the supported
+structured body and initialization forms. Directly capturing a `for` induction
+variable can make the frontend loop-variable pass introduce an unlabeled
+`break`; that function retains its ordinary entry until branch lowering is
+implemented.
+
+The same result target is used for an awaited coroutine assignment. An
+ordinary `os.File.Read` or supported network read worker captures the typed
+cell pointer and writes through it before publishing completion. A source
+literal may directly recover, panic, or call Goexit; the existing terminal
+rewrite is applied after its captures have been redirected through the
+snapshotted cells.
+
+The LIFO stack therefore admits compiler-generated wrappers and statically
+known source literals whose captures have this cell representation; it does
+not enable open dynamic calls. A nested closure inside a repeated literal that
+recaptures one of these variables remains rejected until the cell pointer can
+be propagated through every nested environment. A stackless `go` edge inside
+a terminal named target and a `go` target that may explicitly panic also
+retain the ordinary Go path.
 
 A native panic raised by an implicit fault or an ordinary synchronous callee
 is recovered at the queue-driving boundary, not by a defer installed around
@@ -1078,7 +1105,8 @@ semantics. A native panic raised during cleanup replaces the active panic and
 overlays, without erasing, a pending Goexit. The recovery boundary does not
 consume the runtime's own Goexit unwind marker.
 
-The remaining phase is repeated-literal capture ownership.
+Repeated-literal capture ownership is implemented. Nested closure-environment
+propagation remains a separate general-closure task.
 
 ### 11.2 Channels and synchronization
 
@@ -1252,22 +1280,26 @@ The first automatic lowering supports:
 - implicit nil, bounds, divide, and synchronous-callee panics through
   structured calls;
 - direct recover and replacement panic in fixed local defer literals and
-  statically resolved local or imported named defer targets;
+  repeated source defer literals, and statically resolved local or imported
+  named defer targets;
 - direct Goexit cleanup through structured calls and isolated spawned
   logical goroutines;
 - Goexit in fixed local defer literals, direct deferred Goexit, and statically
-  resolved local or imported named defer targets, including frontend argument
-  and method wrappers, ignored results, repeated named registrations,
-  target-owned cleanup, parent recover, replacement panic, and indirect
-  terminal calls through certified structured dependencies.
+  resolved local or imported named defer targets, including repeated source
+  literals, frontend argument and method wrappers, ignored results, repeated
+  named registrations, target-owned cleanup, parent recover, replacement
+  panic, and indirect terminal calls through certified structured
+  dependencies.
 
 It initially rejects:
 
 - open interface or function-value calls;
-- repeated source defer literals using terminal control, indirect
+- nested closures that recapture a repeated source literal's cell, indirect
   recover-capable helpers, missing or unknown defer-entry capabilities, a
   stackless `go` edge inside a terminal named defer target, and a spawned
   target that may explicitly panic;
+- direct capture of a `for` induction variable when frontend loop-variable
+  rewriting introduces unsupported branch control;
 - reflection;
 - closures with escaping environments;
 - variadic C calls;
@@ -1512,15 +1544,21 @@ The compiler:
   panic to its parent, runs each frame's fixed or repeated defers in one
   shared cleanup state, and re-raises the root outcome on an ordinary Go
   stack;
-- lowers direct recover and replacement panic in a fixed local defer literal
-  through a stable task token, uses the ordinary entry for certified local or
-  imported recover-only named targets, and uses a private nested factory for
-  certified named targets that may panic, with ordinary `panic(nil)`
-  compatibility;
+- represents every logical variable captured by a repeated source defer
+  literal with a factory-owned typed current-cell slot, allocates local cells
+  at declaration execution, snapshots the current pointer at registration,
+  and rewrites literal references through that pointer; parameters, named
+  results, address identity, post-registration mutation, LIFO sharing, and GC
+  scanning therefore retain Go semantics;
+- lowers direct recover and replacement panic in a fixed or repeated local
+  defer literal through a stable task token, uses the ordinary entry for
+  certified local or imported recover-only named targets, and uses a private
+  nested factory for certified named targets that may panic, with ordinary
+  `panic(nil)` compatibility;
 - lowers `runtime.Goexit` from a compiler-owned operation recipe, propagates
   its sticky outcome through structured calls, and isolates it at a detached
   stackless `go` boundary;
-- rewrites Goexit in a fixed local defer literal or direct
+- rewrites Goexit in a fixed or repeated local defer literal or direct
   `defer runtime.Goexit()` to an immediate task-owned terminal return, and
   invokes a statically resolved local or imported named target through its
   private factory and a nested run-to-completion scheduler, preserving
@@ -1537,6 +1575,9 @@ The compiler:
 - explicitly declares source locals moved into generated factories, ensuring
   that locals captured across a child suspension receive typed heap storage
   even when the source declaration was implicit;
+- carries captured-cell result targets through structured awaits and through
+  supported ordinary file or network read workers, so asynchronous result
+  publication writes the declaration instance selected before suspension;
 - rejects unsupported control flow deterministically and removes callers whose
   stackless dependencies cannot be lowered;
 - recognizes the narrow `time.Sleep`, `os.File.Read`, and
@@ -1663,6 +1704,13 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   4,096 independently captured heap pointers during 50 concurrent forced GCs,
   and covers the greater-than-128-byte capture path that escape analysis
   retains through a per-registration heap cell;
+- repeated source defer literals with parameter and named-result sharing,
+  zero-valued and initialized locals, per-iteration declaration identity,
+  multiple literals sharing one cell, mutation after registration, address
+  equality, single- and multi-result structured awaits, and LIFO cleanup;
+  a source-literal pointer-retention probe runs alongside the same 50 forced
+  GCs, and an ordinary file-read probe verifies that asynchronous `n` and
+  `error` results are written through the selected iteration's cells;
 - fixed local defer literals and local named targets that recover an original
   panic, replace it with another panic, recover the replacement in an earlier
   defer, panic during normal-return cleanup, call recover without a panic, and
@@ -1694,9 +1742,9 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   and object inspection verifies imported private factories and task-owned
   Goexit rewriting;
 - deterministic ordinary-path fallback for indirect recover helpers, missing
-  or unknown defer capabilities, repeated source defer literals using
-  recover, a stackless `go` edge inside a named defer target, and a stackless
-  `go` target that may explicitly panic;
+  or unknown defer capabilities, nested closures that recapture a repeated
+  source literal's cell, a stackless `go` edge inside a named defer target,
+  and a stackless `go` target that may explicitly panic;
 - ordinary callers, missing capabilities, and complex multi-result targets
   retain the public Go entry and execute correctly; an effectful destination
   probe verifies left-before-right evaluation order, and decoder tests verify
@@ -1751,6 +1799,15 @@ For the repeated-defer follow-up, the complete coroutine compiler package is
 production statements in `lower.go` (100%). The real object, panic, GC, and
 large-capture checks run as end-to-end subprocess tests in addition to that
 instrumented unit coverage.
+
+For the repeated-source-literal follow-up, the complete coroutine compiler
+package is 92.5% covered. The complete profile covers 164 of 167 changed
+production statements in `lower.go` (98.2%). The three uncovered statements
+reject malformed untyped dynamic-wrapper captures, a non-name fixed-wrapper
+capture, and an impossible ordinary-read result expression. End-to-end tests
+add real single- and multi-result awaits, file-read worker publication,
+terminal cleanup, address identity, and concurrent-GC coverage that is not
+credited to the in-process profile.
 
 For the direct-recover follow-up, the complete coroutine compiler package is
 90.0% covered. Focused profiles cover 69 of 72 changed compiler statements
@@ -1894,45 +1951,43 @@ reported separately above.
 ### 15.4 Remaining restrictions
 
 The MVP does not yet support range loops, labeled control flow, dynamic calls,
-interfaces, escaping closures, terminal control in repeated source defer
-literals, indirect recover-capable helpers, stackless `go` edges in terminal
-named defer targets, explicit panic from a non-structured spawned task,
-channels, select, mutex parking, reflection, callbacks, variadic C calls, or
-general C ABI type classification. Explicit and implicit panic and Goexit
+interfaces, unlabeled branch control including frontend loop-variable
+rewrites, general escaping closures, nested closures that recapture a
+repeated-literal cell, indirect recover-capable helpers, stackless `go` edges
+in terminal named defer targets, explicit panic from a non-structured spawned
+task, channels, select, mutex parking, reflection, callbacks, variadic C calls,
+or general C ABI type classification. Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
-spawned logical goroutine, fixed or repeated-simple-loop defer cleanup, direct
-recover or replacement panic, direct deferred Goexit, and statically resolved
-local or imported named terminal targets are supported. The terminal target
-may reach panic or Goexit through certified indirect structured calls. Direct
-foreign declarations now have a restricted transparent cgo path, but
-floating-point, aggregate, variadic, callback-capable, errno, and non-target
-ABIs retain ordinary cgo. Cross-package factory ABI 1 excludes interface and
-method-value calls, closures, and generic shapes. Frontend-normalized nested
-multi-result calls and conservatively normalized single-result calls are
-supported. Short-circuit right operands, loop condition and post expressions,
-effectful expression prefixes, and complex result targets remain on the
-ordinary entry until general expression, control-flow, and assignment
-lowering exists. Logical traceback, debugger, profiler, race instrumentation
-on native executor stacks, dynamic executor sizing, cancellation of in-flight
-file work, and broad standard-library compatibility remain future work.
+spawned logical goroutine, fixed or repeated-simple-loop defer cleanup,
+terminal control and typed capture ownership in repeated source literals,
+direct deferred Goexit, and statically resolved local or imported named
+terminal targets are supported. The terminal target may reach panic or Goexit
+through certified indirect structured calls. Direct foreign declarations now
+have a restricted transparent cgo path, but floating-point, aggregate,
+variadic, callback-capable, errno, and non-target ABIs retain ordinary cgo.
+Cross-package factory ABI 1 excludes interface and method-value calls,
+closures, and generic shapes. Frontend-normalized nested multi-result calls and
+conservatively normalized single-result calls are supported. Short-circuit
+right operands, loop condition and post expressions, effectful expression
+prefixes, and complex result targets remain on the ordinary entry until
+general expression, control-flow, and assignment lowering exists. Logical
+traceback, debugger, profiler, race instrumentation on native executor stacks,
+dynamic executor sizing, cancellation of in-flight file work, and broad
+standard-library compatibility remain future work.
 
 ## 16. Work after the MVP
 
 The likely order is:
 
-1. complete panic, defer, and recover lowering; fixed and
-   repeated-simple-loop defer cleanup, explicit typed panic outcomes, implicit
-   panic capture, direct recover or replacement panic in fixed local defer
-   literals and local or imported named targets, sticky Goexit propagation,
-   direct deferred Goexit, and indirect panic or Goexit calls through
-   certified named targets are implemented; repeated-literal capture ownership
-   remains;
-2. add channels, select, mutexes, semaphores, and runtime notes;
-3. generalize System ABI type classification and errno handling;
-4. extend expression and assignment normalization to short-circuit control,
-   loop conditions, and effectful destinations, then extend the
-   compiler-private factory ABI only with matching closure and generic
-   lowering; do not add source annotations or per-call policy metadata;
+1. add channels, select, mutexes, semaphores, and runtime notes;
+2. generalize System ABI type classification and errno handling;
+3. extend expression, assignment, and branch normalization to short-circuit
+   control, loop conditions, frontend loop-variable rewrites, and effectful
+   destinations, then extend the compiler-private factory ABI only with
+   matching closure and generic lowering; do not add source annotations or
+   per-call policy metadata;
+4. propagate repeated-literal cell pointers through nested closure
+   environments as part of general closure lowering;
 5. add dynamic function values, interfaces, closures, generics, and reflect;
 6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;

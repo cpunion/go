@@ -52,6 +52,8 @@ type lowerDefer struct {
 	statement       *ir.GoDeferStmt
 	call            *ir.CallExpr
 	armed           *ir.Name
+	sourceLiteral   bool
+	literalCaptures []*ir.Name
 	rewriteTerminal TerminalFlags
 	terminalTarget  *ir.Func
 	namedRecover    bool
@@ -61,7 +63,7 @@ type lowerDefer struct {
 }
 
 type lowerDeferCapture struct {
-	source   *ir.Name
+	source   ir.Node
 	snapshot *ir.Name
 }
 
@@ -288,12 +290,23 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			// Init list. Record the assignment that directly owns each call
 			// so lowering can detach that Init list without treating the
 			// surrounding statement as the result destination.
-			ir.Visit(stmt, func(node ir.Node) {
-				call := recordAssignmentCall(node)
-				if call != nil && awaitContainers[call] == nil {
-					awaitContainers[call] = stmt
-				}
-			})
+			containers := ir.Nodes{stmt}
+			switch stmt := stmt.(type) {
+			case *ir.BlockStmt:
+				containers = nil
+			case *ir.IfStmt:
+				containers = ir.Nodes{stmt.Cond}
+			case *ir.ForStmt:
+				containers = ir.Nodes{stmt.Cond}
+			}
+			for _, root := range containers {
+				ir.Visit(root, func(node ir.Node) {
+					call := recordAssignmentCall(node)
+					if call != nil && awaitContainers[call] == nil {
+						awaitContainers[call] = stmt
+					}
+				})
+			}
 			switch stmt := stmt.(type) {
 			case *ir.CallExpr:
 				statementCalls[stmt] = true
@@ -533,7 +546,35 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("defer wrapper has no target")
 			}
 			if !edge.Callee.Wrapper() && dynamicDefers {
-				return nil, fmt.Errorf("repeated source defer literal")
+				deferred.sourceLiteral = true
+				deferred.literalCaptures = slices.Clone(
+					edge.Callee.ClosureVars)
+				captured := make(map[*ir.Name]bool,
+					len(deferred.literalCaptures))
+				for _, variable := range deferred.literalCaptures {
+					source := variable.Canonical()
+					if source == nil || source.Type() == nil {
+						return nil, fmt.Errorf(
+							"repeated source defer capture has no type")
+					}
+					captured[source] = true
+				}
+				nested := false
+				ir.Visit(edge.Callee, func(node ir.Node) {
+					closure, ok := node.(*ir.ClosureExpr)
+					if !ok || closure.Func == edge.Callee {
+						return
+					}
+					for _, variable := range closure.Func.ClosureVars {
+						if captured[variable.Canonical()] {
+							nested = true
+						}
+					}
+				})
+				if nested {
+					return nil, fmt.Errorf(
+						"nested repeated source defer capture")
+				}
 			}
 		}
 		if summary.Terminal != 0 {
@@ -1505,6 +1546,55 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	}
 
+	captureCells := make(map[*ir.Name]*ir.Name)
+	captureStorage := make(map[*ir.Name]*ir.Name)
+	var captureCellInitializers ir.Nodes
+	for _, deferred := range candidate.defers {
+		if !deferred.sourceLiteral {
+			continue
+		}
+		for _, variable := range deferred.literalCaptures {
+			source := variable.Canonical()
+			if captureCells[source] != nil {
+				continue
+			}
+			storage := source
+			parameter := candidate.parameters[source]
+			result := candidate.results[source]
+			if parameter != nil {
+				storage = parameter
+			} else if result != nil {
+				storage = result
+			}
+			cell := typecheck.TempAt(source.Pos(), factory,
+				types.NewPtr(source.Type()))
+			captureCells[source] = cell
+			captureStorage[storage.Canonical()] = cell
+			addDeclaration(ir.NewDecl(source.Pos(), ir.ODCL, cell))
+
+			if parameter == nil && result == nil {
+				captureCellInitializers = append(captureCellInitializers,
+					ir.NewAssignStmt(source.Pos(), cell,
+						ir.NewZero(source.Pos(), cell.Type())))
+				continue
+			}
+			allocation := typedNew(source.Pos(), source.Type())
+			captureCellInitializers = append(captureCellInitializers,
+				ir.NewAssignStmt(source.Pos(), cell, allocation))
+			if parameter != nil {
+				captureCellInitializers = append(captureCellInitializers,
+					ir.NewAssignStmt(source.Pos(),
+						typedDeref(source.Pos(), cell, source.Type()),
+						parameter))
+			}
+		}
+	}
+	captureCell := func(name *ir.Name) *ir.Name {
+		if cell := captureCells[name.Canonical()]; cell != nil {
+			return cell
+		}
+		return captureStorage[name.Canonical()]
+	}
 	// Source locals become factory locals. Returning the closure then places
 	// the captured slots in a typed, GC-scanned heap object.
 	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
@@ -1531,6 +1621,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				ir.NewZero(pos, result.Type())))
 		}
 	}
+	declarations = append(declarations, captureCellInitializers...)
 	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
 		len(candidate.defers))
 	var deferStack *ir.Name
@@ -1615,12 +1706,72 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		states = append(states, state)
 		return stateIndex
 	}
+	captureCellAllocation := func(name *ir.Name) ir.Node {
+		cell := captureCell(name)
+		if cell == nil {
+			return nil
+		}
+		allocation := typedNew(name.Pos(), name.Type())
+		assign := ir.NewAssignStmt(name.Pos(), capture(cell), allocation)
+		assign.SetTypecheck(1)
+		return assign
+	}
 	newBodyState := func(body ir.Nodes, next int) int {
-		filtered := make(ir.Nodes, 0, len(body))
+		filtered := make(ir.Nodes, 0, len(body)+1)
+		allocated := make(map[*ir.Name]bool)
 		for _, stmt := range body {
+			if init := stmt.Init(); len(init) != 0 {
+				for i, initStmt := range init {
+					decl, ok := initStmt.(*ir.Decl)
+					if !ok || captureCell(decl.X) == nil {
+						continue
+					}
+					name := decl.X.Canonical()
+					if !allocated[name] {
+						init[i] = captureCellAllocation(decl.X)
+						allocated[name] = true
+					}
+				}
+				stmt.(ir.InitNode).SetInit(init)
+			}
 			if decl, ok := stmt.(*ir.Decl); ok {
+				if captureCell(decl.X) != nil {
+					name := decl.X.Canonical()
+					if !allocated[name] {
+						filtered = append(filtered,
+							captureCellAllocation(decl.X))
+						allocated[name] = true
+					}
+					continue
+				}
 				addDeclaration(decl)
 				continue
+			}
+			switch stmt := stmt.(type) {
+			case *ir.AssignStmt:
+				if stmt.Def {
+					if name, ok := stmt.X.(*ir.Name); ok {
+						source := name.Canonical()
+						if allocation := captureCellAllocation(name); allocation != nil &&
+							!allocated[source] {
+							filtered = append(filtered, allocation)
+							allocated[source] = true
+						}
+					}
+				}
+			case *ir.AssignListStmt:
+				if stmt.Def {
+					for _, target := range stmt.Lhs {
+						if name, ok := target.(*ir.Name); ok {
+							source := name.Canonical()
+							if allocation := captureCellAllocation(name); allocation != nil &&
+								!allocated[source] {
+								filtered = append(filtered, allocation)
+								allocated[source] = true
+							}
+						}
+					}
+				}
 			}
 			filtered = append(filtered, stmt)
 		}
@@ -1830,6 +1981,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 		}
 		if name, ok := node.(*ir.Name); ok {
+			if cell := captureCell(name); cell != nil {
+				return typedDeref(name.Pos(), capture(cell), name.Type())
+			}
 			if parameter := candidate.parameters[name.Canonical()]; parameter != nil {
 				return capture(parameter)
 			}
@@ -1876,6 +2030,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A repeated site snapshots each capture before constructing its wrapper;
 	// otherwise every registration would observe the last value written to
 	// the shared frame slot.
+	rewriteLiteralCapture := func(fn *ir.Func, variable, pointer *ir.Name) {
+		var rewrite func(ir.Node) ir.Node
+		rewrite = func(node ir.Node) ir.Node {
+			if node == variable {
+				return typedDeref(node.Pos(), pointer, variable.Type())
+			}
+			ir.EditChildren(node, rewrite)
+			return node
+		}
+		for i, stmt := range fn.Body {
+			fn.Body[i] = rewrite(stmt)
+		}
+		fn.ClosureVars = slices.DeleteFunc(fn.ClosureVars,
+			func(candidate *ir.Name) bool {
+				return candidate == variable
+			})
+	}
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
 		if deferred.directGoexit {
@@ -1908,13 +2079,35 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return err
 			}
 		}
-		for _, variable := range closure.Func.ClosureVars {
-			outer, ok := edit(variable.Outer).(*ir.Name)
-			if !ok {
-				return fmt.Errorf("%s: defer capture is not a variable",
-					ir.PkgFuncName(fn))
+		closureVars := slices.Clone(closure.Func.ClosureVars)
+		if deferred.sourceLiteral {
+			literalCaptures := make(map[*ir.Name]bool,
+				len(deferred.literalCaptures))
+			for _, variable := range deferred.literalCaptures {
+				literalCaptures[variable] = true
+				cell := captureCell(variable)
+				snapshot := typecheck.TempAt(variable.Pos(), resume,
+					cell.Type())
+				pointer := ir.NewClosureVar(variable.Pos(), closure.Func,
+					snapshot)
+				rewriteLiteralCapture(closure.Func, variable, pointer)
+				deferred.captures = append(deferred.captures,
+					lowerDeferCapture{
+						source: capture(cell), snapshot: snapshot,
+					})
 			}
+			closureVars = slices.DeleteFunc(closureVars,
+				func(variable *ir.Name) bool {
+					return literalCaptures[variable]
+				})
+		}
+		for _, variable := range closureVars {
+			outer := edit(variable.Outer)
 			if candidate.dynamicDefers {
+				if outer == nil || outer.Type() == nil {
+					return fmt.Errorf("%s: defer capture has no type",
+						ir.PkgFuncName(fn))
+				}
 				snapshot := typecheck.TempAt(variable.Pos(), resume,
 					outer.Type())
 				deferred.captures = append(deferred.captures,
@@ -1922,8 +2115,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				variable.Outer = snapshot
 				variable.Defn = snapshot
 			} else {
-				variable.Outer = outer
-				variable.Defn = outer.Canonical()
+				name, ok := outer.(*ir.Name)
+				if !ok {
+					return fmt.Errorf("%s: defer capture is not a variable",
+						ir.PkgFuncName(fn))
+				}
+				variable.Outer = name
+				variable.Defn = name.Canonical()
 			}
 		}
 	}
@@ -2135,7 +2333,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
 				body = append(body, ir.NewAssignStmt(pos,
-					ir.NewStarExpr(pos, pointer), capture(value)))
+					ir.NewStarExpr(pos, pointer), edit(value)))
 			}
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
@@ -2205,8 +2403,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 									ir.PkgFuncName(fn), i)
 							}
 							edited := edit(lhs)
-							name, ok = edited.(*ir.Name)
-							if !ok {
+							var dereference *ir.StarExpr
+							switch target := edited.(type) {
+							case *ir.Name:
+								name = target
+							case *ir.StarExpr:
+								dereference = target
+								name, ok = target.X.(*ir.Name)
+							default:
+								ok = false
+							}
+							if !ok || name == nil {
 								return fmt.Errorf("%s: read result %d is not a variable",
 									ir.PkgFuncName(fn), i)
 							}
@@ -2224,7 +2431,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 								captured = ir.NewClosureVar(name.Pos(), closure.Func, name)
 								workerCaptures[canonical] = captured
 							}
-							assignment.Lhs[i] = captured
+							if dereference != nil {
+								assignment.Lhs[i] = typedDeref(
+									dereference.Pos(), captured,
+									dereference.Type())
+							} else {
+								assignment.Lhs[i] = captured
+							}
 						}
 						assignment.Def = false
 						assignment.Rhs = ir.Nodes{state.call}
@@ -2591,4 +2804,18 @@ func ordinaryReadOperation(call *ir.CallExpr) bool {
 
 func typedInt(pos src.XPos, typ *types.Type, value int64) ir.Node {
 	return ir.NewBasicLit(pos, typ, constant.MakeInt64(value))
+}
+
+func typedDeref(pos src.XPos, pointer ir.Node, typ *types.Type) ir.Node {
+	value := ir.NewStarExpr(pos, pointer)
+	value.SetType(typ)
+	value.SetTypecheck(1)
+	return value
+}
+
+func typedNew(pos src.XPos, typ *types.Type) ir.Node {
+	allocation := ir.NewUnaryExpr(pos, ir.ONEW, ir.TypeNode(typ))
+	allocation.SetType(types.NewPtr(typ))
+	allocation.SetTypecheck(1)
+	return allocation
 }

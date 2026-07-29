@@ -941,6 +941,8 @@ var evaluatedIndex int
 var trace [9]int
 var traceIndex int
 var retained int
+var literalRetained int
+var literalMismatch bool
 var largeTrace [4]int
 var largeTraceIndex int
 
@@ -990,6 +992,21 @@ func retain(count int) {
 }
 
 //go:noinline
+func retainLiteral(count int) {
+	for i := 0; i < count; i++ {
+		index := i
+		value := &entry{value: 1000 + i}
+		defer func() {
+			literalRetained += value.value - 1000
+			if value.value != 1000+index {
+				literalMismatch = true
+			}
+		}()
+		runtime.Gosched()
+	}
+}
+
+//go:noinline
 func retainLarge() {
 	for i := 0; i < len(largeTrace); i++ {
 		var value largeValue
@@ -1030,6 +1047,7 @@ func main() {
 	close(begin)
 	const retainedCount = 4096
 	retain(retainedCount)
+	retainLiteral(retainedCount)
 	retainLarge()
 	<-done
 
@@ -1038,6 +1056,8 @@ func main() {
 	runtime.GOMAXPROCS(oldProcs)
 	if recovered != "dynamic defer panic" ||
 		retained != retainedCount*(retainedCount-1)/2 ||
+		literalRetained != retainedCount*(retainedCount-1)/2 ||
+		literalMismatch ||
 		largeTraceIndex != len(largeTrace) ||
 		largeTrace != [4]int{4, 3, 2, 1} ||
 		evaluatedIndex != len(evaluated) ||
@@ -1068,7 +1088,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building dynamic defer coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=4 skipped=3"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=5 skipped=3"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
@@ -1099,6 +1119,272 @@ func main() {
 	} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("dynamic defer resume contains %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
+func TestRepeatedLiteralCaptureLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+type entry struct {
+	value int
+}
+
+var seenValue [3]int
+var seenBare [3]int
+var seenBoundary [3]int
+var seenPair [3][2]int
+var seenObject [3]int
+var seenShared [3]int
+var seenResult [3]int
+var seenAddress [3]bool
+
+//go:noinline
+func boundaryValue(value int) int {
+	runtime.Gosched()
+	return 40 + value
+}
+
+//go:noinline
+func boundaryPair(value int) (int, int) {
+	runtime.Gosched()
+	return 50 + value, 60 + value
+}
+
+//go:noinline
+func capture(shared int) (result int) {
+	result = 1
+	for i := 0; i < len(seenValue); i++ {
+		iteration := i
+		value := i
+		var bare int
+		boundary := boundaryValue(i)
+		left, right := boundaryPair(i)
+		address := &value
+		object := &entry{value: i}
+		defer func() {
+			seenValue[iteration] = value
+			seenBare[iteration] = bare
+			seenBoundary[iteration] = boundary
+			seenPair[iteration] = [2]int{left, right}
+			seenObject[iteration] = object.value
+			seenShared[iteration] = shared
+			seenResult[iteration] = result
+			seenAddress[iteration] = &value == address
+			shared++
+			result += value
+		}()
+		defer func() {
+			value += 10
+			object.value += 20
+		}()
+		value++
+		bare = 30 + i
+		object.value++
+		result++
+		shared++
+		runtime.Gosched()
+	}
+	shared += 100
+	return
+}
+
+func main() {
+	result := capture(2)
+	if result != 40 ||
+		seenValue != [3]int{11, 12, 13} ||
+		seenBare != [3]int{30, 31, 32} ||
+		seenBoundary != [3]int{40, 41, 42} ||
+		seenPair != [3][2]int{{50, 60}, {51, 61}, {52, 62}} ||
+		seenObject != [3]int{21, 22, 23} ||
+		seenShared != [3]int{107, 106, 105} ||
+		seenResult != [3]int{29, 17, 4} ||
+		seenAddress != [3]bool{true, true, true} {
+		panic("bad repeated literal capture")
+	}
+	println("stackless-coro-repeated-literal-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-repeated-literal")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building repeated literal coroutine failed: %v\n%s",
+			err, out)
+	}
+	if want := "coro: phase=lower lowered=4 skipped=0"; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	for _, diagnostic := range []string{
+		"skip main.capture:", "skip main.main:",
+	} {
+		if strings.Contains(out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("repeated literal coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-repeated-literal-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.capture\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of repeated literal resume function failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, "capture.coro.func") {
+		t.Fatalf("objdump did not find repeated literal resume function\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{
+		"runtime.deferproc", "runtime.deferreturn", "runtime.gopanic",
+		"runtime.gorecover",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("repeated literal resume contains %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
+func TestRepeatedLiteralReadResultLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"os"
+	"runtime"
+)
+
+var seenN [2]int
+var seenErr [2]bool
+var seenText [2]string
+
+//go:noinline
+func readTwice(file *os.File) {
+	for i := 0; i < len(seenN); i++ {
+		index := i
+		buffer := make([]byte, 4)
+		var n int
+		var err error
+		n, err = file.Read(buffer)
+		defer func() {
+			seenN[index] = n
+			seenErr[index] = err == nil
+			seenText[index] = string(buffer)
+		}()
+		runtime.Gosched()
+	}
+}
+
+func main() {
+	file, err := os.CreateTemp("", "coro-repeated-read")
+	if err != nil {
+		panic(err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.WriteString("abcdefgh"); err != nil {
+		panic(err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	readTwice(file)
+	if seenN != [2]int{4, 4} ||
+		seenErr != [2]bool{true, true} ||
+		seenText != [2]string{"abcd", "efgh"} {
+		panic("bad repeated read capture")
+	}
+	println("stackless-coro-repeated-read-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-repeated-read")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building repeated read coroutine failed: %v\n%s",
+			err, out)
+	}
+	if want := "coro: phase=lower lowered="; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	if strings.Contains(out, "skip main.readTwice:") {
+		t.Fatalf("readTwice was not lowered\n%s", out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("repeated read coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-repeated-read-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.readTwice\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of repeated read resume function failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, "readTwice.coro.func") {
+		t.Fatalf("objdump did not find repeated read resume function\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{
+		"runtime.deferproc", "runtime.deferreturn",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("repeated read resume contains %q\n%s",
 				forbidden, disassembly)
 		}
 	}
@@ -1538,6 +1824,24 @@ func dynamicRecover() (recovered [3]any) {
 }
 
 //go:noinline
+func dynamicReplacement() (replacement any) {
+	defer func() {
+		replacement = recover()
+	}()
+	for i := 0; i < 3; i++ {
+		value := i
+		defer func() {
+			if value == 12 {
+				panic("dynamic replacement")
+			}
+		}()
+		value += 10
+		runtime.Gosched()
+	}
+	panic("dynamic original")
+}
+
+//go:noinline
 func noPanic() (recovered any) {
 	defer func() {
 		recovered = recover()
@@ -1630,6 +1934,7 @@ func main() {
 	original, replacement := replacement()
 	cleanup := normalCleanup()
 	dynamic := dynamicRecover()
+	dynamicReplacementValue := dynamicReplacement()
 	none := noPanic()
 	nilValue := nilPanic()
 	namedFallback()
@@ -1643,6 +1948,7 @@ func main() {
 		cleanup != "cleanup" ||
 		dynamic[2] != "dynamic" ||
 		dynamic[1] != nil || dynamic[0] != nil ||
+		dynamicReplacementValue != "dynamic replacement" ||
 		none != nil || (nilValue == nil) != expectNil ||
 		namedValue != "named" ||
 		namedArgValue != "named-arg" || namedArgTag != 23 ||
@@ -1676,14 +1982,12 @@ func main() {
 	if err != nil {
 		t.Fatalf("building recover coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=10 skipped=4"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=12 skipped=4"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
-	if want := "main.dynamicRecover: repeated source defer literal"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain repeated literal fallback %q\n%s", want, out)
-	}
 	for _, name := range []string{
-		"replacement", "normalCleanup", "noPanic", "nilPanic",
+		"replacement", "normalCleanup", "dynamicRecover", "dynamicReplacement",
+		"noPanic", "nilPanic",
 		"namedFallback", "namedArg", "namedDynamicRecover",
 		"namedReplacement", "namedMethod",
 	} {
@@ -2050,7 +2354,7 @@ func TestDeferGoexitLowering(t *testing.T) {
 import "runtime"
 
 var trace string
-var returned [9]bool
+var returned [10]bool
 var literalRecover any
 var namedRecover any
 var argumentValue int
@@ -2168,6 +2472,29 @@ func dynamicParent() {
 }
 
 //go:noinline
+func dynamicLiteralParent() {
+	defer func() {
+		trace += "dynamic-literal-outer;"
+	}()
+	for i := 0; i < 3; i++ {
+		value := i
+		defer func() {
+			switch value {
+			case 10:
+				trace += "dynamic-literal-10;"
+			case 11:
+				trace += "dynamic-literal-11;"
+			case 12:
+				trace += "dynamic-literal-12;"
+				runtime.Goexit()
+			}
+		}()
+		value += 10
+	}
+	runtime.Gosched()
+}
+
+//go:noinline
 func recoverThenExit() {
 	recoveredParent = recover()
 	runtime.Goexit()
@@ -2259,15 +2586,18 @@ func main() {
 	run(6, overlayParent)
 	run(7, faultParent)
 	run(8, normalParent)
+	run(9, dynamicLiteralParent)
 
 	const wantTrace = "literal-inner;literal-outer;" +
 		"named-target;named-outer;" +
 		"argument-target;argument-outer;" +
 		"method-target;method-outer;" +
 		"dynamic-2;dynamic-1;dynamic-0;dynamic-outer;" +
-		"recover-outer;overlay-outer;fault-outer;normal-target;"
+		"recover-outer;overlay-outer;fault-outer;normal-target;" +
+		"dynamic-literal-12;dynamic-literal-11;dynamic-literal-10;" +
+		"dynamic-literal-outer;"
 	if trace != wantTrace ||
-		returned != [9]bool{false, false, false, false, false, false, false, false, true} ||
+		returned != [10]bool{false, false, false, false, false, false, false, false, true, false} ||
 		literalRecover != nil || namedRecover != nil ||
 		argumentValue != 7 || methodValue != 11 ||
 		recoveredParent != "parent panic" || recoveredAfterExit != nil ||
@@ -2300,7 +2630,7 @@ func main() {
 	for _, name := range []string{
 		"literal", "namedExit", "namedParent", "exitArgument",
 		"argumentParent", "(*receiver).exit", "methodParent", "exitIndex",
-		"dynamicParent", "recoverThenExit", "recoverParent",
+		"dynamicParent", "dynamicLiteralParent", "recoverThenExit", "recoverParent",
 		"panicDuringExit", "overlayParent", "faultDuringExit",
 		"faultParent", "maybeExit", "normalParent",
 	} {
