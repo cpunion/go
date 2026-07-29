@@ -55,9 +55,13 @@ const (
 	// control flags were recorded.
 	factorySummaryVersion uint64 = 3
 
+	// terminalSummaryVersion is the coroutine summary format before named
+	// defer entry capabilities were recorded.
+	terminalSummaryVersion uint64 = 4
+
 	// SummaryVersion is the current coroutine function summary format stored
 	// in the compiler-private Unified IR extension.
-	SummaryVersion uint64 = 4
+	SummaryVersion uint64 = 5
 )
 
 // The compiler processes one package per process, so summaries are package
@@ -73,7 +77,7 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 		return FuncSummary{}, false, nil
 	}
 	if version != legacySummaryVersion && version != factorySummaryVersion &&
-		version != SummaryVersion {
+		version != terminalSummaryVersion && version != SummaryVersion {
 		return FuncSummary{}, false,
 			fmt.Errorf("unsupported coroutine summary version %d", version)
 	}
@@ -100,13 +104,21 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 		}
 		summary.Factory = FactoryABI(factoryValue)
 	}
-	if version == SummaryVersion {
+	if version >= terminalSummaryVersion {
 		terminalValue := next()
 		if terminalValue > uint64(^TerminalFlags(0)) {
 			return FuncSummary{}, false,
 				fmt.Errorf("invalid coroutine terminal flags %d", terminalValue)
 		}
 		summary.Terminal = TerminalFlags(terminalValue)
+	}
+	if version == SummaryVersion {
+		deferValue := next()
+		if deferValue > uint64(^DeferABI(0)) {
+			return FuncSummary{}, false,
+				fmt.Errorf("invalid coroutine defer ABI %d", deferValue)
+		}
+		summary.Defer = DeferABI(deferValue)
 	}
 	return summary, true, nil
 }
@@ -223,6 +235,7 @@ type Function struct {
 	Edges         []Edge
 	Sites         []Site
 	Factory       FactoryABI
+	Defer         DeferABI
 }
 
 // Plan is the result of analyzing one package.
@@ -241,6 +254,7 @@ func (p *Plan) PublishSummaries() {
 			Exec:     function.Exec,
 			Terminal: function.Terminal,
 			Factory:  function.Factory,
+			Defer:    function.Defer,
 		})
 	}
 }
@@ -518,15 +532,23 @@ func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
 	if edge.Unknown {
 		return FuncSummary{}, false
 	}
-	if callee := p.Functions[edge.Callee]; callee != nil {
-		return FuncSummary{
-			Effect:   callee.Effect,
-			Exec:     callee.Exec,
-			Terminal: callee.Terminal,
-			Factory:  callee.Factory,
-		}, true
+	if p.Functions[edge.Callee] != nil {
+		return p.funcSummary(edge.Callee)
 	}
 	return edge.Imported, true
+}
+
+func (p *Plan) funcSummary(fn *ir.Func) (FuncSummary, bool) {
+	if function := p.Functions[fn]; function != nil {
+		return FuncSummary{
+			Effect:   function.Effect,
+			Exec:     function.Exec,
+			Terminal: function.Terminal,
+			Factory:  function.Factory,
+			Defer:    function.Defer,
+		}, true
+	}
+	return Summary(fn)
 }
 
 func (p *Plan) operationRecipe(fn *ir.Func) (OperationRecipe, bool) {

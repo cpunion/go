@@ -96,13 +96,25 @@ func TestDecodeFuncSummary(t *testing.T) {
 			summary, ok, err, *reads, want)
 	}
 
-	next, reads = read(uint64(MaySuspend), 0, 2, uint64(MayPanic|UsesRecover))
-	summary, ok, err = DecodeFuncSummary(SummaryVersion, next)
+	next, reads = read(uint64(MaySuspend), 0, 2,
+		uint64(MayPanic|UsesRecover))
+	summary, ok, err = DecodeFuncSummary(terminalSummaryVersion, next)
 	want = FuncSummary{
 		Effect: MaySuspend, Factory: FactoryABI(2),
 		Terminal: MayPanic | UsesRecover,
 	}
 	if err != nil || !ok || summary != want || *reads != 4 {
+		t.Fatalf("terminal summary = %+v, %t, %v with %d reads, want %+v",
+			summary, ok, err, *reads, want)
+	}
+
+	next, reads = read(uint64(NoSuspend), 0, uint64(FactoryABI1),
+		uint64(MayGoexit), uint64(DeferABI1))
+	summary, ok, err = DecodeFuncSummary(SummaryVersion, next)
+	want = FuncSummary{
+		Factory: FactoryABI1, Terminal: MayGoexit, Defer: DeferABI1,
+	}
+	if err != nil || !ok || summary != want || *reads != 5 {
 		t.Fatalf("current summary = %+v, %t, %v with %d reads, want %+v",
 			summary, ok, err, *reads, want)
 	}
@@ -143,6 +155,14 @@ func TestDecodeFuncSummary(t *testing.T) {
 			},
 			want: "invalid coroutine terminal flags",
 		},
+		{
+			name: "defer", version: SummaryVersion,
+			values: []uint64{
+				uint64(NoSuspend), 0, uint64(NoFactory),
+				uint64(UsesRecover), 256,
+			},
+			want: "invalid coroutine defer ABI",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			next, _ := read(test.values...)
@@ -159,12 +179,13 @@ func TestPublishSummary(t *testing.T) {
 	fn := testFunc("published")
 	want := FuncSummary{
 		Effect: MaySuspend, Exec: NeedsSystemABI,
-		Terminal: MayPanic, Factory: FactoryABI1,
+		Terminal: MayPanic, Factory: FactoryABI1, Defer: DeferABI1,
 	}
 	plan := &Plan{Functions: map[*ir.Func]*Function{
 		fn: {
 			Func: fn, Effect: want.Effect, Exec: want.Exec,
 			Terminal: want.Terminal, Factory: want.Factory,
+			Defer: want.Defer,
 		},
 	}}
 	plan.PublishSummaries()
