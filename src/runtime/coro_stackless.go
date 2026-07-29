@@ -82,6 +82,10 @@ type stacklessCoroOperation struct {
 	scheduler *stacklessCoroScheduler
 	task      *stacklessCoroTask
 	timer     *timer
+	channel   *hchan
+	element   unsafe.Pointer
+	received  *bool
+	send      bool
 	fd        int32
 	buffer    []byte
 	call      func()
@@ -594,6 +598,73 @@ func coroSleep(ctx unsafe.Pointer, ns int64) {
 	startStacklessCoroTimer(ctx, ns)
 }
 
+// coroChanSend transfers a blocking channel send to an ordinary goroutine.
+// Completion only publishes readiness; the worker never invokes the
+// continuation directly.
+func coroChanSend(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer) {
+	startStacklessCoroChannel(ctx, channel, element, nil, true)
+}
+
+// coroChanRecv transfers a blocking channel receive to an ordinary goroutine.
+// received is optional and records the comma-ok result.
+func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool) {
+	startStacklessCoroChannel(ctx, channel, element, received, false)
+}
+
+func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
+	element unsafe.Pointer, received *bool, send bool) {
+	s, task := stacklessCoroStartOperation(ctx, "channel")
+	op := &stacklessCoroOperation{
+		scheduler: s,
+		task:      task,
+		channel:   channel,
+		element:   element,
+		received:  received,
+		send:      send,
+	}
+	op.id = registerStacklessCoroOperation(op)
+	go stacklessCoroChannelWorker(op.id)
+}
+
+func stacklessCoroChannelWorker(id uint64) {
+	op := findStacklessCoroOperation(id)
+	if op == nil {
+		return
+	}
+
+	panicked := true
+	var panicValue any
+	func() {
+		defer func() {
+			if panicked {
+				panicValue = recover()
+			}
+		}()
+		if op.send {
+			chansend(op.channel, op.element, true, sys.GetCallerPC())
+		} else {
+			_, received := chanrecv(op.channel, op.element, true)
+			if op.received != nil {
+				*op.received = received
+			}
+		}
+		panicked = false
+	}()
+
+	op = takeStacklessCoroOperation(id)
+	if op == nil {
+		return
+	}
+	op.channel = nil
+	op.element = nil
+	op.received = nil
+	if panicked {
+		op.scheduler.panicOperation(op.task, panicValue)
+		return
+	}
+	op.scheduler.ready(op.task, true)
+}
+
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
 	s, task := stacklessCoroStartOperation(ctx, "sleep")
 
@@ -715,6 +786,24 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 	if signal {
 		s.signal()
 	}
+}
+
+func (s *stacklessCoroScheduler) panicOperation(task *stacklessCoroTask, value any) {
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskWaiting ||
+		task.terminal != stacklessCoroTerminalNone || task.goexit ||
+		task.readyPending {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine operation panic")
+	}
+	task.terminal = stacklessCoroTerminalPanic
+	if s.terminalValues == nil {
+		s.terminalValues = make(map[*stacklessCoroTask]any)
+	}
+	s.terminalValues[task] = value
+	s.readyLocked(task)
+	unlock(&s.lock)
+	s.signal()
 }
 
 func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {

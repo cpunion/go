@@ -958,6 +958,173 @@ func TestStacklessCoroSpawn(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroChannel(t *testing.T) {
+	channel := make(chan int, 1)
+	discard := make(chan int, 1)
+	discard <- 1
+	sendValue := 42
+	value := -1
+	var received bool
+	var state int
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received)
+			return runtime.StacklessCoroActionWait
+		case 2:
+			if value != sendValue || !received {
+				t.Fatalf("channel receive = (%d, %t), want (%d, true)",
+					value, received, sendValue)
+			}
+			close(channel)
+			value = -1
+			received = true
+			state = 3
+			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received)
+			return runtime.StacklessCoroActionWait
+		case 3:
+			if value != 0 || received {
+				t.Fatalf("closed channel receive = (%d, %t), want (0, false)",
+					value, received)
+			}
+			state = 4
+			runtime.RecvIntStacklessCoroForTest(ctx, discard, nil, nil)
+			return runtime.StacklessCoroActionWait
+		case 4:
+			state = 5
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroChannelPanic(t *testing.T) {
+	channel := make(chan int)
+	close(channel)
+	value := 1
+	state := 0
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				return action
+			}
+			switch state {
+			case 0:
+				state = 1
+				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				return runtime.StacklessCoroActionWait
+			default:
+				t.Fatalf("unexpected state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	}()
+	err, ok := recovered.(error)
+	if !ok || err.Error() != "send on closed channel" {
+		t.Fatalf("recovered channel panic = %v, want send on closed channel",
+			recovered)
+	}
+}
+
+func TestStacklessCoroChannelProgress(t *testing.T) {
+	const senderCount = 8
+
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	type senderState struct {
+		state int
+		value int
+	}
+	senders := make([]senderState, senderCount)
+	channel := make(chan int)
+	var completed atomic.Int32
+	var rootState, receivedCount, value, sum int
+	var waiting, received bool
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch rootState {
+		case 0:
+			for i := range senders {
+				sender := &senders[i]
+				sender.value = i + 1
+				runtime.SpawnStacklessCoroForTest(ctx,
+					func(childCtx unsafe.Pointer) uint8 {
+						switch sender.state {
+						case 0:
+							sender.state = 1
+							runtime.SendIntStacklessCoroForTest(childCtx,
+								channel, &sender.value)
+							return runtime.StacklessCoroActionWait
+						case 1:
+							sender.state = 2
+							completed.Add(1)
+							return runtime.StacklessCoroActionComplete
+						default:
+							return runtime.StacklessCoroActionInvalid
+						}
+					})
+			}
+			rootState = 1
+			return runtime.StacklessCoroActionYield
+
+		case 1:
+			if waiting {
+				if !received {
+					t.Fatal("unbuffered channel receive reported closed")
+				}
+				sum += value
+				receivedCount++
+				waiting = false
+			}
+			if receivedCount == senderCount {
+				rootState = 2
+				return runtime.StacklessCoroActionYield
+			}
+			value = 0
+			received = false
+			waiting = true
+			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received)
+			return runtime.StacklessCoroActionWait
+
+		case 2:
+			if completed.Load() != senderCount {
+				return runtime.StacklessCoroActionYield
+			}
+			rootState = 3
+			return runtime.StacklessCoroActionComplete
+
+		default:
+			t.Fatalf("unexpected root state %d", rootState)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if want := senderCount * (senderCount + 1) / 2; sum != want {
+		t.Fatalf("channel sum = %d, want %d", sum, want)
+	}
+	for i := range senders {
+		if senders[i].state != 2 {
+			t.Fatalf("sender %d state = %d, want 2", i, senders[i].state)
+		}
+	}
+}
+
 func TestStacklessCoroSleep(t *testing.T) {
 	const delay = 5 * time.Millisecond
 	var state int
