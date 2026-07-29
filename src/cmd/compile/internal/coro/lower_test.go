@@ -5083,6 +5083,219 @@ func TestLowerChannelOperations(t *testing.T) {
 	}
 }
 
+func TestLowerChannelRange(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/channelrange", "channelrange")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	fn := newLowerTestFunc(pkg, "rangeChannel")
+	elementType := types.NewPtr(types.Types[types.TINT])
+	channelType := types.NewChan(elementType, types.Cboth)
+	channel := fn.NewLocal(src.NoXPos, pkg.Lookup("channel"), channelType)
+	key := fn.NewLocal(src.NoXPos, pkg.Lookup("key"),
+		elementType)
+	rangeKey := fn.NewLocal(src.NoXPos, pkg.Lookup("rangeKey"),
+		elementType)
+	copyKey := ir.NewAssignStmt(src.NoXPos, key, rangeKey)
+	copyKey.Def = true
+	copyKey.SetTypecheck(1)
+	copyKey.SetInit(ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, key)})
+	loop := ir.NewRangeStmt(src.NoXPos, rangeKey, nil, channel,
+		ir.Nodes{copyKey}, false)
+	loop.SetTypecheck(1)
+
+	interfaceKey := fn.NewLocal(src.NoXPos, pkg.Lookup("interfaceKey"),
+		types.Types[types.TINTER])
+	convertedLoop := ir.NewRangeStmt(src.NoXPos, interfaceKey, nil, channel,
+		nil, false)
+	convertedLoop.SetTypecheck(1)
+	fn.Body = ir.Nodes{
+		ir.NewDecl(src.NoXPos, ir.ODCL, channel),
+		loop,
+		convertedLoop,
+		newLowerTestReturn(),
+	}
+	function := &Function{
+		Func:    fn,
+		Local:   MaySuspend,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Sites: []Site{
+			{ID: 1, Kind: SiteChannel, Node: loop},
+			{ID: 2, Kind: SiteChannel, Node: convertedLoop},
+		},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn: function,
+	}})
+	if err != nil {
+		t.Fatalf("Lower failed: %v", err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	var receives, nativeRanges, nativeReceives int
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			switch node.Op() {
+			case ir.ORANGE:
+				nativeRanges++
+			case ir.ORECV:
+				nativeReceives++
+			}
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil &&
+				name.Sym().Name == "coroChanRecv" {
+				receives++
+			}
+		})
+	}
+	if receives != 2 {
+		t.Fatalf("generated IR has %d channel receives, want 2", receives)
+	}
+	if nativeRanges != 0 || nativeReceives != 0 {
+		t.Fatalf("generated IR retains %d ranges and %d receives",
+			nativeRanges, nativeReceives)
+	}
+}
+
+func TestTransformedRangeVariable(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/rangevar", "rangevar")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	fn := newLowerTestFunc(pkg, "rangeVariable")
+	key := fn.NewLocal(src.NoXPos, pkg.Lookup("key"),
+		types.Types[types.TINT])
+	variable := fn.NewLocal(src.NoXPos, pkg.Lookup("variable"),
+		types.Types[types.TINT])
+
+	if got := transformedRangeVariable(nil); got != nil {
+		t.Fatalf("transformedRangeVariable(nil) = %v, want nil", got)
+	}
+	loop := ir.NewRangeStmt(src.NoXPos, key, nil, nil, nil, false)
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("empty range variable = %v, want nil", got)
+	}
+	loop.Body = ir.Nodes{ir.NewInt(src.NoXPos, 1)}
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("non-assignment range variable = %v, want nil", got)
+	}
+
+	assignment := ir.NewAssignStmt(src.NoXPos, variable, key)
+	loop.Body = ir.Nodes{assignment}
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("non-defining range variable = %v, want nil", got)
+	}
+	assignment.Def = true
+	assignment.Y = ir.NewInt(src.NoXPos, 1)
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("unrelated range variable = %v, want nil", got)
+	}
+	assignment.Y = key
+	assignment.X = ir.NewIndexExpr(src.NoXPos, variable,
+		ir.NewInt(src.NoXPos, 0))
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("non-name range variable = %v, want nil", got)
+	}
+	assignment.X = variable
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("undeclared range variable = %v, want nil", got)
+	}
+	assignment.SetInit(ir.Nodes{ir.NewBlockStmt(src.NoXPos, nil)})
+	if got := transformedRangeVariable(loop); got != nil {
+		t.Fatalf("unmatched range declaration = %v, want nil", got)
+	}
+	assignment.SetInit(ir.Nodes{
+		ir.NewDecl(src.NoXPos, ir.ODCL, variable),
+	})
+	if got := transformedRangeVariable(loop); got != variable {
+		t.Fatalf("transformed range variable = %v, want %v", got, variable)
+	}
+}
+
+func TestLowerRejectsRangeVariableClosure(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/rangeclosure", "rangeclosure")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	fn := newLowerTestFunc(pkg, "rangeClosure")
+	channelType := types.NewChan(types.Types[types.TINT], types.Cboth)
+	channel := fn.NewLocal(src.NoXPos, pkg.Lookup("channel"), channelType)
+	rangeKey := fn.NewLocal(src.NoXPos, pkg.Lookup("rangeKey"),
+		types.Types[types.TINT])
+	variable := fn.NewLocal(src.NoXPos, pkg.Lookup("variable"),
+		types.Types[types.TINT])
+	copyKey := ir.NewAssignStmt(src.NoXPos, variable, rangeKey)
+	copyKey.Def = true
+	copyKey.SetInit(ir.Nodes{
+		ir.NewDecl(src.NoXPos, ir.ODCL, variable),
+	})
+
+	closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), fn, typecheck.Target, 0)
+	closure.DeclareParams(true)
+	captured := ir.NewClosureVar(src.NoXPos, closure, variable)
+	sink := ir.NewNameAt(src.NoXPos, pkg.Lookup("sink"),
+		types.Types[types.TINT])
+	sink.Class = ir.PEXTERN
+	closure.Body = ir.Nodes{
+		ir.NewAssignStmt(src.NoXPos, sink, captured),
+	}
+	closureTarget := fn.NewLocal(src.NoXPos, pkg.Lookup("closure"),
+		closure.Type())
+	saveClosure := ir.NewAssignStmt(src.NoXPos, closureTarget,
+		closure.OClosure)
+	loop := ir.NewRangeStmt(src.NoXPos, rangeKey, nil, channel,
+		ir.Nodes{copyKey, saveClosure}, false)
+	fn.Body = ir.Nodes{loop}
+	function := &Function{
+		Func: fn,
+		Sites: []Site{{
+			ID: 1, Kind: SiteChannel, Node: loop,
+		}},
+	}
+	_, err := newLowerCandidate(
+		&Plan{Functions: map[*ir.Func]*Function{fn: function}},
+		function)
+	if err == nil || !strings.Contains(err.Error(),
+		"range variable captured by closure") {
+		t.Fatalf("newLowerCandidate error = %v, want range closure error", err)
+	}
+}
+
 func TestLowerRejectsUnsupportedChannels(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -5134,13 +5347,69 @@ func TestLowerRejectsUnsupportedChannels(t *testing.T) {
 			want: "receive result 0 is not a variable",
 		},
 		{
-			name: "range",
-			make: func(_ *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
-				loop := ir.NewRangeStmt(src.NoXPos, nil, nil, channel,
+			name: "range-value-variable",
+			make: func(fn *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				value := fn.NewLocal(src.NoXPos,
+					pkg.Lookup("rangeValue"), types.Types[types.TINT])
+				loop := ir.NewRangeStmt(src.NoXPos, nil, value, channel,
 					nil, false)
 				return ir.Nodes{loop}, loop
 			},
-			want: "unsupported operation range",
+			want: "channel range has value variable",
+		},
+		{
+			name: "labeled-range",
+			make: func(_ *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				loop := ir.NewRangeStmt(src.NoXPos, nil, nil, channel,
+					nil, false)
+				loop.Label = pkg.Lookup("rangeLabel")
+				return ir.Nodes{loop}, loop
+			},
+			want: "labeled range loop",
+		},
+		{
+			name: "non-channel-range",
+			make: func(_ *ir.Func, _ *ir.Name) (ir.Nodes, ir.Node) {
+				loop := ir.NewRangeStmt(src.NoXPos, nil, nil,
+					ir.NewInt(src.NoXPos, 1), nil, false)
+				return ir.Nodes{loop}, loop
+			},
+			want: "unsupported range loop",
+		},
+		{
+			name: "unprocessed-range-variable",
+			make: func(_ *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				loop := ir.NewRangeStmt(src.NoXPos, nil, nil, channel,
+					nil, true)
+				return ir.Nodes{loop}, loop
+			},
+			want: "unprocessed range variables",
+		},
+		{
+			name: "complex-range-result",
+			make: func(fn *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				values := fn.NewLocal(src.NoXPos,
+					pkg.Lookup("rangeValues"),
+					types.NewSlice(types.Types[types.TINT]))
+				key := ir.NewIndexExpr(src.NoXPos, values,
+					ir.NewInt(src.NoXPos, 0))
+				key.SetType(types.Types[types.TINT])
+				loop := ir.NewRangeStmt(src.NoXPos, key, nil, channel,
+					nil, false)
+				return ir.Nodes{loop}, loop
+			},
+			want: "range result is not a variable",
+		},
+		{
+			name: "untyped-range-result",
+			make: func(fn *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				key := fn.NewLocal(src.NoXPos,
+					pkg.Lookup("untypedRangeResult"), nil)
+				loop := ir.NewRangeStmt(src.NoXPos, key, nil, channel,
+					nil, false)
+				return ir.Nodes{loop}, loop
+			},
+			want: "range result has no type",
 		},
 		{
 			name: "select",

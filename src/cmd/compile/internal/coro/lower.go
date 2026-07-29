@@ -41,6 +41,7 @@ type lowerCandidate struct {
 	defers        []*lowerDefer
 	dynamicDefers bool
 	channels      map[ir.Node]*lowerChannel
+	rangeVars     []*ir.Name
 	panics        map[*ir.UnaryExpr]bool
 	parameters    map[*ir.Name]*ir.Name
 	results       map[*ir.Name]*ir.Name
@@ -77,6 +78,8 @@ type lowerChannel struct {
 	recvValue  ir.Node
 	recvOK     ir.Node
 	recvOKTemp *ir.Name
+	rangeStmt  *ir.RangeStmt
+	rangeChan  *ir.Name
 }
 
 type lowerState struct {
@@ -273,6 +276,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	dynamicDefers := false
+	var rangeVars []*ir.Name
+	recordedRangeVars := make(map[*ir.Name]bool)
 	recordAssignmentCall := func(node ir.Node) *ir.CallExpr {
 		switch node := node.(type) {
 		case *ir.AssignStmt:
@@ -313,6 +318,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				containers = ir.Nodes{stmt.Cond}
 			case *ir.ForStmt:
 				containers = ir.Nodes{stmt.Cond}
+			case *ir.RangeStmt:
+				containers = ir.Nodes{stmt.X}
+				if stmt.X != nil && stmt.X.Type() != nil &&
+					stmt.X.Type().IsChan() {
+					channelStatements[stmt] = stmt
+					channelContainers[stmt] = stmt
+				}
 			}
 			for _, root := range containers {
 				ir.Visit(root, func(node ir.Node) {
@@ -400,6 +412,22 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				if err := collectStatements(stmt.Body, true); err != nil {
 					return err
 				}
+			case *ir.RangeStmt:
+				if stmt.Label != nil {
+					return fmt.Errorf("labeled range loop")
+				}
+				if stmt.X == nil || stmt.X.Type() == nil ||
+					!stmt.X.Type().IsChan() {
+					return fmt.Errorf("unsupported range loop")
+				}
+				if variable := transformedRangeVariable(stmt); variable != nil &&
+					!recordedRangeVars[variable.Canonical()] {
+					recordedRangeVars[variable.Canonical()] = true
+					rangeVars = append(rangeVars, variable)
+				}
+				if err := collectStatements(stmt.Body, true); err != nil {
+					return err
+				}
 			case *ir.ReturnStmt:
 				if len(stmt.Results) != 0 && len(stmt.Results) != sig.NumResults() {
 					return fmt.Errorf("return has %d results, want %d",
@@ -429,6 +457,30 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if err := collectStatements(fn.Body, false); err != nil {
 		return nil, err
 	}
+	if len(rangeVars) != 0 {
+		rangeVariableSet := make(map[*ir.Name]bool, len(rangeVars))
+		for _, variable := range rangeVars {
+			rangeVariableSet[variable.Canonical()] = true
+		}
+		rangeClosureCapture := false
+		ir.Visit(fn, func(node ir.Node) {
+			if rangeClosureCapture {
+				return
+			}
+			closure, ok := node.(*ir.ClosureExpr)
+			if !ok {
+				return
+			}
+			for _, variable := range closure.Func.ClosureVars {
+				if rangeVariableSet[variable.Canonical()] {
+					rangeClosureCapture = true
+				}
+			}
+		})
+		if rangeClosureCapture {
+			return nil, fmt.Errorf("range variable captured by closure")
+		}
+	}
 
 	edges := make(map[*ir.CallExpr]Edge)
 	for _, edge := range function.Edges {
@@ -456,6 +508,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		defers:        defers,
 		dynamicDefers: dynamicDefers,
 		channels:      make(map[ir.Node]*lowerChannel),
+		rangeVars:     rangeVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
 	for _, site := range function.Sites {
@@ -655,6 +708,29 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	return candidate, nil
 }
 
+// transformedRangeVariable recognizes the assignment inserted by
+// loopvar.ForCapture for a per-iteration range variable.
+func transformedRangeVariable(stmt *ir.RangeStmt) *ir.Name {
+	if stmt == nil || len(stmt.Body) == 0 {
+		return nil
+	}
+	assignment, ok := stmt.Body[0].(*ir.AssignStmt)
+	if !ok || !assignment.Def || assignment.Y != stmt.Key {
+		return nil
+	}
+	variable, ok := assignment.X.(*ir.Name)
+	if !ok {
+		return nil
+	}
+	for _, init := range assignment.Init() {
+		declaration, ok := init.(*ir.Decl)
+		if ok && declaration.X.Canonical() == variable.Canonical() {
+			return variable
+		}
+	}
+	return nil
+}
+
 func newLowerChannel(node, statement, container ir.Node) (*lowerChannel, error) {
 	if node == nil || statement == nil || container == nil {
 		return nil, fmt.Errorf("operation has no owning statement")
@@ -714,6 +790,27 @@ func newLowerChannel(node, statement, container ir.Node) (*lowerChannel, error) 
 			!normalizedReceiveAssignment(node, statement, container) {
 			return nil, fmt.Errorf("nested receive assignment")
 		}
+
+	case *ir.RangeStmt:
+		if statement != node || container != node {
+			return nil, fmt.Errorf("nested channel range")
+		}
+		if node.Value != nil {
+			return nil, fmt.Errorf("channel range has value variable")
+		}
+		if node.DistinctVars {
+			return nil, fmt.Errorf("unprocessed range variables")
+		}
+		if node.Key != nil && !ir.IsBlank(node.Key) {
+			if _, ok := node.Key.(*ir.Name); !ok {
+				return nil, fmt.Errorf("range result is not a variable")
+			}
+			if node.Key.Type() == nil {
+				return nil, fmt.Errorf("range result has no type")
+			}
+		}
+		channel.channel = node.X
+		channel.rangeStmt = node
 
 	default:
 		return nil, fmt.Errorf("unsupported operation %v", node.Op())
@@ -1680,44 +1777,50 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	captureCells := make(map[*ir.Name]*ir.Name)
 	captureStorage := make(map[*ir.Name]*ir.Name)
 	var captureCellInitializers ir.Nodes
+	addCaptureCell := func(variable *ir.Name) {
+		source := variable.Canonical()
+		if captureCells[source] != nil {
+			return
+		}
+		storage := source
+		parameter := candidate.parameters[source]
+		result := candidate.results[source]
+		if parameter != nil {
+			storage = parameter
+		} else if result != nil {
+			storage = result
+		}
+		cell := typecheck.TempAt(source.Pos(), factory,
+			types.NewPtr(source.Type()))
+		captureCells[source] = cell
+		captureStorage[storage.Canonical()] = cell
+		addDeclaration(ir.NewDecl(source.Pos(), ir.ODCL, cell))
+
+		if parameter == nil && result == nil {
+			captureCellInitializers = append(captureCellInitializers,
+				ir.NewAssignStmt(source.Pos(), cell,
+					ir.NewZero(source.Pos(), cell.Type())))
+			return
+		}
+		allocation := typedNew(source.Pos(), source.Type())
+		captureCellInitializers = append(captureCellInitializers,
+			ir.NewAssignStmt(source.Pos(), cell, allocation))
+		if parameter != nil {
+			captureCellInitializers = append(captureCellInitializers,
+				ir.NewAssignStmt(source.Pos(),
+					typedDeref(source.Pos(), cell, source.Type()),
+					parameter))
+		}
+	}
+	for _, variable := range candidate.rangeVars {
+		addCaptureCell(variable)
+	}
 	for _, deferred := range candidate.defers {
 		if !deferred.sourceLiteral {
 			continue
 		}
 		for _, variable := range deferred.literalCaptures {
-			source := variable.Canonical()
-			if captureCells[source] != nil {
-				continue
-			}
-			storage := source
-			parameter := candidate.parameters[source]
-			result := candidate.results[source]
-			if parameter != nil {
-				storage = parameter
-			} else if result != nil {
-				storage = result
-			}
-			cell := typecheck.TempAt(source.Pos(), factory,
-				types.NewPtr(source.Type()))
-			captureCells[source] = cell
-			captureStorage[storage.Canonical()] = cell
-			addDeclaration(ir.NewDecl(source.Pos(), ir.ODCL, cell))
-
-			if parameter == nil && result == nil {
-				captureCellInitializers = append(captureCellInitializers,
-					ir.NewAssignStmt(source.Pos(), cell,
-						ir.NewZero(source.Pos(), cell.Type())))
-				continue
-			}
-			allocation := typedNew(source.Pos(), source.Type())
-			captureCellInitializers = append(captureCellInitializers,
-				ir.NewAssignStmt(source.Pos(), cell, allocation))
-			if parameter != nil {
-				captureCellInitializers = append(captureCellInitializers,
-					ir.NewAssignStmt(source.Pos(),
-						typedDeref(source.Pos(), cell, source.Type()),
-						parameter))
-			}
+			addCaptureCell(variable)
 		}
 	}
 	captureCell := func(name *ir.Name) *ir.Name {
@@ -2040,6 +2143,66 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			bodyState := lowerStatements(stmt.Body, postState)
 			states[conditionState].thenState = bodyState
 			return lowerStatements(stmt.Init(), conditionState)
+
+		case *ir.RangeStmt:
+			channel := candidate.channels[stmt]
+			if channel == nil || channel.rangeStmt != stmt {
+				panic("unexpected coroutine range boundary")
+			}
+			channelType := channel.channel.Type()
+			elementType := channelType.Elem()
+			rangeChan := typecheck.TempAt(stmt.Pos(), factory, channelType)
+			rangeValue := typecheck.TempAt(stmt.Pos(), factory, elementType)
+			rangeOK := typecheck.TempAt(stmt.Pos(), factory,
+				types.Types[types.TBOOL])
+			channel.rangeChan = rangeChan
+			channel.recvValue = rangeValue
+			channel.recvOK = rangeOK
+			for _, name := range []*ir.Name{
+				rangeChan, rangeValue, rangeOK,
+			} {
+				addDeclaration(ir.NewDecl(stmt.Pos(), ir.ODCL, name))
+			}
+
+			receiveState := addState(lowerState{
+				transition: SiteChannel,
+				channel:    channel,
+				statement:  stmt,
+				next:       -1,
+				thenState:  -1,
+				elseState:  -1,
+			})
+			bodyNext := receiveState
+			if elementType.HasPointers() {
+				clear := ir.NewAssignStmt(stmt.Pos(), channel.recvValue,
+					ir.NewZero(stmt.Pos(), elementType))
+				bodyNext = newBodyState(ir.Nodes{clear}, bodyNext)
+			}
+			bodyState := lowerStatements(stmt.Body, bodyNext)
+			if stmt.Key != nil && !ir.IsBlank(stmt.Key) {
+				value := ir.Node(channel.recvValue)
+				if !types.Identical(stmt.Key.Type(), elementType) {
+					conversion := ir.NewConvExpr(stmt.Pos(), ir.OCONV,
+						stmt.Key.Type(), value)
+					conversion.TypeWord = stmt.KeyTypeWord
+					conversion.SrcRType = stmt.KeySrcRType
+					value = conversion
+				}
+				assignment := ir.NewAssignStmt(stmt.Pos(), stmt.Key, value)
+				bodyState = newBodyState(ir.Nodes{assignment}, bodyState)
+			}
+			branchState := addState(lowerState{
+				condition: channel.recvOK,
+				next:      -1,
+				thenState: bodyState,
+				elseState: next,
+			})
+			states[receiveState].next = branchState
+
+			initialize := ir.NewAssignStmt(stmt.Pos(), channel.rangeChan,
+				channel.channel)
+			entryState := newBodyState(ir.Nodes{initialize}, receiveState)
+			return lowerStatements(stmt.Init(), entryState)
 		}
 		if init := ir.TakeInit(stmt); len(init) != 0 {
 			continuation := next
@@ -2554,8 +2717,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				elementType := channelType.Elem()
 				channelValue := typecheck.TempAt(channel.node.Pos(), resume,
 					channelType)
+				operationChannel := channel.channel
+				if channel.rangeChan != nil {
+					operationChannel = channel.rangeChan
+				}
 				body = append(body, ir.NewAssignStmt(channel.node.Pos(),
-					channelValue, edit(channel.channel)))
+					channelValue, edit(operationChannel)))
 				if channel.sendValue != nil {
 					value := typecheck.TempAt(channel.node.Pos(), factory,
 						elementType)

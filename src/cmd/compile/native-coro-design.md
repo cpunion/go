@@ -11,8 +11,9 @@ fixed or repeated local defer literals and statically resolved local or
 imported named defer targets; direct deferred Goexit; operation-progress
 follow-ups; nested multi-result and conservatively normalized single-result
 expressions; and restricted compiler-private cross-package factory and defer
-entries; ordinary channel send, single-value receive, and comma-ok receive
-use the runtime's shared channel wait queues without an operation goroutine;
+entries; ordinary channel send, single-value receive, comma-ok receive, and
+receive-channel range use the runtime's shared channel wait queues without an
+operation goroutine;
 not production-ready
 
 Last updated: 2026-07-29
@@ -1126,6 +1127,17 @@ A receive writes typed result temporaries before publishing readiness.
 Send-on-closed-channel panic is transferred to the logical task and enters the
 same cleanup path as another asynchronous terminal outcome.
 
+Channel range evaluates the channel expression once into frame-owned storage.
+Each iteration receives into hidden typed value and status slots, assigns the
+source iteration variable only after a successful receive, and returns to the
+same receive state after the body. A closed receive leaves an existing
+iteration variable unchanged. The hidden value is cleared before the next
+receive when its type contains pointers, matching the ordinary compiler's
+lifetime rule. Nested channel ranges and suspension in a range body use the
+same state graph. Per-iteration variables whose addresses escape receive a
+fresh typed cell on every iteration; a closure that captures such a variable
+retains the ordinary entry until general closure-frame lowering exists.
+
 The runtime registers a stackless operation directly in the existing
 `hchan.sendq` or `hchan.recvq`. Its `sudog` has no parked `g`; an
 experiment-only owner points to the registry operation instead. Ordinary and
@@ -1142,9 +1154,9 @@ It therefore uses a dedicated heap `sudog` that becomes garbage after the
 waker removes and clears it, instead of returning the waiter to an ordinary
 per-P cache from the waker's execution context. The non-experiment `sudog`
 extension has zero size and leaves the 64-bit structure at 104 bytes; the
-experiment-only owner pointer makes it 112 bytes. Select, channel range,
-multiple operations in one expression, and effectful receive destinations
-remain separate compiler and runtime steps.
+experiment-only owner pointer makes it 112 bytes. Select, multiple operations
+in one expression, and effectful receive destinations remain separate
+compiler and runtime steps.
 
 ### 11.3 Timers
 
@@ -1301,6 +1313,9 @@ The first automatic lowering supports:
 - `if`, simple loops, ordinary return, and explicit compiler test operations;
 - ordinary channel send, discarded or single-value receive, and comma-ok
   receive with simple variable targets;
+- receive-channel range with zero or one iteration variable, including nested
+  range, suspension in the body, assignment conversion, and per-iteration
+  address identity;
 - one logical root and spawned roots;
 - normal completion;
 - conditional fixed direct defer sites and repeated defer sites in simple
@@ -1329,6 +1344,7 @@ It initially rejects:
   target that may explicitly panic;
 - direct capture of a `for` induction variable when frontend loop-variable
   rewriting introduces unsupported branch control;
+- closure capture of a per-iteration channel-range variable;
 - reflection;
 - closures with escaping environments;
 - variadic C calls;
@@ -1559,6 +1575,9 @@ The compiler:
   Go assignment semantics;
 - evaluates a channel send's channel and value in source order and keeps the
   value in factory-owned typed storage until the operation completes;
+- lowers receive-channel range to a cyclic receive, status branch, body, and
+  pointer-clearing state sequence while evaluating the channel expression
+  exactly once;
 - normalizes single-result awaits in returns, call arguments, and simple
   assignments into pre-escape typed temporary assignments when doing so
   preserves every observable prefix operation; an existing statement `Init`
@@ -1903,6 +1922,15 @@ statements (94.79%). The uncovered core-channel statements are defensive
 mixed-owner and invalid-completion throws; test-only compiler subprocesses are
 again not credited to these profiles.
 
+For the channel-range follow-up, the complete coroutine compiler package is
+92.4% covered. The profile covers 143 of 147 changed production statements in
+`lower.go` (97.28%). The four uncovered statements are defensive propagation
+and invalid-state paths. End-to-end subprocess tests additionally compile and
+run buffered, unbuffered, closed, empty, converted, nested, body-yield, and
+per-iteration-address cases, and verify that an iteration-variable closure
+falls back without changing Go behavior; subprocess coverage is not credited
+to the in-process profile.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -2031,16 +2059,16 @@ reported separately above.
 
 ### 15.4 Remaining restrictions
 
-The MVP does not yet support range loops, labeled control flow, dynamic calls,
-interfaces, unlabeled branch control including frontend loop-variable
-rewrites, general escaping closures, nested closures that recapture a
-repeated-literal cell, indirect recover-capable helpers, stackless `go` edges
-in terminal named defer targets, explicit panic from a non-structured spawned
-task, channel range, select, multiple channel operations in one expression,
-effectful receive destinations, mutex parking, reflection, callbacks,
-variadic C calls, or general C ABI type classification. Ordinary channel
-send, discarded or single-value receive, and comma-ok receive with simple
-variable targets are supported through the runtime's shared channel wait
+The MVP does not yet support general non-channel range loops, labeled control
+flow, dynamic calls, interfaces, unlabeled branch control, closure capture of
+a per-iteration channel-range variable, general escaping closures, nested
+closures that recapture a repeated-literal cell, indirect recover-capable
+helpers, stackless `go` edges in terminal named defer targets, explicit panic
+from a non-structured spawned task, select, multiple channel operations in one
+expression, effectful receive destinations, mutex parking, reflection,
+callbacks, variadic C calls, or general C ABI type classification. Ordinary
+channel send, discarded or single-value receive, comma-ok receive, and
+receive-channel range are supported through the runtime's shared channel wait
 queues.
 Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
@@ -2065,7 +2093,7 @@ standard-library compatibility remain future work.
 
 The likely order is:
 
-1. add channel range and select on the direct runtime wait-queue integration;
+1. add select on the direct runtime wait-queue integration;
 2. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
 3. generalize System ABI type classification and errno handling;
