@@ -3697,6 +3697,322 @@ func main() {
 	}
 }
 
+func TestChannelSelectLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"runtime"
+	"time"
+)
+
+var evaluation int
+var produced chan int
+var consumed chan int
+var duplicateChannel chan int
+var emptyStarted chan struct{}
+
+//go:noinline
+func channel(id int, ch chan int) chan int {
+	evaluation = evaluation*10 + id
+	return ch
+}
+
+//go:noinline
+func value(id, result int) int {
+	evaluation = evaluation*10 + id
+	return result
+}
+
+//go:noinline
+func buffered(ch chan int, disabled chan int) (int, bool) {
+	select {
+	case result, ok := <-channel(1, ch):
+		runtime.Gosched()
+		return result, ok
+	case channel(2, disabled) <- value(3, 17):
+		return -1, false
+	}
+}
+
+//go:noinline
+func withDefault(recv, send chan int) (int, bool) {
+	result := 29
+	ok := true
+	select {
+	case result, ok = <-channel(4, recv):
+	case channel(5, send) <- value(6, 31):
+	default:
+		runtime.Gosched()
+	}
+	return result, ok
+}
+
+//go:noinline
+func produce() {
+	produced <- 37
+}
+
+//go:noinline
+func blocked(first, second chan int) int {
+	produced = second
+	go produce()
+	select {
+	case result := <-first:
+		return result + 1000
+	case result := <-second:
+		runtime.Gosched()
+		return result
+	}
+}
+
+//go:noinline
+func consume() {
+	result := <-produced
+	consumed <- result
+}
+
+//go:noinline
+func selectedSend(ch chan int) int {
+	produced = ch
+	consumed = make(chan int, 1)
+	go consume()
+	select {
+	case ch <- 41:
+		result := <-consumed
+		return result
+	}
+}
+
+//go:noinline
+func bufferedSend(ch chan int) int {
+	select {
+	case ch <- 42:
+	}
+	result := <-ch
+	return result
+}
+
+//go:noinline
+func closedReceive(ch chan int) (int, bool) {
+	result := 43
+	ok := true
+	select {
+	case result, ok = <-ch:
+	}
+	return result, ok
+}
+
+//go:noinline
+func closedSend(ch chan int) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	select {
+	case ch <- 47:
+	}
+	return nil
+}
+
+//go:noinline
+func heterogeneous(ints chan int, strings chan string) string {
+	select {
+	case intResult := <-ints:
+		if intResult == 0 {
+			return "zero"
+		}
+		return "int"
+	case stringResult := <-strings:
+		runtime.Gosched()
+		return stringResult
+	}
+}
+
+//go:noinline
+func onlyDefault() int {
+	select {
+	default:
+		runtime.Gosched()
+		return 71
+	}
+}
+
+//go:noinline
+func nested(outer, inner chan int) int {
+	select {
+	case first := <-outer:
+		select {
+		case second := <-inner:
+			runtime.Gosched()
+			return first + second
+		}
+	}
+}
+
+//go:noinline
+func produceDuplicate() {
+	duplicateChannel <- 79
+}
+
+//go:noinline
+func duplicate(ch chan int) int {
+	duplicateChannel = ch
+	go produceDuplicate()
+	select {
+	case result := <-ch:
+		return result
+	case result := <-ch:
+		return result + 100
+	}
+}
+
+//go:noinline
+func selectedTimer(ch <-chan time.Time) time.Time {
+	select {
+	case result := <-ch:
+		return result
+	}
+}
+
+//go:noinline
+func emptySelect() {
+	emptyStarted <- struct{}{}
+	select {}
+}
+
+func main() {
+	ready := make(chan int, 1)
+	ready <- 11
+	result, ok := buffered(ready, nil)
+	if result != 11 || !ok || evaluation != 123 {
+		panic("bad buffered select")
+	}
+
+	result, ok = withDefault(nil, nil)
+	if result != 29 || !ok || evaluation != 123456 {
+		panic("bad default select")
+	}
+
+	if result := blocked(nil, make(chan int)); result != 37 {
+		panic("blocked select stalled the scheduler")
+	}
+	if result := selectedSend(make(chan int)); result != 41 {
+		panic("bad selected send")
+	}
+	if result := bufferedSend(make(chan int, 1)); result != 42 {
+		panic("bad buffered send")
+	}
+
+	closed := make(chan int)
+	close(closed)
+	result, ok = closedReceive(closed)
+	if result != 0 || ok {
+		panic("bad closed receive")
+	}
+	if closedSend(closed) == nil {
+		panic("send on closed channel did not panic")
+	}
+
+	strings := make(chan string, 1)
+	strings <- "selected"
+	if heterogeneous(nil, strings) != "selected" {
+		panic("bad heterogeneous select")
+	}
+	if onlyDefault() != 71 {
+		panic("bad default-only select")
+	}
+
+	outer := make(chan int, 1)
+	inner := make(chan int, 1)
+	outer <- 73
+	inner <- 5
+	if nested(outer, inner) != 78 {
+		panic("bad nested select")
+	}
+	duplicateResult := duplicate(make(chan int))
+	if duplicateResult != 79 && duplicateResult != 179 {
+		panic("bad duplicate-channel select")
+	}
+	timer := time.NewTimer(5 * time.Millisecond)
+	timerResult := selectedTimer(timer.C)
+	if timerResult.IsZero() {
+		panic("bad timer select")
+	}
+	started := make(chan struct{})
+	emptyStarted = started
+	go emptySelect()
+	<-started
+	println("stackless-coro-select-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-select")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building channel select coroutine failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"buffered", "withDefault", "produce", "blocked", "consume",
+		"selectedSend", "bufferedSend", "closedReceive", "closedSend",
+		"heterogeneous",
+		"onlyDefault", "nested", "produceDuplicate", "duplicate", "main",
+		"selectedTimer", "emptySelect",
+	} {
+		if diagnostic := "skip main." + name + ":"; strings.Contains(
+			out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("channel select coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-select-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(buffered|withDefault|blocked|selectedSend|bufferedSend|closedReceive|closedSend|heterogeneous|nested|duplicate|selectedTimer|emptySelect)\.coro\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of channel select resume functions failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, "runtime.coroSelect") {
+		t.Errorf("channel select resume functions do not contain coroSelect\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{
+		"runtime.selectgo", "runtime.selectnbsend", "runtime.selectnbrecv",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("channel select resume functions contain %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
 func TestInliningCompatibility(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

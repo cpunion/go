@@ -41,6 +41,7 @@ type lowerCandidate struct {
 	defers        []*lowerDefer
 	dynamicDefers bool
 	channels      map[ir.Node]*lowerChannel
+	selects       map[*ir.SelectStmt]*lowerSelect
 	rangeVars     []*ir.Name
 	panics        map[*ir.UnaryExpr]bool
 	parameters    map[*ir.Name]*ir.Name
@@ -82,11 +83,34 @@ type lowerChannel struct {
 	rangeChan  *ir.Name
 }
 
+type lowerSelect struct {
+	statement   *ir.SelectStmt
+	cases       []*lowerSelectCase
+	defaultCase *ir.CommClause
+	descriptors *ir.Name
+	chosen      *ir.Name
+	received    *ir.Name
+}
+
+type lowerSelectCase struct {
+	clause       *ir.CommClause
+	operation    ir.Node
+	channel      ir.Node
+	sendValue    ir.Node
+	recvValue    ir.Node
+	recvOK       ir.Node
+	send         bool
+	index        int
+	channelValue *ir.Name
+	elementValue *ir.Name
+}
+
 type lowerState struct {
 	body       []ir.Node
 	transition SiteKind
 	call       *ir.CallExpr
 	channel    *lowerChannel
+	selection  *lowerSelect
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -273,6 +297,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)
 	channelStatements := make(map[ir.Node]ir.Node)
 	channelContainers := make(map[ir.Node]ir.Node)
+	selects := make(map[*ir.SelectStmt]*lowerSelect)
+	selectOperations := make(map[ir.Node]*ir.SelectStmt)
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	dynamicDefers := false
@@ -324,6 +350,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					stmt.X.Type().IsChan() {
 					channelStatements[stmt] = stmt
 					channelContainers[stmt] = stmt
+				}
+			case *ir.SelectStmt:
+				containers = nil
+				for _, clause := range stmt.Cases {
+					if clause != nil && clause.Comm != nil {
+						containers = append(containers, clause.Comm)
+					}
 				}
 			}
 			for _, root := range containers {
@@ -428,6 +461,24 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				if err := collectStatements(stmt.Body, true); err != nil {
 					return err
 				}
+			case *ir.SelectStmt:
+				selection, err := newLowerSelect(stmt)
+				if err != nil {
+					return err
+				}
+				selects[stmt] = selection
+				for _, selected := range selection.cases {
+					selectOperations[selected.operation] = stmt
+					selectOperations[selected.clause.Comm] = stmt
+				}
+				for _, clause := range stmt.Cases {
+					if err := collectStatements(clause.Init(), inLoop); err != nil {
+						return err
+					}
+					if err := collectStatements(clause.Body, inLoop); err != nil {
+						return err
+					}
+				}
 			case *ir.ReturnStmt:
 				if len(stmt.Results) != 0 && len(stmt.Results) != sig.NumResults() {
 					return fmt.Errorf("return has %d results, want %d",
@@ -447,7 +498,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				switch stmt.Op() {
 				case ir.OBREAK, ir.OCONTINUE, ir.OFALL, ir.OGOTO,
-					ir.OLABEL, ir.OSELECT:
+					ir.OLABEL:
 					return fmt.Errorf("control flow %v", stmt.Op())
 				}
 			}
@@ -508,6 +559,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		defers:        defers,
 		dynamicDefers: dynamicDefers,
 		channels:      make(map[ir.Node]*lowerChannel),
+		selects:       selects,
 		rangeVars:     rangeVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
@@ -521,6 +573,15 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			continue
 		}
 		if site.Kind == SiteChannel {
+			if stmt, ok := site.Node.(*ir.SelectStmt); ok {
+				if candidate.selects[stmt] == nil {
+					return nil, fmt.Errorf("unplanned select site %d", site.ID)
+				}
+				continue
+			}
+			if selectOperations[site.Node] != nil {
+				continue
+			}
 			channel, err := newLowerChannel(site.Node,
 				channelStatements[site.Node], channelContainers[site.Node])
 			if err != nil {
@@ -729,6 +790,127 @@ func transformedRangeVariable(stmt *ir.RangeStmt) *ir.Name {
 		}
 	}
 	return nil
+}
+
+func newLowerSelect(stmt *ir.SelectStmt) (*lowerSelect, error) {
+	if stmt == nil {
+		return nil, fmt.Errorf("nil select")
+	}
+	if stmt.Label != nil {
+		return nil, fmt.Errorf("labeled select")
+	}
+	if len(stmt.Compiled) != 0 || stmt.Walked() {
+		return nil, fmt.Errorf("already lowered select")
+	}
+	if len(stmt.Cases) > 1<<16 {
+		return nil, fmt.Errorf("select has %d cases", len(stmt.Cases))
+	}
+
+	selection := &lowerSelect{statement: stmt}
+	var sends, receives []*lowerSelectCase
+	checkTarget := func(target ir.Node, result int) error {
+		if target == nil || ir.IsBlank(target) {
+			return nil
+		}
+		if _, ok := target.(*ir.Name); !ok {
+			return fmt.Errorf("receive result %d is not a variable", result)
+		}
+		if target.Type() == nil {
+			return fmt.Errorf("receive result %d has no type", result)
+		}
+		return nil
+	}
+	for _, clause := range stmt.Cases {
+		if clause == nil {
+			return nil, fmt.Errorf("nil select case")
+		}
+		if clause.Comm == nil {
+			if selection.defaultCase != nil {
+				return nil, fmt.Errorf("multiple select defaults")
+			}
+			selection.defaultCase = clause
+			continue
+		}
+
+		selected := &lowerSelectCase{clause: clause}
+		switch operation := clause.Comm.(type) {
+		case *ir.SendStmt:
+			selected.operation = operation
+			selected.channel = operation.Chan
+			selected.sendValue = operation.Value
+			selected.send = true
+			sends = append(sends, selected)
+
+		case *ir.UnaryExpr:
+			if operation.Op() != ir.ORECV {
+				return nil, fmt.Errorf("unsupported select operation %v",
+					operation.Op())
+			}
+			selected.operation = operation
+			selected.channel = operation.X
+			receives = append(receives, selected)
+
+		case *ir.AssignStmt:
+			receive, ok := operation.Y.(*ir.UnaryExpr)
+			if !ok || receive.Op() != ir.ORECV {
+				return nil, fmt.Errorf("unsupported select assignment")
+			}
+			if err := checkTarget(operation.X, 0); err != nil {
+				return nil, err
+			}
+			selected.operation = receive
+			selected.channel = receive.X
+			selected.recvValue = operation.X
+			receives = append(receives, selected)
+
+		case *ir.AssignListStmt:
+			if (operation.Op() != ir.OSELRECV2 &&
+				operation.Op() != ir.OAS2RECV &&
+				operation.Op() != ir.OAS2) ||
+				len(operation.Lhs) != 2 || len(operation.Rhs) != 1 {
+				return nil, fmt.Errorf("unsupported select receive assignment")
+			}
+			receive, ok := operation.Rhs[0].(*ir.UnaryExpr)
+			if !ok || receive.Op() != ir.ORECV {
+				return nil, fmt.Errorf("select receive has no receive operation")
+			}
+			for i, target := range operation.Lhs {
+				if err := checkTarget(target, i); err != nil {
+					return nil, err
+				}
+			}
+			selected.operation = receive
+			selected.channel = receive.X
+			selected.recvValue = operation.Lhs[0]
+			selected.recvOK = operation.Lhs[1]
+			receives = append(receives, selected)
+
+		default:
+			return nil, fmt.Errorf("unsupported select operation %v",
+				clause.Comm.Op())
+		}
+		if selected.channel == nil || selected.channel.Type() == nil ||
+			!selected.channel.Type().IsChan() {
+			return nil, fmt.Errorf("select operation has no channel type")
+		}
+	}
+	selection.cases = append(sends, receives...)
+	for i, selected := range selection.cases {
+		selected.index = i
+	}
+	return selection, nil
+}
+
+// stacklessSelectCaseType matches runtime.scase. The runtime helper accepts a
+// byte pointer, just like selectgo, so this compiler-private type only freezes
+// the two-pointer layout used by the generated frame.
+func stacklessSelectCaseType(pos src.XPos) *types.Type {
+	return types.NewStruct([]*types.Field{
+		types.NewField(pos, typecheck.Lookup("c"),
+			types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, typecheck.Lookup("elem"),
+			types.Types[types.TUNSAFEPTR]),
+	})
 }
 
 func newLowerChannel(node, statement, container ir.Node) (*lowerChannel, error) {
@@ -2035,7 +2217,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				required = true
 				return
 			}
+			if _, ok := node.(*ir.ReturnStmt); ok {
+				required = true
+				return
+			}
 			if candidate.channels[node] != nil {
+				required = true
+				return
+			}
+			if selectStmt, ok := node.(*ir.SelectStmt); ok &&
+				candidate.selects[selectStmt] != nil {
 				required = true
 				return
 			}
@@ -2057,7 +2248,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		switch stmt := stmt.(type) {
 		case *ir.ReturnStmt:
 			return true
-		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt:
+		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.SelectStmt:
 			return requiresControlLowering(stmt)
 		}
 		if channelOperation(stmt, candidate.channels) != nil {
@@ -2202,6 +2393,174 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			initialize := ir.NewAssignStmt(stmt.Pos(), channel.rangeChan,
 				channel.channel)
 			entryState := newBodyState(ir.Nodes{initialize}, receiveState)
+			return lowerStatements(stmt.Init(), entryState)
+
+		case *ir.SelectStmt:
+			selection := candidate.selects[stmt]
+			if selection == nil || selection.statement != stmt {
+				panic("unexpected coroutine select boundary")
+			}
+			if len(selection.cases) == 0 &&
+				selection.defaultCase != nil {
+				entry := lowerStatements(selection.defaultCase.Body, next)
+				entry = lowerStatements(selection.defaultCase.Init(), entry)
+				return lowerStatements(stmt.Init(), entry)
+			}
+
+			selection.chosen = typecheck.TempAt(stmt.Pos(), factory,
+				types.Types[types.TINT])
+			selection.received = typecheck.TempAt(stmt.Pos(), factory,
+				types.Types[types.TBOOL])
+			for _, name := range []*ir.Name{
+				selection.chosen, selection.received,
+			} {
+				addDeclaration(ir.NewDecl(stmt.Pos(), ir.ODCL, name))
+			}
+			if len(selection.cases) != 0 {
+				caseType := stacklessSelectCaseType(stmt.Pos())
+				selection.descriptors = typecheck.TempAt(stmt.Pos(), factory,
+					types.NewArray(caseType, int64(len(selection.cases))))
+				addDeclaration(ir.NewDecl(stmt.Pos(), ir.ODCL,
+					selection.descriptors))
+			}
+			for _, selected := range selection.cases {
+				channelType := selected.channel.Type()
+				selected.channelValue = typecheck.TempAt(
+					selected.operation.Pos(), factory, channelType)
+				addDeclaration(ir.NewDecl(selected.operation.Pos(),
+					ir.ODCL, selected.channelValue))
+				if selected.sendValue != nil ||
+					(selected.recvValue != nil &&
+						!ir.IsBlank(selected.recvValue)) {
+					selected.elementValue = typecheck.TempAt(
+						selected.operation.Pos(), factory,
+						channelType.Elem())
+					addDeclaration(ir.NewDecl(selected.operation.Pos(),
+						ir.ODCL, selected.elementValue))
+				}
+			}
+
+			selectedByClause := make(map[*ir.CommClause]*lowerSelectCase,
+				len(selection.cases))
+			for _, selected := range selection.cases {
+				selectedByClause[selected.clause] = selected
+			}
+			var initialize ir.Nodes
+			for _, clause := range stmt.Cases {
+				initialize = append(initialize, clause.Init()...)
+				selected := selectedByClause[clause]
+				if selected == nil {
+					continue
+				}
+				initialize = append(initialize, ir.NewAssignStmt(
+					selected.operation.Pos(), selected.channelValue,
+					selected.channel))
+				if selected.sendValue != nil {
+					initialize = append(initialize, ir.NewAssignStmt(
+						selected.operation.Pos(), selected.elementValue,
+						selected.sendValue))
+				}
+				descriptor := ir.NewIndexExpr(selected.operation.Pos(),
+					selection.descriptors,
+					ir.NewInt(selected.operation.Pos(),
+						int64(selected.index)))
+				channelField := ir.NewSelectorExpr(selected.operation.Pos(),
+					ir.ODOT, descriptor, typecheck.Lookup("c"))
+				channelPointer := typecheck.ConvNop(selected.channelValue,
+					types.Types[types.TUNSAFEPTR])
+				initialize = append(initialize, ir.NewAssignStmt(
+					selected.operation.Pos(), channelField,
+					channelPointer))
+				if selected.elementValue != nil {
+					descriptor = ir.NewIndexExpr(selected.operation.Pos(),
+						selection.descriptors,
+						ir.NewInt(selected.operation.Pos(),
+							int64(selected.index)))
+					elementField := ir.NewSelectorExpr(
+						selected.operation.Pos(), ir.ODOT, descriptor,
+						typecheck.Lookup("elem"))
+					elementPointer := typecheck.ConvNop(
+						typecheck.NodAddr(selected.elementValue),
+						types.Types[types.TUNSAFEPTR])
+					initialize = append(initialize, ir.NewAssignStmt(
+						selected.operation.Pos(), elementField,
+						elementPointer))
+				}
+			}
+
+			clearValues := func(selected *lowerSelectCase) ir.Nodes {
+				var body ir.Nodes
+				if selected != nil && !selected.send &&
+					selected.recvValue != nil &&
+					!ir.IsBlank(selected.recvValue) {
+					body = append(body, ir.NewAssignStmt(
+						selected.operation.Pos(), selected.recvValue,
+						selected.elementValue))
+				}
+				if selected != nil && !selected.send &&
+					selected.recvOK != nil &&
+					!ir.IsBlank(selected.recvOK) {
+					body = append(body, ir.NewAssignStmt(
+						selected.operation.Pos(), selected.recvOK,
+						selection.received))
+				}
+				for _, candidate := range selection.cases {
+					body = append(body, ir.NewAssignStmt(
+						candidate.operation.Pos(), candidate.channelValue,
+						ir.NewZero(candidate.operation.Pos(),
+							candidate.channelValue.Type())))
+					if candidate.elementValue != nil &&
+						candidate.elementValue.Type().HasPointers() {
+						body = append(body, ir.NewAssignStmt(
+							candidate.operation.Pos(),
+							candidate.elementValue,
+							ir.NewZero(candidate.operation.Pos(),
+								candidate.elementValue.Type())))
+					}
+				}
+				return body
+			}
+
+			dispatch := next
+			for i := len(selection.cases) - 1; i >= 0; i-- {
+				selected := selection.cases[i]
+				caseState := lowerStatements(selected.clause.Body, next)
+				caseState = lowerStatements(clearValues(selected), caseState)
+				condition := ir.NewBinaryExpr(selected.operation.Pos(),
+					ir.OEQ, selection.chosen,
+					ir.NewInt(selected.operation.Pos(),
+						int64(selected.index)))
+				dispatch = addState(lowerState{
+					condition: condition,
+					next:      -1,
+					thenState: caseState,
+					elseState: dispatch,
+				})
+			}
+			if selection.defaultCase != nil {
+				defaultState := lowerStatements(
+					selection.defaultCase.Body, next)
+				defaultState = lowerStatements(
+					clearValues(nil), defaultState)
+				condition := ir.NewBinaryExpr(stmt.Pos(), ir.OLT,
+					selection.chosen, ir.NewInt(stmt.Pos(), 0))
+				dispatch = addState(lowerState{
+					condition: condition,
+					next:      -1,
+					thenState: defaultState,
+					elseState: dispatch,
+				})
+			}
+
+			selectState := addState(lowerState{
+				transition: SiteChannel,
+				selection:  selection,
+				statement:  stmt,
+				next:       dispatch,
+				thenState:  -1,
+				elseState:  -1,
+			})
+			entryState := lowerStatements(initialize, selectState)
 			return lowerStatements(stmt.Init(), entryState)
 		}
 		if init := ir.TakeInit(stmt); len(init) != 0 {
@@ -2708,6 +3067,45 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					ir.Nodes{ctx, child}, false))
 				action = actionWait
 			case SiteChannel:
+				if selection := state.selection; selection != nil {
+					casePointerType := types.NewPtr(
+						types.Types[types.TUINT8])
+					var casesPointer ir.Node = ir.NewNilExpr(
+						state.statement.Pos(), casePointerType)
+					if selection.descriptors != nil {
+						descriptors := edit(selection.descriptors)
+						first := ir.NewIndexExpr(state.statement.Pos(),
+							descriptors, ir.NewInt(state.statement.Pos(), 0))
+						casesPointer = typecheck.ConvNop(
+							typecheck.NodAddr(first), casePointerType)
+					}
+					nsends := 0
+					for _, selected := range selection.cases {
+						if !selected.send {
+							break
+						}
+						nsends++
+					}
+					body = append(body, typecheck.Call(
+						state.statement.Pos(),
+						typecheck.LookupRuntime("coroSelect"),
+						ir.Nodes{
+							ctx,
+							casesPointer,
+							ir.NewInt(state.statement.Pos(),
+								int64(nsends)),
+							ir.NewInt(state.statement.Pos(),
+								int64(len(selection.cases)-nsends)),
+							ir.NewBasicLit(state.statement.Pos(),
+								types.Types[types.TBOOL],
+								constant.MakeBool(
+									selection.defaultCase == nil)),
+							typecheck.NodAddr(edit(selection.chosen)),
+							typecheck.NodAddr(edit(selection.received)),
+						}, false))
+					action = actionWait
+					break
+				}
 				channel := state.channel
 				if channel == nil {
 					return fmt.Errorf("%s: state %d has no channel operation",

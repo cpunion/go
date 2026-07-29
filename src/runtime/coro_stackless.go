@@ -87,6 +87,7 @@ type stacklessCoroOperation struct {
 	received  *bool
 	send      bool
 	timerWait bool
+	selection *stacklessCoroSelect
 	fd        int32
 	buffer    []byte
 	call      func()
@@ -610,6 +611,12 @@ func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, re
 	startStacklessCoroChannel(ctx, channel, element, received, false)
 }
 
+// coroSelect starts a channel select for a stackless logical goroutine.
+func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool,
+	chosen *int, received *bool) {
+	startStacklessCoroSelect(ctx, cases, nsends, nrecvs, block, chosen, received)
+}
+
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) {
 	s, task := stacklessCoroStartOperation(ctx, "channel")
@@ -629,10 +636,19 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	}
 }
 
-func finishStacklessCoroChannel(owner unsafe.Pointer, success bool) {
+func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
 	op := (*stacklessCoroOperation)(owner)
+	if op != nil && op.selection != nil {
+		finishStacklessCoroSelect(op, waiter, success)
+		return
+	}
 	if op == nil || takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid stackless coroutine channel completion")
+	}
+	if waiter != nil {
+		waiter.coro.clear()
+		waiter.c.set(nil)
+		releaseStacklessCoroSudog(waiter)
 	}
 	if op.timerWait {
 		unblockTimerChan(op.channel)

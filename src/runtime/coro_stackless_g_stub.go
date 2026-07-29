@@ -22,8 +22,13 @@ func (*stacklessCoroSudog) set(unsafe.Pointer) {
 
 func (*stacklessCoroSudog) clear() {}
 
-func finishStacklessCoroChannel(unsafe.Pointer, bool) {
+func finishStacklessCoroChannel(unsafe.Pointer, *sudog, bool) {
 	throw("runtime: stackless coroutine channel waiter without experiment")
+}
+
+func stacklessCoroSelectTry(unsafe.Pointer) bool {
+	throw("runtime: stackless coroutine select without experiment")
+	return false
 }
 
 func releaseStacklessCoroSudog(*sudog) {
