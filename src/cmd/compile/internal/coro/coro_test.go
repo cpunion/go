@@ -3393,6 +3393,310 @@ func main() {
 	}
 }
 
+func TestChannelRangeLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var evaluated int
+var produced chan int
+
+//go:noinline
+func rangeSource(ch <-chan int) <-chan int {
+	evaluated++
+	return ch
+}
+
+//go:noinline
+func values3(a, b, c int) <-chan int {
+	ch := make(chan int, 3)
+	ch <- a
+	ch <- b
+	ch <- c
+	close(ch)
+	return ch
+}
+
+//go:noinline
+func values2(a, b int) <-chan int {
+	ch := make(chan int, 2)
+	ch <- a
+	ch <- b
+	close(ch)
+	return ch
+}
+
+//go:noinline
+func channels2(a, b <-chan int) <-chan (<-chan int) {
+	ch := make(chan (<-chan int), 2)
+	ch <- a
+	ch <- b
+	close(ch)
+	return ch
+}
+
+//go:noinline
+func empty() <-chan int {
+	ch := make(chan int)
+	close(ch)
+	return ch
+}
+
+//go:noinline
+func rangeSum(ch <-chan int) (int, int) {
+	sum := 0
+	last := 37
+	for last = range rangeSource(ch) {
+		runtime.Gosched()
+		sum += last
+	}
+	return sum, last
+}
+
+//go:noinline
+func rangeBlank(ch <-chan int) int {
+	count := 0
+	for range ch {
+		count++
+	}
+	return count
+}
+
+//go:noinline
+func rangeInterface(ch <-chan int) int {
+	var value any
+	sum := 0
+	for value = range ch {
+		sum += value.(int)
+	}
+	return sum
+}
+
+//go:noinline
+func rangeDistinct(ch <-chan int) bool {
+	var values []*int
+	for value := range ch {
+		values = append(values, &value)
+		runtime.Gosched()
+	}
+	return len(values) == 2 && values[0] != values[1] &&
+		*values[0] == 41 && *values[1] == 43
+}
+
+//go:noinline
+func rangeNested(ch <-chan (<-chan int)) int {
+	sum := 0
+	for inner := range ch {
+		for value := range inner {
+			sum += value
+		}
+	}
+	return sum
+}
+
+//go:noinline
+func produce() {
+	produced <- 19
+	produced <- 23
+	close(produced)
+}
+
+//go:noinline
+func rangeProduced() int {
+	ch := make(chan int)
+	produced = ch
+	go produce()
+	return rangeBlank(ch)
+}
+
+func main() {
+	sumValues := values3(2, 3, 5)
+	total, last := rangeSum(sumValues)
+	if total != 10 || last != 5 || evaluated != 1 {
+		panic("bad channel range result")
+	}
+
+	emptyValues := empty()
+	emptyTotal, emptyLast := rangeSum(emptyValues)
+	if emptyTotal != 0 || emptyLast != 37 || evaluated != 2 {
+		panic("closed channel range changed the iteration variable")
+	}
+	blankValues := values2(7, 11)
+	blankCount := rangeBlank(blankValues)
+	if blankCount != 2 {
+		panic("bad blank channel range")
+	}
+	interfaceValues := values2(13, 17)
+	interfaceSum := rangeInterface(interfaceValues)
+	if interfaceSum != 30 {
+		panic("bad converted channel range")
+	}
+	distinctValues := values2(41, 43)
+	distinct := rangeDistinct(distinctValues)
+	if !distinct {
+		panic("bad channel range iteration variables")
+	}
+	firstNested := values2(59, 61)
+	secondNested := values2(67, 71)
+	nestedValues := channels2(firstNested, secondNested)
+	nestedSum := rangeNested(nestedValues)
+	if nestedSum != 258 {
+		panic("bad nested channel range")
+	}
+	producedCount := rangeProduced()
+	if producedCount != 2 {
+		panic("blocked channel range stalled the scheduler")
+	}
+	println("stackless-coro-channel-range-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-channel-range")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building channel range coroutine failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"values3", "values2", "channels2", "rangeSum", "rangeBlank",
+		"rangeInterface", "rangeDistinct", "rangeNested", "produce",
+		"rangeProduced", "main",
+	} {
+		if diagnostic := "skip main." + name + ":"; strings.Contains(
+			out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("channel range coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-channel-range-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.range(Sum|Blank|Interface|Distinct|Nested)\.coro\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of channel range resume functions failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, "runtime.coroChanRecv") {
+		t.Errorf("channel range resume functions do not contain coroChanRecv\n%s",
+			disassembly)
+	}
+	for _, forbidden := range []string{
+		"runtime.chanrecv1", "runtime.chanrecv2",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("channel range resume functions contain %q\n%s",
+				forbidden, disassembly)
+		}
+	}
+}
+
+func TestChannelRangeClosureFallback(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+//go:noinline
+func values() <-chan int {
+	ch := make(chan int, 2)
+	ch <- 47
+	ch <- 53
+	close(ch)
+	return ch
+}
+
+//go:noinline
+func collect(ch <-chan int) []func() int {
+	var result []func() int
+	for value := range ch {
+		result = append(result, func() int {
+			return value
+		})
+		runtime.Gosched()
+	}
+	return result
+}
+
+func main() {
+	ch := values()
+	result := collect(ch)
+	first := result[0]()
+	second := result[1]()
+	if len(result) != 2 || first != 47 || second != 53 {
+		println("channel range closure result", len(result), first, second)
+		panic("bad channel range closure variables")
+	}
+	println("stackless-coro-channel-range-closure-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-channel-range-closure")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building channel range closure failed: %v\n%s", err, out)
+	}
+	if diagnostic := "skip main.values:"; strings.Contains(out, diagnostic) {
+		t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+	}
+	if diagnostic := "coro: skip main.collect: range variable captured by closure"; !strings.Contains(
+		out, diagnostic) {
+		t.Errorf("output does not contain %q\n%s", diagnostic, out)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("channel range closure failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-channel-range-closure-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+}
+
 func TestInliningCompatibility(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
