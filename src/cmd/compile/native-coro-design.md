@@ -12,7 +12,8 @@ imported named defer targets; direct deferred Goexit; operation-progress
 follow-ups; nested multi-result and conservatively normalized single-result
 expressions; and restricted compiler-private cross-package factory and defer
 entries; ordinary channel send, single-value receive, and comma-ok receive
-are implemented; not production-ready
+use the runtime's shared channel wait queues without an operation goroutine;
+not production-ready
 
 Last updated: 2026-07-29
 
@@ -1125,19 +1126,25 @@ A receive writes typed result temporaries before publishing readiness.
 Send-on-closed-channel panic is transferred to the logical task and enters the
 same cleanup path as another asynchronous terminal outcome.
 
-The runtime bridge executes each potentially blocking channel operation on an
-ordinary Go worker goroutine. The worker receives only a registry operation
-identity, never calls the continuation, and publishes success or panic through
-the scheduler ready queue. This proves compiler evaluation order, result
-ownership, early completion, panic transfer, and nonblocking executor progress
-without freezing a second channel implementation.
+The runtime registers a stackless operation directly in the existing
+`hchan.sendq` or `hchan.recvq`. Its `sudog` has no parked `g`; an
+experiment-only owner points to the registry operation instead. Ordinary and
+stackless waiters consequently share one FIFO, buffer accounting, close path,
+timer-channel bookkeeping, and race synchronization. Matching copies values
+with the channel's element type, releases the channel lock, releases the
+`sudog`, and only then publishes the logical task to its scheduler. A producer
+never invokes the continuation.
 
-The worker bridge is transitional: a blocked operation still owns an ordinary
-goroutine stack. The scalable path should register the logical task directly
-with the runtime channel wait queues and publish through the same operation
-identity. Select, channel range, multiple operations in one expression,
-effectful receive destinations, and direct sudog integration remain separate
-steps.
+This removes the per-operation goroutine and its stack without introducing a
+parallel channel implementation. A parked goroutine releases its own `sudog`
+after wakeup, but a logical waiter has no resumed `g` to perform that cleanup.
+It therefore uses a dedicated heap `sudog` that becomes garbage after the
+waker removes and clears it, instead of returning the waiter to an ordinary
+per-P cache from the waker's execution context. The non-experiment `sudog`
+extension has zero size and leaves the 64-bit structure at 104 bytes; the
+experiment-only owner pointer makes it 112 bytes. Select, channel range,
+multiple operations in one expression, and effectful receive destinations
+remain separate compiler and runtime steps.
 
 ### 11.3 Timers
 
@@ -1639,8 +1646,9 @@ The runtime:
   a caller local saved on the pre-switch stack;
 - uses common operation ownership for timer, regular-file worker, nonblocking
   socket, and asynchronous C completion;
-- transfers ordinary channel send and receive through operation-identity
-  workers, publishes completion without invoking a continuation, and converts
+- registers ordinary channel send and receive directly in the runtime channel
+  wait queues, shares FIFO and buffering with parked goroutines, publishes
+  completion only after releasing the channel lock, and converts
   send-on-closed panic into a task-owned terminal outcome;
 - makes timer completion and cancellation race for the same operation record,
   so exactly one path readies the waiter;
@@ -1692,8 +1700,12 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   success/EOF/deadline/close, and asynchronous C success/error paths;
 - buffered and unbuffered channel send/receive, closed-channel comma-ok,
   blank results, defined bool status, discarded receive, send-on-closed panic,
-  and eight simultaneously blocked sends making progress at
+  direct ordinary/logical waiter interoperability, shared FIFO order, and 64
+  simultaneously blocked logical sends without 64 operation goroutines at
   `GOMAXPROCS=1`;
+- a real timer channel repeatedly pairs `Stop` and `Reset` with a directly
+  queued logical receive, covering the `blockTimerChan` and
+  `unblockTimerChan` lifecycle;
 - at `GOMAXPROCS=1`, a sibling stackless task must run before it can cancel a
   pending timer or release the writer that completes a blocked file or socket
   read; a five-second rescue makes a scheduling regression fail instead of
@@ -1883,6 +1895,14 @@ defined-bool comma-ok results, pointer values across a forced GC, closed-send
 panic recovery, and object inspection; subprocess coverage is not credited to
 the in-process profile.
 
+For the direct channel wait-queue follow-up, the union of the feature-off
+complete runtime profile, feature-on complete runtime profile, and focused
+feature-on race profile covers 191 of 209 changed production statements
+(91.39%). The experiment-only `chan_coro.go` implementation is 91 of 96
+statements (94.79%). The uncovered core-channel statements are defensive
+mixed-owner and invalid-completion throws; test-only compiler subprocesses are
+again not credited to these profiles.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -1896,6 +1916,22 @@ runs, not stable performance promises.
 | zero-duration timer wake | 9.14 us | 27.34 us | 248 B |
 | one-byte regular-file read | 10.47 us | 25.28 us | 144 B |
 | one-byte socket read | 10.78 us | 25.35 us | 144 B |
+
+The direct channel benchmark performs one unbuffered stackless send/receive
+handoff. Ten 1-second samples on Darwin/arm64 Apple M4 Max and translated
+Linux/amd64 VirtualApple compare the operation-goroutine implementation at the
+preceding channel commit with the shared wait-queue implementation:
+
+| Channel implementation | Darwin median | Linux median | Darwin B/op | Linux B/op | allocs/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| operation goroutine | 10.06 us | 38.186 us | 384 | 385 | 4 |
+| direct runtime wait queue | 194.85 ns | 572.9 ns | 464 | 464 | 3 |
+
+The direct path is approximately 51.6 times faster on Darwin and 66.7 times
+faster on translated Linux in this microbenchmark, and removes one allocation.
+Its dedicated 112-byte logical `sudog` increases bytes per handoff by about 80
+relative to the worker baseline; a coroutine-specific waiter pool is a
+separate optimization after the ownership model is stable.
 
 A compiler-generated yield loop was also compared with the integration branch
 using 20 interleaved 500 ms samples on Darwin/arm64. The baseline and
@@ -2004,7 +2040,8 @@ task, channel range, select, multiple channel operations in one expression,
 effectful receive destinations, mutex parking, reflection, callbacks,
 variadic C calls, or general C ABI type classification. Ordinary channel
 send, discarded or single-value receive, and comma-ok receive with simple
-variable targets are supported through a transitional per-operation worker.
+variable targets are supported through the runtime's shared channel wait
+queues.
 Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
 spawned logical goroutine, fixed or repeated-simple-loop defer cleanup,
@@ -2028,8 +2065,7 @@ standard-library compatibility remain future work.
 
 The likely order is:
 
-1. replace the transitional channel worker with direct runtime wait-queue
-   integration, then add channel range and select;
+1. add channel range and select on the direct runtime wait-queue integration;
 2. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
 3. generalize System ABI type classification and errno handling;

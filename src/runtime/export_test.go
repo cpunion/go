@@ -566,6 +566,8 @@ type G = g
 
 const StacklessCoroGSize = unsafe.Sizeof(stacklessCoroG{})
 
+const StacklessCoroSudogSize = unsafe.Sizeof(stacklessCoroSudog{})
+
 type Sudog = sudog
 
 type XRegPerG = xRegPerG

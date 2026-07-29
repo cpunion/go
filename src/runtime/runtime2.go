@@ -399,14 +399,21 @@ func (p *maybeTraceableChan) get() *hchan {
 // many sudogs for one g; and many gs may be waiting on the same
 // synchronization object, so there may be many sudogs for one object.
 //
-// sudogs are allocated from a special pool. Use acquireSudog and
-// releaseSudog to allocate and free them.
+// sudogs are ordinarily allocated from a special pool. Use acquireSudog and
+// releaseSudog to allocate and free them. Stackless coroutine channel waiters
+// have operation-owned storage; see newStacklessCoroSudog.
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
 	g *g
+
+	// coro holds an owner only for a stackless coroutine channel waiter.
+	// Such a waiter has no parked g; channel completion publishes the
+	// operation to its logical scheduler instead. The field has zero size
+	// when the coroutine experiment is disabled.
+	coro stacklessCoroSudog
 
 	next *sudog
 	prev *sudog

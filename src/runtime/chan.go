@@ -320,6 +320,11 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		unlockf()
 		fatal("send on synctest channel from outside bubble")
 	}
+	op := sg.coro.get()
+	if op != nil && sg.g != nil {
+		unlockf()
+		throw("runtime: channel waiter has both g and coroutine")
+	}
 	if raceenabled {
 		if c.dataqsiz == 0 {
 			racesync(c, sg)
@@ -337,8 +342,21 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		}
 	}
 	if sg.elem.get() != nil {
-		sendDirect(c.elemtype, sg, ep)
+		if op != nil {
+			typedmemmove(c.elemtype, sg.elem.get(), ep)
+		} else {
+			sendDirect(c.elemtype, sg, ep)
+		}
 		sg.elem.set(nil)
+	}
+	if op != nil {
+		sg.coro.clear()
+		sg.c.set(nil)
+		sg.success = true
+		unlockf()
+		releaseStacklessCoroSudog(sg)
+		finishStacklessCoroChannel(op, true)
+		return
 	}
 	gp := sg.g
 	unlockf()
@@ -434,6 +452,7 @@ func closechan(c *hchan) {
 	c.closed = 1
 
 	var glist gList
+	var corohead, corotail *sudog
 
 	// release all readers
 	for {
@@ -447,6 +466,20 @@ func closechan(c *hchan) {
 		}
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
+		}
+		if sg.coro.get() != nil {
+			if sg.g != nil {
+				unlock(&c.lock)
+				throw("runtime: channel waiter has both g and coroutine")
+			}
+			sg.success = false
+			if corotail == nil {
+				corohead = sg
+			} else {
+				corotail.waitlink = sg
+			}
+			corotail = sg
+			continue
 		}
 		gp := sg.g
 		gp.param = unsafe.Pointer(sg)
@@ -467,6 +500,20 @@ func closechan(c *hchan) {
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
+		if sg.coro.get() != nil {
+			if sg.g != nil {
+				unlock(&c.lock)
+				throw("runtime: channel waiter has both g and coroutine")
+			}
+			sg.success = false
+			if corotail == nil {
+				corohead = sg
+			} else {
+				corotail.waitlink = sg
+			}
+			corotail = sg
+			continue
+		}
 		gp := sg.g
 		gp.param = unsafe.Pointer(sg)
 		sg.success = false
@@ -482,6 +529,16 @@ func closechan(c *hchan) {
 		gp := glist.pop()
 		gp.schedlink = 0
 		goready(gp, 3)
+	}
+	for corohead != nil {
+		sg := corohead
+		corohead = sg.waitlink
+		sg.waitlink = nil
+		op := sg.coro.get()
+		sg.coro.clear()
+		sg.c.set(nil)
+		releaseStacklessCoroSudog(sg)
+		finishStacklessCoroChannel(op, false)
 	}
 }
 
@@ -704,13 +761,22 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		unlockf()
 		fatal("receive on synctest channel from outside bubble")
 	}
+	op := sg.coro.get()
+	if op != nil && sg.g != nil {
+		unlockf()
+		throw("runtime: channel waiter has both g and coroutine")
+	}
 	if c.dataqsiz == 0 {
 		if raceenabled {
 			racesync(c, sg)
 		}
 		if ep != nil {
 			// copy data from sender
-			recvDirect(c.elemtype, sg, ep)
+			if op != nil {
+				typedmemmove(c.elemtype, ep, sg.elem.get())
+			} else {
+				recvDirect(c.elemtype, sg, ep)
+			}
 		}
 	} else {
 		// Queue is full. Take the item at the
@@ -735,6 +801,15 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 	}
 	sg.elem.set(nil)
+	if op != nil {
+		sg.coro.clear()
+		sg.c.set(nil)
+		sg.success = true
+		unlockf()
+		releaseStacklessCoroSudog(sg)
+		finishStacklessCoroChannel(op, true)
+		return
+	}
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
@@ -915,8 +990,12 @@ func (c *hchan) raceaddr() unsafe.Pointer {
 
 func racesync(c *hchan, sg *sudog) {
 	racerelease(chanbuf(c, 0))
-	raceacquireg(sg.g, chanbuf(c, 0))
-	racereleaseg(sg.g, chanbuf(c, 0))
+	if owner := sg.coro.get(); owner != nil {
+		raceacquire(owner)
+	} else {
+		raceacquireg(sg.g, chanbuf(c, 0))
+		racereleaseg(sg.g, chanbuf(c, 0))
+	}
 	raceacquire(chanbuf(c, 0))
 }
 
@@ -938,6 +1017,21 @@ func racenotify(c *hchan, idx uint, sg *sudog) {
 	// following the memory model's happens-before rules (rules that are
 	// implemented in racereleaseacquire).  Instead, we accumulate happens-before
 	// information in the synchronization object associated with c.buf.
+	if sg != nil {
+		if owner := sg.coro.get(); owner != nil {
+			// The logical waiter released its history through owner.
+			// Merge it into this operation and publish the merged history
+			// to the buffer slot for a later receiver.
+			raceacquire(owner)
+			if c.elemsize == 0 {
+				raceacquire(qp)
+				racerelease(qp)
+			} else {
+				racereleaseacquire(qp)
+			}
+			return
+		}
+	}
 	if c.elemsize == 0 {
 		if sg == nil {
 			raceacquire(qp)

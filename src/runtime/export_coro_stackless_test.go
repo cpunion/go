@@ -129,10 +129,49 @@ func SendIntStacklessCoroForTest(ctx unsafe.Pointer, channel chan<- int, value *
 		unsafe.Pointer(value))
 }
 
+func SendStacklessCoroForTest(ctx unsafe.Pointer, channel any,
+	value unsafe.Pointer) {
+	coroChanSend(ctx, (*hchan)(efaceOf(&channel).data), value)
+}
+
 func RecvIntStacklessCoroForTest(ctx unsafe.Pointer, channel <-chan int,
 	value *int, received *bool) {
 	coroChanRecv(ctx, *(**hchan)(unsafe.Pointer(&channel)),
 		unsafe.Pointer(value), received)
+}
+
+func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
+	value unsafe.Pointer, received *bool) {
+	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
+}
+
+func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {
+	c := (*hchan)(efaceOf(&channel).data)
+	lock(&c.lock)
+	for sg := c.sendq.first; sg != nil; sg = sg.next {
+		send++
+		if sg.coro.get() != nil {
+			logical++
+		}
+	}
+	for sg := c.recvq.first; sg != nil; sg = sg.next {
+		recv++
+		if sg.coro.get() != nil {
+			logical++
+		}
+	}
+	unlock(&c.lock)
+	return
+}
+
+func StacklessCoroOperationCountForTest() int {
+	lock(&stacklessCoroOperations.lock)
+	count := 0
+	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+		count++
+	}
+	unlock(&stacklessCoroOperations.lock)
+	return count
 }
 
 func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) uint64 {

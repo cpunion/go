@@ -28,8 +28,8 @@ func TestSizeof(t *testing.T) {
 		}, // g, but exported for testing
 		{
 			runtime.Sudog{},
-			64,
-			104,
+			64 + runtime.StacklessCoroSudogSize,
+			104 + runtime.StacklessCoroSudogSize,
 		}, // sudog, but exported for testing
 	}
 

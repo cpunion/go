@@ -86,6 +86,7 @@ type stacklessCoroOperation struct {
 	element   unsafe.Pointer
 	received  *bool
 	send      bool
+	timerWait bool
 	fd        int32
 	buffer    []byte
 	call      func()
@@ -598,14 +599,12 @@ func coroSleep(ctx unsafe.Pointer, ns int64) {
 	startStacklessCoroTimer(ctx, ns)
 }
 
-// coroChanSend transfers a blocking channel send to an ordinary goroutine.
-// Completion only publishes readiness; the worker never invokes the
-// continuation directly.
+// coroChanSend starts a channel send for a stackless logical goroutine.
 func coroChanSend(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer) {
 	startStacklessCoroChannel(ctx, channel, element, nil, true)
 }
 
-// coroChanRecv transfers a blocking channel receive to an ordinary goroutine.
+// coroChanRecv starts a channel receive for a stackless logical goroutine.
 // received is optional and records the comma-ok result.
 func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool) {
 	startStacklessCoroChannel(ctx, channel, element, received, false)
@@ -623,46 +622,38 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 		send:      send,
 	}
 	op.id = registerStacklessCoroOperation(op)
-	go stacklessCoroChannelWorker(op.id)
+	if send {
+		chansendStackless(op)
+	} else {
+		chanrecvStackless(op)
+	}
 }
 
-func stacklessCoroChannelWorker(id uint64) {
-	op := findStacklessCoroOperation(id)
-	if op == nil {
-		return
+func finishStacklessCoroChannel(owner unsafe.Pointer, success bool) {
+	op := (*stacklessCoroOperation)(owner)
+	if op == nil || takeStacklessCoroOperation(op.id) != op {
+		throw("runtime: invalid stackless coroutine channel completion")
 	}
-
-	panicked := true
-	var panicValue any
-	func() {
-		defer func() {
-			if panicked {
-				panicValue = recover()
-			}
-		}()
-		if op.send {
-			chansend(op.channel, op.element, true, sys.GetCallerPC())
-		} else {
-			_, received := chanrecv(op.channel, op.element, true)
-			if op.received != nil {
-				*op.received = received
-			}
-		}
-		panicked = false
-	}()
-
-	op = takeStacklessCoroOperation(id)
-	if op == nil {
-		return
+	if op.timerWait {
+		unblockTimerChan(op.channel)
+		op.timerWait = false
 	}
+	s := op.scheduler
+	task := op.task
+	send := op.send
+	if !send && op.received != nil {
+		*op.received = success
+	}
+	op.scheduler = nil
+	op.task = nil
 	op.channel = nil
 	op.element = nil
 	op.received = nil
-	if panicked {
-		op.scheduler.panicOperation(op.task, panicValue)
+	if send && !success {
+		s.panicOperation(task, plainError("send on closed channel"))
 		return
 	}
-	op.scheduler.ready(op.task, true)
+	s.ready(task, true)
 }
 
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
