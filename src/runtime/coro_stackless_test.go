@@ -239,6 +239,102 @@ func TestStacklessCoroNativePanicReplacement(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNamedDeferRecover(t *testing.T) {
+	if got, want := runtime.StacklessCoroGSize, unsafe.Sizeof(uintptr(0)); got != want {
+		t.Fatalf("stackless coroutine G state size = %d, want %d", got, want)
+	}
+
+	t.Run("logical", func(t *testing.T) {
+		var recovered any
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			runtime.PanicStacklessCoroForTest(ctx, "logical panic")
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.DeferCallStacklessCoroForTest(token, func() {
+				recovered = recover()
+			})
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				t.Fatalf("terminal action after recover = %d, want invalid",
+					action)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		if recovered != "logical panic" {
+			t.Fatalf("recovered panic = %v, want %q",
+				recovered, "logical panic")
+		}
+	})
+
+	t.Run("managed", func(t *testing.T) {
+		var recovered any
+		runtime.RunStacklessCoroInlineForTest(func(ctx unsafe.Pointer) uint8 {
+			runtime.PanicStacklessCoroForTest(ctx, "managed panic")
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.DeferCallStacklessCoroForTest(token, func() {
+				recovered = recover()
+			})
+			return runtime.StacklessCoroActionComplete
+		})
+		if recovered != "managed panic" {
+			t.Fatalf("recovered panic = %v, want %q",
+				recovered, "managed panic")
+		}
+	})
+
+	t.Run("native-precedence", func(t *testing.T) {
+		var native, logical any
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			runtime.PanicStacklessCoroForTest(ctx, "logical panic")
+			token := runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.DeferCallStacklessCoroForTest(token, func() {
+				defer func() {
+					native = recover()
+				}()
+				panic("native panic")
+			})
+			runtime.DeferCallStacklessCoroForTest(token, func() {
+				logical = recover()
+			})
+			return runtime.StacklessCoroActionComplete
+		})
+		if native != "native panic" || logical != "logical panic" {
+			t.Fatalf("recovered panics = (%v, %v), want (%q, %q)",
+				native, logical, "native panic", "logical panic")
+		}
+	})
+
+	t.Run("scope-cleared", func(t *testing.T) {
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				token := runtime.DeferTokenStacklessCoroForTest(ctx)
+				runtime.DeferCallStacklessCoroForTest(token, func() {
+					panic("escaped panic")
+				})
+				t.Fatal("defer call returned after panic")
+			case 1:
+				state = 2
+				if value := recover(); value != nil {
+					t.Fatalf("recover outside defer call = %v, want nil", value)
+				}
+				token := runtime.DeferTokenStacklessCoroForTest(ctx)
+				if value := runtime.DeferRecoverStacklessCoroForTest(token); value != "escaped panic" {
+					t.Fatalf("pending panic = %v, want %q",
+						value, "escaped panic")
+				}
+				return runtime.StacklessCoroActionComplete
+			}
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		})
+		if state != 2 {
+			t.Fatalf("state = %d, want 2", state)
+		}
+	})
+}
+
 func TestStacklessCoroNativeGoexit(t *testing.T) {
 	done := make(chan struct{})
 	returned := make(chan struct{}, 1)

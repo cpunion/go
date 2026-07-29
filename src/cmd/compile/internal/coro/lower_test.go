@@ -1479,6 +1479,448 @@ func TestLowerDeferTerminal(t *testing.T) {
 	}
 }
 
+func TestPlanNamedDeferTerminal(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/plannameddefer",
+		"plannameddefer")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	target := newLowerTestFunc(pkg, "target")
+	const terminal = MayPanic | UsesRecover
+	targetFunction := &Function{
+		Func:          target,
+		LocalTerminal: terminal,
+		Terminal:      terminal,
+	}
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		target: targetFunction,
+	}}
+
+	got, ok := planDeferTerminal(plan, target,
+		FuncSummary{Terminal: terminal})
+	if !ok || got.target != target || got.rewrite != 0 {
+		t.Fatalf("direct named terminal plan = (%+v, %t), want target %v",
+			got, ok, target)
+	}
+
+	wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+		types.NewSignature(nil, nil, nil),
+		newLowerTestFunc(pkg, "outer"), typecheck.Target, 0)
+	wrapper.DeclareParams(true)
+	wrapper.SetWrapper(true)
+	wrapper.WrappedFunc = target
+	call := newLowerTestCall(target)
+	wrapper.Body = ir.Nodes{call}
+	plan.Functions[wrapper] = &Function{
+		Func:     wrapper,
+		Terminal: terminal,
+		Edges: []Edge{
+			{
+				Kind: GoCall, Callee: target,
+				CalleeName: symbolName(target.Nname), Node: call,
+			},
+			{
+				Kind: DirectCall, Callee: newLowerTestFunc(pkg, "plain"),
+				CalleeName: "plain", Node: call,
+			},
+			{
+				Kind: DirectCall, Callee: target,
+				CalleeName: symbolName(target.Nname), Node: call,
+			},
+		},
+	}
+	plan.Functions[plan.Functions[wrapper].Edges[1].Callee] = &Function{
+		Func: plan.Functions[wrapper].Edges[1].Callee,
+	}
+	got, ok = planDeferTerminal(plan, wrapper,
+		FuncSummary{Terminal: terminal})
+	if !ok || got.target != target || got.rewrite != 0 {
+		t.Fatalf("wrapped named terminal plan = (%+v, %t), want target %v",
+			got, ok, target)
+	}
+
+	makeWrapperPlan := func() (*ir.Func, *ir.Func, *Function, *Plan) {
+		target := newLowerTestFunc(pkg, "invalidTarget")
+		targetFunction := &Function{
+			Func:          target,
+			LocalTerminal: terminal,
+			Terminal:      terminal,
+		}
+		wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+			types.NewSignature(nil, nil, nil),
+			newLowerTestFunc(pkg, "invalidOuter"), typecheck.Target, 0)
+		wrapper.DeclareParams(true)
+		wrapper.SetWrapper(true)
+		wrapper.WrappedFunc = target
+		call := newLowerTestCall(target)
+		wrapper.Body = ir.Nodes{call}
+		wrapperFunction := &Function{
+			Func:     wrapper,
+			Terminal: terminal,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: target,
+				CalleeName: symbolName(target.Nname), Node: call,
+			}},
+		}
+		return wrapper, target, wrapperFunction, &Plan{
+			Functions: map[*ir.Func]*Function{
+				wrapper: wrapperFunction,
+				target:  targetFunction,
+			},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		change func(*ir.Func, *ir.Func, *Function, *Plan)
+	}{
+		{
+			name: "missing-target",
+			change: func(wrapper, _ *ir.Func, _ *Function, _ *Plan) {
+				wrapper.WrappedFunc = nil
+			},
+		},
+		{
+			name: "wrapper-local-terminal",
+			change: func(_, _ *ir.Func, wrapper *Function, _ *Plan) {
+				wrapper.LocalTerminal = MayPanic
+			},
+		},
+		{
+			name: "unknown-edge",
+			change: func(_, _ *ir.Func, wrapper *Function, _ *Plan) {
+				wrapper.Edges[0].Unknown = true
+			},
+		},
+		{
+			name: "wrong-target",
+			change: func(_, _ *ir.Func, wrapper *Function, plan *Plan) {
+				other := newLowerTestFunc(pkg, "otherTarget")
+				plan.Functions[other] = &Function{
+					Func:          other,
+					LocalTerminal: terminal,
+					Terminal:      terminal,
+				}
+				wrapper.Edges[0].Callee = other
+			},
+		},
+		{
+			name: "duplicate-target",
+			change: func(_, _ *ir.Func, wrapper *Function, _ *Plan) {
+				wrapper.Edges = append(wrapper.Edges, wrapper.Edges[0])
+			},
+		},
+		{
+			name: "missing-terminal-edge",
+			change: func(_, _ *ir.Func, wrapper *Function, plan *Plan) {
+				plain := newLowerTestFunc(pkg, "plainTarget")
+				plan.Functions[plain] = &Function{Func: plain}
+				wrapper.Edges[0].Callee = plain
+			},
+		},
+		{
+			name: "target-terminal-mismatch",
+			change: func(_, target *ir.Func, _ *Function, plan *Plan) {
+				plan.Functions[target].LocalTerminal = UsesRecover
+			},
+		},
+		{
+			name: "target-unknown-edge",
+			change: func(_, target *ir.Func, _ *Function, plan *Plan) {
+				call := newLowerTestCall(target)
+				plan.Functions[target].Edges = []Edge{{
+					Kind: DirectCall, CalleeName: "<dynamic>",
+					Unknown: true, Node: call,
+				}}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapper, target, wrapperFunction, plan := makeWrapperPlan()
+			tc.change(wrapper, target, wrapperFunction, plan)
+			if got, ok := planDeferTerminal(plan, wrapper,
+				FuncSummary{Terminal: terminal}); ok {
+				t.Fatalf("invalid named terminal plan = %+v, want rejection",
+					got)
+			}
+		})
+	}
+
+	missing := newLowerTestFunc(pkg, "missing")
+	if _, ok := planDeferTerminal(plan, missing,
+		FuncSummary{Terminal: terminal}); ok {
+		t.Fatal("missing function has a terminal defer plan")
+	}
+	if _, ok := planDeferTerminal(plan, target,
+		FuncSummary{Terminal: MayGoexit}); ok {
+		t.Fatal("Goexit has a terminal defer plan")
+	}
+	if hasDirectDeferTerminal(plan, missing, terminal) {
+		t.Fatal("missing function has direct terminal control")
+	}
+}
+
+func TestLowerNamedDeferRecover(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowernameddefer",
+		"lowernameddefer")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	target := newLowerTestFunc(pkg, "target")
+	recoverCall := ir.NewCallExpr(src.NoXPos, ir.ORECOVER, nil, nil)
+	recoverCall.SetType(types.Types[types.TINTER])
+	recoverCall.SetTypecheck(1)
+	target.Body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, ir.BlankNode,
+		recoverCall)}
+
+	fn := newLowerTestFunc(pkg, "namedDeferred")
+	deferCall := newLowerTestCall(target)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+
+	function := &Function{
+		Func:     fn,
+		Local:    MaySuspend,
+		Effect:   MaySuspend,
+		Terminal: UsesRecover,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: deferCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+	targetFunction := &Function{
+		Func:          target,
+		LocalTerminal: UsesRecover,
+		Terminal:      UsesRecover,
+		Primary:       PlainPrimary,
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn:     function,
+		target: targetFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	calls := make(map[string]bool)
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok || call.Fun == nil {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil {
+				calls[name.Sym().Name] = true
+			}
+		})
+	}
+	for _, want := range []string{
+		"coroDeferToken", "coroDeferCall", "coroTerminalAction",
+	} {
+		if !calls[want] {
+			t.Errorf("generated named defer calls = %v, want %s", calls, want)
+		}
+	}
+	if !ir.Any(target, func(node ir.Node) bool {
+		return node.Op() == ir.ORECOVER
+	}) {
+		t.Fatal("named defer target no longer contains ordinary recover")
+	}
+}
+
+func TestLowerDynamicNamedDeferRecover(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowerdynamicnameddefer",
+		"lowerdynamicnameddefer")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	target := newLowerTestFunc(pkg, "target")
+	recoverCall := ir.NewCallExpr(src.NoXPos, ir.ORECOVER, nil, nil)
+	recoverCall.SetType(types.Types[types.TINTER])
+	recoverCall.SetTypecheck(1)
+	target.Body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, ir.BlankNode,
+		recoverCall)}
+
+	fn := newLowerTestFunc(pkg, "dynamicNamedDeferred")
+	deferCall := newLowerTestCall(target)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	loop := ir.NewForStmt(src.NoXPos, nil,
+		ir.NewBool(src.NoXPos, false), nil,
+		ir.Nodes{deferStmt, yieldCall}, false)
+	loop.SetTypecheck(1)
+	fn.Body = ir.Nodes{loop, newLowerTestReturn()}
+
+	function := &Function{
+		Func:     fn,
+		Local:    MaySuspend,
+		Effect:   MaySuspend,
+		Terminal: UsesRecover,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: deferCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+	targetFunction := &Function{
+		Func:          target,
+		LocalTerminal: UsesRecover,
+		Terminal:      UsesRecover,
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn:     function,
+		target: targetFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	found := false
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok || call.Fun == nil {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil &&
+				name.Sym().Name == "coroDeferCall" {
+				found = true
+			}
+		})
+	}
+	if !found {
+		t.Fatal("dynamic named defer does not call coroDeferCall")
+	}
+}
+
+func TestLowerRetainsPanickingNamedDeferTarget(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/retainnameddefer",
+		"retainnameddefer")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	target := newLowerTestFunc(pkg, "target")
+	recoverCall := ir.NewCallExpr(src.NoXPos, ir.ORECOVER, nil, nil)
+	recoverCall.SetType(types.Types[types.TINTER])
+	recoverCall.SetTypecheck(1)
+	panicStmt := ir.NewUnaryExpr(src.NoXPos, ir.OPANIC,
+		ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
+	panicStmt.SetTypecheck(1)
+	target.Body = ir.Nodes{
+		ir.NewAssignStmt(src.NoXPos, ir.BlankNode, recoverCall),
+		panicStmt,
+	}
+
+	fn := newLowerTestFunc(pkg, "namedDeferred")
+	deferCall := newLowerTestCall(target)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+
+	const terminal = MayPanic | UsesRecover
+	function := &Function{
+		Func:     fn,
+		Local:    MaySuspend,
+		Effect:   MaySuspend,
+		Terminal: terminal,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: deferCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+	targetFunction := &Function{
+		Func:          target,
+		LocalTerminal: terminal,
+		Terminal:      terminal,
+		Primary:       CoroPrimary,
+		Sites:         []Site{{ID: 1, Kind: SitePanic, Node: panicStmt}},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn:     function,
+		target: targetFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 1 ||
+		len(result.Diagnostics) != 1 ||
+		!strings.Contains(result.Diagnostics[0],
+			"retained ordinary terminal defer entry") {
+		t.Fatalf("Lower result = %+v, want retained target and lowered caller",
+			result)
+	}
+	if !ir.Any(target, func(node ir.Node) bool {
+		return node.Op() == ir.ORECOVER
+	}) || !ir.Any(target, func(node ir.Node) bool {
+		return node.Op() == ir.OPANIC
+	}) {
+		t.Fatal("named defer target did not retain ordinary terminal body")
+	}
+}
+
 func TestRewriteDeferTerminalMismatch(t *testing.T) {
 	prepareLowerTest(t)
 

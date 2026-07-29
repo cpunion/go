@@ -11,3 +11,7 @@ type stacklessCoroG struct{}
 func (*g) stackIsFixed() bool {
 	return false
 }
+
+func stacklessCoroRecover(*g) any {
+	return nil
+}

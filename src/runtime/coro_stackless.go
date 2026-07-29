@@ -364,6 +364,35 @@ func coroDeferToken(ctx unsafe.Pointer) unsafe.Pointer {
 	return unsafe.Pointer(context.task)
 }
 
+// coroDeferCall invokes a statically proven named defer target with access to
+// its task-owned panic. Ordinary native panics remain visible to gorecover
+// before this logical panic.
+func coroDeferCall(token unsafe.Pointer, deferred func()) {
+	task := (*stacklessCoroTask)(token)
+	if task == nil || task.context.scheduler == nil ||
+		task.context.task != task ||
+		task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
+		throw("runtime: invalid stackless coroutine defer call")
+	}
+	gp := getg()
+	state := gp.stacklessCoro
+	temporary := state == nil
+	if temporary {
+		state = new(stacklessCoroGState)
+		gp.stacklessCoro = state
+	}
+	previous := state.deferTask
+	state.deferTask = task
+	defer func() {
+		state.deferTask = previous
+		if temporary {
+			gp.stacklessCoro = nil
+		}
+	}()
+	deferred()
+}
+
 // coroDeferPanic starts or replaces the panic owned by a running task.
 func coroDeferPanic(token unsafe.Pointer, value any) {
 	task := (*stacklessCoroTask)(token)

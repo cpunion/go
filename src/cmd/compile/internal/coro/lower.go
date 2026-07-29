@@ -48,11 +48,13 @@ type lowerCandidate struct {
 }
 
 type lowerDefer struct {
-	statement *ir.GoDeferStmt
-	call      *ir.CallExpr
-	armed     *ir.Name
-	terminal  TerminalFlags
-	captures  []lowerDeferCapture
+	statement       *ir.GoDeferStmt
+	call            *ir.CallExpr
+	armed           *ir.Name
+	rewriteTerminal TerminalFlags
+	terminalTarget  *ir.Func
+	namedRecover    bool
+	captures        []lowerDeferCapture
 }
 
 type lowerDeferCapture struct {
@@ -109,6 +111,30 @@ func Lower(plan *Plan) (LowerResult, error) {
 	}
 
 	factories := make(map[*ir.Func]*ir.Func)
+
+	// A named terminal defer target must retain its ordinary entry. In
+	// particular, recover in that target executes in the caller's active
+	// defer scope, not in a nested coroutine root. Conservatively remove such
+	// targets before resolving structured factory dependencies.
+	var terminalTargets []*ir.Func
+	for _, candidate := range candidates {
+		for _, deferred := range candidate.defers {
+			target := deferred.terminalTarget
+			if target != nil && candidates[target] != nil &&
+				!slices.Contains(terminalTargets, target) {
+				terminalTargets = append(terminalTargets, target)
+			}
+		}
+	}
+	slices.SortFunc(terminalTargets, func(a, b *ir.Func) int {
+		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
+	})
+	for _, target := range terminalTargets {
+		delete(candidates, target)
+		result.Diagnostics = append(result.Diagnostics,
+			fmt.Sprintf("%s: retained ordinary terminal defer entry",
+				ir.PkgFuncName(target)))
+	}
 
 	// Remove callers whose structured children cannot use this ABI. Iterate to
 	// a fixed point so one unsupported leaf removes every dependent caller.
@@ -487,22 +513,82 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			}
 		}
 		if summary.Terminal != 0 {
-			if !isClosure ||
-				!canLowerDeferTerminal(plan, edge.Callee, summary) {
+			terminal, ok := planDeferTerminal(plan, edge.Callee, summary)
+			if !ok {
 				return nil, fmt.Errorf("defer target has terminal control %s",
 					summary.Terminal)
 			}
-			deferred.terminal = summary.Terminal
+			deferred.rewriteTerminal = terminal.rewrite
+			deferred.terminalTarget = terminal.target
+			deferred.namedRecover = terminal.target != nil &&
+				summary.Terminal&UsesRecover != 0
 		}
 	}
 	return candidate, nil
 }
 
-func canLowerDeferTerminal(plan *Plan, fn *ir.Func, summary FuncSummary) bool {
+type lowerDeferTerminal struct {
+	rewrite TerminalFlags
+	target  *ir.Func
+}
+
+func planDeferTerminal(plan *Plan, fn *ir.Func,
+	summary FuncSummary) (lowerDeferTerminal, bool) {
 	function := plan.Functions[fn]
 	if function == nil ||
-		summary.Terminal != function.LocalTerminal ||
+		summary.Terminal != function.Terminal ||
 		summary.Terminal&^(MayPanic|UsesRecover) != 0 {
+		return lowerDeferTerminal{}, false
+	}
+
+	// A source defer literal is private to this call site, so its direct
+	// terminal operations can be rewritten in place.
+	if fn.OClosure != nil && !fn.Wrapper() {
+		if !hasDirectDeferTerminal(plan, fn, summary.Terminal) {
+			return lowerDeferTerminal{}, false
+		}
+		return lowerDeferTerminal{rewrite: summary.Terminal}, true
+	}
+
+	target := fn
+	if fn.Wrapper() {
+		target = fn.WrappedFunc
+		if target == nil || function.LocalTerminal != 0 {
+			return lowerDeferTerminal{}, false
+		}
+		found := false
+		for _, edge := range function.Edges {
+			if edge.Kind == GoCall {
+				continue
+			}
+			callSummary, known := plan.edgeSummary(edge)
+			if !known {
+				return lowerDeferTerminal{}, false
+			}
+			if callSummary.Terminal == 0 {
+				continue
+			}
+			if found || edge.Callee != target ||
+				callSummary.Terminal != summary.Terminal {
+				return lowerDeferTerminal{}, false
+			}
+			found = true
+		}
+		if !found {
+			return lowerDeferTerminal{}, false
+		}
+	}
+	if !hasDirectDeferTerminal(plan, target, summary.Terminal) {
+		return lowerDeferTerminal{}, false
+	}
+	return lowerDeferTerminal{target: target}, true
+}
+
+func hasDirectDeferTerminal(plan *Plan, fn *ir.Func,
+	want TerminalFlags) bool {
+	function := plan.Functions[fn]
+	if function == nil || function.LocalTerminal != want ||
+		function.Terminal != want {
 		return false
 	}
 	for _, edge := range function.Edges {
@@ -1092,7 +1178,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferStack))
 	}
 	for _, deferred := range candidate.defers {
-		if deferred.terminal != 0 && deferToken == nil {
+		if (deferred.rewriteTerminal != 0 || deferred.namedRecover) &&
+			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
 			addDeclaration(ir.NewDecl(pos, ir.ODCL, deferToken))
@@ -1430,11 +1517,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			continue
 		}
 		closure.Func.ClosureParent = resume
-		if deferred.terminal != 0 {
+		if deferred.rewriteTerminal != 0 {
 			token := ir.NewClosureVar(deferred.statement.Pos(),
 				closure.Func, resumeDeferToken)
 			if err := rewriteDeferTerminal(closure.Func, token,
-				deferred.terminal); err != nil {
+				deferred.rewriteTerminal); err != nil {
 				return err
 			}
 		}
@@ -1612,7 +1699,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				pop := ir.NewAssignStmt(pos, stack,
 					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
 						lastIndex(), nil))
-				call := typecheck.Call(pos, deferredCall, nil, false)
+				call := ir.Node(typecheck.Call(pos, deferredCall, nil, false))
+				if slices.ContainsFunc(candidate.defers,
+					func(deferred *lowerDefer) bool {
+						return deferred.namedRecover
+					}) {
+					call = typecheck.Call(pos,
+						typecheck.LookupRuntime("coroDeferCall"),
+						ir.Nodes{resumeDeferToken, deferredCall}, false)
+				}
 				condition := ir.NewBinaryExpr(pos, ir.ONE, stackLen(),
 					ir.NewInt(pos, 0))
 				// Pop before calling so a later replacement-panic path cannot
@@ -1626,8 +1721,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					clear := ir.NewAssignStmt(deferred.statement.Pos(), armed,
 						ir.NewBasicLit(deferred.statement.Pos(),
 							types.Types[types.TBOOL], constant.MakeBool(false)))
-					call := typecheck.Call(deferred.call.Pos(),
-						edit(deferred.call.Fun), nil, false)
+					fun := edit(deferred.call.Fun)
+					call := ir.Node(typecheck.Call(deferred.call.Pos(),
+						fun, nil, false))
+					if deferred.namedRecover {
+						call = typecheck.Call(deferred.call.Pos(),
+							typecheck.LookupRuntime("coroDeferCall"),
+							ir.Nodes{resumeDeferToken, fun}, false)
+					}
 					body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
 						armed, ir.Nodes{clear, call}, nil))
 				}
