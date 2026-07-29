@@ -1399,7 +1399,14 @@ func TestLowerDeferTerminal(t *testing.T) {
 		ir.NewInt(src.NoXPos, 1))
 	panicInit.SetTypecheck(1)
 	panicStmt.SetInit(ir.Nodes{panicInit})
-	closure.Body = ir.Nodes{recoverAssign, panicStmt}
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	goexitCall := newLowerTestCall(goexit)
+	goexitInit := ir.NewAssignStmt(src.NoXPos, ir.BlankNode,
+		ir.NewInt(src.NoXPos, 2))
+	goexitInit.SetTypecheck(1)
+	goexitCall.SetInit(ir.Nodes{goexitInit})
+	closure.Body = ir.Nodes{recoverAssign, panicStmt, goexitCall}
 
 	deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
 		closure.OClosure, nil)
@@ -1409,7 +1416,7 @@ func TestLowerDeferTerminal(t *testing.T) {
 	yieldCall := newLowerTestCall(yield)
 	fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
 
-	const terminal = MayPanic | UsesRecover
+	const terminal = MayPanic | UsesRecover | MayGoexit
 	function := &Function{
 		Func:     fn,
 		Local:    MaySuspend,
@@ -1427,7 +1434,15 @@ func TestLowerDeferTerminal(t *testing.T) {
 		LocalTerminal: terminal,
 		Terminal:      terminal,
 		Primary:       CoroPrimary,
-		Sites:         []Site{{ID: 1, Kind: SitePanic, Node: panicStmt}},
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: goexit,
+			CalleeName: symbolName(goexit.Nname), Node: goexitCall,
+			Recipe: operationRecipes["runtime.Goexit"],
+		}},
+		Sites: []Site{
+			{ID: 1, Kind: SitePanic, Node: panicStmt},
+			{ID: 2, Kind: SiteGoexit, Node: goexitCall},
+		},
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:      function,
@@ -1471,7 +1486,7 @@ func TestLowerDeferTerminal(t *testing.T) {
 	}
 	for _, want := range []string{
 		"coroDeferToken", "coroDeferPanic", "coroDeferRecover",
-		"coroTerminalAction",
+		"coroDeferGoexit", "coroTerminalAction",
 	} {
 		if !calls[want] {
 			t.Errorf("generated terminal defer calls = %v, want %s", calls, want)
@@ -1670,6 +1685,226 @@ func TestPlanNamedDeferTerminal(t *testing.T) {
 	}
 }
 
+func TestPlanNamedDeferGoexit(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/plandefergoexit",
+		"plandefergoexit")
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	newPlan := func() (*ir.Func, *Function, *Plan) {
+		target := newLowerTestFunc(pkg, "target")
+		call := newLowerTestCall(goexit)
+		target.Body = ir.Nodes{call}
+		function := &Function{
+			Func:          target,
+			LocalTerminal: MayGoexit,
+			Terminal:      MayGoexit,
+			Primary:       CoroPrimary,
+			Edges: []Edge{{
+				Kind: DirectCall, Callee: goexit,
+				CalleeName: symbolName(goexit.Nname), Node: call,
+				Recipe: operationRecipes["runtime.Goexit"],
+			}},
+			Sites: []Site{{ID: 1, Kind: SiteGoexit, Node: call}},
+		}
+		return target, function, &Plan{Functions: map[*ir.Func]*Function{
+			target: function,
+		}}
+	}
+
+	target, function, plan := newPlan()
+	got, ok := planDeferTerminal(plan, target,
+		FuncSummary{Terminal: MayGoexit})
+	if !ok || got.target != target || got.rewrite != 0 {
+		t.Fatalf("named Goexit plan = (%+v, %t), want target %v",
+			got, ok, target)
+	}
+
+	cleanup := newLowerTestFunc(pkg, "cleanup")
+	cleanupFunction := &Function{
+		Func:          cleanup,
+		LocalTerminal: UsesRecover,
+		Terminal:      UsesRecover,
+	}
+	cleanupCall := newLowerTestCall(cleanup)
+	function.Edges = append(function.Edges, Edge{
+		Kind: DeferCall, Callee: cleanup,
+		CalleeName: symbolName(cleanup.Nname), Node: cleanupCall,
+	})
+	function.Terminal |= UsesRecover
+	plan.Functions[cleanup] = cleanupFunction
+	got, ok = planDeferTerminal(plan, target,
+		FuncSummary{Terminal: MayGoexit | UsesRecover})
+	if !ok || got.target != target {
+		t.Fatalf("Goexit target with terminal cleanup plan = (%+v, %t)",
+			got, ok)
+	}
+
+	wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+		types.NewSignature(nil, nil, nil),
+		newLowerTestFunc(pkg, "outer"), typecheck.Target, 0)
+	wrapper.DeclareParams(true)
+	wrapper.SetWrapper(true)
+	wrapper.WrappedFunc = target
+	targetCall := newLowerTestCall(target)
+	wrapper.Body = ir.Nodes{targetCall}
+	plan.Functions[wrapper] = &Function{
+		Func:     wrapper,
+		Terminal: function.Terminal,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: targetCall,
+		}},
+	}
+	got, ok = planDeferTerminal(plan, wrapper,
+		FuncSummary{Terminal: function.Terminal})
+	if !ok || got.target != target {
+		t.Fatalf("wrapped Goexit plan = (%+v, %t), want target %v",
+			got, ok, target)
+	}
+
+	missing := newLowerTestFunc(pkg, "missing")
+	if hasDeferGoexitTarget(plan, missing, MayGoexit) {
+		t.Fatal("missing function is a Goexit defer target")
+	}
+
+	plain := newLowerTestFunc(pkg, "plain")
+	direct := newLowerTestFunc(pkg, "direct")
+	plainCall := newLowerTestCall(plain)
+	directGoexitCall := newLowerTestCall(goexit)
+	directFunction := &Function{
+		Func:          direct,
+		LocalTerminal: MayGoexit,
+		Terminal:      MayGoexit,
+		Edges: []Edge{
+			{
+				Kind: DirectCall, Callee: plain,
+				CalleeName: symbolName(plain.Nname), Node: plainCall,
+			},
+			{
+				Kind: DirectCall, Callee: goexit,
+				CalleeName: symbolName(goexit.Nname), Node: directGoexitCall,
+				Recipe: operationRecipes["runtime.Goexit"],
+			},
+		},
+	}
+	directPlan := &Plan{Functions: map[*ir.Func]*Function{
+		direct: directFunction,
+		plain:  {Func: plain},
+	}}
+	if !hasDirectDeferTerminal(directPlan, direct, MayGoexit) {
+		t.Fatal("direct Goexit with a plain edge has no terminal plan")
+	}
+	directFunction.Edges = append([]Edge{{
+		Kind: GoCall, Callee: plain,
+		CalleeName: symbolName(plain.Nname), Node: newLowerTestCall(plain),
+	}}, directFunction.Edges...)
+	if hasDirectDeferTerminal(directPlan, direct, MayGoexit) {
+		t.Fatal("direct Goexit with a go statement has a terminal plan")
+	}
+
+	tests := []struct {
+		name   string
+		change func(*ir.Func, *Function, *Plan)
+	}{
+		{
+			name: "no-local-Goexit",
+			change: func(_ *ir.Func, function *Function, _ *Plan) {
+				function.LocalTerminal = 0
+			},
+		},
+		{
+			name: "go-call",
+			change: func(_ *ir.Func, function *Function, plan *Plan) {
+				child := newLowerTestFunc(pkg, "goChild")
+				plan.Functions[child] = &Function{Func: child}
+				function.Edges = append(function.Edges, Edge{
+					Kind: GoCall, Callee: child,
+					CalleeName: symbolName(child.Nname),
+					Node:       newLowerTestCall(child),
+				})
+			},
+		},
+		{
+			name: "unknown-call",
+			change: func(_ *ir.Func, function *Function, _ *Plan) {
+				function.Edges = append(function.Edges, Edge{
+					Kind: DirectCall, CalleeName: "<dynamic>", Unknown: true,
+					Node: newLowerTestCall(goexit),
+				})
+			},
+		},
+		{
+			name: "called-terminal",
+			change: func(_ *ir.Func, function *Function, plan *Plan) {
+				child := newLowerTestFunc(pkg, "recoverChild")
+				plan.Functions[child] = &Function{
+					Func: child, LocalTerminal: UsesRecover,
+					Terminal: UsesRecover,
+				}
+				function.Terminal |= UsesRecover
+				function.Edges = append(function.Edges, Edge{
+					Kind: DirectCall, Callee: child,
+					CalleeName: symbolName(child.Nname),
+					Node:       newLowerTestCall(child),
+				})
+			},
+		},
+		{
+			name: "wrong-operation",
+			change: func(_ *ir.Func, function *Function, _ *Plan) {
+				function.Edges = append(function.Edges, Edge{
+					Kind: DirectCall, Callee: goexit,
+					CalleeName: symbolName(goexit.Nname),
+					Node:       newLowerTestCall(goexit),
+					Recipe: OperationRecipe{
+						Kind: SiteYield, Terminal: MayGoexit,
+					},
+				})
+			},
+		},
+		{
+			name: "wrong-terminal",
+			change: func(_ *ir.Func, function *Function, _ *Plan) {
+				function.LocalTerminal |= MayPanic
+				function.Terminal |= MayPanic
+				function.Edges = append(function.Edges, Edge{
+					Kind: DirectCall, Callee: goexit,
+					CalleeName: symbolName(goexit.Nname),
+					Node:       newLowerTestCall(goexit),
+					Recipe: OperationRecipe{
+						Kind: SiteGoexit, Terminal: MayPanic,
+					},
+				})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			target, function, plan := newPlan()
+			tc.change(target, function, plan)
+			if hasDeferGoexitTarget(plan, target, function.Terminal) {
+				t.Fatal("invalid function is a Goexit defer target")
+			}
+			if _, ok := planDeferTerminal(plan, target,
+				FuncSummary{Terminal: function.Terminal}); ok {
+				t.Fatal("invalid function has a Goexit defer plan")
+			}
+		})
+	}
+}
+
 func TestLowerNamedDeferRecover(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -1756,6 +1991,256 @@ func TestLowerNamedDeferRecover(t *testing.T) {
 	}) {
 		t.Fatal("named defer target no longer contains ordinary recover")
 	}
+}
+
+func TestLowerNamedDeferGoexit(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/lowernamedgoexit",
+		"lowernamedgoexit")
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	target := newLowerTestFunc(pkg, "target")
+	goexitCall := newLowerTestCall(goexit)
+	target.Body = ir.Nodes{goexitCall}
+
+	fn := newLowerTestFunc(pkg, "namedDeferred")
+	deferCall := newLowerTestCall(target)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+
+	function := &Function{
+		Func:     fn,
+		Local:    MaySuspend,
+		Effect:   MaySuspend,
+		Terminal: MayGoexit,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: deferCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+	targetFunction := &Function{
+		Func:          target,
+		LocalTerminal: MayGoexit,
+		Terminal:      MayGoexit,
+		Primary:       CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: goexit,
+			CalleeName: symbolName(goexit.Nname), Node: goexitCall,
+			Recipe: operationRecipes["runtime.Goexit"],
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteGoexit, Node: goexitCall}},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn:     function,
+		target: targetFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 2 || result.Skipped != 0 ||
+		len(result.Diagnostics) != 0 {
+		t.Fatalf("Lower result = %+v, want caller and target lowered", result)
+	}
+
+	calls := make(map[string]bool)
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok || call.Fun == nil {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil {
+				calls[name.Sym().Name] = true
+			}
+		})
+	}
+	for _, want := range []string{
+		"coroDeferToken", "coroDeferRun", "target.coro",
+		"coroGoexit", "coroTerminalAction",
+	} {
+		if !calls[want] {
+			t.Errorf("generated named Goexit calls = %v, want %s",
+				calls, want)
+		}
+	}
+	if calls["Goexit"] {
+		t.Errorf("generated named Goexit calls retain runtime.Goexit: %v",
+			calls)
+	}
+}
+
+func TestRewriteDeferFactoryCall(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/rewritedeferfactory",
+		"rewritedeferfactory")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	param := types.NewField(src.NoXPos, pkg.Lookup("value"),
+		types.Types[types.TINT])
+	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	target := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("target"),
+		types.NewSignature(nil, []*types.Field{param}, []*types.Field{result}))
+	target.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, target)
+	factory := newResumeFactory(target)
+	resume := newLowerTestFunc(pkg, "resume")
+	token := resume.NewLocal(src.NoXPos, pkg.Lookup("token"),
+		types.Types[types.TUNSAFEPTR])
+
+	newWrappedDefer := func(callee *ir.Func, args ir.Nodes) (*lowerDefer,
+		*ir.ClosureExpr) {
+		wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+			types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
+		wrapper.DeclareParams(true)
+		wrapper.SetWrapper(true)
+		wrapper.WrappedFunc = target
+		call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, callee.Nname, args)
+		call.SetType(types.Types[types.TINT])
+		call.SetTypecheck(1)
+		wrapper.Body = ir.Nodes{call}
+		deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+			wrapper.OClosure, nil)
+		deferCall.SetTypecheck(1)
+		statement := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+		statement.SetTypecheck(1)
+		return &lowerDefer{statement: statement, call: deferCall},
+			wrapper.OClosure
+	}
+
+	deferred, closure := newWrappedDefer(target, ir.Nodes{
+		ir.NewInt(src.NoXPos, 23),
+	})
+	ir.CurFunc = closure.Func
+	got, err := rewriteDeferFactoryCall(deferred, resume, token,
+		target, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != closure || len(closure.Func.Body) != 2 ||
+		closure.Func.Body[0].Op() != ir.ODCL ||
+		len(closure.Func.ClosureVars) != 1 {
+		t.Fatalf("rewritten wrapper = %v, body %v, captures %v",
+			got, closure.Func.Body, closure.Func.ClosureVars)
+	}
+	var calls []string
+	ir.Visit(closure.Func, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		name := ir.StaticCalleeName(call.Fun)
+		if name != nil && name.Sym() != nil {
+			calls = append(calls, name.Sym().Name)
+		}
+	})
+	for _, want := range []string{"target.coro", "coroDeferRun"} {
+		if !slices.Contains(calls, want) {
+			t.Errorf("rewritten wrapper calls = %v, want %s", calls, want)
+		}
+	}
+
+	if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+		target, nil); err == nil ||
+		!strings.Contains(err.Error(), "missing terminal defer factory") {
+		t.Fatalf("missing factory error = %v", err)
+	}
+
+	t.Run("wrapper-shape", func(t *testing.T) {
+		deferred, closure := newWrappedDefer(target, ir.Nodes{
+			ir.NewInt(src.NoXPos, 1),
+		})
+		closure.Func.Body = append(closure.Func.Body, newLowerTestReturn())
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "has 2 statements") {
+			t.Fatalf("wrapper shape error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-call", func(t *testing.T) {
+		deferred, closure := newWrappedDefer(target, nil)
+		closure.Func.Body = ir.Nodes{newLowerTestReturn()}
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "has no call") {
+			t.Fatalf("wrapper call error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-target", func(t *testing.T) {
+		other := newLowerTestFunc(pkg, "other")
+		deferred, _ := newWrappedDefer(other, nil)
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "wrapper calls") {
+			t.Fatalf("wrapper target error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-arguments", func(t *testing.T) {
+		deferred, _ := newWrappedDefer(target, nil)
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "0 arguments, want 1") {
+			t.Fatalf("wrapper argument error = %v", err)
+		}
+	})
+
+	t.Run("direct-target", func(t *testing.T) {
+		other := newLowerTestFunc(pkg, "direct")
+		call := newLowerTestCall(other)
+		statement := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
+		statement.SetTypecheck(1)
+		deferred := &lowerDefer{statement: statement, call: call}
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "no static target") {
+			t.Fatalf("direct target error = %v", err)
+		}
+	})
+
+	t.Run("direct-normalization", func(t *testing.T) {
+		call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, target.Nname, nil)
+		call.SetTypecheck(1)
+		statement := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
+		statement.SetTypecheck(1)
+		deferred := &lowerDefer{statement: statement, call: call}
+		if _, err := rewriteDeferFactoryCall(deferred, resume, token,
+			target, factory); err == nil ||
+			!strings.Contains(err.Error(), "not normalized") {
+			t.Fatalf("direct normalization error = %v", err)
+		}
+	})
 }
 
 func TestLowerDynamicNamedDeferRecover(t *testing.T) {

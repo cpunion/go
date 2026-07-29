@@ -2040,6 +2040,319 @@ func main() {
 	}
 }
 
+func TestDeferGoexitLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import "runtime"
+
+var trace string
+var returned [9]bool
+var literalRecover any
+var namedRecover any
+var argumentValue int
+var methodValue int
+var recoveredParent any
+var recoveredAfterExit any
+var recoveredOverlay any
+var recoveredFault any
+var faultValue int
+var normalValue int
+
+//go:noinline
+func literal() {
+	defer func() {
+		literalRecover = recover()
+		trace += "literal-outer;"
+	}()
+	defer func() {
+		defer func() {
+			trace += "literal-inner;"
+		}()
+		runtime.Goexit()
+		trace += "literal-returned;"
+	}()
+	runtime.Gosched()
+	panic("literal panic")
+}
+
+//go:noinline
+func namedExit() {
+	defer func() {
+		namedRecover = recover()
+		trace += "named-target;"
+	}()
+	runtime.Goexit()
+	trace += "named-returned;"
+}
+
+//go:noinline
+func namedParent() {
+	defer func() {
+		trace += "named-outer;"
+	}()
+	defer namedExit()
+	runtime.Gosched()
+}
+
+//go:noinline
+func exitArgument(value *int, tag int) int {
+	defer func() {
+		*value += tag
+		trace += "argument-target;"
+	}()
+	runtime.Goexit()
+	return 99
+}
+
+//go:noinline
+func argumentParent() {
+	defer func() {
+		trace += "argument-outer;"
+	}()
+	defer exitArgument(&argumentValue, 7)
+	runtime.Gosched()
+}
+
+type receiver struct {
+	value *int
+}
+
+//go:noinline
+func (r *receiver) exit(tag int) {
+	defer func() {
+		*r.value += tag
+		trace += "method-target;"
+	}()
+	runtime.Goexit()
+}
+
+//go:noinline
+func methodParent() {
+	defer func() {
+		trace += "method-outer;"
+	}()
+	r := receiver{value: &methodValue}
+	defer r.exit(11)
+	runtime.Gosched()
+}
+
+//go:noinline
+func exitIndex(index int) {
+	switch index {
+	case 0:
+		trace += "dynamic-0;"
+	case 1:
+		trace += "dynamic-1;"
+	case 2:
+		trace += "dynamic-2;"
+	}
+	runtime.Goexit()
+}
+
+//go:noinline
+func dynamicOuter() {
+	trace += "dynamic-outer;"
+}
+
+//go:noinline
+func dynamicParent() {
+	defer dynamicOuter()
+	for i := 0; i < 3; i++ {
+		defer exitIndex(i)
+	}
+	runtime.Gosched()
+}
+
+//go:noinline
+func recoverThenExit() {
+	recoveredParent = recover()
+	runtime.Goexit()
+}
+
+//go:noinline
+func recoverParent() {
+	defer func() {
+		recoveredAfterExit = recover()
+		trace += "recover-outer;"
+	}()
+	defer recoverThenExit()
+	runtime.Gosched()
+	panic("parent panic")
+}
+
+//go:noinline
+func panicDuringExit() {
+	defer func() {
+		panic("panic during exit")
+	}()
+	runtime.Goexit()
+}
+
+//go:noinline
+func overlayParent() {
+	defer func() {
+		recoveredOverlay = recover()
+		trace += "overlay-outer;"
+	}()
+	defer panicDuringExit()
+	runtime.Gosched()
+}
+
+//go:noinline
+func faultDuringExit() {
+	defer func() {
+		var pointer *int
+		faultValue = *pointer
+	}()
+	runtime.Goexit()
+}
+
+//go:noinline
+func faultParent() {
+	defer func() {
+		recoveredFault = recover()
+		trace += "fault-outer;"
+	}()
+	defer faultDuringExit()
+	runtime.Gosched()
+}
+
+//go:noinline
+func maybeExit(exit bool, value *int) int {
+	defer func() {
+		trace += "normal-target;"
+	}()
+	if exit {
+		runtime.Goexit()
+	}
+	*value = 42
+	return 7
+}
+
+//go:noinline
+func normalParent() {
+	defer maybeExit(false, &normalValue)
+	runtime.Gosched()
+}
+
+func run(index int, f func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+		returned[index] = true
+	}()
+	<-done
+}
+
+func main() {
+	run(0, literal)
+	run(1, namedParent)
+	run(2, argumentParent)
+	run(3, methodParent)
+	run(4, dynamicParent)
+	run(5, recoverParent)
+	run(6, overlayParent)
+	run(7, faultParent)
+	run(8, normalParent)
+
+	const wantTrace = "literal-inner;literal-outer;" +
+		"named-target;named-outer;" +
+		"argument-target;argument-outer;" +
+		"method-target;method-outer;" +
+		"dynamic-2;dynamic-1;dynamic-0;dynamic-outer;" +
+		"recover-outer;overlay-outer;fault-outer;normal-target;"
+	if trace != wantTrace ||
+		returned != [9]bool{false, false, false, false, false, false, false, false, true} ||
+		literalRecover != nil || namedRecover != nil ||
+		argumentValue != 7 || methodValue != 11 ||
+		recoveredParent != "parent panic" || recoveredAfterExit != nil ||
+		recoveredOverlay != "panic during exit" || recoveredFault == nil ||
+		faultValue != 0 || normalValue != 42 {
+		panic("bad defer Goexit result")
+	}
+	println("stackless-coro-defer-goexit-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-defer-goexit")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building defer Goexit coroutine failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"literal", "namedExit", "namedParent", "exitArgument",
+		"argumentParent", "(*receiver).exit", "methodParent", "exitIndex",
+		"dynamicParent", "recoverThenExit", "recoverParent",
+		"panicDuringExit", "overlayParent", "faultDuringExit",
+		"faultParent", "maybeExit", "normalParent",
+	} {
+		if diagnostic := "coro: skip main." + name + ":"; strings.Contains(out,
+			diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("defer Goexit coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-defer-goexit-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\..*(deferwrap|func)[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of defer Goexit wrappers failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, want := range []string{
+		"runtime.coroDeferGoexit", "runtime.coroDeferRun",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("defer Goexit wrappers do not contain %q\n%s",
+				want, disassembly)
+		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(namedExit|exitArgument|exitIndex|recoverThenExit|panicDuringExit|faultDuringExit|maybeExit)\.coro\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of named defer targets failed: %v\n%s", err, data)
+	}
+	disassembly = string(data)
+	if !strings.Contains(disassembly, "runtime.coroGoexit") {
+		t.Errorf("named defer targets do not contain coroGoexit\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly, "runtime.Goexit") {
+		t.Errorf("named defer targets retain runtime.Goexit\n%s", disassembly)
+	}
+}
+
 func TestDirectSystemABIStackAlignment(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	testenv.MustHaveCGO(t)

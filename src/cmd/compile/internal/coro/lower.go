@@ -54,6 +54,7 @@ type lowerDefer struct {
 	rewriteTerminal TerminalFlags
 	terminalTarget  *ir.Func
 	namedRecover    bool
+	runTerminal     bool
 	captures        []lowerDeferCapture
 }
 
@@ -120,7 +121,8 @@ func Lower(plan *Plan) (LowerResult, error) {
 	for _, candidate := range candidates {
 		for _, deferred := range candidate.defers {
 			target := deferred.terminalTarget
-			if target != nil && candidates[target] != nil &&
+			if target != nil && !deferred.runTerminal &&
+				candidates[target] != nil &&
 				!slices.Contains(terminalTargets, target) {
 				terminalTargets = append(terminalTargets, target)
 			}
@@ -520,8 +522,14 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			}
 			deferred.rewriteTerminal = terminal.rewrite
 			deferred.terminalTarget = terminal.target
+			deferred.runTerminal = terminal.target != nil &&
+				summary.Terminal&MayGoexit != 0
 			deferred.namedRecover = terminal.target != nil &&
+				!deferred.runTerminal &&
 				summary.Terminal&UsesRecover != 0
+			if deferred.runTerminal {
+				candidate.dependencies[terminal.target] = true
+			}
 		}
 	}
 	return candidate, nil
@@ -537,7 +545,7 @@ func planDeferTerminal(plan *Plan, fn *ir.Func,
 	function := plan.Functions[fn]
 	if function == nil ||
 		summary.Terminal != function.Terminal ||
-		summary.Terminal&^(MayPanic|UsesRecover) != 0 {
+		summary.Terminal&^(MayPanic|UsesRecover|MayGoexit) != 0 {
 		return lowerDeferTerminal{}, false
 	}
 
@@ -578,10 +586,40 @@ func planDeferTerminal(plan *Plan, fn *ir.Func,
 			return lowerDeferTerminal{}, false
 		}
 	}
-	if !hasDirectDeferTerminal(plan, target, summary.Terminal) {
+	if summary.Terminal&MayGoexit != 0 {
+		if !hasDeferGoexitTarget(plan, target, summary.Terminal) {
+			return lowerDeferTerminal{}, false
+		}
+	} else if !hasDirectDeferTerminal(plan, target, summary.Terminal) {
 		return lowerDeferTerminal{}, false
 	}
 	return lowerDeferTerminal{target: target}, true
+}
+
+func hasDeferGoexitTarget(plan *Plan, fn *ir.Func,
+	want TerminalFlags) bool {
+	function := plan.Functions[fn]
+	if function == nil || function.Terminal != want ||
+		function.LocalTerminal&MayGoexit == 0 {
+		return false
+	}
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			return false
+		}
+		callSummary, known := plan.edgeSummary(edge)
+		if !known {
+			return false
+		}
+		if callSummary.Terminal == 0 || edge.Kind == DeferCall {
+			continue
+		}
+		if edge.Recipe.Kind != SiteGoexit ||
+			callSummary.Terminal != MayGoexit {
+			return false
+		}
+	}
+	return true
 }
 
 func hasDirectDeferTerminal(plan *Plan, fn *ir.Func,
@@ -593,10 +631,20 @@ func hasDirectDeferTerminal(plan *Plan, fn *ir.Func,
 	}
 	for _, edge := range function.Edges {
 		if edge.Kind == GoCall {
+			if want&MayGoexit != 0 {
+				return false
+			}
 			continue
 		}
 		callSummary, known := plan.edgeSummary(edge)
-		if !known || callSummary.Terminal != 0 {
+		if !known {
+			return false
+		}
+		if callSummary.Terminal == 0 {
+			continue
+		}
+		if edge.Recipe.Kind != SiteGoexit ||
+			callSummary.Terminal != MayGoexit {
 			return false
 		}
 	}
@@ -809,6 +857,24 @@ func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
 					typecheck.LookupRuntime("coroDeferRecover"),
 					ir.Nodes{token}, false)
 			}
+			callee := ir.StaticCalleeName(node.Fun)
+			if callee != nil {
+				if recipe, ok := operationRecipe(callee.Func); ok &&
+					recipe.Kind == SiteGoexit {
+					found |= MayGoexit
+					body := make(ir.Nodes, 0, len(node.Init())+2)
+					for _, init := range ir.TakeInit(node) {
+						body = append(body, edit(init))
+					}
+					body = append(body,
+						typecheck.Call(node.Pos(),
+							typecheck.LookupRuntime("coroDeferGoexit"),
+							ir.Nodes{token}, false),
+						ir.NewReturnStmt(node.Pos(), nil),
+					)
+					return ir.NewBlockStmt(node.Pos(), body)
+				}
+			}
 		case *ir.UnaryExpr:
 			if node.Op() == ir.OPANIC {
 				found |= MayPanic
@@ -835,6 +901,81 @@ func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
 			ir.PkgFuncName(fn), found, want)
 	}
 	return nil
+}
+
+// rewriteDeferFactoryCall routes a statically resolved named defer target
+// through its coroutine factory. A generated go/defer wrapper already owns
+// the target's captured arguments. Calls without arguments or results do not
+// have such a wrapper, so lowering creates one.
+func rewriteDeferFactoryCall(deferred *lowerDefer, resume *ir.Func,
+	token *ir.Name, target, factory *ir.Func) (*ir.ClosureExpr, error) {
+	if target == nil || factory == nil {
+		return nil, fmt.Errorf("missing terminal defer factory")
+	}
+
+	closure, wrapped := deferred.call.Fun.(*ir.ClosureExpr)
+	var call *ir.CallExpr
+	if wrapped {
+		if len(closure.Func.Body) != 1 {
+			return nil, fmt.Errorf("%s: terminal defer wrapper has %d statements",
+				ir.PkgFuncName(closure.Func), len(closure.Func.Body))
+		}
+		var ok bool
+		call, ok = closure.Func.Body[0].(*ir.CallExpr)
+		if !ok {
+			return nil, fmt.Errorf("%s: terminal defer wrapper has no call",
+				ir.PkgFuncName(closure.Func))
+		}
+		callee := ir.StaticCalleeName(call.Fun)
+		if callee == nil || callee.Func != target {
+			return nil, fmt.Errorf("%s: terminal defer wrapper calls %s",
+				ir.PkgFuncName(closure.Func), symbolName(callee))
+		}
+	} else {
+		callee := ir.StaticCalleeName(deferred.call.Fun)
+		if callee == nil || callee.Func != target {
+			return nil, fmt.Errorf("terminal defer has no static target")
+		}
+		if len(target.Type().RecvParams()) != 0 ||
+			target.Type().NumResults() != 0 {
+			return nil, fmt.Errorf("%s: terminal defer call is not normalized",
+				ir.PkgFuncName(target))
+		}
+		wrapper := ir.NewClosureFunc(deferred.statement.Pos(),
+			deferred.statement.Pos(), ir.ODEFER,
+			types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
+		wrapper.DeclareParams(true)
+		wrapper.SetWrapper(true)
+		wrapper.WrappedFunc = target
+		closure = wrapper.OClosure
+		deferred.call.Fun = closure
+	}
+
+	wrapper := closure.Func
+	token = ir.NewClosureVar(deferred.statement.Pos(), wrapper, token)
+	var args ir.Nodes
+	var body ir.Nodes
+	if call != nil {
+		args = slices.Clone(call.Args)
+		body = append(body, ir.TakeInit(call)...)
+	}
+	inputs := target.Type().RecvParams()
+	if len(args) != len(inputs) {
+		return nil, fmt.Errorf("%s: terminal defer wrapper has %d arguments, want %d",
+			ir.PkgFuncName(wrapper), len(args), len(inputs))
+	}
+	for _, result := range target.Type().Results() {
+		temp := typecheck.TempAt(deferred.statement.Pos(), wrapper, result.Type)
+		body = append(body, ir.NewDecl(deferred.statement.Pos(), ir.ODCL, temp))
+		args = append(args, typecheck.NodAddrAt(deferred.statement.Pos(), temp))
+	}
+	resumeCall := typecheck.Call(deferred.statement.Pos(), factory.Nname,
+		args, false)
+	body = append(body, typecheck.Call(deferred.statement.Pos(),
+		typecheck.LookupRuntime("coroDeferRun"),
+		ir.Nodes{token, resumeCall}, false))
+	wrapper.Body = body
+	return closure, nil
 }
 
 // lowerRunToCompletion builds a single-invocation resume closure. Foreign
@@ -1178,7 +1319,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferStack))
 	}
 	for _, deferred := range candidate.defers {
-		if (deferred.rewriteTerminal != 0 || deferred.namedRecover) &&
+		if (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
+			deferred.runTerminal) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -1513,6 +1655,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// the shared frame slot.
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
+		if deferred.runTerminal {
+			var err error
+			closure, err = rewriteDeferFactoryCall(deferred, resume,
+				resumeDeferToken, deferred.terminalTarget,
+				factories[deferred.terminalTarget])
+			if err != nil {
+				return err
+			}
+			ok = true
+		}
 		if !ok {
 			continue
 		}
