@@ -108,6 +108,19 @@ func init() {
 // coroRun drives one stackless logical goroutine and its children. The
 // compiler emits calls to coroRun only for coroutine root adapters.
 func coroRun(resume stacklessCoroResume) {
+	s := newStacklessCoroScheduler(resume)
+
+	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
+		nativeScheduler.stopReplacementExecutors()
+		nativeScheduler.finish()
+		return
+	}
+	s.run(false)
+	s.stopReplacementExecutors()
+	s.finish()
+}
+
+func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroScheduler {
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
@@ -120,15 +133,7 @@ func coroRun(resume stacklessCoroResume) {
 	root := &stacklessCoroTask{resume: resume}
 	s.root = root
 	s.ready(root, false)
-
-	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
-		nativeScheduler.stopReplacementExecutors()
-		nativeScheduler.finish()
-		return
-	}
-	s.run(false)
-	s.stopReplacementExecutors()
-	s.finish()
+	return s
 }
 
 func (s *stacklessCoroScheduler) finish() {
@@ -364,17 +369,26 @@ func coroDeferToken(ctx unsafe.Pointer) unsafe.Pointer {
 	return unsafe.Pointer(context.task)
 }
 
-// coroDeferCall invokes a statically proven named defer target with access to
-// its task-owned panic. Ordinary native panics remain visible to gorecover
-// before this logical panic.
-func coroDeferCall(token unsafe.Pointer, deferred func()) {
+func activeStacklessCoroDeferTask(token unsafe.Pointer,
+	message string) *stacklessCoroTask {
 	task := (*stacklessCoroTask)(token)
 	if task == nil || task.context.scheduler == nil ||
 		task.context.task != task ||
 		task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending {
-		throw("runtime: invalid stackless coroutine defer call")
+		throw(message)
 	}
+	return task
+}
+
+type stacklessCoroDeferScope struct {
+	gp        *g
+	state     *stacklessCoroGState
+	previous  *stacklessCoroTask
+	temporary bool
+}
+
+func enterStacklessCoroDeferScope(task *stacklessCoroTask) stacklessCoroDeferScope {
 	gp := getg()
 	state := gp.stacklessCoro
 	temporary := state == nil
@@ -384,13 +398,124 @@ func coroDeferCall(token unsafe.Pointer, deferred func()) {
 	}
 	previous := state.deferTask
 	state.deferTask = task
-	defer func() {
-		state.deferTask = previous
-		if temporary {
-			gp.stacklessCoro = nil
-		}
-	}()
+	return stacklessCoroDeferScope{
+		gp: gp, state: state, previous: previous, temporary: temporary,
+	}
+}
+
+func (scope *stacklessCoroDeferScope) leave() {
+	scope.state.deferTask = scope.previous
+	if scope.temporary {
+		scope.gp.stacklessCoro = nil
+	}
+}
+
+// coroDeferCall invokes a statically proven named defer target with access to
+// its task-owned panic. Ordinary native panics remain visible to gorecover
+// before this logical panic.
+func coroDeferCall(token unsafe.Pointer, deferred func()) {
+	task := activeStacklessCoroDeferTask(token,
+		"runtime: invalid stackless coroutine defer call")
+	scope := enterStacklessCoroDeferScope(task)
+	defer scope.leave()
 	deferred()
+}
+
+// coroDeferRun invokes a statically resolved deferred function through its
+// coroutine factory. The nested scheduler is restricted by compiler proof to
+// run-to-completion work, so it cannot leave detached tasks or operations.
+func coroDeferRun(token unsafe.Pointer, resume stacklessCoroResume) {
+	task := activeStacklessCoroDeferTask(token,
+		"runtime: invalid stackless coroutine defer run")
+	scope := enterStacklessCoroDeferScope(task)
+	defer scope.leave()
+
+	s := newStacklessCoroScheduler(resume)
+	s.run(false)
+	if raceenabled {
+		raceacquire(unsafe.Pointer(s.root))
+	}
+	kind, goexit, value, reason :=
+		takeStacklessCoroDeferOutcome(s)
+	if reason != "" {
+		throw(reason)
+	}
+
+	parent := task.context.scheduler
+	lock(&parent.lock)
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
+		(task.terminal != stacklessCoroTerminalNone &&
+			task.terminal != stacklessCoroTerminalPanic) {
+		unlock(&parent.lock)
+		throw("runtime: invalid stackless coroutine defer merge")
+	}
+	switch kind {
+	case stacklessCoroTerminalNone:
+		if goexit {
+			task.terminal = stacklessCoroTerminalNone
+			delete(parent.terminalValues, task)
+			task.goexit = true
+		}
+	case stacklessCoroTerminalPanic:
+		task.terminal = stacklessCoroTerminalPanic
+		task.goexit = task.goexit || goexit
+		if parent.terminalValues == nil {
+			parent.terminalValues = make(map[*stacklessCoroTask]any)
+		}
+		parent.terminalValues[task] = value
+	}
+	unlock(&parent.lock)
+}
+
+func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
+	kind stacklessCoroTerminalKind, goexit bool, value any, reason string) {
+	root := s.root
+	kind = root.terminal
+	goexit = root.goexit
+	value, ok := s.terminalValues[root]
+	if root.state != stacklessCoroTaskComplete {
+		return 0, false, nil,
+			"runtime: incomplete stackless coroutine defer run"
+	}
+	switch kind {
+	case stacklessCoroTerminalNone:
+		if ok {
+			return 0, false, nil,
+				"runtime: unexpected stackless coroutine defer value"
+		}
+	case stacklessCoroTerminalPanic:
+		if !ok {
+			return 0, false, nil,
+				"runtime: missing stackless coroutine defer panic value"
+		}
+	default:
+		return 0, false, nil,
+			"runtime: invalid stackless coroutine defer outcome"
+	}
+	root.terminal = stacklessCoroTerminalNone
+	root.goexit = false
+	delete(s.terminalValues, root)
+	return kind, goexit, value, ""
+}
+
+// coroDeferGoexit replaces a running task's panic with a sticky Goexit. The
+// compiler emits an immediate return after this call, allowing the deferred
+// function's own native defers to run without executing its remaining body.
+func coroDeferGoexit(token unsafe.Pointer) {
+	task := activeStacklessCoroDeferTask(token,
+		"runtime: invalid stackless coroutine defer Goexit")
+	s := task.context.scheduler
+	lock(&s.lock)
+	if task.terminal != stacklessCoroTerminalNone &&
+		task.terminal != stacklessCoroTerminalPanic {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine defer Goexit transition")
+	}
+	task.terminal = stacklessCoroTerminalNone
+	delete(s.terminalValues, task)
+	task.goexit = true
+	unlock(&s.lock)
 }
 
 // coroDeferPanic starts or replaces the panic owned by a running task.

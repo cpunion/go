@@ -74,6 +74,36 @@ func DeferCallStacklessCoroForTest(token unsafe.Pointer, deferred func()) {
 	coroDeferCall(token, deferred)
 }
 
+func DeferRunStacklessCoroForTest(token unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
+	coroDeferRun(token, resume)
+}
+
+func DeferGoexitStacklessCoroForTest(token unsafe.Pointer) {
+	coroDeferGoexit(token)
+}
+
+func StacklessCoroDeferOutcomeErrorsForTest() []string {
+	check := func(state stacklessCoroTaskState,
+		terminal stacklessCoroTerminalKind, hasValue bool) string {
+		root := &stacklessCoroTask{
+			state:    state,
+			terminal: terminal,
+		}
+		s := &stacklessCoroScheduler{root: root}
+		if hasValue {
+			s.terminalValues = map[*stacklessCoroTask]any{root: "panic"}
+		}
+		_, _, _, reason := takeStacklessCoroDeferOutcome(s)
+		return reason
+	}
+	return []string{
+		check(stacklessCoroTaskRunning, stacklessCoroTerminalNone, false),
+		check(stacklessCoroTaskComplete, stacklessCoroTerminalNone, true),
+		check(stacklessCoroTaskComplete, stacklessCoroTerminalPanic, false),
+		check(stacklessCoroTaskComplete, stacklessCoroTerminalKind(255), false),
+	}
+}
+
 func DeferPanicStacklessCoroForTest(token unsafe.Pointer, value any) {
 	coroDeferPanic(token, value)
 }
