@@ -1522,9 +1522,27 @@ func TestPlanNamedDeferTerminal(t *testing.T) {
 
 	got, ok := planDeferTerminal(plan, target,
 		FuncSummary{Terminal: terminal})
-	if !ok || got.target != target || got.rewrite != 0 {
+	if !ok || got.target != target || got.rewrite != 0 || !got.factory {
 		t.Fatalf("direct named terminal plan = (%+v, %t), want target %v",
 			got, ok, target)
+	}
+
+	recoverOnly := newLowerTestFunc(pkg, "recoverOnly")
+	recoverOnlyFunction := &Function{
+		Func:          recoverOnly,
+		LocalTerminal: UsesRecover,
+		Terminal:      UsesRecover,
+	}
+	plan.Functions[recoverOnly] = recoverOnlyFunction
+	got, ok = planDeferTerminal(plan, recoverOnly,
+		FuncSummary{Terminal: UsesRecover})
+	if !ok || got.target != recoverOnly || got.factory {
+		t.Fatalf("direct recover-only plan = (%+v, %t)", got, ok)
+	}
+	recoverOnlyFunction.LocalTerminal = 0
+	if got, ok := planDeferTerminal(plan, recoverOnly,
+		FuncSummary{Terminal: UsesRecover}); ok {
+		t.Fatalf("indirect recover-only plan = %+v", got)
 	}
 
 	wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
@@ -1558,7 +1576,7 @@ func TestPlanNamedDeferTerminal(t *testing.T) {
 	}
 	got, ok = planDeferTerminal(plan, wrapper,
 		FuncSummary{Terminal: terminal})
-	if !ok || got.target != target || got.rewrite != 0 {
+	if !ok || got.target != target || got.rewrite != 0 || !got.factory {
 		t.Fatalf("wrapped named terminal plan = (%+v, %t), want target %v",
 			got, ok, target)
 	}
@@ -1775,7 +1793,7 @@ func TestPlanNamedDeferGoexit(t *testing.T) {
 	}
 
 	missing := newLowerTestFunc(pkg, "missing")
-	if hasDeferGoexitTarget(plan, missing, MayGoexit) {
+	if canPlanDeferFactoryTarget(plan, missing, MayGoexit) {
 		t.Fatal("missing function is a Goexit defer target")
 	}
 
@@ -1894,7 +1912,7 @@ func TestPlanNamedDeferGoexit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			target, function, plan := newPlan()
 			tc.change(target, function, plan)
-			if hasDeferGoexitTarget(plan, target, function.Terminal) {
+			if canPlanDeferFactoryTarget(plan, target, function.Terminal) {
 				t.Fatal("invalid function is a Goexit defer target")
 			}
 			if _, ok := planDeferTerminal(plan, target,
@@ -1902,6 +1920,313 @@ func TestPlanNamedDeferGoexit(t *testing.T) {
 				t.Fatal("invalid function has a Goexit defer plan")
 			}
 		})
+	}
+}
+
+func TestPlanImportedDeferTerminal(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/importeddefer",
+		"importeddefer")
+	importedPkg := types.NewPkg("example.com/coro/importeddefer/target",
+		"target")
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	plan := &Plan{Functions: make(map[*ir.Func]*Function)}
+
+	plain := newLowerTestFunc(importedPkg, "Recover")
+	plainSummary := FuncSummary{
+		Terminal: UsesRecover,
+		Defer:    DeferABI1,
+	}
+	SetSummary(plain, plainSummary)
+	got, ok := planDeferTerminal(plan, plain, plainSummary)
+	if !ok || got.target != plain || got.factory || got.directGoexit {
+		t.Fatalf("imported plain terminal plan = (%+v, %t)", got, ok)
+	}
+
+	coroutine := newLowerTestFunc(importedPkg, "Panic")
+	coroutineSummary := FuncSummary{
+		Terminal: MayPanic,
+		Factory:  FactoryABI1,
+		Defer:    DeferABI1,
+	}
+	SetSummary(coroutine, coroutineSummary)
+	got, ok = planDeferTerminal(plan, coroutine, coroutineSummary)
+	if !ok || got.target != coroutine || !got.factory ||
+		got.directGoexit {
+		t.Fatalf("imported coroutine terminal plan = (%+v, %t)", got, ok)
+	}
+
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	got, ok = planDeferTerminal(plan, goexit,
+		FuncSummary{Terminal: MayGoexit})
+	if !ok || got.target != goexit || !got.directGoexit || got.factory {
+		t.Fatalf("direct Goexit terminal plan = (%+v, %t)", got, ok)
+	}
+
+	tests := []struct {
+		name    string
+		summary FuncSummary
+		input   FuncSummary
+		shape   bool
+	}{
+		{
+			name:    "missing-capability",
+			summary: FuncSummary{Terminal: UsesRecover},
+			input:   FuncSummary{Terminal: UsesRecover},
+		},
+		{
+			name: "missing-factory",
+			summary: FuncSummary{
+				Terminal: MayPanic, Defer: DeferABI1,
+			},
+			input: FuncSummary{Terminal: MayPanic},
+		},
+		{
+			name: "missing-coroutine-capability",
+			summary: FuncSummary{
+				Terminal: MayPanic, Factory: FactoryABI1,
+			},
+			input: FuncSummary{Terminal: MayPanic},
+		},
+		{
+			name: "suspending",
+			summary: FuncSummary{
+				Effect: MaySuspend, Terminal: UsesRecover,
+				Defer: DeferABI1,
+			},
+			input: FuncSummary{Terminal: UsesRecover},
+		},
+		{
+			name: "execution-constraint",
+			summary: FuncSummary{
+				Exec: NeedsPreempt, Terminal: UsesRecover,
+				Defer: DeferABI1,
+			},
+			input: FuncSummary{Terminal: UsesRecover},
+		},
+		{
+			name: "terminal-mismatch",
+			summary: FuncSummary{
+				Terminal: MayPanic, Factory: FactoryABI1,
+				Defer: DeferABI1,
+			},
+			input: FuncSummary{Terminal: MayGoexit},
+		},
+		{
+			name: "unsupported-shape",
+			summary: FuncSummary{
+				Terminal: MayPanic, Factory: FactoryABI1,
+				Defer: DeferABI1,
+			},
+			input: FuncSummary{Terminal: MayPanic},
+			shape: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fn := newLowerTestFunc(importedPkg, test.name)
+			if test.shape {
+				fn.Type().SetHasShape(true)
+			}
+			SetSummary(fn, test.summary)
+			if got, ok := planDeferTerminal(plan, fn, test.input); ok {
+				t.Fatalf("invalid imported terminal plan = %+v", got)
+			}
+		})
+	}
+
+	missing := newLowerTestFunc(importedPkg, "Missing")
+	if got, ok := planDeferTerminal(plan, missing,
+		FuncSummary{Terminal: UsesRecover}); ok {
+		t.Fatalf("missing imported summary plan = %+v", got)
+	}
+	gosched := newLowerTestFunc(runtimePkg, "Gosched")
+	if got, ok := planDeferTerminal(plan, gosched,
+		FuncSummary{Terminal: MayGoexit}); ok {
+		t.Fatalf("non-Goexit operation plan = %+v", got)
+	}
+	if got, ok := planDeferTerminal(plan, nil,
+		FuncSummary{Terminal: MayPanic}); ok {
+		t.Fatalf("nil terminal plan = %+v", got)
+	}
+}
+
+func TestDeferFactoryCandidates(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/defercandidates",
+		"defercandidates")
+	importedPkg := types.NewPkg("example.com/coro/defercandidates/imported",
+		"imported")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	newCandidate := func(name string) (*ir.Func, *Function,
+		*lowerCandidate) {
+		fn := newLowerTestFunc(pkg, name)
+		function := &Function{
+			Func: fn, Terminal: MayPanic, Primary: CoroPrimary,
+		}
+		return fn, function, &lowerCandidate{
+			function:     function,
+			dependencies: make(map[*ir.Func]bool),
+		}
+	}
+
+	leaf, leafFunction, leafCandidate := newCandidate("leaf")
+	plainDependency := newLowerTestFunc(pkg, "plainDependency")
+	plainDependencyFunction := &Function{Func: plainDependency}
+	plainCall := newLowerTestCall(plainDependency)
+	leafFunction.Edges = []Edge{{
+		Kind: DeferCall, Callee: plainDependency,
+		CalleeName: symbolName(plainDependency.Nname), Node: plainCall,
+	}}
+	leafCandidate.dependencies[plainDependency] = true
+	parent, parentFunction, parentCandidate := newCandidate("parent")
+	parentCandidate.dependencies[leaf] = true
+
+	first, firstFunction, firstCandidate := newCandidate("first")
+	second, secondFunction, secondCandidate := newCandidate("second")
+	firstCandidate.dependencies[second] = true
+	secondCandidate.dependencies[first] = true
+
+	imported := newLowerTestFunc(importedPkg, "good")
+	SetSummary(imported, FuncSummary{
+		Terminal: MayPanic, Factory: FactoryABI1, Defer: DeferABI1,
+	})
+	importedParent, importedParentFunction,
+		importedParentCandidate := newCandidate("importedParent")
+	importedParentCandidate.dependencies[imported] = true
+
+	ordinaryOnly := newLowerTestFunc(importedPkg, "ordinaryOnly")
+	SetSummary(ordinaryOnly, FuncSummary{
+		Terminal: MayPanic, Factory: FactoryABI1,
+	})
+	rejected, rejectedFunction, rejectedCandidate :=
+		newCandidate("rejected")
+	rejectedCandidate.dependencies[ordinaryOnly] = true
+	transitive, transitiveFunction, transitiveCandidate :=
+		newCandidate("transitive")
+	transitiveCandidate.dependencies[rejected] = true
+
+	unknown := newLowerTestFunc(importedPkg, "unknown")
+	unknownParent, unknownParentFunction,
+		unknownParentCandidate := newCandidate("unknownParent")
+	unknownParentCandidate.dependencies[unknown] = true
+
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		leaf:            leafFunction,
+		plainDependency: plainDependencyFunction,
+		parent:          parentFunction,
+		first:           firstFunction,
+		second:          secondFunction,
+		importedParent:  importedParentFunction,
+		rejected:        rejectedFunction,
+		transitive:      transitiveFunction,
+		unknownParent:   unknownParentFunction,
+	}}
+	candidates := map[*ir.Func]*lowerCandidate{
+		leaf:           leafCandidate,
+		parent:         parentCandidate,
+		first:          firstCandidate,
+		second:         secondCandidate,
+		importedParent: importedParentCandidate,
+		rejected:       rejectedCandidate,
+		transitive:     transitiveCandidate,
+		unknownParent:  unknownParentCandidate,
+	}
+	available := deferFactoryCandidates(plan, candidates)
+	for _, fn := range []*ir.Func{
+		leaf, parent, first, second, importedParent,
+	} {
+		if !available[fn] {
+			t.Errorf("%s is not a defer factory candidate", fn.Sym().Name)
+		}
+	}
+	for _, fn := range []*ir.Func{rejected, transitive, unknownParent} {
+		if available[fn] {
+			t.Errorf("%s remains a defer factory candidate", fn.Sym().Name)
+		}
+	}
+	if !hasDeferFactory(plan, available, leaf) ||
+		hasDeferFactory(plan, available, rejected) ||
+		!hasDeferFactory(plan, available, imported) ||
+		hasDeferFactory(plan, available, ordinaryOnly) {
+		t.Fatalf("defer factory lookup disagrees with candidates %v",
+			available)
+	}
+
+	recoverTarget := newLowerTestFunc(pkg, "recoverTarget")
+	recoverFunction := &Function{
+		Func: recoverTarget, Terminal: UsesRecover,
+	}
+	plan.Functions[recoverTarget] = recoverFunction
+	directRecover, directRecoverFunction,
+		directRecoverCandidate := newCandidate("directRecover")
+	recoverCall := newLowerTestCall(recoverTarget)
+	directRecoverFunction.Edges = []Edge{{
+		Kind: DirectCall, Callee: recoverTarget,
+		CalleeName: symbolName(recoverTarget.Nname), Node: recoverCall,
+	}}
+	plan.Functions[directRecover] = directRecoverFunction
+
+	goCandidate, goFunction, goCallCandidate := newCandidate("goCall")
+	goFunction.Edges = []Edge{{
+		Kind: GoCall, Callee: leaf,
+		CalleeName: symbolName(leaf.Nname), Node: newLowerTestCall(leaf),
+	}}
+	plan.Functions[goCandidate] = goFunction
+
+	unknownCall, unknownCallFunction,
+		unknownCallCandidate := newCandidate("unknownCall")
+	unknownCallFunction.Edges = []Edge{{
+		Kind: DirectCall, CalleeName: "<dynamic>", Unknown: true,
+		Node: newLowerTestCall(leaf),
+	}}
+	plan.Functions[unknownCall] = unknownCallFunction
+
+	invalid := []*lowerCandidate{
+		nil,
+		{function: &Function{
+			Func:   newLowerTestFunc(pkg, "suspending"),
+			Effect: MaySuspend, Terminal: MayPanic,
+		}},
+		{function: &Function{
+			Func: newLowerTestFunc(pkg, "constrained"),
+			Exec: NeedsPreempt, Terminal: MayPanic,
+		}},
+		{function: &Function{
+			Func: newLowerTestFunc(pkg, "nonterminal"),
+		}},
+		directRecoverCandidate,
+		goCallCandidate,
+		unknownCallCandidate,
+	}
+	shape := newLowerTestFunc(pkg, "shape")
+	shape.Type().SetHasShape(true)
+	invalid = append(invalid, &lowerCandidate{
+		function: &Function{Func: shape, Terminal: MayPanic},
+	})
+	for i, candidate := range invalid {
+		if deferFactoryCandidate(plan, candidate) {
+			t.Errorf("invalid candidate %d supports defer factory", i)
+		}
 	}
 }
 
@@ -2086,6 +2411,166 @@ func TestLowerNamedDeferGoexit(t *testing.T) {
 		t.Errorf("generated named Goexit calls retain runtime.Goexit: %v",
 			calls)
 	}
+}
+
+func TestRewriteDeferGoexitCall(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/rewritedefergoexit",
+		"rewritedefergoexit")
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	resume := newLowerTestFunc(pkg, "resume")
+	token := resume.NewLocal(src.NoXPos, pkg.Lookup("token"),
+		types.Types[types.TUNSAFEPTR])
+	ir.CurFunc = resume
+
+	newDirectDefer := func(target *ir.Func) *lowerDefer {
+		call := newLowerTestCall(target)
+		statement := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)
+		statement.SetTypecheck(1)
+		return &lowerDefer{statement: statement, call: call}
+	}
+	newWrappedDefer := func(target, callee *ir.Func,
+		args ir.Nodes) (*lowerDefer, *ir.ClosureExpr, *ir.CallExpr) {
+		wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ODEFER,
+			types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
+		wrapper.DeclareParams(true)
+		wrapper.SetWrapper(true)
+		wrapper.WrappedFunc = target
+		call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, callee.Nname, args)
+		call.SetTypecheck(1)
+		wrapper.Body = ir.Nodes{call}
+		deferCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+			wrapper.OClosure, nil)
+		deferCall.SetTypecheck(1)
+		statement := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+		statement.SetTypecheck(1)
+		return &lowerDefer{statement: statement, call: deferCall},
+			wrapper.OClosure, call
+	}
+
+	deferred := newDirectDefer(goexit)
+	got, err := rewriteDeferGoexitCall(deferred, resume, token, goexit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || deferred.call.Fun != got ||
+		got.Func.WrappedFunc != goexit ||
+		len(got.Func.ClosureVars) != 1 {
+		t.Fatalf("direct Goexit wrapper = %v, call %v, captures %v",
+			got, deferred.call.Fun, got.Func.ClosureVars)
+	}
+	var calls []string
+	ir.Visit(got.Func, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		callee := ir.StaticCalleeName(call.Fun)
+		if callee != nil && callee.Sym() != nil {
+			calls = append(calls, callee.Sym().Name)
+		}
+	})
+	if !slices.Equal(calls, []string{"coroDeferGoexit"}) {
+		t.Fatalf("direct Goexit wrapper calls = %v", calls)
+	}
+
+	wrapped, closure, call := newWrappedDefer(goexit, goexit, nil)
+	initName := resume.NewLocal(src.NoXPos, pkg.Lookup("init"),
+		types.Types[types.TINT])
+	init := ir.NewAssignStmt(src.NoXPos, initName, ir.NewInt(src.NoXPos, 1))
+	call.SetInit(ir.Nodes{init})
+	got, err = rewriteDeferGoexitCall(wrapped, resume, token, goexit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != closure || len(closure.Func.Body) != 2 ||
+		closure.Func.Body[0] != init {
+		t.Fatalf("wrapped Goexit body = %v, want init and runtime call",
+			closure.Func.Body)
+	}
+
+	if _, err := rewriteDeferGoexitCall(wrapped, resume, token, nil); err == nil ||
+		!strings.Contains(err.Error(), "missing direct Goexit target") {
+		t.Fatalf("missing target error = %v", err)
+	}
+
+	t.Run("wrapper-shape", func(t *testing.T) {
+		deferred, closure, _ := newWrappedDefer(goexit, goexit, nil)
+		closure.Func.Body = append(closure.Func.Body, newLowerTestReturn())
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			goexit); err == nil ||
+			!strings.Contains(err.Error(), "has 2 statements") {
+			t.Fatalf("wrapper shape error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-call", func(t *testing.T) {
+		deferred, closure, _ := newWrappedDefer(goexit, goexit, nil)
+		closure.Func.Body = ir.Nodes{newLowerTestReturn()}
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			goexit); err == nil ||
+			!strings.Contains(err.Error(), "has no call") {
+			t.Fatalf("wrapper call error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-target", func(t *testing.T) {
+		other := newLowerTestFunc(runtimePkg, "Other")
+		deferred, _, _ := newWrappedDefer(goexit, other, nil)
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			goexit); err == nil ||
+			!strings.Contains(err.Error(), "wrapper calls") {
+			t.Fatalf("wrapper target error = %v", err)
+		}
+	})
+
+	t.Run("wrapper-arguments", func(t *testing.T) {
+		deferred, _, _ := newWrappedDefer(goexit, goexit,
+			ir.Nodes{ir.NewInt(src.NoXPos, 1)})
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			goexit); err == nil ||
+			!strings.Contains(err.Error(), "has arguments") {
+			t.Fatalf("wrapper argument error = %v", err)
+		}
+	})
+
+	t.Run("direct-target", func(t *testing.T) {
+		other := newLowerTestFunc(runtimePkg, "DirectOther")
+		deferred := newDirectDefer(other)
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			goexit); err == nil ||
+			!strings.Contains(err.Error(), "no static target") {
+			t.Fatalf("direct target error = %v", err)
+		}
+	})
+
+	t.Run("direct-normalization", func(t *testing.T) {
+		result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+		target := ir.NewFunc(src.NoXPos, src.NoXPos,
+			runtimePkg.Lookup("GoexitResult"),
+			types.NewSignature(nil, nil, []*types.Field{result}))
+		target.DeclareParams(true)
+		deferred := newDirectDefer(target)
+		if _, err := rewriteDeferGoexitCall(deferred, resume, token,
+			target); err == nil ||
+			!strings.Contains(err.Error(), "not normalized") {
+			t.Fatalf("direct normalization error = %v", err)
+		}
+	})
 }
 
 func TestRewriteDeferFactoryCall(t *testing.T) {
@@ -2326,7 +2811,7 @@ func TestLowerDynamicNamedDeferRecover(t *testing.T) {
 	}
 }
 
-func TestLowerRetainsPanickingNamedDeferTarget(t *testing.T) {
+func TestLowerRunsPanickingNamedDeferFactory(t *testing.T) {
 	prepareLowerTest(t)
 
 	oldTarget := typecheck.Target
@@ -2390,19 +2875,188 @@ func TestLowerRetainsPanickingNamedDeferTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if result.Lowered != 2 || result.Skipped != 0 ||
+		len(result.Diagnostics) != 0 {
+		t.Fatalf("Lower result = %+v, want target and caller lowered",
+			result)
+	}
+	if targetFunction.Factory != FactoryABI1 ||
+		targetFunction.Defer != DeferABI1 {
+		t.Fatalf("target capabilities = factory %v, defer %v",
+			targetFunction.Factory, targetFunction.Defer)
+	}
+	if !ir.Any(target, func(node ir.Node) bool {
+		call, ok := node.(*ir.CallExpr)
+		return ok && symbolName(ir.StaticCalleeName(call.Fun)) ==
+			"runtime.coroRun"
+	}) {
+		t.Fatal("named defer target does not use its coroutine entry")
+	}
+}
+
+func TestLowerRequiresDeferSafeTransitiveFactory(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/defertransitive",
+		"defertransitive")
+	importedPkg := types.NewPkg("example.com/coro/defertransitive/imported",
+		"imported")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	imported := newLowerTestFunc(importedPkg, "Panic")
+	importedSummary := FuncSummary{
+		Terminal: MayPanic,
+		Factory:  FactoryABI1,
+	}
+	SetSummary(imported, importedSummary)
+
+	target := newLowerTestFunc(pkg, "target")
+	importedCall := newLowerTestCall(imported)
+	target.Body = ir.Nodes{importedCall, newLowerTestReturn()}
+	targetFunction := &Function{
+		Func:     target,
+		Terminal: MayPanic,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: imported,
+			CalleeName: symbolName(imported.Nname),
+			Imported:   importedSummary, Node: importedCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: importedCall}},
+	}
+
+	yield := newLowerTestFunc(pkg, "yield")
+	caller := newLowerTestFunc(pkg, "caller")
+	deferCall := newLowerTestCall(target)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	caller.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+	callerFunction := &Function{
+		Func:     caller,
+		Local:    MaySuspend,
+		Effect:   MaySuspend,
+		Terminal: MayPanic,
+		Primary:  CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: target,
+			CalleeName: symbolName(target.Nname), Node: deferCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		target: targetFunction,
+		caller: callerFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result.Lowered != 1 || result.Skipped != 1 ||
 		len(result.Diagnostics) != 1 ||
 		!strings.Contains(result.Diagnostics[0],
-			"retained ordinary terminal defer entry") {
-		t.Fatalf("Lower result = %+v, want retained target and lowered caller",
+			"unsupported coroutine defer dependency") {
+		t.Fatalf("Lower result = %+v, want only ordinary target factory",
 			result)
 	}
-	if !ir.Any(target, func(node ir.Node) bool {
-		return node.Op() == ir.ORECOVER
-	}) || !ir.Any(target, func(node ir.Node) bool {
-		return node.Op() == ir.OPANIC
-	}) {
-		t.Fatal("named defer target did not retain ordinary terminal body")
+	if targetFunction.Factory != FactoryABI1 ||
+		targetFunction.Defer != NoDeferABI {
+		t.Fatalf("target capabilities = factory %v, defer %v",
+			targetFunction.Factory, targetFunction.Defer)
+	}
+	if callerFunction.Factory != NoFactory {
+		t.Fatalf("caller factory = %v, want none", callerFunction.Factory)
+	}
+}
+
+func TestLowerDirectDeferGoexit(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/directdefergoexit",
+		"directdefergoexit")
+	runtimePkg := types.NewPkg("runtime", "runtime")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	goexit := newLowerTestFunc(runtimePkg, "Goexit")
+	yield := newLowerTestFunc(pkg, "yield")
+	fn := newLowerTestFunc(pkg, "deferred")
+	deferCall := newLowerTestCall(goexit)
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, deferCall)
+	deferStmt.SetTypecheck(1)
+	yieldCall := newLowerTestCall(yield)
+	fn.Body = ir.Nodes{deferStmt, yieldCall, newLowerTestReturn()}
+
+	function := &Function{
+		Func:          fn,
+		Local:         MaySuspend,
+		Effect:        MaySuspend,
+		LocalTerminal: MayGoexit,
+		Terminal:      MayGoexit,
+		Primary:       CoroPrimary,
+		Edges: []Edge{{
+			Kind: DeferCall, Callee: goexit,
+			CalleeName: symbolName(goexit.Nname), Node: deferCall,
+			Imported: FuncSummary{Terminal: MayGoexit},
+			Recipe:   operationRecipes["runtime.Goexit"],
+		}},
+		Sites: []Site{
+			{ID: 1, Kind: SiteGoexit, Node: deferCall},
+			{ID: 2, Kind: SiteYield, Node: yieldCall},
+		},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn: function,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		len(result.Diagnostics) != 0 {
+		t.Fatalf("Lower result = %+v, want direct Goexit defer lowered",
+			result)
+	}
+
+	var deferGoexit, ordinaryGoexit bool
+	for _, generated := range typecheck.Target.Funcs {
+		if generated == goexit {
+			continue
+		}
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			switch symbolName(ir.StaticCalleeName(call.Fun)) {
+			case "runtime.coroDeferGoexit":
+				deferGoexit = true
+			case "runtime.Goexit":
+				ordinaryGoexit = true
+			}
+		})
+	}
+	if !deferGoexit || ordinaryGoexit {
+		t.Fatalf("generated calls: coroDeferGoexit=%t, Goexit=%t",
+			deferGoexit, ordinaryGoexit)
 	}
 }
 

@@ -37,6 +37,7 @@ type lowerCandidate struct {
 	foreignCalls  map[*ir.CallExpr]ForeignCallClass
 	directCalls   map[*ir.CallExpr]*ir.Func
 	dependencies  map[*ir.Func]bool
+	deferDeps     map[*ir.Func]bool
 	defers        []*lowerDefer
 	dynamicDefers bool
 	panics        map[*ir.UnaryExpr]bool
@@ -55,6 +56,7 @@ type lowerDefer struct {
 	terminalTarget  *ir.Func
 	namedRecover    bool
 	runTerminal     bool
+	directGoexit    bool
 	captures        []lowerDeferCapture
 }
 
@@ -113,35 +115,13 @@ func Lower(plan *Plan) (LowerResult, error) {
 
 	factories := make(map[*ir.Func]*ir.Func)
 
-	// A named terminal defer target must retain its ordinary entry. In
-	// particular, recover in that target executes in the caller's active
-	// defer scope, not in a nested coroutine root. Conservatively remove such
-	// targets before resolving structured factory dependencies.
-	var terminalTargets []*ir.Func
-	for _, candidate := range candidates {
-		for _, deferred := range candidate.defers {
-			target := deferred.terminalTarget
-			if target != nil && !deferred.runTerminal &&
-				candidates[target] != nil &&
-				!slices.Contains(terminalTargets, target) {
-				terminalTargets = append(terminalTargets, target)
-			}
-		}
-	}
-	slices.SortFunc(terminalTargets, func(a, b *ir.Func) int {
-		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
-	})
-	for _, target := range terminalTargets {
-		delete(candidates, target)
-		result.Diagnostics = append(result.Diagnostics,
-			fmt.Sprintf("%s: retained ordinary terminal defer entry",
-				ir.PkgFuncName(target)))
-	}
-
-	// Remove callers whose structured children cannot use this ABI. Iterate to
-	// a fixed point so one unsupported leaf removes every dependent caller.
-	for changed := true; changed; {
-		changed = false
+	// Remove callers whose structured children cannot use the required ABI.
+	// Iterate to a fixed point so one unsupported leaf removes every
+	// dependent caller, including callers that require the stricter defer
+	// factory contract.
+	var deferFactories map[*ir.Func]bool
+	for {
+		changed := false
 		for _, function := range functions {
 			fn := function.Func
 			candidate := candidates[fn]
@@ -164,6 +144,40 @@ func Lower(plan *Plan) (LowerResult, error) {
 					ir.PkgFuncName(fn), unsupported[0]))
 			delete(candidates, fn)
 			changed = true
+		}
+		deferFactories = deferFactoryCandidates(plan, candidates)
+		for _, function := range functions {
+			fn := function.Func
+			candidate := candidates[fn]
+			if candidate == nil {
+				continue
+			}
+			var unsupported []string
+			for dependency := range candidate.deferDeps {
+				if !hasDeferFactory(plan, deferFactories, dependency) {
+					unsupported = append(unsupported,
+						ir.PkgFuncName(dependency))
+				}
+			}
+			if len(unsupported) == 0 {
+				continue
+			}
+			slices.Sort(unsupported)
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: unsupported coroutine defer dependency %s",
+					ir.PkgFuncName(fn), unsupported[0]))
+			delete(candidates, fn)
+			changed = true
+		}
+		if !changed {
+			break
+		}
+	}
+	for _, function := range functions {
+		function.Defer = NoDeferABI
+		if plainDeferEntrySupported(plan, function) ||
+			deferFactories[function.Func] {
+			function.Defer = DeferABI1
 		}
 	}
 	for _, function := range functions {
@@ -383,6 +397,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		foreignCalls:  make(map[*ir.CallExpr]ForeignCallClass),
 		directCalls:   make(map[*ir.CallExpr]*ir.Func),
 		dependencies:  make(map[*ir.Func]bool),
+		deferDeps:     make(map[*ir.Func]bool),
 		defers:        defers,
 		dynamicDefers: dynamicDefers,
 		panics:        make(map[*ir.UnaryExpr]bool),
@@ -400,9 +415,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if !ok {
 			return nil, fmt.Errorf("non-call site %d", site.ID)
 		}
-		if slices.ContainsFunc(defers, func(deferred *lowerDefer) bool {
-			return deferred.call == call
-		}) {
+		deferredSite := slices.ContainsFunc(defers,
+			func(deferred *lowerDefer) bool {
+				return deferred.call == call
+			})
+		if deferredSite && site.Kind == SiteGoexit {
+			// The deferred call is registered here rather than executed.
+			// planDeferTerminal validates and rewrites the operation below.
+			continue
+		}
+		if deferredSite {
 			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
@@ -522,13 +544,14 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			}
 			deferred.rewriteTerminal = terminal.rewrite
 			deferred.terminalTarget = terminal.target
-			deferred.runTerminal = terminal.target != nil &&
-				summary.Terminal&MayGoexit != 0
+			deferred.runTerminal = terminal.factory
+			deferred.directGoexit = terminal.directGoexit
 			deferred.namedRecover = terminal.target != nil &&
-				!deferred.runTerminal &&
+				!deferred.runTerminal && !deferred.directGoexit &&
 				summary.Terminal&UsesRecover != 0
 			if deferred.runTerminal {
 				candidate.dependencies[terminal.target] = true
+				candidate.deferDeps[terminal.target] = true
 			}
 		}
 	}
@@ -536,22 +559,26 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 }
 
 type lowerDeferTerminal struct {
-	rewrite TerminalFlags
-	target  *ir.Func
+	rewrite      TerminalFlags
+	target       *ir.Func
+	factory      bool
+	directGoexit bool
 }
 
 func planDeferTerminal(plan *Plan, fn *ir.Func,
 	summary FuncSummary) (lowerDeferTerminal, bool) {
-	function := plan.Functions[fn]
-	if function == nil ||
-		summary.Terminal != function.Terminal ||
+	if fn == nil || summary.Terminal == 0 ||
 		summary.Terminal&^(MayPanic|UsesRecover|MayGoexit) != 0 {
+		return lowerDeferTerminal{}, false
+	}
+	function := plan.Functions[fn]
+	if function != nil && summary.Terminal != function.Terminal {
 		return lowerDeferTerminal{}, false
 	}
 
 	// A source defer literal is private to this call site, so its direct
 	// terminal operations can be rewritten in place.
-	if fn.OClosure != nil && !fn.Wrapper() {
+	if function != nil && fn.OClosure != nil && !fn.Wrapper() {
 		if !hasDirectDeferTerminal(plan, fn, summary.Terminal) {
 			return lowerDeferTerminal{}, false
 		}
@@ -559,7 +586,7 @@ func planDeferTerminal(plan *Plan, fn *ir.Func,
 	}
 
 	target := fn
-	if fn.Wrapper() {
+	if function != nil && fn.Wrapper() {
 		target = fn.WrappedFunc
 		if target == nil || function.LocalTerminal != 0 {
 			return lowerDeferTerminal{}, false
@@ -586,40 +613,78 @@ func planDeferTerminal(plan *Plan, fn *ir.Func,
 			return lowerDeferTerminal{}, false
 		}
 	}
-	if summary.Terminal&MayGoexit != 0 {
-		if !hasDeferGoexitTarget(plan, target, summary.Terminal) {
+
+	if recipe, ok := plan.operationRecipe(target); ok {
+		if recipe.Kind != SiteGoexit ||
+			recipe.Terminal != summary.Terminal {
 			return lowerDeferTerminal{}, false
 		}
-	} else if !hasDirectDeferTerminal(plan, target, summary.Terminal) {
+		return lowerDeferTerminal{
+			target: target, directGoexit: true,
+		}, true
+	}
+
+	targetSummary, known := plan.funcSummary(target)
+	if !known || targetSummary.Terminal != summary.Terminal ||
+		targetSummary.Effect != NoSuspend || targetSummary.Exec != 0 {
 		return lowerDeferTerminal{}, false
 	}
-	return lowerDeferTerminal{target: target}, true
+	if targetSummary.Primary() == PlainPrimary {
+		if plan.Functions[target] != nil {
+			if !hasDirectDeferTerminal(plan, target,
+				targetSummary.Terminal) {
+				return lowerDeferTerminal{}, false
+			}
+		} else if targetSummary.Defer != DeferABI1 {
+			return lowerDeferTerminal{}, false
+		}
+		return lowerDeferTerminal{target: target}, true
+	}
+
+	if plan.Functions[target] != nil {
+		if !canPlanDeferFactoryTarget(plan, target,
+			targetSummary.Terminal) {
+			return lowerDeferTerminal{}, false
+		}
+	} else if targetSummary.Defer != DeferABI1 ||
+		targetSummary.Factory != FactoryABI1 ||
+		!resumeFactorySupported(target) {
+		return lowerDeferTerminal{}, false
+	}
+	return lowerDeferTerminal{target: target, factory: true}, true
 }
 
-func hasDeferGoexitTarget(plan *Plan, fn *ir.Func,
+func canPlanDeferFactoryTarget(plan *Plan, fn *ir.Func,
 	want TerminalFlags) bool {
 	function := plan.Functions[fn]
 	if function == nil || function.Terminal != want ||
-		function.LocalTerminal&MayGoexit == 0 {
+		function.Effect != NoSuspend || function.Exec != 0 ||
+		(FuncSummary{Terminal: want}).Primary() != CoroPrimary ||
+		!resumeFactorySupported(fn) {
 		return false
 	}
+	found := function.LocalTerminal
 	for _, edge := range function.Edges {
 		if edge.Kind == GoCall {
 			return false
 		}
-		callSummary, known := plan.edgeSummary(edge)
+		summary, known := plan.edgeSummary(edge)
 		if !known {
 			return false
 		}
-		if callSummary.Terminal == 0 || edge.Kind == DeferCall {
-			continue
-		}
-		if edge.Recipe.Kind != SiteGoexit ||
-			callSummary.Terminal != MayGoexit {
+		if edge.Recipe.Kind != SiteInvalid &&
+			(edge.Recipe.Kind != SiteGoexit ||
+				edge.Recipe.Terminal != MayGoexit ||
+				function.LocalTerminal&MayGoexit == 0) {
 			return false
 		}
+		if edge.Kind == DirectCall &&
+			summary.Terminal&UsesRecover != 0 {
+			return false
+		}
+		found |= summary.Terminal
 	}
-	return true
+	return found == want
 }
 
 func hasDirectDeferTerminal(plan *Plan, fn *ir.Func,
@@ -723,6 +788,89 @@ func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
 		factories[fn] = factory
 	}
 	return ok
+}
+
+func deferFactoryCandidates(plan *Plan,
+	candidates map[*ir.Func]*lowerCandidate) map[*ir.Func]bool {
+	available := make(map[*ir.Func]bool)
+	for fn, candidate := range candidates {
+		if deferFactoryCandidate(plan, candidate) {
+			available[fn] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for fn := range available {
+			candidate := candidates[fn]
+			supported := true
+			for dependency := range candidate.dependencies {
+				summary, known := plan.funcSummary(dependency)
+				if !known {
+					supported = false
+					break
+				}
+				if summary.Primary() != CoroPrimary {
+					continue
+				}
+				if plan.Functions[dependency] != nil {
+					supported = available[dependency]
+				} else {
+					supported = summary.Defer == DeferABI1 &&
+						summary.Factory == FactoryABI1
+				}
+				if !supported {
+					break
+				}
+			}
+			if supported {
+				continue
+			}
+			delete(available, fn)
+			changed = true
+		}
+	}
+	return available
+}
+
+func deferFactoryCandidate(plan *Plan, candidate *lowerCandidate) bool {
+	if candidate == nil || candidate.function.Effect != NoSuspend ||
+		candidate.function.Exec != 0 ||
+		candidate.function.Terminal == 0 ||
+		!resumeFactorySupported(candidate.function.Func) {
+		return false
+	}
+	for _, edge := range candidate.function.Edges {
+		if edge.Kind == GoCall {
+			return false
+		}
+		if edge.Kind != DirectCall {
+			continue
+		}
+		summary, known := plan.edgeSummary(edge)
+		if !known || summary.Terminal&UsesRecover != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasDeferFactory(plan *Plan, available map[*ir.Func]bool,
+	fn *ir.Func) bool {
+	if plan.Functions[fn] != nil {
+		return available[fn]
+	}
+	summary, ok := Summary(fn)
+	return ok && summary.Defer == DeferABI1 &&
+		summary.Factory == FactoryABI1 && resumeFactorySupported(fn)
+}
+
+func plainDeferEntrySupported(plan *Plan, function *Function) bool {
+	fn := function.Func
+	return function.Primary == PlainPrimary &&
+		function.Effect == NoSuspend && function.Exec == 0 &&
+		function.Terminal != 0 && fn != nil && !fn.Wrapper() &&
+		resumeFactorySupported(fn) &&
+		hasDirectDeferTerminal(plan, fn, function.Terminal)
 }
 
 // canLowerRunToCompletion reports whether candidate has to enter a native ABI
@@ -903,6 +1051,67 @@ func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
 	return nil
 }
 
+func rewriteDeferGoexitCall(deferred *lowerDefer, resume *ir.Func,
+	token *ir.Name, target *ir.Func) (*ir.ClosureExpr, error) {
+	if target == nil {
+		return nil, fmt.Errorf("missing direct Goexit target")
+	}
+
+	closure, wrapped := deferred.call.Fun.(*ir.ClosureExpr)
+	var call *ir.CallExpr
+	if wrapped {
+		if len(closure.Func.Body) != 1 {
+			return nil, fmt.Errorf("%s: direct Goexit wrapper has %d statements",
+				ir.PkgFuncName(closure.Func), len(closure.Func.Body))
+		}
+		var ok bool
+		call, ok = closure.Func.Body[0].(*ir.CallExpr)
+		if !ok {
+			return nil, fmt.Errorf("%s: direct Goexit wrapper has no call",
+				ir.PkgFuncName(closure.Func))
+		}
+		callee := ir.StaticCalleeName(call.Fun)
+		if callee == nil || callee.Func != target {
+			return nil, fmt.Errorf("%s: direct Goexit wrapper calls %s",
+				ir.PkgFuncName(closure.Func), symbolName(callee))
+		}
+	} else {
+		callee := ir.StaticCalleeName(deferred.call.Fun)
+		if callee == nil || callee.Func != target {
+			return nil, fmt.Errorf("direct Goexit defer has no static target")
+		}
+		if len(target.Type().RecvParams()) != 0 ||
+			target.Type().NumResults() != 0 {
+			return nil, fmt.Errorf("%s: direct Goexit call is not normalized",
+				ir.PkgFuncName(target))
+		}
+		wrapper := ir.NewClosureFunc(deferred.statement.Pos(),
+			deferred.statement.Pos(), ir.ODEFER,
+			types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
+		wrapper.DeclareParams(true)
+		wrapper.SetWrapper(true)
+		wrapper.WrappedFunc = target
+		closure = wrapper.OClosure
+		deferred.call.Fun = closure
+	}
+
+	wrapper := closure.Func
+	token = ir.NewClosureVar(deferred.statement.Pos(), wrapper, token)
+	var body ir.Nodes
+	if call != nil {
+		if len(call.Args) != 0 {
+			return nil, fmt.Errorf("%s: direct Goexit wrapper has arguments",
+				ir.PkgFuncName(wrapper))
+		}
+		body = append(body, ir.TakeInit(call)...)
+	}
+	body = append(body, typecheck.Call(deferred.statement.Pos(),
+		typecheck.LookupRuntime("coroDeferGoexit"),
+		ir.Nodes{token}, false))
+	wrapper.Body = body
+	return closure, nil
+}
+
 // rewriteDeferFactoryCall routes a statically resolved named defer target
 // through its coroutine factory. A generated go/defer wrapper already owns
 // the target's captured arguments. Calls without arguments or results do not
@@ -1015,6 +1224,13 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 
 	for _, result := range candidate.resultValues {
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, result))
+		if terminalAware {
+			// Generated terminal control can bypass every source return.
+			// Initialize the captured result slot so SSA does not require a
+			// value assigned only on normal-return paths.
+			declarations = append(declarations, ir.NewAssignStmt(pos, result,
+				ir.NewZero(pos, result.Type())))
+		}
 	}
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
@@ -1304,8 +1520,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	fn.Dcl = fnDcl
 
+	terminalAware := needsTerminalEntry(candidate)
 	for _, result := range candidate.resultValues {
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, result))
+		if terminalAware {
+			// Generated terminal control can bypass every source return.
+			// Initialize the captured result slot so SSA does not require a
+			// value assigned only on normal-return paths.
+			declarations = append(declarations, ir.NewAssignStmt(pos, result,
+				ir.NewZero(pos, result.Type())))
+		}
 	}
 	deferByStatement := make(map[*ir.GoDeferStmt]*lowerDefer,
 		len(candidate.defers))
@@ -1320,7 +1544,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		if (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
-			deferred.runTerminal) &&
+			deferred.runTerminal || deferred.directGoexit) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -1337,7 +1561,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	pc := typecheck.TempAt(pos, factory, types.Types[types.TUINT32])
 	addDeclaration(ir.NewDecl(pos, ir.ODCL, pc))
-	terminalAware := needsTerminalEntry(candidate)
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
@@ -1655,7 +1878,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// the shared frame slot.
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
-		if deferred.runTerminal {
+		if deferred.directGoexit {
+			var err error
+			closure, err = rewriteDeferGoexitCall(deferred, resume,
+				resumeDeferToken, deferred.terminalTarget)
+			if err != nil {
+				return err
+			}
+			ok = true
+		} else if deferred.runTerminal {
 			var err error
 			closure, err = rewriteDeferFactoryCall(deferred, resume,
 				resumeDeferToken, deferred.terminalTarget,

@@ -194,12 +194,26 @@ const (
 	FactoryABI1
 )
 
+// DeferABI identifies a compiler-verified entry contract for invoking a
+// statically resolved named function during coroutine defer cleanup.
+type DeferABI uint8
+
+const (
+	NoDeferABI DeferABI = iota
+	// DeferABI1 uses the ordinary entry for a plain primary and FactoryABI1
+	// for a coroutine primary. The coroutine entry and every
+	// coroutine-primary child used during cleanup are proven not to suspend,
+	// require a constrained executor, or leave a detached stackless task.
+	DeferABI1
+)
+
 // FuncSummary is the portion of a function plan exported across packages.
 type FuncSummary struct {
 	Effect   Effect
 	Exec     ExecFlags
 	Terminal TerminalFlags
 	Factory  FactoryABI
+	Defer    DeferABI
 }
 
 func (s FuncSummary) Primary() PrimaryKind {

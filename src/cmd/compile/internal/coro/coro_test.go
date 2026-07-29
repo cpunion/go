@@ -1676,7 +1676,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building recover coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=9 skipped=5"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=10 skipped=4"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 	if want := "main.dynamicRecover: repeated source defer literal"; !strings.Contains(out, want) {
@@ -1691,8 +1691,8 @@ func main() {
 			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
 		}
 	}
-	if want := "main.namedRecoverAndReplace: retained ordinary terminal defer entry"; !strings.Contains(out, want) {
-		t.Errorf("output does not contain retained named target %q\n%s",
+	if want := "func=namedRecoverAndReplace.coro,"; !strings.Contains(out, want) {
+		t.Errorf("output does not contain nested terminal factory %q\n%s",
 			want, out)
 	}
 
@@ -3171,6 +3171,222 @@ func main() {
 		if !strings.Contains(symbols, want) {
 			t.Errorf("symbols do not contain %q", want)
 		}
+	}
+}
+
+func TestCrossPackageTerminalDefer(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	writeFile := func(name, contents string) {
+		t.Helper()
+		name = filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(name), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFile("go.mod", "module example.com/corodefer\n\ngo 1.28\n")
+	writeFile("leaf/leaf.go", `package leaf
+
+import "runtime"
+
+//go:noinline
+func Recover(value *any) {
+	*value = recover()
+}
+
+//go:noinline
+func indirectPanic(trace *string) {
+	*trace += "leaf-call;"
+	panic("nested panic")
+}
+
+//go:noinline
+func Panic(trace *string) {
+	defer func() {
+		*trace += "leaf-cleanup;"
+	}()
+	indirectPanic(trace)
+}
+
+//go:noinline
+func indirectExit() {
+	runtime.Goexit()
+}
+
+//go:noinline
+func Exit(trace *string, tag int) int {
+	defer func() {
+		if tag == 7 {
+			*trace += "leaf-cleanup;"
+		}
+	}()
+	indirectExit()
+	panic("returned after Goexit")
+}
+`)
+	writeFile("mid/mid.go", `package mid
+
+import "example.com/corodefer/leaf"
+
+//go:noinline
+func Panic(trace *string) {
+	*trace += "mid-call;"
+	leaf.Panic(trace)
+}
+
+//go:noinline
+func Exit(trace *string) int {
+	defer func() {
+		*trace += "mid-cleanup;"
+	}()
+	leaf.Exit(trace, 7)
+	panic("returned after Exit")
+}
+`)
+	writeFile("root/main.go", `package main
+
+import (
+	"example.com/corodefer/leaf"
+	"example.com/corodefer/mid"
+	"runtime"
+)
+
+var exitTrace string
+var directTrace string
+
+//go:noinline
+func panicCase() (trace string, recovered any) {
+	defer leaf.Recover(&recovered)
+	defer mid.Panic(&trace)
+	runtime.Gosched()
+	panic("parent panic")
+}
+
+//go:noinline
+func exitCase(done chan struct{}) {
+	trace := ""
+	defer func() {
+		exitTrace = trace + "root-cleanup;"
+		close(done)
+	}()
+	defer mid.Exit(&trace)
+	runtime.Gosched()
+}
+
+//go:noinline
+func directExit(done chan struct{}) {
+	trace := ""
+	defer func() {
+		directTrace = trace + "root-cleanup;"
+		close(done)
+	}()
+	defer runtime.Goexit()
+	runtime.Gosched()
+}
+
+func main() {
+	trace, recovered := panicCase()
+	if trace != "mid-call;leaf-call;leaf-cleanup;" ||
+		recovered != "nested panic" {
+		panic("bad cross-package panic defer")
+	}
+
+	done := make(chan struct{})
+	go exitCase(done)
+	<-done
+	if exitTrace != "leaf-cleanup;mid-cleanup;root-cleanup;" {
+		panic("bad cross-package Goexit defer")
+	}
+
+	done = make(chan struct{})
+	go directExit(done)
+	<-done
+	if directTrace != "root-cleanup;" {
+		panic("bad direct Goexit defer")
+	}
+	println("stackless-coro-cross-defer-ok")
+}
+`)
+
+	exe := filepath.Join(tmp, "coro-cross-defer")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/corodefer/...=-l -d=coro=4",
+		"./root")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("cross-package terminal defer build failed: %v\n%s",
+			err, out)
+	}
+	for _, name := range []string{
+		"example.com/corodefer/leaf.Panic",
+		"example.com/corodefer/leaf.Exit",
+		"example.com/corodefer/mid.Panic",
+		"example.com/corodefer/mid.Exit",
+		"main.panicCase",
+		"main.exitCase",
+		"main.directExit",
+	} {
+		if strings.Contains(out, "coro: skip "+name+":") {
+			t.Errorf("cross-package terminal defer function %s was not lowered\n%s",
+				name, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-package terminal defer executable failed: %v\n%s",
+			err, data)
+	} else if want := "stackless-coro-cross-defer-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("executable output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm of cross-package terminal defer executable failed: %v\n%s",
+			err, data)
+	}
+	symbols := string(data)
+	for _, want := range []string{
+		"example.com/corodefer/leaf.Panic.coro",
+		"example.com/corodefer/leaf.Exit.coro",
+		"example.com/corodefer/mid.Panic.coro",
+		"example.com/corodefer/mid.Exit.coro",
+		"main.panicCase.coro",
+		"main.exitCase.coro",
+		"main.directExit.coro",
+	} {
+		if !strings.Contains(symbols, want) {
+			t.Errorf("symbols do not contain %q", want)
+		}
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.directExit.*`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of direct Goexit defer failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	if !strings.Contains(disassembly, "runtime.coroDeferGoexit") {
+		t.Errorf("direct Goexit defer does not call runtime.coroDeferGoexit\n%s",
+			disassembly)
+	}
+	if strings.Contains(disassembly, "runtime.Goexit") {
+		t.Errorf("direct Goexit defer retains runtime.Goexit\n%s", disassembly)
 	}
 }
 
