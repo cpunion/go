@@ -3131,6 +3131,7 @@ func TestChannelOperationLowering(t *testing.T) {
 import (
 	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 type namedBool bool
@@ -3200,6 +3201,12 @@ func receive(ch chan int) (int, bool) {
 //go:noinline
 func discard(ch chan int) {
 	<-ch
+}
+
+//go:noinline
+func timerReceive(ch <-chan time.Time) time.Time {
+	value := <-ch
+	return value
 }
 
 //go:noinline
@@ -3304,13 +3311,18 @@ func main() {
 	discarded <- 1
 	discard(discarded)
 
+	timer := time.NewTimer(10 * time.Millisecond)
+	if value := timerReceive(timer.C); value.IsZero() {
+		panic("bad timer channel result")
+	}
+
 	closed := make(chan int)
 	close(closed)
 	if closedSend(closed) == nil {
 		panic("send on closed channel did not panic")
 	}
 	if sum := many(); sum != 8 {
-		panic("blocked channel workers stalled the scheduler")
+		panic("blocked channel operations stalled the scheduler")
 	}
 	println("stackless-coro-channel-ok")
 }
@@ -3336,7 +3348,8 @@ func main() {
 	}
 	for _, name := range []string{
 		"send", "sendOne", "sendPointer", "directionalSend",
-		"directionalRecv", "receive", "discard", "closedSend", "many", "main",
+		"directionalRecv", "receive", "discard", "timerReceive",
+		"closedSend", "many", "main",
 	} {
 		if diagnostic := "skip main." + name + ":"; strings.Contains(
 			out, diagnostic) {

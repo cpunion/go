@@ -8,6 +8,7 @@ package runtime_test
 
 import (
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -122,6 +123,62 @@ func BenchmarkStacklessCoroTimer(b *testing.B) {
 		pending = true
 		runtime.SleepStacklessCoroForTest(ctx, 0)
 		return runtime.StacklessCoroActionWait
+	})
+}
+
+func BenchmarkStacklessCoroChannel(b *testing.B) {
+	channel := make(chan int)
+	value := 1
+	var received atomic.Int64
+	receiverPending := false
+	receiverValue := 0
+	receiverOK := false
+	receiver := func(ctx unsafe.Pointer) uint8 {
+		if receiverPending {
+			if receiverValue != value || !receiverOK {
+				b.Fatalf("receive = (%d, %t), want (%d, true)",
+					receiverValue, receiverOK, value)
+			}
+			received.Add(1)
+			receiverPending = false
+		}
+		if received.Load() == int64(b.N) {
+			return runtime.StacklessCoroActionComplete
+		}
+		receiverPending = true
+		runtime.RecvIntStacklessCoroForTest(ctx, channel, &receiverValue,
+			&receiverOK)
+		return runtime.StacklessCoroActionWait
+	}
+
+	sent := 0
+	sendPending := false
+	state := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			runtime.SpawnStacklessCoroForTest(ctx, receiver)
+			state = 1
+			return runtime.StacklessCoroActionYield
+		case 1:
+			if sendPending {
+				sent++
+				sendPending = false
+			}
+			if sent == b.N {
+				if received.Load() != int64(b.N) {
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
+			}
+			sendPending = true
+			runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+			return runtime.StacklessCoroActionWait
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
 	})
 }
 

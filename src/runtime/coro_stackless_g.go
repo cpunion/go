@@ -17,6 +17,25 @@ type stacklessCoroG struct {
 	stacklessCoro *stacklessCoroGState
 }
 
+type stacklessCoroSudog struct {
+	owner unsafe.Pointer
+}
+
+func (s *stacklessCoroSudog) get() unsafe.Pointer {
+	return s.owner
+}
+
+func (s *stacklessCoroSudog) set(owner unsafe.Pointer) {
+	if owner == nil || s.owner != nil {
+		throw("runtime: invalid stackless coroutine channel waiter owner")
+	}
+	s.owner = owner
+}
+
+func (s *stacklessCoroSudog) clear() {
+	s.owner = nil
+}
+
 func (gp *g) stackIsFixed() bool {
 	return gp.stacklessCoro != nil && gp.stacklessCoro.native != nil
 }
