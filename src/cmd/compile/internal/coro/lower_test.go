@@ -254,6 +254,18 @@ func TestNeedsTerminalEntry(t *testing.T) {
 	exiting.transitions[nil] = SiteGoexit
 	check("goexit", exiting, true)
 
+	receiving := candidate()
+	receiving.channels = map[ir.Node]*lowerChannel{
+		nil: {},
+	}
+	check("channel receive", receiving, false)
+
+	sending := candidate()
+	sending.channels = map[ir.Node]*lowerChannel{
+		nil: {sendValue: ir.NewInt(src.NoXPos, 1)},
+	}
+	check("channel send", sending, true)
+
 	callTarget := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("callTarget"),
 		types.NewSignature(nil, nil, nil))
 	newCall := func() *ir.CallExpr {
@@ -4924,5 +4936,361 @@ func TestLowerNormalizedResults(t *testing.T) {
 	if wrapperCalls != 0 {
 		t.Fatalf("generated IR has %d calls to ordinary wrapper, want 0",
 			wrapperCalls)
+	}
+}
+
+func TestLowerChannelOperations(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/channel", "channel")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	fn := newLowerTestFunc(pkg, "operations")
+	channelType := types.NewChan(types.Types[types.TINT], types.Cboth)
+	channel := fn.NewLocal(src.NoXPos, pkg.Lookup("channel"), channelType)
+	channelDecl := ir.NewDecl(src.NoXPos, ir.ODCL, channel)
+	boolName := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE,
+		pkg.Lookup("definedBool"))
+	definedBool := types.NewNamed(boolName)
+	boolName.SetType(definedBool)
+	boolName.SetTypecheck(1)
+	definedBool.SetUnderlying(types.Types[types.TBOOL])
+
+	send := ir.NewSendStmt(src.NoXPos, channel,
+		ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+			constant.MakeInt64(1)))
+	send.SetTypecheck(1)
+
+	directTarget := fn.NewLocal(src.NoXPos, pkg.Lookup("directTarget"),
+		types.Types[types.TINT])
+	directRecv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+	directRecv.SetType(types.Types[types.TINT])
+	directRecv.SetTypecheck(1)
+	direct := ir.NewAssignStmt(src.NoXPos, directTarget, directRecv)
+	direct.SetTypecheck(1)
+
+	singleTemp := fn.NewLocal(src.NoXPos, pkg.Lookup("singleTemp"),
+		types.Types[types.TINT])
+	singleTarget := fn.NewLocal(src.NoXPos, pkg.Lookup("singleTarget"),
+		types.Types[types.TINT])
+	singleRecv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+	singleRecv.SetType(types.Types[types.TINT])
+	singleRecv.SetTypecheck(1)
+	singleInner := ir.NewAssignStmt(src.NoXPos, singleTemp, singleRecv)
+	singleInner.SetTypecheck(1)
+	singleProjection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+		types.Types[types.TINT], singleTemp)
+	singleProjection.SetTypecheck(1)
+	singleProjection.SetInit(ir.Nodes{singleInner})
+	singleOuter := ir.NewAssignStmt(src.NoXPos, singleTarget,
+		singleProjection)
+	singleOuter.SetTypecheck(1)
+
+	pairValueTemp := fn.NewLocal(src.NoXPos, pkg.Lookup("pairValueTemp"),
+		types.Types[types.TINT])
+	pairOKTemp := fn.NewLocal(src.NoXPos, pkg.Lookup("pairOKTemp"),
+		definedBool)
+	pairValue := fn.NewLocal(src.NoXPos, pkg.Lookup("pairValue"),
+		types.Types[types.TINT])
+	pairOK := fn.NewLocal(src.NoXPos, pkg.Lookup("pairOK"),
+		definedBool)
+	pairRecv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+	pairRecv.SetType(types.Types[types.TINT])
+	pairRecv.SetTypecheck(1)
+	pairInner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2RECV,
+		ir.Nodes{pairValueTemp, pairOKTemp}, ir.Nodes{pairRecv})
+	pairInner.SetTypecheck(1)
+	pairProjection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+		types.Types[types.TINT], pairValueTemp)
+	pairProjection.SetTypecheck(1)
+	pairProjection.SetInit(ir.Nodes{pairInner})
+	pairOuter := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+		ir.Nodes{pairValue, pairOK},
+		ir.Nodes{pairProjection, pairOKTemp})
+	pairOuter.SetTypecheck(1)
+
+	discard := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+	discard.SetType(types.Types[types.TINT])
+	discard.SetTypecheck(1)
+
+	fn.Body = ir.Nodes{
+		channelDecl, send, direct, singleOuter, pairOuter, discard,
+		newLowerTestReturn(),
+	}
+	function := &Function{
+		Func:    fn,
+		Local:   MaySuspend,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Sites: []Site{
+			{ID: 1, Kind: SiteChannel, Node: send},
+			{ID: 2, Kind: SiteChannel, Node: directRecv},
+			{ID: 3, Kind: SiteChannel, Node: singleRecv},
+			{ID: 4, Kind: SiteChannel, Node: pairRecv},
+			{ID: 5, Kind: SiteChannel, Node: discard},
+		},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn: function,
+	}})
+	if err != nil {
+		t.Fatalf("Lower failed: %v", err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	var sends, receives, nativeChannels int
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			switch node.Op() {
+			case ir.OSEND, ir.ORECV:
+				nativeChannels++
+			}
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name == nil || name.Sym() == nil {
+				return
+			}
+			switch name.Sym().Name {
+			case "coroChanSend":
+				sends++
+			case "coroChanRecv":
+				receives++
+			}
+		})
+	}
+	if sends != 1 || receives != 4 {
+		t.Fatalf("generated channel helpers = (%d send, %d receive), want (1, 4)",
+			sends, receives)
+	}
+	if nativeChannels != 0 {
+		t.Fatalf("generated IR retains %d native channel operations",
+			nativeChannels)
+	}
+}
+
+func TestLowerRejectsUnsupportedChannels(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/channelreject", "channelreject")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	channelType := types.NewChan(types.Types[types.TINT], types.Cboth)
+
+	tests := []struct {
+		name string
+		make func(*ir.Func, *ir.Name) (ir.Nodes, ir.Node)
+		want string
+	}{
+		{
+			name: "nested-expression",
+			make: func(fn *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+				recv.SetType(types.Types[types.TINT])
+				target := fn.NewLocal(src.NoXPos, pkg.Lookup("nestedTarget"),
+					types.Types[types.TINT])
+				expression := ir.NewBinaryExpr(src.NoXPos, ir.OADD, recv,
+					ir.NewInt(src.NoXPos, 1))
+				expression.SetType(types.Types[types.TINT])
+				assign := ir.NewAssignStmt(src.NoXPos, target, expression)
+				return ir.Nodes{assign}, recv
+			},
+			want: "nested receive assignment",
+		},
+		{
+			name: "complex-target",
+			make: func(fn *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+				recv.SetType(types.Types[types.TINT])
+				values := fn.NewLocal(src.NoXPos, pkg.Lookup("values"),
+					types.NewSlice(types.Types[types.TINT]))
+				target := ir.NewIndexExpr(src.NoXPos, values,
+					ir.NewInt(src.NoXPos, 0))
+				target.SetType(types.Types[types.TINT])
+				assign := ir.NewAssignStmt(src.NoXPos, target, recv)
+				return ir.Nodes{assign}, recv
+			},
+			want: "receive result 0 is not a variable",
+		},
+		{
+			name: "range",
+			make: func(_ *ir.Func, channel *ir.Name) (ir.Nodes, ir.Node) {
+				loop := ir.NewRangeStmt(src.NoXPos, nil, nil, channel,
+					nil, false)
+				return ir.Nodes{loop}, loop
+			},
+			want: "unsupported operation range",
+		},
+		{
+			name: "select",
+			make: func(_ *ir.Func, _ *ir.Name) (ir.Nodes, ir.Node) {
+				selectStmt := ir.NewSelectStmt(src.NoXPos, nil)
+				return ir.Nodes{selectStmt}, selectStmt
+			},
+			want: "control flow select",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fn := newLowerTestFunc(pkg, test.name)
+			channel := fn.NewLocal(src.NoXPos,
+				pkg.Lookup(test.name+"Channel"), channelType)
+			body, site := test.make(fn, channel)
+			fn.Body = body
+			function := &Function{
+				Func: fn,
+				Sites: []Site{{
+					ID: 1, Kind: SiteChannel, Node: site,
+				}},
+			}
+			_, err := newLowerCandidate(
+				&Plan{Functions: map[*ir.Func]*Function{fn: function}},
+				function)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("newLowerCandidate error = %v, want %q",
+					err, test.want)
+			}
+		})
+	}
+}
+
+func TestNewLowerChannelRejectsMalformedIR(t *testing.T) {
+	prepareLowerTest(t)
+
+	pkg := types.NewPkg("example.com/coro/channelmalformed",
+		"channelmalformed")
+	channel := ir.NewNameAt(src.NoXPos, pkg.Lookup("channel"),
+		types.NewChan(types.Types[types.TINT], types.Cboth))
+	newRecv := func() *ir.UnaryExpr {
+		recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+		recv.SetType(types.Types[types.TINT])
+		return recv
+	}
+	newTarget := func(name string, typ *types.Type) *ir.Name {
+		return ir.NewNameAt(src.NoXPos, pkg.Lookup(name), typ)
+	}
+
+	tests := []struct {
+		name string
+		make func() (ir.Node, ir.Node, ir.Node)
+		want string
+	}{
+		{
+			name: "nested-send",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				send := ir.NewSendStmt(src.NoXPos, channel,
+					ir.NewInt(src.NoXPos, 1))
+				return send, send, ir.NewBlockStmt(src.NoXPos, nil)
+			},
+			want: "nested send",
+		},
+		{
+			name: "invalid-receive",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				node := ir.NewUnaryExpr(src.NoXPos, ir.ONEG, channel)
+				return node, node, node
+			},
+			want: "invalid receive operation",
+		},
+		{
+			name: "nested-receive",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				recv := newRecv()
+				owner := newRecv()
+				return recv, owner, owner
+			},
+			want: "nested receive",
+		},
+		{
+			name: "bad-receive-list",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				recv := newRecv()
+				owner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2RECV,
+					ir.Nodes{newTarget("listTarget",
+						types.Types[types.TINT])}, ir.Nodes{recv})
+				return recv, owner, owner
+			},
+			want: "unsupported receive assignment",
+		},
+		{
+			name: "bad-owner",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				recv := newRecv()
+				owner := ir.NewBlockStmt(src.NoXPos, nil)
+				return recv, owner, owner
+			},
+			want: "nested receive in BLOCK",
+		},
+		{
+			name: "untyped-result",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				recv := newRecv()
+				owner := ir.NewAssignStmt(src.NoXPos,
+					newTarget("untypedTarget", nil), recv)
+				return recv, owner, owner
+			},
+			want: "receive result 0 has no type",
+		},
+		{
+			name: "bad-normalization",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				recv := newRecv()
+				temp := newTarget("normalTemp", types.Types[types.TINT])
+				owner := ir.NewAssignStmt(src.NoXPos, temp, recv)
+				other := newTarget("normalOther", types.Types[types.TINT])
+				projection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+					types.Types[types.TINT], other)
+				projection.SetInit(ir.Nodes{owner})
+				container := ir.NewAssignStmt(src.NoXPos,
+					newTarget("normalTarget", types.Types[types.TINT]),
+					projection)
+				return recv, owner, container
+			},
+			want: "nested receive assignment",
+		},
+		{
+			name: "bad-channel",
+			make: func() (ir.Node, ir.Node, ir.Node) {
+				notChannel := newTarget("notChannel",
+					types.Types[types.TINT])
+				recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, notChannel)
+				recv.SetType(types.Types[types.TINT])
+				return recv, recv, recv
+			},
+			want: "operation has no channel type",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node, statement, container := test.make()
+			_, err := newLowerChannel(node, statement, container)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("newLowerChannel error = %v, want %q",
+					err, test.want)
+			}
+		})
 	}
 }

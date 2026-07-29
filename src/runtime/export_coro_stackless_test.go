@@ -124,6 +124,17 @@ func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) {
 	coroSleep(ctx, ns)
 }
 
+func SendIntStacklessCoroForTest(ctx unsafe.Pointer, channel chan<- int, value *int) {
+	coroChanSend(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+		unsafe.Pointer(value))
+}
+
+func RecvIntStacklessCoroForTest(ctx unsafe.Pointer, channel <-chan int,
+	value *int, received *bool) {
+	coroChanRecv(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+		unsafe.Pointer(value), received)
+}
+
 func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) uint64 {
 	return startStacklessCoroTimer(ctx, ns)
 }

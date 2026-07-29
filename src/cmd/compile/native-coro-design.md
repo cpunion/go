@@ -11,7 +11,8 @@ fixed or repeated local defer literals and statically resolved local or
 imported named defer targets; direct deferred Goexit; operation-progress
 follow-ups; nested multi-result and conservatively normalized single-result
 expressions; and restricted compiler-private cross-package factory and defer
-entries are implemented; not production-ready
+entries; ordinary channel send, single-value receive, and comma-ok receive
+are implemented; not production-ready
 
 Last updated: 2026-07-29
 
@@ -1115,9 +1116,28 @@ producer may publish readiness or a committed result, but it may not resume a
 frame directly. Mutexes, semaphores, notes, and condition variables need the
 same park/wake boundary.
 
-The MVP does not need full channel semantics before proving yield, timer, file,
-and network paths. It does need a scheduler-internal ready queue that is safe
-under concurrent foreign completion.
+The first channel slice lowers ordinary sends, discarded or single-value
+receives, and comma-ok receives with simple variable targets. It preserves the
+frontend's normalized temporary assignments, including blank results and
+defined bool conversions. A send evaluates the channel and value before
+suspending, then retains the typed value in factory-owned, GC-scanned storage.
+A receive writes typed result temporaries before publishing readiness.
+Send-on-closed-channel panic is transferred to the logical task and enters the
+same cleanup path as another asynchronous terminal outcome.
+
+The runtime bridge executes each potentially blocking channel operation on an
+ordinary Go worker goroutine. The worker receives only a registry operation
+identity, never calls the continuation, and publishes success or panic through
+the scheduler ready queue. This proves compiler evaluation order, result
+ownership, early completion, panic transfer, and nonblocking executor progress
+without freezing a second channel implementation.
+
+The worker bridge is transitional: a blocked operation still owns an ordinary
+goroutine stack. The scalable path should register the logical task directly
+with the runtime channel wait queues and publish through the same operation
+identity. Select, channel range, multiple operations in one expression,
+effectful receive destinations, and direct sudog integration remain separate
+steps.
 
 ### 11.3 Timers
 
@@ -1272,6 +1292,8 @@ The first automatic lowering supports:
 - local variables whose addresses do not escape except into their typed
   coroutine frame;
 - `if`, simple loops, ordinary return, and explicit compiler test operations;
+- ordinary channel send, discarded or single-value receive, and comma-ok
+  receive with simple variable targets;
 - one logical root and spawned roots;
 - normal completion;
 - conditional fixed direct defer sites and repeated defer sites in simple
@@ -1524,6 +1546,12 @@ The compiler:
 - splits frontend-generated expression `Init` assignments at an awaited
   multi-result call and resumes the enclosing expression from typed result
   temporaries;
+- splits frontend-normalized channel receive assignments at the operation,
+  writes their typed value and status temporaries asynchronously, and resumes
+  the original projection so blank results and defined bool conversions retain
+  Go assignment semantics;
+- evaluates a channel send's channel and value in source order and keeps the
+  value in factory-owned typed storage until the operation completes;
 - normalizes single-result awaits in returns, call arguments, and simple
   assignments into pre-escape typed temporary assignments when doing so
   preserves every observable prefix operation; an existing statement `Init`
@@ -1611,6 +1639,9 @@ The runtime:
   a caller local saved on the pre-switch stack;
 - uses common operation ownership for timer, regular-file worker, nonblocking
   socket, and asynchronous C completion;
+- transfers ordinary channel send and receive through operation-identity
+  workers, publishes completion without invoking a continuation, and converts
+  send-on-closed panic into a task-owned terminal outcome;
 - makes timer completion and cancellation race for the same operation record,
   so exactly one path readies the waiter;
 - keeps the stackless scheduler runnable while a timer, file worker, or socket
@@ -1659,6 +1690,10 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - yield, structured child await, 100,000 spawned logical goroutines, timer
   fire/cancel races, regular-file success/error/EOF, socket
   success/EOF/deadline/close, and asynchronous C success/error paths;
+- buffered and unbuffered channel send/receive, closed-channel comma-ok,
+  blank results, defined bool status, discarded receive, send-on-closed panic,
+  and eight simultaneously blocked sends making progress at
+  `GOMAXPROCS=1`;
 - at `GOMAXPROCS=1`, a sibling stackless task must run before it can cancel a
   pending timer or release the writer that completes a blocked file or socket
   read; a five-second rescue makes a scheduling regression fail instead of
@@ -1838,6 +1873,16 @@ statements in `coro_stackless.go`. Together they cover 78 of 80 changed core
 statements (97.5%). The two uncovered statements are the defensive invalid
 panic-requeue throw.
 
+For the ordinary-channel follow-up, the complete coroutine compiler package
+is 92.3% covered. The complete profile covers 144 of 158 changed production
+statements in `lower.go` (91.1%), and the focused normal and race runtime
+profiles cover 42 of 46 changed statements in `coro_stackless.go` (91.3%).
+Together they cover 186 of 204 changed core statements (91.2%). End-to-end
+tests additionally compile and run direction-restricted channels, blank and
+defined-bool comma-ok results, pointer values across a forced GC, closed-send
+panic recovery, and object inspection; subprocess coverage is not credited to
+the in-process profile.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -1955,8 +2000,12 @@ interfaces, unlabeled branch control including frontend loop-variable
 rewrites, general escaping closures, nested closures that recapture a
 repeated-literal cell, indirect recover-capable helpers, stackless `go` edges
 in terminal named defer targets, explicit panic from a non-structured spawned
-task, channels, select, mutex parking, reflection, callbacks, variadic C calls,
-or general C ABI type classification. Explicit and implicit panic and Goexit
+task, channel range, select, multiple channel operations in one expression,
+effectful receive destinations, mutex parking, reflection, callbacks,
+variadic C calls, or general C ABI type classification. Ordinary channel
+send, discarded or single-value receive, and comma-ok receive with simple
+variable targets are supported through a transitional per-operation worker.
+Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
 spawned logical goroutine, fixed or repeated-simple-loop defer cleanup,
 terminal control and typed capture ownership in repeated source literals,
@@ -1979,24 +2028,27 @@ standard-library compatibility remain future work.
 
 The likely order is:
 
-1. add channels, select, mutexes, semaphores, and runtime notes;
-2. generalize System ABI type classification and errno handling;
-3. extend expression, assignment, and branch normalization to short-circuit
+1. replace the transitional channel worker with direct runtime wait-queue
+   integration, then add channel range and select;
+2. add mutexes, semaphores, and runtime notes through the same park/wake
+   boundary;
+3. generalize System ABI type classification and errno handling;
+4. extend expression, assignment, and branch normalization to short-circuit
    control, loop conditions, frontend loop-variable rewrites, and effectful
    destinations, then extend the compiler-private factory ABI only with
    matching closure and generic lowering; do not add source annotations or
    per-call policy metadata;
-4. propagate repeated-literal cell pointers through nested closure
+5. propagate repeated-literal cell pointers through nested closure
    environments as part of general closure lowering;
-5. add dynamic function values, interfaces, closures, generics, and reflect;
-6. add precise logical traceback, debugger, profiler, trace, race, and
+6. add dynamic function values, interfaces, closures, generics, and reflect;
+7. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;
-7. add work stealing, affinity, dynamic executor sizing, and bounded blocking
+8. add work stealing, affinity, dynamic executor sizing, and bounded blocking
    policies;
-8. broaden `time`, `os`, `net`, `internal/poll`, and standard-library tests;
-9. evaluate deeper integration with the Go scheduler after the nested
+9. broaden `time`, `os`, `net`, `internal/poll`, and standard-library tests;
+10. evaluate deeper integration with the Go scheduler after the nested
    executor model is measured;
-10. add other targets only after their platform operation sources and stack
+11. add other targets only after their platform operation sources and stack
     contracts are explicit.
 
 ## 17. Confirmed MVP decisions

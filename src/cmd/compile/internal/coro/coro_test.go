@@ -1732,7 +1732,8 @@ func main() {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The child competes with many toolchain subprocesses during all.bash.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd = testenv.CommandContext(t, ctx, exe)
 	data, err = cmd.CombinedOutput()
@@ -3116,6 +3117,265 @@ int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
 	for _, forbidden := range []string{"runtime.cgocall", "runtime.asmcgocall", "_cgo_Cfunc_"} {
 		if strings.Contains(disassembly, forbidden) {
 			t.Errorf("async submit disassembly contains %q\n%s", forbidden, disassembly)
+		}
+	}
+}
+
+func TestChannelOperationLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"runtime"
+	"sync/atomic"
+)
+
+type namedBool bool
+
+var evaluated int
+var sendChannel chan int
+var manyChannel chan int
+var pointerChannel chan *int
+var gcDone atomic.Uint32
+
+//go:noinline
+func nextValue() int {
+	evaluated++
+	return 7
+}
+
+//go:noinline
+func send() {
+	sendChannel <- nextValue()
+}
+
+//go:noinline
+func sendOne() {
+	manyChannel <- 1
+}
+
+//go:noinline
+func newPointer() *int {
+	value := new(int)
+	*value = 29
+	return value
+}
+
+//go:noinline
+func sendPointer() {
+	pointerChannel <- newPointer()
+}
+
+//go:noinline
+func directionalSend(ch chan<- int) {
+	ch <- 23
+}
+
+//go:noinline
+func directionalRecv(ch <-chan int) int {
+	value := <-ch
+	return value
+}
+
+//go:noinline
+func collect() {
+	runtime.GC()
+	gcDone.Store(1)
+}
+
+//go:noinline
+func launch(f func()) {
+	go f()
+}
+
+//go:noinline
+func receive(ch chan int) (int, bool) {
+	value, ok := <-ch
+	return value, ok
+}
+
+//go:noinline
+func discard(ch chan int) {
+	<-ch
+}
+
+//go:noinline
+func closedSend(ch chan int) (recovered any) {
+	defer func() {
+		recovered = recover()
+	}()
+	ch <- 1
+	return
+}
+
+//go:noinline
+func many() int {
+	ch := make(chan int)
+	manyChannel = ch
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	go sendOne()
+	sum := 0
+	for i := 0; i < 8; i++ {
+		value, ok := <-ch
+		if !ok {
+			panic("unexpected closed channel")
+		}
+		sum += value
+	}
+	return sum
+}
+
+func main() {
+	ch := make(chan int)
+	sendChannel = ch
+	go send()
+	runtime.Gosched()
+	if evaluated != 1 {
+		panic("send value was not evaluated before blocking")
+	}
+	value, ok := receive(ch)
+	if value != 7 || !ok || evaluated != 1 {
+		panic("bad unbuffered channel result")
+	}
+
+	buffered := make(chan int, 1)
+	buffered <- 11
+	if got := <-buffered; got != 11 {
+		panic("bad buffered channel result")
+	}
+	close(buffered)
+	zero, open := <-buffered
+	if zero != 0 || open {
+		panic("bad closed channel receive")
+	}
+
+	firstBlank := make(chan int, 1)
+	firstBlank <- 13
+	_, onlyOK := <-firstBlank
+	if !onlyOK {
+		panic("bad blank channel value")
+	}
+
+	secondBlank := make(chan int, 1)
+	secondBlank <- 17
+	onlyValue, _ := <-secondBlank
+	if onlyValue != 17 {
+		panic("bad blank channel status")
+	}
+
+	namedChannel := make(chan int, 1)
+	namedChannel <- 19
+	var namedValue int
+	var namedOK namedBool
+	namedValue, namedOK = <-namedChannel
+	if namedValue != 19 || !namedOK {
+		panic("bad named channel status")
+	}
+
+	directional := make(chan int, 1)
+	directionalSend(directional)
+	if directionalRecv(directional) != 23 {
+		panic("bad directional channel result")
+	}
+
+	pointers := make(chan *int)
+	pointerChannel = pointers
+	go sendPointer()
+	runtime.Gosched()
+	launch(collect)
+	for gcDone.Load() == 0 {
+		runtime.Gosched()
+	}
+	pointer := <-pointers
+	if pointer == nil || *pointer != 29 {
+		panic("channel send value was not kept alive")
+	}
+
+	discarded := make(chan int, 1)
+	discarded <- 1
+	discard(discarded)
+
+	closed := make(chan int)
+	close(closed)
+	if closedSend(closed) == nil {
+		panic("send on closed channel did not panic")
+	}
+	if sum := many(); sum != 8 {
+		panic("blocked channel workers stalled the scheduler")
+	}
+	println("stackless-coro-channel-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-channel")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building channel coroutine failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"send", "sendOne", "sendPointer", "directionalSend",
+		"directionalRecv", "receive", "discard", "closedSend", "many", "main",
+	} {
+		if diagnostic := "skip main." + name + ":"; strings.Contains(
+			out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("channel coroutine failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-channel-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(send|receive)\.coro\.func[0-9]+$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of channel resume functions failed: %v\n%s",
+			err, data)
+	}
+	disassembly := string(data)
+	for _, want := range []string{
+		"runtime.coroChanSend", "runtime.coroChanRecv",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("channel resume functions do not contain %q\n%s",
+				want, disassembly)
+		}
+	}
+	for _, forbidden := range []string{
+		"runtime.chansend1", "runtime.chanrecv1", "runtime.chanrecv2",
+	} {
+		if strings.Contains(disassembly, forbidden) {
+			t.Errorf("channel resume functions contain %q\n%s",
+				forbidden, disassembly)
 		}
 	}
 }

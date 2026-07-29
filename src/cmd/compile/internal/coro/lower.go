@@ -40,6 +40,7 @@ type lowerCandidate struct {
 	deferDeps     map[*ir.Func]bool
 	defers        []*lowerDefer
 	dynamicDefers bool
+	channels      map[ir.Node]*lowerChannel
 	panics        map[*ir.UnaryExpr]bool
 	parameters    map[*ir.Name]*ir.Name
 	results       map[*ir.Name]*ir.Name
@@ -67,10 +68,22 @@ type lowerDeferCapture struct {
 	snapshot *ir.Name
 }
 
+type lowerChannel struct {
+	node       ir.Node
+	statement  ir.Node
+	container  ir.Node
+	channel    ir.Node
+	sendValue  ir.Node
+	recvValue  ir.Node
+	recvOK     ir.Node
+	recvOKTemp *ir.Name
+}
+
 type lowerState struct {
 	body       []ir.Node
 	transition SiteKind
 	call       *ir.CallExpr
+	channel    *lowerChannel
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -255,6 +268,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)
+	channelStatements := make(map[ir.Node]ir.Node)
+	channelContainers := make(map[ir.Node]ir.Node)
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	dynamicDefers := false
@@ -304,6 +319,33 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					call := recordAssignmentCall(node)
 					if call != nil && awaitContainers[call] == nil {
 						awaitContainers[call] = stmt
+					}
+					switch node := node.(type) {
+					case *ir.SendStmt:
+						channelStatements[node] = node
+					case *ir.AssignStmt:
+						if recv, ok := node.Y.(*ir.UnaryExpr); ok &&
+							recv.Op() == ir.ORECV {
+							channelStatements[recv] = node
+						}
+					case *ir.AssignListStmt:
+						if len(node.Rhs) == 1 {
+							if recv, ok := node.Rhs[0].(*ir.UnaryExpr); ok &&
+								recv.Op() == ir.ORECV {
+								channelStatements[recv] = node
+							}
+						}
+					}
+				})
+				ir.Visit(root, func(node ir.Node) {
+					switch node.Op() {
+					case ir.OSEND, ir.ORECV, ir.OSELECT, ir.ORANGE:
+						if channelStatements[node] == nil {
+							channelStatements[node] = stmt
+						}
+						if channelContainers[node] == nil {
+							channelContainers[node] = stmt
+						}
 					}
 				})
 			}
@@ -413,6 +455,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		deferDeps:     make(map[*ir.Func]bool),
 		defers:        defers,
 		dynamicDefers: dynamicDefers,
+		channels:      make(map[ir.Node]*lowerChannel),
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
 	for _, site := range function.Sites {
@@ -422,6 +465,19 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("invalid panic site %d", site.ID)
 			}
 			candidate.panics[panicExpr] = true
+			continue
+		}
+		if site.Kind == SiteChannel {
+			channel, err := newLowerChannel(site.Node,
+				channelStatements[site.Node], channelContainers[site.Node])
+			if err != nil {
+				return nil, fmt.Errorf("channel site %d: %v", site.ID, err)
+			}
+			if candidate.channels[channel.statement] != nil {
+				return nil, fmt.Errorf(
+					"multiple channel operations in one statement")
+			}
+			candidate.channels[channel.statement] = channel
 			continue
 		}
 		call, ok := site.Node.(*ir.CallExpr)
@@ -597,6 +653,76 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		}
 	}
 	return candidate, nil
+}
+
+func newLowerChannel(node, statement, container ir.Node) (*lowerChannel, error) {
+	if node == nil || statement == nil || container == nil {
+		return nil, fmt.Errorf("operation has no owning statement")
+	}
+	channel := &lowerChannel{
+		node: node, statement: statement, container: container,
+	}
+	switch node := node.(type) {
+	case *ir.SendStmt:
+		if statement != node || container != node {
+			return nil, fmt.Errorf("nested send")
+		}
+		channel.channel = node.Chan
+		channel.sendValue = node.Value
+
+	case *ir.UnaryExpr:
+		if node.Op() != ir.ORECV {
+			return nil, fmt.Errorf("invalid receive operation %v", node.Op())
+		}
+		channel.channel = node.X
+		switch statement := statement.(type) {
+		case *ir.UnaryExpr:
+			if statement != node {
+				return nil, fmt.Errorf("nested receive")
+			}
+		case *ir.AssignStmt:
+			if statement.Y != node {
+				return nil, fmt.Errorf("nested receive assignment")
+			}
+			channel.recvValue = statement.X
+		case *ir.AssignListStmt:
+			if (statement.Op() != ir.OAS2RECV &&
+				statement.Op() != ir.OAS2) ||
+				len(statement.Lhs) != 2 || len(statement.Rhs) != 1 ||
+				statement.Rhs[0] != node {
+				return nil, fmt.Errorf("unsupported receive assignment")
+			}
+			channel.recvValue = statement.Lhs[0]
+			channel.recvOK = statement.Lhs[1]
+		default:
+			return nil, fmt.Errorf("nested receive in %v", statement.Op())
+		}
+		for i, target := range []ir.Node{channel.recvValue, channel.recvOK} {
+			if target == nil || ir.IsBlank(target) {
+				continue
+			}
+			if _, ok := target.(*ir.Name); !ok {
+				return nil, fmt.Errorf(
+					"receive result %d is not a variable", i)
+			}
+			if target.Type() == nil {
+				return nil, fmt.Errorf(
+					"receive result %d has no type", i)
+			}
+		}
+		if statement != container &&
+			!normalizedReceiveAssignment(node, statement, container) {
+			return nil, fmt.Errorf("nested receive assignment")
+		}
+
+	default:
+		return nil, fmt.Errorf("unsupported operation %v", node.Op())
+	}
+	if channel.channel == nil || channel.channel.Type() == nil ||
+		!channel.channel.Type().IsChan() {
+		return nil, fmt.Errorf("operation has no channel type")
+	}
+	return channel, nil
 }
 
 type lowerDeferTerminal struct {
@@ -958,6 +1084,11 @@ func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 func needsTerminalEntry(candidate *lowerCandidate) bool {
 	if candidate.function.Terminal != 0 || len(candidate.defers) != 0 {
 		return true
+	}
+	for _, channel := range candidate.channels {
+		if channel.sendValue != nil {
+			return true
+		}
 	}
 	for _, transition := range candidate.transitions {
 		if transition == SiteAwait || transition == SiteGoexit {
@@ -1801,6 +1932,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				required = true
 				return
 			}
+			if candidate.channels[node] != nil {
+				required = true
+				return
+			}
 			call, ok := node.(*ir.CallExpr)
 			if !ok {
 				return
@@ -1821,6 +1956,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return true
 		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt:
 			return requiresControlLowering(stmt)
+		}
+		if channelOperation(stmt, candidate.channels) != nil {
+			return true
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
 			switch candidate.transitions[call] {
@@ -1850,6 +1988,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		switch stmt := stmt.(type) {
 		case *ir.UnaryExpr:
 			if stmt.Op() != ir.OPANIC || !candidate.panics[stmt] {
+				if candidate.channels[stmt] != nil {
+					break
+				}
 				panic(fmt.Sprintf("unexpected coroutine unary boundary %s",
 					stmt.Op()))
 			}
@@ -1902,11 +2043,46 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		if init := ir.TakeInit(stmt); len(init) != 0 {
 			continuation := next
-			if transitionCall(stmt, candidate.transitions) != nil {
+			if transitionCall(stmt, candidate.transitions) != nil ||
+				channelOperation(stmt, candidate.channels) != nil {
 				continuation = lowerStatement(stmt, next)
 			} else {
 				continuation = newBodyState(ir.Nodes{stmt}, next)
 			}
+			return lowerStatements(init, continuation)
+		}
+		if channel := candidate.channels[stmt]; channel != nil {
+			stateNext := next
+			if channel.recvOK != nil && !ir.IsBlank(channel.recvOK) &&
+				!types.Identical(channel.recvOK.Type(),
+					types.Types[types.TBOOL]) {
+				if channel.recvOKTemp == nil {
+					channel.recvOKTemp = typecheck.TempAt(
+						channel.node.Pos(), factory,
+						types.Types[types.TBOOL])
+					addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL,
+						channel.recvOKTemp))
+				}
+				conversion := ir.NewAssignStmt(channel.node.Pos(),
+					channel.recvOK, typecheck.Conv(channel.recvOKTemp,
+						channel.recvOK.Type()))
+				stateNext = newBodyState(ir.Nodes{conversion}, next)
+			}
+			return addState(lowerState{
+				transition: SiteChannel,
+				channel:    channel,
+				statement:  stmt,
+				next:       stateNext,
+				thenState:  -1,
+				elseState:  -1,
+			})
+		}
+		if channel := channelOperation(stmt, candidate.channels); channel != nil {
+			init := takeNodeInit(stmt, channel.node)
+			if len(init) == 0 {
+				panic("coroutine channel operation has no normalized init")
+			}
+			continuation := newBodyState(ir.Nodes{stmt}, next)
 			return lowerStatements(init, continuation)
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
@@ -2368,6 +2544,53 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					typecheck.LookupRuntime("coroAwait"),
 					ir.Nodes{ctx, child}, false))
 				action = actionWait
+			case SiteChannel:
+				channel := state.channel
+				if channel == nil {
+					return fmt.Errorf("%s: state %d has no channel operation",
+						ir.PkgFuncName(fn), i)
+				}
+				channelType := channel.channel.Type()
+				elementType := channelType.Elem()
+				channelValue := typecheck.TempAt(channel.node.Pos(), resume,
+					channelType)
+				body = append(body, ir.NewAssignStmt(channel.node.Pos(),
+					channelValue, edit(channel.channel)))
+				if channel.sendValue != nil {
+					value := typecheck.TempAt(channel.node.Pos(), factory,
+						elementType)
+					addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL,
+						value))
+					value = capture(value)
+					body = append(body, ir.NewAssignStmt(channel.node.Pos(),
+						value, edit(channel.sendValue)))
+					body = append(body, typecheck.Call(channel.node.Pos(),
+						typecheck.LookupRuntime("coroChanSend",
+							elementType, elementType),
+						ir.Nodes{ctx, channelValue,
+							typecheck.NodAddr(value)}, false))
+				} else {
+					resultPointer := ir.Node(typecheck.NodNil())
+					if channel.recvValue != nil &&
+						!ir.IsBlank(channel.recvValue) {
+						resultPointer = typecheck.NodAddr(
+							edit(channel.recvValue))
+					}
+					okPointer := ir.Node(typecheck.NodNil())
+					if channel.recvOK != nil && !ir.IsBlank(channel.recvOK) {
+						target := channel.recvOK
+						if channel.recvOKTemp != nil {
+							target = channel.recvOKTemp
+						}
+						okPointer = typecheck.NodAddr(edit(target))
+					}
+					body = append(body, typecheck.Call(channel.node.Pos(),
+						typecheck.LookupRuntime("coroChanRecv",
+							elementType, elementType),
+						ir.Nodes{ctx, channelValue, resultPointer,
+							okPointer}, false))
+				}
+				action = actionWait
 			case SiteTimer:
 				if len(state.call.Args) != 1 {
 					return fmt.Errorf("%s: timer operation has %d arguments",
@@ -2713,6 +2936,53 @@ func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
 	return inner, true
 }
 
+// normalizedReceiveAssignment reports whether statement evaluates recv into
+// temporaries that container only projects into simple assignment targets.
+// order introduces this shape to preserve assignment evaluation order.
+func normalizedReceiveAssignment(recv *ir.UnaryExpr, statement,
+	container ir.Node) bool {
+	if recv == nil || recv.Op() != ir.ORECV ||
+		initNodeContaining(container, recv) == nil {
+		return false
+	}
+	switch statement := statement.(type) {
+	case *ir.AssignStmt:
+		outer, ok := container.(*ir.AssignStmt)
+		if !ok || statement.Y != recv ||
+			(!ir.IsBlank(outer.X) && outer.X.Op() != ir.ONAME) {
+			return false
+		}
+		return isResultProjection(outer.Y, statement.X)
+
+	case *ir.AssignListStmt:
+		outer, ok := container.(*ir.AssignListStmt)
+		if !ok || len(statement.Lhs) != 2 ||
+			len(statement.Rhs) != 1 || statement.Rhs[0] != recv ||
+			len(outer.Lhs) != len(outer.Rhs) {
+			return false
+		}
+		projection := 0
+		for _, result := range statement.Lhs {
+			if ir.IsBlank(result) {
+				continue
+			}
+			if projection == len(outer.Lhs) {
+				return false
+			}
+			target := outer.Lhs[projection]
+			if !ir.IsBlank(target) && target.Op() != ir.ONAME {
+				return false
+			}
+			if !isResultProjection(outer.Rhs[projection], result) {
+				return false
+			}
+			projection++
+		}
+		return projection == len(outer.Lhs)
+	}
+	return false
+}
+
 // isResultProjection reports whether node only converts a temporary result.
 // Other expressions need general evaluation-order lowering around suspension.
 func isResultProjection(node, result ir.Node) bool {
@@ -2730,11 +3000,11 @@ func isResultProjection(node, result ir.Node) bool {
 	}
 }
 
-func callInitNode(node ir.Node, call *ir.CallExpr) ir.Node {
+func initNodeContaining(node, target ir.Node) ir.Node {
 	if init := node.Init(); len(init) != 0 {
 		found := false
 		ir.VisitList(init, func(node ir.Node) {
-			if node == call {
+			if node == target {
 				found = true
 			}
 		})
@@ -2745,10 +3015,14 @@ func callInitNode(node ir.Node, call *ir.CallExpr) ir.Node {
 
 	var result ir.Node
 	ir.DoChildren(node, func(child ir.Node) bool {
-		result = callInitNode(child, call)
+		result = initNodeContaining(child, target)
 		return result != nil
 	})
 	return result
+}
+
+func callInitNode(node ir.Node, call *ir.CallExpr) ir.Node {
+	return initNodeContaining(node, call)
 }
 
 // takeCallInit detaches the containing initialization list that evaluates
@@ -2759,6 +3033,27 @@ func takeCallInit(node ir.Node, call *ir.CallExpr) ir.Nodes {
 		return ir.TakeInit(init)
 	}
 	return nil
+}
+
+func takeNodeInit(node, target ir.Node) ir.Nodes {
+	if init := initNodeContaining(node, target); init != nil {
+		return ir.TakeInit(init)
+	}
+	return nil
+}
+
+func channelOperation(stmt ir.Node,
+	channels map[ir.Node]*lowerChannel) *lowerChannel {
+	if channel := channels[stmt]; channel != nil {
+		return channel
+	}
+	var found *lowerChannel
+	ir.Visit(stmt, func(node ir.Node) {
+		if found == nil {
+			found = channels[node]
+		}
+	})
+	return found
 }
 
 func transitionCall(stmt ir.Node, transitions map[*ir.CallExpr]SiteKind) *ir.CallExpr {
