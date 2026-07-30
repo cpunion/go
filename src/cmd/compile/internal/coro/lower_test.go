@@ -4218,6 +4218,235 @@ func TestCallResultTargets(t *testing.T) {
 	}
 }
 
+func TestCgoErrnoResultRewrite(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/cgoerrno", "cgoerrno")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	owner := newLowerTestFunc(pkg, "owner")
+
+	errnoName := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, pkg.Lookup("errno"))
+	errnoType := types.NewNamed(errnoName)
+	errnoName.SetType(errnoType)
+	errnoName.SetTypecheck(1)
+	errnoType.SetUnderlying(types.Types[types.TUINTPTR])
+	recv := types.NewField(src.NoXPos, nil, errnoType)
+	errorResult := types.NewField(src.NoXPos, nil, types.Types[types.TSTRING])
+	errorMethod := types.NewField(src.NoXPos,
+		types.ErrorType.AllMethods()[0].Sym,
+		types.NewSignature(recv, nil, []*types.Field{errorResult}))
+	errnoType.SetMethods([]*types.Field{errorMethod})
+	errnoType.SetAllMethods([]*types.Field{errorMethod})
+
+	valueType := types.Types[types.TINT64]
+	results := func(last *types.Type) []*types.Field {
+		return []*types.Field{
+			types.NewField(src.NoXPos, nil, valueType),
+			types.NewField(src.NoXPos, nil, last),
+		}
+	}
+	wrapper := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("wrapper"),
+		types.NewSignature(nil, nil, results(types.ErrorType)))
+	directFunc := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("direct"),
+		types.NewSignature(nil, nil, results(errnoType)))
+	direct := lowerDirectCall{function: directFunc, errno: true}
+
+	newCall := func() *ir.CallExpr {
+		call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, wrapper.Nname, nil)
+		call.SetType(wrapper.Type().ResultsTuple())
+		call.SetTypecheck(1)
+		return call
+	}
+	newNormalized := func(blank bool) (*ir.CallExpr, *ir.AssignListStmt,
+		*ir.AssignListStmt, *ir.Name) {
+		call := newCall()
+		value := owner.NewLocal(src.NoXPos, pkg.Lookup("value"),
+			valueType)
+		errValue := owner.NewLocal(src.NoXPos, pkg.Lookup("errValue"),
+			types.ErrorType)
+		inner := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+			ir.Nodes{value, errValue}, ir.Nodes{call})
+		inner.SetTypecheck(1)
+		projection := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP,
+			valueType, value)
+		projection.SetTypecheck(1)
+		projection.SetInit(ir.Nodes{inner})
+		resultTarget := owner.NewLocal(src.NoXPos, pkg.Lookup("result"),
+			valueType)
+		errTarget := owner.NewLocal(src.NoXPos, pkg.Lookup("err"),
+			types.ErrorType)
+		target := ir.Node(errTarget)
+		if blank {
+			target = ir.BlankNode
+		}
+		outer := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
+			ir.Nodes{resultTarget, target},
+			ir.Nodes{projection, errValue})
+		outer.SetTypecheck(1)
+		return call, inner, outer, errTarget
+	}
+
+	call, inner, outer, errTarget := newNormalized(false)
+	if err := validateCgoErrnoCall(call, outer, direct); err != nil {
+		t.Fatal(err)
+	}
+	post, err := rewriteCgoErrnoResult(outer, call, direct, owner,
+		func(node ir.Node) ir.Node { return node })
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawErrno, ok := inner.Lhs[1].(*ir.Name)
+	if !ok || rawErrno.Type() != errnoType {
+		t.Fatalf("raw errno target = %v, want %v temporary",
+			inner.Lhs[1], errnoType)
+	}
+	if outer.Rhs[1].Op() != ir.ONIL || outer.Rhs[1].Type() != types.ErrorType {
+		t.Fatalf("outer errno projection = %v, want nil error", outer.Rhs[1])
+	}
+	if len(post) != 1 {
+		t.Fatalf("errno postlude = %v, want one conditional", post)
+	}
+	condition, ok := post[0].(*ir.IfStmt)
+	if !ok || len(condition.Body) != 1 || len(condition.Else) != 1 {
+		t.Fatalf("errno postlude = %v, want two-way conditional", post[0])
+	}
+	for _, branch := range []ir.Nodes{condition.Body, condition.Else} {
+		assignment, ok := branch[0].(*ir.AssignStmt)
+		if !ok || assignment.X != errTarget {
+			t.Fatalf("errno branch = %v, want assignment to %v",
+				branch[0], errTarget)
+		}
+	}
+
+	blankCall, blankInner, blankOuter, _ := newNormalized(true)
+	post, err = rewriteCgoErrnoResult(blankOuter, blankCall, direct, owner,
+		func(node ir.Node) ir.Node { return node })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(post) != 0 || blankInner.Lhs[1].Type() != errnoType {
+		t.Fatalf("blank errno rewrite = (%v, %v), want raw discard",
+			blankInner.Lhs[1], post)
+	}
+
+	directCall := newCall()
+	directValue := owner.NewLocal(src.NoXPos, pkg.Lookup("directValue"),
+		valueType)
+	directErr := owner.NewLocal(src.NoXPos, pkg.Lookup("directErr"),
+		types.ErrorType)
+	directAssignment := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{directValue, directErr}, ir.Nodes{directCall})
+	directAssignment.SetTypecheck(1)
+	if post, err = rewriteCgoErrnoResult(directAssignment, directCall,
+		direct, owner, func(node ir.Node) ir.Node { return node }); err != nil ||
+		len(post) != 1 {
+		t.Fatalf("direct errno rewrite = (%v, %v), want one postlude",
+			post, err)
+	}
+
+	setCgoDirectCallType(call, directFunc.Type())
+	if call.Type() != directFunc.Type().ResultsTuple() {
+		t.Fatalf("multi-result direct call type = %v, want %v",
+			call.Type(), directFunc.Type().ResultsTuple())
+	}
+	one := types.NewSignature(nil, nil, []*types.Field{
+		types.NewField(src.NoXPos, nil, valueType),
+	})
+	setCgoDirectCallType(call, one)
+	if call.Type() != valueType {
+		t.Fatalf("single-result direct call type = %v, want %v",
+			call.Type(), valueType)
+	}
+	setCgoDirectCallType(call, types.NewSignature(nil, nil, nil))
+	if call.Type() != nil {
+		t.Fatalf("no-result direct call type = %v, want nil", call.Type())
+	}
+}
+
+func TestCgoErrnoResultValidation(t *testing.T) {
+	prepareLowerTest(t)
+
+	pkg := types.NewPkg("example.com/coro/cgoerrnovalidation",
+		"cgoerrnovalidation")
+	valueType := types.Types[types.TINT64]
+	directType := func(last *types.Type) *types.Type {
+		return types.NewSignature(nil, nil, []*types.Field{
+			types.NewField(src.NoXPos, nil, valueType),
+			types.NewField(src.NoXPos, nil, last),
+		})
+	}
+	directFunc := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("direct"),
+		directType(types.Types[types.TUINTPTR]))
+	call := newLowerTestCall(directFunc)
+	value := ir.NewNameAt(src.NoXPos, pkg.Lookup("value"), valueType)
+	errTarget := ir.NewNameAt(src.NoXPos, pkg.Lookup("err"),
+		types.ErrorType)
+	assignment := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+		ir.Nodes{value, errTarget}, ir.Nodes{call})
+
+	tests := []struct {
+		name   string
+		call   *ir.CallExpr
+		stmt   ir.Node
+		direct lowerDirectCall
+		want   string
+	}{
+		{"missing", nil, assignment, lowerDirectCall{}, "missing"},
+		{"statement", call, call,
+			lowerDirectCall{function: directFunc, errno: true}, "matching"},
+		{"target count", call,
+			ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+				ir.Nodes{value}, ir.Nodes{call}),
+			lowerDirectCall{function: directFunc, errno: true}, "targets"},
+		{"complex target", call,
+			ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+				ir.Nodes{value, ir.NewStarExpr(src.NoXPos, value)},
+				ir.Nodes{call}),
+			lowerDirectCall{function: directFunc, errno: true}, "non-variable"},
+		{"non-interface target", call,
+			ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+				ir.Nodes{value, value}, ir.Nodes{call}),
+			lowerDirectCall{function: directFunc, errno: true}, "interface"},
+		{"non-integer errno", call, assignment,
+			lowerDirectCall{
+				function: ir.NewFunc(src.NoXPos, src.NoXPos,
+					pkg.Lookup("floatDirect"),
+					directType(types.Types[types.TFLOAT64])),
+				errno: true,
+			}, "non-integer"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := cgoErrnoAssignment(test.call, test.stmt,
+				test.direct); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("cgoErrnoAssignment error = %v, want %q",
+					err, test.want)
+			}
+		})
+	}
+
+	if post, err := rewriteCgoErrnoResult(assignment, call,
+		lowerDirectCall{}, nil, nil); err != nil || len(post) != 0 {
+		t.Fatalf("ordinary direct rewrite = (%v, %v), want no postlude",
+			post, err)
+	}
+	if _, err := rewriteCgoErrnoResult(call, call,
+		lowerDirectCall{function: directFunc, errno: true}, nil, nil); err == nil {
+		t.Fatal("invalid errno rewrite succeeded")
+	}
+}
+
 func TestSupportsAwaitInit(t *testing.T) {
 	prepareLowerTest(t)
 

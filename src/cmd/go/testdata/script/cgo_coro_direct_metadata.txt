@@ -5,8 +5,12 @@ mkdir direct
 go tool cgo -objdir=direct main.go
 grep '//go:cgo_direct v1 _Cfunc_add_u64 _Cdirect_add_u64 add_u64 mayblock u64,u64 u64 -' direct/_cgo_gotypes.go
 grep '//go:cgo_direct v1 _Cfunc_mix_fp _Cdirect_mix_fp mix_fp mayblock f64,i32,f32,u64 f64 -' direct/_cgo_gotypes.go
+grep '//go:cgo_direct v1 _C2func_errno_value _Cdirect2_errno_value errno_value mayblock i64,i32 i64 errno' direct/_cgo_gotypes.go
+grep '//go:cgo_direct v1 _C2func_errno_void _Cdirect2_errno_void errno_void mayblock i32 void errno' direct/_cgo_gotypes.go
 grep 'func _Cdirect_add_u64' direct/_cgo_gotypes.go
 grep 'func _Cdirect_mix_fp' direct/_cgo_gotypes.go
+grep 'func _Cdirect2_errno_value.*syscall.Errno' direct/_cgo_gotypes.go
+grep 'func _Cdirect2_errno_void.*syscall.Errno' direct/_cgo_gotypes.go
 grep 'func _Cdirect_set_u32' direct/_cgo_gotypes.go
 ! grep 'func _Cdirect_set_u32.*_Ctype_void' direct/_cgo_gotypes.go
 grep 'TEXT ·_Cdirect_add_u64' direct/_cgo_direct.s
@@ -28,11 +32,14 @@ grep 'CALL.*_Cfunc_add_u64_direct' direct/_cgo_direct.s
 [GOARCH:amd64] grep 'MOVSD.*X0.*ret' direct/_cgo_direct.s
 grep '_Cfunc_static_add_direct' direct/main.cgo2.c
 grep 'return static_add' direct/main.cgo2.c
+grep '_C2func_errno_value_direct' direct/main.cgo2.c
+grep 'saved_errno = errno' direct/main.cgo2.c
+grep 'return [(]size_t[)]saved_errno' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
 go build -gcflags='-l -d=coro=4' -o program .
 stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=coro exec=block-thread,system-abi'
 stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
-stderr 'coro: phase=lower lowered=3 skipped=0'
+stderr 'coro: phase=lower lowered=4 skipped=0'
 exec ./program
 stderr '^42$'
 go tool objdump -s 'main\._Cdirect_add_u64' program
@@ -44,8 +51,15 @@ go tool objdump -s 'main\.main\.coro\.func1' program
 stdout '_Cdirect_add_u64'
 stdout '_Cdirect_mix_fp'
 stdout '_Cdirect_call_sin'
+stdout '_Cdirect2_errno_value'
+stdout '_Cdirect2_errno_void'
 stdout '_Cfunc_may_callback'
 ! stdout '_Cfunc_add_u64'
+! stdout '_C2func_errno_value'
+! stdout 'runtime.cgocall'
+go tool objdump -s 'main\.errnoCall\.coro\.func1' program
+stdout '_Cdirect2_errno_value'
+! stdout '_C2func_errno_value'
 ! stdout 'runtime.cgocall'
 go tool objdump -s 'main\.orderedArgument\.coro\.func1' program
 stdout 'runtime.coroPanic'
@@ -80,6 +94,7 @@ package main
 
 /*
 #include <stdint.h>
+#include <errno.h>
 #include <time.h>
 
 #cgo LDFLAGS: -lm
@@ -102,6 +117,10 @@ package main
 #cgo nocallback scale_fp
 #cgo noescape call_sin
 #cgo nocallback call_sin
+#cgo noescape errno_value
+#cgo nocallback errno_value
+#cgo noescape errno_void
+#cgo nocallback errno_void
 
 uint64_t add_u64(uint64_t, uint64_t);
 int64_t mix_i(int8_t, uint16_t, int32_t, uint64_t);
@@ -111,6 +130,8 @@ int32_t block_until(uint32_t *, uint32_t *);
 double mix_fp(double, int32_t, float, uint64_t);
 float scale_fp(float, double);
 double call_sin(double);
+int64_t errno_value(int64_t, int32_t);
+void errno_void(int32_t);
 
 static uint32_t static_add(uint32_t a, uint32_t b) {
 	return a + b;
@@ -123,6 +144,7 @@ static uint64_t may_callback(uint64_t value) {
 import "C"
 import (
 	"runtime"
+	"syscall"
 	"sync/atomic"
 	"unsafe"
 )
@@ -147,6 +169,12 @@ func replacement() {
 	atomic.StoreUint32(&gate, 1)
 }
 
+//go:noinline
+func errnoCall(code C.int32_t) (C.int64_t, error) {
+	value, err := C.errno_value(29, code)
+	return value, err
+}
+
 func main() {
 	value := C.add_u64(orderedArgument(19, 0), orderedArgument(23, 1))
 	callbackValue := C.may_callback(9)
@@ -158,10 +186,18 @@ func main() {
 	mixedFloat := C.mix_fp(0.5, -2, 1.25, 4)
 	scaledFloat := C.scale_fp(1.5, 2)
 	sine := C.call_sin(0.5)
+	errnoValue, errnoErr := C.errno_value(17, C.EINVAL)
+	_, nilErr := C.errno_value(18, 0)
+	_, voidErr := C.errno_void(C.ENOENT)
+	_, voidNil := C.errno_void(0)
+	steadyErrnoValue, steadyErrnoErr := errnoCall(C.EBUSY)
 	if argumentOrder != 2 || callbackValue != 9 || mixed != 10595 ||
 		slot != 77 || narrow != -120 || staticValue != 42 ||
 		mixedFloat != 3.75 || scaledFloat != 3 ||
-		sine != sine || sine < 0.479425 || sine > 0.479426 {
+		sine != sine || sine < 0.479425 || sine > 0.479426 ||
+		errnoValue != 17 || errnoErr != syscall.EINVAL || nilErr != nil ||
+		voidErr != syscall.ENOENT || voidNil != nil ||
+		steadyErrnoValue != 29 || steadyErrnoErr != syscall.EBUSY {
 		panic("bad direct C ABI result")
 	}
 	go replacement()
@@ -179,6 +215,7 @@ func main() {
 -- add.c --
 #include <math.h>
 #include <stdint.h>
+#include <errno.h>
 #include <time.h>
 
 uint64_t add_u64(uint64_t a, uint64_t b) {
@@ -213,6 +250,15 @@ float scale_fp(float a, double b) {
 
 double call_sin(double value) {
 	return sin(value);
+}
+
+int64_t errno_value(int64_t value, int32_t error) {
+	errno = error;
+	return value;
+}
+
+void errno_void(int32_t error) {
+	errno = error;
 }
 
 int32_t block_until(uint32_t *gate, uint32_t *entered) {

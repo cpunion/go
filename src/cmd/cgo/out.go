@@ -636,7 +636,25 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 		direct.Name = ast.NewIdent(call.direct)
 		directType := *d.Type
 		direct.Type = &directType
-		if call.result == cgoDirectVoid {
+		if direct.Type.Results != nil {
+			results := make([]*ast.Field, len(direct.Type.Results.List))
+			for i, result := range direct.Type.Results.List {
+				resultCopy := *result
+				resultCopy.Names = []*ast.Ident{ast.NewIdent("ret")}
+				results[i] = &resultCopy
+			}
+			if call.errno {
+				results[len(results)-1] = &ast.Field{
+					Names: []*ast.Ident{ast.NewIdent("errno")},
+					Type: &ast.SelectorExpr{
+						X:   ast.NewIdent("syscall"),
+						Sel: ast.NewIdent("Errno"),
+					},
+				}
+			}
+			direct.Type.Results = &ast.FieldList{List: results}
+		}
+		if !call.errno && call.result == cgoDirectVoid {
 			direct.Type.Results = nil
 		}
 		if p.noEscapes[n.C] {

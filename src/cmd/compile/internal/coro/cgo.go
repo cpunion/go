@@ -48,6 +48,7 @@ func (call cgoDirectCall) recipe() OperationRecipe {
 		Kind:    SiteForeign,
 		Foreign: call.class,
 		Direct:  call.direct,
+		Errno:   call.errno,
 	}
 	switch call.class {
 	case DirectNoBlock:

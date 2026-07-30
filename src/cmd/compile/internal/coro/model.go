@@ -234,6 +234,7 @@ type OperationRecipe struct {
 	Terminal TerminalFlags
 	Foreign  ForeignCallClass
 	Direct   string
+	Errno    bool
 }
 
 var operationRecipes = map[string]OperationRecipe{

@@ -35,7 +35,7 @@ type lowerCandidate struct {
 	function      *Function
 	transitions   map[*ir.CallExpr]SiteKind
 	foreignCalls  map[*ir.CallExpr]ForeignCallClass
-	directCalls   map[*ir.CallExpr]*ir.Func
+	directCalls   map[*ir.CallExpr]lowerDirectCall
 	dependencies  map[*ir.Func]bool
 	deferDeps     map[*ir.Func]bool
 	defers        []*lowerDefer
@@ -49,6 +49,11 @@ type lowerCandidate struct {
 	resultValues  []*ir.Name
 	resultPtrs    []*ir.Name
 	factory       *ir.Func
+}
+
+type lowerDirectCall struct {
+	function *ir.Func
+	errno    bool
 }
 
 type lowerDefer struct {
@@ -553,7 +558,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		function:      function,
 		transitions:   make(map[*ir.CallExpr]SiteKind),
 		foreignCalls:  make(map[*ir.CallExpr]ForeignCallClass),
-		directCalls:   make(map[*ir.CallExpr]*ir.Func),
+		directCalls:   make(map[*ir.CallExpr]lowerDirectCall),
 		dependencies:  make(map[*ir.Func]bool),
 		deferDeps:     make(map[*ir.Func]bool),
 		defers:        defers,
@@ -681,7 +686,17 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return nil, fmt.Errorf("missing direct entry %s",
 						edge.Recipe.Direct)
 				}
-				candidate.directCalls[call] = edge.Direct
+				direct := lowerDirectCall{
+					function: edge.Direct,
+					errno:    edge.Recipe.Errno,
+				}
+				if direct.errno {
+					if err := validateCgoErrnoCall(call,
+						awaitStatements[call], direct); err != nil {
+						return nil, err
+					}
+				}
+				candidate.directCalls[call] = direct
 			}
 			if site.Foreign != AsyncOperation {
 				continue
@@ -1718,8 +1733,11 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		case *ir.AssignListStmt:
 			node.Def = false
 		case *ir.CallExpr:
-			if direct := candidate.directCalls[node]; direct != nil {
-				node.Fun = direct.Nname
+			if direct := candidate.directCalls[node]; direct.function != nil {
+				node.Fun = direct.function.Nname
+				if direct.errno {
+					setCgoDirectCallType(node, direct.function.Type())
+				}
 			}
 		}
 		if name, ok := node.(*ir.Name); ok {
@@ -1886,6 +1904,11 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 				foreignCall.Args[i] = temp
 			}
 
+			post, err := rewriteCgoErrnoResult(stmt, foreignCall,
+				candidate.directCalls[foreignCall], resume, edit)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+			}
 			edited := edit(stmt)
 			switch foreign {
 			case DirectNoBlock:
@@ -1896,10 +1919,12 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 					typecheck.Call(stmt.Pos(),
 						typecheck.LookupRuntime("coroExitForeign"), nil, false),
 				)
+				body = append(body, post...)
 			case DirectMayBlock:
 				body = append(body, blockingForeignEnter(stmt.Pos(), ctx)...)
 				body = append(body, edited)
 				body = append(body, blockingForeignExit(stmt.Pos())...)
+				body = append(body, post...)
 			default:
 				return nil, fmt.Errorf("%s: unsupported foreign call %s",
 					ir.PkgFuncName(fn), foreign)
@@ -2713,8 +2738,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.AssignListStmt:
 			node.Def = false
 		case *ir.CallExpr:
-			if direct := candidate.directCalls[node]; direct != nil {
-				node.Fun = direct.Nname
+			if direct := candidate.directCalls[node]; direct.function != nil {
+				node.Fun = direct.function.Nname
+				if direct.errno {
+					setCgoDirectCallType(node, direct.function.Type())
+				}
 			}
 		}
 		if name, ok := node.(*ir.Name); ok {
@@ -2953,6 +2981,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				body = append(body, before...)
 			}
+			post, err := rewriteCgoErrnoResult(stmt, foreignCall,
+				candidate.directCalls[foreignCall], resume, edit)
+			if err != nil {
+				return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+			}
 			edited := edit(stmt)
 			switch foreign {
 			case NotForeign:
@@ -2967,10 +3000,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						typecheck.LookupRuntime("coroExitForeign"),
 						nil, false),
 				)
+				body = append(body, post...)
 			case DirectMayBlock:
 				body = append(body, blockingForeignEnter(stmt.Pos(), ctx)...)
 				body = append(body, edited)
 				body = append(body, blockingForeignExit(stmt.Pos())...)
+				body = append(body, post...)
 			default:
 				return fmt.Errorf("%s: unsupported foreign call %s",
 					ir.PkgFuncName(fn), foreign)
@@ -3703,6 +3738,99 @@ func ordinaryReadOperation(call *ir.CallExpr) bool {
 		return true
 	}
 	return false
+}
+
+func validateCgoErrnoCall(call *ir.CallExpr, stmt ir.Node,
+	direct lowerDirectCall) error {
+	_, err := cgoErrnoAssignment(call, stmt, direct)
+	return err
+}
+
+func cgoErrnoAssignment(call *ir.CallExpr, stmt ir.Node,
+	direct lowerDirectCall) (*ir.AssignListStmt, error) {
+	if call == nil || direct.function == nil || !direct.errno {
+		return nil, fmt.Errorf("missing direct cgo errno call")
+	}
+	results := direct.function.Type().NumResults()
+	assignment, ok := stmt.(*ir.AssignListStmt)
+	if !ok || len(assignment.Rhs) != 1 || assignment.Rhs[0] != call {
+		assignment, ok = normalizedResultAssignment(call, stmt, results)
+		if !ok {
+			return nil, fmt.Errorf(
+				"direct cgo errno call has no matching result assignment")
+		}
+	}
+	if results < 2 || len(assignment.Lhs) != results {
+		return nil, fmt.Errorf("direct cgo errno call has %d result targets, want %d",
+			len(assignment.Lhs), results)
+	}
+	target := assignment.Lhs[results-1]
+	if outer, ok := stmt.(*ir.AssignListStmt); ok && outer != assignment {
+		target = outer.Lhs[results-1]
+	}
+	if !ir.IsBlank(target) {
+		if target.Op() != ir.ONAME {
+			return nil, fmt.Errorf("direct cgo errno result has a non-variable target")
+		}
+		if target.Type() == nil || !target.Type().IsInterface() {
+			return nil, fmt.Errorf("direct cgo errno result target is not an interface")
+		}
+	}
+	errnoType := direct.function.Type().Result(results - 1).Type
+	if errnoType == nil || !errnoType.IsInteger() {
+		return nil, fmt.Errorf("direct cgo errno entry has a non-integer result")
+	}
+	return assignment, nil
+}
+
+// rewriteCgoErrnoResult keeps the raw errno value inside the foreign-call
+// window. Converting syscall.Errno to error may allocate, so that conversion
+// must run only after the runtime has left the blocking state.
+func rewriteCgoErrnoResult(stmt ir.Node, call *ir.CallExpr,
+	direct lowerDirectCall, owner *ir.Func,
+	edit func(ir.Node) ir.Node) (ir.Nodes, error) {
+	if !direct.errno {
+		return nil, nil
+	}
+	assignment, err := cgoErrnoAssignment(call, stmt, direct)
+	if err != nil {
+		return nil, err
+	}
+	index := len(assignment.Lhs) - 1
+	target := assignment.Lhs[index]
+	targetType := target.Type()
+	if outer, ok := stmt.(*ir.AssignListStmt); ok && outer != assignment {
+		target = outer.Lhs[index]
+		outer.Rhs[index] = ir.NewZero(call.Pos(), targetType)
+	}
+
+	errnoType := direct.function.Type().Result(index).Type
+	errno := typecheck.TempAt(call.Pos(), owner, errnoType)
+	assignment.Lhs[index] = errno
+	if ir.IsBlank(target) {
+		return nil, nil
+	}
+
+	target = edit(target)
+	condition := ir.NewBinaryExpr(call.Pos(), ir.ONE, errno,
+		ir.NewZero(call.Pos(), errnoType))
+	nonzero := ir.NewAssignStmt(call.Pos(), target,
+		typecheck.AssignConv(errno, target.Type(), "cgo errno result"))
+	zero := ir.NewAssignStmt(call.Pos(), target,
+		ir.NewZero(call.Pos(), target.Type()))
+	return ir.Nodes{ir.NewIfStmt(call.Pos(), condition,
+		ir.Nodes{nonzero}, ir.Nodes{zero})}, nil
+}
+
+func setCgoDirectCallType(call *ir.CallExpr, typ *types.Type) {
+	switch typ.NumResults() {
+	case 0:
+		call.SetType(nil)
+	case 1:
+		call.SetType(typ.Result(0).Type)
+	default:
+		call.SetType(typ.ResultsTuple())
+	}
 }
 
 // blockingForeignEnter and blockingForeignExit surround a direct call with

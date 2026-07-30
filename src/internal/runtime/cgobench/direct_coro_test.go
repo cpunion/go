@@ -32,6 +32,17 @@ func TestCalls(t *testing.T) {
 			t.Errorf("%s libm calls = %g, want %g", test.name, test.got, wantLibm)
 		}
 	}
+	for _, test := range []struct {
+		name string
+		got  int64
+	}{
+		{"ordinary", cgobench.CgoErrnoCalls(5)},
+		{"direct", cgobench.DirectErrnoCalls(5)},
+	} {
+		if test.got != 5 {
+			t.Errorf("%s errno calls = %d, want 5", test.name, test.got)
+		}
+	}
 	if got := cgobench.NoBlockCalls(2); got != 2 {
 		t.Fatalf("NoBlockCalls(2) = %d, want 2", got)
 	}
@@ -110,7 +121,7 @@ func testRunnableHandoffs(t *testing.T, handoffs func(int) uint64) {
 //
 //	GOEXPERIMENT=coro go test internal/runtime/cgobench \
 //		-run=^$ \
-//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|LibmSteady|BlockingHandoff|RunnableHandoff)$' \
+//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|LibmSteady|ErrnoSteady|BlockingHandoff|RunnableHandoff)$' \
 //		-gcflags=internal/runtime/cgobench='-l -d=coro=4'
 //
 // The Steady benchmarks batch calls within one coroutine root and isolate the
@@ -139,6 +150,20 @@ func BenchmarkDirectCgoLibmSteady(b *testing.B) {
 	b.ReportAllocs()
 	if got := cgobench.DirectLibmCalls(b.N); math.IsNaN(got) || got <= 0 {
 		b.Fatalf("result = %g, want a positive sum", got)
+	}
+}
+
+func BenchmarkOrdinaryCgoErrnoSteady(b *testing.B) {
+	b.ReportAllocs()
+	if got := cgobench.CgoErrnoCalls(b.N); got != int64(b.N) {
+		b.Fatalf("result = %d, want %d", got, b.N)
+	}
+}
+
+func BenchmarkDirectCgoErrnoSteady(b *testing.B) {
+	b.ReportAllocs()
+	if got := cgobench.DirectErrnoCalls(b.N); got != int64(b.N) {
+		b.Fatalf("result = %d, want %d", got, b.N)
 	}
 }
 

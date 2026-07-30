@@ -15,6 +15,8 @@ package cgobench
 #cgo nocallback coro_direct_empty
 #cgo noescape coro_direct_sin_add
 #cgo nocallback coro_direct_sin_add
+#cgo noescape coro_direct_errno
+#cgo nocallback coro_direct_errno
 #cgo noescape coro_direct_handoff
 #cgo nocallback coro_direct_handoff
 #cgo noescape coro_direct_runnable_handoff
@@ -24,6 +26,8 @@ void coro_cgo_empty(void);
 void coro_direct_empty(void);
 void coro_cgo_sin_add(double, double *);
 void coro_direct_sin_add(double, double *);
+int64_t coro_cgo_errno(int64_t);
+int64_t coro_direct_errno(int64_t);
 void coro_cgo_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_direct_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_cgo_runnable_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
@@ -81,6 +85,33 @@ func DirectLibmCalls(iterations int) float64 {
 		C.coro_direct_sin_add(C.double(value), &sum)
 	}
 	return float64(sum)
+}
+
+// CgoErrnoCalls invokes the ordinary cgo two-result path with a zero errno.
+func CgoErrnoCalls(iterations int) int64 {
+	var value C.int64_t
+	for i := 0; i < iterations; i++ {
+		next, err := C.coro_cgo_errno(value)
+		if err != nil {
+			return -1
+		}
+		value = next
+	}
+	return int64(value)
+}
+
+// DirectErrnoCalls invokes the same two-result operation through the
+// coroutine direct path. The package must be compiled with -d=coro=4.
+func DirectErrnoCalls(iterations int) int64 {
+	var value C.int64_t
+	for i := 0; i < iterations; i++ {
+		next, err := C.coro_direct_errno(value)
+		if err != nil {
+			return -1
+		}
+		value = next
+	}
+	return int64(value)
 }
 
 var cgoHandoffGate uint32
