@@ -11,6 +11,7 @@
 #endif
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +20,14 @@ CGOBENCH_NOINLINE void coro_cgo_empty(void) {
 }
 
 CGOBENCH_NOINLINE void coro_direct_empty(void) {
+}
+
+CGOBENCH_NOINLINE void coro_cgo_sin_add(double value, double *sum) {
+	*sum += sin(value);
+}
+
+CGOBENCH_NOINLINE void coro_direct_sin_add(double value, double *sum) {
+	*sum += sin(value);
 }
 
 static uint64_t coro_nanotime(void) {

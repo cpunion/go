@@ -807,13 +807,17 @@ This metadata is generated only for `GOEXPERIMENT=coro`. It is consumed by the
 compiler and is not passed to the linker as a cgo directive. It does not change
 the ordinary cgo path until native lowering has selected the direct entry.
 
-The first generated metadata is limited to non-variadic integer and pointer
-signatures with at most six parameters and one result. A declaration must use
-the existing `#cgo nocallback` contract. `#cgo noescape` remains an independent
-escape-analysis optimization. Unsupported declarations retain the ordinary
-cgo path in compatibility mode. Integration tests assert both the metadata and
-the selected symbols in disassembly, so a fallback cannot silently become a
-direct-call performance result.
+The generated metadata supports non-variadic integer, pointer, `float`, and
+`double` signatures with one scalar result. Integer and floating-point
+argument registers are classified independently, as required by both target
+System ABIs. Linux/amd64 accepts up to six integer or pointer arguments and
+eight floating-point arguments; Darwin/arm64 accepts up to eight of each.
+A declaration must use the existing `#cgo nocallback` contract. The existing
+`#cgo noescape` directive remains an independent escape-analysis optimization.
+Unsupported declarations retain the ordinary cgo path in compatibility mode.
+Integration tests assert both the metadata and the selected symbols in
+disassembly, so a fallback cannot silently become a direct-call performance
+result.
 
 `cmd/cgo` emits a typed external bridge in the same C translation unit as the
 preamble. This makes `static` and inline declarations visible to the generated
@@ -1760,7 +1764,9 @@ The transparent cgo frontend:
   experiment on Darwin/arm64 and Linux/amd64;
 - requires the existing `#cgo nocallback` declaration and conservatively
   classifies it as `DirectMayBlock`;
-- supports up to six integer or pointer parameters and one scalar result;
+- classifies integer, pointer, `float`, and `double` parameters into the
+  target ABI's independent general-purpose and floating-point register
+  classes, and supports one scalar result;
 - preserves ordinary cgo for unsupported declarations and sanitizer builds;
 - emits a typed bridge in the preamble translation unit, so `static`
   declarations work without exposing a new user annotation.
@@ -2238,6 +2244,34 @@ runnable sibling, the direct steady boundary changed from 12.63 ns to
 12.38 ns and root entry from 66.02 ns to 65.46 ns. Those differences are
 within run-to-run noise and show no no-sibling regression.
 
+The scalar ABI follow-up adds `float` and `double` classification. An
+end-to-end mixed signature uses floating-point and integer argument registers
+in alternating source order and returns a `double`. The same test calls
+`sin` from libm, checks the result, and verifies that final lowering selects
+the direct symbols. Race builds continue to select the ordinary wrappers.
+
+The corresponding steady benchmark calls a non-inlined C function with the
+signature `(double, double *) -> void`; the C body accumulates an actual libm
+`sin` result. The void result keeps the repeated call in the currently
+supported loop lowering, while the separate end-to-end test covers
+floating-point return registers. Disassembly verifies that the direct
+benchmark calls its `_Cdirect_` entry and contains neither `runtime.cgocall`
+nor `runtime.asmcgocall`. Each value below is the median of ten 500 ms runs:
+
+| Shape | Path | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | --- | ---: | ---: | ---: |
+| empty C leaf | ordinary cgo | 13.14 ns | 21.82 ns | 0 B/op, 0 allocs/op |
+| empty C leaf | transparent `DirectMayBlock` | 12.77 ns | 21.63 ns | 0 B/op, 0 allocs/op |
+| libm `sin` accumulation | ordinary cgo | 17.02 ns | 32.24 ns | 0 B/op, 0 allocs/op |
+| libm `sin` accumulation | transparent `DirectMayBlock` | 17.94 ns | 30.47 ns | 0 B/op, 0 allocs/op |
+
+The direct libm shape is about 5.4% slower on Darwin and 5.5% faster in the
+translated Linux run. The empty boundary is slightly smaller on both. These
+mixed platform results do not establish a universal short-call speedup for
+the conservative `DirectMayBlock` class. They do establish real library ABI
+compatibility and retain a fixed benchmark for future transition and
+`DirectNoBlock` policy work.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
@@ -2256,7 +2290,8 @@ closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive
 destinations, multiple channel operations in one expression, mutex parking,
-reflection, callbacks, variadic C calls, or general C ABI type classification.
+result-bearing direct C calls nested in loops, reflection, callbacks, variadic
+C calls, or general C ABI type classification.
 Ordinary channel send, discarded or single-value receive, comma-ok receive,
 receive-channel range, and select with simple receive targets are supported
 through the runtime's shared channel wait queues.
@@ -2267,8 +2302,8 @@ terminal control and typed capture ownership in repeated source literals,
 direct deferred Goexit, and statically resolved local or imported named
 terminal targets are supported. The terminal target may reach panic or Goexit
 through certified indirect structured calls. Direct foreign declarations now
-have a restricted transparent cgo path, but floating-point, aggregate,
-variadic, callback-capable, errno, and non-target ABIs retain ordinary cgo.
+have a restricted transparent cgo path, but aggregate, variadic,
+callback-capable, errno, and non-target ABIs retain ordinary cgo.
 Cross-package factory ABI 1 excludes interface and method-value calls,
 closures, and generic shapes. Frontend-normalized nested multi-result calls and
 conservatively normalized single-result calls are supported. Short-circuit
@@ -2285,7 +2320,7 @@ The likely order is:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
-2. generalize System ABI type classification and errno handling;
+2. add aggregate System ABI classification and errno handling;
 3. extend expression, assignment, and branch normalization to short-circuit
    control, loop conditions, frontend loop-variable rewrites, and effectful
    destinations, then extend the compiler-private factory ABI only with

@@ -11,6 +11,10 @@ import (
 
 const cgoDirectVersion = "v1"
 
+// maxCgoDirectParams is the widest supported signature: eight integer and
+// eight floating-point argument registers.
+const maxCgoDirectParams = 16
+
 type cgoABIType uint8
 
 const (
@@ -23,6 +27,8 @@ const (
 	cgoABIUint16
 	cgoABIUint32
 	cgoABIUint64
+	cgoABIFloat32
+	cgoABIFloat64
 	cgoABIPointer
 	cgoABIVoid
 )
@@ -110,8 +116,8 @@ func parseCgoABIParams(value string) ([]cgoABIType, error) {
 		return nil, nil
 	}
 	fields := strings.Split(value, ",")
-	if len(fields) > 6 {
-		return nil, fmt.Errorf("cgo direct call has %d parameters, maximum is 6", len(fields))
+	if len(fields) > maxCgoDirectParams {
+		return nil, fmt.Errorf("cgo direct call has %d parameters, maximum is %d", len(fields), maxCgoDirectParams)
 	}
 	params := make([]cgoABIType, len(fields))
 	for i, field := range fields {
@@ -145,6 +151,10 @@ func parseCgoABIType(value string) (cgoABIType, error) {
 		return cgoABIUint32, nil
 	case "u64":
 		return cgoABIUint64, nil
+	case "f32":
+		return cgoABIFloat32, nil
+	case "f64":
+		return cgoABIFloat64, nil
 	case "ptr":
 		return cgoABIPointer, nil
 	case "void":

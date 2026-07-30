@@ -9,6 +9,7 @@ package cgobench_test
 import (
 	"internal/runtime/cgobench"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"testing"
@@ -19,6 +20,18 @@ func TestCalls(t *testing.T) {
 	cgobench.CgoCall()
 	cgobench.DirectCalls(2)
 	cgobench.DirectCall()
+	wantLibm := 3*math.Sin(0.5) + 2*math.Sin(0.625)
+	for _, test := range []struct {
+		name string
+		got  float64
+	}{
+		{"ordinary", cgobench.CgoLibmCalls(5)},
+		{"direct", cgobench.DirectLibmCalls(5)},
+	} {
+		if math.IsNaN(test.got) || math.Abs(test.got-wantLibm) > 1e-14 {
+			t.Errorf("%s libm calls = %g, want %g", test.name, test.got, wantLibm)
+		}
+	}
 	if got := cgobench.NoBlockCalls(2); got != 2 {
 		t.Fatalf("NoBlockCalls(2) = %d, want 2", got)
 	}
@@ -97,7 +110,7 @@ func testRunnableHandoffs(t *testing.T, handoffs func(int) uint64) {
 //
 //	GOEXPERIMENT=coro go test internal/runtime/cgobench \
 //		-run=^$ \
-//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|BlockingHandoff|RunnableHandoff)$' \
+//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|LibmSteady|BlockingHandoff|RunnableHandoff)$' \
 //		-gcflags=internal/runtime/cgobench='-l -d=coro=4'
 //
 // The Steady benchmarks batch calls within one coroutine root and isolate the
@@ -113,6 +126,20 @@ func BenchmarkOrdinaryCgoCallsSteady(b *testing.B) {
 
 func BenchmarkDirectCgoCallsSteady(b *testing.B) {
 	cgobench.DirectCalls(b.N)
+}
+
+func BenchmarkOrdinaryCgoLibmSteady(b *testing.B) {
+	b.ReportAllocs()
+	if got := cgobench.CgoLibmCalls(b.N); math.IsNaN(got) || got <= 0 {
+		b.Fatalf("result = %g, want a positive sum", got)
+	}
+}
+
+func BenchmarkDirectCgoLibmSteady(b *testing.B) {
+	b.ReportAllocs()
+	if got := cgobench.DirectLibmCalls(b.N); math.IsNaN(got) || got <= 0 {
+		b.Fatalf("result = %g, want a positive sum", got)
+	}
 }
 
 func BenchmarkNoBlockCgoCallsSteady(b *testing.B) {

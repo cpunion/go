@@ -41,13 +41,15 @@ func TestCgoDirectType(t *testing.T) {
 		{"uintptr64", &Type{Size: 8, Go: ast.NewIdent("uintptr")}, cgoDirectUint64, true},
 		{"int32 word", &Type{Size: 4, Go: ast.NewIdent("int")}, cgoDirectInt32, true},
 		{"int64 word", &Type{Size: 8, Go: ast.NewIdent("int")}, cgoDirectInt64, true},
+		{"float32", &Type{Size: 4, Go: ast.NewIdent("float32")}, cgoDirectFloat32, true},
+		{"float64", &Type{Size: 8, Go: ast.NewIdent("float64")}, cgoDirectFloat64, true},
 		{"pointer", &Type{Size: 8, Go: &ast.StarExpr{X: ast.NewIdent("byte")}}, cgoDirectPointer, true},
 		{"void pointer", &Type{Size: 8, Go: ast.NewIdent("unsafe.Pointer")}, cgoDirectPointer, true},
 		{"bad pointer", &Type{Size: 8, Go: ast.NewIdent("uintptr"), BadPointer: true}, cgoDirectPointer, true},
 		{"wrong fixed size", &Type{Size: 8, Go: ast.NewIdent("uint32")}, cgoDirectUint32, false},
 		{"unsupported uint size", &Type{Size: 16, Go: ast.NewIdent("uint")}, "", false},
 		{"unsupported int size", &Type{Size: 16, Go: ast.NewIdent("int")}, "", false},
-		{"float", &Type{Size: 8, Go: ast.NewIdent("float64")}, "", false},
+		{"wrong float size", &Type{Size: 4, Go: ast.NewIdent("float64")}, cgoDirectFloat64, false},
 		{"struct", &Type{Size: 8, Go: &ast.StructType{}}, "", false},
 	}
 	for _, test := range tests {
@@ -118,16 +120,19 @@ func TestCgoDirectCall(t *testing.T) {
 			delete(p.noCallbacks, "add_u64")
 		}},
 		{"too many parameters", func(_ *Package, n *Name) {
-			n.FuncType.Params = append(n.FuncType.Params, make([]*Type, 5)...)
+			for len(n.FuncType.Params) < 9 {
+				n.FuncType.Params = append(n.FuncType.Params,
+					&Type{Size: 8, Go: ast.NewIdent("uint64")})
+			}
 		}},
 		{"void parameter", func(_ *Package, n *Name) {
 			n.FuncType.Params[0] = nil
 		}},
 		{"unsupported parameter", func(_ *Package, n *Name) {
-			n.FuncType.Params[0] = &Type{Size: 8, Go: ast.NewIdent("float64")}
+			n.FuncType.Params[0] = &Type{Size: 8, Go: &ast.StructType{}}
 		}},
 		{"unsupported result", func(_ *Package, n *Name) {
-			n.FuncType.Result = &Type{Size: 8, Go: ast.NewIdent("float64")}
+			n.FuncType.Result = &Type{Size: 8, Go: &ast.StructType{}}
 		}},
 		{"errno result", func(_ *Package, n *Name) {
 			n.AddError = true
@@ -180,6 +185,32 @@ func TestCgoDirectCall(t *testing.T) {
 	if got, want := output.String(),
 		"//go:cgo_direct v1 _Cfunc_tick _Cdirect_tick tick mayblock - void -\n"; got != want {
 		t.Fatalf("void directive = %q, want %q", got, want)
+	}
+
+	floating := &Name{
+		C:      "mix_fp",
+		Kind:   "func",
+		Mangle: "_Cfunc_mix_fp",
+		FuncType: &FuncType{
+			Params: []*Type{
+				{Size: 8, Go: ast.NewIdent("float64")},
+				{Size: 4, Go: ast.NewIdent("int32")},
+				{Size: 4, Go: ast.NewIdent("float32")},
+				{Size: 8, Go: ast.NewIdent("uint64")},
+			},
+			Result: &Type{Size: 8, Go: ast.NewIdent("float64")},
+		},
+	}
+	p.noCallbacks["mix_fp"] = true
+	call, ok = p.directCall(floating)
+	if !ok {
+		t.Fatal("directCall rejected floating declaration")
+	}
+	output.Reset()
+	call.writeDirective(&output)
+	if got, want := output.String(),
+		"//go:cgo_direct v1 _Cfunc_mix_fp _Cdirect_mix_fp mix_fp mayblock f64,i32,f32,u64 f64 -\n"; got != want {
+		t.Fatalf("floating directive = %q, want %q", got, want)
 	}
 }
 
@@ -262,6 +293,21 @@ func TestCgoDirectFrame(t *testing.T) {
 		t.Errorf("32-bit result offset and frame size = (%d, %d), want (0, 12)",
 			result, size)
 	}
+
+	call.params = []cgoDirectType{
+		cgoDirectFloat32,
+		cgoDirectUint8,
+		cgoDirectFloat64,
+	}
+	call.result = cgoDirectFloat32
+	params, result, size = cgoDirectFrame(call, 8)
+	if got, want := fmt.Sprint(params), "[0 4 8]"; got != want {
+		t.Errorf("floating parameter offsets = %s, want %s", got, want)
+	}
+	if result != 16 || size != 20 {
+		t.Errorf("floating result offset and frame size = (%d, %d), want (16, 20)",
+			result, size)
+	}
 }
 
 func TestCgoDirectAssemblyCall(t *testing.T) {
@@ -333,6 +379,8 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 		{cgoDirectUint32, "MOVWU", "MOVL", "MOVW", "MOVL"},
 		{cgoDirectInt64, "MOVD", "MOVQ", "MOVD", "MOVQ"},
 		{cgoDirectUint64, "MOVD", "MOVQ", "MOVD", "MOVQ"},
+		{cgoDirectFloat32, "FMOVS", "MOVSS", "FMOVS", "MOVSS"},
+		{cgoDirectFloat64, "FMOVD", "MOVSD", "FMOVD", "MOVSD"},
 		{cgoDirectPointer, "MOVD", "MOVQ", "MOVD", "MOVQ"},
 	}
 	for _, test := range tests {
@@ -352,15 +400,74 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 		})
 	}
 
-	for i, want := range []string{"R0", "R1", "R2", "R3", "R4", "R5"} {
-		if got := cgoDirectArgRegister("arm64", i); got != want {
-			t.Errorf("arm64 argument register %d = %s, want %s", i, got, want)
+	params := []cgoDirectType{
+		cgoDirectUint64,
+		cgoDirectFloat64,
+		cgoDirectInt32,
+		cgoDirectFloat32,
+	}
+	for _, test := range []struct {
+		goarch string
+		want   []string
+	}{
+		{"arm64", []string{"R0", "F0", "R1", "F1"}},
+		{"amd64", []string{"DI", "X0", "SI", "X1"}},
+	} {
+		got, ok := cgoDirectArgRegisters(test.goarch, params)
+		if !ok || !slices.Equal(got, test.want) {
+			t.Errorf("%s argument registers = (%q, %t), want (%q, true)",
+				test.goarch, got, ok, test.want)
 		}
 	}
-	for i, want := range []string{"DI", "SI", "DX", "CX", "R8", "R9"} {
-		if got := cgoDirectArgRegister("amd64", i); got != want {
-			t.Errorf("amd64 argument register %d = %s, want %s", i, got, want)
+	for _, test := range []struct {
+		goarch string
+		count  int
+		typ    cgoDirectType
+	}{
+		{"amd64", 7, cgoDirectUint64},
+		{"arm64", 9, cgoDirectUint64},
+		{"amd64", 9, cgoDirectFloat64},
+		{"arm64", 9, cgoDirectFloat64},
+	} {
+		params := make([]cgoDirectType, test.count)
+		for i := range params {
+			params[i] = test.typ
 		}
+		if got, ok := cgoDirectArgRegisters(test.goarch, params); ok {
+			t.Errorf("%s accepted argument registers %q", test.goarch, got)
+		}
+	}
+	for _, test := range []struct {
+		goarch   string
+		integer  int
+		floating int
+	}{
+		{"amd64", 6, 8},
+		{"arm64", 8, 8},
+	} {
+		params := make([]cgoDirectType, 0, test.integer+test.floating)
+		for i := 0; i < test.integer || i < test.floating; i++ {
+			if i < test.integer {
+				params = append(params, cgoDirectUint64)
+			}
+			if i < test.floating {
+				params = append(params, cgoDirectFloat64)
+			}
+		}
+		if _, ok := cgoDirectArgRegisters(test.goarch, params); !ok {
+			t.Errorf("%s rejected %d integer and %d floating arguments",
+				test.goarch, test.integer, test.floating)
+		}
+	}
+	if got, ok := cgoDirectArgRegisters("other",
+		[]cgoDirectType{cgoDirectFloat64}); ok || got != nil {
+		t.Errorf("unsupported architecture registers = (%q, %t), want (nil, false)",
+			got, ok)
+	}
+	if got, ok := cgoDirectArgRegisters("other",
+		[]cgoDirectType{cgoDirectUint64}); ok || got != nil {
+		t.Errorf("unsupported integer registers = (%q, %t), want (nil, false)",
+			got, ok)
 	}
 	amd64Call := cgoDirectCallInstructions("amd64", "entry")
 	wantAMD64 := []string{
@@ -395,11 +502,17 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 		[]string{"CALL\tentry(SB)"}; !slices.Equal(got, want) {
 		t.Errorf("fallback call instructions = %q, want %q", got, want)
 	}
-	if got := cgoDirectResultRegister("arm64"); got != "R0" {
+	if got := cgoDirectResultRegister("arm64", cgoDirectUint64); got != "R0" {
 		t.Errorf("arm64 result register = %s, want R0", got)
 	}
-	if got := cgoDirectResultRegister("amd64"); got != "AX" {
+	if got := cgoDirectResultRegister("amd64", cgoDirectUint64); got != "AX" {
 		t.Errorf("amd64 result register = %s, want AX", got)
+	}
+	if got := cgoDirectResultRegister("arm64", cgoDirectFloat64); got != "F0" {
+		t.Errorf("arm64 floating result register = %s, want F0", got)
+	}
+	if got := cgoDirectResultRegister("amd64", cgoDirectFloat32); got != "X0" {
+		t.Errorf("amd64 floating result register = %s, want X0", got)
 	}
 	if got := cgoDirectVoid.size(); got != 0 {
 		t.Errorf("void size = %d, want 0", got)
