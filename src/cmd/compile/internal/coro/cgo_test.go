@@ -19,7 +19,7 @@ func TestParseCgoDirectDirectives(t *testing.T) {
 		{"cgo_direct", "v1", "_Cfunc_read", "_Cdirect_read", "read",
 			"mayblock", "i32,ptr,u64", "i64", "errno"},
 		{"cgo_direct", "v1", "_Cfunc_all", "_Cdirect_all", "all",
-			"mayblock", "i8,i16,i32,i64,u8,u16", "u32", "-"},
+			"mayblock", "i8,i16,i32,i64,u8,u16,f32,f64", "u32", "-"},
 	}
 	calls, err := parseCgoDirectives(directives)
 	if err != nil {
@@ -39,7 +39,7 @@ func TestParseCgoDirectDirectives(t *testing.T) {
 	all := calls["_Cfunc_all"]
 	wantParams := []cgoABIType{
 		cgoABIInt8, cgoABIInt16, cgoABIInt32, cgoABIInt64,
-		cgoABIUint8, cgoABIUint16,
+		cgoABIUint8, cgoABIUint16, cgoABIFloat32, cgoABIFloat64,
 	}
 	if len(all.params) != len(wantParams) {
 		t.Fatalf("all metadata params = %v, want %v", all.params, wantParams)
@@ -67,11 +67,11 @@ func TestParseCgoDirectDirectiveErrors(t *testing.T) {
 		{"fields", func(d []string) []string { return d[:8] }, "invalid"},
 		{"version", func(d []string) []string { d[1] = "v2"; return d }, "version"},
 		{"class", func(d []string) []string { d[5] = "noblock"; return d }, "class"},
-		{"parameter", func(d []string) []string { d[6] = "f64"; return d }, "ABI type"},
+		{"parameter", func(d []string) []string { d[6] = "f128"; return d }, "ABI type"},
 		{"empty parameter", func(d []string) []string { d[6] = ""; return d }, "ABI type"},
 		{"void parameter", func(d []string) []string { d[6] = "void"; return d }, "void"},
 		{"too many parameters", func(d []string) []string {
-			d[6] = "i8,i8,i8,i8,i8,i8,i8"
+			d[6] = "i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8,i8"
 			return d
 		}, "maximum"},
 		{"result", func(d []string) []string { d[7] = "word"; return d }, "ABI type"},

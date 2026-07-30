@@ -26,6 +26,8 @@ const (
 	cgoDirectUint16  cgoDirectType = "u16"
 	cgoDirectUint32  cgoDirectType = "u32"
 	cgoDirectUint64  cgoDirectType = "u64"
+	cgoDirectFloat32 cgoDirectType = "f32"
+	cgoDirectFloat64 cgoDirectType = "f64"
 	cgoDirectPointer cgoDirectType = "ptr"
 	cgoDirectVoid    cgoDirectType = "void"
 )
@@ -47,10 +49,6 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 		return cgoDirectCall{}, false
 	}
 
-	const maxRegisterParams = 6
-	if len(n.FuncType.Params) > maxRegisterParams {
-		return cgoDirectCall{}, false
-	}
 	params := make([]cgoDirectType, len(n.FuncType.Params))
 	for i, param := range n.FuncType.Params {
 		var ok bool
@@ -58,6 +56,9 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 		if !ok || params[i] == cgoDirectVoid {
 			return cgoDirectCall{}, false
 		}
+	}
+	if _, ok := cgoDirectArgRegisters(buildcfg.GOARCH, params); !ok {
+		return cgoDirectCall{}, false
 	}
 
 	result := cgoDirectVoid
@@ -145,11 +146,12 @@ func (p *Package) writeDirectAssembly() {
 
 func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 	offsets, resultOffset, frameSize := cgoDirectFrame(call, p.PtrSize)
+	registers, _ := cgoDirectArgRegisters(buildcfg.GOARCH, call.params)
 	fmt.Fprintf(w, "TEXT ·%s(SB),NOSPLIT,$0-%d\n", call.direct, frameSize)
 	for i, param := range call.params {
 		fmt.Fprintf(w, "\t%s\tp%d+%d(FP), %s\n",
 			cgoDirectLoad(buildcfg.GOARCH, param), i, offsets[i],
-			cgoDirectArgRegister(buildcfg.GOARCH, i))
+			registers[i])
 	}
 	for _, instruction := range cgoDirectCallInstructions(buildcfg.GOARCH, call.entry) {
 		fmt.Fprintf(w, "\t%s\n", instruction)
@@ -157,7 +159,7 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 	if call.result != cgoDirectVoid {
 		fmt.Fprintf(w, "\t%s\t%s, ret+%d(FP)\n",
 			cgoDirectStore(buildcfg.GOARCH, call.result),
-			cgoDirectResultRegister(buildcfg.GOARCH), resultOffset)
+			cgoDirectResultRegister(buildcfg.GOARCH, call.result), resultOffset)
 	}
 	fmt.Fprintln(w, "\tRET")
 }
@@ -259,9 +261,9 @@ func (typ cgoDirectType) size() int64 {
 		return 1
 	case cgoDirectInt16, cgoDirectUint16:
 		return 2
-	case cgoDirectInt32, cgoDirectUint32:
+	case cgoDirectInt32, cgoDirectUint32, cgoDirectFloat32:
 		return 4
-	case cgoDirectInt64, cgoDirectUint64, cgoDirectPointer:
+	case cgoDirectInt64, cgoDirectUint64, cgoDirectFloat64, cgoDirectPointer:
 		return 8
 	}
 	return 0
@@ -270,6 +272,10 @@ func (typ cgoDirectType) size() int64 {
 func cgoDirectLoad(goarch string, typ cgoDirectType) string {
 	if goarch == "arm64" {
 		switch typ {
+		case cgoDirectFloat32:
+			return "FMOVS"
+		case cgoDirectFloat64:
+			return "FMOVD"
 		case cgoDirectInt8:
 			return "MOVB"
 		case cgoDirectUint8:
@@ -287,6 +293,10 @@ func cgoDirectLoad(goarch string, typ cgoDirectType) string {
 		}
 	}
 	switch typ {
+	case cgoDirectFloat32:
+		return "MOVSS"
+	case cgoDirectFloat64:
+		return "MOVSD"
 	case cgoDirectInt8:
 		return "MOVBQSX"
 	case cgoDirectUint8:
@@ -306,6 +316,12 @@ func cgoDirectLoad(goarch string, typ cgoDirectType) string {
 
 func cgoDirectStore(goarch string, typ cgoDirectType) string {
 	if goarch == "arm64" {
+		switch typ {
+		case cgoDirectFloat32:
+			return "FMOVS"
+		case cgoDirectFloat64:
+			return "FMOVD"
+		}
 		switch typ.size() {
 		case 1:
 			return "MOVB"
@@ -316,6 +332,12 @@ func cgoDirectStore(goarch string, typ cgoDirectType) string {
 		default:
 			return "MOVD"
 		}
+	}
+	switch typ {
+	case cgoDirectFloat32:
+		return "MOVSS"
+	case cgoDirectFloat64:
+		return "MOVSD"
 	}
 	switch typ.size() {
 	case 1:
@@ -329,18 +351,59 @@ func cgoDirectStore(goarch string, typ cgoDirectType) string {
 	}
 }
 
-func cgoDirectArgRegister(goarch string, index int) string {
-	if goarch == "arm64" {
-		return fmt.Sprintf("R%d", index)
+// cgoDirectArgRegisters assigns the independent integer and floating-point
+// register classes of the target System ABI.
+func cgoDirectArgRegisters(goarch string, params []cgoDirectType) ([]string, bool) {
+	registers := make([]string, len(params))
+	var integer, floating int
+	for i, param := range params {
+		if param.isFloat() {
+			if floating >= 8 {
+				return nil, false
+			}
+			if goarch == "arm64" {
+				registers[i] = fmt.Sprintf("F%d", floating)
+			} else if goarch == "amd64" {
+				registers[i] = fmt.Sprintf("X%d", floating)
+			} else {
+				return nil, false
+			}
+			floating++
+			continue
+		}
+		if goarch == "arm64" {
+			if integer >= 8 {
+				return nil, false
+			}
+			registers[i] = fmt.Sprintf("R%d", integer)
+		} else if goarch == "amd64" {
+			if integer >= 6 {
+				return nil, false
+			}
+			registers[i] = [...]string{"DI", "SI", "DX", "CX", "R8", "R9"}[integer]
+		} else {
+			return nil, false
+		}
+		integer++
 	}
-	return [...]string{"DI", "SI", "DX", "CX", "R8", "R9"}[index]
+	return registers, true
 }
 
-func cgoDirectResultRegister(goarch string) string {
+func cgoDirectResultRegister(goarch string, typ cgoDirectType) string {
+	if typ.isFloat() {
+		if goarch == "arm64" {
+			return "F0"
+		}
+		return "X0"
+	}
 	if goarch == "arm64" {
 		return "R0"
 	}
 	return "AX"
+}
+
+func (typ cgoDirectType) isFloat() bool {
+	return typ == cgoDirectFloat32 || typ == cgoDirectFloat64
 }
 
 func cgoDirectTypeOf(t *Type) (cgoDirectType, bool) {
@@ -389,6 +452,10 @@ func cgoDirectTypeOfExpr(expr ast.Expr, size int64, seen map[string]bool) (cgoDi
 			return cgoDirectUint64, size == 8
 		case "int64":
 			return cgoDirectInt64, size == 8
+		case "float32":
+			return cgoDirectFloat32, size == 4
+		case "float64":
+			return cgoDirectFloat64, size == 8
 		case "uint", "uintptr":
 			switch size {
 			case 4:

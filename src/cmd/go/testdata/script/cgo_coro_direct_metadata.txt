@@ -4,16 +4,28 @@ env GOEXPERIMENT=coro
 mkdir direct
 go tool cgo -objdir=direct main.go
 grep '//go:cgo_direct v1 _Cfunc_add_u64 _Cdirect_add_u64 add_u64 mayblock u64,u64 u64 -' direct/_cgo_gotypes.go
+grep '//go:cgo_direct v1 _Cfunc_mix_fp _Cdirect_mix_fp mix_fp mayblock f64,i32,f32,u64 f64 -' direct/_cgo_gotypes.go
 grep 'func _Cdirect_add_u64' direct/_cgo_gotypes.go
+grep 'func _Cdirect_mix_fp' direct/_cgo_gotypes.go
 grep 'func _Cdirect_set_u32' direct/_cgo_gotypes.go
 ! grep 'func _Cdirect_set_u32.*_Ctype_void' direct/_cgo_gotypes.go
 grep 'TEXT ·_Cdirect_add_u64' direct/_cgo_direct.s
 grep 'CALL.*_Cfunc_add_u64_direct' direct/_cgo_direct.s
 [GOARCH:arm64] grep 'SUB.*[$]16, RSP' direct/_cgo_direct.s
 [GOARCH:arm64] grep 'ADD.*[$]16, RSP' direct/_cgo_direct.s
+[GOARCH:arm64] grep 'FMOVD.*p0.*F0' direct/_cgo_direct.s
+[GOARCH:arm64] grep 'MOVW.*p1.*R0' direct/_cgo_direct.s
+[GOARCH:arm64] grep 'FMOVS.*p2.*F1' direct/_cgo_direct.s
+[GOARCH:arm64] grep 'MOVD.*p3.*R1' direct/_cgo_direct.s
+[GOARCH:arm64] grep 'FMOVD.*F0.*ret' direct/_cgo_direct.s
 [GOARCH:amd64] grep 'MOVQ.*SP, R12' direct/_cgo_direct.s
 [GOARCH:amd64] grep 'ANDQ.*SP' direct/_cgo_direct.s
 [GOARCH:amd64] grep 'MOVQ.*R12, SP' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVSD.*p0.*X0' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVLQSX.*p1.*DI' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVSS.*p2.*X1' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVQ.*p3.*SI' direct/_cgo_direct.s
+[GOARCH:amd64] grep 'MOVSD.*X0.*ret' direct/_cgo_direct.s
 grep '_Cfunc_static_add_direct' direct/main.cgo2.c
 grep 'return static_add' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
@@ -30,6 +42,8 @@ stdout 'add_u64'
 ! stdout 'runtime.asmcgocall'
 go tool objdump -s 'main\.main\.coro\.func1' program
 stdout '_Cdirect_add_u64'
+stdout '_Cdirect_mix_fp'
+stdout '_Cdirect_call_sin'
 stdout '_Cfunc_may_callback'
 ! stdout '_Cfunc_add_u64'
 ! stdout 'runtime.cgocall'
@@ -68,6 +82,8 @@ package main
 #include <stdint.h>
 #include <time.h>
 
+#cgo LDFLAGS: -lm
+
 #cgo noescape add_u64
 #cgo nocallback add_u64
 #cgo noescape mix_i
@@ -80,12 +96,21 @@ package main
 #cgo nocallback static_add
 #cgo noescape block_until
 #cgo nocallback block_until
+#cgo noescape mix_fp
+#cgo nocallback mix_fp
+#cgo noescape scale_fp
+#cgo nocallback scale_fp
+#cgo noescape call_sin
+#cgo nocallback call_sin
 
 uint64_t add_u64(uint64_t, uint64_t);
 int64_t mix_i(int8_t, uint16_t, int32_t, uint64_t);
 void set_u32(uint32_t *, uint32_t);
 int8_t narrow_i(int8_t);
 int32_t block_until(uint32_t *, uint32_t *);
+double mix_fp(double, int32_t, float, uint64_t);
+float scale_fp(float, double);
+double call_sin(double);
 
 static uint32_t static_add(uint32_t a, uint32_t b) {
 	return a + b;
@@ -130,8 +155,13 @@ func main() {
 	C.set_u32(&slot, 77)
 	narrow := C.narrow_i(-120)
 	staticValue := C.static_add(30, 12)
+	mixedFloat := C.mix_fp(0.5, -2, 1.25, 4)
+	scaledFloat := C.scale_fp(1.5, 2)
+	sine := C.call_sin(0.5)
 	if argumentOrder != 2 || callbackValue != 9 || mixed != 10595 ||
-		slot != 77 || narrow != -120 || staticValue != 42 {
+		slot != 77 || narrow != -120 || staticValue != 42 ||
+		mixedFloat != 3.75 || scaledFloat != 3 ||
+		sine != sine || sine < 0.479425 || sine > 0.479426 {
 		panic("bad direct C ABI result")
 	}
 	go replacement()
@@ -147,6 +177,7 @@ func main() {
 }
 
 -- add.c --
+#include <math.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -170,6 +201,18 @@ void set_u32(uint32_t *p, uint32_t value) {
 
 int8_t narrow_i(int8_t value) {
 	return value;
+}
+
+double mix_fp(double a, int32_t b, float c, uint64_t d) {
+	return a + (double)b + (double)c + (double)d;
+}
+
+float scale_fp(float a, double b) {
+	return a * (float)b;
+}
+
+double call_sin(double value) {
+	return sin(value);
 }
 
 int32_t block_until(uint32_t *gate, uint32_t *entered) {

@@ -9,8 +9,12 @@ package cgobench
 /*
 #include <stdint.h>
 
+#cgo LDFLAGS: -lm
+
 #cgo noescape coro_direct_empty
 #cgo nocallback coro_direct_empty
+#cgo noescape coro_direct_sin_add
+#cgo nocallback coro_direct_sin_add
 #cgo noescape coro_direct_handoff
 #cgo nocallback coro_direct_handoff
 #cgo noescape coro_direct_runnable_handoff
@@ -18,6 +22,8 @@ package cgobench
 
 void coro_cgo_empty(void);
 void coro_direct_empty(void);
+void coro_cgo_sin_add(double, double *);
+void coro_direct_sin_add(double, double *);
 void coro_cgo_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_direct_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_cgo_runnable_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
@@ -54,6 +60,27 @@ func DirectCalls(iterations int) {
 // Calling it repeatedly from another package includes coroutine root setup.
 func DirectCall() {
 	C.coro_direct_empty()
+}
+
+// CgoLibmCalls invokes a libm function through the ordinary cgo path.
+func CgoLibmCalls(iterations int) float64 {
+	var sum C.double
+	for i := 0; i < iterations; i++ {
+		value := 0.5 + float64(i&1)*0.125
+		C.coro_cgo_sin_add(C.double(value), &sum)
+	}
+	return float64(sum)
+}
+
+// DirectLibmCalls invokes the same libm function through the coroutine direct
+// path. The package must be compiled with -d=coro=4.
+func DirectLibmCalls(iterations int) float64 {
+	var sum C.double
+	for i := 0; i < iterations; i++ {
+		value := 0.5 + float64(i&1)*0.125
+		C.coro_direct_sin_add(C.double(value), &sum)
+	}
+	return float64(sum)
 }
 
 var cgoHandoffGate uint32
