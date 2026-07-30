@@ -2212,6 +2212,32 @@ must reduce the forward handoff without regressing the no-sibling boundary,
 and any return optimization must not move the cost into locked-M
 reacquisition. Logical-task allocation remains a separate follow-up.
 
+A conditional blocking entry now takes the immediate handoff only when the
+scheduler has both replacement capacity and queued logical work. The C call
+remains on its original M, as it does for an ordinary blocking cgo call. The
+runtime releases that M's P with the standard `entersyscallblock` transition,
+and a replacement M runs the queued continuation. The coroutine-specific
+advantage is therefore a smaller decision and wakeup path, not removal of the
+M/P handoff required by a blocking C call.
+
+The scheduler counts runnable tasks while holding its queue lock. Blocking
+entry snapshots that count before notifying replacement executors, avoiding a
+race in which an executor could dequeue the task before entry selected the
+handoff. With no queued task, entry retains the existing `entersyscall` path.
+
+Ten 500 ms Darwin/arm64 samples after this change produced these medians:
+
+| Path | Time from C publication to sibling | Benchmark round trip | Allocation |
+| --- | ---: | ---: | ---: |
+| ordinary cgo | 65.821 us | 66.605 us | 0 B/op, 0 allocs/op |
+| conditional direct handoff | 6.928 us | 23.556 us | 88 B/op, 3 allocs/op |
+
+The direct interval is about 89.5% smaller than ordinary cgo and the complete
+round trip is about 64.6% smaller. In separate paired 15-sample runs without a
+runnable sibling, the direct steady boundary changed from 12.63 ns to
+12.38 ns and root entry from 66.02 ns to 65.46 ns. Those differences are
+within run-to-run noise and show no no-sibling regression.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
