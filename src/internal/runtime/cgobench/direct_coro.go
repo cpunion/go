@@ -13,15 +13,15 @@ package cgobench
 #cgo nocallback coro_direct_empty
 #cgo noescape coro_direct_handoff
 #cgo nocallback coro_direct_handoff
-#cgo noescape coro_direct_stackless_handoff
-#cgo nocallback coro_direct_stackless_handoff
+#cgo noescape coro_direct_runnable_handoff
+#cgo nocallback coro_direct_runnable_handoff
 
 void coro_cgo_empty(void);
 void coro_direct_empty(void);
 void coro_cgo_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_direct_handoff(int, uint32_t *, uint32_t, uint64_t *);
-void coro_cgo_stackless_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
-void coro_direct_stackless_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
+void coro_cgo_runnable_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
+void coro_direct_runnable_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
 */
 import "C"
 import (
@@ -118,80 +118,86 @@ func DirectHandoffs(iterations, writeFD int) uint64 {
 	return elapsed
 }
 
-var cgoStacklessEntered uint64
-var cgoStacklessGate uint64
-var directStacklessEntered uint64
-var directStacklessGate uint64
+var cgoRunnableEntered uint64
+var cgoRunnableGate uint64
+var cgoRunnableEpoch uint64
+var directRunnableEntered uint64
+var directRunnableGate uint64
+var directRunnableEpoch uint64
 
-func stacklessHandoffWorker(iterations int, entered, gate *uint64) {
-	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
-		for atomic.LoadUint64(entered) < epoch {
-			runtime.Gosched()
-		}
-		atomic.StoreUint64(gate, epoch)
+func cgoRunnableHandoffWorker() {
+	epoch := atomic.LoadUint64(&cgoRunnableEpoch)
+	for atomic.LoadUint64(&cgoRunnableEntered) < epoch {
 	}
+	atomic.StoreUint64(&cgoRunnableGate, epoch)
 }
 
-// CgoStacklessHandoffs measures blocking handoffs from ordinary cgo calls to
-// a sibling stackless goroutine. It returns the total time from each C
-// publication until the sibling releases C.
-func CgoStacklessHandoffs(iterations int) uint64 {
+func directRunnableHandoffWorker() {
+	epoch := atomic.LoadUint64(&directRunnableEpoch)
+	for atomic.LoadUint64(&directRunnableEntered) < epoch {
+		runtime.Gosched()
+	}
+	atomic.StoreUint64(&directRunnableGate, epoch)
+}
+
+// CgoRunnableHandoffs measures blocking handoffs from ordinary cgo calls to
+// a sibling Go goroutine. It returns the total time from each C publication
+// until the sibling releases C.
+func CgoRunnableHandoffs(iterations int) uint64 {
 	if iterations < 0 {
 		return failedHandoff
 	}
-	atomic.StoreUint64(&cgoStacklessEntered, 0)
-	atomic.StoreUint64(&cgoStacklessGate, 0)
-	go stacklessHandoffWorker(
-		iterations, &cgoStacklessEntered, &cgoStacklessGate)
-	runtime.Gosched()
+	atomic.StoreUint64(&cgoRunnableEntered, 0)
+	atomic.StoreUint64(&cgoRunnableGate, 0)
 	var elapsed uint64
 	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
-		C.coro_cgo_stackless_handoff(
-			(*C.uint64_t)(&cgoStacklessEntered),
+		atomic.StoreUint64(&cgoRunnableEpoch, epoch)
+		go cgoRunnableHandoffWorker()
+		C.coro_cgo_runnable_handoff(
+			(*C.uint64_t)(&cgoRunnableEntered),
 			C.uint64_t(epoch),
-			(*C.uint64_t)(&cgoStacklessGate),
+			(*C.uint64_t)(&cgoRunnableGate),
 			(*C.uint64_t)(&elapsed),
 		)
 	}
-	return stacklessHandoffResult(
+	return runnableHandoffResult(
 		iterations,
-		atomic.LoadUint64(&cgoStacklessEntered),
-		atomic.LoadUint64(&cgoStacklessGate),
+		atomic.LoadUint64(&cgoRunnableEntered),
+		atomic.LoadUint64(&cgoRunnableGate),
 		elapsed,
 	)
 }
 
-// DirectStacklessHandoffs measures blocking handoffs from direct C calls to a
+// DirectRunnableHandoffs measures blocking handoffs from direct C calls to a
 // sibling stackless goroutine. It returns the total time from each C
 // publication until the sibling releases C. The package must be compiled with
 // -d=coro=4.
-func DirectStacklessHandoffs(iterations int) uint64 {
+func DirectRunnableHandoffs(iterations int) uint64 {
 	if iterations < 0 {
 		return failedHandoff
 	}
-	atomic.StoreUint64(&directStacklessEntered, 0)
-	atomic.StoreUint64(&directStacklessGate, 0)
-	go stacklessHandoffWorker(
-		iterations, &directStacklessEntered, &directStacklessGate)
-	runtime.Gosched()
+	atomic.StoreUint64(&directRunnableEntered, 0)
+	atomic.StoreUint64(&directRunnableGate, 0)
 	var elapsed uint64
 	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
-		C.coro_direct_stackless_handoff(
-			(*C.uint64_t)(&directStacklessEntered),
+		atomic.StoreUint64(&directRunnableEpoch, epoch)
+		go directRunnableHandoffWorker()
+		C.coro_direct_runnable_handoff(
+			(*C.uint64_t)(&directRunnableEntered),
 			C.uint64_t(epoch),
-			(*C.uint64_t)(&directStacklessGate),
+			(*C.uint64_t)(&directRunnableGate),
 			(*C.uint64_t)(&elapsed),
 		)
 	}
-	return stacklessHandoffResult(
+	return runnableHandoffResult(
 		iterations,
-		atomic.LoadUint64(&directStacklessEntered),
-		atomic.LoadUint64(&directStacklessGate),
+		atomic.LoadUint64(&directRunnableEntered),
+		atomic.LoadUint64(&directRunnableGate),
 		elapsed,
 	)
 }
 
-func stacklessHandoffResult(iterations int, entered, gate, elapsed uint64) uint64 {
+func runnableHandoffResult(iterations int, entered, gate, elapsed uint64) uint64 {
 	if elapsed == failedHandoff ||
 		entered != uint64(iterations) ||
 		gate != uint64(iterations) {
