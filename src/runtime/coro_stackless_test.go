@@ -7,6 +7,7 @@
 package runtime_test
 
 import (
+	"bytes"
 	"internal/race"
 	"runtime"
 	"sync/atomic"
@@ -2489,16 +2490,21 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
 
+	const rounds = 2*runtime.StacklessCoroExecutorCount + 1
 	var rescued atomic.Bool
 	rescue := time.AfterFunc(5*time.Second, func() {
 		rescued.Store(true)
-		syscall.Write(fds[1], []byte{'r'})
+		syscall.Write(fds[1], bytes.Repeat([]byte{'r'}, rounds))
 	})
 	defer rescue.Stop()
 
-	var writeErr error
+	var writes atomic.Int32
+	var writeFailed atomic.Bool
 	sibling := func(unsafe.Pointer) uint8 {
-		_, writeErr = syscall.Write(fds[1], []byte{'p'})
+		if _, err := syscall.Write(fds[1], []byte{'p'}); err != nil {
+			writeFailed.Store(true)
+		}
+		writes.Add(1)
 		return runtime.StacklessCoroActionComplete
 	}
 	var state int
@@ -2506,9 +2512,14 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
-			runtime.SpawnStacklessCoroForTest(ctx, sibling)
-			if n := runtime.BlockingReadStacklessCoroForTest(ctx, fds[0], buffer); n != 1 {
-				t.Fatalf("blocking read = %d, want 1", n)
+			for range rounds {
+				runtime.SpawnStacklessCoroForTest(ctx, sibling)
+				if n := runtime.BlockingReadStacklessCoroForTest(ctx, fds[0], buffer); n != 1 {
+					t.Fatalf("blocking read = %d, want 1", n)
+				}
+				if got := string(buffer); got != "p" {
+					t.Fatalf("blocking read = %q, want %q", got, "p")
+				}
 			}
 			state = 1
 			return runtime.StacklessCoroActionYield
@@ -2520,14 +2531,14 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
-	if writeErr != nil {
-		t.Fatal(writeErr)
+	if writeFailed.Load() {
+		t.Fatal("replacement executor write failed")
 	}
 	if rescued.Load() {
 		t.Fatal("blocking foreign call stopped stackless sibling progress")
 	}
-	if got := string(buffer); got != "p" {
-		t.Fatalf("blocking read = %q, want %q", got, "p")
+	if got := writes.Load(); got != rounds {
+		t.Fatalf("replacement writes = %d, want %d", got, rounds)
 	}
 }
 

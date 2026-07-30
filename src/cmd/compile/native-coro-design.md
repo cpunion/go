@@ -711,16 +711,26 @@ migrate until the call returns. The M and executor stack are temporarily
 pinned by the C call. Other logical goroutines make progress on a replacement
 M and executor.
 
-The first correct implementation may reuse narrow parts of
-`entersyscallblock` and `exitsyscall`. It must not route through
-`runtime.cgocall` or `runtime.asmcgocall`. A later optimization can replace
-general syscall state with a coroutine-specific handoff once equivalent GC,
-trace, stop-the-world, and scheduler behavior is proven.
+The first correct implementation reuses `entersyscall` and `exitsyscall` for
+the scheduler and GC state transition. The compiler emits both calls in the
+generated resume frame so that the saved syscall PC, SP, and frame pointer
+remain valid on the slow return path. It does not route through
+`runtime.cgocall` or `runtime.asmcgocall`.
+
+`entersyscallblock` is not an unconditional improvement for this execution
+model. It hands off the P immediately, but a fixed native-stack executor is
+locked to its original M. If another M owns the P when C returns, that executor
+must take the locked-M slow return path. A coroutine-specific handoff remains
+a later optimization, but it must reduce the forward handoff and return costs
+together while preserving GC, trace, stop-the-world, and scheduler behavior.
 
 This path does not eliminate M replacement. Its intended advantage over
 ordinary cgo is a cheaper handoff: the old M remains in C as before, but the
 logical continuation has already been materialized and the call needs neither
-a movable-G-stack save nor a switch to `m.g0`.
+a movable-G-stack save nor a switch to `m.g0`. The direct trampoline also
+avoids the general cgo argument frame, callback bookkeeping, and
+`runtime.cgocall` dispatch. This is a reduction in transition cost, not a
+claim that a blocking C function stops occupying a native thread.
 
 Replacement creation must be demand-driven and bounded. Each replacement that
 also blocks may create another demand, subject to a process limit. Exceeding
@@ -1552,10 +1562,19 @@ Report at least:
 - wrapper and runtime symbols in the call graph.
 
 Measure bounded direct calls and potentially blocking calls separately. The
-blocking comparison additionally reports handoff latency, replacement-M
-creation or reuse, and the time until another logical G first makes progress.
-It compares the coroutine-specific handoff with ordinary cgo rather than
-attributing the `DirectNoBlock` result to the blocking path.
+blocking comparison reports three distinct values:
+
+- direct foreign-boundary cost for a nonblocking control call;
+- time from the blocking C body publishing work until another G first makes
+  progress (`ns/progress`);
+- complete call-and-return time (`ns/op`).
+
+It additionally reports replacement-M creation or reuse. The first value
+isolates the transition that the direct path is designed to reduce, the second
+checks prompt scheduler handoff, and the third exposes return-side P
+reacquisition. It compares identical C bodies through the direct and ordinary
+cgo paths rather than attributing the `DirectNoBlock` result to the blocking
+path.
 
 The scheduling benchmark reports:
 
@@ -1722,8 +1741,12 @@ The runtime:
 - issues supported scalar C calls through System ABI assembly shims and typed
   visibility bridges without `runtime.cgocall`, `runtime.asmcgocall`, or the
   general cgo argument-frame wrappers;
+- reserves the ABI scratch area below SP in arm64 direct trampolines, keeping a
+  non-leaf C function from overwriting the Go frame pointer saved at `SP-8`;
 - releases scheduler capacity around a blocking C call, allowing another
-  stackless logical goroutine to run at `GOMAXPROCS=1`.
+  stackless logical goroutine to run at `GOMAXPROCS=1`;
+- keeps syscall entry and exit in the generated resume frame and reuses both
+  admitted and waiting replacement executors across repeated blocking calls.
 
 The transparent cgo frontend:
 
@@ -1759,6 +1782,9 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
 - 50,000 blocking-boundary root entries concurrent with 100 forced GCs,
   repeated 10 times on Darwin/arm64; this covers stale preemption state when a
   synthetic executor becomes dead and is reused;
+- repeated blocking direct C calls beyond the fixed executor-pool size,
+  including a framed non-leaf C callee, while another G makes progress at
+  `GOMAXPROCS=1`;
 - yield, structured child await, 100,000 spawned logical goroutines, timer
   fire/cancel races, regular-file success/error/EOF, socket
   success/EOF/deadline/close, and asynchronous C success/error paths;

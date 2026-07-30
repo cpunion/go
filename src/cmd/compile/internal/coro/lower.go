@@ -1897,14 +1897,9 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 						typecheck.LookupRuntime("coroExitForeign"), nil, false),
 				)
 			case DirectMayBlock:
-				body = append(body,
-					typecheck.Call(stmt.Pos(),
-						typecheck.LookupRuntime("coroEnterBlocking"),
-						ir.Nodes{ctx}, false),
-					edited,
-					typecheck.Call(stmt.Pos(),
-						typecheck.LookupRuntime("coroExitBlocking"), nil, false),
-				)
+				body = append(body, blockingForeignEnter(stmt.Pos(), ctx)...)
+				body = append(body, edited)
+				body = append(body, blockingForeignExit(stmt.Pos())...)
 			default:
 				return nil, fmt.Errorf("%s: unsupported foreign call %s",
 					ir.PkgFuncName(fn), foreign)
@@ -2973,15 +2968,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						nil, false),
 				)
 			case DirectMayBlock:
-				body = append(body,
-					typecheck.Call(stmt.Pos(),
-						typecheck.LookupRuntime("coroEnterBlocking"),
-						ir.Nodes{ctx}, false),
-					edited,
-					typecheck.Call(stmt.Pos(),
-						typecheck.LookupRuntime("coroExitBlocking"),
-						nil, false),
-				)
+				body = append(body, blockingForeignEnter(stmt.Pos(), ctx)...)
+				body = append(body, edited)
+				body = append(body, blockingForeignExit(stmt.Pos())...)
 			default:
 				return fmt.Errorf("%s: unsupported foreign call %s",
 					ir.PkgFuncName(fn), foreign)
@@ -3714,6 +3703,25 @@ func ordinaryReadOperation(call *ir.CallExpr) bool {
 		return true
 	}
 	return false
+}
+
+// blockingForeignEnter and blockingForeignExit keep entersyscall and
+// exitsyscall in the generated resume frame. Separate runtime wrappers would
+// make the saved syscall frame invalid when exitsyscall takes its slow path.
+func blockingForeignEnter(pos src.XPos, ctx ir.Node) ir.Nodes {
+	return ir.Nodes{
+		typecheck.Call(pos, typecheck.LookupRuntime("coroPrepareBlocking"),
+			ir.Nodes{ctx}, false),
+		typecheck.Call(pos, typecheck.LookupRuntime("entersyscall"), nil, false),
+		typecheck.Call(pos, typecheck.LookupRuntime("coroEnterForeign"), nil, false),
+	}
+}
+
+func blockingForeignExit(pos src.XPos) ir.Nodes {
+	return ir.Nodes{
+		typecheck.Call(pos, typecheck.LookupRuntime("coroExitForeign"), nil, false),
+		typecheck.Call(pos, typecheck.LookupRuntime("exitsyscall"), nil, false),
+	}
 }
 
 func typedInt(pos src.XPos, typ *types.Type, value int64) ir.Node {

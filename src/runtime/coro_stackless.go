@@ -744,27 +744,16 @@ func coroExitForeign() {
 	}
 }
 
+// coroPrepareBlocking wakes replacement capacity before its caller releases
+// the P. The compiler emits the syscall entry and exit in the resume frame.
+//
 //go:nosplit
-func coroEnterBlocking(ctx unsafe.Pointer) {
+func coroPrepareBlocking(ctx unsafe.Pointer) {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine blocking call")
 	}
 	context.scheduler.wakeReplacementExecutor()
-	// coroExitBlocking returns through a different helper frame. Save the
-	// continuation frame so exitsyscall never refers to an unwound entry
-	// frame. This is the same reentry protocol used by cgo callbacks.
-	pc := sys.GetCallerPC()
-	sp := sys.GetCallerSP()
-	bp := getcallerfp()
-	reentersyscall(pc, sp, bp)
-	coroEnterForeign()
-}
-
-//go:nosplit
-func coroExitBlocking() {
-	coroExitForeign()
-	exitsyscall()
 }
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCoroScheduler, *stacklessCoroTask) {
@@ -1073,6 +1062,13 @@ func (s *stacklessCoroScheduler) replacementExecutor() {
 func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 	if s == nil || s.executorsReady.Load() == 0 {
 		return
+	}
+	// A replacement that has already entered run waits on wake, not
+	// executorWake. Notify both admitted and not-yet-admitted executors so
+	// repeated blocking calls can reuse the fixed pool.
+	select {
+	case s.wake <- struct{}{}:
+	default:
 	}
 	select {
 	case s.executorWake <- struct{}{}:

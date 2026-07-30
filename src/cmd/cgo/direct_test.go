@@ -10,6 +10,7 @@ import (
 	"go/ast"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -376,9 +377,23 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 			t.Errorf("amd64 call instruction %d = %q, want %q", i, got, want)
 		}
 	}
-	if got, want := strings.Join(cgoDirectCallInstructions("arm64", "entry"), "\n"),
-		"CALL\tentry(SB)"; got != want {
-		t.Errorf("arm64 call instructions = %q, want %q", got, want)
+	arm64Call := cgoDirectCallInstructions("arm64", "entry")
+	wantARM64 := []string{
+		"SUB\t$16, RSP",
+		"CALL\tentry(SB)",
+		"ADD\t$16, RSP",
+	}
+	if len(arm64Call) != len(wantARM64) {
+		t.Fatalf("arm64 call instructions = %q, want %q", arm64Call, wantARM64)
+	}
+	for i, want := range wantARM64 {
+		if got := arm64Call[i]; got != want {
+			t.Errorf("arm64 call instruction %d = %q, want %q", i, got, want)
+		}
+	}
+	if got, want := cgoDirectCallInstructions("other", "entry"),
+		[]string{"CALL\tentry(SB)"}; !slices.Equal(got, want) {
+		t.Errorf("fallback call instructions = %q, want %q", got, want)
 	}
 	if got := cgoDirectResultRegister("arm64"); got != "R0" {
 		t.Errorf("arm64 result register = %s, want R0", got)

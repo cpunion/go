@@ -1435,7 +1435,10 @@ func TestLowerStateMachines(t *testing.T) {
 		t.Errorf("run-to-completion control flow has %d loops and %d switches, want 1 and 0",
 			runLoops, runSwitches)
 	}
-	if want := []string{"coroEnterBlocking", "directEntry", "coroExitBlocking"}; !slices.Equal(runCalls, want) {
+	if want := []string{
+		"coroPrepareBlocking", "entersyscall", "coroEnterForeign",
+		"directEntry", "coroExitForeign", "exitsyscall",
+	}; !slices.Equal(runCalls, want) {
 		t.Errorf("run-to-completion calls = %v, want %v", runCalls, want)
 	}
 
