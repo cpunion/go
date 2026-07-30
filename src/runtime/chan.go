@@ -350,12 +350,9 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		sg.elem.set(nil)
 	}
 	if op != nil {
-		sg.coro.clear()
-		sg.c.set(nil)
 		sg.success = true
 		unlockf()
-		releaseStacklessCoroSudog(sg)
-		finishStacklessCoroChannel(op, true)
+		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
 	gp := sg.g
@@ -535,10 +532,7 @@ func closechan(c *hchan) {
 		corohead = sg.waitlink
 		sg.waitlink = nil
 		op := sg.coro.get()
-		sg.coro.clear()
-		sg.c.set(nil)
-		releaseStacklessCoroSudog(sg)
-		finishStacklessCoroChannel(op, false)
+		finishStacklessCoroChannel(op, sg, false)
 	}
 }
 
@@ -802,12 +796,9 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	}
 	sg.elem.set(nil)
 	if op != nil {
-		sg.coro.clear()
-		sg.c.set(nil)
 		sg.success = true
 		unlockf()
-		releaseStacklessCoroSudog(sg)
-		finishStacklessCoroChannel(op, true)
+		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
 	gp := sg.g
@@ -969,7 +960,15 @@ func (q *waitq) dequeue() *sudog {
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
 		if sgp.isSelect {
-			if !sgp.g.selectDone.CompareAndSwap(0, 1) {
+			won := false
+			if sgp.g != nil {
+				won = sgp.g.selectDone.CompareAndSwap(0, 1)
+			} else if owner := sgp.coro.get(); owner != nil {
+				won = stacklessCoroSelectTry(owner)
+			} else {
+				throw("runtime: select waiter has no owner")
+			}
+			if !won {
 				// We lost the race to wake this goroutine.
 				continue
 			}

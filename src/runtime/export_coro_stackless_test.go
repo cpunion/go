@@ -145,6 +145,37 @@ func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
 	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
 }
 
+type StacklessCoroSelectCasesForTest struct {
+	cases  []scase
+	nsends int
+}
+
+func NewStacklessCoroSelectCasesForTest(channels []any,
+	elements []unsafe.Pointer, nsends int) *StacklessCoroSelectCasesForTest {
+	if len(channels) != len(elements) || nsends < 0 || nsends > len(channels) {
+		throw("runtime: invalid stackless coroutine test select")
+	}
+	cases := make([]scase, len(channels))
+	for i := range channels {
+		if channels[i] != nil {
+			cases[i].c = (*hchan)(efaceOf(&channels[i]).data)
+		}
+		cases[i].elem = elements[i]
+	}
+	return &StacklessCoroSelectCasesForTest{cases: cases, nsends: nsends}
+}
+
+func SelectStacklessCoroForTest(ctx unsafe.Pointer,
+	cases *StacklessCoroSelectCasesForTest, block bool, chosen *int,
+	received *bool) {
+	var first *scase
+	if len(cases.cases) != 0 {
+		first = &cases.cases[0]
+	}
+	coroSelect(ctx, first, cases.nsends, len(cases.cases)-cases.nsends,
+		block, chosen, received)
+}
+
 func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {
 	c := (*hchan)(efaceOf(&channel).data)
 	lock(&c.lock)

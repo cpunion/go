@@ -5175,6 +5175,292 @@ func TestLowerChannelRange(t *testing.T) {
 	}
 }
 
+func TestLowerChannelSelect(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	pkg := types.NewPkg("example.com/coro/channelselect", "channelselect")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	fn := newLowerTestFunc(pkg, "selectChannel")
+	channelType := types.NewChan(types.Types[types.TINT], types.Cboth)
+	sendChannel := fn.NewLocal(src.NoXPos, pkg.Lookup("sendChannel"),
+		channelType)
+	recvChannel := fn.NewLocal(src.NoXPos, pkg.Lookup("recvChannel"),
+		channelType)
+	sendValue := fn.NewLocal(src.NoXPos, pkg.Lookup("sendValue"),
+		types.Types[types.TINT])
+	recvValue := fn.NewLocal(src.NoXPos, pkg.Lookup("recvValue"),
+		types.Types[types.TINT])
+	recvOK := fn.NewLocal(src.NoXPos, pkg.Lookup("recvOK"),
+		types.Types[types.TBOOL])
+
+	send := ir.NewSendStmt(src.NoXPos, sendChannel, sendValue)
+	recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, recvChannel)
+	recv.SetType(types.Types[types.TINT])
+	recvAssign := ir.NewAssignListStmt(src.NoXPos, ir.OSELRECV2,
+		ir.Nodes{recvValue, recvOK}, ir.Nodes{recv})
+	sendCase := ir.NewCommStmt(src.NoXPos, send, nil)
+	recvCase := ir.NewCommStmt(src.NoXPos, recvAssign, nil)
+	defaultCase := ir.NewCommStmt(src.NoXPos, nil, nil)
+	selectStmt := ir.NewSelectStmt(src.NoXPos,
+		[]*ir.CommClause{recvCase, defaultCase, sendCase})
+	fn.Body = ir.Nodes{selectStmt, newLowerTestReturn()}
+
+	function := &Function{
+		Func:    fn,
+		Local:   MaySuspend,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Sites: []Site{
+			{ID: 1, Kind: SiteChannel, Node: selectStmt},
+			{ID: 2, Kind: SiteChannel, Node: recv},
+			{ID: 3, Kind: SiteChannel, Node: send},
+		},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		fn: function,
+	}})
+	if err != nil {
+		t.Fatalf("Lower failed: %v", err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	}
+
+	var selects, nativeSelects, nativeChannels int
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			switch node.Op() {
+			case ir.OSELECT:
+				nativeSelects++
+			case ir.OSEND, ir.ORECV:
+				nativeChannels++
+			}
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name != nil && name.Sym() != nil &&
+				name.Sym().Name == "coroSelect" {
+				selects++
+				if len(call.Args) != 7 {
+					t.Errorf("coroSelect has %d arguments, want 7",
+						len(call.Args))
+				}
+			}
+		})
+	}
+	if selects != 1 {
+		t.Fatalf("generated IR has %d coroutine selects, want 1", selects)
+	}
+	if nativeSelects != 0 || nativeChannels != 0 {
+		t.Fatalf("generated IR retains %d selects and %d channel operations",
+			nativeSelects, nativeChannels)
+	}
+}
+
+func TestNewLowerSelectRejectsMalformedIR(t *testing.T) {
+	prepareLowerTest(t)
+
+	pkg := types.NewPkg("example.com/coro/selectmalformed",
+		"selectmalformed")
+	channel := ir.NewNameAt(src.NoXPos, pkg.Lookup("channel"),
+		types.NewChan(types.Types[types.TINT], types.Cboth))
+	newRecv := func() *ir.UnaryExpr {
+		recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+		recv.SetType(types.Types[types.TINT])
+		return recv
+	}
+	newTarget := func(name string, typ *types.Type) *ir.Name {
+		return ir.NewNameAt(src.NoXPos, pkg.Lookup(name), typ)
+	}
+	newSelect := func(comm ir.Node) *ir.SelectStmt {
+		return ir.NewSelectStmt(src.NoXPos, []*ir.CommClause{
+			ir.NewCommStmt(src.NoXPos, comm, nil),
+		})
+	}
+
+	tests := []struct {
+		name string
+		make func() *ir.SelectStmt
+		want string
+	}{
+		{
+			name: "labeled",
+			make: func() *ir.SelectStmt {
+				stmt := newSelect(newRecv())
+				stmt.Label = pkg.Lookup("label")
+				return stmt
+			},
+			want: "labeled select",
+		},
+		{
+			name: "walked",
+			make: func() *ir.SelectStmt {
+				stmt := newSelect(newRecv())
+				stmt.SetWalked(true)
+				return stmt
+			},
+			want: "already lowered select",
+		},
+		{
+			name: "compiled",
+			make: func() *ir.SelectStmt {
+				stmt := newSelect(newRecv())
+				stmt.Compiled = ir.Nodes{ir.NewBlockStmt(src.NoXPos, nil)}
+				return stmt
+			},
+			want: "already lowered select",
+		},
+		{
+			name: "too-many-cases",
+			make: func() *ir.SelectStmt {
+				return ir.NewSelectStmt(src.NoXPos,
+					make([]*ir.CommClause, 1<<16+1))
+			},
+			want: "select has 65537 cases",
+		},
+		{
+			name: "nil-case",
+			make: func() *ir.SelectStmt {
+				return ir.NewSelectStmt(src.NoXPos,
+					[]*ir.CommClause{nil})
+			},
+			want: "nil select case",
+		},
+		{
+			name: "multiple-defaults",
+			make: func() *ir.SelectStmt {
+				return ir.NewSelectStmt(src.NoXPos, []*ir.CommClause{
+					ir.NewCommStmt(src.NoXPos, nil, nil),
+					ir.NewCommStmt(src.NoXPos, nil, nil),
+				})
+			},
+			want: "multiple select defaults",
+		},
+		{
+			name: "invalid-unary",
+			make: func() *ir.SelectStmt {
+				operation := ir.NewUnaryExpr(src.NoXPos, ir.ONEG, channel)
+				return newSelect(operation)
+			},
+			want: "unsupported select operation",
+		},
+		{
+			name: "invalid-assignment",
+			make: func() *ir.SelectStmt {
+				assignment := ir.NewAssignStmt(src.NoXPos,
+					newTarget("assignTarget", types.Types[types.TINT]),
+					ir.NewInt(src.NoXPos, 1))
+				return newSelect(assignment)
+			},
+			want: "unsupported select assignment",
+		},
+		{
+			name: "complex-result",
+			make: func() *ir.SelectStmt {
+				values := newTarget("values",
+					types.NewSlice(types.Types[types.TINT]))
+				target := ir.NewIndexExpr(src.NoXPos, values,
+					ir.NewInt(src.NoXPos, 0))
+				target.SetType(types.Types[types.TINT])
+				return newSelect(ir.NewAssignStmt(src.NoXPos,
+					target, newRecv()))
+			},
+			want: "receive result 0 is not a variable",
+		},
+		{
+			name: "untyped-result",
+			make: func() *ir.SelectStmt {
+				return newSelect(ir.NewAssignStmt(src.NoXPos,
+					newTarget("untyped", nil), newRecv()))
+			},
+			want: "receive result 0 has no type",
+		},
+		{
+			name: "invalid-receive-list",
+			make: func() *ir.SelectStmt {
+				assignment := ir.NewAssignListStmt(src.NoXPos, ir.OAS2RECV,
+					ir.Nodes{newTarget("result",
+						types.Types[types.TINT])}, ir.Nodes{newRecv()})
+				return newSelect(assignment)
+			},
+			want: "unsupported select receive assignment",
+		},
+		{
+			name: "receive-list-without-receive",
+			make: func() *ir.SelectStmt {
+				assignment := ir.NewAssignListStmt(src.NoXPos, ir.OAS2RECV,
+					ir.Nodes{
+						newTarget("value", types.Types[types.TINT]),
+						newTarget("ok", types.Types[types.TBOOL]),
+					}, ir.Nodes{ir.NewInt(src.NoXPos, 1)})
+				return newSelect(assignment)
+			},
+			want: "select receive has no receive operation",
+		},
+		{
+			name: "unsupported-operation",
+			make: func() *ir.SelectStmt {
+				return newSelect(ir.NewBlockStmt(src.NoXPos, nil))
+			},
+			want: "unsupported select operation",
+		},
+		{
+			name: "untyped-channel",
+			make: func() *ir.SelectStmt {
+				untyped := ir.NewNameAt(src.NoXPos,
+					pkg.Lookup("untypedChannel"), nil)
+				recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, untyped)
+				recv.SetType(types.Types[types.TINT])
+				return newSelect(recv)
+			},
+			want: "select operation has no channel type",
+		},
+	}
+
+	if _, err := newLowerSelect(nil); err == nil ||
+		!strings.Contains(err.Error(), "nil select") {
+		t.Fatalf("newLowerSelect(nil) error = %v, want nil select", err)
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := newLowerSelect(test.make())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("newLowerSelect error = %v, want %q", err, test.want)
+			}
+		})
+	}
+
+	target := newTarget("validTarget", types.Types[types.TINT])
+	for name, stmt := range map[string]*ir.SelectStmt{
+		"empty": ir.NewSelectStmt(src.NoXPos, nil),
+		"default": ir.NewSelectStmt(src.NoXPos, []*ir.CommClause{
+			ir.NewCommStmt(src.NoXPos, nil, nil),
+		}),
+		"bare-receive": newSelect(newRecv()),
+		"assigned-receive": newSelect(ir.NewAssignStmt(
+			src.NoXPos, target, newRecv())),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := newLowerSelect(stmt); err != nil {
+				t.Fatalf("newLowerSelect failed: %v", err)
+			}
+		})
+	}
+}
+
 func TestTransformedRangeVariable(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -5410,14 +5696,6 @@ func TestLowerRejectsUnsupportedChannels(t *testing.T) {
 				return ir.Nodes{loop}, loop
 			},
 			want: "range result has no type",
-		},
-		{
-			name: "select",
-			make: func(_ *ir.Func, _ *ir.Name) (ir.Nodes, ir.Node) {
-				selectStmt := ir.NewSelectStmt(src.NoXPos, nil)
-				return ir.Nodes{selectStmt}, selectStmt
-			},
-			want: "control flow select",
 		},
 	}
 

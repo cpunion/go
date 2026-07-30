@@ -13,7 +13,8 @@ follow-ups; nested multi-result and conservatively normalized single-result
 expressions; and restricted compiler-private cross-package factory and defer
 entries; ordinary channel send, single-value receive, comma-ok receive, and
 receive-channel range use the runtime's shared channel wait queues without an
-operation goroutine;
+operation goroutine; channel select uses one task-owned arbitration record and
+shared wait-queue entries without a goroutine per case;
 not production-ready
 
 Last updated: 2026-07-29
@@ -190,11 +191,14 @@ This path solves problems that ordinary Go goroutines create:
 - callbacks must re-enter a Go goroutine stack;
 - a general argument frame handles arbitrary generated signatures.
 
-A stackless coroutine executor changes the first two premises. A resume episode
-can run on one fixed, nonmoving, C-compatible executor stack. A potentially
-blocking call can release its managed execution permit before entering C, so a
-replacement executor can make progress. It is therefore unnecessary to pay
-for a cgo wrapper and a `g0` stack switch on every supported call.
+A stackless coroutine executor changes the first premise and the cost structure
+of the second. A resume episode can run on one fixed, nonmoving, C-compatible
+executor stack. A potentially blocking call must still remain on its current M
+while a replacement M runs managed work. Before entering C, however, it can
+release its managed execution permit without saving, moving, or switching away
+from a goroutine stack: the logical continuation is already in its typed heap
+frame. It is therefore unnecessary to pay for a cgo wrapper and a `g0` stack
+switch on every supported call.
 
 The remaining responsibilities do not disappear. They become explicit,
 smaller foreign-entry and foreign-exit protocols for each call class.
@@ -551,10 +555,13 @@ An operation identity is a small, pointer-free value containing at least a
 source route, slot, and generation. It is safe to copy through a C callback,
 worker queue, pipe, event port, or interrupt mailbox.
 
-The logical wait ticket is separate from the physical operation identity. One
-logical select may own several operation identities, and a physical source may
-remain active after another candidate won. The wait ticket stays in
-scheduler-owned logical-G state and never enters the producer ABI.
+The logical wait ticket is separate from the physical operation identity. A
+logical wait may own one arbitration record and several physical source
+registrations; a future mixed-source select may also need several operation
+identities. The implemented channel select uses one identity shared by all of
+its channel waiters. A physical source may remain active after another
+candidate wins. The wait ticket stays in scheduler-owned logical-G state and
+never enters the producer ABI.
 
 The identity resolves to an owner-controlled operation record. Reuse is
 allowed only after:
@@ -709,6 +716,11 @@ The first correct implementation may reuse narrow parts of
 `runtime.cgocall` or `runtime.asmcgocall`. A later optimization can replace
 general syscall state with a coroutine-specific handoff once equivalent GC,
 trace, stop-the-world, and scheduler behavior is proven.
+
+This path does not eliminate M replacement. Its intended advantage over
+ordinary cgo is a cheaper handoff: the old M remains in C as before, but the
+logical continuation has already been materialized and the call needs neither
+a movable-G-stack save nor a switch to `m.g0`.
 
 Replacement creation must be demand-driven and bounded. Each replacement that
 also blocks may create another demand, subject to a process limit. Exceeding
@@ -1138,6 +1150,17 @@ same state graph. Per-iteration variables whose addresses escape receive a
 fresh typed cell on every iteration; a closure that captures such a variable
 retains the ordinary entry until general closure-frame lowering exists.
 
+Channel select evaluates every channel operand and send value once in source
+order, stores channels and typed elements in the coroutine frame, and builds a
+compiler-private descriptor array matching the runtime's two-pointer `scase`
+layout. Runtime case indices group sends before receives as `selectgo` does;
+explicit state dispatch maps the selected index back to the source case.
+Receive values and comma-ok status are assigned only for the selected case,
+and pointer-bearing case storage is cleared before its body runs. Buffered,
+unbuffered, nil, duplicate, closed, default-only, empty, nested, and timer
+channel selects are supported. Receive destinations remain restricted to
+simple variables or blanks.
+
 The runtime registers a stackless operation directly in the existing
 `hchan.sendq` or `hchan.recvq`. Its `sudog` has no parked `g`; an
 experiment-only owner points to the registry operation instead. Ordinary and
@@ -1154,9 +1177,17 @@ It therefore uses a dedicated heap `sudog` that becomes garbage after the
 waker removes and clears it, instead of returning the waiter to an ordinary
 per-P cache from the waker's execution context. The non-experiment `sudog`
 extension has zero size and leaves the 64-bit structure at 104 bytes; the
-experiment-only owner pointer makes it 112 bytes. Select, multiple operations
-in one expression, and effectful receive destinations remain separate
-compiler and runtime steps.
+experiment-only owner pointer makes it 112 bytes.
+
+A blocked logical select owns one operation record, one atomic arbitration
+bit, and one `sudog` per non-nil case. The waiters enter the existing channel
+queues in channel-address lock order. The first producer that removes a waiter
+wins the arbitration, completes the channel transaction, then reacquires the
+ordered channel locks to remove every losing waiter and balance timer-channel
+bookkeeping. Duplicate cases on one channel use the same arbitration path.
+Only after all waiters and descriptor references are cleared does the producer
+publish one selected index and ready the task. No case owns a goroutine and no
+producer invokes the continuation.
 
 ### 11.3 Timers
 
@@ -1520,6 +1551,12 @@ Report at least:
 - generated text size;
 - wrapper and runtime symbols in the call graph.
 
+Measure bounded direct calls and potentially blocking calls separately. The
+blocking comparison additionally reports handoff latency, replacement-M
+creation or reuse, and the time until another logical G first makes progress.
+It compares the coroutine-specific handoff with ordinary cgo rather than
+attributing the `DirectNoBlock` result to the blocking path.
+
 The scheduling benchmark reports:
 
 - memory for 1, 1,000, and 100,000 suspended logical goroutines;
@@ -1578,6 +1615,10 @@ The compiler:
 - lowers receive-channel range to a cyclic receive, status branch, body, and
   pointer-clearing state sequence while evaluating the channel expression
   exactly once;
+- lowers channel select to source-ordered operand evaluation, frame-owned
+  typed case storage, one runtime operation, and explicit selected-case
+  dispatch; this includes empty and default-only selects, nil and duplicate
+  channels, closed send and receive, nested case control, and timer channels;
 - normalizes single-result awaits in returns, call arguments, and simple
   assignments into pre-escape typed temporary assignments when doing so
   preserves every observable prefix operation; an existing statement `Init`
@@ -1669,6 +1710,10 @@ The runtime:
   wait queues, shares FIFO and buffering with parked goroutines, publishes
   completion only after releasing the channel lock, and converts
   send-on-closed panic into a task-owned terminal outcome;
+- registers every non-nil case of a logical select in those same queues,
+  arbitrates one winner with task-owned atomic state, removes losing waiters
+  under the ordinary select lock order, and balances timer-channel blocking
+  without allocating a goroutine per case;
 - makes timer completion and cancellation race for the same operation record,
   so exactly one path readies the waiter;
 - keeps the stackless scheduler runnable while a timer, file worker, or socket
@@ -1722,6 +1767,10 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   direct ordinary/logical waiter interoperability, shared FIFO order, and 64
   simultaneously blocked logical sends without 64 operation goroutines at
   `GOMAXPROCS=1`;
+- buffered and unbuffered select send/receive, source-order evaluation,
+  default, nil, duplicate, closed, heterogeneous, nested, empty, and timer
+  cases; blocked winner publication removes all losing waiters, and stress
+  runs exercise both ordinary and race builds;
 - a real timer channel repeatedly pairs `Stop` and `Reset` with a directly
   queued logical receive, covering the `blockTimerChan` and
   `unblockTimerChan` lifecycle;
@@ -1931,6 +1980,19 @@ per-iteration-address cases, and verify that an iteration-variable closure
 falls back without changing Go behavior; subprocess coverage is not credited
 to the in-process profile.
 
+For the channel-select follow-up, the complete coroutine compiler package is
+92.4% covered. The compiler profile covers 182 of 195 changed production
+statements in `lower.go` (93.33%). The union of feature-off and feature-on
+complete runtime profiles with the focused feature-on race profile covers 281
+of 299 changed runtime statements (93.98%). Together they cover 463 of 494
+changed core statements (93.72%). The uncovered runtime statements are
+sanitizer-only hooks, synctest and invalid-state failures, one heap-sort branch,
+and the non-experiment defensive stub. End-to-end subprocess tests additionally
+compile and run source-order, buffered, unbuffered, default, nil, duplicate,
+closed, heterogeneous, nested, empty, and timer cases and inspect generated
+resume symbols; subprocess coverage is not credited to the in-process
+profiles.
+
 ### 15.3 Measurements
 
 The runtime benchmarks use a 100 ms sample. Values are representative local
@@ -2064,12 +2126,12 @@ flow, dynamic calls, interfaces, unlabeled branch control, closure capture of
 a per-iteration channel-range variable, general escaping closures, nested
 closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
-from a non-structured spawned task, select, multiple channel operations in one
-expression, effectful receive destinations, mutex parking, reflection,
-callbacks, variadic C calls, or general C ABI type classification. Ordinary
-channel send, discarded or single-value receive, comma-ok receive, and
-receive-channel range are supported through the runtime's shared channel wait
-queues.
+from a non-structured spawned task, labeled select or complex select receive
+destinations, multiple channel operations in one expression, mutex parking,
+reflection, callbacks, variadic C calls, or general C ABI type classification.
+Ordinary channel send, discarded or single-value receive, comma-ok receive,
+receive-channel range, and select with simple receive targets are supported
+through the runtime's shared channel wait queues.
 Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
 spawned logical goroutine, fixed or repeated-simple-loop defer cleanup,
@@ -2093,26 +2155,25 @@ standard-library compatibility remain future work.
 
 The likely order is:
 
-1. add select on the direct runtime wait-queue integration;
-2. add mutexes, semaphores, and runtime notes through the same park/wake
+1. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
-3. generalize System ABI type classification and errno handling;
-4. extend expression, assignment, and branch normalization to short-circuit
+2. generalize System ABI type classification and errno handling;
+3. extend expression, assignment, and branch normalization to short-circuit
    control, loop conditions, frontend loop-variable rewrites, and effectful
    destinations, then extend the compiler-private factory ABI only with
    matching closure and generic lowering; do not add source annotations or
    per-call policy metadata;
-5. propagate repeated-literal cell pointers through nested closure
+4. propagate repeated-literal cell pointers through nested closure
    environments as part of general closure lowering;
-6. add dynamic function values, interfaces, closures, generics, and reflect;
-7. add precise logical traceback, debugger, profiler, trace, race, and
+5. add dynamic function values, interfaces, closures, generics, and reflect;
+6. add precise logical traceback, debugger, profiler, trace, race, and
    coverage integration;
-8. add work stealing, affinity, dynamic executor sizing, and bounded blocking
+7. add work stealing, affinity, dynamic executor sizing, and bounded blocking
    policies;
-9. broaden `time`, `os`, `net`, `internal/poll`, and standard-library tests;
-10. evaluate deeper integration with the Go scheduler after the nested
+8. broaden `time`, `os`, `net`, `internal/poll`, and standard-library tests;
+9. evaluate deeper integration with the Go scheduler after the nested
    executor model is measured;
-11. add other targets only after their platform operation sources and stack
+10. add other targets only after their platform operation sources and stack
     contracts are explicit.
 
 ## 17. Confirmed MVP decisions

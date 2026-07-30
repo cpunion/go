@@ -7,6 +7,7 @@
 package runtime_test
 
 import (
+	"internal/race"
 	"runtime"
 	"sync/atomic"
 	"syscall"
@@ -1006,6 +1007,515 @@ func TestStacklessCoroChannel(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+}
+
+func TestStacklessCoroSelect(t *testing.T) {
+	send := make(chan int, 1)
+	ready := make(chan int, 1)
+	ready <- 53
+	closed := make(chan int)
+	close(closed)
+	var disabled chan int
+	sendValue := 59
+	receivedValue := -1
+	chosen := -2
+	received := false
+	var cases *runtime.StacklessCoroSelectCasesForTest
+	state := 0
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			cases = runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{send}, []unsafe.Pointer{unsafe.Pointer(&sendValue)}, 1)
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 0 || received {
+				t.Fatalf("buffered send select = (%d, %t), want (0, false)",
+					chosen, received)
+			}
+			if value := <-send; value != sendValue {
+				t.Fatalf("buffered send value = %d, want %d", value, sendValue)
+			}
+			cases = runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{disabled, ready},
+				[]unsafe.Pointer{
+					unsafe.Pointer(&sendValue),
+					unsafe.Pointer(&receivedValue),
+				}, 1)
+			state = 2
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 2:
+			if chosen != 1 || !received || receivedValue != 53 {
+				t.Fatalf("ready select = (%d, %t, %d), want (1, true, 53)",
+					chosen, received, receivedValue)
+			}
+			cases = runtime.NewStacklessCoroSelectCasesForTest(
+				nil, nil, 0)
+			chosen = -2
+			received = true
+			state = 3
+			runtime.SelectStacklessCoroForTest(ctx, cases, false,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 3:
+			if chosen != -1 || received {
+				t.Fatalf("default select = (%d, %t), want (-1, false)",
+					chosen, received)
+			}
+			receivedValue = -1
+			cases = runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{closed}, []unsafe.Pointer{
+					unsafe.Pointer(&receivedValue),
+				}, 0)
+			chosen = -2
+			received = true
+			state = 4
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 4:
+			if chosen != 0 || received || receivedValue != 0 {
+				t.Fatalf("closed receive select = (%d, %t, %d), want (0, false, 0)",
+					chosen, received, receivedValue)
+			}
+			state = 5
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroSelectBlocked(t *testing.T) {
+	first := make(chan int)
+	second := make(chan int)
+	value := -1
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{first, second},
+		[]unsafe.Pointer{unsafe.Pointer(&value), unsafe.Pointer(&value)}, 0)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			firstSend, firstRecv, firstLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(first)
+			secondSend, secondRecv, secondLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if firstSend == 0 && firstRecv == 1 && firstLogical == 1 &&
+				secondSend == 0 && secondRecv == 1 && secondLogical == 1 {
+				second <- 61
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("select waiters were not queued: first=(%d,%d,%d) second=(%d,%d,%d)",
+					firstSend, firstRecv, firstLogical,
+					secondSend, secondRecv, secondLogical)
+				close(first)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 1 || !received || value != 61 {
+				t.Fatalf("blocked select = (%d, %t, %d), want (1, true, 61)",
+					chosen, received, value)
+			}
+			for _, channel := range []chan int{first, second} {
+				send, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if send != 0 || recv != 0 || logical != 0 {
+					t.Fatalf("select loser remained queued: (%d, %d, %d)",
+						send, recv, logical)
+				}
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	<-peerDone
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
+	}
+}
+
+func TestStacklessCoroSelectReadyPeers(t *testing.T) {
+	t.Run("Receiver", func(t *testing.T) {
+		channel := make(chan int)
+		result := make(chan int, 1)
+		go func() {
+			result <- <-channel
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			send, recv, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(channel)
+			if send == 0 && recv == 1 && logical == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				close(channel)
+				t.Fatal("ordinary select receiver was not queued")
+			}
+			runtime.Gosched()
+		}
+
+		value := 63
+		chosen := -1
+		received := true
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 1)
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if chosen != 0 || received {
+					t.Fatalf("send select = (%d, %t), want (0, false)",
+						chosen, received)
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if got := <-result; got != value {
+			t.Fatalf("ordinary receiver got %d, want %d", got, value)
+		}
+	})
+
+	t.Run("Sender", func(t *testing.T) {
+		channel := make(chan int)
+		sent := make(chan struct{})
+		go func() {
+			channel <- 65
+			close(sent)
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			send, recv, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(channel)
+			if send == 1 && recv == 0 && logical == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("ordinary select sender was not queued")
+			}
+			runtime.Gosched()
+		}
+
+		value := -1
+		chosen := -1
+		received := false
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if chosen != 0 || !received || value != 65 {
+					t.Fatalf("receive select = (%d, %t, %d), want (0, true, 65)",
+						chosen, received, value)
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		<-sent
+	})
+}
+
+func TestStacklessCoroSelectBlockedSend(t *testing.T) {
+	first := make(chan int)
+	second := make(chan int)
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	firstValue := 67
+	secondValue := 69
+	var timeoutValue time.Time
+	chosen := -1
+	received := true
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{first, second, timer.C},
+		[]unsafe.Pointer{
+			unsafe.Pointer(&firstValue),
+			unsafe.Pointer(&secondValue),
+			unsafe.Pointer(&timeoutValue),
+		}, 2)
+	peerResult := make(chan int, 1)
+	go func() {
+		for {
+			firstSend, firstRecv, firstLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(first)
+			secondSend, secondRecv, secondLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if firstSend == 1 && firstRecv == 0 && firstLogical == 1 &&
+				secondSend == 1 && secondRecv == 0 && secondLogical == 1 {
+				peerResult <- <-second
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 1 || received {
+				t.Fatalf("blocked send select = (%d, %t), want (1, false)",
+					chosen, received)
+			}
+			for _, channel := range []any{first, second, timer.C} {
+				send, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if send != 0 || recv != 0 || logical != 0 {
+					t.Fatalf("send select loser remained queued: (%d, %d, %d)",
+						send, recv, logical)
+				}
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if value := <-peerResult; value != secondValue {
+		t.Fatalf("blocked select sent %d, want %d", value, secondValue)
+	}
+}
+
+func TestStacklessCoroSelectTimer(t *testing.T) {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	var value time.Time
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{timer.C}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+	state := 0
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 0 || !received || value.IsZero() {
+				t.Fatalf("timer select = (%d, %t, %v), want timer value",
+					chosen, received, value)
+			}
+			send, recv, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(timer.C)
+			if send != 0 || recv != 0 || logical != 0 {
+				t.Fatalf("timer select waiter remained queued: (%d, %d, %d)",
+					send, recv, logical)
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroSelectClose(t *testing.T) {
+	first := make(chan int)
+	second := make(chan int)
+	value := -1
+	chosen := -1
+	received := true
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{first, first, second},
+		[]unsafe.Pointer{
+			unsafe.Pointer(&value),
+			unsafe.Pointer(&value),
+			unsafe.Pointer(&value),
+		}, 0)
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_, firstRecv, _ :=
+				runtime.StacklessCoroChannelWaitersForTest(first)
+			_, secondRecv, _ :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if firstRecv == 2 && secondRecv == 1 {
+				close(first)
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("select close waiters were not queued")
+				close(first)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if (chosen != 0 && chosen != 1) || received || value != 0 {
+				t.Fatalf("closed select = (%d, %t, %d), want duplicate closed case",
+					chosen, received, value)
+			}
+			_, recv, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if recv != 0 || logical != 0 {
+				t.Fatalf("closed select loser remained queued: (%d, %d)",
+					recv, logical)
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroSelectBlockedSendPanic(t *testing.T) {
+	if race.Enabled {
+		t.Skip("concurrent channel close and send is a data race")
+	}
+	channel := make(chan int)
+	value := 71
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 1)
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			send, recv, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(channel)
+			if send == 1 && recv == 0 && logical == 1 {
+				close(channel)
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("blocked select sender was not queued")
+				close(channel)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				return action
+			}
+			switch state {
+			case 0:
+				state = 1
+				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received)
+				return runtime.StacklessCoroActionWait
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	}()
+	<-peerDone
+	err, ok := recovered.(error)
+	if !ok || err.Error() != "send on closed channel" {
+		t.Fatalf("recovered blocked select panic = %v, want send on closed channel",
+			recovered)
+	}
+}
+
+func TestStacklessCoroSelectPanic(t *testing.T) {
+	channel := make(chan int)
+	close(channel)
+	value := 67
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 1)
+	state := 0
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				return action
+			}
+			switch state {
+			case 0:
+				state = 1
+				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received)
+				return runtime.StacklessCoroActionWait
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	}()
+	err, ok := recovered.(error)
+	if !ok || err.Error() != "send on closed channel" {
+		t.Fatalf("recovered select panic = %v, want send on closed channel",
+			recovered)
+	}
 }
 
 func TestStacklessCoroChannelPanic(t *testing.T) {

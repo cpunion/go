@@ -60,12 +60,12 @@ func chansendStackless(op *stacklessCoroOperation) {
 	lock(&c.lock)
 	if c.closed != 0 {
 		unlock(&c.lock)
-		finishStacklessCoroChannel(unsafe.Pointer(op), false)
+		finishStacklessCoroChannel(unsafe.Pointer(op), nil, false)
 		return
 	}
 	if sg := c.recvq.dequeue(); sg != nil {
 		send(c, sg, op.element, func() { unlock(&c.lock) }, 3)
-		finishStacklessCoroChannel(unsafe.Pointer(op), true)
+		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
 	if c.qcount < c.dataqsiz {
@@ -80,7 +80,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 		}
 		c.qcount++
 		unlock(&c.lock)
-		finishStacklessCoroChannel(unsafe.Pointer(op), true)
+		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
 
@@ -123,12 +123,12 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 			if op.element != nil {
 				typedmemclr(c.elemtype, op.element)
 			}
-			finishStacklessCoroChannel(unsafe.Pointer(op), false)
+			finishStacklessCoroChannel(unsafe.Pointer(op), nil, false)
 			return
 		}
 	} else if sg := c.sendq.dequeue(); sg != nil {
 		recv(c, sg, op.element, func() { unlock(&c.lock) }, 3)
-		finishStacklessCoroChannel(unsafe.Pointer(op), true)
+		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
 	if c.qcount > 0 {
@@ -146,7 +146,7 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 		}
 		c.qcount--
 		unlock(&c.lock)
-		finishStacklessCoroChannel(unsafe.Pointer(op), true)
+		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
 
