@@ -1939,6 +1939,50 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	return nil
 }
 
+func reparentClosureCaptures(fn, resume *ir.Func,
+	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node) error {
+	// Source function literals now execute inside resume. Reparent them and
+	// route their captures through resume's copy of each factory local.
+	// Defer wrappers need specialized snapshot and terminal rewriting, so
+	// leave those closures alone here.
+	var captureErr error
+	ir.Visit(fn, func(node ir.Node) {
+		if captureErr != nil {
+			return
+		}
+		closure, ok := node.(*ir.ClosureExpr)
+		if !ok || closure.Func.ClosureParent != fn ||
+			deferClosures[closure.Func] {
+			return
+		}
+		closure.Func.ClosureParent = resume
+		for _, variable := range closure.Func.ClosureVars {
+			outer, ok := edit(variable.Outer).(*ir.Name)
+			if !ok {
+				captureErr = fmt.Errorf(
+					"%s: closure capture is not a variable",
+					ir.PkgFuncName(fn))
+				return
+			}
+			variable.Outer = outer
+			variable.Defn = outer.Canonical()
+		}
+		// Reparenting can change the canonical definition of a variable
+		// captured again by a nested literal. Refresh that descendant chain
+		// before escape analysis assigns locations.
+		ir.Visit(closure.Func, func(node ir.Node) {
+			nested, ok := node.(*ir.ClosureExpr)
+			if !ok {
+				return
+			}
+			for _, variable := range nested.Func.ClosureVars {
+				variable.Defn = variable.Outer.Canonical()
+			}
+		})
+	})
+	return captureErr
+}
+
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
@@ -2698,6 +2742,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		ir.EditChildren(node, edit)
 		return node
+	}
+
+	deferClosures := make(map[*ir.Func]bool, len(candidate.defers))
+	for _, deferred := range candidate.defers {
+		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
+			deferClosures[closure.Func] = true
+		}
+	}
+	if err := reparentClosureCaptures(fn, resume, deferClosures, edit); err != nil {
+		return err
 	}
 
 	prepareForeignCall := func(stmt ir.Node, call *ir.CallExpr) (ir.Nodes, error) {
