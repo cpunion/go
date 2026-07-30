@@ -73,6 +73,7 @@ type stacklessCoroScheduler struct {
 	executorWake   chan struct{}
 	executorDone   chan struct{}
 	executorsReady atomic.Uint32
+	runnable       atomic.Uint32
 }
 
 // A stacklessCoroOperation is owned by the runtime registry until its source
@@ -745,10 +746,11 @@ func coroExitForeign() {
 }
 
 // coroEnterBlocking wakes replacement capacity, saves its caller as the
-// syscall continuation, and enters foreign-call state. Its caller is the
-// generated resume frame and remains active until coroExitBlocking. Saving the
-// helper frame itself would leave exitsyscall with an invalid continuation
-// after this function returns.
+// syscall continuation, and enters foreign-call state. If another logical
+// task can run, it promptly hands the P to replacement capacity. Its caller
+// is the generated resume frame and remains active until coroExitBlocking.
+// Saving the helper frame itself would leave exitsyscall with an invalid
+// continuation after this function returns.
 //
 //go:nosplit
 func coroEnterBlocking(ctx unsafe.Pointer) {
@@ -756,7 +758,7 @@ func coroEnterBlocking(ctx unsafe.Pointer) {
 	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine blocking call")
 	}
-	context.scheduler.wakeReplacementExecutor()
+	handoff := context.scheduler.wakeReplacementExecutor()
 
 	// Keep this state transition in sync with coroEnterForeign. It is
 	// open-coded so the blocking path crosses one runtime boundary.
@@ -773,7 +775,11 @@ func coroEnterBlocking(ctx unsafe.Pointer) {
 	pc := sys.GetCallerPC()
 	sp := sys.GetCallerSP()
 	bp := getcallerfp()
-	reentersyscall(pc, sp, bp)
+	if handoff {
+		reentersyscallblock(pc, sp, bp)
+	} else {
+		reentersyscall(pc, sp, bp)
+	}
 
 	osPreemptExtEnter(mp)
 	gp.nocgocallback = true
@@ -881,6 +887,7 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
 		s.tail.next = task
 	}
 	s.tail = task
+	s.runnable.Add(1)
 	if raceenabled {
 		// Runtime mutex operations are invisible to the race detector.
 		// Merge both the previous resume episode and the producer that made
@@ -900,6 +907,7 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	if s.head == nil {
 		s.tail = nil
 	}
+	s.runnable.Add(-1)
 	task.next = nil
 	if task.state != stacklessCoroTaskRunnable || task.resuming ||
 		task.readyPending {
@@ -1107,11 +1115,15 @@ func (s *stacklessCoroScheduler) replacementExecutor() {
 	s.executorDone <- struct{}{}
 }
 
+// wakeReplacementExecutor notifies replacement capacity. It reports whether
+// logical work was queued before the notification.
+//
 //go:nosplit
-func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
+func (s *stacklessCoroScheduler) wakeReplacementExecutor() bool {
 	if s == nil || s.executorsReady.Load() == 0 {
-		return
+		return false
 	}
+	handoff := s.runnable.Load() != 0
 	// A replacement that has already entered run waits on wake, not
 	// executorWake. Notify both admitted and not-yet-admitted executors so
 	// repeated blocking calls can reuse the fixed pool.
@@ -1123,6 +1135,7 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 	case s.executorWake <- struct{}{}:
 	default:
 	}
+	return handoff
 }
 
 func (s *stacklessCoroScheduler) stopReplacementExecutors() {

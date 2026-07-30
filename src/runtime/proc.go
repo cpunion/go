@@ -4829,6 +4829,19 @@ func entersyscallHandleGCWait(trace traceLocker) {
 //go:linkname entersyscallblock
 //go:nosplit
 func entersyscallblock() {
+	// N.B. getcallerfp cannot be written directly as argument in the call
+	// to reentersyscallblock because it forces spilling the other arguments
+	// to the stack. This results in exceeding the nosplit stack requirements
+	// on some platforms.
+	fp := getcallerfp()
+	reentersyscallblock(sys.GetCallerPC(), sys.GetCallerSP(), fp)
+}
+
+// reentersyscallblock is like entersyscallblock, but uses an explicitly
+// saved caller frame. The frame must remain valid until exitsyscall.
+//
+//go:nosplit
+func reentersyscallblock(pc, sp, bp uintptr) {
 	gp := getg()
 
 	gp.m.locks++ // see comment in entersyscall
@@ -4840,9 +4853,6 @@ func entersyscallblock() {
 	addGSyscallNoP(gp.m) // We're going to give up our P.
 
 	// Leave SP around for GC and traceback.
-	pc := sys.GetCallerPC()
-	sp := sys.GetCallerSP()
-	bp := getcallerfp()
 	save(pc, sp, bp)
 	gp.syscallsp = gp.sched.sp
 	gp.syscallpc = gp.sched.pc
@@ -4895,7 +4905,7 @@ func entersyscallblock() {
 	}
 
 	// Resave for traceback during blocked call.
-	save(sys.GetCallerPC(), sys.GetCallerSP(), getcallerfp())
+	save(pc, sp, bp)
 
 	gp.m.locks--
 }
