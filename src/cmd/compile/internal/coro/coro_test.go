@@ -806,6 +806,219 @@ func main() {
 	}
 }
 
+func TestTimerAPILowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	progress        int32
+	afterFuncDone   chan struct{}
+	timerPanic      any
+	timerPanicCalls int
+)
+
+//go:noinline
+func markProgress() {
+	atomic.StoreInt32(&progress, 1)
+	runtime.Gosched()
+}
+
+//go:noinline
+func sleepProgress() bool {
+	go markProgress()
+	time.Sleep(20 * time.Millisecond)
+	return atomic.LoadInt32(&progress) != 0
+}
+
+//go:noinline
+func afterWait() bool {
+	select {
+	case value, ok := <-time.After(time.Millisecond):
+		return ok && !value.IsZero()
+	}
+}
+
+//go:noinline
+func finishAfterFunc() {
+	close(afterFuncDone)
+}
+
+// Keep the callback top-level so this test isolates timer scheduling from
+// captured-local closure lowering.
+//go:noinline
+func afterFuncWait() bool {
+	afterFuncDone = make(chan struct{})
+	timer := time.AfterFunc(time.Hour, finishAfterFunc)
+	if !timer.Stop() {
+		return false
+	}
+	if timer.Reset(time.Millisecond) {
+		return false
+	}
+	select {
+	case <-afterFuncDone:
+		return !timer.Stop()
+	}
+}
+
+//go:noinline
+func resetWait() bool {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		return false
+	}
+	if timer.Reset(time.Millisecond) {
+		return false
+	}
+	select {
+	case value, ok := <-timer.C:
+		return ok && !value.IsZero()
+	}
+}
+
+//go:noinline
+func stoppedTimer() bool {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		return false
+	}
+	select {
+	case <-timer.C:
+		return false
+	default:
+		return true
+	}
+}
+
+//go:noinline
+func tickerWait() int {
+	ticker := time.NewTicker(time.Millisecond)
+	count := 0
+	for count < 3 {
+		select {
+		case <-ticker.C:
+			count++
+			if count == 1 {
+				ticker.Reset(2 * time.Millisecond)
+			}
+		}
+	}
+	ticker.Stop()
+	return count
+}
+
+//go:noinline
+func tickWait() bool {
+	select {
+	case value, ok := <-time.Tick(time.Millisecond):
+		return ok && !value.IsZero()
+	}
+}
+
+//go:noinline
+func captureTimerPanic() {
+	timerPanic = recover()
+}
+
+//go:noinline
+func invalidTicker() {
+	defer captureTimerPanic()
+	runtime.Gosched()
+	timerPanicCalls++
+	time.NewTicker(0)
+	timerPanicCalls += 100
+}
+
+func main() {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	invalidTicker()
+	if !sleepProgress() || !afterWait() || !afterFuncWait() ||
+		!resetWait() || !stoppedTimer() || tickerWait() != 3 ||
+		!tickWait() ||
+		timerPanic == nil ||
+		timerPanicCalls != 1 {
+		panic("bad stackless coroutine timer API result")
+	}
+	println("stackless-coro-timer-api-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-timer-api")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building timer API test failed: %v\n%s", err, out)
+	}
+	if want := "coro: phase=lower lowered="; !strings.Contains(out, want) {
+		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	for _, name := range []string{
+		"markProgress", "sleepProgress", "afterWait", "afterFuncWait",
+		"resetWait", "stoppedTimer", "tickerWait", "tickWait",
+		"invalidTicker",
+	} {
+		if want := "coro: phase=pre-lower-ssa func=" + name + ".coro,"; !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("timer API test failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-timer-api-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(sleepProgress|afterWait|afterFuncWait|resetWait|stoppedTimer|tickerWait|tickWait|invalidTicker)\.coro\.func[0-9]+$`,
+		exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("objdump of timer API resumes failed: %v\n%s", err, data)
+	}
+	disassembly := string(data)
+	for _, want := range []string{
+		"runtime.coroSleep", "runtime.coroSelect",
+		"runtime.coroTerminalAction", "time.AfterFunc",
+		"time.NewTicker", "time.Tick",
+	} {
+		if !strings.Contains(disassembly, want) {
+			t.Errorf("timer API resumes do not call %s\n%s", want, disassembly)
+		}
+	}
+	for _, unwanted := range []string{"runtime.selectgo", "runtime.chanrecv"} {
+		if strings.Contains(disassembly, unwanted) {
+			t.Errorf("timer API resumes unexpectedly call %s\n%s",
+				unwanted, disassembly)
+		}
+	}
+}
+
 func TestFixedDeferLowering(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

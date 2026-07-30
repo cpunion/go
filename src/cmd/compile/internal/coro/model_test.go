@@ -210,10 +210,23 @@ func TestEdgeNeedsCoroEntry(t *testing.T) {
 	}) {
 		t.Fatal("System ABI imported edge does not require a coroutine entry")
 	}
-	if !plan.edgeNeedsCoroEntry(Edge{
+	if plan.edgeNeedsCoroEntry(Edge{
 		Imported: FuncSummary{Terminal: MayPanic},
 	}) {
-		t.Fatal("panicking imported edge does not require a coroutine entry")
+		t.Fatal("native-safe panicking imported edge requires a coroutine entry")
+	}
+	if !plan.edgeNeedsCoroEntry(Edge{
+		Imported: FuncSummary{
+			Terminal: MayPanic,
+			Factory:  FactoryABI1,
+		},
+	}) {
+		t.Fatal("panicking imported edge with a factory does not require it")
+	}
+	local := testFunc("localPanic")
+	plan.Functions[local] = &Function{Func: local, Terminal: MayPanic}
+	if !plan.edgeNeedsCoroEntry(Edge{Callee: local}) {
+		t.Fatal("panicking local edge does not require a coroutine entry")
 	}
 	if !plan.edgeNeedsCoroEntry(Edge{
 		Imported: FuncSummary{Terminal: MayGoexit},
