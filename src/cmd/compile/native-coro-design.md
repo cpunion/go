@@ -2136,6 +2136,33 @@ exposes the larger root-creation cost. The entry measurements are evidence for
 the separate cross-package entry design question in section 10.9, not
 justification for adding source annotations.
 
+A follow-up benchmark uses the same non-leaf C body for ordinary cgo and
+transparent `DirectMayBlock`. The body writes one byte to a pipe and waits on
+an atomic gate set by a Go worker. It reports both the interval from the C
+write until the worker releases the gate and the complete call-and-return
+time. Each value below is the median of ten 500 ms samples:
+
+| Platform | Path | Time to Go progress | Complete round trip |
+| --- | --- | ---: | ---: |
+| Darwin/arm64 | ordinary cgo | 1.575 us | 1.765 us |
+| Darwin/arm64 | transparent `DirectMayBlock` | 1.581 us | 1.798 us |
+| Linux/amd64 translated | ordinary cgo | 2.951 ms | 2.967 ms |
+| Linux/amd64 translated | transparent `DirectMayBlock` | 2.915 ms | 2.950 ms |
+
+The Darwin samples ran on an Apple M4 Max. The translated Linux samples ran on
+the QEMU TCG guest and show substantially more scheduler noise. Both paths
+reported zero allocations per call; the translated direct batch amortized its
+one root setup to 2 B per call.
+
+The platform directions differ and the Darwin distributions overlap, so this
+does not yet demonstrate a lower blocking handoff cost. It does show prompt
+forward progress and establishes separate regression metrics for the handoff
+and return sides. In the same Darwin run, the steady nonblocking direct
+boundary was 4.011 ns versus 13.35 ns for ordinary cgo. That remains the
+measured evidence that avoiding the general cgo transition can reduce cost.
+A coroutine-specific blocking handoff must demonstrate the same advantage in
+`ns/progress` without moving a large penalty into P reacquisition on return.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped

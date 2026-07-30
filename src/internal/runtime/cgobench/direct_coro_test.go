@@ -81,11 +81,14 @@ func testFailedHandoff(t *testing.T, reset func(), handoffs func(int, int) uint6
 // Run these benchmarks with:
 //
 //	GOEXPERIMENT=coro go test internal/runtime/cgobench \
-//		-run=^$ -bench='Cgo(CallsSteady|CallEntry)$' \
+//		-run=^$ \
+//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|BlockingHandoff)$' \
 //		-gcflags=internal/runtime/cgobench='-l -d=coro=4'
 //
 // The Steady benchmarks batch calls within one coroutine root and isolate the
 // foreign boundary. The Entry benchmarks include root setup on every call.
+// The blocking benchmarks report both full round-trip time and the interval
+// until another goroutine makes progress.
 func BenchmarkOrdinaryCgoCallsSteady(b *testing.B) {
 	cgobench.CgoCalls(b.N)
 }
