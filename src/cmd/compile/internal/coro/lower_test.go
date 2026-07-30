@@ -1436,8 +1436,7 @@ func TestLowerStateMachines(t *testing.T) {
 			runLoops, runSwitches)
 	}
 	if want := []string{
-		"coroPrepareBlocking", "entersyscall", "coroEnterForeign",
-		"directEntry", "coroExitForeign", "exitsyscall",
+		"coroEnterBlocking", "directEntry", "coroExitBlocking",
 	}; !slices.Equal(runCalls, want) {
 		t.Errorf("run-to-completion calls = %v, want %v", runCalls, want)
 	}

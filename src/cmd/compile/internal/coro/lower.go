@@ -3705,22 +3705,18 @@ func ordinaryReadOperation(call *ir.CallExpr) bool {
 	return false
 }
 
-// blockingForeignEnter and blockingForeignExit keep entersyscall and
-// exitsyscall in the generated resume frame. Separate runtime wrappers would
-// make the saved syscall frame invalid when exitsyscall takes its slow path.
+// blockingForeignEnter and blockingForeignExit surround a direct call with
+// the runtime's blocking foreign-call state.
 func blockingForeignEnter(pos src.XPos, ctx ir.Node) ir.Nodes {
 	return ir.Nodes{
-		typecheck.Call(pos, typecheck.LookupRuntime("coroPrepareBlocking"),
+		typecheck.Call(pos, typecheck.LookupRuntime("coroEnterBlocking"),
 			ir.Nodes{ctx}, false),
-		typecheck.Call(pos, typecheck.LookupRuntime("entersyscall"), nil, false),
-		typecheck.Call(pos, typecheck.LookupRuntime("coroEnterForeign"), nil, false),
 	}
 }
 
 func blockingForeignExit(pos src.XPos) ir.Nodes {
 	return ir.Nodes{
-		typecheck.Call(pos, typecheck.LookupRuntime("coroExitForeign"), nil, false),
-		typecheck.Call(pos, typecheck.LookupRuntime("exitsyscall"), nil, false),
+		typecheck.Call(pos, typecheck.LookupRuntime("coroExitBlocking"), nil, false),
 	}
 }
 

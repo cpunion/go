@@ -244,22 +244,16 @@ func BlockingReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte)
 	if len(buffer) == 0 {
 		return 0
 	}
-	coroPrepareBlocking(ctx)
-	entersyscall()
-	coroEnterForeign()
+	coroEnterBlocking(ctx)
 	n := read(int32(fd), unsafe.Pointer(&buffer[0]), int32(len(buffer)))
-	coroExitForeign()
-	exitsyscall()
+	coroExitBlocking()
 	KeepAlive(buffer)
 	return int(n)
 }
 
 func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
-	coroPrepareBlocking(ctx)
-	entersyscall()
-	coroEnterForeign()
-	coroExitForeign()
-	exitsyscall()
+	coroEnterBlocking(ctx)
+	coroExitBlocking()
 }
 
 func CheckEarlyReadyStacklessCoroForTest() bool {

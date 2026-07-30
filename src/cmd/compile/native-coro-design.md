@@ -711,18 +711,23 @@ migrate until the call returns. The M and executor stack are temporarily
 pinned by the C call. Other logical goroutines make progress on a replacement
 M and executor.
 
-The first correct implementation reuses `entersyscall` and `exitsyscall` for
-the scheduler and GC state transition. The compiler emits both calls in the
-generated resume frame so that the saved syscall PC, SP, and frame pointer
-remain valid on the slow return path. It does not route through
-`runtime.cgocall` or `runtime.asmcgocall`.
+The implementation reuses `reentersyscall` and `exitsyscall` for the scheduler
+and GC state transition. The combined blocking-entry helper explicitly saves
+its generated resume caller as the syscall PC, SP, and frame pointer. That
+resume frame remains active until the combined exit helper calls
+`exitsyscall`, including on its slow return path. The helpers also open-code
+the no-callback foreign state transition, so each side crosses one runtime
+boundary. The call does not route through `runtime.cgocall` or
+`runtime.asmcgocall`.
 
 `entersyscallblock` is not an unconditional improvement for this execution
-model. It hands off the P immediately, but a fixed native-stack executor is
-locked to its original M. If another M owns the P when C returns, that executor
-must take the locked-M slow return path. A coroutine-specific handoff remains
-a later optimization, but it must reduce the forward handoff and return costs
-together while preserving GC, trace, stop-the-world, and scheduler behavior.
+model. Calling it inside a helper saves a helper frame that is invalid after
+the helper returns. Emitting it directly in the resume frame is correct and
+hands off the P immediately, but a fixed native-stack executor is locked to
+its original M. If another M owns the P when C returns, that executor must take
+the locked-M slow return path. A coroutine-specific handoff remains a later
+optimization, but it must reduce the forward handoff and return costs together
+while preserving GC, trace, stop-the-world, and scheduler behavior.
 
 This path does not eliminate M replacement. Its intended advantage over
 ordinary cgo is a cheaper handoff: the old M remains in C as before, but the
@@ -1745,8 +1750,9 @@ The runtime:
   non-leaf C function from overwriting the Go frame pointer saved at `SP-8`;
 - releases scheduler capacity around a blocking C call, allowing another
   stackless logical goroutine to run at `GOMAXPROCS=1`;
-- keeps syscall entry and exit in the generated resume frame and reuses both
-  admitted and waiting replacement executors across repeated blocking calls.
+- explicitly saves the generated resume frame in its combined blocking entry,
+  exits syscall state before that frame unwinds, and reuses both admitted and
+  waiting replacement executors across repeated blocking calls.
 
 The transparent cgo frontend:
 
@@ -2162,6 +2168,20 @@ boundary was 4.011 ns versus 13.35 ns for ordinary cgo. That remains the
 measured evidence that avoiding the general cgo transition can reduce cost.
 A coroutine-specific blocking handoff must demonstrate the same advantage in
 `ns/progress` without moving a large penalty into P reacquisition on return.
+
+Combining blocking preparation, caller-frame capture, syscall entry, and
+foreign bookkeeping into one runtime entry reduces the conservative direct
+boundary itself. Ten later 500 ms Darwin/arm64 samples measured a median of
+12.61 ns for transparent `DirectMayBlock` versus 13.28 ns for ordinary cgo.
+The same run measured 1.614 us versus 1.610 us until Go progress and 1.837 us
+versus 1.804 us for the complete round trip. The boundary is approximately 5%
+smaller, while the thread handoff and return remain effectively scheduler
+costs.
+
+For comparison, a direct-resume experiment with `entersyscallblock` measured
+approximately 6.5 us until Go progress and 11.2 us for the round trip. It was
+correct only when emitted in the resume frame and was slower on both sides, so
+the implementation does not use it.
 
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and

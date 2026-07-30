@@ -207,9 +207,8 @@ func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroCallRead(unsafe.Pointer, func())
 func coroEnterForeign()
 func coroExitForeign()
-func coroPrepareBlocking(unsafe.Pointer)
-func entersyscall()
-func exitsyscall()
+func coroEnterBlocking(unsafe.Pointer)
+func coroExitBlocking()
 func coroAsyncDouble(unsafe.Pointer, int, int, uint64, *uint64, *uintptr)
 
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer

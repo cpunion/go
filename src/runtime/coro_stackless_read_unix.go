@@ -46,12 +46,9 @@ func coroCallRead(ctx unsafe.Pointer, call func()) {
 
 func coroAsyncDouble(ctx unsafe.Pointer, readFD, writeFD int, value uint64, result *uint64, errno *uintptr) {
 	op := startStacklessCoroAsync(ctx, readFD, result, errno)
-	coroPrepareBlocking(ctx)
-	entersyscall()
-	coroEnterForeign()
+	coroEnterBlocking(ctx)
 	submitErr := coroSubmit(op.id, value, int32(writeFD))
-	coroExitForeign()
-	exitsyscall()
+	coroExitBlocking()
 	if submitErr != 0 {
 		failStacklessCoroAsync(op.id, uintptr(submitErr))
 		return
