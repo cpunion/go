@@ -5524,6 +5524,113 @@ func TestTransformedRangeVariable(t *testing.T) {
 	}
 }
 
+func TestReparentClosureCaptures(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/closurecapture", "closurecapture")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	fn := newLowerTestFunc(pkg, "source")
+	resume := newLowerTestFunc(pkg, "resume")
+	source := fn.NewLocal(src.NoXPos, pkg.Lookup("sourceValue"),
+		types.Types[types.TINT])
+	resumeSource := resume.NewLocal(src.NoXPos, pkg.Lookup("resumeValue"),
+		types.Types[types.TINT])
+
+	closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), fn, typecheck.Target, 0)
+	closure.DeclareParams(true)
+	captured := ir.NewClosureVar(src.NoXPos, closure, source)
+	nested := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), closure, typecheck.Target, 0)
+	nested.DeclareParams(true)
+	nestedCapture := ir.NewClosureVar(src.NoXPos, nested, captured)
+	nestedTarget := closure.NewLocal(src.NoXPos, pkg.Lookup("nested"),
+		nested.Type())
+	closure.Body = ir.Nodes{
+		ir.NewAssignStmt(src.NoXPos, nestedTarget, nested.OClosure),
+	}
+
+	excluded := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), fn, typecheck.Target, 0)
+	excluded.DeclareParams(true)
+	excludedCapture := ir.NewClosureVar(src.NoXPos, excluded, source)
+	closureTarget := fn.NewLocal(src.NoXPos, pkg.Lookup("closure"),
+		closure.Type())
+	excludedTarget := fn.NewLocal(src.NoXPos, pkg.Lookup("excluded"),
+		excluded.Type())
+	fn.Body = ir.Nodes{
+		ir.NewAssignStmt(src.NoXPos, closureTarget, closure.OClosure),
+		ir.NewAssignStmt(src.NoXPos, excludedTarget, excluded.OClosure),
+	}
+
+	edit := func(node ir.Node) ir.Node {
+		if node == source {
+			return resumeSource
+		}
+		return node
+	}
+	if err := reparentClosureCaptures(fn, resume,
+		map[*ir.Func]bool{excluded: true}, edit); err != nil {
+		t.Fatal(err)
+	}
+	if closure.ClosureParent != resume {
+		t.Fatalf("closure parent = %v, want resume", closure.ClosureParent)
+	}
+	if captured.Outer != resumeSource ||
+		captured.Defn != resumeSource.Canonical() {
+		t.Fatalf("capture = (outer %v, definition %v), want %v",
+			captured.Outer, captured.Defn, resumeSource)
+	}
+	if nested.ClosureParent != closure ||
+		nestedCapture.Defn != captured.Canonical() {
+		t.Fatalf("nested capture = (parent %v, definition %v), want (%v, %v)",
+			nested.ClosureParent, nestedCapture.Defn,
+			closure, captured.Canonical())
+	}
+	if excluded.ClosureParent != fn ||
+		excludedCapture.Outer != source {
+		t.Fatalf("excluded capture = (parent %v, outer %v), want (%v, %v)",
+			excluded.ClosureParent, excludedCapture.Outer, fn, source)
+	}
+
+	badFn := newLowerTestFunc(pkg, "badSource")
+	badResume := newLowerTestFunc(pkg, "badResume")
+	badSource := badFn.NewLocal(src.NoXPos, pkg.Lookup("badValue"),
+		types.Types[types.TINT])
+	badClosure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), badFn, typecheck.Target, 0)
+	badClosure.DeclareParams(true)
+	ir.NewClosureVar(src.NoXPos, badClosure, badSource)
+	badTarget := badFn.NewLocal(src.NoXPos, pkg.Lookup("badClosure"),
+		badClosure.Type())
+	laterClosure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), badFn, typecheck.Target, 0)
+	laterClosure.DeclareParams(true)
+	laterTarget := badFn.NewLocal(src.NoXPos, pkg.Lookup("laterClosure"),
+		laterClosure.Type())
+	badFn.Body = ir.Nodes{
+		ir.NewAssignStmt(src.NoXPos, badTarget, badClosure.OClosure),
+		ir.NewAssignStmt(src.NoXPos, laterTarget, laterClosure.OClosure),
+	}
+	err := reparentClosureCaptures(badFn, badResume, nil,
+		func(ir.Node) ir.Node {
+			return ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
+				constant.MakeInt64(0))
+		})
+	if err == nil || !strings.Contains(err.Error(),
+		"badSource: closure capture is not a variable") {
+		t.Fatalf("reparentClosureCaptures error = %v", err)
+	}
+}
+
 func TestLowerRejectsRangeVariableClosure(t *testing.T) {
 	prepareLowerTest(t)
 

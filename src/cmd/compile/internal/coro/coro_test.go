@@ -821,7 +821,6 @@ import (
 
 var (
 	progress        int32
-	afterFuncDone   chan struct{}
 	timerPanic      any
 	timerPanicCalls int
 )
@@ -848,16 +847,11 @@ func afterWait() bool {
 }
 
 //go:noinline
-func finishAfterFunc() {
-	close(afterFuncDone)
-}
-
-// Keep the callback top-level so this test isolates timer scheduling from
-// captured-local closure lowering.
-//go:noinline
 func afterFuncWait() bool {
-	afterFuncDone = make(chan struct{})
-	timer := time.AfterFunc(time.Hour, finishAfterFunc)
+	done := make(chan struct{})
+	timer := time.AfterFunc(time.Hour, func() {
+		close(done)
+	})
 	if !timer.Stop() {
 		return false
 	}
@@ -865,7 +859,7 @@ func afterFuncWait() bool {
 		return false
 	}
 	select {
-	case <-afterFuncDone:
+	case <-done:
 		return !timer.Stop()
 	}
 }
@@ -1016,6 +1010,118 @@ func main() {
 			t.Errorf("timer API resumes unexpectedly call %s\n%s",
 				unwanted, disassembly)
 		}
+	}
+}
+
+func TestCapturedClosureLowering(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"runtime"
+	"time"
+)
+
+//go:noinline
+func captureParameter(value int) int {
+	done := make(chan struct{})
+	time.AfterFunc(time.Millisecond, func() {
+		value += 2
+		close(done)
+	})
+	runtime.Gosched()
+	<-done
+	return value
+}
+
+//go:noinline
+func captureResult(value int) (result int) {
+	result = value
+	done := make(chan struct{})
+	time.AfterFunc(time.Millisecond, func() {
+		result += 3
+		close(done)
+	})
+	<-done
+	return
+}
+
+//go:noinline
+func captureAfterSuspend(value int) int {
+	runtime.Gosched()
+	done := make(chan struct{})
+	time.AfterFunc(time.Millisecond, func() {
+		value += 4
+		close(done)
+	})
+	<-done
+	return value
+}
+
+//go:noinline
+func captureNested(value int) int {
+	done := make(chan struct{})
+	time.AfterFunc(time.Millisecond, func() {
+		func() {
+			value += 5
+			close(done)
+		}()
+	})
+	<-done
+	return value
+}
+
+func main() {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	if captureParameter(10) != 12 ||
+		captureResult(20) != 23 ||
+		captureAfterSuspend(30) != 34 ||
+		captureNested(40) != 45 {
+		panic("bad captured closure result")
+	}
+	println("stackless-coro-captured-closure-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-captured-closure")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-l -d=coro=4",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	out := string(data)
+	if err != nil {
+		t.Fatalf("building captured closure test failed: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"captureParameter", "captureResult",
+		"captureAfterSuspend", "captureNested",
+	} {
+		if want := "coro: phase=pre-lower-ssa func=" + name + ".coro,"; !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("captured closure test failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-captured-closure-ok"; !strings.Contains(string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
 }
 
