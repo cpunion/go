@@ -134,7 +134,7 @@ func TestCgoDirectCall(t *testing.T) {
 		{"unsupported result", func(_ *Package, n *Name) {
 			n.FuncType.Result = &Type{Size: 8, Go: &ast.StructType{}}
 		}},
-		{"errno result", func(_ *Package, n *Name) {
+		{"mismatched errno wrapper", func(_ *Package, n *Name) {
 			n.AddError = true
 		}},
 		{"invalid C symbol", func(p *Package, n *Name) {
@@ -244,18 +244,57 @@ func TestCgoDirectTypedef(t *testing.T) {
 }
 
 func TestCgoDirectErrno(t *testing.T) {
-	call := cgoDirectCall{
-		wrapper: "_Cfunc_read",
-		direct:  "_Cdirect_read",
-		symbol:  "read",
-		params:  []cgoDirectType{cgoDirectInt32, cgoDirectPointer, cgoDirectUint64},
-		result:  cgoDirectInt64,
-		errno:   true,
+	oldExperiment := buildcfg.Experiment
+	oldGccgo := *gccgo
+	buildcfg.Experiment.Coro = true
+	*gccgo = false
+	defer func() {
+		buildcfg.Experiment = oldExperiment
+		*gccgo = oldGccgo
+	}()
+
+	n := &Name{
+		C:        "read",
+		Kind:     "func",
+		Mangle:   "_C2func_read",
+		AddError: true,
+		FuncType: &FuncType{
+			Params: []*Type{
+				{Size: 4, Go: ast.NewIdent("int32")},
+				{Size: 8, Go: &ast.StarExpr{X: ast.NewIdent("byte")}},
+				{Size: 8, Go: ast.NewIdent("uint64")},
+			},
+			Result: &Type{Size: 8, Go: ast.NewIdent("int64")},
+		},
+	}
+	p := &Package{noCallbacks: map[string]bool{"read": true}}
+	call, ok := p.directCall(n)
+	if !ok {
+		t.Fatal("directCall rejected errno declaration")
+	}
+	if call.direct != "_Cdirect2_read" || !call.errno {
+		t.Fatalf("errno direct call = %+v", call)
 	}
 	var output bytes.Buffer
 	call.writeDirective(&output)
 	if got := output.String(); !strings.HasSuffix(got, " i32,ptr,u64 i64 errno\n") {
 		t.Fatalf("directive = %q, want errno signature", got)
+	}
+
+	limit := 8
+	if buildcfg.GOARCH == "amd64" {
+		limit = 6
+	}
+	n.FuncType.Params = make([]*Type, limit)
+	for i := range n.FuncType.Params {
+		n.FuncType.Params[i] = &Type{Size: 8, Go: ast.NewIdent("uint64")}
+	}
+	if _, ok := p.directCall(n); ok {
+		t.Fatal("directCall accepted errno result without a register for its result pointer")
+	}
+	n.FuncType.Result = nil
+	if _, ok := p.directCall(n); !ok {
+		t.Fatal("directCall rejected void errno declaration at the register limit")
 	}
 }
 
@@ -268,30 +307,37 @@ func TestCgoDirectFrame(t *testing.T) {
 		},
 		result: cgoDirectUint32,
 	}
-	params, result, size := cgoDirectFrame(call, 8)
+	params, result, errno, size := cgoDirectFrame(call, 8)
 	if got, want := fmt.Sprint(params), "[0 8 16]"; got != want {
 		t.Errorf("parameter offsets = %s, want %s", got, want)
 	}
-	if result != 24 || size != 28 {
-		t.Errorf("result offset and frame size = (%d, %d), want (24, 28)",
-			result, size)
+	if result != 24 || errno != 0 || size != 28 {
+		t.Errorf("result offsets and frame size = (%d, %d, %d), want (24, 0, 28)",
+			result, errno, size)
 	}
 
+	call.errno = true
+	params, result, errno, size = cgoDirectFrame(call, 8)
+	if result != 24 || errno != 32 || size != 40 {
+		t.Errorf("errno result offsets and frame size = (%d, %d, %d), want (24, 32, 40)",
+			result, errno, size)
+	}
 	call.result = cgoDirectVoid
-	params, result, size = cgoDirectFrame(call, 8)
-	if result != 0 || size != 17 {
-		t.Errorf("void result offset and frame size = (%d, %d), want (0, 17)",
-			result, size)
+	params, result, errno, size = cgoDirectFrame(call, 8)
+	if result != 0 || errno != 24 || size != 32 {
+		t.Errorf("void errno offsets and frame size = (%d, %d, %d), want (0, 24, 32)",
+			result, errno, size)
 	}
 
+	call.errno = false
 	call.params = []cgoDirectType{cgoDirectUint8, cgoDirectUint64}
-	params, result, size = cgoDirectFrame(call, 4)
+	params, result, errno, size = cgoDirectFrame(call, 4)
 	if got, want := fmt.Sprint(params), "[0 4]"; got != want {
 		t.Errorf("32-bit parameter offsets = %s, want %s", got, want)
 	}
-	if result != 0 || size != 12 {
-		t.Errorf("32-bit result offset and frame size = (%d, %d), want (0, 12)",
-			result, size)
+	if result != 0 || errno != 0 || size != 12 {
+		t.Errorf("32-bit result offsets and frame size = (%d, %d, %d), want (0, 0, 12)",
+			result, errno, size)
 	}
 
 	call.params = []cgoDirectType{
@@ -300,13 +346,13 @@ func TestCgoDirectFrame(t *testing.T) {
 		cgoDirectFloat64,
 	}
 	call.result = cgoDirectFloat32
-	params, result, size = cgoDirectFrame(call, 8)
+	params, result, errno, size = cgoDirectFrame(call, 8)
 	if got, want := fmt.Sprint(params), "[0 4 8]"; got != want {
 		t.Errorf("floating parameter offsets = %s, want %s", got, want)
 	}
-	if result != 16 || size != 20 {
-		t.Errorf("floating result offset and frame size = (%d, %d), want (16, 20)",
-			result, size)
+	if result != 16 || errno != 0 || size != 20 {
+		t.Errorf("floating result offsets and frame size = (%d, %d, %d), want (16, 0, 20)",
+			result, errno, size)
 	}
 }
 
@@ -360,6 +406,39 @@ func TestCgoDirectAssemblyCall(t *testing.T) {
 	}
 	if got := string(data); !strings.Contains(got, text) {
 		t.Errorf("generated assembly does not contain call:\n%s", got)
+	}
+
+	errnoCall := cgoDirectCall{
+		direct: "_Cdirect2_read",
+		entry:  "read_errno",
+		params: []cgoDirectType{cgoDirectInt32},
+		result: cgoDirectInt64,
+		errno:  true,
+	}
+	output.Reset()
+	(&Package{PtrSize: 8}).writeDirectAssemblyCall(&output, errnoCall)
+	text = output.String()
+	for _, want := range []string{
+		"TEXT ·_Cdirect2_read(SB),NOSPLIT,$0-24",
+		"CALL\tread_errno(SB)",
+		"errno+16(FP)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("errno assembly does not contain %q:\n%s", want, text)
+		}
+	}
+	if buildcfg.GOARCH == "arm64" {
+		for _, want := range []string{"MOVD\t$ret+8(FP), R1", "MOVD\tR0, errno+16(FP)"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("arm64 errno assembly does not contain %q:\n%s", want, text)
+			}
+		}
+	} else {
+		for _, want := range []string{"LEAQ\tret+8(FP), SI", "MOVQ\tAX, errno+16(FP)"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("amd64 errno assembly does not contain %q:\n%s", want, text)
+			}
+		}
 	}
 }
 
@@ -514,6 +593,12 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 	if got := cgoDirectResultRegister("amd64", cgoDirectFloat32); got != "X0" {
 		t.Errorf("amd64 floating result register = %s, want X0", got)
 	}
+	if got := cgoDirectAddress("arm64"); got != "MOVD" {
+		t.Errorf("arm64 address instruction = %q, want MOVD", got)
+	}
+	if got := cgoDirectAddress("amd64"); got != "LEAQ" {
+		t.Errorf("amd64 address instruction = %q, want LEAQ", got)
+	}
 	if got := cgoDirectVoid.size(); got != 0 {
 		t.Errorf("void size = %d, want 0", got)
 	}
@@ -557,6 +642,41 @@ func TestCgoDirectCBridge(t *testing.T) {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("void C bridge does not contain %q:\n%s", want, output.String())
 		}
+	}
+
+	n.FuncType.Params = []*Type{
+		{C: &TypeRepr{Repr: "unsigned long long"}},
+	}
+	n.FuncType.Result = &Type{C: &TypeRepr{Repr: "long long"}}
+	call.entry = "_cgo_test_C2func_read_direct"
+	call.errno = true
+	n.C = "read_value"
+	output.Reset()
+	new(Package).writeDirectCBridge(&output, n, call)
+	for _, want := range []string{
+		"size_t\n_cgo_test_C2func_read_direct(",
+		"unsigned long long p0, long long *result",
+		"\tlong long value;",
+		"\terrno = 0;",
+		"\tvalue = read_value(p0);",
+		"\tsaved_errno = errno;",
+		"\t*result = value;",
+		"\treturn (size_t)saved_errno;",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("errno C bridge does not contain %q:\n%s", want, output.String())
+		}
+	}
+
+	n.FuncType.Params = nil
+	n.FuncType.Result = nil
+	call.entry = "_cgo_test_C2func_tick_direct"
+	n.C = "tick"
+	output.Reset()
+	new(Package).writeDirectCBridge(&output, n, call)
+	if strings.Contains(output.String(), "*result") ||
+		!strings.Contains(output.String(), "\ttick();\n\tsaved_errno = errno;") {
+		t.Errorf("void errno C bridge is invalid:\n%s", output.String())
 	}
 }
 
@@ -603,7 +723,7 @@ func TestCgoDirectGoDeclaration(t *testing.T) {
 	text := output.String()
 	for _, want := range []string{
 		"//go:cgo_direct v1 _Cfunc_add _Cdirect_add add mayblock u64,u64 u64 -",
-		"//go:noescape\nfunc _Cdirect_add(",
+		"//go:noescape\nfunc _Cdirect_add(p0 _Ctype_uint64_t, p1 _Ctype_uint64_t) (ret _Ctype_uint64_t)",
 		"func _Cfunc_add(",
 	} {
 		if !strings.Contains(text, want) {
@@ -615,6 +735,42 @@ func TestCgoDirectGoDeclaration(t *testing.T) {
 	}
 	if len(p.directCalls) != 1 || p.directCalls[0].direct != "_Cdirect_add" {
 		t.Fatalf("direct calls = %+v, want _Cdirect_add", p.directCalls)
+	}
+
+	n.Mangle = "_C2func_add"
+	n.AddError = true
+	p.directCalls = nil
+	output.Reset()
+	p.writeDefsFunc(&output, n, &callsMalloc)
+	text = output.String()
+	for _, want := range []string{
+		"//go:cgo_direct v1 _C2func_add _Cdirect2_add add mayblock u64,u64 u64 errno",
+		"func _Cdirect2_add(p0 _Ctype_uint64_t, p1 _Ctype_uint64_t) (ret _Ctype_uint64_t, errno syscall.Errno)",
+		"func _C2func_add(",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("generated errno Go does not contain %q:\n%s", want, text)
+		}
+	}
+	if len(p.directCalls) != 1 || p.directCalls[0].direct != "_Cdirect2_add" {
+		t.Fatalf("errno direct calls = %+v, want _Cdirect2_add", p.directCalls)
+	}
+
+	n.FuncType.Result = nil
+	n.FuncType.Go = &ast.FuncType{
+		Params: &ast.FieldList{List: []*ast.Field{
+			{Type: goType},
+			{Type: goType},
+		}},
+		Results: new(ast.FieldList),
+	}
+	p.directCalls = nil
+	output.Reset()
+	p.writeDefsFunc(&output, n, &callsMalloc)
+	text = output.String()
+	want := "func _Cdirect2_add(p0 _Ctype_uint64_t, p1 _Ctype_uint64_t) (errno syscall.Errno)"
+	if !strings.Contains(text, want) {
+		t.Errorf("generated void errno Go does not contain %q:\n%s", want, text)
 	}
 }
 

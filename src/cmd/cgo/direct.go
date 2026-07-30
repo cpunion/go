@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"go/ast"
 	"io"
+	"slices"
 	"strings"
 
 	"internal/buildcfg"
@@ -44,7 +45,7 @@ type cgoDirectCall struct {
 
 func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 	if !cgoDirectSupported() || *gccgo || n.Kind != "func" ||
-		n.FuncType == nil || n.AddError || !p.noCallbacks[n.C] ||
+		n.FuncType == nil || !p.noCallbacks[n.C] ||
 		!validCgoDirectSymbol(n.C) {
 		return cgoDirectCall{}, false
 	}
@@ -57,10 +58,6 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 			return cgoDirectCall{}, false
 		}
 	}
-	if _, ok := cgoDirectArgRegisters(buildcfg.GOARCH, params); !ok {
-		return cgoDirectCall{}, false
-	}
-
 	result := cgoDirectVoid
 	if n.FuncType.Result != nil {
 		var ok bool
@@ -70,11 +67,23 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 		}
 	}
 
-	const wrapperPrefix = "_Cfunc_"
-	if !strings.HasPrefix(n.Mangle, wrapperPrefix) {
+	registerParams := params
+	if n.AddError && result != cgoDirectVoid {
+		registerParams = append(slices.Clone(params), cgoDirectPointer)
+	}
+	if _, ok := cgoDirectArgRegisters(buildcfg.GOARCH, registerParams); !ok {
 		return cgoDirectCall{}, false
 	}
-	direct := "_Cdirect_" + strings.TrimPrefix(n.Mangle, wrapperPrefix)
+
+	var direct string
+	switch {
+	case !n.AddError && strings.HasPrefix(n.Mangle, "_Cfunc_"):
+		direct = "_Cdirect_" + strings.TrimPrefix(n.Mangle, "_Cfunc_")
+	case n.AddError && strings.HasPrefix(n.Mangle, "_C2func_"):
+		direct = "_Cdirect2_" + strings.TrimPrefix(n.Mangle, "_C2func_")
+	default:
+		return cgoDirectCall{}, false
+	}
 	return cgoDirectCall{
 		wrapper: n.Mangle,
 		direct:  direct,
@@ -145,18 +154,35 @@ func (p *Package) writeDirectAssembly() {
 }
 
 func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
-	offsets, resultOffset, frameSize := cgoDirectFrame(call, p.PtrSize)
-	registers, _ := cgoDirectArgRegisters(buildcfg.GOARCH, call.params)
+	offsets, resultOffset, errnoOffset, frameSize := cgoDirectFrame(call, p.PtrSize)
+	registerParams := call.params
+	if call.errno && call.result != cgoDirectVoid {
+		registerParams = append(slices.Clone(call.params), cgoDirectPointer)
+	}
+	registers, _ := cgoDirectArgRegisters(buildcfg.GOARCH, registerParams)
 	fmt.Fprintf(w, "TEXT ·%s(SB),NOSPLIT,$0-%d\n", call.direct, frameSize)
 	for i, param := range call.params {
 		fmt.Fprintf(w, "\t%s\tp%d+%d(FP), %s\n",
 			cgoDirectLoad(buildcfg.GOARCH, param), i, offsets[i],
 			registers[i])
 	}
+	if call.errno && call.result != cgoDirectVoid {
+		address := fmt.Sprintf("ret+%d(FP)", resultOffset)
+		if buildcfg.GOARCH == "arm64" {
+			address = "$" + address
+		}
+		fmt.Fprintf(w, "\t%s\t%s, %s\n",
+			cgoDirectAddress(buildcfg.GOARCH), address, registers[len(call.params)])
+	}
 	for _, instruction := range cgoDirectCallInstructions(buildcfg.GOARCH, call.entry) {
 		fmt.Fprintf(w, "\t%s\n", instruction)
 	}
-	if call.result != cgoDirectVoid {
+	if call.errno {
+		fmt.Fprintf(w, "\t%s\t%s, errno+%d(FP)\n",
+			cgoDirectStore(buildcfg.GOARCH, cgoDirectPointer),
+			cgoDirectResultRegister(buildcfg.GOARCH, cgoDirectPointer),
+			errnoOffset)
+	} else if call.result != cgoDirectVoid {
 		fmt.Fprintf(w, "\t%s\t%s, ret+%d(FP)\n",
 			cgoDirectStore(buildcfg.GOARCH, call.result),
 			cgoDirectResultRegister(buildcfg.GOARCH, call.result), resultOffset)
@@ -193,7 +219,9 @@ func cgoDirectCallInstructions(goarch, entry string) []string {
 // argument-frame wrapper.
 func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 	fmt.Fprintln(w, "CGO_NO_SANITIZE_THREAD")
-	if result := n.FuncType.Result; result != nil {
+	if call.errno {
+		fmt.Fprintln(w, "size_t")
+	} else if result := n.FuncType.Result; result != nil {
 		fmt.Fprintln(w, cgoDirectCType(result))
 	} else {
 		fmt.Fprintln(w, "void")
@@ -205,10 +233,25 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 		}
 		fmt.Fprintf(w, "%s p%d", cgoDirectCType(param), i)
 	}
+	if call.errno && n.FuncType.Result != nil {
+		if len(n.FuncType.Params) != 0 {
+			fmt.Fprint(w, ", ")
+		}
+		fmt.Fprintf(w, "%s *result", cgoDirectCType(n.FuncType.Result))
+	}
 	fmt.Fprintln(w, ")")
 	fmt.Fprintln(w, "{")
+	if call.errno {
+		if n.FuncType.Result != nil {
+			fmt.Fprintf(w, "\t%s value;\n", cgoDirectCType(n.FuncType.Result))
+		}
+		fmt.Fprintln(w, "\tint saved_errno;")
+		fmt.Fprintln(w, "\terrno = 0;")
+	}
 	fmt.Fprint(w, "\t")
-	if n.FuncType.Result != nil {
+	if call.errno && n.FuncType.Result != nil {
+		fmt.Fprint(w, "value = ")
+	} else if !call.errno && n.FuncType.Result != nil {
 		fmt.Fprint(w, "return ")
 	}
 	fmt.Fprintf(w, "%s(", n.C)
@@ -219,6 +262,13 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 		fmt.Fprintf(w, "p%d", i)
 	}
 	fmt.Fprintln(w, ");")
+	if call.errno {
+		fmt.Fprintln(w, "\tsaved_errno = errno;")
+		if n.FuncType.Result != nil {
+			fmt.Fprintln(w, "\t*result = value;")
+		}
+		fmt.Fprintln(w, "\treturn (size_t)saved_errno;")
+	}
 	fmt.Fprintln(w, "}")
 	fmt.Fprintln(w)
 }
@@ -230,7 +280,7 @@ func cgoDirectCType(typ *Type) string {
 	return typ.C.String()
 }
 
-func cgoDirectFrame(call cgoDirectCall, ptrSize int64) (params []int64, result, size int64) {
+func cgoDirectFrame(call cgoDirectCall, ptrSize int64) (params []int64, result, errno, size int64) {
 	params = make([]int64, len(call.params))
 	var offset int64
 	for i, param := range call.params {
@@ -242,13 +292,18 @@ func cgoDirectFrame(call cgoDirectCall, ptrSize int64) (params []int64, result, 
 		params[i] = offset
 		offset += param.size()
 	}
-	if call.result == cgoDirectVoid {
-		return params, 0, offset
+	if call.result != cgoDirectVoid {
+		offset = cgoDirectAlign(offset, ptrSize)
+		offset = cgoDirectAlign(offset, call.result.size())
+		result = offset
+		offset += call.result.size()
 	}
-	offset = cgoDirectAlign(offset, ptrSize)
-	offset = cgoDirectAlign(offset, call.result.size())
-	result = offset
-	return params, result, result + call.result.size()
+	if call.errno {
+		offset = cgoDirectAlign(offset, ptrSize)
+		errno = offset
+		offset += ptrSize
+	}
+	return params, result, errno, offset
 }
 
 func cgoDirectAlign(value, align int64) int64 {
@@ -349,6 +404,13 @@ func cgoDirectStore(goarch string, typ cgoDirectType) string {
 	default:
 		return "MOVQ"
 	}
+}
+
+func cgoDirectAddress(goarch string) string {
+	if goarch == "arm64" {
+		return "MOVD"
+	}
+	return "LEAQ"
 }
 
 // cgoDirectArgRegisters assigns the independent integer and floating-point

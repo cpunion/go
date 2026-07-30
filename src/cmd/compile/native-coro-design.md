@@ -1,7 +1,8 @@
 # Native Stackless Coroutine Design
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
-`-d=coro=4`; transparent scalar cgo direct calls, fixed and repeated
+`-d=coro=4`; transparent scalar cgo direct calls including the two-result
+errno form, fixed and repeated
 simple-loop defer cleanup for normal return and explicit panic, direct recover
 and replacement panic in fixed or repeated local defer literals and
 statically resolved local or imported named defer targets, typed structured
@@ -17,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -818,6 +819,22 @@ Unsupported declarations retain the ordinary cgo path in compatibility mode.
 Integration tests assert both the metadata and the selected symbols in
 disassembly, so a fallback cannot silently become a direct-call performance
 result.
+
+The cgo two-result form requires a split result protocol. The C bridge clears
+errno, calls the target, and captures errno before doing any other work. For a
+non-void target, the direct entry passes a hidden pointer to the scalar Go
+result slot and the bridge writes the C result through that pointer. The bridge
+returns raw errno as `size_t` in the ordinary integer result register. This
+avoids a platform-specific aggregate return. The hidden pointer participates
+in argument-register classification; a declaration falls back to ordinary
+cgo when no register remains.
+
+The generated Go direct declaration exposes the raw pair as
+`(result, syscall.Errno)`. Lowering stores that pair while the M is still in
+foreign-blocking state, leaves that state, and only then converts a nonzero
+`syscall.Errno` to the source error interface. A zero value becomes nil.
+Keeping interface conversion outside the foreign window is required because
+it may allocate or otherwise enter the Go runtime.
 
 `cmd/cgo` emits a typed external bridge in the same C translation unit as the
 preamble. This makes `static` and inline declarations visible to the generated
@@ -1767,6 +1784,8 @@ The transparent cgo frontend:
 - classifies integer, pointer, `float`, and `double` parameters into the
   target ABI's independent general-purpose and floating-point register
   classes, and supports one scalar result;
+- supports the cgo two-result errno form by returning raw errno separately and
+  materializing nil or `syscall.Errno` only after blocking-call exit;
 - preserves ordinary cgo for unsupported declarations and sanitizer builds;
 - emits a typed bridge in the preamble translation unit, so `static`
   declarations work without exposing a new user annotation.
@@ -1821,6 +1840,8 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   waiter functions contain generated coroutine resume symbols;
 - direct C symbol inspection proving the absence of the general cgo
   transition symbols in the supported hot path;
+- two-result direct C calls with zero and nonzero errno for both scalar and
+  void C results, through both run-to-completion and state-machine lowering;
 - a run-to-completion direct C call followed by an implicit nil fault recovers
   without replaying the C call;
 - the transparent C fixture evaluates two panic-capable argument helpers in
@@ -2272,6 +2293,26 @@ the conservative `DirectMayBlock` class. They do establish real library ABI
 compatibility and retain a fixed benchmark for future transition and
 `DirectNoBlock` policy work.
 
+The two-result errno follow-up adds another fixed steady benchmark. Both paths
+call a non-inlined C leaf that clears errno and returns one scalar. The direct
+bridge also writes that scalar through its hidden result pointer and returns
+raw errno in the integer result register. Disassembly verifies
+`_Cdirect2_coro_direct_errno` and the absence of `runtime.cgocall` and
+`runtime.asmcgocall`. Each value is the median of ten 500 ms runs:
+
+| Path | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | ---: | ---: | ---: |
+| ordinary cgo errno | 18.30 ns | 26.59 ns | 0 B/op, 0 allocs/op |
+| direct cgo errno | 16.94 ns | 23.95 ns | 0 B/op, 0 allocs/op |
+
+The direct boundary is about 7.4% smaller on Darwin and 9.9% smaller in the
+translated Linux run. These short calls do not require a replacement M to run,
+so this benchmark isolates the ABI and enter/exit transition rather than the
+blocking handoff itself. A genuinely blocking call still leaves the C frame on
+its original M and hands the P to a replacement M when runnable work exists.
+The coroutine advantage is the lower transition and conditional handoff cost,
+not removal of that scheduler obligation.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
@@ -2303,7 +2344,7 @@ direct deferred Goexit, and statically resolved local or imported named
 terminal targets are supported. The terminal target may reach panic or Goexit
 through certified indirect structured calls. Direct foreign declarations now
 have a restricted transparent cgo path, but aggregate, variadic,
-callback-capable, errno, and non-target ABIs retain ordinary cgo.
+callback-capable, and non-target ABIs retain ordinary cgo.
 Cross-package factory ABI 1 excludes interface and method-value calls,
 closures, and generic shapes. Frontend-normalized nested multi-result calls and
 conservatively normalized single-result calls are supported. Short-circuit
@@ -2320,7 +2361,8 @@ The likely order is:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
-2. add aggregate System ABI classification and errno handling;
+2. add aggregate System ABI classification and platform-error conventions
+   beyond POSIX errno;
 3. extend expression, assignment, and branch normalization to short-circuit
    control, loop conditions, frontend loop-variable rewrites, and effectful
    destinations, then extend the compiler-private factory ABI only with

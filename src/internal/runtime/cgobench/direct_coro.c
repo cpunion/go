@@ -30,6 +30,16 @@ CGOBENCH_NOINLINE void coro_direct_sin_add(double value, double *sum) {
 	*sum += sin(value);
 }
 
+CGOBENCH_NOINLINE int64_t coro_cgo_errno(int64_t value) {
+	errno = 0;
+	return value + 1;
+}
+
+CGOBENCH_NOINLINE int64_t coro_direct_errno(int64_t value) {
+	errno = 0;
+	return value + 1;
+}
+
 static uint64_t coro_nanotime(void) {
 	struct timespec now;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {

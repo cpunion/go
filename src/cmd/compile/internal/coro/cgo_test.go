@@ -115,6 +115,12 @@ func TestCgoDirectRecipe(t *testing.T) {
 			t.Errorf("%v recipe = %+v", test.class, recipe)
 		}
 	}
+	if recipe := (cgoDirectCall{
+		class: DirectMayBlock,
+		errno: true,
+	}).recipe(); !recipe.Errno {
+		t.Fatalf("errno recipe = %+v, want Errno", recipe)
+	}
 }
 
 func TestCgoDirectRecipeOverridesWrapper(t *testing.T) {
