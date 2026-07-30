@@ -679,6 +679,9 @@ func netWaiter() {
 }
 
 func main() {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
 	go func() {
 		deadline := time.Now().Add(500 * time.Millisecond)
 		for time.Now().Before(deadline) {

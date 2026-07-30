@@ -38,6 +38,8 @@ func TestCalls(t *testing.T) {
 		cgobench.ReleaseDirectHandoff,
 		cgobench.DirectHandoffs)
 	testFailedHandoff(t, cgobench.ResetDirectHandoff, cgobench.DirectHandoffs)
+	testStacklessHandoffs(t, cgobench.CgoStacklessHandoffs)
+	testStacklessHandoffs(t, cgobench.DirectStacklessHandoffs)
 }
 
 func testHandoffs(t *testing.T, iterations int, reset func(),
@@ -78,17 +80,32 @@ func testFailedHandoff(t *testing.T, reset func(), handoffs func(int, int) uint6
 	}
 }
 
+func testStacklessHandoffs(t *testing.T, handoffs func(int) uint64) {
+	t.Helper()
+	if got := handoffs(8); got == ^uint64(0) {
+		t.Fatal("stackless handoff failed")
+	}
+	if got := handoffs(0); got != 0 {
+		t.Fatalf("zero stackless handoffs = %d, want 0", got)
+	}
+	if got := handoffs(-1); got != ^uint64(0) {
+		t.Fatalf("negative stackless handoffs = %d, want failure", got)
+	}
+}
+
 // Run these benchmarks with:
 //
 //	GOEXPERIMENT=coro go test internal/runtime/cgobench \
 //		-run=^$ \
-//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|BlockingHandoff)$' \
+//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|BlockingHandoff|StacklessHandoff)$' \
 //		-gcflags=internal/runtime/cgobench='-l -d=coro=4'
 //
 // The Steady benchmarks batch calls within one coroutine root and isolate the
 // foreign boundary. The Entry benchmarks include root setup on every call.
-// The blocking benchmarks report both full round-trip time and the interval
-// until another goroutine makes progress.
+// The blocking benchmarks use an ordinary goroutine and a pipe. The stackless
+// benchmarks use an atomic-only C gate and a sibling logical goroutine. Both
+// report full round-trip time and the interval until the sibling makes
+// progress.
 func BenchmarkOrdinaryCgoCallsSteady(b *testing.B) {
 	cgobench.CgoCalls(b.N)
 }
@@ -137,6 +154,14 @@ func BenchmarkDirectCgoBlockingHandoff(b *testing.B) {
 		cgobench.DirectHandoffs)
 }
 
+func BenchmarkOrdinaryCgoStacklessHandoff(b *testing.B) {
+	benchmarkStacklessHandoffs(b, cgobench.CgoStacklessHandoffs)
+}
+
+func BenchmarkDirectCgoStacklessHandoff(b *testing.B) {
+	benchmarkStacklessHandoffs(b, cgobench.DirectStacklessHandoffs)
+}
+
 func benchmarkHandoffs(b *testing.B, reset func(), release func(uint32),
 	handoffs func(int, int) uint64) {
 	oldProcs := runtime.GOMAXPROCS(1)
@@ -169,6 +194,19 @@ func benchmarkHandoffs(b *testing.B, reset func(), release func(uint32),
 	}
 	if err := <-workerErr; err != nil {
 		b.Fatal(err)
+	}
+	b.ReportMetric(float64(elapsed)/float64(b.N), "ns/progress")
+}
+
+func benchmarkStacklessHandoffs(b *testing.B, handoffs func(int) uint64) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	b.ReportAllocs()
+	b.ResetTimer()
+	elapsed := handoffs(b.N)
+	b.StopTimer()
+	if elapsed == ^uint64(0) {
+		b.Fatal("stackless handoff failed")
 	}
 	b.ReportMetric(float64(elapsed)/float64(b.N), "ns/progress")
 }
