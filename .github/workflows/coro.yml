@@ -86,7 +86,7 @@ jobs:
           GOEXPERIMENT: coro
         run: |
           ./bin/go test -count=1 cmd/go -run '^TestScript/cgo_coro_direct_metadata$'
-          ./bin/go test -count=1 internal/runtime/cgobench -run '^TestCalls$' \
+          ./bin/go test -count=1 internal/runtime/cgobench \
             -gcflags=internal/runtime/cgobench='-l -d=coro=4'
 
       - name: Test coroutine operation races

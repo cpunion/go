@@ -2183,6 +2183,26 @@ approximately 6.5 us until Go progress and 11.2 us for the round trip. It was
 correct only when emitted in the resume frame and was slower on both sides, so
 the implementation does not use it.
 
+An atomic-only follow-up isolates the case where the blocked call must let an
+already-runnable stackless sibling progress. Both parent functions first
+yield once, so the compiler lowers the parent and sibling into the same
+logical scheduler before C publishes an epoch and spins on the sibling's
+atomic release. At `GOMAXPROCS=1`, ten Darwin/arm64 samples of 50 handoffs
+produced these medians:
+
+| Path | Time to stackless sibling | Complete round trip |
+| --- | ---: | ---: |
+| ordinary cgo | 24.834 ms | 40.230 ms |
+| transparent `DirectMayBlock` | 24.912 ms | 40.437 ms |
+
+The paths are indistinguishable at this scale. Unlike the pipe fixture, the
+atomic publication does not introduce an external wakeup that makes the
+runtime promptly retake the syscall P. The result isolates the next scheduler
+task: a coroutine-aware blocking entry must hand the P to replacement
+capacity immediately, and its return path must avoid moving that cost into
+locked-M reacquisition. The direct call boundary alone cannot provide this
+benefit.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped

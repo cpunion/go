@@ -70,6 +70,48 @@ CGOBENCH_NOINLINE void coro_direct_handoff(int fd, uint32_t *gate,
 	coro_record_handoff(elapsed, coro_handoff(fd, gate, epoch));
 }
 
+static uint64_t coro_stackless_handoff(uint64_t *entered, uint64_t epoch,
+		uint64_t *gate) {
+	uint64_t start = coro_nanotime();
+	if (start == UINT64_MAX) {
+		return UINT64_MAX;
+	}
+	__atomic_store_n(entered, epoch, __ATOMIC_RELEASE);
+	uint64_t spins = 0;
+	while (__atomic_load_n(gate, __ATOMIC_ACQUIRE) < epoch) {
+		if ((++spins & ((UINT64_C(1) << 20) - 1)) == 0) {
+			uint64_t now = coro_nanotime();
+			if (now == UINT64_MAX || now - start >= 5000000000) {
+				__atomic_store_n(entered, UINT64_MAX, __ATOMIC_RELEASE);
+				return UINT64_MAX;
+			}
+		}
+	}
+	uint64_t end = coro_nanotime();
+	if (end == UINT64_MAX) {
+		return UINT64_MAX;
+	}
+	return end - start;
+}
+
+CGOBENCH_NOINLINE void coro_cgo_stackless_handoff(uint64_t *entered,
+		uint64_t epoch, uint64_t *gate, uint64_t *elapsed) {
+	if (*elapsed == UINT64_MAX) {
+		return;
+	}
+	coro_record_handoff(elapsed,
+			coro_stackless_handoff(entered, epoch, gate));
+}
+
+CGOBENCH_NOINLINE void coro_direct_stackless_handoff(uint64_t *entered,
+		uint64_t epoch, uint64_t *gate, uint64_t *elapsed) {
+	if (*elapsed == UINT64_MAX) {
+		return;
+	}
+	coro_record_handoff(elapsed,
+			coro_stackless_handoff(entered, epoch, gate));
+}
+
 CGOBENCH_NOINLINE uint64_t coro_add_u64(uint64_t a, uint64_t b) {
 	return a + b;
 }

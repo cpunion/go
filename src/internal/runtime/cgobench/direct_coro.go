@@ -13,14 +13,19 @@ package cgobench
 #cgo nocallback coro_direct_empty
 #cgo noescape coro_direct_handoff
 #cgo nocallback coro_direct_handoff
+#cgo noescape coro_direct_stackless_handoff
+#cgo nocallback coro_direct_stackless_handoff
 
 void coro_cgo_empty(void);
 void coro_direct_empty(void);
 void coro_cgo_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_direct_handoff(int, uint32_t *, uint32_t, uint64_t *);
+void coro_cgo_stackless_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
+void coro_direct_stackless_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
 */
 import "C"
 import (
+	"runtime"
 	corort "runtime/coro"
 	"sync/atomic"
 )
@@ -108,6 +113,88 @@ func DirectHandoffs(iterations, writeFD int) uint64 {
 		)
 	}
 	if atomic.LoadUint32(&directHandoffGate) != uint32(iterations) {
+		return failedHandoff
+	}
+	return elapsed
+}
+
+var cgoStacklessEntered uint64
+var cgoStacklessGate uint64
+var directStacklessEntered uint64
+var directStacklessGate uint64
+
+func stacklessHandoffWorker(iterations int, entered, gate *uint64) {
+	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
+		for atomic.LoadUint64(entered) < epoch {
+			runtime.Gosched()
+		}
+		atomic.StoreUint64(gate, epoch)
+	}
+}
+
+// CgoStacklessHandoffs measures blocking handoffs from ordinary cgo calls to
+// a sibling stackless goroutine. It returns the total time from each C
+// publication until the sibling releases C.
+func CgoStacklessHandoffs(iterations int) uint64 {
+	if iterations < 0 {
+		return failedHandoff
+	}
+	atomic.StoreUint64(&cgoStacklessEntered, 0)
+	atomic.StoreUint64(&cgoStacklessGate, 0)
+	go stacklessHandoffWorker(
+		iterations, &cgoStacklessEntered, &cgoStacklessGate)
+	runtime.Gosched()
+	var elapsed uint64
+	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
+		C.coro_cgo_stackless_handoff(
+			(*C.uint64_t)(&cgoStacklessEntered),
+			C.uint64_t(epoch),
+			(*C.uint64_t)(&cgoStacklessGate),
+			(*C.uint64_t)(&elapsed),
+		)
+	}
+	return stacklessHandoffResult(
+		iterations,
+		atomic.LoadUint64(&cgoStacklessEntered),
+		atomic.LoadUint64(&cgoStacklessGate),
+		elapsed,
+	)
+}
+
+// DirectStacklessHandoffs measures blocking handoffs from direct C calls to a
+// sibling stackless goroutine. It returns the total time from each C
+// publication until the sibling releases C. The package must be compiled with
+// -d=coro=4.
+func DirectStacklessHandoffs(iterations int) uint64 {
+	if iterations < 0 {
+		return failedHandoff
+	}
+	atomic.StoreUint64(&directStacklessEntered, 0)
+	atomic.StoreUint64(&directStacklessGate, 0)
+	go stacklessHandoffWorker(
+		iterations, &directStacklessEntered, &directStacklessGate)
+	runtime.Gosched()
+	var elapsed uint64
+	for epoch := uint64(1); epoch <= uint64(iterations); epoch++ {
+		C.coro_direct_stackless_handoff(
+			(*C.uint64_t)(&directStacklessEntered),
+			C.uint64_t(epoch),
+			(*C.uint64_t)(&directStacklessGate),
+			(*C.uint64_t)(&elapsed),
+		)
+	}
+	return stacklessHandoffResult(
+		iterations,
+		atomic.LoadUint64(&directStacklessEntered),
+		atomic.LoadUint64(&directStacklessGate),
+		elapsed,
+	)
+}
+
+func stacklessHandoffResult(iterations int, entered, gate, elapsed uint64) uint64 {
+	if elapsed == failedHandoff ||
+		entered != uint64(iterations) ||
+		gate != uint64(iterations) {
 		return failedHandoff
 	}
 	return elapsed
