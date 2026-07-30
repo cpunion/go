@@ -744,16 +744,65 @@ func coroExitForeign() {
 	}
 }
 
-// coroPrepareBlocking wakes replacement capacity before its caller releases
-// the P. The compiler emits the syscall entry and exit in the resume frame.
+// coroEnterBlocking wakes replacement capacity, saves its caller as the
+// syscall continuation, and enters foreign-call state. Its caller is the
+// generated resume frame and remains active until coroExitBlocking. Saving the
+// helper frame itself would leave exitsyscall with an invalid continuation
+// after this function returns.
 //
 //go:nosplit
-func coroPrepareBlocking(ctx unsafe.Pointer) {
+func coroEnterBlocking(ctx unsafe.Pointer) {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine blocking call")
 	}
 	context.scheduler.wakeReplacementExecutor()
+
+	// Keep this state transition in sync with coroEnterForeign. It is
+	// open-coded so the blocking path crosses one runtime boundary.
+	gp := getg()
+	mp := gp.m
+	if mp.incgo || gp.nocgocallback {
+		throw("runtime: nested stackless coroutine foreign call")
+	}
+	mp.ncgocall++
+	if mp.cgoCallers != nil {
+		mp.cgoCallers[0] = 0
+	}
+
+	pc := sys.GetCallerPC()
+	sp := sys.GetCallerSP()
+	bp := getcallerfp()
+	reentersyscall(pc, sp, bp)
+
+	osPreemptExtEnter(mp)
+	gp.nocgocallback = true
+	mp.incgo = true
+	mp.ncgo++
+}
+
+//go:nosplit
+func coroExitBlocking() {
+	// Keep this state transition in sync with coroExitForeign. It is
+	// open-coded so the blocking path crosses one runtime boundary.
+	gp := getg()
+	mp := gp.m
+	if !mp.incgo || mp.ncgo == 0 || !gp.nocgocallback {
+		throw("runtime: unmatched stackless coroutine foreign call")
+	}
+	gp.nocgocallback = false
+	mp.incgo = false
+	mp.ncgo--
+	osPreemptExtExit(mp)
+	if sys.DITSupported {
+		ditEnabled := sys.DITEnabled()
+		if !gp.ditWanted && ditEnabled {
+			sys.DisableDIT()
+		} else if gp.ditWanted && !ditEnabled {
+			sys.EnableDIT()
+		}
+	}
+	exitsyscall()
 }
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCoroScheduler, *stacklessCoroTask) {
