@@ -9,6 +9,8 @@ package runtime
 import "unsafe"
 
 const (
+	StacklessCoroExecutorCount = stacklessCoroExecutorCount
+
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
 	StacklessCoroActionWait     = stacklessCoroActionWait
