@@ -191,11 +191,14 @@ This path solves problems that ordinary Go goroutines create:
 - callbacks must re-enter a Go goroutine stack;
 - a general argument frame handles arbitrary generated signatures.
 
-A stackless coroutine executor changes the first two premises. A resume episode
-can run on one fixed, nonmoving, C-compatible executor stack. A potentially
-blocking call can release its managed execution permit before entering C, so a
-replacement executor can make progress. It is therefore unnecessary to pay
-for a cgo wrapper and a `g0` stack switch on every supported call.
+A stackless coroutine executor changes the first premise and the cost structure
+of the second. A resume episode can run on one fixed, nonmoving, C-compatible
+executor stack. A potentially blocking call must still remain on its current M
+while a replacement M runs managed work. Before entering C, however, it can
+release its managed execution permit without saving, moving, or switching away
+from a goroutine stack: the logical continuation is already in its typed heap
+frame. It is therefore unnecessary to pay for a cgo wrapper and a `g0` stack
+switch on every supported call.
 
 The remaining responsibilities do not disappear. They become explicit,
 smaller foreign-entry and foreign-exit protocols for each call class.
@@ -713,6 +716,11 @@ The first correct implementation may reuse narrow parts of
 `runtime.cgocall` or `runtime.asmcgocall`. A later optimization can replace
 general syscall state with a coroutine-specific handoff once equivalent GC,
 trace, stop-the-world, and scheduler behavior is proven.
+
+This path does not eliminate M replacement. Its intended advantage over
+ordinary cgo is a cheaper handoff: the old M remains in C as before, but the
+logical continuation has already been materialized and the call needs neither
+a movable-G-stack save nor a switch to `m.g0`.
 
 Replacement creation must be demand-driven and bounded. Each replacement that
 also blocks may create another demand, subject to a process limit. Exceeding
@@ -1542,6 +1550,12 @@ Report at least:
 - allocations per call;
 - generated text size;
 - wrapper and runtime symbols in the call graph.
+
+Measure bounded direct calls and potentially blocking calls separately. The
+blocking comparison additionally reports handoff latency, replacement-M
+creation or reuse, and the time until another logical G first makes progress.
+It compares the coroutine-specific handoff with ordinary cgo rather than
+attributing the `DirectNoBlock` result to the blocking path.
 
 The scheduling benchmark reports:
 
