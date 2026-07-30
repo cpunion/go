@@ -6,9 +6,14 @@
 
 package cgobench
 
-import "testing"
+import (
+	"runtime"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
-func TestStacklessHandoffResult(t *testing.T) {
+func TestRunnableHandoffResult(t *testing.T) {
 	tests := []struct {
 		name       string
 		iterations int
@@ -24,12 +29,30 @@ func TestStacklessHandoffResult(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := stacklessHandoffResult(
+			if got := runnableHandoffResult(
 				test.iterations, test.entered, test.gate, test.elapsed,
 			); got != test.want {
-				t.Fatalf("stacklessHandoffResult() = %d, want %d",
+				t.Fatalf("runnableHandoffResult() = %d, want %d",
 					got, test.want)
 			}
 		})
+	}
+}
+
+func TestDirectRunnableHandoffWorkerWaits(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	atomic.StoreUint64(&directRunnableEntered, 0)
+	atomic.StoreUint64(&directRunnableGate, 0)
+	atomic.StoreUint64(&directRunnableEpoch, 1)
+	timer := time.AfterFunc(time.Millisecond, func() {
+		atomic.StoreUint64(&directRunnableEntered, 1)
+	})
+	defer timer.Stop()
+
+	directRunnableHandoffWorker()
+	if got := atomic.LoadUint64(&directRunnableGate); got != 1 {
+		t.Fatalf("direct runnable gate = %d, want 1", got)
 	}
 }

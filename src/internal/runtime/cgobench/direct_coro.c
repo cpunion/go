@@ -70,7 +70,7 @@ CGOBENCH_NOINLINE void coro_direct_handoff(int fd, uint32_t *gate,
 	coro_record_handoff(elapsed, coro_handoff(fd, gate, epoch));
 }
 
-static uint64_t coro_stackless_handoff(uint64_t *entered, uint64_t epoch,
+static uint64_t coro_runnable_handoff(uint64_t *entered, uint64_t epoch,
 		uint64_t *gate) {
 	uint64_t start = coro_nanotime();
 	if (start == UINT64_MAX) {
@@ -94,22 +94,22 @@ static uint64_t coro_stackless_handoff(uint64_t *entered, uint64_t epoch,
 	return end - start;
 }
 
-CGOBENCH_NOINLINE void coro_cgo_stackless_handoff(uint64_t *entered,
+CGOBENCH_NOINLINE void coro_cgo_runnable_handoff(uint64_t *entered,
 		uint64_t epoch, uint64_t *gate, uint64_t *elapsed) {
 	if (*elapsed == UINT64_MAX) {
 		return;
 	}
 	coro_record_handoff(elapsed,
-			coro_stackless_handoff(entered, epoch, gate));
+			coro_runnable_handoff(entered, epoch, gate));
 }
 
-CGOBENCH_NOINLINE void coro_direct_stackless_handoff(uint64_t *entered,
+CGOBENCH_NOINLINE void coro_direct_runnable_handoff(uint64_t *entered,
 		uint64_t epoch, uint64_t *gate, uint64_t *elapsed) {
 	if (*elapsed == UINT64_MAX) {
 		return;
 	}
 	coro_record_handoff(elapsed,
-			coro_stackless_handoff(entered, epoch, gate));
+			coro_runnable_handoff(entered, epoch, gate));
 }
 
 CGOBENCH_NOINLINE uint64_t coro_add_u64(uint64_t a, uint64_t b) {

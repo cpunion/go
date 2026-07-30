@@ -2184,24 +2184,33 @@ correct only when emitted in the resume frame and was slower on both sides, so
 the implementation does not use it.
 
 An atomic-only follow-up isolates the case where the blocked call must let an
-already-runnable stackless sibling progress. Both parent functions first
-yield once, so the compiler lowers the parent and sibling into the same
-logical scheduler before C publishes an epoch and spins on the sibling's
-atomic release. At `GOMAXPROCS=1`, ten Darwin/arm64 samples of 50 handoffs
-produced these medians:
+already-runnable sibling progress. Each iteration creates one sibling before C
+publishes an epoch and spins on its atomic release. The ordinary path remains
+a plain function and creates an ordinary Go goroutine. The direct parent and
+its no-argument worker both lower, so the direct path enqueues a logical task
+in the same stackless scheduler.
 
-| Path | Time to stackless sibling | Complete round trip |
-| --- | ---: | ---: |
-| ordinary cgo | 24.834 ms | 40.230 ms |
-| transparent `DirectMayBlock` | 24.912 ms | 40.437 ms |
+An earlier fixture used `go worker(arguments)` and yielded before entering C.
+That source shape creates a generated wrapper that is not currently a
+top-level lowering target. Final analysis therefore skipped both parent
+functions, and the resulting 24--40 ms measurements did not exercise the
+intended stackless path. The corrected fixture verifies final lowering and
+uses a one-shot worker so it cannot retain the P after releasing C.
 
-The paths are indistinguishable at this scale. Unlike the pipe fixture, the
-atomic publication does not introduce an external wakeup that makes the
-runtime promptly retake the syscall P. The result isolates the next scheduler
-task: a coroutine-aware blocking entry must hand the P to replacement
-capacity immediately, and its return path must avoid moving that cost into
-locked-M reacquisition. The direct call boundary alone cannot provide this
-benefit.
+At `GOMAXPROCS=1`, ten 500 ms Darwin/arm64 samples produced these medians:
+
+| Path | Time from C publication to sibling | Benchmark round trip | Allocation |
+| --- | ---: | ---: | ---: |
+| ordinary cgo | 66.347 us | 67.438 us | 0 B/op, 0 allocs/op |
+| transparent `DirectMayBlock` | 53.739 us | 70.331 us | 88 B/op, 3 allocs/op |
+
+The direct C-to-sibling interval is about 19% smaller, but logical-task
+creation leaves the complete benchmark round trip about 4.3% larger. The
+round-trip column includes creation of one sibling per iteration; the
+`ns/progress` metric starts at C publication. A coroutine-aware blocking entry
+must reduce the forward handoff without regressing the no-sibling boundary,
+and any return optimization must not move the cost into locked-M
+reacquisition. Logical-task allocation remains a separate follow-up.
 
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
