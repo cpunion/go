@@ -492,7 +492,20 @@ func (p *Plan) edgeMaySuspend(edge Edge) bool {
 
 func (p *Plan) edgeNeedsCoroEntry(edge Edge) bool {
 	summary, known := p.edgeSummary(edge)
-	return !known || summary.Primary() == CoroPrimary
+	if !known || summary.Primary() != CoroPrimary {
+		return !known
+	}
+	// An imported function that cannot suspend, require a constrained
+	// executor, or call Goexit can run on the current executor even when it
+	// may panic. The native resume boundary turns an unhandled panic into the
+	// logical task's terminal outcome. Keep using a coroutine entry when one
+	// was exported, and for local functions whose ordinary entry may already
+	// have been rewritten to start a root scheduler.
+	return p.Functions[edge.Callee] != nil ||
+		summary.Factory != NoFactory ||
+		summary.Effect != NoSuspend ||
+		summary.Exec != 0 ||
+		summary.Terminal&MayGoexit != 0
 }
 
 func (p *Plan) calledExec(function *Function) ExecFlags {

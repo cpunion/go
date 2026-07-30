@@ -539,11 +539,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if edge.Kind != DirectCall || edge.Recipe.Kind != SiteInvalid {
 			continue
 		}
-		summary, known := plan.edgeSummary(edge)
+		_, known := plan.edgeSummary(edge)
 		hasAwait := slices.ContainsFunc(function.Sites, func(site Site) bool {
 			return site.Kind == SiteAwait && site.Node == edge.Node
 		})
-		if known && summary.Primary() == CoroPrimary && !hasAwait {
+		if known && plan.edgeNeedsCoroEntry(edge) && !hasAwait {
 			return nil, fmt.Errorf(
 				"direct call to %s requires coroutine factory entry",
 				edge.CalleeName)
