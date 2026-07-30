@@ -2293,6 +2293,26 @@ the conservative `DirectMayBlock` class. They do establish real library ABI
 compatibility and retain a fixed benchmark for future transition and
 `DirectNoBlock` policy work.
 
+The two-result errno follow-up adds another fixed steady benchmark. Both paths
+call a non-inlined C leaf that clears errno and returns one scalar. The direct
+bridge also writes that scalar through its hidden result pointer and returns
+raw errno in the integer result register. Disassembly verifies
+`_Cdirect2_coro_direct_errno` and the absence of `runtime.cgocall` and
+`runtime.asmcgocall`. Each value is the median of ten 500 ms runs:
+
+| Path | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | ---: | ---: | ---: |
+| ordinary cgo errno | 18.30 ns | 26.59 ns | 0 B/op, 0 allocs/op |
+| direct cgo errno | 16.94 ns | 23.95 ns | 0 B/op, 0 allocs/op |
+
+The direct boundary is about 7.4% smaller on Darwin and 9.9% smaller in the
+translated Linux run. These short calls do not require a replacement M to run,
+so this benchmark isolates the ABI and enter/exit transition rather than the
+blocking handoff itself. A genuinely blocking call still leaves the C frame on
+its original M and hands the P to a replacement M when runnable work exists.
+The coroutine advantage is the lower transition and conditional handoff cost,
+not removal of that scheduler obligation.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
