@@ -9,6 +9,8 @@ package runtime
 import "unsafe"
 
 const (
+	StacklessCoroExecutorCount = stacklessCoroExecutorCount
+
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
 	StacklessCoroActionWait     = stacklessCoroActionWait
@@ -242,16 +244,22 @@ func BlockingReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte)
 	if len(buffer) == 0 {
 		return 0
 	}
-	coroEnterBlocking(ctx)
+	coroPrepareBlocking(ctx)
+	entersyscall()
+	coroEnterForeign()
 	n := read(int32(fd), unsafe.Pointer(&buffer[0]), int32(len(buffer)))
-	coroExitBlocking()
+	coroExitForeign()
+	exitsyscall()
 	KeepAlive(buffer)
 	return int(n)
 }
 
 func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
-	coroEnterBlocking(ctx)
-	coroExitBlocking()
+	coroPrepareBlocking(ctx)
+	entersyscall()
+	coroEnterForeign()
+	coroExitForeign()
+	exitsyscall()
 }
 
 func CheckEarlyReadyStacklessCoroForTest() bool {

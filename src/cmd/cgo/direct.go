@@ -164,14 +164,24 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 
 func cgoDirectCallInstructions(goarch, entry string) []string {
 	call := "CALL\t" + entry + "(SB)"
-	if goarch != "amd64" {
+	switch goarch {
+	case "arm64":
+		// A Go frame saves its frame pointer just below SP. Keep the C
+		// callee's frame below that slot.
+		return []string{
+			"SUB\t$16, RSP",
+			call,
+			"ADD\t$16, RSP",
+		}
+	case "amd64":
+		return []string{
+			"MOVQ\tSP, R12",
+			"ANDQ\t$~15, SP",
+			call,
+			"MOVQ\tR12, SP",
+		}
+	default:
 		return []string{call}
-	}
-	return []string{
-		"MOVQ\tSP, R12",
-		"ANDQ\t$~15, SP",
-		call,
-		"MOVQ\tR12, SP",
 	}
 }
 
