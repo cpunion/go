@@ -2338,6 +2338,24 @@ its original M and hands the P to a replacement M when runnable work exists.
 The coroutine advantage is the lower transition and conditional handoff cost,
 not removal of that scheduler obligation.
 
+The bounded-aggregate follow-up fixes a pointer-free
+`struct { uint64_t; double; }` benchmark. Both paths repeatedly call the same
+non-inlined C function with two by-value struct arguments and one by-value
+struct result. The direct path passes stable Go frame-slot addresses to its
+typed bridge; the platform C compiler performs the actual target ABI
+classification. End-to-end disassembly checks the direct symbol and excludes
+`runtime.cgocall`. Each value is the median of ten paired 500 ms runs:
+
+| Path | Darwin/arm64 | Linux/amd64 translated | Allocation |
+| --- | ---: | ---: | ---: |
+| ordinary cgo aggregate | 22.245 ns | 24.945 ns | 0 B/op, 0 allocs/op |
+| direct cgo aggregate | 21.58 ns | 20.89 ns | 0 B/op, 0 allocs/op |
+
+The direct boundary is about 3.0% smaller on Darwin and 16.3% smaller in the
+translated Linux run. The Darwin distributions overlap and the platforms
+differ materially, so this is evidence that the typed bridge preserves a
+competitive boundary, not a universal aggregate-call speedup.
+
 For a `println` program whose `work` function calls `runtime.Gosched`, the
 Darwin executable is 1,833,458 bytes with the coroutine experiment and
 1,729,378 bytes without it, a 104,080-byte (6.0%) increase. Stripped
