@@ -808,6 +808,22 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 		})
 	}
 
+	for _, test := range []struct {
+		goarch  string
+		address string
+		reg     string
+		want    string
+	}{
+		{"arm64", "p0+0(FP)", "R0", "\tMOVD\t$p0+0(FP), R0\n"},
+		{"amd64", "p0+0(FP)", "DI", "\tLEAQ\tp0+0(FP), DI\n"},
+	} {
+		var output bytes.Buffer
+		writeDirectAddress(&output, test.goarch, test.address, test.reg)
+		if got := output.String(); got != test.want {
+			t.Errorf("%s address = %q, want %q", test.goarch, got, test.want)
+		}
+	}
+
 	params := []cgoDirectType{
 		cgoDirectUint64,
 		cgoDirectFloat64,

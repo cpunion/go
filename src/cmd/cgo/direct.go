@@ -172,8 +172,8 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 	fmt.Fprintf(w, "TEXT ·%s(SB),NOSPLIT,$0-%d\n", call.direct, frameSize)
 	for i, param := range call.params {
 		if param.typ == cgoDirectMemory {
-			writeDirectAddress(w, fmt.Sprintf("p%d+%d(FP)", i, offsets[i]),
-				registers[i])
+			writeDirectAddress(w, buildcfg.GOARCH,
+				fmt.Sprintf("p%d+%d(FP)", i, offsets[i]), registers[i])
 		} else {
 			fmt.Fprintf(w, "\t%s\tp%d+%d(FP), %s\n",
 				cgoDirectLoad(buildcfg.GOARCH, param.typ), i, offsets[i],
@@ -181,8 +181,8 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 		}
 	}
 	if call.indirectResult() {
-		writeDirectAddress(w, fmt.Sprintf("ret+%d(FP)", resultOffset),
-			registers[len(call.params)])
+		writeDirectAddress(w, buildcfg.GOARCH,
+			fmt.Sprintf("ret+%d(FP)", resultOffset), registers[len(call.params)])
 	}
 	for _, instruction := range cgoDirectCallInstructions(buildcfg.GOARCH, call.entry) {
 		fmt.Fprintf(w, "\t%s\n", instruction)
@@ -201,12 +201,12 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 	fmt.Fprintln(w, "\tRET")
 }
 
-func writeDirectAddress(w io.Writer, address, register string) {
-	if buildcfg.GOARCH == "arm64" {
+func writeDirectAddress(w io.Writer, goarch, address, register string) {
+	if goarch == "arm64" {
 		address = "$" + address
 	}
 	fmt.Fprintf(w, "\t%s\t%s, %s\n",
-		cgoDirectAddress(buildcfg.GOARCH), address, register)
+		cgoDirectAddress(goarch), address, register)
 }
 
 func cgoDirectCallInstructions(goarch, entry string) []string {
