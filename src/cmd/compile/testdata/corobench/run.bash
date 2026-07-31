@@ -24,6 +24,16 @@ done
 
 baseline_revision=$(git -C "$baseline_goroot" rev-parse HEAD)
 coro_revision=$(git -C "$coro_goroot" rev-parse HEAD)
+baseline_version=$("$baseline_goroot/bin/go" version)
+coro_version=$("$coro_goroot/bin/go" version)
+if [[ "$baseline_version" != *"_${baseline_revision:0:10} "* ]]; then
+	echo "baseline binary does not match $baseline_revision: $baseline_version" >&2
+	exit 2
+fi
+if [[ "$coro_version" != *"_${coro_revision:0:10} "* ]]; then
+	echo "coroutine binary does not match $coro_revision: $coro_version" >&2
+	exit 2
+fi
 merge_base=$(git -C "$coro_goroot" merge-base \
 	"$baseline_revision" "$coro_revision")
 if [[ "$merge_base" != "$baseline_revision" ]]; then
