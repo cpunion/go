@@ -161,6 +161,43 @@ and 31.78 us versus 31.82 us on Linux (`p=0.796`). The fast path therefore
 removes the unnecessary timer and scheduler round trip without changing the
 positive-duration path.
 
+### Blocking capacity and parallel scaling
+
+Revision `05335641ac` added measurement-only probes for differences that do
+not require a complete implementation to expose. It used the same
+`3e6eb83f95` merge-base, three warm-up pairs, ten alternating-order 500ms
+samples, and disabled inlining. The Darwin results are native Apple M4 Max
+measurements; the Linux results are amd64 measurements under OrbStack
+translation. Each entry is the median baseline followed by the median
+coroutine result.
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| blocking pipe read and sibling release | 1.624 us -> 7.491 us (4.6x) | 1.551 us -> 30.837 us (20x) |
+| blocking TCP read and sibling release | 10.31 us -> 12.70 us (+23%) | 2.758 us -> 33.388 us (12x) |
+| three concurrent blocking C calls | 224.1 us -> 51.530 ms (230x) | 6.731 ms -> 41.940 ms (6.2x) |
+| entry time per blocking C call | 55.916 us -> 8.806 us (-84%) | 1.926 ms -> 28.30 us (-99%) |
+| fixed work, `GOMAXPROCS=1` | 544.8 us -> 544.2 us (~) | 567.9 us -> 566.4 us (~) |
+| fixed work, `GOMAXPROCS=2` | 290.6 us -> 543.5 us (+87%) | 368.6 us -> 560.9 us (+52%) |
+| fixed work, `GOMAXPROCS=4` | 160.3 us -> 545.5 us (+240%) | 226.2 us -> 562.4 us (+149%) |
+| eight concurrent blocking C calls | supported -> capacity-limited | supported -> capacity-limited |
+
+The direct C entry advantage remains visible, especially in the translated
+Linux environment where the baseline pays its full cgo handoff cost. The
+Darwin entry metric was variable, however, and the end-to-end result shows
+that the current executor release and recovery path dominates once several C
+calls block concurrently. The eight-call result is deliberately reported only
+as a capability state; individual timeout counts are scheduler-dependent.
+
+The fixed-work baseline improved by 3.4x on Darwin and 2.5x on translated
+Linux from one to four Ps. The coroutine path did not measurably scale. Its
+fixed-work batches also allocated about 6400 B and 256 objects, while the
+baseline allocated none. Each blocking file or TCP operation used a fixed
+1736 B and 26 allocations on both platforms; the baseline used none. These
+results isolate executor capacity, release/recovery, multi-P scheduling, and
+the public I/O adapter as higher-priority architecture gaps without first
+requiring complete timer, file, and network implementations.
+
 `check.bash` runs the coroutine correctness and coverage test, verifies the
 lowering audit, and checks the direct C symbols without collecting performance
 data. CI runs the correctness test with both toolchains, invokes this check,
