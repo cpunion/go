@@ -122,6 +122,26 @@ file/network I/O without a closure/worker hop, and channel/select adapters.
 The direct C fast path and the live-stack reduction should be preserved while
 those costs are addressed.
 
+### Non-positive sleep fast path
+
+Revision `eda8306ce2` made the compiler-generated sleep operation conditional:
+the runtime helper reports whether a positive-duration timer was started, and
+the logical task only returns a wait action in that case. Against its exact
+parent, `b26bb6fe67`, the same portable benchmark produced these medians:
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| `Sleep(0)` | 5.615 us -> 2.657 ns (-99.95%) | 27.21 us -> 18.75 ns (-99.93%) |
+| allocations | 296 B, 3 allocs -> 0 B, 0 allocs | 296 B, 3 allocs -> 0 B, 0 allocs |
+
+In a separate comparison, the unmodified Go baseline measured 1.024 ns on
+Darwin and 2.279 ns under the translated Linux environment. An
+alternating-order control measurement of `Sleep(1ns)` found no significant
+parent-to-change difference: 5.922 us versus 5.949 us on Darwin (`p=0.853`),
+and 31.78 us versus 31.82 us on Linux (`p=0.796`). The fast path therefore
+removes the unnecessary timer and scheduler round trip without changing the
+positive-duration path.
+
 `check.bash` runs the coroutine correctness and coverage test, verifies the
 lowering audit, and checks the direct C symbols without collecting performance
 data. CI runs the correctness test with both toolchains, invokes this check,
