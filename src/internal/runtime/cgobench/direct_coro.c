@@ -40,6 +40,27 @@ CGOBENCH_NOINLINE int64_t coro_direct_errno(int64_t value) {
 	return value + 1;
 }
 
+typedef struct {
+	uint64_t integer;
+	double floating;
+} coro_pair;
+
+CGOBENCH_NOINLINE coro_pair coro_cgo_pair(coro_pair value, coro_pair step) {
+	coro_pair result = {
+		value.integer + step.integer,
+		value.floating + step.floating,
+	};
+	return result;
+}
+
+CGOBENCH_NOINLINE coro_pair coro_direct_pair(coro_pair value, coro_pair step) {
+	coro_pair result = {
+		value.integer + step.integer,
+		value.floating + step.floating,
+	};
+	return result;
+}
+
 static uint64_t coro_nanotime(void) {
 	struct timespec now;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {

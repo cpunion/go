@@ -6,6 +6,7 @@ package coro
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -14,6 +15,11 @@ const cgoDirectVersion = "v1"
 // maxCgoDirectParams is the widest supported signature: eight integer and
 // eight floating-point argument registers.
 const maxCgoDirectParams = 16
+
+const (
+	maxCgoDirectAggregateSize  = 128
+	maxCgoDirectAggregateAlign = 8
+)
 
 type cgoABIType uint8
 
@@ -30,6 +36,7 @@ const (
 	cgoABIFloat32
 	cgoABIFloat64
 	cgoABIPointer
+	cgoABIMemory
 	cgoABIVoid
 )
 
@@ -161,6 +168,30 @@ func parseCgoABIType(value string) (cgoABIType, error) {
 	case "void":
 		return cgoABIVoid, nil
 	default:
+		if err := parseCgoABIMemory(value); err == nil {
+			return cgoABIMemory, nil
+		}
 		return cgoABIInvalid, fmt.Errorf("unsupported cgo direct ABI type %q", value)
 	}
+}
+
+func parseCgoABIMemory(value string) error {
+	value, ok := strings.CutPrefix(value, "mem")
+	if !ok {
+		return fmt.Errorf("missing memory prefix")
+	}
+	sizeText, alignText, ok := strings.Cut(value, ":")
+	if !ok {
+		return fmt.Errorf("missing memory alignment")
+	}
+	size, err := strconv.ParseInt(sizeText, 10, 64)
+	if err != nil || size <= 0 || size > maxCgoDirectAggregateSize {
+		return fmt.Errorf("invalid memory size")
+	}
+	align, err := strconv.ParseInt(alignText, 10, 64)
+	if err != nil || align <= 0 || align > maxCgoDirectAggregateAlign ||
+		align&(align-1) != 0 {
+		return fmt.Errorf("invalid memory alignment")
+	}
+	return nil
 }

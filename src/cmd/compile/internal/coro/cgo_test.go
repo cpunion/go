@@ -20,6 +20,8 @@ func TestParseCgoDirectDirectives(t *testing.T) {
 			"mayblock", "i32,ptr,u64", "i64", "errno"},
 		{"cgo_direct", "v1", "_Cfunc_all", "_Cdirect_all", "all",
 			"mayblock", "i8,i16,i32,i64,u8,u16,f32,f64", "u32", "-"},
+		{"cgo_direct", "v1", "_Cfunc_pair", "_Cdirect_pair", "pair",
+			"mayblock", "mem16:8,u32", "mem16:8", "-"},
 	}
 	calls, err := parseCgoDirectives(directives)
 	if err != nil {
@@ -52,6 +54,11 @@ func TestParseCgoDirectDirectives(t *testing.T) {
 	if all.result != cgoABIUint32 {
 		t.Errorf("all metadata result = %v, want %v", all.result, cgoABIUint32)
 	}
+	pair := calls["_Cfunc_pair"]
+	if len(pair.params) != 2 || pair.params[0] != cgoABIMemory ||
+		pair.params[1] != cgoABIUint32 || pair.result != cgoABIMemory {
+		t.Errorf("pair metadata = %+v", pair)
+	}
 }
 
 func TestParseCgoDirectDirectiveErrors(t *testing.T) {
@@ -68,6 +75,10 @@ func TestParseCgoDirectDirectiveErrors(t *testing.T) {
 		{"version", func(d []string) []string { d[1] = "v2"; return d }, "version"},
 		{"class", func(d []string) []string { d[5] = "noblock"; return d }, "class"},
 		{"parameter", func(d []string) []string { d[6] = "f128"; return d }, "ABI type"},
+		{"memory size", func(d []string) []string { d[6] = "mem0:8"; return d }, "ABI type"},
+		{"large memory", func(d []string) []string { d[6] = "mem129:8"; return d }, "ABI type"},
+		{"memory alignment", func(d []string) []string { d[6] = "mem16:3"; return d }, "ABI type"},
+		{"memory format", func(d []string) []string { d[6] = "mem16"; return d }, "ABI type"},
 		{"empty parameter", func(d []string) []string { d[6] = ""; return d }, "ABI type"},
 		{"void parameter", func(d []string) []string { d[6] = "void"; return d }, "void"},
 		{"too many parameters", func(d []string) []string {

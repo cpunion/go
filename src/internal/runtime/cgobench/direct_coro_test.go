@@ -43,6 +43,19 @@ func TestCalls(t *testing.T) {
 			t.Errorf("%s errno calls = %d, want 5", test.name, test.got)
 		}
 	}
+	for _, test := range []struct {
+		name string
+		call func(int) (uint64, float64)
+	}{
+		{"ordinary", cgobench.CgoPairCalls},
+		{"direct", cgobench.DirectPairCalls},
+	} {
+		integer, floating := test.call(5)
+		if integer != 11 || floating != 1.75 {
+			t.Errorf("%s pair calls = (%d, %g), want (11, 1.75)",
+				test.name, integer, floating)
+		}
+	}
 	if got := cgobench.NoBlockCalls(2); got != 2 {
 		t.Fatalf("NoBlockCalls(2) = %d, want 2", got)
 	}
@@ -121,7 +134,7 @@ func testRunnableHandoffs(t *testing.T, handoffs func(int) uint64) {
 //
 //	GOEXPERIMENT=coro go test internal/runtime/cgobench \
 //		-run=^$ \
-//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|LibmSteady|ErrnoSteady|BlockingHandoff|RunnableHandoff)$' \
+//		-bench='(Ordinary|Direct|NoBlock)Cgo(CallsSteady|CallEntry|LibmSteady|ErrnoSteady|PairSteady|BlockingHandoff|RunnableHandoff)$' \
 //		-gcflags=internal/runtime/cgobench='-l -d=coro=4'
 //
 // The Steady benchmarks batch calls within one coroutine root and isolate the
@@ -164,6 +177,24 @@ func BenchmarkDirectCgoErrnoSteady(b *testing.B) {
 	b.ReportAllocs()
 	if got := cgobench.DirectErrnoCalls(b.N); got != int64(b.N) {
 		b.Fatalf("result = %d, want %d", got, b.N)
+	}
+}
+
+func BenchmarkOrdinaryCgoPairSteady(b *testing.B) {
+	b.ReportAllocs()
+	integer, floating := cgobench.CgoPairCalls(b.N)
+	if integer != uint64(1+2*b.N) || floating != 0.5+0.25*float64(b.N) {
+		b.Fatalf("result = (%d, %g), want (%d, %g)",
+			integer, floating, 1+2*b.N, 0.5+0.25*float64(b.N))
+	}
+}
+
+func BenchmarkDirectCgoPairSteady(b *testing.B) {
+	b.ReportAllocs()
+	integer, floating := cgobench.DirectPairCalls(b.N)
+	if integer != uint64(1+2*b.N) || floating != 0.5+0.25*float64(b.N) {
+		b.Fatalf("result = (%d, %g), want (%d, %g)",
+			integer, floating, 1+2*b.N, 0.5+0.25*float64(b.N))
 	}
 }
 

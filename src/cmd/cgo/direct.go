@@ -8,13 +8,18 @@ import (
 	"fmt"
 	"go/ast"
 	"io"
-	"slices"
+	"strconv"
 	"strings"
 
 	"internal/buildcfg"
 )
 
 const cgoDirectVersion = "v1"
+
+const (
+	cgoDirectMaxAggregateSize  = 128
+	cgoDirectMaxAggregateAlign = 8
+)
 
 type cgoDirectType string
 
@@ -30,16 +35,27 @@ const (
 	cgoDirectFloat32 cgoDirectType = "f32"
 	cgoDirectFloat64 cgoDirectType = "f64"
 	cgoDirectPointer cgoDirectType = "ptr"
+	cgoDirectMemory  cgoDirectType = "mem"
 	cgoDirectVoid    cgoDirectType = "void"
 )
+
+// cgoDirectValue describes one Go-visible value and how the generated C
+// bridge receives it. Scalar values use their platform register class.
+// Pointer-free aggregate values are passed to the bridge by address, leaving
+// the C compiler responsible for the target function's aggregate ABI.
+type cgoDirectValue struct {
+	typ   cgoDirectType
+	width int64
+	align int64
+}
 
 type cgoDirectCall struct {
 	wrapper string
 	direct  string
 	symbol  string
 	entry   string
-	params  []cgoDirectType
-	result  cgoDirectType
+	params  []cgoDirectValue
+	result  cgoDirectValue
 	errno   bool
 }
 
@@ -50,28 +66,32 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 		return cgoDirectCall{}, false
 	}
 
-	params := make([]cgoDirectType, len(n.FuncType.Params))
+	params := make([]cgoDirectValue, len(n.FuncType.Params))
 	for i, param := range n.FuncType.Params {
 		var ok bool
-		params[i], ok = cgoDirectTypeOf(param)
-		if !ok || params[i] == cgoDirectVoid {
+		params[i], ok = cgoDirectValueOf(param)
+		if !ok || params[i].typ == cgoDirectVoid {
 			return cgoDirectCall{}, false
 		}
 	}
-	result := cgoDirectVoid
+	result := cgoDirectValue{typ: cgoDirectVoid}
 	if n.FuncType.Result != nil {
 		var ok bool
-		result, ok = cgoDirectTypeOf(n.FuncType.Result)
-		if !ok || result == cgoDirectVoid {
+		result, ok = cgoDirectValueOf(n.FuncType.Result)
+		if !ok || result.typ == cgoDirectVoid {
 			return cgoDirectCall{}, false
 		}
 	}
 
-	registerParams := params
-	if n.AddError && result != cgoDirectVoid {
-		registerParams = append(slices.Clone(params), cgoDirectPointer)
+	call := cgoDirectCall{
+		wrapper: n.Mangle,
+		symbol:  n.C,
+		entry:   fmt.Sprintf("_cgo%s%s_direct", cPrefix, n.Mangle),
+		params:  params,
+		result:  result,
+		errno:   n.AddError,
 	}
-	if _, ok := cgoDirectArgRegisters(buildcfg.GOARCH, registerParams); !ok {
+	if _, ok := cgoDirectArgRegisters(buildcfg.GOARCH, call.bridgeParams()); !ok {
 		return cgoDirectCall{}, false
 	}
 
@@ -84,15 +104,8 @@ func (p *Package) directCall(n *Name) (cgoDirectCall, bool) {
 	default:
 		return cgoDirectCall{}, false
 	}
-	return cgoDirectCall{
-		wrapper: n.Mangle,
-		direct:  direct,
-		symbol:  n.C,
-		entry:   fmt.Sprintf("_cgo%s%s_direct", cPrefix, n.Mangle),
-		params:  params,
-		result:  result,
-		errno:   n.AddError,
-	}, true
+	call.direct = direct
+	return call, true
 }
 
 func cgoDirectSupported() bool {
@@ -124,7 +137,7 @@ func (call cgoDirectCall) writeDirective(w io.Writer) {
 	if len(call.params) != 0 {
 		names := make([]string, len(call.params))
 		for i, param := range call.params {
-			names[i] = string(param)
+			names[i] = param.String()
 		}
 		params = strings.Join(names, ",")
 	}
@@ -155,24 +168,21 @@ func (p *Package) writeDirectAssembly() {
 
 func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 	offsets, resultOffset, errnoOffset, frameSize := cgoDirectFrame(call, p.PtrSize)
-	registerParams := call.params
-	if call.errno && call.result != cgoDirectVoid {
-		registerParams = append(slices.Clone(call.params), cgoDirectPointer)
-	}
-	registers, _ := cgoDirectArgRegisters(buildcfg.GOARCH, registerParams)
+	registers, _ := cgoDirectArgRegisters(buildcfg.GOARCH, call.bridgeParams())
 	fmt.Fprintf(w, "TEXT ·%s(SB),NOSPLIT,$0-%d\n", call.direct, frameSize)
 	for i, param := range call.params {
-		fmt.Fprintf(w, "\t%s\tp%d+%d(FP), %s\n",
-			cgoDirectLoad(buildcfg.GOARCH, param), i, offsets[i],
-			registers[i])
-	}
-	if call.errno && call.result != cgoDirectVoid {
-		address := fmt.Sprintf("ret+%d(FP)", resultOffset)
-		if buildcfg.GOARCH == "arm64" {
-			address = "$" + address
+		if param.typ == cgoDirectMemory {
+			writeDirectAddress(w, buildcfg.GOARCH,
+				fmt.Sprintf("p%d+%d(FP)", i, offsets[i]), registers[i])
+		} else {
+			fmt.Fprintf(w, "\t%s\tp%d+%d(FP), %s\n",
+				cgoDirectLoad(buildcfg.GOARCH, param.typ), i, offsets[i],
+				registers[i])
 		}
-		fmt.Fprintf(w, "\t%s\t%s, %s\n",
-			cgoDirectAddress(buildcfg.GOARCH), address, registers[len(call.params)])
+	}
+	if call.indirectResult() {
+		writeDirectAddress(w, buildcfg.GOARCH,
+			fmt.Sprintf("ret+%d(FP)", resultOffset), registers[len(call.params)])
 	}
 	for _, instruction := range cgoDirectCallInstructions(buildcfg.GOARCH, call.entry) {
 		fmt.Fprintf(w, "\t%s\n", instruction)
@@ -182,12 +192,21 @@ func (p *Package) writeDirectAssemblyCall(w io.Writer, call cgoDirectCall) {
 			cgoDirectStore(buildcfg.GOARCH, cgoDirectPointer),
 			cgoDirectResultRegister(buildcfg.GOARCH, cgoDirectPointer),
 			errnoOffset)
-	} else if call.result != cgoDirectVoid {
+	} else if call.result.typ != cgoDirectVoid &&
+		call.result.typ != cgoDirectMemory {
 		fmt.Fprintf(w, "\t%s\t%s, ret+%d(FP)\n",
-			cgoDirectStore(buildcfg.GOARCH, call.result),
-			cgoDirectResultRegister(buildcfg.GOARCH, call.result), resultOffset)
+			cgoDirectStore(buildcfg.GOARCH, call.result.typ),
+			cgoDirectResultRegister(buildcfg.GOARCH, call.result.typ), resultOffset)
 	}
 	fmt.Fprintln(w, "\tRET")
+}
+
+func writeDirectAddress(w io.Writer, goarch, address, register string) {
+	if goarch == "arm64" {
+		address = "$" + address
+	}
+	fmt.Fprintf(w, "\t%s\t%s, %s\n",
+		cgoDirectAddress(goarch), address, register)
 }
 
 func cgoDirectCallInstructions(goarch, entry string) []string {
@@ -221,6 +240,8 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 	fmt.Fprintln(w, "CGO_NO_SANITIZE_THREAD")
 	if call.errno {
 		fmt.Fprintln(w, "size_t")
+	} else if call.result.typ == cgoDirectMemory {
+		fmt.Fprintln(w, "void")
 	} else if result := n.FuncType.Result; result != nil {
 		fmt.Fprintln(w, cgoDirectCType(result))
 	} else {
@@ -231,9 +252,13 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 		if i != 0 {
 			fmt.Fprint(w, ", ")
 		}
-		fmt.Fprintf(w, "%s p%d", cgoDirectCType(param), i)
+		if call.params[i].typ == cgoDirectMemory {
+			fmt.Fprintf(w, "const %s *p%d", cgoDirectCType(param), i)
+		} else {
+			fmt.Fprintf(w, "%s p%d", cgoDirectCType(param), i)
+		}
 	}
-	if call.errno && n.FuncType.Result != nil {
+	if call.indirectResult() {
 		if len(n.FuncType.Params) != 0 {
 			fmt.Fprint(w, ", ")
 		}
@@ -251,6 +276,8 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 	fmt.Fprint(w, "\t")
 	if call.errno && n.FuncType.Result != nil {
 		fmt.Fprint(w, "value = ")
+	} else if call.result.typ == cgoDirectMemory {
+		fmt.Fprint(w, "*result = ")
 	} else if !call.errno && n.FuncType.Result != nil {
 		fmt.Fprint(w, "return ")
 	}
@@ -259,7 +286,11 @@ func (p *Package) writeDirectCBridge(w io.Writer, n *Name, call cgoDirectCall) {
 		if i != 0 {
 			fmt.Fprint(w, ", ")
 		}
-		fmt.Fprintf(w, "p%d", i)
+		if call.params[i].typ == cgoDirectMemory {
+			fmt.Fprintf(w, "*p%d", i)
+		} else {
+			fmt.Fprintf(w, "p%d", i)
+		}
 	}
 	fmt.Fprintln(w, ");")
 	if call.errno {
@@ -284,17 +315,14 @@ func cgoDirectFrame(call cgoDirectCall, ptrSize int64) (params []int64, result, 
 	params = make([]int64, len(call.params))
 	var offset int64
 	for i, param := range call.params {
-		align := param.size()
-		if align > ptrSize {
-			align = ptrSize
-		}
+		align := param.alignment(ptrSize)
 		offset = cgoDirectAlign(offset, align)
 		params[i] = offset
 		offset += param.size()
 	}
-	if call.result != cgoDirectVoid {
+	if call.result.typ != cgoDirectVoid {
 		offset = cgoDirectAlign(offset, ptrSize)
-		offset = cgoDirectAlign(offset, call.result.size())
+		offset = cgoDirectAlign(offset, call.result.alignment(ptrSize))
 		result = offset
 		offset += call.result.size()
 	}
@@ -308,6 +336,55 @@ func cgoDirectFrame(call cgoDirectCall, ptrSize int64) (params []int64, result, 
 
 func cgoDirectAlign(value, align int64) int64 {
 	return (value + align - 1) &^ (align - 1)
+}
+
+func (call cgoDirectCall) bridgeParams() []cgoDirectType {
+	params := make([]cgoDirectType, 0, len(call.params)+1)
+	for _, param := range call.params {
+		params = append(params, param.bridgeType())
+	}
+	if call.indirectResult() {
+		params = append(params, cgoDirectPointer)
+	}
+	return params
+}
+
+func (call cgoDirectCall) indirectResult() bool {
+	return call.result.typ == cgoDirectMemory ||
+		call.errno && call.result.typ != cgoDirectVoid
+}
+
+func (value cgoDirectValue) String() string {
+	if value.typ != cgoDirectMemory {
+		return string(value.typ)
+	}
+	return "mem" + strconv.FormatInt(value.width, 10) + ":" +
+		strconv.FormatInt(value.align, 10)
+}
+
+func (value cgoDirectValue) bridgeType() cgoDirectType {
+	if value.typ == cgoDirectMemory {
+		return cgoDirectPointer
+	}
+	return value.typ
+}
+
+func (value cgoDirectValue) size() int64 {
+	if value.typ == cgoDirectMemory {
+		return value.width
+	}
+	return value.typ.size()
+}
+
+func (value cgoDirectValue) alignment(ptrSize int64) int64 {
+	align := value.align
+	if align == 0 {
+		align = value.size()
+	}
+	if align > ptrSize {
+		align = ptrSize
+	}
+	return align
 }
 
 func (typ cgoDirectType) size() int64 {
@@ -466,6 +543,86 @@ func cgoDirectResultRegister(goarch string, typ cgoDirectType) string {
 
 func (typ cgoDirectType) isFloat() bool {
 	return typ == cgoDirectFloat32 || typ == cgoDirectFloat64
+}
+
+func cgoDirectValueOf(t *Type) (cgoDirectValue, bool) {
+	typ, ok := cgoDirectTypeOf(t)
+	if ok {
+		return cgoDirectValue{typ: typ}, true
+	}
+	if t == nil || t.Size <= 0 || t.Size > cgoDirectMaxAggregateSize ||
+		t.Align <= 0 || t.Align > cgoDirectMaxAggregateAlign ||
+		t.Align&(t.Align-1) != 0 ||
+		!cgoDirectAggregate(t.Go, make(map[string]bool)) {
+		return cgoDirectValue{}, false
+	}
+	return cgoDirectValue{
+		typ:   cgoDirectMemory,
+		width: t.Size,
+		align: t.Align,
+	}, true
+}
+
+func cgoDirectAggregate(expr ast.Expr, seen map[string]bool) bool {
+	switch expr := expr.(type) {
+	case *ast.StructType:
+		for _, field := range expr.Fields.List {
+			if !cgoDirectMemorySafe(field.Type, seen) {
+				return false
+			}
+		}
+		return true
+	case *ast.Ident:
+		if strings.HasPrefix(expr.Name, "_Ctype_union_") ||
+			strings.HasPrefix(expr.Name, "_Ctype_class_") ||
+			seen[expr.Name] {
+			return false
+		}
+		underlying := typedef[expr.Name]
+		if underlying == nil {
+			return false
+		}
+		seen[expr.Name] = true
+		ok := cgoDirectAggregate(underlying.Go, seen)
+		delete(seen, expr.Name)
+		return ok
+	}
+	return false
+}
+
+func cgoDirectMemorySafe(expr ast.Expr, seen map[string]bool) bool {
+	switch expr := expr.(type) {
+	case *ast.ArrayType:
+		return expr.Len != nil && cgoDirectMemorySafe(expr.Elt, seen)
+	case *ast.StructType:
+		for _, field := range expr.Fields.List {
+			if !cgoDirectMemorySafe(field.Type, seen) {
+				return false
+			}
+		}
+		return true
+	case *ast.Ident:
+		switch expr.Name {
+		case "bool", "byte", "uint8", "int8", "uint16", "int16",
+			"uint32", "int32", "uint64", "int64", "uint", "int",
+			"uintptr", "float32", "float64", "complex64", "complex128":
+			return true
+		}
+		if strings.HasPrefix(expr.Name, "_Ctype_union_") ||
+			strings.HasPrefix(expr.Name, "_Ctype_class_") ||
+			seen[expr.Name] {
+			return false
+		}
+		underlying := typedef[expr.Name]
+		if underlying == nil || underlying.BadPointer {
+			return false
+		}
+		seen[expr.Name] = true
+		ok := cgoDirectMemorySafe(underlying.Go, seen)
+		delete(seen, expr.Name)
+		return ok
+	}
+	return false
 }
 
 func cgoDirectTypeOf(t *Type) (cgoDirectType, bool) {
