@@ -154,6 +154,50 @@ func taskParkUntilReleased(tasks int) uint64 {
 }
 
 var (
+	parallelYieldDone     uint64
+	parallelYieldChecksum uint64
+	parallelYieldSeed     uint64
+	parallelYieldWorkSize int
+)
+
+func parallelWork(iterations int, value uint64) uint64 {
+	for i := 0; i < iterations; i++ {
+		value = value*6364136223846793005 + 1442695040888963407
+	}
+	return value
+}
+
+func parallelYieldWorker() {
+	seed := atomic.AddUint64(&parallelYieldSeed, 1)
+	value := parallelWork(parallelYieldWorkSize, seed)
+	runtime.Gosched()
+	value = parallelWork(parallelYieldWorkSize, value)
+	atomic.AddUint64(&parallelYieldChecksum, value)
+	atomic.AddUint64(&parallelYieldDone, 1)
+}
+
+func parallelYieldWork(rounds, tasks, work int) uint64 {
+	if rounds <= 0 || tasks <= 0 || work <= 0 {
+		return 0
+	}
+	var total uint64
+	for round := 0; round < rounds; round++ {
+		atomic.StoreUint64(&parallelYieldDone, 0)
+		atomic.StoreUint64(&parallelYieldChecksum, 0)
+		atomic.StoreUint64(&parallelYieldSeed, uint64(round*tasks))
+		parallelYieldWorkSize = work
+		for task := 0; task < tasks; task++ {
+			go parallelYieldWorker()
+		}
+		for atomic.LoadUint64(&parallelYieldDone) < uint64(tasks) {
+			runtime.Gosched()
+		}
+		total += atomic.LoadUint64(&parallelYieldChecksum)
+	}
+	return total
+}
+
+var (
 	channelPing       chan int
 	channelPong       chan int
 	channelIterations int

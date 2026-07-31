@@ -52,3 +52,22 @@ COROBENCH_NOINLINE uint64_t probe_block(
 	uint64_t end = probe_nanotime();
 	return end >= start ? end - start : 0;
 }
+
+COROBENCH_NOINLINE uint64_t probe_block_group(
+	uint64_t epoch, uint64_t *entered, uint64_t *release,
+	uint64_t timeout_ns) {
+	__atomic_add_fetch(entered, 1, __ATOMIC_RELEASE);
+	uint64_t start = probe_nanotime();
+	if (start == 0) {
+		return 0;
+	}
+	const struct timespec pause = {0, 50000};
+	while (__atomic_load_n(release, __ATOMIC_ACQUIRE) < epoch) {
+		uint64_t now = probe_nanotime();
+		if (now == 0 || now - start >= timeout_ns) {
+			return 0;
+		}
+		nanosleep(&pause, 0);
+	}
+	return 1;
+}

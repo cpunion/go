@@ -47,17 +47,31 @@ baseline_output="$output_dir/baseline.txt"
 coro_output="$output_dir/coro.txt"
 baseline_error="$output_dir/baseline.stderr"
 coro_error="$output_dir/coro.stderr"
+baseline_capability="$output_dir/baseline-capability.txt"
+coro_capability="$output_dir/coro-capability.txt"
+baseline_capability_error="$output_dir/baseline-capability.stderr"
+coro_capability_error="$output_dir/coro-capability.stderr"
 : >"$baseline_output"
 : >"$coro_output"
 : >"$baseline_error"
 : >"$coro_error"
+: >"$baseline_capability"
+: >"$coro_capability"
+: >"$baseline_capability_error"
+: >"$coro_capability_error"
 
 export GO111MODULE=off
 
 "$baseline_goroot/bin/go" test -count=1 -cover
 ./check.bash "$coro_goroot" "$output_dir"
+"$baseline_goroot/bin/go" test -run '^TestCBlockingGroupCapacity$' \
+	-count=1 -v -gcflags=-l >"$baseline_capability" \
+	2>"$baseline_capability_error"
+"$output_dir/coro.test" -test.run '^TestCBlockingGroupCapacity$' \
+	-test.count=1 -test.v >"$coro_capability" \
+	2>"$coro_capability_error"
 
-benchmarks='^Benchmark(YieldBatch|YieldEntry|RecursiveYield64|RecursiveYield4096|DeferYield|RecoverYield|TaskSequence|TaskBurst100|TaskPark100|ChannelRoundTrip|ReadySelect|SleepZero|SleepNanosecond|FileRead|TCPRead|CScalar|CAggregate|CErrno|CLibm|CBlockingHandoff)$'
+benchmarks='^Benchmark(YieldBatch|YieldEntry|RecursiveYield64|RecursiveYield4096|DeferYield|RecoverYield|TaskSequence|TaskBurst100|TaskPark100|ChannelRoundTrip|ReadySelect|SleepZero|SleepNanosecond|FileRead|TCPRead|FileBlockingProgress|TCPBlockingProgress|CScalar|CAggregate|CErrno|CLibm|CBlockingHandoff|CBlockingGroup3|CBlockingGroup8)$'
 samples=${SAMPLES:-10}
 benchtime=${BENCHTIME:-500ms}
 
@@ -97,6 +111,47 @@ for ((sample = 1; sample <= samples; sample++)); do
 	else
 		run_coro
 		run_baseline
+	fi
+done
+
+scaling_benchmarks='^BenchmarkParallelYieldWork$'
+scaling_samples=${SCALING_SAMPLES:-$samples}
+scaling_benchtime=${SCALING_BENCHTIME:-$benchtime}
+
+run_baseline_scaling() {
+	local output=${1:-$baseline_output}
+	if ! "$baseline_goroot/bin/go" test -run '^$' \
+		-bench "$scaling_benchmarks" -benchtime="$scaling_benchtime" \
+		-count=1 -cpu=1,2,4 -timeout=10m -gcflags=-l \
+		>>"$output" 2>>"$baseline_error"; then
+		tail -n 100 "$baseline_error" >&2
+		return 1
+	fi
+}
+
+run_coro_scaling() {
+	local output=${1:-$coro_output}
+	if ! GOEXPERIMENT=coro "$coro_goroot/bin/go" test -run '^$' \
+		-bench "$scaling_benchmarks" -benchtime="$scaling_benchtime" \
+		-count=1 -cpu=1,2,4 -timeout=10m \
+		-gcflags='-l -d=coro=4' >>"$output" 2>>"$coro_error"; then
+		tail -n 100 "$coro_error" >&2
+		return 1
+	fi
+}
+
+scaling_warmups=${SCALING_WARMUP_SAMPLES:-$warmup_samples}
+for ((sample = 1; sample <= scaling_warmups; sample++)); do
+	run_baseline_scaling /dev/null
+	run_coro_scaling /dev/null
+done
+for ((sample = 1; sample <= scaling_samples; sample++)); do
+	if ((sample % 2 == 1)); then
+		run_baseline_scaling
+		run_coro_scaling
+	else
+		run_coro_scaling
+		run_baseline_scaling
 	fi
 done
 

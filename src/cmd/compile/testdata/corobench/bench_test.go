@@ -7,6 +7,8 @@
 package corobench
 
 import (
+	"errors"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -48,6 +50,9 @@ func TestProbes(t *testing.T) {
 	if got := taskParkBursts(2, 3); got != 6 {
 		t.Errorf("taskParkBursts(2, 3) = %d, want 6", got)
 	}
+	if got := parallelYieldWork(1, 4, 8); got == 0 {
+		t.Error("parallelYieldWork(1, 4, 8) returned zero")
+	}
 	if got := channelRoundTrips(4); got != 10 {
 		t.Errorf("channelRoundTrips(4) = %d, want 10", got)
 	}
@@ -80,6 +85,35 @@ func TestProbes(t *testing.T) {
 	}
 	cleanup()
 
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileWatchdog := time.AfterFunc(5*time.Second, func() {
+		pipeReader.Close()
+		pipeWriter.Close()
+	})
+	if got, err := blockingFileRoundTrips(pipeReader, pipeWriter.Fd(), 2); err != nil || got != 2 {
+		t.Errorf("blockingFileRoundTrips(..., 2) = (%d, %v), want (2, nil)",
+			got, err)
+	}
+	if !fileWatchdog.Stop() {
+		t.Error("blocking file probe timed out")
+	}
+	pipeReader.Close()
+	pipeWriter.Close()
+
+	reader, writer, cleanup = newTCPPair(t)
+	networkWatchdog := time.AfterFunc(5*time.Second, cleanup)
+	if got, err := blockingTCPRoundTrips(reader, tcpFD(t, writer), 2); err != nil || got != 2 {
+		t.Errorf("blockingTCPRoundTrips(..., 2) = (%d, %v), want (2, nil)",
+			got, err)
+	}
+	if !networkWatchdog.Stop() {
+		t.Error("blocking TCP probe timed out")
+	}
+	cleanup()
+
 	if got := cScalarCalls(3); got != 4 {
 		t.Errorf("cScalarCalls(3) = %d, want 4", got)
 	}
@@ -99,10 +133,48 @@ func TestProbes(t *testing.T) {
 	if got := cBlockingHandoffs(1); got == 0 {
 		t.Error("cBlockingHandoffs(1) did not measure progress")
 	}
+	if elapsed, timeouts := cBlockingGroup(1, 3, 250*time.Millisecond); elapsed == 0 || timeouts != 0 {
+		t.Errorf("cBlockingGroup(1, 3) = (%d, %d), want elapsed and no timeout",
+			elapsed, timeouts)
+	}
 	runtime.GOMAXPROCS(old)
 }
 
+func TestCBlockingGroupCapacity(t *testing.T) {
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+	elapsed, timeouts := cBlockingGroup(1, 8, 250*time.Millisecond)
+	if elapsed == 0 || timeouts > 8 {
+		t.Fatalf("cBlockingGroup(1, 8) = (%d, %d), want elapsed and at most 8 timeouts",
+			elapsed, timeouts)
+	}
+	t.Logf("blocking-c-group calls=8 supported=%t timeouts=%d",
+		timeouts == 0, timeouts)
+}
+
 func TestProbeEdges(t *testing.T) {
+	writeFailure := errors.New("write failure")
+	readFailure := errors.New("read failure")
+	for _, test := range []struct {
+		name  string
+		state blockingIOState
+		want  error
+	}{
+		{"success", blockingIOState{writeN: 1, readN: 1, progressed: 1}, nil},
+		{"write error", blockingIOState{writeErr: writeFailure}, writeFailure},
+		{"read error", blockingIOState{readErr: readFailure}, readFailure},
+		{"short write", blockingIOState{readN: 1}, io.ErrShortWrite},
+		{"no read progress", blockingIOState{writeN: 1}, io.ErrNoProgress},
+		{"no sibling progress", blockingIOState{writeN: 1, readN: 1},
+			errBlockingIONoProgress},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := blockingIOError(&test.state, 1); got != test.want {
+				t.Errorf("blockingIOError() = %v, want %v", got, test.want)
+			}
+		})
+	}
+
 	if got := yieldLoop(0); got != 0 {
 		t.Errorf("yieldLoop(0) = %d, want 0", got)
 	}
@@ -124,6 +196,15 @@ func TestProbeEdges(t *testing.T) {
 	if got := taskParkUntilReleased(0); got != 0 {
 		t.Errorf("taskParkUntilReleased(0) = %d, want 0", got)
 	}
+	if got := parallelYieldWork(0, 1, 1); got != 0 {
+		t.Errorf("parallelYieldWork(0, 1, 1) = %d, want 0", got)
+	}
+	if got := parallelYieldWork(1, 0, 1); got != 0 {
+		t.Errorf("parallelYieldWork(1, 0, 1) = %d, want 0", got)
+	}
+	if got := parallelYieldWork(1, 1, 0); got != 0 {
+		t.Errorf("parallelYieldWork(1, 1, 0) = %d, want 0", got)
+	}
 	if got := channelRoundTrips(0); got != 0 {
 		t.Errorf("channelRoundTrips(0) = %d, want 0", got)
 	}
@@ -132,6 +213,35 @@ func TestProbeEdges(t *testing.T) {
 	}
 	if got := cBlockingHandoffs(0); got != 0 {
 		t.Errorf("cBlockingHandoffs(0) = %d, want 0", got)
+	}
+	if elapsed, timeouts := cBlockingGroup(0, 1, time.Second); elapsed != 0 || timeouts != 0 {
+		t.Errorf("cBlockingGroup(0, 1, 1s) = (%d, %d), want (0, 0)",
+			elapsed, timeouts)
+	}
+	if elapsed, timeouts := cBlockingGroup(1, 0, time.Second); elapsed != 0 || timeouts != 0 {
+		t.Errorf("cBlockingGroup(1, 0, 1s) = (%d, %d), want (0, 0)",
+			elapsed, timeouts)
+	}
+	if elapsed, timeouts := cBlockingGroup(1, 1, 0); elapsed != 0 || timeouts != 0 {
+		t.Errorf("cBlockingGroup(1, 1, 0) = (%d, %d), want (0, 0)",
+			elapsed, timeouts)
+	}
+	timeoutState := &cBlockingGroupState{epoch: 1, timeout: 1}
+	activeCBlockingGroup = timeoutState
+	cBlockingGroupWorker()
+	if entered, done, timeouts := atomic.LoadUint64(&timeoutState.entered),
+		atomic.LoadUint64(&timeoutState.done),
+		atomic.LoadUint64(&timeoutState.timeouts); entered != 1 || done != 1 || timeouts != 1 {
+		t.Errorf("timed blocking C call = (%d, %d, %d), want (1, 1, 1)",
+			entered, done, timeouts)
+	}
+	if got, err := blockingFileRoundTrips(nil, 0, 0); got != 0 || err != nil {
+		t.Errorf("blockingFileRoundTrips(nil, 0, 0) = (%d, %v), want (0, nil)",
+			got, err)
+	}
+	if got, err := blockingTCPRoundTrips(nil, 0, 0); got != 0 || err != nil {
+		t.Errorf("blockingTCPRoundTrips(nil, 0, 0) = (%d, %v), want (0, nil)",
+			got, err)
 	}
 
 	done := make(chan uint64, 1)
@@ -166,13 +276,47 @@ func TestProbeEdges(t *testing.T) {
 		t.Error("fileReads on a closed file succeeded")
 	}
 
-	reader, _, cleanup := newTCPPair(t)
+	file, err = os.Open("/dev/zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := blockingFileRoundTrips(file, writer.Fd(), 1); got != 0 || err == nil {
+		t.Errorf("blockingFileRoundTrips on a closed reader = (%d, %v), want error",
+			got, err)
+	}
+	invalidFD := writer.Fd()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeProbeByte(invalidFD, 1); err == nil {
+		t.Error("writeProbeByte on a closed descriptor succeeded")
+	}
+
+	reader, tcpWriter, cleanup := newTCPPair(t)
 	if err := reader.Close(); err != nil {
 		cleanup()
 		t.Fatal(err)
 	}
 	if _, err := tcpReads(reader, make([]byte, 1), 1); err == nil {
 		t.Error("tcpReads on a closed connection succeeded")
+	}
+	cleanup()
+
+	reader, tcpWriter, cleanup = newTCPPair(t)
+	if err := reader.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if got, err := blockingTCPRoundTrips(reader, tcpFD(t, tcpWriter), 1); got != 0 || err == nil {
+		t.Errorf("blockingTCPRoundTrips after an expired deadline = (%d, %v), want error",
+			got, err)
 	}
 	cleanup()
 }
@@ -247,6 +391,13 @@ func BenchmarkTaskPark100(b *testing.B) {
 	b.ReportAllocs()
 	if got := taskParkBursts(b.N, 100); got != uint64(100*b.N) {
 		b.Fatalf("taskParkBursts(%d, 100) = %d", b.N, got)
+	}
+}
+
+func BenchmarkParallelYieldWork(b *testing.B) {
+	b.ReportAllocs()
+	if got := parallelYieldWork(b.N, 64, 1<<12); got == 0 {
+		b.Fatal("parallelYieldWork returned zero")
 	}
 }
 
@@ -345,6 +496,40 @@ func BenchmarkTCPRead(b *testing.B) {
 	}
 }
 
+func BenchmarkFileBlockingProgress(b *testing.B) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	watchdog := time.AfterFunc(30*time.Second, func() {
+		reader.Close()
+		writer.Close()
+	})
+	defer watchdog.Stop()
+	b.ReportAllocs()
+	b.ResetTimer()
+	if got, err := blockingFileRoundTrips(reader, writer.Fd(), b.N); err != nil || got != b.N {
+		b.Fatalf("blockingFileRoundTrips(..., %d) = (%d, %v)",
+			b.N, got, err)
+	}
+}
+
+func BenchmarkTCPBlockingProgress(b *testing.B) {
+	reader, writer, cleanup := newTCPPair(b)
+	defer cleanup()
+	watchdog := time.AfterFunc(30*time.Second, cleanup)
+	defer watchdog.Stop()
+	writerFD := tcpFD(b, writer)
+	b.ReportAllocs()
+	b.ResetTimer()
+	if got, err := blockingTCPRoundTrips(reader, writerFD, b.N); err != nil || got != b.N {
+		b.Fatalf("blockingTCPRoundTrips(..., %d) = (%d, %v)",
+			b.N, got, err)
+	}
+}
+
 func BenchmarkCScalar(b *testing.B) {
 	b.ReportAllocs()
 	uintSink = cScalarCalls(b.N)
@@ -379,9 +564,54 @@ func BenchmarkCBlockingHandoff(b *testing.B) {
 	b.ReportMetric(float64(elapsed)/float64(b.N), "ns/progress")
 }
 
+func benchmarkCBlockingGroup(b *testing.B, calls int) {
+	const timeout = 250 * time.Millisecond
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+	_, timeouts := cBlockingGroup(1, calls, timeout)
+	if timeouts != 0 {
+		b.Skipf("%d concurrent blocking C calls exceeded executor capacity",
+			calls)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	entryElapsed, timeouts := cBlockingGroup(b.N, calls, timeout)
+	b.StopTimer()
+	if timeouts != 0 {
+		b.Fatalf("%d blocking C calls timed out", timeouts)
+	}
+	b.ReportMetric(float64(entryElapsed)/float64(b.N*calls),
+		"entry-ns/call")
+}
+
+func BenchmarkCBlockingGroup3(b *testing.B) {
+	benchmarkCBlockingGroup(b, 3)
+}
+
+func BenchmarkCBlockingGroup8(b *testing.B) {
+	benchmarkCBlockingGroup(b, 8)
+}
+
 type fataler interface {
 	Helper()
 	Fatal(...any)
+}
+
+func tcpFD(t fataler, conn *net.TCPConn) uintptr {
+	t.Helper()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+		return 0
+	}
+	var fd uintptr
+	if err := raw.Control(func(value uintptr) {
+		fd = value
+	}); err != nil {
+		t.Fatal(err)
+		return 0
+	}
+	return fd
 }
 
 func newTCPPair(t fataler) (reader, writer *net.TCPConn, cleanup func()) {

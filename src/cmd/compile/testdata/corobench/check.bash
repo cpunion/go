@@ -46,18 +46,29 @@ expected=(
 	taskParkWorker
 	taskParkBursts
 	taskParkUntilReleased
+	parallelYieldWorker
+	parallelYieldWork
 	channelWorker
 	channelRoundTrips
 	readySelects
 	sleepLoop
 	fileReads
 	tcpReads
+	waitForEpoch
+	blockingFileRead
+	blockingFileRelease
+	blockingFileRoundTrips
+	blockingTCPRead
+	blockingTCPRelease
+	blockingTCPRoundTrips
 	cScalarCalls
 	cPairCalls
 	cErrnoCalls
 	cLibmCalls
 	handoffWorker
 	cBlockingHandoffs
+	cBlockingGroupWorker
+	cBlockingGroup
 )
 for function in "${expected[@]}"; do
 	if ! grep -Eq "coro: func=.*\\.${function} .* primary=coro" \
@@ -87,7 +98,8 @@ for function in "${expected[@]}"; do
 		exit 1
 	fi
 done
-for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block; do
+for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block \
+	probe_block_group; do
 	if ! grep -Eq "_Cdirect2?_${symbol}" "$symbols_output"; then
 		echo "missing direct C symbol for $symbol" >&2
 		exit 1
