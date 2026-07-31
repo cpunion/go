@@ -1,0 +1,213 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package corobench
+
+import (
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+func yieldLoop(iterations int) int {
+	completed := 0
+	for i := 0; i < iterations; i++ {
+		runtime.Gosched()
+		completed++
+	}
+	return completed
+}
+
+func yieldEntry() int {
+	runtime.Gosched()
+	return 1
+}
+
+func recursiveYield(depth int) int {
+	if depth <= 0 {
+		runtime.Gosched()
+		return 1
+	}
+	return recursiveYield(depth-1) + 1
+}
+
+func finishDefer(result *int) {
+	*result = *result + 1
+}
+
+func deferYield() (result int) {
+	defer finishDefer(&result)
+	runtime.Gosched()
+	return 1
+}
+
+func recoverYield() (result int) {
+	defer func() {
+		if recover() != nil {
+			result = 1
+		}
+	}()
+	runtime.Gosched()
+	panic("corobench")
+}
+
+var taskDone uint64
+
+func taskWorker() {
+	runtime.Gosched()
+	atomic.AddUint64(&taskDone, 1)
+}
+
+func taskSequence(iterations int) uint64 {
+	if iterations <= 0 {
+		return 0
+	}
+	atomic.StoreUint64(&taskDone, 0)
+	for want := uint64(1); want <= uint64(iterations); want++ {
+		go taskWorker()
+		for atomic.LoadUint64(&taskDone) < want {
+			runtime.Gosched()
+		}
+	}
+	return atomic.LoadUint64(&taskDone)
+}
+
+func taskBursts(rounds, tasks int) uint64 {
+	if rounds <= 0 || tasks <= 0 {
+		return 0
+	}
+	var total uint64
+	for round := 0; round < rounds; round++ {
+		atomic.StoreUint64(&taskDone, 0)
+		for task := 0; task < tasks; task++ {
+			go taskWorker()
+		}
+		for atomic.LoadUint64(&taskDone) < uint64(tasks) {
+			runtime.Gosched()
+		}
+		total += atomic.LoadUint64(&taskDone)
+	}
+	return total
+}
+
+var (
+	taskParkGate  chan struct{}
+	taskParkReady uint64
+	taskParkDone  uint64
+)
+
+func taskParkWorker() {
+	atomic.AddUint64(&taskParkReady, 1)
+	<-taskParkGate
+	atomic.AddUint64(&taskParkDone, 1)
+}
+
+func taskParkBursts(rounds, tasks int) uint64 {
+	if rounds <= 0 || tasks <= 0 {
+		return 0
+	}
+	var total uint64
+	for round := 0; round < rounds; round++ {
+		taskParkGate = make(chan struct{})
+		atomic.StoreUint64(&taskParkReady, 0)
+		atomic.StoreUint64(&taskParkDone, 0)
+		for task := 0; task < tasks; task++ {
+			go taskParkWorker()
+		}
+		for atomic.LoadUint64(&taskParkReady) < uint64(tasks) {
+			runtime.Gosched()
+		}
+		close(taskParkGate)
+		for atomic.LoadUint64(&taskParkDone) < uint64(tasks) {
+			runtime.Gosched()
+		}
+		total += atomic.LoadUint64(&taskParkDone)
+	}
+	return total
+}
+
+var taskParkRelease uint64
+
+func taskParkUntilReleased(tasks int) uint64 {
+	if tasks <= 0 {
+		return 0
+	}
+	taskParkGate = make(chan struct{})
+	atomic.StoreUint64(&taskParkReady, 0)
+	atomic.StoreUint64(&taskParkDone, 0)
+	atomic.StoreUint64(&taskParkRelease, 0)
+	for task := 0; task < tasks; task++ {
+		go taskParkWorker()
+	}
+	for atomic.LoadUint64(&taskParkReady) < uint64(tasks) {
+		runtime.Gosched()
+	}
+	for atomic.LoadUint64(&taskParkRelease) == 0 {
+		runtime.Gosched()
+	}
+	close(taskParkGate)
+	for atomic.LoadUint64(&taskParkDone) < uint64(tasks) {
+		runtime.Gosched()
+	}
+	return atomic.LoadUint64(&taskParkDone)
+}
+
+var (
+	channelPing       chan int
+	channelPong       chan int
+	channelIterations int
+)
+
+func channelWorker() {
+	for i := 0; i < channelIterations; i++ {
+		value := <-channelPing
+		channelPong <- value + 1
+	}
+}
+
+func channelRoundTrips(iterations int) int {
+	if iterations <= 0 {
+		return 0
+	}
+	channelPing = make(chan int)
+	channelPong = make(chan int)
+	channelIterations = iterations
+	go channelWorker()
+	sum := 0
+	for i := 0; i < iterations; i++ {
+		channelPing <- i
+		value := <-channelPong
+		sum += value
+	}
+	return sum
+}
+
+func readySelects(iterations int) int {
+	left := make(chan int, 1)
+	right := make(chan int, 1)
+	sum := 0
+	for i := 0; i < iterations; i++ {
+		if i&1 == 0 {
+			left <- i
+		} else {
+			right <- i
+		}
+		select {
+		case value := <-left:
+			sum += value
+		case value := <-right:
+			sum += value
+		}
+	}
+	return sum
+}
+
+func sleepLoop(iterations int, delay time.Duration) int {
+	completed := 0
+	for i := 0; i < iterations; i++ {
+		time.Sleep(delay)
+		completed++
+	}
+	return completed
+}

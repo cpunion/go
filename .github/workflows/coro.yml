@@ -62,6 +62,12 @@ jobs:
           internal/buildcfg
           runtime
 
+      - name: Test default coroutine architecture probes
+        working-directory: src/cmd/compile/testdata/corobench
+        env:
+          GO111MODULE: off
+        run: ../../../../../bin/go test -count=1 -cover
+
       - name: Build coroutine experiment toolchain
         working-directory: src
         env:
@@ -80,6 +86,21 @@ jobs:
           internal/pkgbits
           internal/buildcfg
           runtime
+
+      - name: Test coroutine architecture probes
+        working-directory: src/cmd/compile/testdata/corobench
+        env:
+          GO111MODULE: off
+          GOEXPERIMENT: coro
+        run: ./check.bash "$GITHUB_WORKSPACE" "$RUNNER_TEMP/corobench"
+
+      - name: Upload coroutine architecture probe audit
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: corobench-${{ matrix.os }}
+          path: ${{ runner.temp }}/corobench
+          if-no-files-found: error
 
       - name: Test transparent cgo direct calls
         env:
