@@ -19,6 +19,8 @@ package corobench
 #cgo nocallback probe_sin
 #cgo noescape probe_block
 #cgo nocallback probe_block
+#cgo noescape probe_block_group
+#cgo nocallback probe_block_group
 
 #include <stdint.h>
 
@@ -32,12 +34,14 @@ probe_pair probe_pair_add(probe_pair, probe_pair);
 int64_t probe_errno(int64_t);
 double probe_sin(double);
 uint64_t probe_block(uint64_t, uint64_t *, uint64_t *);
+uint64_t probe_block_group(uint64_t, uint64_t *, uint64_t *, uint64_t);
 */
 import "C"
 
 import (
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -110,4 +114,62 @@ func cBlockingHandoffs(iterations int) uint64 {
 		elapsed += uint64(sample)
 	}
 	return elapsed
+}
+
+type cBlockingGroupState struct {
+	entered  uint64
+	release  uint64
+	done     uint64
+	timeouts uint64
+	epoch    uint64
+	timeout  uint64
+}
+
+var activeCBlockingGroup *cBlockingGroupState
+
+func cBlockingGroupWorker() {
+	state := activeCBlockingGroup
+	released := C.probe_block_group(
+		C.uint64_t(state.epoch),
+		(*C.uint64_t)(unsafe.Pointer(&state.entered)),
+		(*C.uint64_t)(unsafe.Pointer(&state.release)),
+		C.uint64_t(state.timeout),
+	)
+	if released == 0 {
+		atomic.AddUint64(&state.timeouts, 1)
+	}
+	atomic.AddUint64(&state.done, 1)
+}
+
+func cBlockingGroup(rounds, calls int, timeout time.Duration) (entryElapsed, timeouts uint64) {
+	if rounds <= 0 || calls <= 0 || timeout <= 0 {
+		return 0, 0
+	}
+	state := new(cBlockingGroupState)
+	activeCBlockingGroup = state
+	for round := 0; round < rounds; round++ {
+		epoch := uint64(round + 1)
+		atomic.StoreUint64(&state.entered, 0)
+		atomic.StoreUint64(&state.release, epoch-1)
+		atomic.StoreUint64(&state.done, 0)
+		atomic.StoreUint64(&state.timeouts, 0)
+		state.epoch = epoch
+		state.timeout = uint64(timeout)
+
+		start := time.Now()
+		for call := 0; call < calls; call++ {
+			go cBlockingGroupWorker()
+		}
+		for atomic.LoadUint64(&state.entered) < uint64(calls) &&
+			atomic.LoadUint64(&state.done) == 0 {
+			runtime.Gosched()
+		}
+		entryElapsed += uint64(time.Since(start))
+		atomic.StoreUint64(&state.release, epoch)
+		for atomic.LoadUint64(&state.done) < uint64(calls) {
+			runtime.Gosched()
+		}
+		timeouts += atomic.LoadUint64(&state.timeouts)
+	}
+	return entryElapsed, timeouts
 }

@@ -18,13 +18,29 @@ implementations differ most:
 - unbuffered channel round trips and ready `select`;
 - zero and one-nanosecond sleeps;
 - ready one-byte reads through `os.File.Read` and `net.TCPConn.Read`;
+- blocking pipe and loopback TCP reads released by a runnable logical sibling;
+- fixed-work task batches at `GOMAXPROCS=1,2,4`;
 - scalar, aggregate, errno, and libm C calls;
 - progress from a blocking C call to an already-runnable sibling at
   `GOMAXPROCS=1`.
+- groups of three blocking C calls, plus a self-timed capacity probe with
+  eight concurrent calls.
 
 The I/O benchmarks intentionally use the ordinary public APIs. They therefore
 include the experiment's current closure and worker-pool adaptation rather
-than measuring only lower-level runtime helpers.
+than measuring only lower-level runtime helpers. The blocking probes release
+each public read with a one-byte raw write syscall that cannot fill the empty
+pipe or socket buffer; this keeps the release path out of the unsupported
+public write lowering. A preceding `Sleep(0)` keeps the release worker on the
+automatically colored path without adding a positive-duration timer.
+
+Every probe is interpreted as one of three capability states. A native fast
+path is a performance result. An adapter fallback is an end-to-end measurement
+of the current implementation and is labeled as such. An unsupported or
+capacity-limited path is a capability result only and is not presented as
+performance. The eight-call C benchmark performs a self-timed preflight and
+skips its timing when the logical scheduler cannot keep all calls blocked
+while retaining an executor to release them.
 
 ## Reproducibility
 
@@ -46,13 +62,16 @@ cd /path/to/coroutine/src/cmd/compile/testdata/corobench
 `SAMPLES` defaults to 10 and `BENCHTIME` defaults to 500ms. The runner
 runs three unrecorded warm-up pairs, then alternates which toolchain runs first
 on each recorded sample. `FOOTPRINT_SAMPLES` defaults to six separate one-shot
-measurements.
+measurements. The fixed-work scaling probe uses the same defaults and runs
+separately with `-cpu=1,2,4`; `SCALING_SAMPLES` and `SCALING_BENCHTIME` can
+override them.
 
 The output directory contains benchmark text for each toolchain, compiler
-diagnostics, a lowering audit, the coroutine test binary, and its symbol table.
-Before measuring, the runner requires every intended helper to be classified
-and lowered, then checks direct entries for all five C probes. A fallback is a
-capability result and must not be presented as coroutine performance.
+diagnostics, the eight-call C capacity result, a lowering audit, the coroutine
+test binary, and its symbol table. Before measuring, the runner requires every
+intended helper to be classified and lowered, then checks direct entries for
+all C probes. A fallback is a capability result and must not be presented as
+coroutine performance.
 
 ## Initial architecture comparison
 
