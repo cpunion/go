@@ -596,9 +596,14 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 	s.prepareReplacementExecutors()
 }
 
-// coroSleep starts a timer operation for the current logical goroutine.
-func coroSleep(ctx unsafe.Pointer, ns int64) {
+// coroSleep starts a timer operation for the current logical goroutine and
+// reports whether the task must wait for it.
+func coroSleep(ctx unsafe.Pointer, ns int64) bool {
+	if ns <= 0 {
+		return false
+	}
 	startStacklessCoroTimer(ctx, ns)
+	return true
 }
 
 // coroChanSend starts a channel send for a stackless logical goroutine.

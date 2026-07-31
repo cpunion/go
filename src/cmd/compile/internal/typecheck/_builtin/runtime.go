@@ -198,7 +198,7 @@ func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroPanic(unsafe.Pointer, interface{})
 func coroPanicPending(unsafe.Pointer) bool
-func coroSleep(unsafe.Pointer, int64)
+func coroSleep(unsafe.Pointer, int64) bool
 func coroChanSend(unsafe.Pointer, chan<- any, *any)
 func coroChanRecv(unsafe.Pointer, <-chan any, *any, *bool)
 func coroSelect(unsafe.Pointer, *byte, int, int, bool, *int, *bool)

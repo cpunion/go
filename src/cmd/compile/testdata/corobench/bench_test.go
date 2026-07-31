@@ -57,6 +57,9 @@ func TestProbes(t *testing.T) {
 	if got := sleepLoop(2, 0); got != 2 {
 		t.Errorf("sleepLoop(2, 0) = %d, want 2", got)
 	}
+	if got := sleepLoop(2, -1); got != 2 {
+		t.Errorf("sleepLoop(2, -1) = %d, want 2", got)
+	}
 
 	file, err := os.Open("/dev/zero")
 	if err != nil {

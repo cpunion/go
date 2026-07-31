@@ -122,8 +122,8 @@ func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) u
 	coroSpawn(ctx, resume)
 }
 
-func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) {
-	coroSleep(ctx, ns)
+func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
+	return coroSleep(ctx, ns)
 }
 
 func SendIntStacklessCoroForTest(ctx unsafe.Pointer, channel chan<- int, value *int) {

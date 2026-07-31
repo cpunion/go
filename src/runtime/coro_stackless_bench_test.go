@@ -121,7 +121,9 @@ func BenchmarkStacklessCoroTimer(b *testing.B) {
 			return runtime.StacklessCoroActionComplete
 		}
 		pending = true
-		runtime.SleepStacklessCoroForTest(ctx, 0)
+		if !runtime.SleepStacklessCoroForTest(ctx, 1) {
+			b.Fatal("positive sleep did not start a timer")
+		}
 		return runtime.StacklessCoroActionWait
 	})
 }
