@@ -135,7 +135,11 @@ func TestProbeEdges(t *testing.T) {
 	go func() {
 		done <- taskParkUntilReleased(4)
 	}()
+	readyDeadline := time.Now().Add(5 * time.Second)
 	for atomic.LoadUint64(&taskParkReady) < 4 {
+		if time.Now().After(readyDeadline) {
+			t.Fatal("taskParkUntilReleased(4) did not park its tasks")
+		}
 		runtime.Gosched()
 	}
 	atomic.StoreUint64(&taskParkRelease, 1)

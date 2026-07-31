@@ -81,6 +81,12 @@ if ! "$coro_goroot/bin/go" test -c -o "$test_binary" \
 	exit 1
 fi
 "$coro_goroot/bin/go" tool nm "$test_binary" >"$symbols_output"
+for function in "${expected[@]}"; do
+	if ! grep -Eq "\\.${function}\\.coro$" "$symbols_output"; then
+		echo "missing lowered coroutine symbol for $function" >&2
+		exit 1
+	fi
+done
 for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block; do
 	if ! grep -Eq "_Cdirect2?_${symbol}" "$symbols_output"; then
 		echo "missing direct C symbol for $symbol" >&2
