@@ -3244,10 +3244,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				duration := edit(state.call.Args[0])
 				duration = typecheck.Conv(duration, types.Types[types.TINT64])
-				body = append(body, typecheck.Call(state.call.Pos(),
+				wait := typecheck.Call(state.call.Pos(),
 					typecheck.LookupRuntime("coroSleep"),
-					ir.Nodes{ctx, duration}, false))
-				action = actionWait
+					ir.Nodes{ctx, duration}, false)
+				body = append(body,
+					ir.NewIfStmt(state.call.Pos(), wait, ir.Nodes{
+						ir.NewReturnStmt(state.call.Pos(), []ir.Node{
+							typedInt(state.call.Pos(),
+								types.Types[types.TUINT8],
+								int64(actionWait)),
+						}),
+					}, nil),
+					ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil),
+				)
 			case SiteFile, SitePoll:
 				if ordinaryReadOperation(state.call) {
 					var init ir.Nodes

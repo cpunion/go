@@ -152,7 +152,10 @@ func TestStacklessCoroNativeTrace(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SleepStacklessCoroForTest(ctx, int64(time.Millisecond))
+			if !runtime.SleepStacklessCoroForTest(ctx,
+				int64(time.Millisecond)) {
+				t.Fatal("positive sleep did not start a timer")
+			}
 			return runtime.StacklessCoroActionWait
 		case 1:
 			return runtime.StacklessCoroActionComplete

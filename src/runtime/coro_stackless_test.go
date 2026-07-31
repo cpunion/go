@@ -2342,7 +2342,9 @@ func TestStacklessCoroSleep(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SleepStacklessCoroForTest(ctx, int64(delay))
+			if !runtime.SleepStacklessCoroForTest(ctx, int64(delay)) {
+				t.Fatal("positive sleep did not start a timer")
+			}
 			return runtime.StacklessCoroActionWait
 		case 1:
 			state = 2
@@ -2354,6 +2356,23 @@ func TestStacklessCoroSleep(t *testing.T) {
 	})
 	if elapsed := time.Since(start); elapsed < delay {
 		t.Fatalf("sleep returned after %v, want at least %v", elapsed, delay)
+	}
+}
+
+func TestStacklessCoroSleepNonpositive(t *testing.T) {
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	for _, delay := range []int64{-1, 0} {
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SleepStacklessCoroForTest(ctx, delay) {
+				t.Fatalf("sleep(%d) started a timer", delay)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	}
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations !=
+		baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
 	}
 }
 

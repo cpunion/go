@@ -1255,6 +1255,55 @@ func TestLowerStateMachines(t *testing.T) {
 		}
 	}
 
+	var sleeperResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "sleeper.coro" {
+			sleeperResume = generated
+			break
+		}
+	}
+	if sleeperResume == nil {
+		t.Fatal("sleeper has no generated resume function")
+	}
+	foundSleepGuard := false
+	ir.Visit(sleeperResume, func(node ir.Node) {
+		conditional, ok := node.(*ir.IfStmt)
+		if !ok {
+			return
+		}
+		call, ok := conditional.Cond.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		name := ir.StaticCalleeName(call.Fun)
+		if name == nil || name.Sym() == nil ||
+			name.Sym().Name != "coroSleep" {
+			return
+		}
+		foundSleepGuard = true
+		if len(conditional.Body) != 1 {
+			t.Errorf("sleep guard has %d statements, want 1",
+				len(conditional.Body))
+			return
+		}
+		result, ok := conditional.Body[0].(*ir.ReturnStmt)
+		waitReturn := false
+		if ok && len(result.Results) == 1 {
+			if literal, ok := result.Results[0].(*ir.BasicLit); ok {
+				value, exact := constant.Int64Val(literal.Val())
+				waitReturn = exact && value == int64(actionWait)
+			}
+		}
+		if !waitReturn {
+			t.Errorf("sleep guard body = %v, want wait return",
+				conditional.Body)
+		}
+	})
+	if !foundSleepGuard {
+		t.Error("sleeper resume has no coroSleep result guard")
+	}
+
 	var foreignResume *ir.Func
 	for _, generated := range typecheck.Target.Funcs {
 		if generated.OClosure != nil && generated.ClosureParent != nil &&
