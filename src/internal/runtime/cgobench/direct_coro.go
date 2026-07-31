@@ -17,6 +17,8 @@ package cgobench
 #cgo nocallback coro_direct_sin_add
 #cgo noescape coro_direct_errno
 #cgo nocallback coro_direct_errno
+#cgo noescape coro_direct_pair
+#cgo nocallback coro_direct_pair
 #cgo noescape coro_direct_handoff
 #cgo nocallback coro_direct_handoff
 #cgo noescape coro_direct_runnable_handoff
@@ -28,6 +30,12 @@ void coro_cgo_sin_add(double, double *);
 void coro_direct_sin_add(double, double *);
 int64_t coro_cgo_errno(int64_t);
 int64_t coro_direct_errno(int64_t);
+typedef struct {
+	uint64_t integer;
+	double floating;
+} coro_pair;
+coro_pair coro_cgo_pair(coro_pair, coro_pair);
+coro_pair coro_direct_pair(coro_pair, coro_pair);
 void coro_cgo_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_direct_handoff(int, uint32_t *, uint32_t, uint64_t *);
 void coro_cgo_runnable_handoff(uint64_t *, uint64_t, uint64_t *, uint64_t *);
@@ -112,6 +120,27 @@ func DirectErrnoCalls(iterations int) int64 {
 		value = next
 	}
 	return int64(value)
+}
+
+// CgoPairCalls invokes an aggregate operation through the ordinary cgo path.
+func CgoPairCalls(iterations int) (uint64, float64) {
+	value := C.coro_pair{integer: 1, floating: 0.5}
+	step := C.coro_pair{integer: 2, floating: 0.25}
+	for i := 0; i < iterations; i++ {
+		value = C.coro_cgo_pair(value, step)
+	}
+	return uint64(value.integer), float64(value.floating)
+}
+
+// DirectPairCalls invokes the same aggregate operation through the coroutine
+// direct path. The package must be compiled with -d=coro=4.
+func DirectPairCalls(iterations int) (uint64, float64) {
+	value := C.coro_pair{integer: 1, floating: 0.5}
+	step := C.coro_pair{integer: 2, floating: 0.25}
+	for i := 0; i < iterations; i++ {
+		value = C.coro_direct_pair(value, step)
+	}
+	return uint64(value.integer), float64(value.floating)
 }
 
 var cgoHandoffGate uint32

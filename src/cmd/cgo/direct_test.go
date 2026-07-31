@@ -63,6 +63,234 @@ func TestCgoDirectType(t *testing.T) {
 	}
 }
 
+func TestCgoDirectAggregate(t *testing.T) {
+	structType := func(fields ...ast.Expr) *ast.StructType {
+		list := make([]*ast.Field, len(fields))
+		for i, field := range fields {
+			list[i] = &ast.Field{
+				Names: []*ast.Ident{ast.NewIdent(fmt.Sprintf("f%d", i))},
+				Type:  field,
+			}
+		}
+		return &ast.StructType{Fields: &ast.FieldList{List: list}}
+	}
+
+	value, ok := cgoDirectValueOf(&Type{
+		Size:  16,
+		Align: 8,
+		Go: structType(
+			ast.NewIdent("uint64"),
+			ast.NewIdent("float32"),
+			&ast.ArrayType{Len: &ast.BasicLit{}, Elt: ast.NewIdent("uint8")},
+		),
+	})
+	if !ok || value.typ != cgoDirectMemory || value.size() != 16 ||
+		value.alignment(8) != 8 || value.String() != "mem16:8" ||
+		value.bridgeType() != cgoDirectPointer {
+		t.Fatalf("aggregate value = (%+v, %t)", value, ok)
+	}
+
+	const (
+		structName = "_Ctype_struct_direct_test"
+		unionName  = "_Ctype_union_direct_test"
+		cycleName  = "_Ctype_direct_test_cycle"
+	)
+	oldStruct := typedef[structName]
+	oldUnion := typedef[unionName]
+	oldCycle := typedef[cycleName]
+	defer func() {
+		for name, old := range map[string]*Type{
+			structName: oldStruct,
+			unionName:  oldUnion,
+			cycleName:  oldCycle,
+		} {
+			if old == nil {
+				delete(typedef, name)
+			} else {
+				typedef[name] = old
+			}
+		}
+	}()
+	typedef[structName] = &Type{
+		Size:  8,
+		Align: 4,
+		Go:    structType(ast.NewIdent("uint32"), ast.NewIdent("int32")),
+	}
+	value, ok = cgoDirectValueOf(&Type{
+		Size: 8, Align: 4, Go: ast.NewIdent(structName),
+	})
+	if !ok || value.String() != "mem8:4" {
+		t.Fatalf("named aggregate value = (%+v, %t)", value, ok)
+	}
+
+	typedef[unionName] = &Type{
+		Size: 8, Align: 1,
+		Go: &ast.ArrayType{Len: &ast.BasicLit{}, Elt: ast.NewIdent("uint8")},
+	}
+	typedef[cycleName] = &Type{
+		Size: 8, Align: 8, Go: ast.NewIdent(cycleName),
+	}
+	tests := []struct {
+		name string
+		typ  *Type
+	}{
+		{"pointer field", &Type{
+			Size: 8, Align: 8,
+			Go: structType(&ast.StarExpr{X: ast.NewIdent("uint8")}),
+		}},
+		{"union field", &Type{
+			Size: 8, Align: 1,
+			Go: structType(ast.NewIdent(unionName)),
+		}},
+		{"top-level union", &Type{
+			Size: 8, Align: 1, Go: ast.NewIdent(unionName),
+		}},
+		{"recursive typedef", &Type{
+			Size: 8, Align: 8, Go: ast.NewIdent(cycleName),
+		}},
+		{"oversized", &Type{
+			Size: cgoDirectMaxAggregateSize + 1, Align: 8,
+			Go: structType(ast.NewIdent("uint64")),
+		}},
+		{"over-aligned", &Type{
+			Size: 16, Align: 16,
+			Go: structType(ast.NewIdent("uint64")),
+		}},
+		{"invalid alignment", &Type{
+			Size: 8, Align: 3,
+			Go: structType(ast.NewIdent("uint64")),
+		}},
+		{"zero-sized", &Type{
+			Size: 0, Align: 1, Go: structType(),
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if value, ok := cgoDirectValueOf(test.typ); ok {
+				t.Errorf("cgoDirectValueOf accepted aggregate %+v", value)
+			}
+		})
+	}
+}
+
+func TestCgoDirectAggregateSafety(t *testing.T) {
+	const (
+		safeName       = "_Ctype_direct_test_safe"
+		badPointerName = "_Ctype_direct_test_bad_pointer"
+		cycleName      = "_Ctype_direct_test_memory_cycle"
+		missingName    = "_Ctype_direct_test_missing"
+	)
+	names := []string{safeName, badPointerName, cycleName, missingName}
+	old := make(map[string]*Type)
+	for _, name := range names {
+		old[name] = typedef[name]
+	}
+	defer func() {
+		for _, name := range names {
+			if old[name] == nil {
+				delete(typedef, name)
+			} else {
+				typedef[name] = old[name]
+			}
+		}
+	}()
+
+	typedef[safeName] = &Type{
+		Size:  8,
+		Align: 4,
+		Go: &ast.StructType{Fields: &ast.FieldList{List: []*ast.Field{
+			{Type: ast.NewIdent("uint32")},
+			{Type: &ast.ArrayType{
+				Len: &ast.BasicLit{},
+				Elt: ast.NewIdent("uint8"),
+			}},
+		}}},
+	}
+	typedef[badPointerName] = &Type{
+		Size:       8,
+		Align:      8,
+		Go:         ast.NewIdent("uintptr"),
+		BadPointer: true,
+	}
+	typedef[cycleName] = &Type{
+		Size: 8, Align: 8, Go: ast.NewIdent(cycleName),
+	}
+	delete(typedef, missingName)
+
+	tests := []struct {
+		name string
+		expr ast.Expr
+		seen map[string]bool
+		want bool
+	}{
+		{"named struct", ast.NewIdent(safeName), nil, true},
+		{"missing typedef", ast.NewIdent(missingName), nil, false},
+		{"seen typedef", ast.NewIdent(safeName), map[string]bool{safeName: true}, false},
+		{"union", ast.NewIdent("_Ctype_union_direct_safety"), nil, false},
+		{"class", ast.NewIdent("_Ctype_class_direct_safety"), nil, false},
+		{"non aggregate", &ast.ArrayType{
+			Len: &ast.BasicLit{},
+			Elt: ast.NewIdent("uint8"),
+		}, nil, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seen := test.seen
+			if seen == nil {
+				seen = make(map[string]bool)
+			}
+			if got := cgoDirectAggregate(test.expr, seen); got != test.want {
+				t.Errorf("cgoDirectAggregate(%T) = %t, want %t",
+					test.expr, got, test.want)
+			}
+		})
+	}
+
+	nestedSafe := &ast.StructType{Fields: &ast.FieldList{List: []*ast.Field{
+		{Type: ast.NewIdent("complex128")},
+		{Type: ast.NewIdent(safeName)},
+	}}}
+	nestedUnsafe := &ast.StructType{Fields: &ast.FieldList{List: []*ast.Field{
+		{Type: ast.NewIdent("uint64")},
+		{Type: &ast.StarExpr{X: ast.NewIdent("byte")}},
+	}}}
+	memoryTests := []struct {
+		name string
+		expr ast.Expr
+		seen map[string]bool
+		want bool
+	}{
+		{"array", &ast.ArrayType{
+			Len: &ast.BasicLit{},
+			Elt: ast.NewIdent("float64"),
+		}, nil, true},
+		{"array without length", &ast.ArrayType{
+			Elt: ast.NewIdent("uint8"),
+		}, nil, false},
+		{"nested struct", nestedSafe, nil, true},
+		{"unsafe nested struct", nestedUnsafe, nil, false},
+		{"bad pointer typedef", ast.NewIdent(badPointerName), nil, false},
+		{"missing typedef", ast.NewIdent(missingName), nil, false},
+		{"recursive typedef", ast.NewIdent(cycleName), nil, false},
+		{"seen typedef", ast.NewIdent(safeName), map[string]bool{safeName: true}, false},
+		{"union", ast.NewIdent("_Ctype_union_direct_safety"), nil, false},
+		{"class", ast.NewIdent("_Ctype_class_direct_safety"), nil, false},
+		{"pointer", &ast.StarExpr{X: ast.NewIdent("byte")}, nil, false},
+	}
+	for _, test := range memoryTests {
+		t.Run("memory/"+test.name, func(t *testing.T) {
+			seen := test.seen
+			if seen == nil {
+				seen = make(map[string]bool)
+			}
+			if got := cgoDirectMemorySafe(test.expr, seen); got != test.want {
+				t.Errorf("cgoDirectMemorySafe(%T) = %t, want %t",
+					test.expr, got, test.want)
+			}
+		})
+	}
+}
+
 func TestCgoDirectCall(t *testing.T) {
 	oldExperiment := buildcfg.Experiment
 	oldGccgo := *gccgo
@@ -212,6 +440,41 @@ func TestCgoDirectCall(t *testing.T) {
 		"//go:cgo_direct v1 _Cfunc_mix_fp _Cdirect_mix_fp mix_fp mayblock f64,i32,f32,u64 f64 -\n"; got != want {
 		t.Fatalf("floating directive = %q, want %q", got, want)
 	}
+
+	aggregateType := func() *Type {
+		return &Type{
+			Size:  16,
+			Align: 8,
+			Go: &ast.StructType{Fields: &ast.FieldList{List: []*ast.Field{
+				{Names: []*ast.Ident{ast.NewIdent("x")}, Type: ast.NewIdent("uint64")},
+				{Names: []*ast.Ident{ast.NewIdent("y")}, Type: ast.NewIdent("uint64")},
+			}}},
+		}
+	}
+	aggregate := &Name{
+		C:      "add_pair",
+		Kind:   "func",
+		Mangle: "_Cfunc_add_pair",
+		FuncType: &FuncType{
+			Params: []*Type{aggregateType(), aggregateType()},
+			Result: aggregateType(),
+		},
+	}
+	p.noCallbacks["add_pair"] = true
+	call, ok = p.directCall(aggregate)
+	if !ok {
+		t.Fatal("directCall rejected aggregate declaration")
+	}
+	output.Reset()
+	call.writeDirective(&output)
+	if got, want := output.String(),
+		"//go:cgo_direct v1 _Cfunc_add_pair _Cdirect_add_pair add_pair mayblock mem16:8,mem16:8 mem16:8 -\n"; got != want {
+		t.Fatalf("aggregate directive = %q, want %q", got, want)
+	}
+	if got, want := call.bridgeParams(),
+		[]cgoDirectType{cgoDirectPointer, cgoDirectPointer, cgoDirectPointer}; !slices.Equal(got, want) {
+		t.Fatalf("aggregate bridge parameters = %v, want %v", got, want)
+	}
 }
 
 func TestCgoDirectTypedef(t *testing.T) {
@@ -300,12 +563,12 @@ func TestCgoDirectErrno(t *testing.T) {
 
 func TestCgoDirectFrame(t *testing.T) {
 	call := cgoDirectCall{
-		params: []cgoDirectType{
-			cgoDirectInt32,
-			cgoDirectPointer,
-			cgoDirectUint8,
+		params: []cgoDirectValue{
+			{typ: cgoDirectInt32},
+			{typ: cgoDirectPointer},
+			{typ: cgoDirectUint8},
 		},
-		result: cgoDirectUint32,
+		result: cgoDirectValue{typ: cgoDirectUint32},
 	}
 	params, result, errno, size := cgoDirectFrame(call, 8)
 	if got, want := fmt.Sprint(params), "[0 8 16]"; got != want {
@@ -322,7 +585,7 @@ func TestCgoDirectFrame(t *testing.T) {
 		t.Errorf("errno result offsets and frame size = (%d, %d, %d), want (24, 32, 40)",
 			result, errno, size)
 	}
-	call.result = cgoDirectVoid
+	call.result = cgoDirectValue{typ: cgoDirectVoid}
 	params, result, errno, size = cgoDirectFrame(call, 8)
 	if result != 0 || errno != 24 || size != 32 {
 		t.Errorf("void errno offsets and frame size = (%d, %d, %d), want (0, 24, 32)",
@@ -330,7 +593,10 @@ func TestCgoDirectFrame(t *testing.T) {
 	}
 
 	call.errno = false
-	call.params = []cgoDirectType{cgoDirectUint8, cgoDirectUint64}
+	call.params = []cgoDirectValue{
+		{typ: cgoDirectUint8},
+		{typ: cgoDirectUint64},
+	}
 	params, result, errno, size = cgoDirectFrame(call, 4)
 	if got, want := fmt.Sprint(params), "[0 4]"; got != want {
 		t.Errorf("32-bit parameter offsets = %s, want %s", got, want)
@@ -340,18 +606,34 @@ func TestCgoDirectFrame(t *testing.T) {
 			result, errno, size)
 	}
 
-	call.params = []cgoDirectType{
-		cgoDirectFloat32,
-		cgoDirectUint8,
-		cgoDirectFloat64,
+	call.params = []cgoDirectValue{
+		{typ: cgoDirectFloat32},
+		{typ: cgoDirectUint8},
+		{typ: cgoDirectFloat64},
 	}
-	call.result = cgoDirectFloat32
+	call.result = cgoDirectValue{typ: cgoDirectFloat32}
 	params, result, errno, size = cgoDirectFrame(call, 8)
 	if got, want := fmt.Sprint(params), "[0 4 8]"; got != want {
 		t.Errorf("floating parameter offsets = %s, want %s", got, want)
 	}
 	if result != 16 || errno != 0 || size != 20 {
 		t.Errorf("floating result offsets and frame size = (%d, %d, %d), want (16, 0, 20)",
+			result, errno, size)
+	}
+
+	call.params = []cgoDirectValue{
+		{typ: cgoDirectMemory, width: 16, align: 8},
+		{typ: cgoDirectUint32},
+	}
+	call.result = cgoDirectValue{
+		typ: cgoDirectMemory, width: 24, align: 8,
+	}
+	params, result, errno, size = cgoDirectFrame(call, 8)
+	if got, want := fmt.Sprint(params), "[0 16]"; got != want {
+		t.Errorf("aggregate parameter offsets = %s, want %s", got, want)
+	}
+	if result != 24 || errno != 0 || size != 48 {
+		t.Errorf("aggregate result offsets and frame size = (%d, %d, %d), want (24, 0, 48)",
 			result, errno, size)
 	}
 }
@@ -364,11 +646,11 @@ func TestCgoDirectAssemblyCall(t *testing.T) {
 		direct: "_Cdirect_add",
 		entry:  "add",
 		symbol: "add",
-		params: []cgoDirectType{
-			cgoDirectUint64,
-			cgoDirectUint64,
+		params: []cgoDirectValue{
+			{typ: cgoDirectUint64},
+			{typ: cgoDirectUint64},
 		},
-		result: cgoDirectUint64,
+		result: cgoDirectValue{typ: cgoDirectUint64},
 	}
 	var output bytes.Buffer
 	(&Package{PtrSize: 8}).writeDirectAssemblyCall(&output, call)
@@ -411,8 +693,8 @@ func TestCgoDirectAssemblyCall(t *testing.T) {
 	errnoCall := cgoDirectCall{
 		direct: "_Cdirect2_read",
 		entry:  "read_errno",
-		params: []cgoDirectType{cgoDirectInt32},
-		result: cgoDirectInt64,
+		params: []cgoDirectValue{{typ: cgoDirectInt32}},
+		result: cgoDirectValue{typ: cgoDirectInt64},
 		errno:  true,
 	}
 	output.Reset()
@@ -439,6 +721,53 @@ func TestCgoDirectAssemblyCall(t *testing.T) {
 				t.Errorf("amd64 errno assembly does not contain %q:\n%s", want, text)
 			}
 		}
+	}
+
+	aggregateCall := cgoDirectCall{
+		direct: "_Cdirect_pair",
+		entry:  "pair",
+		params: []cgoDirectValue{
+			{typ: cgoDirectMemory, width: 16, align: 8},
+			{typ: cgoDirectUint32},
+		},
+		result: cgoDirectValue{
+			typ: cgoDirectMemory, width: 16, align: 8,
+		},
+	}
+	output.Reset()
+	(&Package{PtrSize: 8}).writeDirectAssemblyCall(&output, aggregateCall)
+	text = output.String()
+	for _, want := range []string{
+		"TEXT ·_Cdirect_pair(SB),NOSPLIT,$0-40",
+		"CALL\tpair(SB)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("aggregate assembly does not contain %q:\n%s", want, text)
+		}
+	}
+	if buildcfg.GOARCH == "arm64" {
+		for _, want := range []string{
+			"MOVD\t$p0+0(FP), R0",
+			"MOVWU\tp1+16(FP), R1",
+			"MOVD\t$ret+24(FP), R2",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("arm64 aggregate assembly does not contain %q:\n%s", want, text)
+			}
+		}
+	} else {
+		for _, want := range []string{
+			"LEAQ\tp0+0(FP), DI",
+			"MOVL\tp1+16(FP), SI",
+			"LEAQ\tret+24(FP), DX",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("amd64 aggregate assembly does not contain %q:\n%s", want, text)
+			}
+		}
+	}
+	if strings.Contains(text, "AX, ret+") || strings.Contains(text, "R0, ret+") {
+		t.Errorf("aggregate assembly copied a register result:\n%s", text)
 	}
 }
 
@@ -605,7 +934,14 @@ func TestCgoDirectAssemblyInstructions(t *testing.T) {
 }
 
 func TestCgoDirectCBridge(t *testing.T) {
-	call := cgoDirectCall{entry: "_cgo_test_Cfunc_add_direct"}
+	call := cgoDirectCall{
+		entry: "_cgo_test_Cfunc_add_direct",
+		params: []cgoDirectValue{
+			{typ: cgoDirectUint64},
+			{typ: cgoDirectUint32},
+		},
+		result: cgoDirectValue{typ: cgoDirectUint64},
+	}
 	n := &Name{
 		C: "add",
 		FuncType: &FuncType{
@@ -632,6 +968,8 @@ func TestCgoDirectCBridge(t *testing.T) {
 	n.FuncType.Params = nil
 	n.FuncType.Result = nil
 	call.entry = "_cgo_test_Cfunc_tick_direct"
+	call.params = nil
+	call.result = cgoDirectValue{typ: cgoDirectVoid}
 	n.C = "tick"
 	output.Reset()
 	new(Package).writeDirectCBridge(&output, n, call)
@@ -649,6 +987,8 @@ func TestCgoDirectCBridge(t *testing.T) {
 	}
 	n.FuncType.Result = &Type{C: &TypeRepr{Repr: "long long"}}
 	call.entry = "_cgo_test_C2func_read_direct"
+	call.params = []cgoDirectValue{{typ: cgoDirectUint64}}
+	call.result = cgoDirectValue{typ: cgoDirectInt64}
 	call.errno = true
 	n.C = "read_value"
 	output.Reset()
@@ -671,12 +1011,45 @@ func TestCgoDirectCBridge(t *testing.T) {
 	n.FuncType.Params = nil
 	n.FuncType.Result = nil
 	call.entry = "_cgo_test_C2func_tick_direct"
+	call.params = nil
+	call.result = cgoDirectValue{typ: cgoDirectVoid}
 	n.C = "tick"
 	output.Reset()
 	new(Package).writeDirectCBridge(&output, n, call)
 	if strings.Contains(output.String(), "*result") ||
 		!strings.Contains(output.String(), "\ttick();\n\tsaved_errno = errno;") {
 		t.Errorf("void errno C bridge is invalid:\n%s", output.String())
+	}
+
+	pairType := &Type{
+		C:       &TypeRepr{Repr: "struct pair"},
+		Typedef: "pair_t",
+	}
+	n.FuncType.Params = []*Type{pairType, {
+		C: &TypeRepr{Repr: "unsigned int"},
+	}}
+	n.FuncType.Result = pairType
+	n.C = "add_pair"
+	call = cgoDirectCall{
+		entry: "_cgo_test_Cfunc_add_pair_direct",
+		params: []cgoDirectValue{
+			{typ: cgoDirectMemory, width: 16, align: 8},
+			{typ: cgoDirectUint32},
+		},
+		result: cgoDirectValue{
+			typ: cgoDirectMemory, width: 16, align: 8,
+		},
+	}
+	output.Reset()
+	new(Package).writeDirectCBridge(&output, n, call)
+	for _, want := range []string{
+		"void\n_cgo_test_Cfunc_add_pair_direct(",
+		"const pair_t *p0, unsigned int p1, pair_t *result",
+		"\t*result = add_pair(*p0, p1);",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("aggregate C bridge does not contain %q:\n%s", want, output.String())
+		}
 	}
 }
 

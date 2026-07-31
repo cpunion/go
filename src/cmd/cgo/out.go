@@ -654,7 +654,7 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 			}
 			direct.Type.Results = &ast.FieldList{List: results}
 		}
-		if !call.errno && call.result == cgoDirectVoid {
+		if !call.errno && call.result.typ == cgoDirectVoid {
 			direct.Type.Results = nil
 		}
 		if p.noEscapes[n.C] {

@@ -1,8 +1,8 @@
 # Native Stackless Coroutine Design
 
 Status: restricted MVP implemented behind `GOEXPERIMENT=coro` and
-`-d=coro=4`; transparent scalar cgo direct calls including the two-result
-errno form, fixed and repeated
+`-d=coro=4`; transparent scalar and bounded pointer-free aggregate cgo direct
+calls including the two-result errno form, fixed and repeated
 simple-loop defer cleanup for normal return and explicit panic, direct recover
 and replacement panic in fixed or repeated local defer literals and
 statically resolved local or imported named defer targets, typed structured
@@ -801,7 +801,7 @@ compiler-private metadata containing:
 - the generated Go wrapper and direct-entry identities;
 - the external C symbol;
 - the conservative call class;
-- the scalar and pointer System ABI shape;
+- the scalar, pointer, and indirect aggregate bridge shape;
 - whether the two-result form captures errno.
 
 This metadata is generated only for `GOEXPERIMENT=coro`. It is consumed by the
@@ -809,10 +809,12 @@ compiler and is not passed to the linker as a cgo directive. It does not change
 the ordinary cgo path until native lowering has selected the direct entry.
 
 The generated metadata supports non-variadic integer, pointer, `float`, and
-`double` signatures with one scalar result. Integer and floating-point
-argument registers are classified independently, as required by both target
-System ABIs. Linux/amd64 accepts up to six integer or pointer arguments and
-eight floating-point arguments; Darwin/arm64 accepts up to eight of each.
+`double` signatures, plus pointer-free struct parameters and results up to 128
+bytes with at most eight-byte alignment. Integer and floating-point argument
+registers are classified independently, as required by both target System
+ABIs. Linux/amd64 accepts up to six integer or pointer arguments and eight
+floating-point arguments; Darwin/arm64 accepts up to eight of each. An
+indirect aggregate consumes one integer argument register.
 A declaration must use the existing `#cgo nocallback` contract. The existing
 `#cgo noescape` directive remains an independent escape-analysis optimization.
 Unsupported declarations retain the ordinary cgo path in compatibility mode.
@@ -820,14 +822,26 @@ Integration tests assert both the metadata and the selected symbols in
 disassembly, so a fallback cannot silently become a direct-call performance
 result.
 
+The assembly entry passes each supported aggregate's stable Go ABI result or
+argument slot address to the typed C bridge. The bridge dereferences aggregate
+arguments into the target's by-value call and writes an aggregate result
+through a hidden result pointer. The platform C compiler, rather than a
+partial Go-side classifier, therefore implements the target function's SysV
+AMD64 or AAPCS64 aggregate ABI. This internal pointer is not exposed to the
+target function. Structs containing pointers, unions, classes, zero-sized,
+over-aligned, and larger aggregate values retain ordinary cgo. If the bridge
+shape exhausts integer registers it also retains ordinary cgo.
+
 The cgo two-result form requires a split result protocol. The C bridge clears
 errno, calls the target, and captures errno before doing any other work. For a
-non-void target, the direct entry passes a hidden pointer to the scalar Go
-result slot and the bridge writes the C result through that pointer. The bridge
-returns raw errno as `size_t` in the ordinary integer result register. This
-avoids a platform-specific aggregate return. The hidden pointer participates
-in argument-register classification; a declaration falls back to ordinary
-cgo when no register remains.
+non-void target, the direct entry passes a hidden pointer to the Go result slot
+and the bridge writes the C result through that pointer. The bridge returns raw
+errno as `size_t` in the ordinary integer result register. This avoids a
+platform-specific aggregate return. The hidden pointer participates in
+argument-register classification; a declaration falls back to ordinary cgo
+when no register remains. For aggregate results the bridge captures errno
+before copying its local value into the Go result slot, so a compiler-generated
+copy cannot clobber the reported error.
 
 The generated Go direct declaration exposes the raw pair as
 `(result, syscall.Errno)`. Lowering stores that pair while the M is still in
@@ -838,10 +852,11 @@ it may allocate or otherwise enter the Go runtime.
 
 `cmd/cgo` emits a typed external bridge in the same C translation unit as the
 preamble. This makes `static` and inline declarations visible to the generated
-assembly entry without using the general argument-frame wrapper. The bridge
-has the exact C signature and is expected to tail-call the declaration; object
-inspection verifies that the hot path still contains no `runtime.cgocall` or
-`runtime.asmcgocall`.
+assembly entry without using the general argument-frame wrapper. Scalar bridge
+entries have the exact C signature. Aggregate entries use typed pointers only
+at the generated bridge boundary and call the target with its exact by-value
+signature. Object inspection verifies that the hot path still contains no
+`runtime.cgocall` or `runtime.asmcgocall`.
 
 The transparent path is currently emitted only for Darwin/arm64 and
 Linux/amd64. Race, memory-sanitizer, and address-sanitizer builds deliberately
@@ -852,7 +867,10 @@ executor path does not yet provide equivalent sanitizer hooks.
 
 The direct path preserves, rather than weakens, Go's foreign-pointer rules.
 
-The MVP accepts only scalar values and foreign pointers. It does not pass a Go
+The MVP accepts scalar values, foreign pointers, and bounded pointer-free
+structs. Aggregate slot addresses are used only by the synchronous generated
+bridge, which copies arguments and results by value; the target function
+cannot retain those internal pointers. The direct path does not pass a Go
 pointer to memory containing Go pointers.
 
 For later typed calls:
@@ -1783,7 +1801,10 @@ The transparent cgo frontend:
   classifies it as `DirectMayBlock`;
 - classifies integer, pointer, `float`, and `double` parameters into the
   target ABI's independent general-purpose and floating-point register
-  classes, and supports one scalar result;
+  classes, and supports scalar results;
+- passes bounded pointer-free structs through typed bridge pointers, leaving
+  target aggregate argument and result classification to the platform C
+  compiler;
 - supports the cgo two-result errno form by returning raw errno separately and
   materializing nil or `syscall.Errno` only after blocking-call exit;
 - preserves ordinary cgo for unsupported declarations and sanitizer builds;
@@ -1842,6 +1863,10 @@ The following gates pass locally on Darwin/arm64 and Linux/amd64:
   transition symbols in the supported hot path;
 - two-result direct C calls with zero and nonzero errno for both scalar and
   void C results, through both run-to-completion and state-machine lowering;
+- pointer-free struct arguments and results through both ordinary and
+  two-result errno forms; a repeated three-clause loop retains and updates a
+  struct result through the direct entry, and disassembly proves it does not
+  call the ordinary cgo wrapper;
 - a run-to-completion direct C call followed by an implicit nil fault recovers
   without replaying the C call;
 - the transparent C fixture evaluates two panic-capable argument helpers in
@@ -2331,8 +2356,7 @@ closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive
 destinations, multiple channel operations in one expression, mutex parking,
-result-bearing direct C calls nested in loops, reflection, callbacks, variadic
-C calls, or general C ABI type classification.
+reflection, callbacks, variadic C calls, or general C ABI type classification.
 Ordinary channel send, discarded or single-value receive, comma-ok receive,
 receive-channel range, and select with simple receive targets are supported
 through the runtime's shared channel wait queues.
@@ -2343,8 +2367,10 @@ terminal control and typed capture ownership in repeated source literals,
 direct deferred Goexit, and statically resolved local or imported named
 terminal targets are supported. The terminal target may reach panic or Goexit
 through certified indirect structured calls. Direct foreign declarations now
-have a restricted transparent cgo path, but aggregate, variadic,
-callback-capable, and non-target ABIs retain ordinary cgo.
+have a restricted transparent cgo path, including bounded pointer-free
+structs through a typed indirect bridge. Pointer-bearing, union, class,
+oversized, over-aligned, variadic, callback-capable, and non-target ABIs retain
+ordinary cgo.
 Cross-package factory ABI 1 excludes interface and method-value calls,
 closures, and generic shapes. Frontend-normalized nested multi-result calls and
 conservatively normalized single-result calls are supported. Short-circuit
@@ -2361,8 +2387,8 @@ The likely order is:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
-2. add aggregate System ABI classification and platform-error conventions
-   beyond POSIX errno;
+2. broaden aggregate System ABI support beyond the bounded typed bridge and
+   add platform-error conventions beyond POSIX errno;
 3. extend expression, assignment, and branch normalization to short-circuit
    control, loop conditions, frontend loop-variable rewrites, and effectful
    destinations, then extend the compiler-private factory ABI only with
