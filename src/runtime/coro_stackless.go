@@ -27,6 +27,7 @@ const (
 
 const stacklessCoroWarmExecutorCount = 4
 const stacklessCoroTaskCacheSize = 256
+const stacklessCoroOperationCacheSize = 64
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 const (
@@ -73,14 +74,16 @@ type stacklessCoroContext struct {
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
 // work through scheduler operations; they never invoke a continuation.
 type stacklessCoroScheduler struct {
-	lock           mutex
-	head           *stacklessCoroTask
-	tail           *stacklessCoroTask
-	freeTasks      *stacklessCoroTask
-	freeTaskCount  int
-	root           *stacklessCoroTask
-	terminalValues map[*stacklessCoroTask]any
-	wake           chan struct{}
+	lock               mutex
+	head               *stacklessCoroTask
+	tail               *stacklessCoroTask
+	freeTasks          *stacklessCoroTask
+	freeTaskCount      int
+	freeOperations     *stacklessCoroOperation
+	freeOperationCount int
+	root               *stacklessCoroTask
+	terminalValues     map[*stacklessCoroTask]any
+	wake               chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
@@ -750,15 +753,11 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) {
-	s, task := stacklessCoroStartOperation(ctx, "channel")
-	op := &stacklessCoroOperation{
-		scheduler: s,
-		task:      task,
-		channel:   channel,
-		element:   element,
-		received:  received,
-		send:      send,
-	}
+	op := stacklessCoroStartOperation(ctx, "channel")
+	op.channel = channel
+	op.element = element
+	op.received = received
+	op.send = send
 	op.id = registerStacklessCoroOperation(op)
 	if send {
 		chansendStackless(op)
@@ -785,31 +784,22 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 		unblockTimerChan(op.channel)
 		op.timerWait = false
 	}
-	s := op.scheduler
-	task := op.task
 	send := op.send
 	if !send && op.received != nil {
 		*op.received = success
 	}
-	op.scheduler = nil
-	op.task = nil
-	op.channel = nil
-	op.element = nil
-	op.received = nil
 	if send && !success {
-		s.panicOperation(task, plainError("send on closed channel"))
+		panicStacklessCoroOperation(op, plainError("send on closed channel"))
 		return
 	}
-	s.ready(task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
-	s, task := stacklessCoroStartOperation(ctx, "sleep")
-
-	op := &stacklessCoroOperation{scheduler: s, task: task}
-	op.id = registerStacklessCoroOperation(op)
+	op := stacklessCoroStartOperation(ctx, "sleep")
+	id := registerStacklessCoroOperation(op)
 	t := new(timer)
-	t.init(stacklessCoroTimerReady, op.id)
+	t.init(stacklessCoroTimerReady, id)
 	op.timer = t
 
 	when := nanotime()
@@ -820,7 +810,7 @@ func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
 		}
 	}
 	t.reset(when, 0)
-	return op.id
+	return id
 }
 
 func cancelStacklessCoroTimer(id uint64) bool {
@@ -833,7 +823,7 @@ func cancelStacklessCoroTimer(id uint64) bool {
 	}
 	op.timer.stop()
 	op.timer = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 	return true
 }
 
@@ -960,7 +950,7 @@ func coroExitBlocking() {
 	}
 }
 
-func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCoroScheduler, *stacklessCoroTask) {
+func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task == nil {
 		throw("runtime: invalid stackless coroutine " + name)
@@ -974,9 +964,30 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCor
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine operation outside resume")
 	}
+	op := s.freeOperations
+	if op == nil {
+		if s.freeOperationCount != 0 {
+			unlock(&s.lock)
+			throw("runtime: invalid stackless coroutine operation cache")
+		}
+	} else {
+		if s.freeOperationCount <= 0 ||
+			s.freeOperationCount > stacklessCoroOperationCacheSize {
+			unlock(&s.lock)
+			throw("runtime: invalid stackless coroutine operation cache count")
+		}
+		s.freeOperations = op.next
+		s.freeOperationCount--
+		op.next = nil
+	}
 	task.state = stacklessCoroTaskWaiting
 	unlock(&s.lock)
-	return s, task
+	if op == nil {
+		op = new(stacklessCoroOperation)
+	}
+	op.scheduler = s
+	op.task = task
+	return op
 }
 
 func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
@@ -988,7 +999,47 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 	}
 }
 
-func (s *stacklessCoroScheduler) panicOperation(task *stacklessCoroTask, value any) {
+func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
+	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
+		op.timer != nil || op.timerWait || op.next != nil || op.workNext != nil {
+		throw("runtime: invalid completed stackless coroutine operation")
+	}
+	s := op.scheduler
+	task := op.task
+	*op = stacklessCoroOperation{}
+	return s, task
+}
+
+// recycleOperationLocked retains a completed operation for this scheduler.
+// The operation address is a race-detector synchronization identity for
+// channel operations, so race builds must not reuse it for another operation.
+func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperation) {
+	if raceenabled {
+		return
+	}
+	if s.freeOperationCount < 0 ||
+		s.freeOperationCount > stacklessCoroOperationCacheSize {
+		throw("runtime: invalid stackless coroutine operation cache size")
+	}
+	if s.freeOperationCount == stacklessCoroOperationCacheSize {
+		return
+	}
+	op.next = s.freeOperations
+	s.freeOperations = op
+	s.freeOperationCount++
+}
+
+func completeStacklessCoroOperation(op *stacklessCoroOperation) {
+	s, task := clearStacklessCoroOperation(op)
+	lock(&s.lock)
+	s.readyLocked(task)
+	s.recycleOperationLocked(op)
+	unlock(&s.lock)
+	s.signal()
+}
+
+func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
+	s, task := clearStacklessCoroOperation(op)
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskWaiting ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
@@ -1002,6 +1053,7 @@ func (s *stacklessCoroScheduler) panicOperation(task *stacklessCoroTask, value a
 	}
 	s.terminalValues[task] = value
 	s.readyLocked(task)
+	s.recycleOperationLocked(op)
 	unlock(&s.lock)
 	s.signal()
 }
@@ -1431,7 +1483,7 @@ func stacklessCoroTimerReady(arg any, _ uintptr, _ int64) {
 		return
 	}
 	op.timer = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func findStacklessCoroOperation(id uint64) *stacklessCoroOperation {

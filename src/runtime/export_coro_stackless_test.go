@@ -9,8 +9,9 @@ package runtime
 import "unsafe"
 
 const (
-	StacklessCoroWarmExecutorCount = stacklessCoroWarmExecutorCount
-	StacklessCoroTaskCacheSize     = stacklessCoroTaskCacheSize
+	StacklessCoroWarmExecutorCount  = stacklessCoroWarmExecutorCount
+	StacklessCoroTaskCacheSize      = stacklessCoroTaskCacheSize
+	StacklessCoroOperationCacheSize = stacklessCoroOperationCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -131,6 +132,18 @@ func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
 	return count
 }
 
+func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine operation cache query")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	count := s.freeOperationCount
+	unlock(&s.lock)
+	return count
+}
+
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroSpawn(ctx, resume)
 }
@@ -218,6 +231,26 @@ func StacklessCoroOperationCountForTest() int {
 	}
 	unlock(&stacklessCoroOperations.lock)
 	return count
+}
+
+func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine operation token query")
+	}
+	lock(&stacklessCoroOperations.lock)
+	var found *stacklessCoroOperation
+	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+		if op.scheduler == context.scheduler && op.task == context.task {
+			if found != nil {
+				unlock(&stacklessCoroOperations.lock)
+				throw("runtime: multiple stackless coroutine operations for one task")
+			}
+			found = op
+		}
+	}
+	unlock(&stacklessCoroOperations.lock)
+	return unsafe.Pointer(found)
 }
 
 func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) uint64 {
@@ -340,8 +373,9 @@ func CheckStacklessCoroOperationRegistryForTest() bool {
 
 func AsyncReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, result *uint64, errno *uintptr) uint64 {
 	op := startStacklessCoroAsync(ctx, fd, result, errno)
+	id := op.id
 	stacklessCoroReadEnqueue(op)
-	return op.id
+	return id
 }
 
 func FailAsyncStacklessCoroForTest(ctx unsafe.Pointer, result *uint64, errno *uintptr, submitErr uintptr) {

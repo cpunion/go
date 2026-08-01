@@ -2659,6 +2659,152 @@ func TestStacklessCoroSleepCancelRace(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroOperationReuse(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+
+	cacheCount := func(t *testing.T, ctx unsafe.Pointer) {
+		t.Helper()
+		want := 1
+		if race.Enabled {
+			want = 0
+		}
+		if got := runtime.StacklessCoroFreeOperationCountForTest(ctx); got != want {
+			t.Fatalf("cached operations = %d, want %d", got, want)
+		}
+	}
+
+	t.Run("cross-kind", func(t *testing.T) {
+		channel := make(chan int)
+		startReceiver := make(chan struct{})
+		received := make(chan int, 1)
+		go func() {
+			<-startReceiver
+			received <- <-channel
+		}()
+		callRelease := make(chan struct{})
+		value := 42
+		var tokens [3]unsafe.Pointer
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				id := runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
+				tokens[0] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				if !runtime.CancelSleepStacklessCoroForTest(id) {
+					t.Fatal("canceling operation reuse timer failed")
+				}
+				state = 1
+				return runtime.StacklessCoroActionWait
+			case 1:
+				cacheCount(t, ctx)
+				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				tokens[1] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				close(startReceiver)
+				state = 2
+				return runtime.StacklessCoroActionWait
+			case 2:
+				cacheCount(t, ctx)
+				runtime.CallReadStacklessCoroForTest(ctx, func() {
+					<-callRelease
+				})
+				tokens[2] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				close(callRelease)
+				state = 3
+				return runtime.StacklessCoroActionWait
+			case 3:
+				cacheCount(t, ctx)
+				state = 4
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected operation reuse state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if got := <-received; got != value {
+			t.Fatalf("received value = %d, want %d", got, value)
+		}
+		for i, token := range tokens {
+			if token == nil {
+				t.Fatalf("operation token %d is nil", i)
+			}
+			for j := range i {
+				if got, want := token == tokens[j], !race.Enabled; got != want {
+					t.Fatalf("operation tokens %d and %d reused = %t, want %t",
+						i, j, got, want)
+				}
+			}
+		}
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		const operations = runtime.StacklessCoroOperationCacheSize + 1
+		ids := make([]uint64, operations)
+		var started, completed atomic.Int32
+		parentState := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				for i := range operations {
+					index := i
+					childState := 0
+					runtime.SpawnStacklessCoroForTest(ctx, func(childCtx unsafe.Pointer) uint8 {
+						switch childState {
+						case 0:
+							ids[index] = runtime.StartSleepStacklessCoroForTest(
+								childCtx, int64(time.Hour))
+							started.Add(1)
+							childState = 1
+							return runtime.StacklessCoroActionWait
+						case 1:
+							completed.Add(1)
+							childState = 2
+							return runtime.StacklessCoroActionComplete
+						default:
+							t.Fatalf("unexpected operation child state %d", childState)
+							return runtime.StacklessCoroActionInvalid
+						}
+					})
+				}
+				parentState = 1
+				return runtime.StacklessCoroActionYield
+			case 1:
+				if started.Load() != operations {
+					return runtime.StacklessCoroActionYield
+				}
+				for _, id := range ids {
+					if !runtime.CancelSleepStacklessCoroForTest(id) {
+						t.Fatalf("canceling bounded operation %d failed", id)
+					}
+				}
+				want := runtime.StacklessCoroOperationCacheSize
+				if race.Enabled {
+					want = 0
+				}
+				if got := runtime.StacklessCoroFreeOperationCountForTest(ctx); got != want {
+					t.Fatalf("cached operations = %d, want %d", got, want)
+				}
+				parentState = 2
+				return runtime.StacklessCoroActionYield
+			case 2:
+				if completed.Load() != operations {
+					return runtime.StacklessCoroActionYield
+				}
+				parentState = 3
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected operation cache parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	})
+
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d", operations, baselineOperations)
+	}
+}
+
 func TestStacklessCoroOperationRegistry(t *testing.T) {
 	if !runtime.CheckStacklessCoroOperationRegistryForTest() {
 		t.Fatal("operation registry did not reject stale or duplicate completion")

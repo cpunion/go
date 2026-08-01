@@ -34,23 +34,20 @@ func coroCallRead(ctx unsafe.Pointer, call func()) {
 	if call == nil {
 		throw("runtime: nil stackless coroutine read call")
 	}
-	s, task := stacklessCoroStartOperation(ctx, "read call")
-	op := &stacklessCoroOperation{
-		scheduler: s,
-		task:      task,
-		call:      call,
-	}
+	op := stacklessCoroStartOperation(ctx, "read call")
+	op.call = call
 	registerStacklessCoroOperation(op)
 	stacklessCoroReadEnqueue(op)
 }
 
 func coroAsyncDouble(ctx unsafe.Pointer, readFD, writeFD int, value uint64, result *uint64, errno *uintptr) {
 	op := startStacklessCoroAsync(ctx, readFD, result, errno)
+	id := op.id
 	coroEnterBlocking(ctx)
-	submitErr := coroSubmit(op.id, value, int32(writeFD))
+	submitErr := coroSubmit(id, value, int32(writeFD))
 	coroExitBlocking()
 	if submitErr != 0 {
-		failStacklessCoroAsync(op.id, uintptr(submitErr))
+		failStacklessCoroAsync(id, uintptr(submitErr))
 		return
 	}
 	stacklessCoroReadEnqueue(op)
@@ -59,16 +56,12 @@ func coroAsyncDouble(ctx unsafe.Pointer, readFD, writeFD int, value uint64, resu
 func coroSubmit(id, value uint64, fd int32) int32
 
 func startStacklessCoroAsync(ctx unsafe.Pointer, readFD int, result *uint64, errno *uintptr) *stacklessCoroOperation {
-	s, task := stacklessCoroStartOperation(ctx, "async foreign call")
-	op := &stacklessCoroOperation{
-		scheduler: s,
-		task:      task,
-		fd:        int32(readFD),
-		errno:     errno,
-		valueOut:  result,
-		poll:      true,
-		async:     true,
-	}
+	op := stacklessCoroStartOperation(ctx, "async foreign call")
+	op.fd = int32(readFD)
+	op.errno = errno
+	op.valueOut = result
+	op.poll = true
+	op.async = true
 	registerStacklessCoroOperation(op)
 	return op
 }
@@ -81,22 +74,16 @@ func failStacklessCoroAsync(id uint64, errno uintptr) {
 	if op.errno != nil {
 		*op.errno = errno
 	}
-	op.valueOut = nil
-	op.errno = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func startStacklessCoroRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr, poll bool) {
-	s, task := stacklessCoroStartOperation(ctx, "read")
-	op := &stacklessCoroOperation{
-		scheduler: s,
-		task:      task,
-		fd:        int32(fd),
-		buffer:    buffer,
-		n:         n,
-		errno:     errno,
-		poll:      poll,
-	}
+	op := stacklessCoroStartOperation(ctx, "read")
+	op.fd = int32(fd)
+	op.buffer = buffer
+	op.n = n
+	op.errno = errno
+	op.poll = poll
 	registerStacklessCoroOperation(op)
 	stacklessCoroReadEnqueue(op)
 }
@@ -189,8 +176,7 @@ func stacklessCoroCallWorker(id uint64) {
 	if op == nil {
 		return
 	}
-	op.call = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func stacklessCoroReadWorker(id uint64) {
@@ -233,10 +219,7 @@ func stacklessCoroReadWorker(id uint64) {
 	if op.errno != nil {
 		*op.errno = errno
 	}
-	op.buffer = nil
-	op.n = nil
-	op.errno = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func stacklessCoroAsyncWorker(id uint64) {
@@ -261,9 +244,7 @@ func stacklessCoroAsyncWorker(id uint64) {
 	if op.errno != nil {
 		*op.errno = errno
 	}
-	op.valueOut = nil
-	op.errno = nil
-	op.scheduler.ready(op.task, true)
+	completeStacklessCoroOperation(op)
 }
 
 func stacklessCoroPollRead(fd int32, p unsafe.Pointer, length int32) (int32, uintptr) {
