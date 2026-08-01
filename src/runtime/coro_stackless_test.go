@@ -933,10 +933,10 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 
 func TestStacklessCoroSpawn(t *testing.T) {
 	const tasks = 100000
-	var completed int
+	var completed atomic.Int32
 	var rootState int
 	child := func(unsafe.Pointer) uint8 {
-		completed++
+		completed.Add(1)
 		return runtime.StacklessCoroActionComplete
 	}
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -948,8 +948,8 @@ func TestStacklessCoroSpawn(t *testing.T) {
 			rootState = 1
 			return runtime.StacklessCoroActionYield
 		case 1:
-			if completed != tasks {
-				t.Fatalf("completed = %d, want %d", completed, tasks)
+			if completed.Load() != tasks {
+				return runtime.StacklessCoroActionYield
 			}
 			rootState = 2
 			return runtime.StacklessCoroActionComplete
@@ -958,6 +958,55 @@ func TestStacklessCoroSpawn(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+}
+
+func TestStacklessCoroParallelSpawn(t *testing.T) {
+	const workers = runtime.StacklessCoroWarmExecutorCount - 1
+
+	oldProcs := runtime.GOMAXPROCS(runtime.StacklessCoroWarmExecutorCount)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var started, completed atomic.Int32
+	var release atomic.Bool
+	worker := func(unsafe.Pointer) uint8 {
+		started.Add(1)
+		for !release.Load() {
+			runtime.Gosched()
+		}
+		completed.Add(1)
+		return runtime.StacklessCoroActionComplete
+	}
+
+	var state int
+	var stalled bool
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			for range workers {
+				runtime.SpawnStacklessCoroForTest(ctx, worker)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for started.Load() != workers && time.Now().Before(deadline) {
+				runtime.Gosched()
+			}
+			stalled = started.Load() != workers
+			release.Store(true)
+			state = 1
+			return runtime.StacklessCoroActionYield
+		case 1:
+			if completed.Load() != workers {
+				return runtime.StacklessCoroActionYield
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if stalled {
+		t.Fatal("spawned tasks did not run while their parent resume was active")
+	}
 }
 
 func TestStacklessCoroChannel(t *testing.T) {

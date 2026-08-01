@@ -46,6 +46,8 @@ expected=(
 	taskParkWorker
 	taskParkBursts
 	taskParkUntilReleased
+	parallelSpawnWorker
+	parallelSpawnProgress
 	parallelYieldWorker
 	parallelYieldWork
 	channelWorker
