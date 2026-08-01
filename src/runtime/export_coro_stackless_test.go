@@ -256,9 +256,11 @@ func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
 	coroExitBlocking()
 }
 
-func ForeignReturnersStacklessCoroForTest(ctx unsafe.Pointer) uint32 {
+func ForeignReturnStateStacklessCoroForTest(ctx unsafe.Pointer) (uint32, bool) {
 	context := (*stacklessCoroContext)(ctx)
-	return context.scheduler.foreignReturners.Load()
+	scheduler := context.scheduler
+	return scheduler.foreignReturners.Load(),
+		scheduler.runnableState.Load()&stacklessCoroForeignReturnerBit != 0
 }
 
 func CheckEarlyReadyStacklessCoroForTest() bool {

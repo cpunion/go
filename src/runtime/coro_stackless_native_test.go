@@ -167,6 +167,7 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 
 	var state, yields int
 	var stalled bool
+	var returnStateFailed bool
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
@@ -188,9 +189,12 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 			return runtime.StacklessCoroActionYield
 		case 2:
 			if done.Load() == workers {
+				returners, pending := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
+				returnStateFailed = returners != 0 || pending
 				return runtime.StacklessCoroActionComplete
 			}
-			if runtime.ForeignReturnersStacklessCoroForTest(ctx) == 0 {
+			returners, _ := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
+			if returners == 0 {
 				yields = 0
 				return runtime.StacklessCoroActionYield
 			}
@@ -216,6 +220,9 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 	}
 	if rescued.Load() {
 		t.Fatal("blocking foreign-call return required rescue")
+	}
+	if returnStateFailed {
+		t.Fatal("blocking foreign-call return left scheduler state pending")
 	}
 }
 
