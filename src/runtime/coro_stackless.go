@@ -26,6 +26,7 @@ const (
 )
 
 const stacklessCoroExecutorCount = 4
+const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 type stacklessCoroTaskState uint8
 
@@ -73,7 +74,10 @@ type stacklessCoroScheduler struct {
 	executorWake   chan struct{}
 	executorDone   chan struct{}
 	executorsReady atomic.Uint32
-	runnable       atomic.Uint32
+	// runnableState stores the runnable count in its low 31 bits. The high
+	// bit asks a native executor to yield its P to a returning foreign call.
+	runnableState    atomic.Uint32
+	foreignReturners atomic.Uint32
 }
 
 // A stacklessCoroOperation is owned by the runtime registry until its source
@@ -225,10 +229,11 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 		switch action {
 		case stacklessCoroActionYield:
-			s.yield(task)
-			if !native {
+			foreignReturner := s.yield(task)
+			if !native || foreignReturner {
 				// Cooperate with the host scheduler when this target has no
-				// native executor implementation.
+				// native executor implementation or a foreign-call executor
+				// needs a P to return from syscall state.
 				Gosched()
 			}
 		case stacklessCoroActionWait:
@@ -862,7 +867,7 @@ func (s *stacklessCoroScheduler) panicOperation(task *stacklessCoroTask, value a
 	s.signal()
 }
 
-func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
+func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	if task.resuming {
 		if task.state != stacklessCoroTaskWaiting || task.readyPending {
 			throw("runtime: invalid stackless coroutine early ready transition")
@@ -874,7 +879,7 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
 		if raceenabled {
 			racereleasemerge(unsafe.Pointer(task))
 		}
-		return
+		return 0
 	}
 	switch task.state {
 	case stacklessCoroTaskNew, stacklessCoroTaskRunning, stacklessCoroTaskWaiting:
@@ -892,13 +897,14 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) {
 		s.tail.next = task
 	}
 	s.tail = task
-	s.runnable.Add(1)
+	runnable := s.runnableState.Add(1)
 	if raceenabled {
 		// Runtime mutex operations are invisible to the race detector.
 		// Merge both the previous resume episode and the producer that made
 		// this task runnable into the next executor's acquire.
 		racereleasemerge(unsafe.Pointer(task))
 	}
+	return runnable
 }
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
@@ -912,7 +918,7 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	if s.head == nil {
 		s.tail = nil
 	}
-	s.runnable.Add(-1)
+	s.runnableState.Add(-1)
 	task.next = nil
 	if task.state != stacklessCoroTaskRunnable || task.resuming ||
 		task.readyPending {
@@ -928,7 +934,7 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	return task
 }
 
-func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) {
+func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) bool {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -937,8 +943,9 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine yield")
 	}
 	task.resuming = false
-	s.readyLocked(task)
+	runnable := s.readyLocked(task)
 	unlock(&s.lock)
+	return runnable&stacklessCoroForeignReturnerBit != 0
 }
 
 func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
@@ -1121,14 +1128,14 @@ func (s *stacklessCoroScheduler) replacementExecutor() {
 }
 
 // wakeReplacementExecutor notifies replacement capacity. It reports whether
-// logical work was queued before the notification.
+// runnable work or a returning foreign-call executor needs a P.
 //
 //go:nosplit
 func (s *stacklessCoroScheduler) wakeReplacementExecutor() bool {
 	if s == nil || s.executorsReady.Load() == 0 {
 		return false
 	}
-	handoff := s.runnable.Load() != 0
+	handoff := s.runnableState.Load() != 0
 	// A replacement that has already entered run waits on wake, not
 	// executorWake. Notify both admitted and not-yet-admitted executors so
 	// repeated blocking calls can reuse the fixed pool.

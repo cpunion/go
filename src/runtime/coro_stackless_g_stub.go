@@ -42,3 +42,11 @@ func (*g) stackIsFixed() bool {
 func stacklessCoroRecover(*g) any {
 	return nil
 }
+
+//go:nosplit
+func stacklessCoroExitsyscallNoP(*g) bool {
+	return false
+}
+
+//go:nosplit
+func stacklessCoroExitsyscallDone(*g) {}

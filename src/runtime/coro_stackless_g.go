@@ -47,3 +47,31 @@ func stacklessCoroRecover(gp *g) any {
 	}
 	return coroDeferRecover(unsafe.Pointer(state.deferTask))
 }
+
+// stacklessCoroExitsyscallNoP publishes a native executor that could not
+// acquire a P on its return from a foreign call.
+//
+//go:nosplit
+func stacklessCoroExitsyscallNoP(gp *g) bool {
+	scheduler := stacklessCoroNativeSchedulerFor(gp)
+	if scheduler == nil {
+		return false
+	}
+	if scheduler.foreignReturners.Add(1) == 1 {
+		scheduler.runnableState.Or(stacklessCoroForeignReturnerBit)
+	}
+	return true
+}
+
+//go:nosplit
+func stacklessCoroExitsyscallDone(gp *g) {
+	scheduler := stacklessCoroNativeSchedulerFor(gp)
+	if scheduler.foreignReturners.Add(-1) != 0 {
+		return
+	}
+	scheduler.runnableState.And(^stacklessCoroForeignReturnerBit)
+	if scheduler.foreignReturners.Load() != 0 {
+		// A returner may have arrived between the decrement and the clear.
+		scheduler.runnableState.Or(stacklessCoroForeignReturnerBit)
+	}
+}

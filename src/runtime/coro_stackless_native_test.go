@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -118,6 +119,111 @@ func TestStacklessCoroNativeBlockingReuseDuringGC(t *testing.T) {
 		})
 	}
 	<-gcDone
+}
+
+func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
+	const (
+		workers   = 3
+		maxYields = 1000
+	)
+	var sockets [workers][2]int
+	for i := range sockets {
+		pair, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sockets[i] = pair
+		defer syscall.Close(pair[0])
+		defer syscall.Close(pair[1])
+	}
+
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var entered, done atomic.Int32
+	var readFailed, writeFailed atomic.Bool
+	var rescued atomic.Bool
+	rescue := time.AfterFunc(5*time.Second, func() {
+		rescued.Store(true)
+		for _, pair := range sockets {
+			syscall.Write(pair[1], []byte{'r'})
+		}
+	})
+	defer rescue.Stop()
+
+	workerFns := make([]func(unsafe.Pointer) uint8, workers)
+	for i := range workerFns {
+		fd := sockets[i][0]
+		workerFns[i] = func(ctx unsafe.Pointer) uint8 {
+			entered.Add(1)
+			var buffer [1]byte
+			if n := runtime.BlockingReadStacklessCoroForTest(ctx, fd, buffer[:]); n != 1 {
+				readFailed.Store(true)
+			}
+			done.Add(1)
+			return runtime.StacklessCoroActionComplete
+		}
+	}
+
+	var state, yields int
+	var stalled bool
+	var returnStateFailed bool
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			for _, worker := range workerFns {
+				runtime.SpawnStacklessCoroForTest(ctx, worker)
+			}
+			state = 1
+			return runtime.StacklessCoroActionYield
+		case 1:
+			if entered.Load() != workers {
+				return runtime.StacklessCoroActionYield
+			}
+			for _, pair := range sockets {
+				if n := runtime.WriteStacklessCoroNativeForTest(pair[1], 'p'); n != 1 {
+					writeFailed.Store(true)
+				}
+			}
+			state = 2
+			return runtime.StacklessCoroActionYield
+		case 2:
+			if done.Load() == workers {
+				returners, pending := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
+				returnStateFailed = returners != 0 || pending
+				return runtime.StacklessCoroActionComplete
+			}
+			returners, _ := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
+			if returners == 0 {
+				yields = 0
+				return runtime.StacklessCoroActionYield
+			}
+			yields++
+			if yields >= maxYields {
+				stalled = true
+				return runtime.StacklessCoroActionComplete
+			}
+			return runtime.StacklessCoroActionYield
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if stalled {
+		t.Fatal("blocking foreign-call returns did not acquire a P")
+	}
+	if readFailed.Load() {
+		t.Fatal("blocking foreign-call read failed")
+	}
+	if writeFailed.Load() {
+		t.Fatal("blocking foreign-call release failed")
+	}
+	if rescued.Load() {
+		t.Fatal("blocking foreign-call return required rescue")
+	}
+	if returnStateFailed {
+		t.Fatal("blocking foreign-call return left scheduler state pending")
+	}
 }
 
 func TestStacklessCoroNativePreemption(t *testing.T) {

@@ -5058,12 +5058,19 @@ func exitsyscall() {
 		return
 	}
 	// Slowest path: We couldn't get a P, so call into the scheduler.
+	var stacklessCoroReturner bool
+	if goexperiment.Coro {
+		stacklessCoroReturner = stacklessCoroExitsyscallNoP(gp)
+	}
 	gp.m.locks--
 
 	// Call the scheduler.
 	mcall(exitsyscallNoP)
 
 	// Scheduler returned, so we're allowed to run now.
+	if stacklessCoroReturner {
+		stacklessCoroExitsyscallDone(gp)
+	}
 	// Delete the syscallsp information that we left for
 	// the garbage collector during the system call.
 	// Must wait until now because until gosched returns

@@ -9,3 +9,8 @@ package runtime
 func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
 	return nil
 }
+
+//go:nosplit
+func stacklessCoroNativeSchedulerFor(*g) *stacklessCoroScheduler {
+	return nil
+}

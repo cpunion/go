@@ -6,7 +6,10 @@
 
 package runtime
 
-import "internal/runtime/sys"
+import (
+	"internal/runtime/sys"
+	"unsafe"
+)
 
 func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {
 	gp := getg()
@@ -18,4 +21,8 @@ func StacklessCoroNativePoolForTest() (count int) {
 	count = stacklessCoroNativePool.count
 	unlock(&stacklessCoroNativePool.lock)
 	return
+}
+
+func WriteStacklessCoroNativeForTest(fd int, value byte) int {
+	return int(write(uintptr(fd), unsafe.Pointer(&value), 1))
 }

@@ -198,6 +198,39 @@ results isolate executor capacity, release/recovery, multi-P scheduling, and
 the public I/O adapter as higher-priority architecture gaps without first
 requiring complete timer, file, and network implementations.
 
+### Blocking C return progress
+
+Revision `b9520875d0` lets an executor returning from a blocking C call request
+a P when every P is occupied by other coroutine executors. Its exact parent is
+`9e5fa62e01`. The parent benchmark binary was built at `05335641ac`; the only
+intervening change was this benchmark's documentation and its merge, so the
+executable sources are identical to the exact parent.
+
+The comparison used the same checked-in probes, `GOMAXPROCS=1`, three warm-up
+pairs, and ten alternating-order 500ms samples. The Darwin results are native
+Apple M4 Max measurements; the Linux results are amd64 measurements under
+OrbStack translation.
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| three concurrent blocking C calls | 56.323 ms -> 110.5 us (-99.80%, 510x) | 49.110 ms -> 960.6 us (-98.04%, 51x) |
+| blocking C handoff | 24.57 us -> 23.99 us (~) | 119.8 us -> 111.8 us (~) |
+| logical yield batch | 17.34 ns -> 17.11 ns (~) | 34.90 ns -> 30.98 ns (-11%) |
+
+Ordinary direct C calls remained allocation-free. Their short-call results
+ranged from no change to +5.3% on Darwin and from -3.6% to +3.8% on translated
+Linux. These small, bidirectional changes were sensitive to native code layout;
+the executed Go fast path has the same instruction shape before and after this
+change. They are therefore not classified as an algorithmic regression or
+improvement.
+
+For scale only, rather than as a paired statistical comparison, the repaired
+three-call result is about twice as fast on Darwin and seven times as fast on
+translated Linux as the earlier unmodified-Go measurements in the preceding
+section. Eight simultaneous blocking calls remain capacity-limited, and the
+coroutine scheduler still does not scale fixed work across multiple Ps. Those
+are separate executor-capacity and multi-P scheduling tasks.
+
 `check.bash` runs the coroutine correctness and coverage test, verifies the
 lowering audit, and checks the direct C symbols without collecting performance
 data. CI runs the correctness test with both toolchains, invokes this check,
