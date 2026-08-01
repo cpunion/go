@@ -283,3 +283,62 @@ cleanup. The experiment's per-G extension remains one pointer. Capacity does
 not yet retire within a live root, and the global native-context pool retains
 its high-water allocation for later roots. Multi-P logical scheduling remains
 a separate limitation.
+
+### Multi-P runnable scheduling
+
+Revision `f0f5a48057` admits the existing warm replacement executors when an
+ordinary spawn makes new logical work runnable and more than one P is
+available. Its exact parent is `f967a81bbe`. Previously, replacements were
+prepared at root startup but only blocking C entry could wake them, so
+ordinary coroutine work remained serial even with `GOMAXPROCS` greater than
+one. The single-P path does not perform this wakeup; blocking foreign calls
+continue to use the independent capacity mechanism described above.
+
+The compiler-level progress probe uses only ordinary Go source and automatic
+coloring. One parent continuation remains active while three spawned workers
+must all start. The exact parent consistently times out after five seconds;
+the change passes both native Darwin and translated Linux runs, including 20
+repetitions. The runtime regression additionally holds three child resume
+calls active at the same time.
+
+The fixed-work comparison used prebuilt test binaries, three unrecorded
+warm-ups, 12 rotating-order samples, and a 500ms benchmark time. The official
+column is the exact upstream merge-base, `3e6eb83f95`; parent and change use
+the exact revisions above. Each time is the median of the per-operation
+samples.
+
+| Platform and Ps | Official | Parent | Change | Change versus parent |
+| --- | ---: | ---: | ---: | ---: |
+| Darwin arm64, P=1 | 667.164 us | 647.149 us | 640.398 us | -1.04% |
+| Darwin arm64, P=2 | 358.194 us | 619.427 us | 350.350 us | -43.44% |
+| Darwin arm64, P=4 | 237.281 us | 612.583 us | 239.572 us | -60.89% |
+| Linux amd64, P=1 | 725.920 us | 735.046 us | 722.989 us | -1.64% |
+| Linux amd64, P=2 | 424.641 us | 716.091 us | 442.387 us | -38.22% |
+| Linux amd64, P=4 | 311.563 us | 732.977 us | 326.100 us | -55.51% |
+
+On Darwin, official Go scaled by 2.81x and the change by 2.67x from one to
+four Ps; the parent scaled by 1.06x. Under translated Linux, the corresponding
+figures were 2.33x, 2.22x, and 1.00x. The change was within -4.01% to +0.97%
+of official Go on Darwin and -0.40% to +4.67% under translated Linux. The
+Linux values validate direction and broad magnitude only.
+
+Single-P controls showed no regression. The following entries are exact
+parent followed by change medians:
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| sequential task creation | 185.5 ns -> 183.6 ns (-1.0%) | 462.1 ns -> 441.4 ns (-4.5%) |
+| burst creation of 100 tasks | 11.812 us -> 11.484 us (-2.8%) | 31.606 us -> 28.904 us (-8.6%) |
+| park and wake 100 tasks | 31.846 us -> 31.214 us (-2.0%) | 78.320 us -> 72.635 us (-7.3%) |
+| fixed-work batch | 547.558 us -> 546.358 us (-0.2%) | 861.381 us -> 821.332 us (-4.7%) |
+
+Allocation counts were unchanged: sequential creation used 68 B and three
+allocations per task, burst creation used 6800 B and 300 allocations, the
+park/wake probe used 37,312 B and 501 allocations, and the fixed-work batch
+used 6400 B and 256 allocations.
+
+Runnable work currently uses at most the four warm logical executors. It does
+not yet grow beyond that warm capacity, retire idle executors, steal logical
+work through the Go scheduler, or provide scheduler-integrated fairness.
+Those remain separate tasks from the dynamic capacity used for blocking C
+calls.
