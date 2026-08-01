@@ -457,3 +457,81 @@ B and one allocation for the compiler-generated frame or closure. The
 remaining channel allocation is its stackless waiter; ready `select` and
 positive timers similarly expose their non-header costs as the next focused
 optimization targets.
+
+### Exact-upstream architecture checkpoint
+
+The 2026-08-02 checkpoint compares the upstream merge-base
+`5d29d80b6c` with coroutine revision `efe6bee4fb`. Its only change from
+`90ba34fa38` is a compiler stress test, so the measured compiler and runtime
+sources are identical. The runner
+discarded three warm-up pairs and collected ten alternating-order 500ms
+samples from identical source with inlining disabled. The 10,000-task
+footprint used six independent processes, and the scaling probe used ten
+samples at each processor count.
+
+Darwin ran natively on an Apple M4 Max. Linux amd64 ran under OrbStack
+translation, so its values validate direction and broad magnitude rather
+than native absolute time. Each entry below is the median exact upstream
+baseline followed by the median coroutine result. A tilde marks a difference
+that was not statistically significant in this run.
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| amortized `Gosched` | 50.61 ns -> 20.61 ns (-59%) | 56.51 ns -> 32.49 ns (-43%) |
+| one public coroutine entry | 54.98 ns -> 1.330 us (24x) | 60.53 ns -> 1.105 us (18x) |
+| recursive yield, depth 4096 | 22.52 us -> 627.73 us (28x) | 11.16 us -> 933.47 us (84x) |
+| defer across a yield | 56.41 ns -> 1.497 us (27x) | 63.77 ns -> 1.144 us (18x) |
+| panic/recover across a yield | 190.6 ns -> 1.529 us (8.0x) | 229.2 ns -> 1.351 us (5.9x) |
+| park and wake 100 tasks | 18.85 us -> 33.73 us (1.8x) | 21.66 us -> 45.31 us (2.1x) |
+| channel round trip | 179.1 ns -> 318.9 ns (1.8x) | 228.7 ns -> 450.6 ns (2.0x) |
+| ready `select` | 44.78 ns -> 395.55 ns (8.8x) | 59.23 ns -> 473.30 ns (8.0x) |
+| `Sleep(0)` | 1.210 ns -> 4.019 ns (3.3x) | 1.431 ns -> 6.955 ns (4.9x) |
+| `Sleep(1ns)` | 137.4 ns -> 5.889 us (43x) | 334.0 ns -> 26.109 us (78x) |
+| ready file read | 363.7 ns -> 6.026 us (17x) | 181.6 ns -> 27.446 us (151x) |
+| ready TCP read | 312.1 ns -> 6.264 us (20x) | 212.8 ns -> 27.690 us (130x) |
+| blocking file read and sibling release | 1.874 us -> 8.427 us (4.5x) | 1.569 us -> 29.706 us (19x) |
+| blocking TCP read and sibling release | 11.11 us -> 14.78 us (+33%) | 2.804 us -> 35.806 us (13x) |
+| park and wake 10,000 tasks | 10.84 ms -> 754.09 ms (70x) | 10.59 ms -> 460.53 ms (43x) |
+
+Fixed-work scheduling remained statistically level with upstream on native
+Darwin at one, two, and four Ps. Translated Linux was level at one and four
+Ps and 16% faster at two Ps. The experiment therefore preserves the earlier
+multi-P repair while the single-task and operation paths expose the remaining
+fixed costs.
+
+The direct foreign-call path also preserved its intended advantage:
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| scalar C call | 20.97 ns -> 17.11 ns (-18%) | 28.90 ns -> 22.30 ns (-23%) |
+| aggregate, errno, and libm C calls | ~ | -21% to -26% |
+| blocking C handoff | 60.18 us -> 27.60 us (-54%) | 1.924 ms -> 96.77 us (-95%) |
+| three concurrent blocking C calls | 223.3 us -> 104.0 us (-53%) | 6.742 ms -> 971.2 us (-86%) |
+| eight concurrent blocking C calls | 524.6 us -> 163.0 us (-69%) | 16.752 ms -> 1.219 ms (-93%) |
+
+The translated environment amplifies the upstream cgo and syscall handoff
+costs. Entry time, measured separately from the blocking interval, was about
+89% lower on Darwin and 99% lower under translated Linux. Ordinary direct C
+calls remained allocation-free.
+
+Allocation counts explain much of the largest negative differences. A public
+coroutine entry used 584 B and eight allocations. Depth-4096 recursion used
+464.6 KiB and 16,393 allocations. A 100-task park/wake round used 20,225 B
+and 337 allocations, compared with 112 B and one allocation upstream. The
+remaining steady-state operation costs were 224 B and two allocations for a
+channel round trip, 132 B and three allocations for ready `select`, 104 B and
+two allocations for a positive timer, 64 B and one allocation for a ready
+file or TCP read, and 632 B and 18 allocations for a blocking read.
+
+The 10,000-task space result retained the experiment's central advantage:
+live heap fell from 623.1 B to 372.6 B per task and live stack fell from about
+2048 B to 6.554 B per task. Live objects rose from 2.002 to 4.253 per task.
+The next performance work should therefore preserve the space and direct-C
+results while addressing three independent cost centers:
+
+1. make logical frames and root entry explicit enough to coalesce or recycle
+   their typed storage, reducing recursive and high-task-count allocation;
+2. connect logical timer and file/network waits directly to runtime timer and
+   netpoll readiness instead of paying the current adapter-worker hop; and
+3. remove ready-select temporary storage and, only after its ownership model
+   is proven under stress, revisit channel waiter lifetime.
