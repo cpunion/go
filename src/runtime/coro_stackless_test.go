@@ -931,6 +931,154 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroTaskReuse(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	check := func(t *testing.T, tokens [2]unsafe.Pointer) {
+		t.Helper()
+		if tokens[0] == nil || tokens[1] == nil {
+			t.Fatalf("task tokens = %p, %p, want non-nil", tokens[0], tokens[1])
+		}
+		if got, want := tokens[0] == tokens[1], !race.Enabled; got != want {
+			t.Fatalf("task token reused = %t, want %t", got, want)
+		}
+	}
+
+	t.Run("complete", func(t *testing.T) {
+		var tokens [2]unsafe.Pointer
+		var childIndex, parentState int
+		child := func(ctx unsafe.Pointer) uint8 {
+			tokens[childIndex] = runtime.DeferTokenStacklessCoroForTest(ctx)
+			childIndex++
+			return runtime.StacklessCoroActionComplete
+		}
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0, 1:
+				parentState++
+				runtime.AwaitStacklessCoroForTest(ctx, child)
+				return runtime.StacklessCoroActionWait
+			case 2:
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		check(t, tokens)
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		const tasks = runtime.StacklessCoroTaskCacheSize + 1
+		var completed atomic.Int32
+		child := func(unsafe.Pointer) uint8 {
+			completed.Add(1)
+			return runtime.StacklessCoroActionComplete
+		}
+		var parentState int
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				for range tasks {
+					runtime.SpawnStacklessCoroForTest(ctx, child)
+				}
+				parentState = 1
+				return runtime.StacklessCoroActionYield
+			case 1:
+				if completed.Load() != tasks {
+					return runtime.StacklessCoroActionYield
+				}
+				want := runtime.StacklessCoroTaskCacheSize
+				if race.Enabled {
+					want = 0
+				}
+				if got := runtime.StacklessCoroFreeTaskCountForTest(ctx); got != want {
+					t.Fatalf("cached tasks = %d, want %d", got, want)
+				}
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	})
+
+	t.Run("recovered-panic", func(t *testing.T) {
+		var tokens [2]unsafe.Pointer
+		var parentState int
+		panicking := func(ctx unsafe.Pointer) uint8 {
+			tokens[0] = runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.PanicStacklessCoroForTest(ctx, "reused panic task")
+			return runtime.StacklessCoroActionPanic
+		}
+		completing := func(ctx unsafe.Pointer) uint8 {
+			tokens[1] = runtime.DeferTokenStacklessCoroForTest(ctx)
+			return runtime.StacklessCoroActionComplete
+		}
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				parentState = 1
+				runtime.AwaitStacklessCoroForTest(ctx, panicking)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if got := runtime.DeferRecoverStacklessCoroForTest(
+					runtime.DeferTokenStacklessCoroForTest(ctx)); got != "reused panic task" {
+					t.Fatalf("recovered panic = %v, want reused panic task", got)
+				}
+				parentState = 2
+				runtime.AwaitStacklessCoroForTest(ctx, completing)
+				return runtime.StacklessCoroActionWait
+			case 2:
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		check(t, tokens)
+	})
+
+	t.Run("detached-goexit", func(t *testing.T) {
+		token := make(chan unsafe.Pointer, 2)
+		goexiting := func(ctx unsafe.Pointer) uint8 {
+			token <- runtime.DeferTokenStacklessCoroForTest(ctx)
+			runtime.GoexitStacklessCoroForTest(ctx)
+			return runtime.TerminalActionStacklessCoroForTest(ctx)
+		}
+		completing := func(ctx unsafe.Pointer) uint8 {
+			token <- runtime.DeferTokenStacklessCoroForTest(ctx)
+			return runtime.StacklessCoroActionComplete
+		}
+		var parentState int
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				parentState = 1
+				runtime.SpawnStacklessCoroForTest(ctx, goexiting)
+				return runtime.StacklessCoroActionYield
+			case 1:
+				if len(token) != 1 {
+					return runtime.StacklessCoroActionYield
+				}
+				parentState = 2
+				runtime.SpawnStacklessCoroForTest(ctx, completing)
+				return runtime.StacklessCoroActionYield
+			case 2:
+				if len(token) != 2 {
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		check(t, [2]unsafe.Pointer{<-token, <-token})
+	})
+}
+
 func TestStacklessCoroSpawn(t *testing.T) {
 	const tasks = 100000
 	var completed atomic.Int32
