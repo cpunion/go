@@ -435,6 +435,14 @@ coloring:
 | ready file read | 8.687 us -> 8.547 us (-1.08%) | 22.537 us -> 23.415 us (paired +0.12%, ~) | 256 B, 2 allocs -> 64 B, 1 alloc |
 | ready TCP read | 8.730 us -> 8.719 us (paired +0.06%, ~) | 23.523 us -> 23.133 us (-5.08%) | 256 B, 2 allocs -> 64 B, 1 alloc |
 
+The existing 100-task simultaneous park/wake control measured 98.159 us ->
+93.703 us (-3.89%) on Darwin and 70.137 us -> 58.128 us (-13.67%) under
+translated Linux. Darwin allocation fell from 32,357 B and 399 allocations to
+19,978 B and 335 allocations; Linux fell from 32,500 B and 400 allocations to
+20,215 B and 336 allocations. The exact reduction of 64 allocations and about
+12 KiB per iteration demonstrates the cache bound: 64 of the 100 concurrent
+operation headers are reused and the rest remain collectable.
+
 An operation header occupies the 192-byte allocation class. The direct channel
 probe starts one send and one receive per iteration, which explains its 384 B
 and two-allocation reduction. The ordinary-Go ping/pong probe starts four
