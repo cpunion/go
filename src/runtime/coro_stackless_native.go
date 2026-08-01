@@ -300,12 +300,25 @@ func coroNativeFinish(executor *g) {
 	coroNativeGogo(&caller.sched, nativeG0)
 }
 
+//go:nosplit
 func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 	state := gp.stacklessCoro
 	if state == nil {
 		return nil
 	}
 	return (*stacklessCoroNativeContext)(state.native)
+}
+
+//go:nosplit
+func stacklessCoroNativeSchedulerFor(gp *g) *stacklessCoroScheduler {
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil {
+		return nil
+	}
+	if ctx.scheduler == nil {
+		throw("runtime: stackless coroutine blocking call has no scheduler")
+	}
+	return ctx.scheduler
 }
 
 // resetStacklessCoroExecutor clears state that execute and gdestroy normally

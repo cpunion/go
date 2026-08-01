@@ -64,16 +64,17 @@ type stacklessCoroContext struct {
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
 // work through scheduler operations; they never invoke a continuation.
 type stacklessCoroScheduler struct {
-	lock           mutex
-	head           *stacklessCoroTask
-	tail           *stacklessCoroTask
-	root           *stacklessCoroTask
-	terminalValues map[*stacklessCoroTask]any
-	wake           chan struct{}
-	executorWake   chan struct{}
-	executorDone   chan struct{}
-	executorsReady atomic.Uint32
-	runnable       atomic.Uint32
+	lock             mutex
+	head             *stacklessCoroTask
+	tail             *stacklessCoroTask
+	root             *stacklessCoroTask
+	terminalValues   map[*stacklessCoroTask]any
+	wake             chan struct{}
+	executorWake     chan struct{}
+	executorDone     chan struct{}
+	executorsReady   atomic.Uint32
+	runnable         atomic.Uint32
+	foreignReturners atomic.Uint32
 }
 
 // A stacklessCoroOperation is owned by the runtime registry until its source
@@ -226,9 +227,10 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		switch action {
 		case stacklessCoroActionYield:
 			s.yield(task)
-			if !native {
+			if !native || s.foreignReturners.Load() != 0 {
 				// Cooperate with the host scheduler when this target has no
-				// native executor implementation.
+				// native executor implementation or a foreign-call executor
+				// needs a P to return from syscall state.
 				Gosched()
 			}
 		case stacklessCoroActionWait:
@@ -805,6 +807,16 @@ func coroExitBlocking() {
 	mp.incgo = false
 	mp.ncgo--
 	osPreemptExtExit(mp)
+	var scheduler *stacklessCoroScheduler
+	// Publish a foreign return before exitsyscall if this executor lost its P.
+	// This lets the native logical scheduler yield the host P. Calls that keep
+	// their P avoid the scheduler handshake.
+	if mp.p == 0 {
+		scheduler = stacklessCoroNativeSchedulerFor(gp)
+		if scheduler != nil {
+			scheduler.foreignReturners.Add(1)
+		}
+	}
 	if sys.DITSupported {
 		ditEnabled := sys.DITEnabled()
 		if !gp.ditWanted && ditEnabled {
@@ -814,6 +826,9 @@ func coroExitBlocking() {
 		}
 	}
 	exitsyscall()
+	if scheduler != nil {
+		scheduler.foreignReturners.Add(-1)
+	}
 }
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) (*stacklessCoroScheduler, *stacklessCoroTask) {
