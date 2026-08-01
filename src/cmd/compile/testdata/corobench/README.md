@@ -342,3 +342,47 @@ not yet grow beyond that warm capacity, retire idle executors, steal logical
 work through the Go scheduler, or provide scheduler-integrated fairness.
 Those remain separate tasks from the dynamic capacity used for blocking C
 calls.
+
+### Logical task reuse
+
+Revision `ef630a4be2` retains up to 256 completed non-root task headers in
+each live logical scheduler. Its exact parent is `f4830f567a`; that revision
+contains the same concurrent-safe runtime benchmarks, so the comparison does
+not mix the benchmark repair with the runtime change. Race builds do not reuse
+task addresses because the race detector also uses each address as a logical
+synchronization identity.
+
+The runtime-level comparison used prebuilt test binaries, three unrecorded
+warm-ups, and alternating parent/change order. The Darwin samples used a
+500ms benchmark time and the translated Linux samples used 300ms. Each entry
+is the median exact parent followed by the median change; the percentage is
+the median of the paired differences.
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| spawn one task | 75.52 ns -> 65.84 ns (-12.8%) | 179.4 ns -> 163.9 ns (-11.8%) |
+| await one task | 48.68 ns -> 40.84 ns (-16.1%) | 153.0 ns -> 127.3 ns (-12.1%) |
+| allocation per task | 48 B, 1 alloc -> 0 B, 0 allocs | 48 B, 1 alloc -> 0 B, 0 allocs |
+
+The ordinary-Go probes were compiled from identical source with automatic
+coloring. They used three warm-ups and 15 alternating 300ms samples per
+probe. The task header accounts for exactly 48 B and one allocation in every
+result:
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| sequential task | 182.9 ns -> 144.2 ns (-20.8%) | 391.2 ns -> 304.6 ns (-18.6%) |
+| burst of 100 tasks | 11.671 us -> 10.155 us (-13.6%) | 26.620 us -> 20.338 us (-23.2%) |
+| park and wake 100 tasks | 30.442 us -> 30.523 us (+0.6%) | 61.563 us -> 67.978 us (+5.4%) |
+| sequential allocation | 68 B, 3 allocs -> 20 B, 2 allocs | 68 B, 3 allocs -> 20 B, 2 allocs |
+| burst allocation | 6800 B, 300 allocs -> 2000 B, 200 allocs | 6800 B, 300 allocs -> 2000 B, 200 allocs |
+| park/wake allocation | 37,312 B, 501 allocs -> 32,512 B, 401 allocs | 37,312 B, 501 allocs -> 32,512 B, 401 allocs |
+
+A separate 15-pair, 500ms translated-Linux control measured the park/wake
+difference at +7.8%, while the native Darwin result remained neutral. CPU
+profiles attributed 3.7% of the change profile cumulatively to the task-cache
+helper; larger sampled differences appeared in GC write barriers and the
+channel path. The result is retained as a visible follow-up target instead of
+being classified as a general native regression. The remaining 20 B and two
+allocations per sequential task belong to the compiler-generated frame and
+closure; channel operations dominate the park/wake allocation total.

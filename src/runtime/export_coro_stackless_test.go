@@ -10,6 +10,7 @@ import "unsafe"
 
 const (
 	StacklessCoroWarmExecutorCount = stacklessCoroWarmExecutorCount
+	StacklessCoroTaskCacheSize     = stacklessCoroTaskCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -116,6 +117,18 @@ func DeferRecoverStacklessCoroForTest(token unsafe.Pointer) any {
 
 func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
+}
+
+func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task == nil {
+		throw("runtime: invalid stackless coroutine task cache query")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	count := s.freeTaskCount
+	unlock(&s.lock)
+	return count
 }
 
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {

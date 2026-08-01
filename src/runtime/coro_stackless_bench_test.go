@@ -29,17 +29,17 @@ func BenchmarkStacklessCoroYield(b *testing.B) {
 
 func BenchmarkStacklessCoroSpawn(b *testing.B) {
 	spawned := 0
-	completed := 0
+	var completed atomic.Int64
 	child := func(unsafe.Pointer) uint8 {
-		completed++
+		completed.Add(1)
 		return runtime.StacklessCoroActionComplete
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		if spawned == b.N {
-			if completed != spawned {
-				b.Fatalf("completed %d tasks, want %d", completed, spawned)
+			if completed.Load() != int64(spawned) {
+				return runtime.StacklessCoroActionYield
 			}
 			return runtime.StacklessCoroActionComplete
 		}
@@ -64,10 +64,10 @@ func BenchmarkStacklessCoroSpawnBurst(b *testing.B) {
 func benchmarkStacklessCoroSpawnBurst(b *testing.B, tasks int) {
 	b.ReportAllocs()
 	for range b.N {
-		completed := 0
+		var completed atomic.Int64
 		state := 0
 		child := func(unsafe.Pointer) uint8 {
-			completed++
+			completed.Add(1)
 			return runtime.StacklessCoroActionComplete
 		}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -79,8 +79,8 @@ func benchmarkStacklessCoroSpawnBurst(b *testing.B, tasks int) {
 				state = 1
 				return runtime.StacklessCoroActionYield
 			case 1:
-				if completed != tasks {
-					b.Fatalf("completed %d tasks, want %d", completed, tasks)
+				if completed.Load() != int64(tasks) {
+					return runtime.StacklessCoroActionYield
 				}
 				return runtime.StacklessCoroActionComplete
 			default:

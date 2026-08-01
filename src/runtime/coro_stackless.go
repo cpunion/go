@@ -26,6 +26,7 @@ const (
 )
 
 const stacklessCoroWarmExecutorCount = 4
+const stacklessCoroTaskCacheSize = 256
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 const (
@@ -75,6 +76,8 @@ type stacklessCoroScheduler struct {
 	lock           mutex
 	head           *stacklessCoroTask
 	tail           *stacklessCoroTask
+	freeTasks      *stacklessCoroTask
+	freeTaskCount  int
 	root           *stacklessCoroTask
 	terminalValues map[*stacklessCoroTask]any
 	wake           chan struct{}
@@ -164,6 +167,56 @@ func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroSchedul
 	s.root = root
 	s.ready(root, false)
 	return s
+}
+
+// newTaskLocked returns a new or recycled non-root task. The scheduler lock
+// must be held.
+func (s *stacklessCoroScheduler) newTaskLocked(resume stacklessCoroResume,
+	parent *stacklessCoroTask) *stacklessCoroTask {
+	task := s.freeTasks
+	if task == nil {
+		if s.freeTaskCount != 0 {
+			throw("runtime: invalid stackless coroutine task cache")
+		}
+		return &stacklessCoroTask{resume: resume, parent: parent}
+	}
+	if s.freeTaskCount <= 0 || s.freeTaskCount > stacklessCoroTaskCacheSize {
+		throw("runtime: invalid stackless coroutine task cache count")
+	}
+	s.freeTasks = task.next
+	s.freeTaskCount--
+	task.resume = resume
+	task.parent = parent
+	task.next = nil
+	return task
+}
+
+// recycleTaskLocked retains a completed non-root task for this scheduler. A
+// task address is also a race-detector synchronization identity, so race
+// builds must not reuse it for an unrelated logical goroutine.
+func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
+	_, hasTerminalValue := s.terminalValues[task]
+	if task == s.root || task.resume != nil || task.parent != nil ||
+		task.next != nil || task.state != stacklessCoroTaskComplete ||
+		task.terminal != stacklessCoroTerminalNone || task.goexit ||
+		task.resuming || task.readyPending ||
+		task.context.scheduler != nil || task.context.task != nil ||
+		hasTerminalValue {
+		throw("runtime: invalid stackless coroutine task recycle")
+	}
+	if raceenabled {
+		return
+	}
+	if s.freeTaskCount < 0 || s.freeTaskCount > stacklessCoroTaskCacheSize {
+		throw("runtime: invalid stackless coroutine task cache size")
+	}
+	if s.freeTaskCount == stacklessCoroTaskCacheSize {
+		return
+	}
+	task.state = stacklessCoroTaskNew
+	task.next = s.freeTasks
+	s.freeTasks = task
+	s.freeTaskCount++
 }
 
 func (s *stacklessCoroScheduler) finish() {
@@ -341,7 +394,7 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 		throw("runtime: stackless coroutine await outside resume")
 	}
 	parent.state = stacklessCoroTaskWaiting
-	s.readyLocked(&stacklessCoroTask{resume: child, parent: parent})
+	s.readyLocked(s.newTaskLocked(child, parent))
 	unlock(&s.lock)
 }
 
@@ -662,7 +715,7 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine spawn outside resume")
 	}
-	s.readyLocked(&stacklessCoroTask{resume: child})
+	s.readyLocked(s.newTaskLocked(child, nil))
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	s.wakeReplacementExecutor()
@@ -1086,6 +1139,9 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
+		if task != s.root {
+			s.recycleTaskLocked(task)
+		}
 		unlock(&s.lock)
 		if task == s.root {
 			s.stopExecutorRuns()
@@ -1100,6 +1156,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 		throw("runtime: stackless coroutine completed for non-waiting parent")
 	}
 	s.readyLocked(parent)
+	s.recycleTaskLocked(task)
 	unlock(&s.lock)
 }
 
@@ -1125,6 +1182,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 			delete(s.terminalValues, task)
 			task.terminal = stacklessCoroTerminalNone
 			task.goexit = false
+			s.recycleTaskLocked(task)
 			unlock(&s.lock)
 			panic(value)
 		}
@@ -1144,6 +1202,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	task.goexit = false
 	s.terminalValues[parent] = value
 	s.readyLocked(parent)
+	s.recycleTaskLocked(task)
 	unlock(&s.lock)
 }
 
@@ -1170,6 +1229,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 			return
 		}
 		task.goexit = false
+		s.recycleTaskLocked(task)
 		unlock(&s.lock)
 		return
 	}
@@ -1181,6 +1241,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	parent.goexit = true
 	task.goexit = false
 	s.readyLocked(parent)
+	s.recycleTaskLocked(task)
 	unlock(&s.lock)
 }
 
