@@ -150,6 +150,23 @@ func TestCBlockingGroupCapacity(t *testing.T) {
 	}
 }
 
+func TestParallelSpawnProgress(t *testing.T) {
+	const workers = 3
+
+	oldProcs := runtime.GOMAXPROCS(workers + 1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	atomic.StoreUint32(&parallelSpawnTimeout, 0)
+	watchdog := time.AfterFunc(5*time.Second, func() {
+		atomic.StoreUint32(&parallelSpawnTimeout, 1)
+	})
+	if !parallelSpawnProgress(workers) {
+		t.Fatal("spawned tasks did not run while their parent was active")
+	}
+	if !watchdog.Stop() {
+		t.Fatal("parallel spawn progress required watchdog recovery")
+	}
+}
+
 func TestProbeEdges(t *testing.T) {
 	writeFailure := errors.New("write failure")
 	readFailure := errors.New("read failure")

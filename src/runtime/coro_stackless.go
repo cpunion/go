@@ -665,6 +665,7 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 	s.readyLocked(&stacklessCoroTask{resume: child})
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
+	s.wakeReplacementExecutor()
 }
 
 // coroSleep starts a timer operation for the current logical goroutine and
@@ -1193,6 +1194,22 @@ func (s *stacklessCoroScheduler) signal() {
 func (s *stacklessCoroScheduler) signalAll() {
 	for range stacklessCoroWarmExecutorCount {
 		s.signal()
+	}
+}
+
+// wakeReplacementExecutor admits a warm replacement and wakes an admitted
+// executor. A spawn may add runnable work while its current resume function
+// continues to run, so the executor driving that function cannot consume the
+// new task yet. With one P, admission would only add contention; blocking
+// foreign calls admit replacement capacity through their own path.
+func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
+	if gomaxprocs <= 1 {
+		return
+	}
+	s.signal()
+	select {
+	case s.executorWake <- struct{}{}:
+	default:
 	}
 }
 

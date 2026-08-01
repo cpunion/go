@@ -160,6 +160,46 @@ var (
 	parallelYieldWorkSize int
 )
 
+var (
+	parallelSpawnStarted uint64
+	parallelSpawnDone    uint64
+	parallelSpawnRelease uint32
+	parallelSpawnTimeout uint32
+)
+
+func parallelSpawnWorker() {
+	runtime.Gosched()
+	atomic.AddUint64(&parallelSpawnStarted, 1)
+	for atomic.LoadUint32(&parallelSpawnRelease) == 0 &&
+		atomic.LoadUint32(&parallelSpawnTimeout) == 0 {
+	}
+	atomic.AddUint64(&parallelSpawnDone, 1)
+}
+
+func parallelSpawnProgress(workers int) bool {
+	if workers <= 0 {
+		return false
+	}
+	// Keep this helper on the automatically colored path while leaving the
+	// spawn-and-wait episode itself free of suspension points.
+	runtime.Gosched()
+	atomic.StoreUint64(&parallelSpawnStarted, 0)
+	atomic.StoreUint64(&parallelSpawnDone, 0)
+	atomic.StoreUint32(&parallelSpawnRelease, 0)
+	for worker := 0; worker < workers; worker++ {
+		go parallelSpawnWorker()
+	}
+	for atomic.LoadUint64(&parallelSpawnStarted) != uint64(workers) &&
+		atomic.LoadUint32(&parallelSpawnTimeout) == 0 {
+	}
+	started := atomic.LoadUint64(&parallelSpawnStarted) == uint64(workers)
+	atomic.StoreUint32(&parallelSpawnRelease, 1)
+	for atomic.LoadUint64(&parallelSpawnDone) != uint64(workers) &&
+		atomic.LoadUint32(&parallelSpawnTimeout) == 0 {
+	}
+	return started && atomic.LoadUint64(&parallelSpawnDone) == uint64(workers)
+}
+
 func parallelWork(iterations int, value uint64) uint64 {
 	for i := 0; i < iterations; i++ {
 		value = value*6364136223846793005 + 1442695040888963407
