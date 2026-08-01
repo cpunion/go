@@ -256,6 +256,11 @@ func BlockingBoundaryStacklessCoroForTest(ctx unsafe.Pointer) {
 	coroExitBlocking()
 }
 
+func ForeignReturnersStacklessCoroForTest(ctx unsafe.Pointer) uint32 {
+	context := (*stacklessCoroContext)(ctx)
+	return context.scheduler.foreignReturners.Load()
+}
+
 func CheckEarlyReadyStacklessCoroForTest() bool {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroExecutorCount),
