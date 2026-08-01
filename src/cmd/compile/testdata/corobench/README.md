@@ -386,3 +386,62 @@ channel path. The result is retained as a visible follow-up target instead of
 being classified as a general native regression. The remaining 20 B and two
 allocations per sequential task belong to the compiler-generated frame and
 closure; channel operations dominate the park/wake allocation total.
+
+### Logical operation reuse
+
+Revision `57d68dbee3` retains up to 64 completed operation headers in each
+live logical scheduler. Its exact parent is `a39f1317e7`. Completion clears
+the entire union-shaped header before caching it, so timer, channel, select,
+file, socket, and asynchronous-call operations can safely reuse one another.
+The existing operation registry still uses a monotonically increasing ID;
+late timer callbacks therefore cannot find a header that has been reused for
+a different operation.
+
+Normal completion, operation panic, and recycling use the scheduler's existing
+lock. Allocation on a cache miss remains outside that lock. Race builds do not
+reuse operation addresses because the channel race hooks use the address as a
+synchronization identity. The tests exercise reuse across timer, channel, and
+read-call kinds, the 64-entry bound with 65 simultaneously pending timers,
+panic and every ordinary completion source, registry cleanup, and the
+race-build no-reuse rule.
+
+The comparison used prebuilt test binaries, three unrecorded warm-up pairs,
+and 15 recorded samples with alternating parent/change order. Darwin used a
+500ms benchmark time. Translated Linux used 300ms except for the timer rows:
+the 300ms timer samples varied from about 12 to 44 us and gave contradictory
+runtime and end-to-end directions, so those two rows were repeated in
+isolation with a 1s benchmark time. Each entry is the median exact parent
+followed by the median change; the percentage is the median of the 15 paired
+differences. Linux values validate direction and broad magnitude rather than
+native absolute time.
+
+The direct runtime operation probes produced:
+
+| Probe | Darwin arm64 | Linux amd64 | Allocation per iteration |
+| --- | ---: | ---: | ---: |
+| positive timer | 8.288 us -> 8.132 us (-2.06%) | 31.452 us -> 28.592 us (-12.25%) | 296 B, 3 allocs -> 104 B, 2 allocs |
+| channel | 309.9 ns -> 237.6 ns (-23.03%) | 639.2 ns -> 217.7 ns (-65.79%) | 496 B, 3 allocs -> 112 B, 1 alloc |
+| ready file read | 9.004 us -> 8.939 us (paired +0.37%, ~) | 23.094 us -> 24.691 us (paired +3.36%, ~) | 192 B, 1 alloc -> 0 B, 0 allocs |
+| ready socket read | 10.723 us -> 10.229 us (-3.97%) | 29.047 us -> 29.033 us (paired +0.73%, ~) | 192 B, 1 alloc -> 0 B, 0 allocs |
+
+The ordinary-Go probes were compiled from identical source with automatic
+coloring:
+
+| Probe | Darwin arm64 | Linux amd64 | Allocation per iteration |
+| --- | ---: | ---: | ---: |
+| channel round trip | 627.7 ns -> 461.7 ns (-26.55%) | 1.310 us -> 463.6 ns (-64.13%) | 992 B, 6 allocs -> 224 B, 2 allocs |
+| ready `select` | 244.5 ns -> 190.1 ns (-22.19%) | 574.4 ns -> 348.8 ns (-39.61%) | 516 B, 5 allocs -> 132 B, 3 allocs |
+| `Sleep(1ns)` | 8.130 us -> 8.112 us (-1.68%) | 32.446 us -> 29.043 us (-9.79%) | 296 B, 3 allocs -> 104 B, 2 allocs |
+| ready file read | 8.687 us -> 8.547 us (-1.08%) | 22.537 us -> 23.415 us (paired +0.12%, ~) | 256 B, 2 allocs -> 64 B, 1 alloc |
+| ready TCP read | 8.730 us -> 8.719 us (paired +0.06%, ~) | 23.523 us -> 23.133 us (-5.08%) | 256 B, 2 allocs -> 64 B, 1 alloc |
+
+An operation header occupies the 192-byte allocation class. The direct channel
+probe starts one send and one receive per iteration, which explains its 384 B
+and two-allocation reduction. The ordinary-Go ping/pong probe starts four
+channel operations and therefore saves 768 B and four allocations. Its exact
+parent already includes logical task reuse. File and socket runtime probes now
+allocate nothing for the operation itself. Their ordinary-Go probes retain 64
+B and one allocation for the compiler-generated frame or closure. The
+remaining channel allocation is its stackless waiter; ready `select` and
+positive timers similarly expose their non-header costs as the next focused
+optimization targets.
