@@ -1128,14 +1128,14 @@ func (s *stacklessCoroScheduler) replacementExecutor() {
 }
 
 // wakeReplacementExecutor notifies replacement capacity. It reports whether
-// logical work was queued before the notification.
+// runnable work or a returning foreign-call executor needs a P.
 //
 //go:nosplit
 func (s *stacklessCoroScheduler) wakeReplacementExecutor() bool {
 	if s == nil || s.executorsReady.Load() == 0 {
 		return false
 	}
-	handoff := s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0
+	handoff := s.runnableState.Load() != 0
 	// A replacement that has already entered run waits on wake, not
 	// executorWake. Notify both admitted and not-yet-admitted executors so
 	// repeated blocking calls can reuse the fixed pool.
