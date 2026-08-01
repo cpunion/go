@@ -9,8 +9,9 @@ package runtime
 import "unsafe"
 
 type stacklessCoroGState struct {
-	native    unsafe.Pointer
-	deferTask *stacklessCoroTask
+	native            unsafe.Pointer
+	deferTask         *stacklessCoroTask
+	blockingScheduler *stacklessCoroScheduler
 }
 
 type stacklessCoroG struct {

@@ -58,30 +58,47 @@ func TestStacklessCoroNativeStack(t *testing.T) {
 	})
 }
 
-func TestStacklessCoroNativePoolBound(t *testing.T) {
+func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	const roots = 16
-	var wg sync.WaitGroup
-	started := make(chan struct{}, roots)
-	gate := make(chan struct{})
-	wg.Add(roots)
-	for range roots {
-		go func() {
-			defer wg.Done()
-			runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
-				started <- struct{}{}
-				<-gate
-				return runtime.StacklessCoroActionComplete
-			})
-		}()
+	run := func() int {
+		var wg sync.WaitGroup
+		started := make(chan struct{}, roots)
+		gate := make(chan struct{})
+		wg.Add(roots)
+		for range roots {
+			go func() {
+				defer wg.Done()
+				runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+					started <- struct{}{}
+					<-gate
+					return runtime.StacklessCoroActionComplete
+				})
+			}()
+		}
+		watchdog := time.NewTimer(5 * time.Second)
+		for range roots {
+			select {
+			case <-started:
+			case <-watchdog.C:
+				close(gate)
+				wg.Wait()
+				t.Fatal("native executor pool did not grow for concurrent roots")
+			}
+		}
+		watchdog.Stop()
+		count := runtime.StacklessCoroNativePoolForTest()
+		close(gate)
+		wg.Wait()
+		return count
 	}
-	for range runtime.StacklessCoroExecutorCount {
-		<-started
+
+	grown := run()
+	if grown < roots {
+		t.Fatalf("native executor count = %d, want at least %d", grown, roots)
 	}
-	if got := runtime.StacklessCoroNativePoolForTest(); got != runtime.StacklessCoroExecutorCount {
-		t.Fatalf("native executor count = %d, want %d", got, runtime.StacklessCoroExecutorCount)
+	if reused := run(); reused != grown {
+		t.Fatalf("native executor count after reuse = %d, want %d", reused, grown)
 	}
-	close(gate)
-	wg.Wait()
 }
 
 func TestStacklessCoroNativeReuseDuringGC(t *testing.T) {
@@ -122,11 +139,16 @@ func TestStacklessCoroNativeBlockingReuseDuringGC(t *testing.T) {
 }
 
 func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
-	const (
-		workers   = 3
-		maxYields = 1000
-	)
-	var sockets [workers][2]int
+	testStacklessCoroNativeBlockingProgress(t, 3)
+}
+
+func TestStacklessCoroNativeBlockingCapacity(t *testing.T) {
+	testStacklessCoroNativeBlockingProgress(t, 8)
+}
+
+func testStacklessCoroNativeBlockingProgress(t *testing.T, workers int) {
+	const maxYields = 1000
+	sockets := make([][2]int, workers)
 	for i := range sockets {
 		pair, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 		if err != nil {
@@ -167,6 +189,7 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 
 	var state, yields int
 	var stalled bool
+	var executorStateFailed bool
 	var returnStateFailed bool
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
@@ -177,9 +200,17 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 			state = 1
 			return runtime.StacklessCoroActionYield
 		case 1:
-			if entered.Load() != workers {
+			if rescued.Load() {
+				return runtime.StacklessCoroActionComplete
+			}
+			if entered.Load() != int32(workers) {
 				return runtime.StacklessCoroActionYield
 			}
+			executors, blocking := runtime.ExecutorStateStacklessCoroForTest(ctx)
+			if blocking != uint32(workers) {
+				return runtime.StacklessCoroActionYield
+			}
+			executorStateFailed = executors < blocking+1
 			for _, pair := range sockets {
 				if n := runtime.WriteStacklessCoroNativeForTest(pair[1], 'p'); n != 1 {
 					writeFailed.Store(true)
@@ -188,9 +219,13 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 			state = 2
 			return runtime.StacklessCoroActionYield
 		case 2:
-			if done.Load() == workers {
+			if rescued.Load() {
+				return runtime.StacklessCoroActionComplete
+			}
+			if done.Load() == int32(workers) {
 				returners, pending := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
-				returnStateFailed = returners != 0 || pending
+				_, blocking := runtime.ExecutorStateStacklessCoroForTest(ctx)
+				returnStateFailed = returners != 0 || pending || blocking != 0
 				return runtime.StacklessCoroActionComplete
 			}
 			returners, _ := runtime.ForeignReturnStateStacklessCoroForTest(ctx)
@@ -211,6 +246,9 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 	})
 	if stalled {
 		t.Fatal("blocking foreign-call returns did not acquire a P")
+	}
+	if executorStateFailed {
+		t.Fatal("blocking foreign calls did not reserve replacement capacity")
 	}
 	if readFailed.Load() {
 		t.Fatal("blocking foreign-call read failed")

@@ -33,12 +33,16 @@ type stacklessCoroNativeContext struct {
 	lockedInt  uint32
 	g0Accurate bool
 	sigmask    sigset
+	poolNext   *stacklessCoroNativeContext
 }
 
 var stacklessCoroNativePool struct {
-	lock      mutex
-	count     int
+	lock  mutex
+	count int
+	// available preserves the common lock-free reuse path. Contexts beyond
+	// the warm capacity remain reusable through overflow.
 	available chan *stacklessCoroNativeContext
+	overflow  *stacklessCoroNativeContext
 }
 
 // coroNativeGogo installs newG0 and resumes buf in one assembly sequence. No
@@ -47,7 +51,7 @@ func coroNativeGogo(buf *gobuf, newG0 *g)
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
-	stacklessCoroNativePool.available = make(chan *stacklessCoroNativeContext, stacklessCoroExecutorCount)
+	stacklessCoroNativePool.available = make(chan *stacklessCoroNativeContext, stacklessCoroWarmExecutorCount)
 }
 
 // coroRunOnNativeStack runs s on a fixed portion of the current operating
@@ -95,18 +99,27 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 	default:
 	}
 	lock(&stacklessCoroNativePool.lock)
-	if stacklessCoroNativePool.count < stacklessCoroExecutorCount {
-		stacklessCoroNativePool.count++
+	if ctx := stacklessCoroNativePool.overflow; ctx != nil {
+		stacklessCoroNativePool.overflow = ctx.poolNext
+		ctx.poolNext = nil
 		unlock(&stacklessCoroNativePool.lock)
-		return newStacklessCoroNativeContext()
+		return ctx
 	}
-	available := stacklessCoroNativePool.available
+	stacklessCoroNativePool.count++
 	unlock(&stacklessCoroNativePool.lock)
-	return <-available
+	return newStacklessCoroNativeContext()
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
-	stacklessCoroNativePool.available <- ctx
+	select {
+	case stacklessCoroNativePool.available <- ctx:
+		return
+	default:
+	}
+	lock(&stacklessCoroNativePool.lock)
+	ctx.poolNext = stacklessCoroNativePool.overflow
+	stacklessCoroNativePool.overflow = ctx
+	unlock(&stacklessCoroNativePool.lock)
 }
 
 func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
@@ -242,8 +255,8 @@ func coroNativeFinish(executor *g) {
 	if ctx == nil || ctx.executor != executor {
 		throw("runtime: invalid stackless coroutine native finish")
 	}
-	if ctx.gState.deferTask != nil {
-		throw("runtime: active stackless coroutine defer during native finish")
+	if ctx.gState.deferTask != nil || ctx.gState.blockingScheduler != nil {
+		throw("runtime: active stackless coroutine state during native finish")
 	}
 	schedulerG := getg()
 	mp := schedulerG.m

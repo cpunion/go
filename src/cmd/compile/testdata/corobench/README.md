@@ -236,3 +236,50 @@ lowering audit, and checks the direct C symbols without collecting performance
 data. CI runs the correctness test with both toolchains, invokes this check,
 and retains its artifacts. It does not enforce performance thresholds:
 hosted-runner measurements are not stable enough for that purpose.
+
+### Elastic blocking C capacity
+
+Revision `3a2a4d07e9` replaces the fixed four-executor limit with four warm
+executors and on-demand growth. Its exact parent is `50c67d66c0`. A scheduler
+now counts executors from blocking entry until they return with a P. When all
+current capacity is blocked, a managed-stack coordinator starts another
+replacement executor. Native contexts retain a four-entry lock-free reuse
+path and use a locked overflow list beyond it.
+
+The paired comparison used `GOMAXPROCS=1`, three warm-up pairs, and ten
+alternating-order 500ms samples. Darwin ran natively on an Apple M4 Max. Linux
+amd64 ran under OrbStack translation, so its absolute times should not be
+compared with Darwin. Each entry is the median exact parent followed by the
+median change.
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| scalar C call | 11.76 ns -> 12.21 ns (+3.9%) | 20.66 ns -> 21.28 ns (+3.0%) |
+| aggregate C call | 14.94 ns -> 15.16 ns (+1.5%) | 21.66 ns -> 22.30 ns (+2.9%) |
+| errno C call | 15.21 ns -> 15.56 ns (+2.3%) | 24.06 ns -> 26.04 ns (+8.2%) |
+| libm C call | 17.33 ns -> 17.32 ns (~) | 26.92 ns -> 27.33 ns (+1.5%) |
+| blocking C handoff | 24.57 us -> 25.46 us (~) | 93.17 us -> 96.48 us (~) |
+| three concurrent blocking C calls | 112.7 us -> 112.9 us (~) | 965.1 us -> 950.3 us (~) |
+| eight concurrent blocking C calls | capacity-limited -> 166.6 us | capacity-limited -> 1.203 ms |
+
+The eight-call result is a newly supported capability, not a numerical
+speedup: the parent preflight skips timing because it cannot keep all eight
+calls blocked while retaining a release executor. The change measured
+5.654 us of entry time per call on Darwin and 25.62 us under translated Linux.
+It used 705-706 B and 32 allocations per eight-call operation. Three-call and
+handoff allocations were unchanged, and ordinary direct C calls remained
+allocation-free.
+
+The small short-call cost is fixed rather than proportional to blocking
+duration. A direct C return now checks the current logical executor state after
+`exitsyscall`; the measured absolute difference was about 0.2-2 ns. This keeps
+the no-child entry path compact while making the blocking count exact through
+P reacquisition.
+
+The native-context pool test holds 16 simultaneous roots, verifies growth, and
+then verifies that a second batch reuses the same high-water capacity. The
+eight-call runtime test also verifies exact blocking counts and return-state
+cleanup. The experiment's per-G extension remains one pointer. Capacity does
+not yet retire within a live root, and the global native-context pool retains
+its high-water allocation for later roots. Multi-P logical scheduling remains
+a separate limitation.

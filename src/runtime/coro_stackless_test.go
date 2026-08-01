@@ -2509,7 +2509,7 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
 
-	const rounds = 2*runtime.StacklessCoroExecutorCount + 1
+	const rounds = 2*runtime.StacklessCoroWarmExecutorCount + 1
 	var rescued atomic.Bool
 	rescue := time.AfterFunc(5*time.Second, func() {
 		rescued.Store(true)
