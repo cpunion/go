@@ -144,12 +144,10 @@ func TestCBlockingGroupCapacity(t *testing.T) {
 	old := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(old)
 	elapsed, timeouts := cBlockingGroup(1, 8, 250*time.Millisecond)
-	if elapsed == 0 || timeouts > 8 {
-		t.Fatalf("cBlockingGroup(1, 8) = (%d, %d), want elapsed and at most 8 timeouts",
+	if elapsed == 0 || timeouts != 0 {
+		t.Fatalf("cBlockingGroup(1, 8) = (%d, %d), want elapsed and no timeouts",
 			elapsed, timeouts)
 	}
-	t.Logf("blocking-c-group calls=8 supported=%t timeouts=%d",
-		timeouts == 0, timeouts)
 }
 
 func TestProbeEdges(t *testing.T) {

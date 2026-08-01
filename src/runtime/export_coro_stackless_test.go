@@ -9,7 +9,7 @@ package runtime
 import "unsafe"
 
 const (
-	StacklessCoroExecutorCount = stacklessCoroExecutorCount
+	StacklessCoroWarmExecutorCount = stacklessCoroWarmExecutorCount
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -25,7 +25,7 @@ func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroExecutorCount),
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	rootTask := &stacklessCoroTask{resume: resume}
@@ -37,7 +37,7 @@ func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 
 func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroExecutorCount),
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	rootTask := &stacklessCoroTask{resume: root}
@@ -263,9 +263,15 @@ func ForeignReturnStateStacklessCoroForTest(ctx unsafe.Pointer) (uint32, bool) {
 		scheduler.runnableState.Load()&stacklessCoroForeignReturnerBit != 0
 }
 
+func ExecutorStateStacklessCoroForTest(ctx unsafe.Pointer) (uint32, uint32) {
+	context := (*stacklessCoroContext)(ctx)
+	scheduler := context.scheduler
+	return scheduler.executorCount.Load(), scheduler.blockingExecutors.Load()
+}
+
 func CheckEarlyReadyStacklessCoroForTest() bool {
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroExecutorCount),
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	task := &stacklessCoroTask{
