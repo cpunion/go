@@ -3458,9 +3458,12 @@ import (
 
 type namedBool bool
 
+const manyRounds = 256
+
 var evaluated int
 var sendChannel chan int
 var manyChannel chan int
+var manyReady atomic.Uint32
 var pointerChannel chan *int
 var gcDone atomic.Uint32
 
@@ -3477,6 +3480,7 @@ func send() {
 
 //go:noinline
 func sendOne() {
+	manyReady.Add(1)
 	manyChannel <- 1
 }
 
@@ -3542,25 +3546,32 @@ func closedSend(ch chan int) (recovered any) {
 
 //go:noinline
 func many() int {
-	ch := make(chan int)
-	manyChannel = ch
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	go sendOne()
-	sum := 0
-	for i := 0; i < 8; i++ {
-		value, ok := <-ch
-		if !ok {
-			panic("unexpected closed channel")
+	total := 0
+	for round := 0; round < manyRounds; round++ {
+		ch := make(chan int)
+		manyChannel = ch
+		manyReady.Store(0)
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		go sendOne()
+		for manyReady.Load() != 8 {
+			runtime.Gosched()
 		}
-		sum += value
+		runtime.Gosched()
+		for i := 0; i < 8; i++ {
+			value, ok := <-ch
+			if !ok {
+				panic("unexpected closed channel")
+			}
+			total += value
+		}
 	}
-	return sum
+	return total
 }
 
 func main() {
@@ -3643,7 +3654,7 @@ func main() {
 	if closedSend(closed) == nil {
 		panic("send on closed channel did not panic")
 	}
-	if sum := many(); sum != 8 {
+	if sum := many(); sum != manyRounds*8 {
 		panic("blocked channel operations stalled the scheduler")
 	}
 	println("stackless-coro-channel-ok")
