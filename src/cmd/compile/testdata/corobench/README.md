@@ -44,11 +44,15 @@ while retaining an executor to release them.
 
 ## Reproducibility
 
-Build one GOROOT at the coroutine branch's upstream merge-base and another at
-the coroutine revision under test. The runner verifies that the first revision
-is the merge-base of the two histories:
+Fetch the upstream development branch, then build one GOROOT at its exact
+merge-base with the coroutine revision and another at the coroutine revision
+under test. The runner resolves `origin/master` by default and verifies the
+first revision against that merge-base. Set `UPSTREAM_REF` when the upstream
+development branch has a different local name:
 
 ```
+git fetch origin master
+
 cd src
 GOROOT_BOOTSTRAP=/path/to/bootstrap ./make.bash
 
