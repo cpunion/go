@@ -166,7 +166,6 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 	}
 
 	var state, yields int
-	var returnStarted bool
 	var stalled bool
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
@@ -191,8 +190,8 @@ func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 			if done.Load() == workers {
 				return runtime.StacklessCoroActionComplete
 			}
-			if !returnStarted {
-				returnStarted = runtime.ForeignReturnersStacklessCoroForTest(ctx) != 0
+			if runtime.ForeignReturnersStacklessCoroForTest(ctx) == 0 {
+				yields = 0
 				return runtime.StacklessCoroActionYield
 			}
 			yields++
