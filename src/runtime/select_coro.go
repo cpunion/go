@@ -69,18 +69,14 @@ func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
 	lockOrder = lockOrder[:len(pollOrder)]
 	sortStacklessCoroSelectLocks(cases, pollOrder, lockOrder)
 
-	s, task := stacklessCoroStartOperation(ctx, "select")
-	op := &stacklessCoroOperation{
-		scheduler: s,
-		task:      task,
-		selection: &stacklessCoroSelect{
-			cases:     cases,
-			lockOrder: lockOrder,
-			waiters:   make([]*sudog, ncases),
-			chosen:    chosen,
-			received:  received,
-			nsends:    nsends,
-		},
+	op := stacklessCoroStartOperation(ctx, "select")
+	op.selection = &stacklessCoroSelect{
+		cases:     cases,
+		lockOrder: lockOrder,
+		waiters:   make([]*sudog, ncases),
+		chosen:    chosen,
+		received:  received,
+		nsends:    nsends,
 	}
 	op.id = registerStacklessCoroOperation(op)
 
@@ -344,8 +340,6 @@ func completeStacklessCoroSelect(op *stacklessCoroOperation, chosen int,
 
 func publishStacklessCoroSelect(op *stacklessCoroOperation,
 	selection *stacklessCoroSelect, chosen int, recvOK, sendClosed bool) {
-	s := op.scheduler
-	task := op.task
 	*selection.chosen = chosen
 	*selection.received = recvOK
 	for i := range selection.cases {
@@ -356,12 +350,9 @@ func publishStacklessCoroSelect(op *stacklessCoroOperation,
 	selection.waiters = nil
 	selection.chosen = nil
 	selection.received = nil
-	op.scheduler = nil
-	op.task = nil
-	op.selection = nil
 	if sendClosed {
-		s.panicOperation(task, plainError("send on closed channel"))
+		panicStacklessCoroOperation(op, plainError("send on closed channel"))
 		return
 	}
-	s.ready(task, true)
+	completeStacklessCoroOperation(op)
 }
