@@ -75,11 +75,19 @@ func TestResumeFactorySupported(t *testing.T) {
 	if !resumeFactorySupported(method) {
 		t.Fatal("method does not support a resume factory")
 	}
-	methodFactory := resumeFactoryType(method)
+	methodFactory := resumeFactoryType(method, FactoryABI1)
 	if methodFactory.NumRecvs() != 0 || methodFactory.NumParams() != 1 ||
 		methodFactory.Param(0).Type != recv.Type {
 		t.Fatalf("method factory type = %v, want explicit receiver parameter",
 			methodFactory)
+	}
+	explicitFactory := resumeFactoryType(method, FactoryABI2)
+	if explicitFactory.NumResults() != 2 ||
+		explicitFactory.Result(0).Type != types.Types[types.TUNSAFEPTR] ||
+		!types.Identical(explicitFactory.Result(1).Type,
+			stacklessResumeType()) {
+		t.Fatalf("explicit factory type = %v, want frame and resume results",
+			explicitFactory)
 	}
 	results := []*types.Field{
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
@@ -99,7 +107,7 @@ func TestResumeFactorySupported(t *testing.T) {
 	if !resumeFactorySupported(variadic) {
 		t.Fatal("variadic function does not support a resume factory")
 	}
-	variadicFactory := resumeFactoryType(variadic)
+	variadicFactory := resumeFactoryType(variadic, FactoryABI1)
 	if variadicFactory.IsVariadic() || variadicFactory.NumParams() != 1 ||
 		variadicFactory.Param(0).Type != values.Type {
 		t.Fatalf("variadic factory type = %v, want explicit slice parameter",
@@ -179,7 +187,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Lowered != 1 || result.Skipped != 0 ||
-		function.Factory != FactoryABI1 {
+		function.Factory != FactoryABI2 {
 		t.Fatalf("Lower result = %+v, factory = %v", result, function.Factory)
 	}
 
@@ -204,6 +212,122 @@ func TestLowerMethodReceiver(t *testing.T) {
 		factoryCall.Args[1] != paramName {
 		t.Fatalf("method factory arguments = %v, want receiver and parameter",
 			factoryCall.Args)
+	}
+
+	var generatedFactory *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.Sym() == resumeFactorySymbol(method) {
+			generatedFactory = generated
+			break
+		}
+	}
+	if generatedFactory == nil {
+		t.Fatalf("missing generated factory %s", wantFactory)
+	}
+	if generatedFactory.Type().NumResults() != 2 {
+		t.Fatalf("factory results = %d, want frame and resume",
+			generatedFactory.Type().NumResults())
+	}
+	returnStmt, ok := generatedFactory.Body[len(generatedFactory.Body)-1].(*ir.ReturnStmt)
+	if !ok || len(returnStmt.Results) != 2 {
+		t.Fatalf("factory return = %T, want frame and resume",
+			generatedFactory.Body[len(generatedFactory.Body)-1])
+	}
+	resume, ok := returnStmt.Results[1].(*ir.ClosureExpr)
+	if !ok || resume.Func.ClosureParent != generatedFactory {
+		t.Fatalf("factory resume = %T, want generated static resume",
+			returnStmt.Results[1])
+	}
+	if len(resume.Func.ClosureVars) != 0 {
+		t.Fatalf("resume has %d closure variables, want none",
+			len(resume.Func.ClosureVars))
+	}
+	allocations := 0
+	ir.VisitList(generatedFactory.Body, func(node ir.Node) {
+		if node.Op() == ir.ONEW {
+			allocations++
+		}
+	})
+	if allocations != 1 {
+		t.Fatalf("factory has %d allocations, want one typed frame", allocations)
+	}
+}
+
+func TestExplicitFrameFactorySupported(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	defer func() { typecheck.Target = oldTarget }()
+	typecheck.Target = new(ir.Package)
+
+	pkg := types.NewPkg("example.com/coro/explicitframe", "explicitframe")
+	sequence := 0
+	candidate := func(kind SiteKind) *lowerCandidate {
+		sequence++
+		fn := newLowerTestFunc(pkg, pkg.LookupNum("candidate", sequence).Name)
+		fn.Body = []ir.Node{newLowerTestReturn()}
+		return &lowerCandidate{
+			function: &Function{
+				Func: fn, Effect: MaySuspend,
+				Sites: []Site{{Kind: kind}},
+			},
+			foreignCalls: make(map[*ir.CallExpr]ForeignCallClass),
+		}
+	}
+
+	if explicitFrameFactorySupported(nil) {
+		t.Fatal("nil candidate supports an explicit frame")
+	}
+	for _, kind := range []SiteKind{SiteYield, SiteAwait} {
+		if got := candidate(kind); !explicitFrameFactorySupported(got) {
+			t.Errorf("%s candidate does not support an explicit frame", kind)
+		}
+	}
+	for _, kind := range []SiteKind{SiteSpawn, SiteTimer, SiteForeign} {
+		if got := candidate(kind); explicitFrameFactorySupported(got) {
+			t.Errorf("%s candidate supports an explicit frame", kind)
+		}
+	}
+
+	deferABI := candidate(SiteYield)
+	deferABI.function.Defer = DeferABI1
+	if explicitFrameFactorySupported(deferABI) {
+		t.Error("defer ABI candidate supports an explicit frame")
+	}
+	deferred := candidate(SiteYield)
+	deferred.defers = []*lowerDefer{{}}
+	if explicitFrameFactorySupported(deferred) {
+		t.Error("defer candidate supports an explicit frame")
+	}
+	ranged := candidate(SiteYield)
+	ranged.rangeVars = []*ir.Name{ir.NewNameAt(src.NoXPos,
+		pkg.Lookup("rangeValue"), types.Types[types.TINT])}
+	if explicitFrameFactorySupported(ranged) {
+		t.Error("range candidate supports an explicit frame")
+	}
+	terminal := candidate(SiteYield)
+	terminal.function.Terminal = MayPanic
+	if explicitFrameFactorySupported(terminal) {
+		t.Error("terminal candidate supports an explicit frame")
+	}
+
+	closure := candidate(SiteYield)
+	nested := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), closure.function.Func,
+		typecheck.Target, 0)
+	nested.DeclareParams(true)
+	closure.function.Func.Body = []ir.Node{nested.OClosure}
+	if explicitFrameFactorySupported(closure) {
+		t.Error("closure candidate supports an explicit frame")
+	}
+
+	runToCompletion := candidate(SiteForeign)
+	call := newLowerTestCall(newLowerTestFunc(pkg, "foreign"))
+	runToCompletion.function.Effect = NoSuspend
+	runToCompletion.function.Sites[0].Foreign = DirectNoBlock
+	runToCompletion.foreignCalls[call] = DirectNoBlock
+	runToCompletion.function.Func.Body = []ir.Node{call, newLowerTestReturn()}
+	if explicitFrameFactorySupported(runToCompletion) {
+		t.Error("run-to-completion candidate supports an explicit frame")
 	}
 }
 
@@ -1552,26 +1676,39 @@ func TestLowerStateMachines(t *testing.T) {
 		}
 	}
 
+	explicitFrames := map[*ir.Func]bool{
+		child: true, parent: true, spawned: true,
+	}
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,
 		ordinaryFileReader, asyncCaller, foreignCaller, runToCompletion,
 		runSingle, runStructured, structured, deferred, dynamicDeferred,
 		repeatedDeferred, repeatedRead,
 	} {
-		if len(fn.Body) != 2 {
-			t.Errorf("%s body has %d statements, want 2", fn.Sym().Name, len(fn.Body))
+		wantStatements := 2
+		callIndex := 0
+		wantRuntime := "coroRun"
+		if explicitFrames[fn] {
+			wantStatements = 5
+			callIndex = 3
+			wantRuntime = "coroRunFrame"
+		}
+		if len(fn.Body) != wantStatements {
+			t.Errorf("%s body has %d statements, want %d", fn.Sym().Name,
+				len(fn.Body), wantStatements)
 			continue
 		}
-		call, ok := fn.Body[0].(*ir.CallExpr)
+		call, ok := fn.Body[callIndex].(*ir.CallExpr)
 		if !ok {
-			t.Errorf("%s first statement is %T, want call", fn.Sym().Name, fn.Body[0])
+			t.Errorf("%s statement %d is %T, want call", fn.Sym().Name,
+				callIndex, fn.Body[callIndex])
 			continue
 		}
 		callee := ir.StaticCalleeName(call.Fun)
 		if callee == nil || callee.Sym().Pkg != ir.Pkgs.Runtime ||
-			callee.Sym().Name != "coroRun" {
-			t.Errorf("%s wrapper calls %v, want runtime.coroRun",
-				fn.Sym().Name, callee)
+			callee.Sym().Name != wantRuntime {
+			t.Errorf("%s wrapper calls %v, want runtime.%s",
+				fn.Sym().Name, callee, wantRuntime)
 		}
 		if fn.Inl != nil {
 			t.Errorf("%s retained stale inline body", fn.Sym().Name)
@@ -2980,7 +3117,7 @@ func TestRewriteDeferFactoryCall(t *testing.T) {
 		types.NewSignature(nil, []*types.Field{param}, []*types.Field{result}))
 	target.DeclareParams(true)
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, target)
-	factory := newResumeFactory(target)
+	factory := newResumeFactory(target, FactoryABI1)
 	resume := newLowerTestFunc(pkg, "resume")
 	token := resume.NewLocal(src.NoXPos, pkg.Lookup("token"),
 		types.Types[types.TUNSAFEPTR])
@@ -3870,11 +4007,15 @@ func TestLowerImportedFactory(t *testing.T) {
 			lowered: 2, callers: 2,
 		},
 		{
+			name: "explicit", factory: FactoryABI2,
+			lowered: 2, callers: 2,
+		},
+		{
 			name: "missing", skipped: 1, callers: 1,
 			diagnostic: "unsupported coroutine dependency",
 		},
 		{
-			name: "unknown", factory: FactoryABI(2),
+			name: "unknown", factory: FactoryABI(3),
 			skipped: 1, callers: 1,
 			diagnostic: "unsupported coroutine dependency",
 		},
@@ -3970,8 +4111,8 @@ func TestLowerImportedFactory(t *testing.T) {
 					result.Diagnostics)
 			}
 			for _, function := range functions {
-				if function.Factory != FactoryABI1 {
-					t.Fatalf("lowered function factory = %v, want v1",
+				if function.Factory != FactoryABI2 {
+					t.Fatalf("lowered function factory = %v, want v2",
 						function.Factory)
 				}
 			}

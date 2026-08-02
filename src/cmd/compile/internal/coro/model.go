@@ -192,6 +192,10 @@ const (
 	// parameter. A variadic parameter uses its normalized slice type. Each
 	// result is returned through a typed pointer.
 	FactoryABI1
+	// FactoryABI2 returns an explicit typed-frame pointer followed by a
+	// static resume function. The frame is opaque outside the defining
+	// package and is passed back to the matching frame-aware runtime entry.
+	FactoryABI2
 )
 
 // DeferABI identifies a compiler-verified entry contract for invoking a

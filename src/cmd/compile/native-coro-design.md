@@ -2440,6 +2440,63 @@ The compiler migration should remain incremental:
 5. remove the closure fallback only after cross-package summaries, terminal
    cleanup, race behavior, and every existing lowering test agree.
 
+Factory ABI 2 now implements the first three steps and the root, await, and
+spawn portion of the fourth for a deliberately closed subset. Its factory
+allocates one anonymous, GC-typed frame and returns that frame as an opaque
+pointer together with a zero-capture resume function. The resume function
+loads the typed frame from the first resume-packet word. Root,
+structured-await, and spawn call sites select the frame-aware runtime entry
+from the callee's exported factory summary, including across package
+boundaries.
+
+The initial ABI 2 subset contains only yield and structured-await state
+machines. Run-to-completion functions, source closures, range-variable
+captures, defer or terminal behavior, and timer, file, poll, channel, spawn,
+or foreign transition sites retain factory ABI 1. An ABI 1 caller can still
+await or spawn an ABI 2 child. These restrictions keep closure and cleanup
+ownership unchanged while the typed-frame layout is validated; they are
+fallback rules, not source annotations.
+
+The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
+inlining, enabled real lowering with `-d=coro=4`, and reports the median of
+five 300 ms samples:
+
+| Probe | Closure frame | Explicit frame | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 2,011 ns, 360 B, 5 allocs | 1,768 ns, 336 B, 4 allocs | -12.1%, -6.7%, -20.0% |
+| recursive yield, depth 64 | 15,375 ns, 7,808 B, 262 allocs | 11,871 ns, 6,504 B, 132 allocs | -22.8%, -16.7%, -49.6% |
+| recursive yield, depth 4,096 | 858,059 ns, 475,520 B, 16,390 allocs | 667,799 ns, 393,576 B, 8,196 allocs | -22.2%, -17.2%, -50.0% |
+
+The same five-sample gate on Linux/amd64 under OrbStack translation confirmed
+the direction and exact allocation counts. Absolute translated timings are
+not compared with native Darwin:
+
+| Probe | Closure frame | Explicit frame | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 1,123 ns, 360 B, 5 allocs | 933 ns, 336 B, 4 allocs | -16.9%, -6.7%, -20.0% |
+| recursive yield, depth 64 | 16,107 ns, 7,808 B, 262 allocs | 13,425 ns, 6,504 B, 132 allocs | -16.7%, -16.7%, -49.6% |
+| recursive yield, depth 4,096 | 959,615 ns, 475,520 B, 16,390 allocs | 794,517 ns, 393,576 B, 8,196 allocs | -17.2%, -17.2%, -50.0% |
+
+The exact upstream merge-base, revision `5d29d80b6c`, still defines a large
+lower bound. With the same sources and flags except coroutine lowering, the
+ordinary compiler allocated no heap objects in these probes:
+
+| Probe | Upstream Darwin | Explicit frame Darwin | Upstream Linux | Explicit frame Linux |
+| --- | ---: | ---: | ---: | ---: |
+| public yield entry | 51.46 ns | 1,768 ns (34x) | 90.64 ns | 933 ns (10x) |
+| recursive yield, depth 64 | 410.6 ns | 11,871 ns (29x) | 338.2 ns | 13,425 ns (40x) |
+| recursive yield, depth 4,096 | 19,048 ns | 667,799 ns (35x) | 18,259 ns | 794,517 ns (44x) |
+
+The explicit frame removes one object from a public entry and almost half the
+objects in recursive lowering, but it does not eliminate the remaining frame
+allocation or scheduler transition cost. Those are separate optimization
+targets; the translated Linux ratios show direction, not native timing.
+
+Object inspection shows one typed heap allocation in each eligible factory
+and a direct frame load at resume entry. The task header remains 48 bytes. The
+GC, checkptr, race, cross-package, and recursive probes continue to use the
+same source programs as factory ABI 1.
+
 No source annotation or per-function policy switch is introduced. The first
 performance gate is a simple public entry plus depth-64 and depth-4096
 recursion. It must reduce compiler-owned objects, preserve the 48-byte task
