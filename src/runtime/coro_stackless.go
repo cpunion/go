@@ -81,7 +81,7 @@ type stacklessCoroScheduler struct {
 	freeTaskCount      int
 	freeOperations     *stacklessCoroOperation
 	freeOperationCount int
-	root               *stacklessCoroTask
+	root               stacklessCoroTask
 	terminalValues     map[*stacklessCoroTask]any
 	wake               chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
@@ -166,9 +166,8 @@ func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroSchedul
 	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
-	root := &stacklessCoroTask{resume: resume}
-	s.root = root
-	s.ready(root, false)
+	s.root.resume = resume
+	s.ready(&s.root, false)
 	return s
 }
 
@@ -199,7 +198,7 @@ func (s *stacklessCoroScheduler) newTaskLocked(resume stacklessCoroResume,
 // builds must not reuse it for an unrelated logical goroutine.
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	_, hasTerminalValue := s.terminalValues[task]
-	if task == s.root || task.resume != nil || task.parent != nil ||
+	if task == &s.root || task.resume != nil || task.parent != nil ||
 		task.next != nil || task.state != stacklessCoroTaskComplete ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
 		task.resuming || task.readyPending ||
@@ -224,14 +223,14 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 
 func (s *stacklessCoroScheduler) finish() {
 	if raceenabled {
-		raceacquire(unsafe.Pointer(s.root))
+		raceacquire(unsafe.Pointer(&s.root))
 	}
 	kind := s.root.terminal
 	goexit := s.root.goexit
-	value, ok := s.terminalValues[s.root]
+	value, ok := s.terminalValues[&s.root]
 	s.root.terminal = stacklessCoroTerminalNone
 	s.root.goexit = false
-	delete(s.terminalValues, s.root)
+	delete(s.terminalValues, &s.root)
 	switch kind {
 	case stacklessCoroTerminalNone:
 	case stacklessCoroTerminalPanic:
@@ -567,7 +566,7 @@ func coroDeferRun(token unsafe.Pointer, resume stacklessCoroResume) {
 	s := newStacklessCoroScheduler(resume)
 	s.run(false)
 	if raceenabled {
-		raceacquire(unsafe.Pointer(s.root))
+		raceacquire(unsafe.Pointer(&s.root))
 	}
 	kind, goexit, value, reason :=
 		takeStacklessCoroDeferOutcome(s)
@@ -604,7 +603,7 @@ func coroDeferRun(token unsafe.Pointer, resume stacklessCoroResume) {
 
 func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
 	kind stacklessCoroTerminalKind, goexit bool, value any, reason string) {
-	root := s.root
+	root := &s.root
 	kind = root.terminal
 	goexit = root.goexit
 	value, ok := s.terminalValues[root]
@@ -1191,11 +1190,11 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
-		if task != s.root {
+		if task != &s.root {
 			s.recycleTaskLocked(task)
 		}
 		unlock(&s.lock)
-		if task == s.root {
+		if task == &s.root {
 			s.stopExecutorRuns()
 		} else {
 			s.signalAll()
@@ -1230,7 +1229,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
-		if task != s.root {
+		if task != &s.root {
 			delete(s.terminalValues, task)
 			task.terminal = stacklessCoroTerminalNone
 			task.goexit = false
@@ -1275,7 +1274,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
-		if task == s.root {
+		if task == &s.root {
 			unlock(&s.lock)
 			s.stopExecutorRuns()
 			return

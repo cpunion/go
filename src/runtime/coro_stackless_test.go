@@ -1145,6 +1145,15 @@ func TestStacklessCoroLazyExecutorChannels(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroEmbeddedRoot(t *testing.T) {
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if !runtime.RootEmbeddedStacklessCoroForTest(ctx) {
+			t.Fatal("root task is not embedded in its scheduler")
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+}
+
 func TestStacklessCoroParallelSpawn(t *testing.T) {
 	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 
