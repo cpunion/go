@@ -535,3 +535,37 @@ results while addressing three independent cost centers:
    netpoll readiness instead of paying the current adapter-worker hop; and
 3. remove ready-select temporary storage and, only after its ownership model
    is proven under stress, revisit channel waiter lifetime.
+
+### Lazy replacement-executor channels
+
+Revision `6bad5627c8` leaves the two warm replacement-executor channels nil
+until a root first spawns independent logical work. Its exact parent is
+`246b24eb84`. Roots that only run, yield, await, use timers or I/O, or call C
+therefore do not allocate channels that they never use. The first spawn still
+prepares all replacement state synchronously before admitting an executor;
+the scheduler's capacity and blocking-call paths are otherwise unchanged.
+
+The comparison used prebuilt test binaries, three unrecorded warm-up pairs,
+and 15 recorded 500ms samples with alternating parent/change order. The
+allocation result was identical on native Darwin arm64 and translated Linux
+amd64:
+
+| Probe | Exact parent | Change |
+| --- | ---: | ---: |
+| one public coroutine entry | 584 B, 8 allocs | 360 B, 6 allocs |
+| recursive yield, depth 64 | 8032 B, 265 allocs | 7808 B, 263 allocs |
+| recursive yield, depth 4096 | 475,744 B, 16,393 allocs | 475,520 B, 16,391 allocs |
+| defer across a yield | 608 B, 9 allocs | 384 B, 7 allocs |
+| panic/recover across a yield | 864 B, 11 allocs | 640 B, 9 allocs |
+
+Every root saves exactly 224 B and two allocations. The proportional saving
+is largest for shallow roots; recursive frame allocation is independent of
+this change.
+
+Translated Linux measured public-entry time at 1.693 us -> 1.564 us
+(-7.62%, `p=0.037`). The other four timing differences were not statistically
+significant (`p=0.054` to `p=0.775`). Native Darwin timing samples were
+collected while unrelated host workloads were active and were too noisy to
+classify, so they are deliberately omitted rather than presented as a
+speedup. The deterministic allocation reduction is the result this change is
+intended to establish.
