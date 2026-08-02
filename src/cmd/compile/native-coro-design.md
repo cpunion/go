@@ -2470,6 +2470,15 @@ and timer eligibility produced no stable object reduction in their dedicated
 probes, so they remain ABI 1 rather than broadening the new ABI without a
 measured benefit.
 
+The same alternating measurement on Linux/amd64 reproduced the exact object
+counts and byte reduction: the 100 parked tasks fell from 337 to 237
+allocations and from 19.75 KiB to 18.19 KiB. Channel round-trip and
+ready-select again remained at two and three allocations. None of the three
+timing changes was statistically significant. Linux timing was collected in
+an amd64 virtual machine on an arm64 host and is therefore directional, while
+the allocation result is architecture independent and agrees with the
+Darwin disassembly.
+
 The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
 inlining, enabled real lowering with `-d=coro=4`, and reports the median of
 five 300 ms samples:
