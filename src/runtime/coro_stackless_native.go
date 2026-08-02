@@ -81,10 +81,6 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 		throw("runtime: stackless coroutine caller has pending parameter")
 	}
 	if root && ctx.freeTasks != nil {
-		if s.freeTasks != nil || s.freeTaskCount != 0 {
-			releaseStacklessCoroNativeContext(ctx)
-			throw("runtime: non-empty stackless coroutine root cache")
-		}
 		s.freeTasks = ctx.freeTasks
 		s.freeTaskCount = ctx.freeTaskCount
 		ctx.freeTasks = nil
