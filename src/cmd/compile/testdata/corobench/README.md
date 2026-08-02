@@ -569,3 +569,36 @@ collected while unrelated host workloads were active and were too noisy to
 classify, so they are deliberately omitted rather than presented as a
 speedup. The deterministic allocation reduction is the result this change is
 intended to establish.
+
+### Embedded root task
+
+Revision `79fc8a8736` stores the root task header directly in its scheduler
+instead of allocating a separately owned object. Its exact parent is
+`d7b9d12d87`. Non-root tasks retain their existing cache and ownership model;
+root completion, panic, Goexit, defer, and race synchronization continue to
+use the root header's stable address.
+
+The comparison used prebuilt test binaries, three unrecorded warm-up pairs,
+and 15 recorded 500ms samples with alternating parent/change order. Native
+Darwin arm64 and translated Linux amd64 produced the same allocation result:
+
+| Probe | Exact parent | Change |
+| --- | ---: | ---: |
+| one public coroutine entry | 360 B, 6 allocs | 360 B, 5 allocs |
+| recursive yield, depth 64 | 7808 B, 263 allocs | 7808 B, 262 allocs |
+| recursive yield, depth 4096 | 475,520 B, 16,391 allocs | 475,520 B, 16,390 allocs |
+| defer across a yield | 384 B, 7 allocs | 384 B, 6 allocs |
+| panic/recover across a yield | 640 B, 9 allocs | 640 B, 8 allocs |
+
+The scheduler's larger allocation accounts for the former root bytes, so
+aggregate bytes per root are unchanged while every root uses one fewer heap
+object. The checked-in runtime entry benchmark measures the resulting
+scheduler and wake channel at 304 B and two allocations per root.
+
+Darwin timing differences were not statistically significant (`p=0.395` to
+`p=1.000`). Translated Linux measured public entry at 997.8 ns -> 968.9 ns
+(-2.90%, `p=0.001`), defer at 1.044 us -> 1.010 us (-3.26%, `p=0.001`), and
+recover at 1.242 us -> 1.219 us (-1.85%, `p=0.008`); both recursive probes
+were neutral. These small translated-Linux changes are retained as supporting
+data. The cross-platform conclusion is the exact one-object reduction, not a
+general timing claim.
