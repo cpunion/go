@@ -49,11 +49,18 @@ type lowerCandidate struct {
 	resultValues  []*ir.Name
 	resultPtrs    []*ir.Name
 	factory       *ir.Func
+	factoryABI    FactoryABI
 }
 
 type lowerDirectCall struct {
 	function *ir.Func
 	errno    bool
+}
+
+type lowerFactoryCall struct {
+	setup  ir.Nodes
+	frame  ir.Node
+	resume ir.Node
 }
 
 type lowerDefer struct {
@@ -232,7 +239,12 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if candidate == nil {
 			continue
 		}
-		candidate.factory = newResumeFactory(candidate.function.Func)
+		candidate.factoryABI = FactoryABI1
+		if explicitFrameFactorySupported(candidate) {
+			candidate.factoryABI = FactoryABI2
+		}
+		candidate.factory = newResumeFactory(candidate.function.Func,
+			candidate.factoryABI)
 		factories[function.Func] = candidate.factory
 		candidate.parameters = make(map[*ir.Name]*ir.Name)
 		candidate.results = make(map[*ir.Name]*ir.Name)
@@ -272,7 +284,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 			return result, err
 		}
 		if resumeFactorySupported(function.Func) {
-			function.Factory = FactoryABI1
+			function.Factory = candidate.factoryABI
 		}
 		result.Lowered++
 	}
@@ -1191,10 +1203,15 @@ func resumeFactorySupported(fn *ir.Func) bool {
 	return !fn.Type().HasShape()
 }
 
-func resumeFactoryType(fn *ir.Func) *types.Type {
+func resumeFactoryType(fn *ir.Func, abi FactoryABI) *types.Type {
 	pos := fn.Pos()
 	resumeType := stacklessResumeType()
-	result := types.NewField(pos, nil, resumeType)
+	results := []*types.Field{types.NewField(pos, nil, resumeType)}
+	if abi == FactoryABI2 {
+		results = append([]*types.Field{
+			types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		}, results...)
+	}
 	inputs := fn.Type().RecvParams()
 	params := make([]*types.Field, len(inputs))
 	for i, field := range inputs {
@@ -1207,16 +1224,16 @@ func resumeFactoryType(fn *ir.Func) *types.Type {
 		params = append(params,
 			types.NewField(field.Pos, sym, types.NewPtr(field.Type)))
 	}
-	return types.NewSignature(nil, params, []*types.Field{result})
+	return types.NewSignature(nil, params, results)
 }
 
 func resumeFactorySymbol(fn *ir.Func) *types.Sym {
 	return fn.Sym().Pkg.Lookup(fn.Sym().Name + ".coro")
 }
 
-func newResumeFactory(fn *ir.Func) *ir.Func {
+func newResumeFactory(fn *ir.Func, abi FactoryABI) *ir.Func {
 	pos := fn.Pos()
-	typ := resumeFactoryType(fn)
+	typ := resumeFactoryType(fn, abi)
 	sym := resumeFactorySymbol(fn)
 	factory := ir.NewFunc(pos, pos, sym, typ)
 	factory.SetDupok(fn.Dupok())
@@ -1228,12 +1245,36 @@ func newResumeFactory(fn *ir.Func) *ir.Func {
 
 func importedResumeFactory(fn *ir.Func) (*ir.Func, bool) {
 	summary, ok := Summary(fn)
-	if !ok || summary.Factory != FactoryABI1 || !resumeFactorySupported(fn) {
+	if !ok || (summary.Factory != FactoryABI1 &&
+		summary.Factory != FactoryABI2) || !resumeFactorySupported(fn) {
 		return nil, false
 	}
 	pos := fn.Pos()
 	return ir.NewFunc(pos, pos, resumeFactorySymbol(fn),
-		resumeFactoryType(fn)), true
+		resumeFactoryType(fn, summary.Factory)), true
+}
+
+// explicitFrameFactorySupported limits the first ABI 2 deployment to
+// state-machine functions whose storage can move into one generated frame
+// without rewriting nested closure or defer capture ownership.
+func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
+	if candidate == nil || canLowerRunToCompletion(candidate) ||
+		candidate.function.Defer != NoDeferABI || len(candidate.defers) != 0 ||
+		len(candidate.rangeVars) != 0 || candidate.function.Terminal != 0 {
+		return false
+	}
+	for _, site := range candidate.function.Sites {
+		if site.Kind != SiteYield && site.Kind != SiteAwait {
+			return false
+		}
+	}
+	supported := true
+	ir.Visit(candidate.function.Func, func(node ir.Node) {
+		if _, ok := node.(*ir.ClosureExpr); ok {
+			supported = false
+		}
+	})
+	return supported
 }
 
 func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
@@ -2007,7 +2048,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	function := candidate.function
 	fn := function.Func
 	factory := candidate.factory
-	resumeType := factory.Type().Result(0).Type
+	resumeType := stacklessResumeType()
 	pos := fn.Pos()
 
 	var declarations []ir.Node
@@ -2075,8 +2116,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		return captureStorage[name.Canonical()]
 	}
-	// Source locals become factory locals. Returning the closure then places
-	// the captured slots in a typed, GC-scanned heap object.
+	// Source locals become factory locals. ABI 1 captures them in an ordinary
+	// closure; ABI 2 copies their initial values into one typed frame.
 	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
 	for _, name := range fn.Dcl {
 		switch name.Class {
@@ -2148,9 +2189,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		if closure := captured[name]; closure != nil {
 			return closure
 		}
-		// Initializers execute after the closure has been created. Force
-		// capture by reference, rather than loading an uninitialized slot.
-		name.Defn = nil
+		if candidate.factoryABI == FactoryABI1 {
+			// Initializers execute after the closure has been created. Force
+			// capture by reference, rather than loading an uninitialized slot.
+			name.Defn = nil
+		}
 		closure := ir.NewClosureVar(name.Pos(), resume, name)
 		captured[name] = closure
 		return closure
@@ -2700,11 +2743,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
 	var edit func(ir.Node) ir.Node
-	factoryCall := func(call *ir.CallExpr, statement ir.Node) (ir.Node, error) {
+	factoryCall := func(call *ir.CallExpr,
+		statement ir.Node) (lowerFactoryCall, error) {
 		edge := edgeForCall(function, call)
 		child := factories[edge.Callee]
 		if child == nil {
-			return nil, fmt.Errorf("%s: missing factory for %s",
+			return lowerFactoryCall{}, fmt.Errorf("%s: missing factory for %s",
 				ir.PkgFuncName(fn), edge.CalleeName)
 		}
 		args := make(ir.Nodes, len(call.Args))
@@ -2714,7 +2758,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		targets, err := callResultTargets(call, statement,
 			edge.Callee.Type().NumResults())
 		if err != nil {
-			return nil, fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+			return lowerFactoryCall{}, fmt.Errorf("%s: %v",
+				ir.PkgFuncName(fn), err)
 		}
 		for i, target := range targets {
 			if target == nil {
@@ -2725,7 +2770,24 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			args = append(args, typecheck.NodAddr(edit(target)))
 		}
-		return typecheck.Call(call.Pos(), child.Nname, args, false), nil
+		factoryCall := typecheck.Call(call.Pos(), child.Nname, args, false)
+		if child.Type().NumResults() == 1 {
+			return lowerFactoryCall{resume: factoryCall}, nil
+		}
+		frame := typecheck.TempAt(call.Pos(), resume,
+			types.Types[types.TUNSAFEPTR])
+		childResume := typecheck.TempAt(call.Pos(), resume,
+			stacklessResumeType())
+		assignment := ir.NewAssignListStmt(call.Pos(), ir.OAS2,
+			ir.Nodes{frame, childResume}, ir.Nodes{factoryCall})
+		return lowerFactoryCall{
+			setup: ir.Nodes{
+				ir.NewDecl(call.Pos(), ir.ODCL, frame),
+				ir.NewDecl(call.Pos(), ir.ODCL, childResume),
+				assignment,
+			},
+			frame: frame, resume: childResume,
+		}, nil
 	}
 
 	edit = func(node ir.Node) ir.Node {
@@ -2968,9 +3030,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					if err != nil {
 						return err
 					}
+					body = append(body, child.setup...)
+					name := "coroSpawn"
+					args := ir.Nodes{ctx, child.resume}
+					if child.frame != nil {
+						name = "coroSpawnFrame"
+						args = ir.Nodes{ctx, child.frame, child.resume}
+					}
 					body = append(body, typecheck.Call(goStmt.Pos(),
-						typecheck.LookupRuntime("coroSpawn"),
-						ir.Nodes{ctx, child}, false))
+						typecheck.LookupRuntime(name), args, false))
 					continue
 				}
 			}
@@ -3140,9 +3208,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				if err != nil {
 					return err
 				}
+				body = append(body, child.setup...)
+				name := "coroAwait"
+				args := ir.Nodes{ctx, child.resume}
+				if child.frame != nil {
+					name = "coroAwaitFrame"
+					args = ir.Nodes{ctx, child.frame, child.resume}
+				}
 				body = append(body, typecheck.Call(state.call.Pos(),
-					typecheck.LookupRuntime("coroAwait"),
-					ir.Nodes{ctx, child}, false))
+					typecheck.LookupRuntime(name), args, false))
 				action = actionWait
 			case SiteChannel:
 				if selection := state.selection; selection != nil {
@@ -3436,6 +3510,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations ir.Nodes, readAssignments []*ir.AssignListStmt) {
+	if candidate.factoryABI == FactoryABI2 {
+		finishExplicitFrameLowering(candidate, resume, declarations)
+		return
+	}
 	fn := candidate.function.Func
 	factory := candidate.factory
 	pos := fn.Pos()
@@ -3468,6 +3546,137 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	for _, assignment := range readAssignments {
 		assignment.SetOp(ir.OAS2FUNC)
 	}
+
+	// The source inline body no longer describes the physical primary.
+	fn.Inl = nil
+}
+
+func explicitFrameField(pos src.XPos, frame ir.Node,
+	field *types.Field) *ir.SelectorExpr {
+	selector := ir.NewSelectorExpr(pos, ir.ODOTPTR, frame, field.Sym)
+	selector.Selection = field
+	selector.SetType(field.Type)
+	selector.SetTypecheck(1)
+	return selector
+}
+
+func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
+	declarations ir.Nodes) {
+	fn := candidate.function.Func
+	factory := candidate.factory
+	pos := fn.Pos()
+	closureVars := slices.Clone(resume.ClosureVars)
+	fields := make([]*types.Field, len(closureVars))
+	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
+	for i, variable := range closureVars {
+		field := types.NewField(variable.Pos(),
+			typecheck.LookupNum("F", i), variable.Type())
+		fields[i] = field
+		replacements[variable] = field
+	}
+	frameType := types.NewStruct(fields)
+	frameType.SetNoalg(true)
+	framePointerType := types.NewPtr(frameType)
+	frame := typecheck.TempAt(pos, resume, framePointerType)
+
+	var rewrite func(ir.Node) ir.Node
+	rewrite = func(node ir.Node) ir.Node {
+		if variable, ok := node.(*ir.Name); ok {
+			if field := replacements[variable]; field != nil {
+				return explicitFrameField(node.Pos(), frame, field)
+			}
+		}
+		ir.EditChildren(node, rewrite)
+		return node
+	}
+	for i, stmt := range resume.Body {
+		resume.Body[i] = rewrite(stmt)
+	}
+	resume.ClosureVars = nil
+
+	ctx := resume.Dcl[0]
+	unsafePointerType := types.Types[types.TUNSAFEPTR]
+	packetPointer := typecheck.ConvNop(ctx, types.NewPtr(unsafePointerType))
+	packetFrame := typedDeref(pos, packetPointer, unsafePointerType)
+	loadFrame := typecheck.ConvNop(packetFrame, framePointerType)
+	resume.Body = append(ir.Nodes{
+		ir.NewDecl(pos, ir.ODCL, frame),
+		ir.NewAssignStmt(pos, frame, loadFrame),
+	}, resume.Body...)
+
+	autoInitializers := make(map[*ir.Name]bool)
+	for _, variable := range closureVars {
+		outer := variable.Outer.Canonical()
+		switch outer.Class {
+		case ir.PAUTO, ir.PAUTOHEAP:
+			autoInitializers[outer] = true
+		}
+	}
+	initializedDeclarations := make(ir.Nodes, 0,
+		len(declarations)+len(autoInitializers))
+	for _, declaration := range declarations {
+		initializedDeclarations = append(initializedDeclarations, declaration)
+		decl, ok := declaration.(*ir.Decl)
+		if !ok {
+			continue
+		}
+		name := decl.X.Canonical()
+		if autoInitializers[name] {
+			initializedDeclarations = append(initializedDeclarations,
+				ir.NewAssignStmt(name.Pos(), name,
+					ir.NewZero(name.Pos(), name.Type())))
+			delete(autoInitializers, name)
+		}
+	}
+	declarations = initializedDeclarations
+
+	factoryFrame := typecheck.TempAt(pos, factory, framePointerType)
+	declarations = append(declarations,
+		ir.NewDecl(pos, ir.ODCL, factoryFrame),
+		ir.NewAssignStmt(pos, factoryFrame, typedNew(pos, frameType)))
+	for i, variable := range closureVars {
+		declarations = append(declarations, ir.NewAssignStmt(pos,
+			explicitFrameField(variable.Pos(), factoryFrame, fields[i]),
+			variable.Outer))
+	}
+
+	oldCurFunc := ir.CurFunc
+	ir.CurFunc = resume
+	typecheck.Stmts(resume.Body)
+
+	ir.CurFunc = factory
+	frameResult := typecheck.ConvNop(factoryFrame, unsafePointerType)
+	factory.Body = append(declarations, ir.NewReturnStmt(pos, []ir.Node{
+		frameResult, resume.OClosure,
+	}))
+	typecheck.Stmts(factory.Body)
+
+	ir.CurFunc = fn
+	inputs := fn.Type().RecvParams()
+	args := make(ir.Nodes, len(inputs))
+	for i, field := range inputs {
+		args[i], _ = field.Nname.(ir.Node)
+	}
+	for _, field := range fn.Type().Results() {
+		result, _ := field.Nname.(ir.Node)
+		args = append(args, typecheck.NodAddr(result))
+	}
+	newFrame := typecheck.TempAt(pos, fn, unsafePointerType)
+	newResume := typecheck.TempAt(pos, fn, stacklessResumeType())
+	makeFrame := typecheck.Call(pos, factory.Nname, args, false)
+	assignFrame := ir.NewAssignListStmt(pos, ir.OAS2,
+		ir.Nodes{newFrame, newResume}, ir.Nodes{makeFrame})
+	run := typecheck.Call(pos, typecheck.LookupRuntime("coroRunFrame"),
+		ir.Nodes{newFrame, newResume}, false)
+	fn.Body = []ir.Node{
+		ir.NewDecl(pos, ir.ODCL, newFrame),
+		ir.NewDecl(pos, ir.ODCL, newResume),
+		assignFrame,
+		run,
+		ir.NewReturnStmt(pos, nil),
+	}
+	typecheck.Stmts(fn.Body)
+	ir.CurFunc = oldCurFunc
 
 	// The source inline body no longer describes the physical primary.
 	fn.Inl = nil
