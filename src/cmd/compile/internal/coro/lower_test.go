@@ -277,12 +277,14 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 	if explicitFrameFactorySupported(nil) {
 		t.Fatal("nil candidate supports an explicit frame")
 	}
-	for _, kind := range []SiteKind{SiteYield, SiteAwait} {
+	for _, kind := range []SiteKind{SiteYield, SiteAwait, SiteChannel} {
 		if got := candidate(kind); !explicitFrameFactorySupported(got) {
 			t.Errorf("%s candidate does not support an explicit frame", kind)
 		}
 	}
-	for _, kind := range []SiteKind{SiteSpawn, SiteTimer, SiteForeign} {
+	for _, kind := range []SiteKind{
+		SiteSpawn, SiteTimer, SiteFile, SitePoll, SiteForeign,
+	} {
 		if got := candidate(kind); explicitFrameFactorySupported(got) {
 			t.Errorf("%s candidate supports an explicit frame", kind)
 		}
@@ -5467,8 +5469,10 @@ func TestLowerChannelOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 1 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		function.Factory != FactoryABI2 {
+		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 2 function",
+			result, function.Factory)
 	}
 
 	var sends, receives, nativeChannels int
@@ -5563,8 +5567,10 @@ func TestLowerChannelRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 1 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		function.Factory != FactoryABI1 {
+		t.Fatalf("Lower result = %+v, factory = %v, want ABI 1 range fallback",
+			result, function.Factory)
 	}
 
 	var receives, nativeRanges, nativeReceives int
@@ -5654,8 +5660,10 @@ func TestLowerChannelSelect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
-	if result.Lowered != 1 || result.Skipped != 0 {
-		t.Fatalf("Lower result = %+v, want one lowered function", result)
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		function.Factory != FactoryABI2 {
+		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 2 function",
+			result, function.Factory)
 	}
 
 	var selects, nativeSelects, nativeChannels int
