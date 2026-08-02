@@ -14,6 +14,16 @@ import (
 	"unsafe"
 )
 
+func BenchmarkStacklessCoroEntry(b *testing.B) {
+	resume := func(unsafe.Pointer) uint8 {
+		return runtime.StacklessCoroActionComplete
+	}
+	b.ReportAllocs()
+	for range b.N {
+		runtime.RunStacklessCoroForTest(resume)
+	}
+}
+
 func BenchmarkStacklessCoroYield(b *testing.B) {
 	iterations := 0
 	b.ReportAllocs()

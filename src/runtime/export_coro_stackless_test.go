@@ -30,9 +30,8 @@ func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
-	rootTask := &stacklessCoroTask{resume: resume}
-	s.root = rootTask
-	s.ready(rootTask, false)
+	s.root.resume = resume
+	s.ready(&s.root, false)
 	s.run(false)
 	s.finish()
 }
@@ -42,9 +41,8 @@ func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) 
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
-	rootTask := &stacklessCoroTask{resume: root}
-	s.root = rootTask
-	s.ready(rootTask, false)
+	s.root.resume = root
+	s.ready(&s.root, false)
 	s.ready(&stacklessCoroTask{resume: detached}, false)
 	s.run(false)
 	throw("runtime: detached stackless coroutine test returned")
@@ -89,11 +87,13 @@ func DeferGoexitStacklessCoroForTest(token unsafe.Pointer) {
 func StacklessCoroDeferOutcomeErrorsForTest() []string {
 	check := func(state stacklessCoroTaskState,
 		terminal stacklessCoroTerminalKind, hasValue bool) string {
-		root := &stacklessCoroTask{
-			state:    state,
-			terminal: terminal,
+		s := &stacklessCoroScheduler{
+			root: stacklessCoroTask{
+				state:    state,
+				terminal: terminal,
+			},
 		}
-		s := &stacklessCoroScheduler{root: root}
+		root := &s.root
 		if hasValue {
 			s.terminalValues = map[*stacklessCoroTask]any{root: "panic"}
 		}
@@ -322,16 +322,21 @@ func ExecutorChannelsStacklessCoroForTest(ctx unsafe.Pointer) (bool, bool, bool)
 		scheduler.executorDone != nil
 }
 
+func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
+	context := (*stacklessCoroContext)(ctx)
+	return context.task == &context.scheduler.root
+}
+
 func CheckEarlyReadyStacklessCoroForTest() bool {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
-	task := &stacklessCoroTask{
+	s.root = stacklessCoroTask{
 		state:    stacklessCoroTaskRunning,
 		resuming: true,
 	}
-	s.root = task
+	task := &s.root
 	context := stacklessCoroContext{
 		scheduler: s,
 		task:      task,
