@@ -2449,13 +2449,24 @@ structured-await, and spawn call sites select the frame-aware runtime entry
 from the callee's exported factory summary, including across package
 boundaries.
 
-The initial ABI 2 subset contains only yield and structured-await state
-machines. Run-to-completion functions, source closures, range-variable
-captures, defer or terminal behavior, and timer, file, poll, channel, spawn,
-or foreign transition sites retain factory ABI 1. An ABI 1 caller can still
-await or spawn an ABI 2 child. These restrictions keep closure and cleanup
-ownership unchanged while the typed-frame layout is validated; they are
-fallback rules, not source annotations.
+The initial ABI 2 subset contained only yield and structured-await state
+machines. The first measured extension also admits channel transition sites
+when the function has no range-variable capture. Run-to-completion functions,
+source closures, channel ranges, defer or terminal behavior, and timer, file,
+poll, spawn, or foreign transition sites retain factory ABI 1. An ABI 1 caller
+can still await or spawn an ABI 2 child. These restrictions keep closure and
+cleanup ownership unchanged while the typed-frame layout is validated; they
+are fallback rules, not source annotations.
+
+Ten alternating-order 200 ms samples on Darwin/arm64 measured the channel
+extension against the initial subset. Parking and waking 100 channel-blocked
+tasks fell from 337 to 237 allocations (-29.7%) and from 20,225 to 18,625
+bytes (-7.9%). Time changed from 100.19 us to 93.18 us, which was not
+statistically significant (`p=0.579`). Channel round-trip and ready-select
+allocation counts remained two and three respectively, with no significant
+time change. Spawn and timer eligibility produced no stable object reduction
+in their dedicated probes, so they remain ABI 1 rather than broadening the
+new ABI without a measured benefit.
 
 The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
 inlining, enabled real lowering with `-d=coro=4`, and reports the median of
