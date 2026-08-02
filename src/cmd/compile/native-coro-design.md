@@ -2399,6 +2399,53 @@ traceback, debugger, profiler, race instrumentation on native executor stacks,
 dynamic executor sizing, cancellation of in-flight file work, and broad
 standard-library compatibility remain future work.
 
+### 15.5 Explicit frame migration
+
+The architecture in sections 1 and 7 specifies a typed frame pointer plus a
+static resume symbol. The initial implementation instead lets ordinary Go
+closure lowering provide a provisional typed frame: the generated factory
+returns a closure, and variables assigned by the resume function occupy
+separate captured cells. This is GC-correct and kept the first lowering small,
+but it does not yet realize the intended physical handle or allocation cost.
+
+After the root-entry reductions, a public `yieldEntry` uses 360 B and five
+allocations. Its runtime scheduler and wake channel account for 304 B and two
+allocations. Disassembly attributes the remaining compiler-side 56 B and
+three allocations to an 8-byte result cell in the wrapper, a 16-byte
+pointer-free state cell in the factory, and a 32-byte scanned closure. A
+depth-4096 recursive yield uses 475,520 B and 16,390 allocations, so reducing
+per-frame objects has substantially more leverage than another scheduler
+micro-optimization.
+
+Revision `b996f63c22` adds the runtime foundation without changing the active
+factory ABI. The task-owned resume packet remains two pointer widths: its
+former task backlink becomes an explicit frame pointer, the scheduler pointer
+continues to identify the active owner, and the task is recovered from the
+packet's embedded address. This keeps the logical-task header at 48 bytes and
+does not allocate a packet for each transition. Frame-aware root, await,
+spawn, and deferred-run entries coexist with the closure entries, which pass
+a nil frame until compiler lowering migrates.
+
+The compiler migration should remain incremental:
+
+1. generate one typed struct containing the state and values live across
+   suspension for the already-supported closed-function subset;
+2. generate a static resume function that loads the typed pointer from the
+   first resume-packet word, instead of capturing mutable factory locals;
+3. add a versioned factory ABI that returns the opaque frame pointer and
+   static resume symbol, while retaining factory ABI 1 as a fallback for
+   unsupported closures and generic shapes;
+4. route root, structured await, spawn, and eligible defer sites through the
+   matching frame-aware runtime entries;
+5. remove the closure fallback only after cross-package summaries, terminal
+   cleanup, race behavior, and every existing lowering test agree.
+
+No source annotation or per-function policy switch is introduced. The first
+performance gate is a simple public entry plus depth-64 and depth-4096
+recursion. It must reduce compiler-owned objects, preserve the 48-byte task
+header and live-stack advantage, and leave timer, file, network, channel,
+defer, panic, Goexit, and direct-C probes green on both MVP platforms.
+
 ## 16. Work after the MVP
 
 The likely order is:
