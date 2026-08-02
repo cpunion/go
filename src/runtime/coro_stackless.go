@@ -87,6 +87,8 @@ type stacklessCoroScheduler struct {
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
+	// These channels remain nil until a root first needs replacement
+	// executors.
 	executorWake        chan struct{}
 	executorDone        chan struct{}
 	executorGrow        chan struct{}
@@ -160,9 +162,7 @@ func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroSchedul
 		throw("runtime: nil stackless coroutine resume function")
 	}
 	s := &stacklessCoroScheduler{
-		wake:         make(chan struct{}, stacklessCoroWarmExecutorCount),
-		executorWake: make(chan struct{}, stacklessCoroWarmExecutorCount-1),
-		executorDone: make(chan struct{}),
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
@@ -1331,6 +1331,8 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		return
 	}
 
+	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
+	s.executorDone = make(chan struct{})
 	s.executorGrow = make(chan struct{}, 1)
 	s.executorStop = make(chan struct{})
 	s.executorManagerDone = make(chan struct{})

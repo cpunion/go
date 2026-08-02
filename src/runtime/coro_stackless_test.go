@@ -1108,6 +1108,43 @@ func TestStacklessCoroSpawn(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroLazyExecutorChannels(t *testing.T) {
+	var childDone atomic.Bool
+	child := func(unsafe.Pointer) uint8 {
+		childDone.Store(true)
+		return runtime.StacklessCoroActionComplete
+	}
+	var state int
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			wake, executorWake, executorDone :=
+				runtime.ExecutorChannelsStacklessCoroForTest(ctx)
+			if !wake || executorWake || executorDone {
+				t.Fatalf("initial channels = (%t, %t, %t), want (true, false, false)",
+					wake, executorWake, executorDone)
+			}
+			runtime.SpawnStacklessCoroForTest(ctx, child)
+			wake, executorWake, executorDone =
+				runtime.ExecutorChannelsStacklessCoroForTest(ctx)
+			if !wake || !executorWake || !executorDone {
+				t.Fatalf("prepared channels = (%t, %t, %t), want (true, true, true)",
+					wake, executorWake, executorDone)
+			}
+			state = 1
+			return runtime.StacklessCoroActionYield
+		case 1:
+			if !childDone.Load() {
+				return runtime.StacklessCoroActionYield
+			}
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
 func TestStacklessCoroParallelSpawn(t *testing.T) {
 	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 
