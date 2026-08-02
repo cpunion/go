@@ -67,8 +67,22 @@ const (
 )
 
 type stacklessCoroContext struct {
+	// frame stays first so compiler-generated resume functions can use the
+	// context as the stable frame-bearing resume packet.
+	frame     unsafe.Pointer
 	scheduler *stacklessCoroScheduler
-	task      *stacklessCoroTask
+}
+
+// task returns the task that embeds context. Keeping the resume packet in the
+// task lets an indirect resume call use a stable address without allocating a
+// packet on every transition.
+func (context *stacklessCoroContext) task() *stacklessCoroTask {
+	if context == nil {
+		return nil
+	}
+	return (*stacklessCoroTask)(unsafe.Pointer(
+		uintptr(unsafe.Pointer(context)) -
+			unsafe.Offsetof(stacklessCoroTask{}.context)))
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -145,7 +159,11 @@ func init() {
 // coroRun drives one stackless logical goroutine and its children. The
 // compiler emits calls to coroRun only for coroutine root adapters.
 func coroRun(resume stacklessCoroResume) {
-	s := newStacklessCoroScheduler(resume)
+	coroRunFrame(nil, resume)
+}
+
+func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
+	s := newStacklessCoroScheduler(frame, resume)
 
 	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
 		nativeScheduler.stopReplacementExecutors()
@@ -157,7 +175,8 @@ func coroRun(resume stacklessCoroResume) {
 	s.finish()
 }
 
-func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroScheduler {
+func newStacklessCoroScheduler(frame unsafe.Pointer,
+	resume stacklessCoroResume) *stacklessCoroScheduler {
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
@@ -167,20 +186,27 @@ func newStacklessCoroScheduler(resume stacklessCoroResume) *stacklessCoroSchedul
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
+	s.root.context.frame = frame
 	s.ready(&s.root, false)
 	return s
 }
 
 // newTaskLocked returns a new or recycled non-root task. The scheduler lock
 // must be held.
-func (s *stacklessCoroScheduler) newTaskLocked(resume stacklessCoroResume,
-	parent *stacklessCoroTask) *stacklessCoroTask {
+func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
+	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
 	task := s.freeTasks
 	if task == nil {
 		if s.freeTaskCount != 0 {
 			throw("runtime: invalid stackless coroutine task cache")
 		}
-		return &stacklessCoroTask{resume: resume, parent: parent}
+		return &stacklessCoroTask{
+			resume: resume,
+			parent: parent,
+			context: stacklessCoroContext{
+				frame: frame,
+			},
+		}
 	}
 	if s.freeTaskCount <= 0 || s.freeTaskCount > stacklessCoroTaskCacheSize {
 		throw("runtime: invalid stackless coroutine task cache count")
@@ -189,6 +215,7 @@ func (s *stacklessCoroScheduler) newTaskLocked(resume stacklessCoroResume,
 	s.freeTaskCount--
 	task.resume = resume
 	task.parent = parent
+	task.context.frame = frame
 	task.next = nil
 	return task
 }
@@ -202,7 +229,7 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		task.next != nil || task.state != stacklessCoroTaskComplete ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
 		task.resuming || task.readyPending ||
-		task.context.scheduler != nil || task.context.task != nil ||
+		task.context.frame != nil || task.context.scheduler != nil ||
 		hasTerminalValue {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
@@ -311,8 +338,7 @@ func (scope *stacklessCoroRunScope) leave() {
 func (s *stacklessCoroScheduler) runTasks(native bool) {
 	var task *stacklessCoroTask
 	defer func() {
-		if task == nil || task.context.scheduler != s ||
-			task.context.task != task {
+		if task == nil || task.context.scheduler != s {
 			return
 		}
 		p := getg()._panic
@@ -324,7 +350,6 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		// being unwound. Replacement also preserves a pending Goexit.
 		recordStacklessCoroPanic(s, task, value, true)
 		task.context.scheduler = nil
-		task.context.task = nil
 		s.readyAfterPanic(task)
 	}()
 
@@ -343,10 +368,8 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 			continue
 		}
 		task.context.scheduler = s
-		task.context.task = task
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
-		task.context.task = nil
 
 		switch action {
 		case stacklessCoroActionYield:
@@ -378,16 +401,33 @@ func (s *stacklessCoroScheduler) rootComplete() bool {
 	return complete
 }
 
+// coroFrame returns the typed-frame pointer carried by a resume packet.
+// Compiler-generated explicit resume functions use the first packet word
+// directly; this helper keeps tests and runtime validation independent of
+// that layout.
+func coroFrame(ctx unsafe.Pointer) unsafe.Pointer {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine frame query")
+	}
+	return context.frame
+}
+
 // coroAwait transfers execution to child. Completion makes the current task
 // runnable; it does not call the parent continuation.
 func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
+	coroAwaitFrame(ctx, nil, child)
+}
+
+func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil ||
+	parent := context.task()
+	if context == nil || context.scheduler == nil || parent == nil ||
 		child == nil {
 		throw("runtime: invalid stackless coroutine await")
 	}
 	s := context.scheduler
-	parent := context.task
 	lock(&s.lock)
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
@@ -396,7 +436,7 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 		throw("runtime: stackless coroutine await outside resume")
 	}
 	parent.state = stacklessCoroTaskWaiting
-	s.readyLocked(s.newTaskLocked(child, parent))
+	s.readyLocked(s.newTaskLocked(frame, child, parent))
 	unlock(&s.lock)
 }
 
@@ -404,10 +444,11 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 // its frame-owned cleanup state.
 func coroPanic(ctx unsafe.Pointer, value any) {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine panic")
 	}
-	recordStacklessCoroPanic(context.scheduler, context.task, value, false)
+	recordStacklessCoroPanic(context.scheduler, task, value, false)
 }
 
 func recordStacklessCoroPanic(s *stacklessCoroScheduler,
@@ -434,10 +475,10 @@ func recordStacklessCoroPanic(s *stacklessCoroScheduler,
 // current frame.
 func coroPanicPending(ctx unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine panic query")
 	}
-	task := context.task
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending {
 		throw("runtime: stackless coroutine panic query outside resume")
@@ -448,11 +489,11 @@ func coroPanicPending(ctx unsafe.Pointer) bool {
 // coroGoexit starts Goexit cleanup for the running logical goroutine.
 func coroGoexit(ctx unsafe.Pointer) {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine Goexit")
 	}
 	s := context.scheduler
-	task := context.task
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -467,10 +508,10 @@ func coroGoexit(ctx unsafe.Pointer) {
 // coroTerminalAction reports the pending terminal action for a running task.
 func coroTerminalAction(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine terminal query")
 	}
-	task := context.task
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending {
 		throw("runtime: stackless coroutine terminal query outside resume")
@@ -494,19 +535,19 @@ func coroTerminalAction(ctx unsafe.Pointer) uint8 {
 // while that task is actively running cleanup.
 func coroDeferToken(ctx unsafe.Pointer) unsafe.Pointer {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil ||
-		context.task.state != stacklessCoroTaskRunning ||
-		!context.task.resuming || context.task.readyPending {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
+		task.state != stacklessCoroTaskRunning ||
+		!task.resuming || task.readyPending {
 		throw("runtime: invalid stackless coroutine defer token")
 	}
-	return unsafe.Pointer(context.task)
+	return unsafe.Pointer(task)
 }
 
 func activeStacklessCoroDeferTask(token unsafe.Pointer,
 	message string) *stacklessCoroTask {
 	task := (*stacklessCoroTask)(token)
 	if task == nil || task.context.scheduler == nil ||
-		task.context.task != task ||
 		task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending {
 		throw(message)
@@ -558,12 +599,17 @@ func coroDeferCall(token unsafe.Pointer, deferred func()) {
 // coroutine factory. The nested scheduler is restricted by compiler proof to
 // run-to-completion work, so it cannot leave detached tasks or operations.
 func coroDeferRun(token unsafe.Pointer, resume stacklessCoroResume) {
+	coroDeferRunFrame(token, nil, resume)
+}
+
+func coroDeferRunFrame(token, frame unsafe.Pointer,
+	resume stacklessCoroResume) {
 	task := activeStacklessCoroDeferTask(token,
 		"runtime: invalid stackless coroutine defer run")
 	scope := enterStacklessCoroDeferScope(task)
 	defer scope.leave()
 
-	s := newStacklessCoroScheduler(resume)
+	s := newStacklessCoroScheduler(frame, resume)
 	s.run(false)
 	if raceenabled {
 		raceacquire(unsafe.Pointer(&s.root))
@@ -654,8 +700,7 @@ func coroDeferGoexit(token unsafe.Pointer) {
 // coroDeferPanic starts or replaces the panic owned by a running task.
 func coroDeferPanic(token unsafe.Pointer, value any) {
 	task := (*stacklessCoroTask)(token)
-	if task == nil || task.context.scheduler == nil ||
-		task.context.task != task {
+	if task == nil || task.context.scheduler == nil {
 		throw("runtime: invalid stackless coroutine defer panic")
 	}
 	recordStacklessCoroPanic(task.context.scheduler, task, value, true)
@@ -665,8 +710,7 @@ func coroDeferPanic(token unsafe.Pointer, value any) {
 // emits this call for a direct recover expression in the active defer body.
 func coroDeferRecover(token unsafe.Pointer) any {
 	task := (*stacklessCoroTask)(token)
-	if task == nil || task.context.scheduler == nil ||
-		task.context.task != task {
+	if task == nil || task.context.scheduler == nil {
 		throw("runtime: invalid stackless coroutine defer recover")
 	}
 	s := task.context.scheduler
@@ -702,22 +746,25 @@ func coroDeferRecover(token unsafe.Pointer) any {
 // coroSpawn enqueues an independent logical goroutine. The current task keeps
 // running until it returns its next scheduler action.
 func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
+	coroSpawnFrame(ctx, nil, child)
+}
+
+func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil ||
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
 		child == nil {
 		throw("runtime: invalid stackless coroutine spawn")
 	}
 	s := context.scheduler
 	lock(&s.lock)
-	if context.task.state != stacklessCoroTaskRunning ||
-		!context.task.resuming ||
-		context.task.readyPending ||
-		context.task.terminal != stacklessCoroTerminalNone ||
-		context.task.goexit {
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending || task.terminal != stacklessCoroTerminalNone ||
+		task.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine spawn outside resume")
 	}
-	s.readyLocked(s.newTaskLocked(child, nil))
+	s.readyLocked(s.newTaskLocked(frame, child, nil))
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	s.wakeReplacementExecutor()
@@ -874,7 +921,8 @@ func coroExitForeign() {
 //go:nosplit
 func coroEnterBlocking(ctx unsafe.Pointer) {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine blocking call")
 	}
 	scheduler := context.scheduler
@@ -951,11 +999,11 @@ func coroExitBlocking() {
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine " + name)
 	}
 	s := context.scheduler
-	task := context.task
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -1184,6 +1232,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	task.context.frame = nil
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -1223,6 +1272,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	task.context.frame = nil
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -1268,6 +1318,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	task.resume = nil
+	task.context.frame = nil
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}

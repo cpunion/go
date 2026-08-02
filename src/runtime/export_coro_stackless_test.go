@@ -25,6 +25,11 @@ func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 	coroRun(resume)
 }
 
+func RunStacklessCoroFrameForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	coroRunFrame(frame, resume)
+}
+
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
@@ -50,6 +55,11 @@ func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) 
 
 func AwaitStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroAwait(ctx, resume)
+}
+
+func AwaitStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	coroAwaitFrame(ctx, frame, resume)
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
@@ -78,6 +88,11 @@ func DeferCallStacklessCoroForTest(token unsafe.Pointer, deferred func()) {
 
 func DeferRunStacklessCoroForTest(token unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroDeferRun(token, resume)
+}
+
+func DeferRunStacklessCoroFrameForTest(token, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	coroDeferRunFrame(token, frame, resume)
 }
 
 func DeferGoexitStacklessCoroForTest(token unsafe.Pointer) {
@@ -122,7 +137,7 @@ func StacklessCoroTaskSizeForTest() uintptr {
 
 func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	if context == nil || context.scheduler == nil || context.task() == nil {
 		throw("runtime: invalid stackless coroutine task cache query")
 	}
 	s := context.scheduler
@@ -134,7 +149,7 @@ func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
 
 func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	if context == nil || context.scheduler == nil || context.task() == nil {
 		throw("runtime: invalid stackless coroutine operation cache query")
 	}
 	s := context.scheduler
@@ -146,6 +161,15 @@ func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 	coroSpawn(ctx, resume)
+}
+
+func SpawnStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	coroSpawnFrame(ctx, frame, resume)
+}
+
+func FrameStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
+	return coroFrame(ctx)
 }
 
 func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
@@ -235,13 +259,13 @@ func StacklessCoroOperationCountForTest() int {
 
 func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || context.task == nil {
+	if context == nil || context.scheduler == nil || context.task() == nil {
 		throw("runtime: invalid stackless coroutine operation token query")
 	}
 	lock(&stacklessCoroOperations.lock)
 	var found *stacklessCoroOperation
 	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		if op.scheduler == context.scheduler && op.task == context.task {
+		if op.scheduler == context.scheduler && op.task == context.task() {
 			if found != nil {
 				unlock(&stacklessCoroOperations.lock)
 				throw("runtime: multiple stackless coroutine operations for one task")
@@ -324,7 +348,7 @@ func ExecutorChannelsStacklessCoroForTest(ctx unsafe.Pointer) (bool, bool, bool)
 
 func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
-	return context.task == &context.scheduler.root
+	return context.task() == &context.scheduler.root
 }
 
 func CheckEarlyReadyStacklessCoroForTest() bool {
@@ -337,12 +361,9 @@ func CheckEarlyReadyStacklessCoroForTest() bool {
 		resuming: true,
 	}
 	task := &s.root
-	context := stacklessCoroContext{
-		scheduler: s,
-		task:      task,
-	}
+	task.context.scheduler = s
 
-	stacklessCoroStartOperation(unsafe.Pointer(&context), "early ready test")
+	stacklessCoroStartOperation(unsafe.Pointer(&task.context), "early ready test")
 	s.ready(task, true)
 
 	lock(&s.lock)
