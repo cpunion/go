@@ -23,17 +23,19 @@ const (
 )
 
 type stacklessCoroNativeContext struct {
-	gState     stacklessCoroGState
-	scheduler  *stacklessCoroScheduler
-	schedulerG *g
-	executor   *g
-	caller     *g
-	nativeG0   *g
-	lockedG    guintptr
-	lockedInt  uint32
-	g0Accurate bool
-	sigmask    sigset
-	poolNext   *stacklessCoroNativeContext
+	gState        stacklessCoroGState
+	scheduler     *stacklessCoroScheduler
+	freeTasks     *stacklessCoroTask
+	freeTaskCount int
+	schedulerG    *g
+	executor      *g
+	caller        *g
+	nativeG0      *g
+	lockedG       guintptr
+	lockedInt     uint32
+	g0Accurate    bool
+	sigmask       sigset
+	poolNext      *stacklessCoroNativeContext
 }
 
 var stacklessCoroNativePool struct {
@@ -63,6 +65,10 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if raceenabled {
 		return nil
 	}
+	// A newly created root is the only scheduler that is both off and has
+	// one executor. Replacement executors are prepared before they start.
+	root := s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.executorCount.Load() == 1
 
 	ctx := acquireStacklessCoroNativeContext()
 	gp := getg()
@@ -73,6 +79,16 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if gp.param != nil {
 		releaseStacklessCoroNativeContext(ctx)
 		throw("runtime: stackless coroutine caller has pending parameter")
+	}
+	if root && ctx.freeTasks != nil {
+		if s.freeTasks != nil || s.freeTaskCount != 0 {
+			releaseStacklessCoroNativeContext(ctx)
+			throw("runtime: non-empty stackless coroutine root cache")
+		}
+		s.freeTasks = ctx.freeTasks
+		s.freeTaskCount = ctx.freeTaskCount
+		ctx.freeTasks = nil
+		ctx.freeTaskCount = 0
 	}
 
 	ctx.scheduler = s
@@ -88,6 +104,13 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
+	if root && scheduler.executorState.Load() == stacklessCoroExecutorStateOff &&
+		scheduler.freeTasks != nil {
+		ctx.freeTasks = scheduler.freeTasks
+		ctx.freeTaskCount = scheduler.freeTaskCount
+		scheduler.freeTasks = nil
+		scheduler.freeTaskCount = 0
+	}
 	releaseStacklessCoroNativeContext(ctx)
 	return scheduler
 }
@@ -116,6 +139,10 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 		return
 	default:
 	}
+	// Only the bounded warm pool retains task caches. The overflow list may
+	// grow with peak root concurrency and must not retain one cache per peak.
+	ctx.freeTasks = nil
+	ctx.freeTaskCount = 0
 	lock(&stacklessCoroNativePool.lock)
 	ctx.poolNext = stacklessCoroNativePool.overflow
 	stacklessCoroNativePool.overflow = ctx

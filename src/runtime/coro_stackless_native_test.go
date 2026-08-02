@@ -101,6 +101,100 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeTaskReuse(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	run := func() (tasks int) {
+		var state int
+		child := func(unsafe.Pointer) uint8 {
+			return runtime.StacklessCoroActionComplete
+		}
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				tasks = runtime.StacklessCoroFreeTaskCountForTest(ctx)
+				state = 1
+				runtime.AwaitStacklessCoroForTest(ctx, child)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected cache reuse state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		return tasks
+	}
+
+	// Sequential acquisitions rotate through the lock-free warm pool. Prime
+	// every slot before checking that a later root receives the task cache.
+	for range 2 * runtime.StacklessCoroWarmExecutorCount {
+		run()
+	}
+	if tasks := run(); tasks == 0 {
+		t.Fatal("native root task cache is empty after reuse")
+	}
+}
+
+func TestStacklessCoroNativeTaskCacheBound(t *testing.T) {
+	const roots = 2 * runtime.StacklessCoroWarmExecutorCount
+	started := make(chan struct{}, roots)
+	gate := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(roots)
+	for range roots {
+		go func() {
+			defer wg.Done()
+			var state int
+			child := func(unsafe.Pointer) uint8 {
+				return runtime.StacklessCoroActionComplete
+			}
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					runtime.AwaitStacklessCoroForTest(ctx, child)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					state = 2
+					if tasks := runtime.StacklessCoroFreeTaskCountForTest(ctx); tasks == 0 {
+						t.Error("native root task cache is empty")
+					}
+					started <- struct{}{}
+					<-gate
+					return runtime.StacklessCoroActionComplete
+				default:
+					t.Errorf("unexpected task cache state %d", state)
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+		}()
+	}
+	watchdog := time.NewTimer(5 * time.Second)
+	for range roots {
+		select {
+		case <-started:
+		case <-watchdog.C:
+			close(gate)
+			wg.Wait()
+			t.Fatal("native roots did not populate their task caches")
+		}
+	}
+	watchdog.Stop()
+	close(gate)
+	wg.Wait()
+
+	warm, overflow := runtime.StacklessCoroNativePoolTaskCacheForTest()
+	if warm == 0 {
+		t.Error("warm native pool retained no task cache")
+	}
+	if overflow != 0 {
+		t.Errorf("overflow native pool retained %d tasks", overflow)
+	}
+}
+
 func TestStacklessCoroNativeReuseDuringGC(t *testing.T) {
 	const runs = 10_000
 	gcDone := make(chan struct{})

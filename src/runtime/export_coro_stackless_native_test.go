@@ -23,6 +23,21 @@ func StacklessCoroNativePoolForTest() (count int) {
 	return
 }
 
+func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
+	available := stacklessCoroNativePool.available
+	for range len(available) {
+		ctx := <-available
+		warm += ctx.freeTaskCount
+		available <- ctx
+	}
+	lock(&stacklessCoroNativePool.lock)
+	for ctx := stacklessCoroNativePool.overflow; ctx != nil; ctx = ctx.poolNext {
+		overflow += ctx.freeTaskCount
+	}
+	unlock(&stacklessCoroNativePool.lock)
+	return
+}
+
 func WriteStacklessCoroNativeForTest(fd int, value byte) int {
 	return int(write(uintptr(fd), unsafe.Pointer(&value), 1))
 }
