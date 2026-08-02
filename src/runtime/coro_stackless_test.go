@@ -1154,6 +1154,68 @@ func TestStacklessCoroEmbeddedRoot(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroResumeFrames(t *testing.T) {
+	rootFrame := new(int)
+	deferFrame := new(int)
+	childFrame := new(int)
+	spawnFrame := new(int)
+	checkFrame := func(ctx, want unsafe.Pointer, name string) {
+		t.Helper()
+		if got := runtime.FrameStacklessCoroForTest(ctx); got != want {
+			t.Fatalf("%s frame = %p, want %p", name, got, want)
+		}
+	}
+
+	deferred := func(ctx unsafe.Pointer) uint8 {
+		checkFrame(ctx, unsafe.Pointer(deferFrame), "defer")
+		return runtime.StacklessCoroActionComplete
+	}
+	var childDone atomic.Bool
+	child := func(ctx unsafe.Pointer) uint8 {
+		checkFrame(ctx, unsafe.Pointer(childFrame), "child")
+		childDone.Store(true)
+		return runtime.StacklessCoroActionComplete
+	}
+	var spawnDone atomic.Bool
+	spawned := func(ctx unsafe.Pointer) uint8 {
+		checkFrame(ctx, unsafe.Pointer(spawnFrame), "spawn")
+		spawnDone.Store(true)
+		return runtime.StacklessCoroActionComplete
+	}
+
+	var state int
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(rootFrame),
+		func(ctx unsafe.Pointer) uint8 {
+			checkFrame(ctx, unsafe.Pointer(rootFrame), "root")
+			switch state {
+			case 0:
+				token := runtime.DeferTokenStacklessCoroForTest(ctx)
+				runtime.DeferRunStacklessCoroFrameForTest(token,
+					unsafe.Pointer(deferFrame), deferred)
+				runtime.AwaitStacklessCoroFrameForTest(ctx,
+					unsafe.Pointer(childFrame), child)
+				state = 1
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if !childDone.Load() {
+					t.Fatal("child did not complete")
+				}
+				runtime.SpawnStacklessCoroFrameForTest(ctx,
+					unsafe.Pointer(spawnFrame), spawned)
+				state = 2
+				return runtime.StacklessCoroActionYield
+			case 2:
+				if !spawnDone.Load() {
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+}
+
 func TestStacklessCoroParallelSpawn(t *testing.T) {
 	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 
