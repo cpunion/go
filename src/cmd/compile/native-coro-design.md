@@ -2464,9 +2464,11 @@ tasks fell from 337 to 237 allocations (-29.7%) and from 20,225 to 18,625
 bytes (-7.9%). Time changed from 100.19 us to 93.18 us, which was not
 statistically significant (`p=0.579`). Channel round-trip and ready-select
 allocation counts remained two and three respectively, with no significant
-time change. Spawn and timer eligibility produced no stable object reduction
-in their dedicated probes, so they remain ABI 1 rather than broadening the
-new ABI without a measured benefit.
+time change. Disassembly attributes the parked-task delta to replacing a
+separate state object and scanned closure with one small typed frame. Spawn
+and timer eligibility produced no stable object reduction in their dedicated
+probes, so they remain ABI 1 rather than broadening the new ABI without a
+measured benefit.
 
 The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
 inlining, enabled real lowering with `-d=coro=4`, and reports the median of
