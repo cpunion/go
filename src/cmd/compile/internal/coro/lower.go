@@ -2189,11 +2189,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		if closure := captured[name]; closure != nil {
 			return closure
 		}
-		if candidate.factoryABI == FactoryABI1 {
-			// Initializers execute after the closure has been created. Force
-			// capture by reference, rather than loading an uninitialized slot.
-			name.Defn = nil
-		}
+		// Initializers execute after the closure has been created. Force
+		// capture by reference, rather than loading an uninitialized slot.
+		// Explicit frames also replace references in the defining assignment,
+		// so it must no longer remain the outer variable's definition.
+		name.Defn = nil
 		closure := ir.NewClosureVar(name.Pos(), resume, name)
 		captured[name] = closure
 		return closure

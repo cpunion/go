@@ -270,6 +270,7 @@ var nestedResult int
 var nestedElseResult int
 var nestedReturnResult int
 var nestedEvaluationCount int
+var multiResultValue int
 
 //go:noinline
 func machine() {
@@ -415,6 +416,20 @@ func nestedReturn(value int) int {
 	return value + 1
 }
 
+//go:noinline
+func pair() (int, bool) {
+	return 42, true
+}
+
+//go:noinline
+func multiResult() {
+	value, ok := pair()
+	runtime.Gosched()
+	if ok {
+		multiResultValue = value
+	}
+}
+
 func main() {
 	gcDone := make(chan struct{})
 	go func() {
@@ -430,6 +445,7 @@ func main() {
 	nestedResult = nestedControl(4)
 	nestedElseResult = nestedControl(-1)
 	nestedReturnResult = nestedReturn(41) + nestedReturn(-1)
+	multiResult()
 	sleepStart := time.Now()
 	sleeper()
 	sleepElapsed := time.Since(sleepStart)
@@ -532,6 +548,7 @@ func main() {
 		nestedElseResult != -1 ||
 		nestedReturnResult != 41 ||
 		nestedEvaluationCount != 4 ||
+		multiResultValue != 42 ||
 		!slept || sleepElapsed < 5*time.Millisecond ||
 		fileN != 4 || fileErrno != 0 || string(fileBuffer) != "file" ||
 		ordinaryFileN != 4 || ordinaryFileErr != nil || string(ordinaryFileBuffer) != "file" ||
@@ -554,7 +571,7 @@ func main() {
 	exe := filepath.Join(tmp, "coro")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=command-line-arguments=-l -d=coro=4",
+		"-gcflags=command-line-arguments=-l -N -d=coro=4",
 		src)
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
@@ -566,7 +583,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=18"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=19"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
