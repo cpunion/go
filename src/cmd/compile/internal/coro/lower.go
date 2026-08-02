@@ -1264,7 +1264,9 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 		return false
 	}
 	for _, site := range candidate.function.Sites {
-		if site.Kind != SiteYield && site.Kind != SiteAwait {
+		switch site.Kind {
+		case SiteYield, SiteAwait, SiteChannel:
+		default:
 			return false
 		}
 	}
