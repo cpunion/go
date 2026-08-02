@@ -2467,6 +2467,16 @@ five 300 ms samples:
 | recursive yield, depth 64 | 15,375 ns, 7,808 B, 262 allocs | 11,871 ns, 6,504 B, 132 allocs | -22.8%, -16.7%, -49.6% |
 | recursive yield, depth 4,096 | 858,059 ns, 475,520 B, 16,390 allocs | 667,799 ns, 393,576 B, 8,196 allocs | -22.2%, -17.2%, -50.0% |
 
+The same five-sample gate on Linux/amd64 under OrbStack translation confirmed
+the direction and exact allocation counts. Absolute translated timings are
+not compared with native Darwin:
+
+| Probe | Closure frame | Explicit frame | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 1,123 ns, 360 B, 5 allocs | 933 ns, 336 B, 4 allocs | -16.9%, -6.7%, -20.0% |
+| recursive yield, depth 64 | 16,107 ns, 7,808 B, 262 allocs | 13,425 ns, 6,504 B, 132 allocs | -16.7%, -16.7%, -49.6% |
+| recursive yield, depth 4,096 | 959,615 ns, 475,520 B, 16,390 allocs | 794,517 ns, 393,576 B, 8,196 allocs | -17.2%, -17.2%, -50.0% |
+
 Object inspection shows one typed heap allocation in each eligible factory
 and a direct frame load at resume entry. The task header remains 48 bytes. The
 GC, checkptr, race, cross-package, and recursive probes continue to use the
