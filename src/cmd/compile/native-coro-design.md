@@ -2633,6 +2633,33 @@ size and without weakening concurrent spawn correctness. Public-root frame,
 scheduler, and wake allocations and the remaining transition overhead stay
 separate targets after that fast path.
 
+The saturated-reservation follow-up implements the bypass without changing
+factory ABI 3. The scheduler's two task counts now occupy eighteen bits of an
+atomically published 32-bit word. Its high bit reports that all 256
+cache-owned tasks are active or reserved. The two frame-byte counters remain
+adjacent `uint16` values, so the complete cache state still occupies eight
+bytes. Neither the 48-byte task nor the scheduler and native-context layouts
+grow. Writers continue to hold the scheduler lock; only the saturation query
+loads the packed word without it.
+
+Compiler-generated explicit frames are nonempty. The runtime makes that
+contract explicit by declining to cache a zero-sized frame. Consequently,
+when all cache-owned task slots are occupied and the free-frame byte count is
+zero, no positive-sized factory can reuse or claim a frame. `coroTakeFrame`
+then returns nil without taking the scheduler lock or creating a reservation.
+The factory allocates its ordinary typed frame, and the immediately following
+frame-aware await or spawn creates the uncached task in its existing single
+scheduler entry. A concurrent completion may turn this into a conservative
+cache miss, but cannot detach a task, cross a resume identity, or exceed the
+bounded cache.
+
+The deep-unwind runtime test requires this path after the 256th live frame. A
+separate test starts 257 frame-aware children at `GOMAXPROCS=1`, requires the
+last spawn to proceed without a reservation, and waits for every child to
+complete. Race builds retain their existing policy of disabling all task and
+frame identity reuse. The within-capacity reservation path, public-root
+objects, and uncached frame/task allocations remain unchanged.
+
 ## 16. Work after the MVP
 
 The likely order is:
