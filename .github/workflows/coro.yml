@@ -94,49 +94,6 @@ jobs:
           GOEXPERIMENT: coro
         run: ./check.bash "$GITHUB_WORKSPACE" "$RUNNER_TEMP/corobench"
 
-      - name: Measure root wake reuse
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          set -euo pipefail
-          parent_root="$RUNNER_TEMP/go-parent"
-          result="$RUNNER_TEMP/corobench/wake-reuse"
-          git clone --quiet "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$parent_root"
-          git -C "$parent_root" checkout --quiet --detach ed8c809ce58dae7b68ac4c017b3097c9440dafa5
-          (
-            cd "$parent_root/src"
-            GOEXPERIMENT=coro ./make.bash
-          )
-          (
-            cd "$parent_root/src/cmd/compile/testdata/corobench"
-            GO111MODULE=off GOEXPERIMENT=coro \
-              "$parent_root/bin/go" test -c -o "$RUNNER_TEMP/parent.test" \
-              -gcflags='-l -d=coro=4'
-          )
-          mkdir -p "$result"
-          parent="$RUNNER_TEMP/parent.test"
-          feature="$RUNNER_TEMP/corobench/coro.test"
-          args=(-test.run='^$' -test.bench='^(BenchmarkYieldEntry|BenchmarkRecursiveYield64|BenchmarkRecursiveYield4096)$' -test.benchtime=1s -test.count=1 -test.cpu=1)
-          for i in {1..5}; do
-            GOMAXPROCS=1 "$parent" "${args[@]}" >/dev/null
-            GOMAXPROCS=1 "$feature" "${args[@]}" >/dev/null
-          done
-          for i in {1..20}; do
-            if (( i % 2 )); then
-              GOMAXPROCS=1 "$parent" "${args[@]}" >> "$result/parent.txt"
-              GOMAXPROCS=1 "$feature" "${args[@]}" >> "$result/feature.txt"
-            else
-              GOMAXPROCS=1 "$feature" "${args[@]}" >> "$result/feature.txt"
-              GOMAXPROCS=1 "$parent" "${args[@]}" >> "$result/parent.txt"
-            fi
-          done
-          (
-            cd "$result"
-            GOTOOLCHAIN=local "$GITHUB_WORKSPACE/bin/go" run \
-              golang.org/x/perf/cmd/benchstat@v0.0.0-20260709024250-82a0b07e230d \
-              parent.txt feature.txt | tee benchstat.txt
-          )
-
       - name: Upload coroutine architecture probe audit
         if: always()
         uses: actions/upload-artifact@v7
