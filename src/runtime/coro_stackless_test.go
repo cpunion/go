@@ -1706,6 +1706,97 @@ func TestStacklessCoroLazyExecutorChannels(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroWakePool(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds retain per-scheduler wake identities")
+	}
+	const roots = 2 * runtime.StacklessCoroWarmExecutorCount
+
+	oldProcs := runtime.GOMAXPROCS(runtime.StacklessCoroWarmExecutorCount)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var ready atomic.Int32
+	var release atomic.Bool
+	wakes := make([]chan struct{}, roots)
+	done := make(chan struct{}, roots)
+	for i := range roots {
+		go func() {
+			state := 0
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					wakes[i] = runtime.WakeStacklessCoroForTest(ctx)
+					runtime.SignalStacklessCoroForTest(ctx)
+					state = 1
+					ready.Add(1)
+					return runtime.StacklessCoroActionYield
+				case 1:
+					if !release.Load() {
+						return runtime.StacklessCoroActionYield
+					}
+					return runtime.StacklessCoroActionComplete
+				default:
+					panic("unexpected wake-pool state")
+				}
+			})
+			done <- struct{}{}
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for ready.Load() != roots && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if ready.Load() != roots {
+		t.Fatalf("ready roots = %d, want %d", ready.Load(), roots)
+	}
+	for i, wake := range wakes {
+		for j := range i {
+			if wake == wakes[j] {
+				t.Fatalf("roots %d and %d share a wake channel", i, j)
+			}
+		}
+	}
+	release.Store(true)
+	timeout := time.After(5 * time.Second)
+	for range roots {
+		select {
+		case <-done:
+		case <-timeout:
+			t.Fatal("wake-pool root did not stop")
+		}
+	}
+	if got := runtime.StacklessCoroWakePoolSizeForTest(); got !=
+		runtime.StacklessCoroWarmExecutorCount {
+		t.Fatalf("wake pool size = %d, want %d", got,
+			runtime.StacklessCoroWarmExecutorCount)
+	}
+	for i := range runtime.StacklessCoroWarmExecutorCount {
+		buffered := -1
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			buffered = len(runtime.WakeStacklessCoroForTest(ctx))
+			return runtime.StacklessCoroActionComplete
+		})
+		if buffered != 0 {
+			t.Fatalf("reused wake channel %d has %d notifications", i,
+				buffered)
+		}
+	}
+
+	native := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
+	if !native {
+		return
+	}
+	resume := func(unsafe.Pointer) uint8 {
+		return runtime.StacklessCoroActionComplete
+	}
+	if got := testing.AllocsPerRun(100, func() {
+		runtime.RunStacklessCoroForTest(resume)
+	}); got != 1 {
+		t.Fatalf("native root allocations = %v, want 1", got)
+	}
+}
+
 func TestStacklessCoroEmbeddedRoot(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		if !runtime.RootEmbeddedStacklessCoroForTest(ctx) {

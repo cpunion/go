@@ -2698,6 +2698,88 @@ uniform 1.94% timing increase, including the unsaturated controls.
 The native Linux run above is therefore the Linux performance result; the
 translated run remains a behavioral cross-platform check.
 
+### 15.6 Bounded root wake reuse
+
+Allocation profiling after the bounded frame work separated the four objects
+in one public coroutine entry. The runtime-owned scheduler is 192 bytes and
+its buffered wake channel is 112 bytes. Compiler lowering contributes a
+24-byte typed frame and an 8-byte result cell. The wake channel is empty for a
+run-to-completion root, but allocating a new channel for every scheduler still
+accounted for one third of its bytes and one quarter of its objects.
+
+The runtime now retains up to four stopped-scheduler wake channels in a
+bounded global pool. A scheduler returns its channel only after every
+replacement executor has joined, drains any coalesced notifications before
+publication, and clears its own reference. Simultaneously live roots therefore
+never share a channel. Channels above the four-entry warm bound are not
+retained. Race builds continue to allocate a distinct channel for each root so
+reusing a runtime synchronization identity cannot add a false happens-before
+edge between unrelated logical goroutines.
+
+A prototype instead stored the channel in the pooled native context. That
+made reuse free of a second pool operation, but required delaying native-
+context release until replacement executors joined. A repeated lifecycle test
+then exposed an internally locked goroutine leaving with `mp.lockedInt` still
+set. The prototype was discarded: native-context restoration and release stay
+in their original order, and wake-channel ownership is independent of native
+stack ownership in the final design.
+
+The concurrency test holds eight roots live at once, requires eight distinct
+wake channels, leaves a notification buffered in each, then verifies that
+release drains the notifications and retains exactly four channels. A steady
+native root uses one 192-byte runtime allocation instead of the parent's
+304 bytes and two allocations. The scheduler, native context, and task layouts
+remain 192, 112, and 48 bytes respectively; this change adds no field to any of
+them.
+
+The exact-parent Darwin/arm64 comparison used five warm-up pairs, twenty
+alternating-order one-second samples, `GOMAXPROCS=1`, disabled inlining, and
+real coroutine lowering. The parent was the tree merged at `ed8c809ce5`, and
+the measured implementation was `1daa6280ac`:
+
+| Probe | Parent | Wake reuse | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 1.067 us, 336 B, 4 allocs | 1.070 us, 224 B, 3 allocs | time neutral (`p=0.298`), -33.33% bytes, -25% allocs |
+| recursive yield, depth 64 | 5.333 us, 360 B, 4 allocs | 5.223 us, 248 B, 3 allocs | -2.07% time (`p=0.002`), -31.11% bytes, -25% allocs |
+| recursive yield, depth 4,096 | 404.5 us, 369,000 B, 7,684 allocs | 393.9 us, 368,888 B, 7,683 allocs | -2.63% time (`p<0.001`), -112 B, -1 alloc |
+
+Fixed-layout coroutine timings are sensitive to small text-address changes even
+when the recursive path is unchanged. As a layout control, twelve matched
+Darwin binaries for each tree were linked with `-randlayout` seeds 1 through
+12, warmed for 100 ms, and measured for 750 ms in alternating order. Entry,
+depth 64, and depth 4,096 were all statistically neutral (`p=0.766`, `0.235`,
+and `0.242`); their timing geomean improved by 0.98%. Every randomized binary
+retained the exact allocation reductions in the table above. The allocation
+result is therefore independent of layout, while a small timing change from a
+single linked image is not treated as an algorithmic effect.
+
+The local translated Linux/amd64 gate used three warm-up pairs and ten
+alternating 500 ms samples. It reproduced every allocation count. Entry and
+depth 4,096 were neutral; depth 64 improved by 3.00% (`p=0.007`). These times
+remain directional because the host is arm64.
+
+Two native GitHub Linux/amd64 runs used five warm-up pairs and twenty
+alternating one-second samples. On an AMD EPYC 9V74 runner, entry improved by
+0.36%, while depth 64 and depth 4,096 increased by 1.51% and 1.56%; the timing
+geomean increased by 0.90%. A clean rerun on an AMD EPYC 7763 measured entry
+from 2.296 us to 2.282 us (-0.61%), depth 64 as neutral (`p=0.101`), and depth
+4,096 from 874.1 us to 862.6 us (-1.32%); its geomean improved by 0.38%.
+Both runs reproduced every allocation count exactly. The opposite fixed-image
+timing directions, together with the randomized-layout control, show no
+systematic timing regression.
+
+The same twelve-seed randomized-layout control on the native EPYC 9V74 runner
+also found entry, depth 64, and depth 4,096 neutral (`p=0.062`, `0.203`, and
+`0.160`); its timing geomean improved by 0.14%. Every seed again reproduced
+the exact allocation reductions.
+
+For scale, the exact upstream results retained from the same Darwin benchmark
+series were 46.34 ns at entry, 391.9 ns at depth 64, and 18.95 us at depth
+4,096, with no heap allocation. Wake reuse leaves the coroutine path about
+23.1x, 13.3x, and 20.8x slower respectively. It removes one fixed root object;
+the result cell, typed root frame, scheduler allocation, and the uncached deep
+frames and tasks remain independent targets.
+
 ## 16. Work after the MVP
 
 The likely order is:
