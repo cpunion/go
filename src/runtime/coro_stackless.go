@@ -27,6 +27,7 @@ const (
 
 const stacklessCoroWarmExecutorCount = 4
 const stacklessCoroTaskCacheSize = 256
+const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
@@ -56,6 +57,8 @@ type stacklessCoroTask struct {
 	goexit       bool
 	resuming     bool
 	readyPending bool
+	cacheFrame   bool
+	frameSize    uint16
 	context      stacklessCoroContext
 }
 
@@ -88,11 +91,17 @@ func (context *stacklessCoroContext) task() *stacklessCoroTask {
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
 // work through scheduler operations; they never invoke a continuation.
 type stacklessCoroScheduler struct {
-	lock               mutex
-	head               *stacklessCoroTask
-	tail               *stacklessCoroTask
-	freeTasks          *stacklessCoroTask
-	freeTaskCount      int
+	lock          mutex
+	head          *stacklessCoroTask
+	tail          *stacklessCoroTask
+	freeTasks     *stacklessCoroTask
+	reservedTasks *stacklessCoroTask
+	// The bounded task and frame caches fit in uint16. Keep their counters
+	// packed so enabling frame reuse does not grow the scheduler size class.
+	freePlainTaskCount uint16
+	freeFrameBytes     uint16
+	cachedFrameTasks   uint16
+	cachedFrameBytes   uint16
 	freeOperations     *stacklessCoroOperation
 	freeOperationCount int
 	root               stacklessCoroTask
@@ -195,11 +204,8 @@ func newStacklessCoroScheduler(frame unsafe.Pointer,
 // must be held.
 func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
 	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
-	task := s.freeTasks
+	task := s.takeFreeTaskLocked()
 	if task == nil {
-		if s.freeTaskCount != 0 {
-			throw("runtime: invalid stackless coroutine task cache")
-		}
 		return &stacklessCoroTask{
 			resume: resume,
 			parent: parent,
@@ -208,16 +214,74 @@ func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
 			},
 		}
 	}
-	if s.freeTaskCount <= 0 || s.freeTaskCount > stacklessCoroTaskCacheSize {
-		throw("runtime: invalid stackless coroutine task cache count")
-	}
-	s.freeTasks = task.next
-	s.freeTaskCount--
 	task.resume = resume
 	task.parent = parent
 	task.context.frame = frame
-	task.next = nil
+	task.cacheFrame = false
+	task.frameSize = 0
 	return task
+}
+
+func (s *stacklessCoroScheduler) takeFreeTaskLocked() *stacklessCoroTask {
+	task := s.freeTasks
+	if task == nil {
+		if s.freePlainTaskCount != 0 || s.freeFrameBytes != 0 {
+			throw("runtime: invalid stackless coroutine task cache")
+		}
+		return nil
+	}
+	if s.freePlainTaskCount > stacklessCoroTaskCacheSize {
+		throw("runtime: invalid stackless coroutine task cache count")
+	}
+	var previous *stacklessCoroTask
+	if s.freePlainTaskCount > 0 {
+		for task != nil && task.cacheFrame {
+			previous = task
+			task = task.next
+		}
+		if task == nil {
+			throw("runtime: invalid stackless coroutine plain task cache")
+		}
+	}
+	if previous == nil {
+		s.freeTasks = task.next
+	} else {
+		previous.next = task.next
+	}
+	task.next = nil
+	if task.cacheFrame {
+		if s.freeFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine frame cache size")
+		}
+		s.freeFrameBytes -= task.frameSize
+		s.discardCachedFrameTaskLocked(task)
+	} else {
+		if s.freePlainTaskCount == 0 {
+			throw("runtime: invalid stackless coroutine task cache count")
+		}
+		s.freePlainTaskCount--
+	}
+	return task
+}
+
+func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
+	task.resume = nil
+	task.context.frame = nil
+	task.cacheFrame = false
+	task.frameSize = 0
+}
+
+func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
+	task *stacklessCoroTask) {
+	if task.cacheFrame {
+		if s.cachedFrameTasks == 0 ||
+			s.cachedFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine cached-frame ownership")
+		}
+		s.cachedFrameTasks--
+		s.cachedFrameBytes -= task.frameSize
+	}
+	clearStacklessCoroTaskFrame(task)
 }
 
 // recycleTaskLocked retains a completed non-root task for this scheduler. A
@@ -225,27 +289,48 @@ func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
 // builds must not reuse it for an unrelated logical goroutine.
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	_, hasTerminalValue := s.terminalValues[task]
-	if task == &s.root || task.resume != nil || task.parent != nil ||
+	validFrame := !task.cacheFrame && task.resume == nil &&
+		task.context.frame == nil && task.frameSize == 0
+	if task.cacheFrame {
+		validFrame = task.resume != nil && task.context.frame != nil &&
+			int(task.frameSize) <= stacklessCoroFrameCacheSize &&
+			s.cachedFrameTasks > 0 &&
+			s.cachedFrameBytes >= task.frameSize
+	}
+	if task == &s.root || !validFrame || task.parent != nil ||
 		task.next != nil || task.state != stacklessCoroTaskComplete ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
 		task.resuming || task.readyPending ||
-		task.context.frame != nil || task.context.scheduler != nil ||
+		task.context.scheduler != nil ||
 		hasTerminalValue {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
 	if raceenabled {
+		s.discardCachedFrameTaskLocked(task)
 		return
 	}
-	if s.freeTaskCount < 0 || s.freeTaskCount > stacklessCoroTaskCacheSize {
+	if s.cachedFrameTasks > stacklessCoroTaskCacheSize ||
+		s.freePlainTaskCount >
+			uint16(stacklessCoroTaskCacheSize)-s.cachedFrameTasks {
 		throw("runtime: invalid stackless coroutine task cache size")
 	}
-	if s.freeTaskCount == stacklessCoroTaskCacheSize {
+	if !task.cacheFrame &&
+		s.freePlainTaskCount ==
+			uint16(stacklessCoroTaskCacheSize)-s.cachedFrameTasks {
 		return
 	}
 	task.state = stacklessCoroTaskNew
 	task.next = s.freeTasks
 	s.freeTasks = task
-	s.freeTaskCount++
+	if task.cacheFrame {
+		if s.freeFrameBytes > s.cachedFrameBytes ||
+			s.cachedFrameBytes-s.freeFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine free-frame size")
+		}
+		s.freeFrameBytes += task.frameSize
+	} else {
+		s.freePlainTaskCount++
+	}
 }
 
 func (s *stacklessCoroScheduler) finish() {
@@ -414,6 +499,147 @@ func coroFrame(ctx unsafe.Pointer) unsafe.Pointer {
 	return context.frame
 }
 
+// coroFrameCached reports whether the current typed frame owns bounded cache
+// capacity. Compiler-generated completion paths clear its pointer fields
+// before the runtime retains it.
+func coroFrameCached(ctx unsafe.Pointer) bool {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
+		task.state != stacklessCoroTaskRunning || !task.resuming {
+		throw("runtime: invalid stackless coroutine frame-cache query")
+	}
+	return task.cacheFrame
+}
+
+// coroTakeFrame reserves a task for a compiler-generated frame factory and
+// returns a cached frame when one has the same resume entry and size. The
+// reservation keeps the opaque typed allocation reachable until the matching
+// await or spawn operation consumes it.
+func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
+	size uintptr) unsafe.Pointer {
+	if ctx == nil || raceenabled || size > stacklessCoroFrameCacheSize {
+		return nil
+	}
+	context := (*stacklessCoroContext)(ctx)
+	parent := context.task()
+	if context.scheduler == nil || parent == nil || child == nil {
+		throw("runtime: invalid stackless coroutine frame reservation")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+		parent.readyPending ||
+		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine frame reservation outside resume")
+	}
+	task := s.takeCachedFrameTaskLocked(child, uint16(size))
+	if task == nil {
+		task = s.newTaskLocked(nil, child, parent)
+		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
+			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
+			task.cacheFrame = true
+			task.frameSize = uint16(size)
+			s.cachedFrameTasks++
+			s.cachedFrameBytes += uint16(size)
+		}
+	} else {
+		task.parent = parent
+	}
+	task.next = s.reservedTasks
+	s.reservedTasks = task
+	frame := task.context.frame
+	unlock(&s.lock)
+	return frame
+}
+
+func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
+	resume stacklessCoroResume, size uint16) *stacklessCoroTask {
+	identity := stacklessCoroResumeIdentity(resume)
+	var previous *stacklessCoroTask
+	for task := s.freeTasks; task != nil; task = task.next {
+		if !task.cacheFrame || task.frameSize != size ||
+			stacklessCoroResumeIdentity(task.resume) != identity {
+			previous = task
+			continue
+		}
+		if previous == nil {
+			s.freeTasks = task.next
+		} else {
+			previous.next = task.next
+		}
+		if s.freeFrameBytes < task.frameSize ||
+			s.cachedFrameTasks == 0 ||
+			s.cachedFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine frame cache")
+		}
+		s.freeFrameBytes -= task.frameSize
+		task.next = nil
+		return task
+	}
+	return nil
+}
+
+func (s *stacklessCoroScheduler) takeReservedFrameTaskLocked(
+	parent *stacklessCoroTask, frame unsafe.Pointer,
+	resume stacklessCoroResume) *stacklessCoroTask {
+	if s.reservedTasks == nil {
+		return nil
+	}
+	identity := stacklessCoroResumeIdentity(resume)
+	var previous *stacklessCoroTask
+	for task := s.reservedTasks; task != nil; task = task.next {
+		if task.parent != parent ||
+			stacklessCoroResumeIdentity(task.resume) != identity {
+			previous = task
+			continue
+		}
+		if task.state != stacklessCoroTaskNew ||
+			task.context.scheduler != nil ||
+			(task.context.frame != nil && task.context.frame != frame) {
+			throw("runtime: invalid stackless coroutine frame reservation")
+		}
+		if previous == nil {
+			s.reservedTasks = task.next
+		} else {
+			previous.next = task.next
+		}
+		task.next = nil
+		task.context.frame = frame
+		return task
+	}
+	return nil
+}
+
+// ABI 3 factories return static, capture-free resume values. Their funcval
+// pointers are stable identities and avoid resolving a PC at every child
+// transition.
+func stacklessCoroResumeIdentity(resume stacklessCoroResume) *funcval {
+	return *(**funcval)(unsafe.Pointer(&resume))
+}
+
+func (s *stacklessCoroScheduler) cancelReservedFrameTasksLocked(
+	parent *stacklessCoroTask) {
+	reserved := s.reservedTasks
+	s.reservedTasks = nil
+	for task := reserved; task != nil; {
+		next := task.next
+		task.next = nil
+		if task.parent != parent {
+			task.next = s.reservedTasks
+			s.reservedTasks = task
+			task = next
+			continue
+		}
+		task.parent = nil
+		task.state = stacklessCoroTaskComplete
+		s.discardCachedFrameTaskLocked(task)
+		s.recycleTaskLocked(task)
+		task = next
+	}
+}
+
 // coroAwait transfers execution to child. Completion makes the current task
 // runnable; it does not call the parent continuation.
 func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
@@ -435,8 +661,12 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine await outside resume")
 	}
+	task := s.takeReservedFrameTaskLocked(parent, frame, child)
+	if task == nil {
+		task = s.newTaskLocked(frame, child, parent)
+	}
 	parent.state = stacklessCoroTaskWaiting
-	s.readyLocked(s.newTaskLocked(frame, child, parent))
+	s.readyLocked(task)
 	unlock(&s.lock)
 }
 
@@ -751,20 +981,26 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
 
 func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	context := (*stacklessCoroContext)(ctx)
-	task := context.task()
-	if context == nil || context.scheduler == nil || task == nil ||
+	parent := context.task()
+	if context == nil || context.scheduler == nil || parent == nil ||
 		child == nil {
 		throw("runtime: invalid stackless coroutine spawn")
 	}
 	s := context.scheduler
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning || !task.resuming ||
-		task.readyPending || task.terminal != stacklessCoroTerminalNone ||
-		task.goexit {
+	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+		parent.readyPending || parent.terminal != stacklessCoroTerminalNone ||
+		parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine spawn outside resume")
 	}
-	s.readyLocked(s.newTaskLocked(frame, child, nil))
+	task := s.takeReservedFrameTaskLocked(parent, frame, child)
+	if task == nil {
+		task = s.newTaskLocked(frame, child, nil)
+	} else {
+		task.parent = nil
+	}
+	s.readyLocked(task)
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	s.wakeReplacementExecutor()
@@ -1215,6 +1451,7 @@ func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine panic recovery")
 	}
+	s.cancelReservedFrameTasksLocked(task)
 	task.resuming = false
 	s.readyLocked(task)
 	unlock(&s.lock)
@@ -1231,8 +1468,9 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 	}
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
-	task.resume = nil
-	task.context.frame = nil
+	if !task.cacheFrame {
+		clearStacklessCoroTaskFrame(task)
+	}
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -1271,8 +1509,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	}
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
-	task.resume = nil
-	task.context.frame = nil
+	s.discardCachedFrameTaskLocked(task)
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -1317,8 +1554,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	}
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
-	task.resume = nil
-	task.context.frame = nil
+	s.discardCachedFrameTaskLocked(task)
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}

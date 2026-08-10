@@ -11,6 +11,7 @@ import "unsafe"
 const (
 	StacklessCoroWarmExecutorCount  = stacklessCoroWarmExecutorCount
 	StacklessCoroTaskCacheSize      = stacklessCoroTaskCacheSize
+	StacklessCoroFrameCacheSize     = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize = stacklessCoroOperationCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
@@ -60,6 +61,11 @@ func AwaitStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) u
 func AwaitStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) {
 	coroAwaitFrame(ctx, frame, resume)
+}
+
+func TakeStacklessCoroFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr) unsafe.Pointer {
+	return coroTakeFrame(ctx, resume, size)
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
@@ -142,9 +148,97 @@ func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
 	}
 	s := context.scheduler
 	lock(&s.lock)
-	count := s.freeTaskCount
+	count := 0
+	for task := s.freeTasks; task != nil; task = task.next {
+		count++
+	}
 	unlock(&s.lock)
 	return count
+}
+
+func StacklessCoroFreeFrameBytesForTest(ctx unsafe.Pointer) int {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task() == nil {
+		throw("runtime: invalid stackless coroutine frame cache query")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	bytes := int(s.freeFrameBytes)
+	unlock(&s.lock)
+	return bytes
+}
+
+func StacklessCoroReservedFrameCountForTest(ctx unsafe.Pointer) int {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task() == nil {
+		throw("runtime: invalid stackless coroutine frame cache query")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	count := 0
+	for task := s.reservedTasks; task != nil; task = task.next {
+		count++
+	}
+	unlock(&s.lock)
+	return count
+}
+
+func StacklessCoroCancelReservedFramesForTest() bool {
+	resume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	firstParent := new(stacklessCoroTask)
+	secondParent := new(stacklessCoroTask)
+	first := &stacklessCoroTask{
+		resume: resume, parent: firstParent, cacheFrame: true, frameSize: 1,
+		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
+	}
+	second := &stacklessCoroTask{
+		resume: resume, parent: secondParent, cacheFrame: true, frameSize: 1,
+		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
+	}
+	first.next = second
+	s := &stacklessCoroScheduler{
+		reservedTasks: first, cachedFrameTasks: 2, cachedFrameBytes: 2,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	s.cancelReservedFrameTasksLocked(firstParent)
+	recycled := s.freeTasks == first && s.freePlainTaskCount == 1
+	if raceenabled {
+		recycled = s.freeTasks == nil && s.freePlainTaskCount == 0
+	}
+	valid := s.reservedTasks == second && second.next == nil &&
+		second.parent == secondParent && second.cacheFrame &&
+		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1 &&
+		recycled &&
+		first.resume == nil && first.context.frame == nil && !first.cacheFrame
+	unlock(&s.lock)
+	return valid
+}
+
+func StacklessCoroPreferPlainTaskForTest() bool {
+	resume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	cached := &stacklessCoroTask{
+		resume: resume, cacheFrame: true, frameSize: 1,
+		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
+	}
+	plain := new(stacklessCoroTask)
+	cached.next = plain
+	s := &stacklessCoroScheduler{
+		freeTasks: cached, freePlainTaskCount: 1, freeFrameBytes: 1,
+		cachedFrameTasks: 1, cachedFrameBytes: 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	got := s.newTaskLocked(nil, resume, nil)
+	valid := got == plain && s.freeTasks == cached && cached.next == nil &&
+		s.freePlainTaskCount == 0 && s.freeFrameBytes == 1 &&
+		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1
+	unlock(&s.lock)
+	return valid
 }
 
 func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
@@ -170,6 +264,10 @@ func SpawnStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
 
 func FrameStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	return coroFrame(ctx)
+}
+
+func FrameCachedStacklessCoroForTest(ctx unsafe.Pointer) bool {
+	return coroFrameCached(ctx)
 }
 
 func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {

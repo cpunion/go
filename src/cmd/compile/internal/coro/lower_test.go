@@ -89,6 +89,35 @@ func TestResumeFactorySupported(t *testing.T) {
 		t.Fatalf("explicit factory type = %v, want frame and resume results",
 			explicitFactory)
 	}
+	cachedFactory := resumeFactoryType(method, FactoryABI3)
+	if cachedFactory.NumParams() != 2 ||
+		cachedFactory.Param(0).Type != types.Types[types.TUNSAFEPTR] ||
+		cachedFactory.Param(1).Type != recv.Type ||
+		cachedFactory.NumResults() != 2 {
+		t.Fatalf("cached factory type = %v, want context, receiver, frame, and resume",
+			cachedFactory)
+	}
+	if got := resumeFactoryABI(
+		ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("Cached"), cachedFactory),
+		method); got != FactoryABI3 {
+		t.Fatalf("cached factory ABI = %v, want v3", got)
+	}
+	for _, abi := range []FactoryABI{FactoryABI1, FactoryABI2, FactoryABI3} {
+		factory := ir.NewFunc(src.NoXPos, src.NoXPos,
+			pkg.LookupNum("Factory", int(abi)), resumeFactoryType(method, abi))
+		if got := resumeFactoryABI(factory, method); got != abi {
+			t.Errorf("factory ABI = %v, want %v", got, abi)
+		}
+	}
+	if got := resumeFactoryABI(nil, method); got != NoFactory {
+		t.Errorf("nil factory ABI = %v, want none", got)
+	}
+	if got := resumeFactoryABI(method, nil); got != NoFactory {
+		t.Errorf("nil source ABI = %v, want none", got)
+	}
+	if got := resumeFactoryABI(method, method); got != NoFactory {
+		t.Errorf("ordinary function ABI = %v, want none", got)
+	}
 	results := []*types.Field{
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
@@ -187,7 +216,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Lowered != 1 || result.Skipped != 0 ||
-		function.Factory != FactoryABI2 {
+		function.Factory != FactoryABI3 {
 		t.Fatalf("Lower result = %+v, factory = %v", result, function.Factory)
 	}
 
@@ -208,9 +237,9 @@ func TestLowerMethodReceiver(t *testing.T) {
 	if factoryCall.Fun.Type().IsVariadic() {
 		t.Fatalf("method factory call remains variadic: %v", factoryCall.Fun.Type())
 	}
-	if len(factoryCall.Args) != 2 || factoryCall.Args[0] != receiverName ||
-		factoryCall.Args[1] != paramName {
-		t.Fatalf("method factory arguments = %v, want receiver and parameter",
+	if len(factoryCall.Args) != 3 || !ir.IsNil(factoryCall.Args[0]) ||
+		factoryCall.Args[1] != receiverName || factoryCall.Args[2] != paramName {
+		t.Fatalf("method factory arguments = %v, want nil context, receiver, and parameter",
 			factoryCall.Args)
 	}
 
@@ -233,8 +262,14 @@ func TestLowerMethodReceiver(t *testing.T) {
 		t.Fatalf("factory return = %T, want frame and resume",
 			generatedFactory.Body[len(generatedFactory.Body)-1])
 	}
-	resume, ok := returnStmt.Results[1].(*ir.ClosureExpr)
-	if !ok || resume.Func.ClosureParent != generatedFactory {
+	var resume *ir.ClosureExpr
+	ir.Visit(generatedFactory, func(node ir.Node) {
+		closure, ok := node.(*ir.ClosureExpr)
+		if ok && closure.Func.ClosureParent == generatedFactory {
+			resume = closure
+		}
+	})
+	if resume == nil {
 		t.Fatalf("factory resume = %T, want generated static resume",
 			returnStmt.Results[1])
 	}
@@ -250,6 +285,40 @@ func TestLowerMethodReceiver(t *testing.T) {
 	})
 	if allocations != 1 {
 		t.Fatalf("factory has %d allocations, want one typed frame", allocations)
+	}
+	takeFrames := 0
+	ir.VisitList(generatedFactory.Body, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if ok && symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
+			"runtime.coroTakeFrame" {
+			takeFrames++
+		}
+	})
+	if takeFrames != 1 {
+		t.Fatalf("factory has %d frame-cache lookups, want one", takeFrames)
+	}
+	cacheQueries, pointerClears := 0, 0
+	ir.VisitList(resume.Func.Body, func(node ir.Node) {
+		condition, ok := node.(*ir.IfStmt)
+		if !ok {
+			return
+		}
+		call, ok := condition.Cond.(*ir.CallExpr)
+		if !ok || symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) !=
+			"runtime.coroFrameCached" {
+			return
+		}
+		cacheQueries++
+		for _, stmt := range condition.Body {
+			assignment, ok := stmt.(*ir.AssignStmt)
+			if ok && ir.IsZero(assignment.Y) {
+				pointerClears++
+			}
+		}
+	})
+	if cacheQueries != 1 || pointerClears == 0 {
+		t.Fatalf("resume has %d frame-cache queries and %d pointer clears, want one query and pointer clears",
+			cacheQueries, pointerClears)
 	}
 }
 
@@ -4013,11 +4082,15 @@ func TestLowerImportedFactory(t *testing.T) {
 			lowered: 2, callers: 2,
 		},
 		{
+			name: "cached", factory: FactoryABI3,
+			lowered: 2, callers: 2,
+		},
+		{
 			name: "missing", skipped: 1, callers: 1,
 			diagnostic: "unsupported coroutine dependency",
 		},
 		{
-			name: "unknown", factory: FactoryABI(3),
+			name: "unknown", factory: FactoryABI(4),
 			skipped: 1, callers: 1,
 			diagnostic: "unsupported coroutine dependency",
 		},
@@ -4113,8 +4186,8 @@ func TestLowerImportedFactory(t *testing.T) {
 					result.Diagnostics)
 			}
 			for _, function := range functions {
-				if function.Factory != FactoryABI2 {
-					t.Fatalf("lowered function factory = %v, want v2",
+				if function.Factory != FactoryABI3 {
+					t.Fatalf("lowered function factory = %v, want v3",
 						function.Factory)
 				}
 			}
@@ -5470,8 +5543,8 @@ func TestLowerChannelOperations(t *testing.T) {
 		t.Fatalf("Lower failed: %v", err)
 	}
 	if result.Lowered != 1 || result.Skipped != 0 ||
-		function.Factory != FactoryABI2 {
-		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 2 function",
+		function.Factory != FactoryABI3 {
+		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 3 function",
 			result, function.Factory)
 	}
 
@@ -5661,8 +5734,8 @@ func TestLowerChannelSelect(t *testing.T) {
 		t.Fatalf("Lower failed: %v", err)
 	}
 	if result.Lowered != 1 || result.Skipped != 0 ||
-		function.Factory != FactoryABI2 {
-		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 2 function",
+		function.Factory != FactoryABI3 {
+		t.Fatalf("Lower result = %+v, factory = %v, want one ABI 3 function",
 			result, function.Factory)
 	}
 

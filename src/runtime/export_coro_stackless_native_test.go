@@ -27,15 +27,23 @@ func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 	available := stacklessCoroNativePool.available
 	for range len(available) {
 		ctx := <-available
-		warm += ctx.freeTaskCount
+		warm += stacklessCoroTaskListLen(ctx.freeTasks)
 		available <- ctx
 	}
 	lock(&stacklessCoroNativePool.lock)
 	for ctx := stacklessCoroNativePool.overflow; ctx != nil; ctx = ctx.poolNext {
-		overflow += ctx.freeTaskCount
+		overflow += stacklessCoroTaskListLen(ctx.freeTasks)
 	}
 	unlock(&stacklessCoroNativePool.lock)
 	return
+}
+
+func stacklessCoroTaskListLen(task *stacklessCoroTask) int {
+	count := 0
+	for ; task != nil; task = task.next {
+		count++
+	}
+	return count
 }
 
 func WriteStacklessCoroNativeForTest(fd int, value byte) int {
