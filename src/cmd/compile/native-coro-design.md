@@ -2633,6 +2633,71 @@ size and without weakening concurrent spawn correctness. Public-root frame,
 scheduler, and wake allocations and the remaining transition overhead stay
 separate targets after that fast path.
 
+The saturated-reservation follow-up implements the bypass without changing
+factory ABI 3 or any runtime object layout. The first locked factory attempt
+that reaches the 256-task capacity still creates its ordinary uncached
+reservation. That task records the saturated lineage in its existing
+`frameSize` field using a value outside the permitted cached-frame range.
+Descendant explicit-frame factories recognize the mark before taking the
+scheduler lock and return nil without creating a reservation. The factory
+allocates its ordinary typed frame, and the immediately following frame-aware
+await or spawn creates the uncached task in its existing single scheduler
+entry and propagates the mark.
+
+The hint is task-local: it adds no atomic state, cache-counter update, task
+field, or compiler metadata. A concurrent completion can make a marked
+lineage take conservative cache misses, but cannot detach a task, cross a
+resume identity, or exceed the bounded cache. Cached lineages retain the
+original locked lookup until they reach the capacity boundary. Frames that
+are uncached only because they are oversized or exceed the byte budget are
+not marked, so their smaller descendants remain eligible for caching. Root
+sibling fan-out retains the original reservation path; extending that case
+was not worth adding a shared query to every public entry.
+
+Two shared-state prototypes were rejected before this task-local design. One
+packed the mutable task counts and hint into an atomic word; a 20-sample
+translated Linux control run made depth-64 recursion 8.54% slower
+(`p=0.002`). A separate atomic hint avoided the packed updates but still put
+a shared load on public-root factories. Neither prototype is present in the
+final change.
+
+The deep-unwind runtime test requires every descendant bypass after the first
+uncached reservation and counts 512 bypasses across two depth-512 lineages.
+An oversized-parent test requires a smaller child to retain the normal
+reservation path. Race builds retain their existing policy of disabling all
+task and frame identity reuse. The within-capacity reservation path,
+public-root objects, cache counters, and uncached frame/task allocations
+remain unchanged.
+
+Exact layout probes on Darwin/arm64 and Linux/amd64 reported the same values
+for the parent and this change: a 192-byte scheduler, a 112-byte native
+context, and a 48-byte task. Performance measurements used the exact
+`b9c9d0e7ef` parent, five warm-up pairs, twenty alternating-order one-second
+samples, `GOMAXPROCS=1`, disabled inlining, and real coroutine lowering. The
+Darwin samples ran on an Apple M4 Max; the Linux samples ran natively on an
+Intel Xeon Platinum 8573C:
+
+| Probe | Darwin arm64 | Linux amd64 |
+| --- | ---: | ---: |
+| public yield entry | 1.054 us -> 1.053 us (~) | 1.731 us -> 1.715 us (-0.92%) |
+| recursive yield, depth 64 | 5.214 us -> 5.222 us (~) | 15.78 us -> 15.69 us (~) |
+| recursive yield, depth 4,096 | 443.7 us -> 412.4 us (-7.05%) | 1.179 ms -> 1.094 ms (-7.23%) |
+| time geomean | -2.42% | -2.97% |
+
+Both deep changes were statistically significant (`p<0.001`); both depth-64
+controls were neutral. The Darwin entry control was neutral, while the small
+Linux entry improvement was significant. Every sample retained the exact
+allocation results from the parent: 336 B and four allocations at entry,
+360 B and four allocations at depth 64, and 369,000 B and 7,684 allocations
+at depth 4,096. At that depth, the task-local mark bypasses 3,839 of the 3,840
+otherwise redundant reservations beyond the bounded cache.
+
+The local Linux/amd64 validation environment uses VirtualApple translation.
+It reproduced the lowering and exact allocation results but reported a
+uniform 1.94% timing increase, including the unsaturated controls.
+The native Linux run above is therefore the Linux performance result; the
+translated run remains a behavioral cross-platform check.
+
 ## 16. Work after the MVP
 
 The likely order is:
