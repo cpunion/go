@@ -4363,6 +4363,97 @@ func main() {
 	}
 }
 
+func TestTypedFrameCacheClearsPointers(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "main.go")
+	program := `package main
+
+import (
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+type payload struct {
+	value int64
+}
+
+var finalized atomic.Int64
+
+func finalize(value *payload) {
+	finalized.Store(value.value)
+}
+
+//go:noinline
+func cached(value int64) int64 {
+	pointer := &payload{value: value}
+	runtime.SetFinalizer(pointer, finalize)
+	runtime.Gosched()
+	result := pointer.value
+	runtime.KeepAlive(pointer)
+	return result
+}
+
+//go:noinline
+func waitFinalizer(want int64) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if finalized.Load() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	panic("typed frame retained completed pointers")
+}
+
+func main() {
+	if cached(41) != 41 {
+		panic("bad first cached result")
+	}
+	waitFinalizer(41)
+	if cached(42) != 42 {
+		panic("bad reused cached result")
+	}
+	waitFinalizer(42)
+	println("stackless-coro-frame-cache-ok")
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "coro-frame-cache")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=command-line-arguments=-d=coro=2",
+		src)
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("building typed-frame cache test failed: %v\n%s", err, data)
+	}
+	if diagnostic := "skip main.cached:"; strings.Contains(string(data), diagnostic) {
+		t.Fatalf("output contains unexpected %q\n%s", diagnostic, data)
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("typed-frame cache test failed: %v\n%s", err, data)
+	}
+	if want := "stackless-coro-frame-cache-ok"; !strings.Contains(
+		string(data), want) {
+		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+}
+
 func TestInliningCompatibility(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 

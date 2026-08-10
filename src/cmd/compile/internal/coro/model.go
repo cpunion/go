@@ -196,6 +196,10 @@ const (
 	// static resume function. The frame is opaque outside the defining
 	// package and is passed back to the matching frame-aware runtime entry.
 	FactoryABI2
+	// FactoryABI3 accepts the current resume context before the source
+	// parameters. The factory uses it to reuse a matching typed frame while
+	// preserving the opaque frame boundary between packages.
+	FactoryABI3
 )
 
 // DeferABI identifies a compiler-verified entry contract for invoking a

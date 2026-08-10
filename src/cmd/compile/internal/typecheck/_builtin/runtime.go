@@ -201,6 +201,7 @@ func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawnFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroPanic(unsafe.Pointer, interface{})
 func coroPanicPending(unsafe.Pointer) bool
+func coroFrameCached(unsafe.Pointer) bool
 func coroSleep(unsafe.Pointer, int64) bool
 func coroChanSend(unsafe.Pointer, chan<- any, *any)
 func coroChanRecv(unsafe.Pointer, <-chan any, *any, *bool)
@@ -345,3 +346,6 @@ func coroDeferRecover(unsafe.Pointer) interface{}
 // stackless coroutine terminal outcomes
 func coroGoexit(unsafe.Pointer)
 func coroTerminalAction(unsafe.Pointer) uint8
+
+// stackless coroutine frame factory
+func coroTakeFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
