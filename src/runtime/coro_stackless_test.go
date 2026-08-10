@@ -1770,6 +1770,17 @@ func TestStacklessCoroWakePool(t *testing.T) {
 		t.Fatalf("wake pool size = %d, want %d", got,
 			runtime.StacklessCoroWarmExecutorCount)
 	}
+	for i := range runtime.StacklessCoroWarmExecutorCount {
+		buffered := -1
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			buffered = len(runtime.WakeStacklessCoroForTest(ctx))
+			return runtime.StacklessCoroActionComplete
+		})
+		if buffered != 0 {
+			t.Fatalf("reused wake channel %d has %d notifications", i,
+				buffered)
+		}
+	}
 
 	native := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
 		runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
