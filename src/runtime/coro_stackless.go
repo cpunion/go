@@ -141,17 +141,9 @@ func (s *stacklessCoroScheduler) frameCacheSaturated() bool {
 	return s.frameCacheSaturatedState.Load() != 0
 }
 
-// updateFrameCacheSaturationLocked publishes only transitions into and out
-// of saturation. The scheduler lock must be held.
-func (s *stacklessCoroScheduler) updateFrameCacheSaturationLocked(
-	oldCachedTasks, oldFreeFrameBytes uint16) {
-	oldSaturated := oldCachedTasks == stacklessCoroTaskCacheSize &&
-		oldFreeFrameBytes == 0
-	saturated := s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-		s.freeFrameBytes == 0
-	if oldSaturated == saturated {
-		return
-	}
+// setFrameCacheSaturatedLocked publishes a transition into or out of
+// saturation. The scheduler lock must be held.
+func (s *stacklessCoroScheduler) setFrameCacheSaturatedLocked(saturated bool) {
 	if saturated {
 		s.frameCacheSaturatedState.Store(1)
 	} else {
@@ -304,15 +296,16 @@ func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
 func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 	task *stacklessCoroTask) {
 	if task.cacheFrame {
-		oldCachedTasks := s.cachedFrameTasks
-		oldFreeFrameBytes := s.freeFrameBytes
 		if s.cachedFrameTasks == 0 ||
 			s.cachedFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine cached-frame ownership")
 		}
+		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0 {
+			s.setFrameCacheSaturatedLocked(false)
+		}
 		s.cachedFrameTasks--
 		s.cachedFrameBytes -= task.frameSize
-		s.updateFrameCacheSaturationLocked(oldCachedTasks, oldFreeFrameBytes)
 	}
 	clearStacklessCoroTaskFrame(task)
 }
@@ -356,14 +349,15 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	task.next = s.freeTasks
 	s.freeTasks = task
 	if task.cacheFrame {
-		oldFreeFrameBytes := s.freeFrameBytes
 		if s.freeFrameBytes > s.cachedFrameBytes ||
 			s.cachedFrameBytes-s.freeFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine free-frame size")
 		}
+		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0 {
+			s.setFrameCacheSaturatedLocked(false)
+		}
 		s.freeFrameBytes += task.frameSize
-		s.updateFrameCacheSaturationLocked(s.cachedFrameTasks,
-			oldFreeFrameBytes)
 	} else {
 		s.freePlainTaskCount++
 	}
@@ -585,13 +579,14 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		task = s.newTaskLocked(nil, child, parent)
 		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
-			oldCachedTasks := s.cachedFrameTasks
 			task.cacheFrame = true
 			task.frameSize = uint16(size)
 			s.cachedFrameTasks++
 			s.cachedFrameBytes += uint16(size)
-			s.updateFrameCacheSaturationLocked(oldCachedTasks,
-				s.freeFrameBytes)
+			if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+				s.freeFrameBytes == 0 {
+				s.setFrameCacheSaturatedLocked(true)
+			}
 		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
 			s.freeFrameBytes == 0 {
 			task.frameSize = stacklessCoroUncachedFrameLineage
@@ -642,10 +637,11 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 			s.cachedFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine frame cache")
 		}
-		oldFreeFrameBytes := s.freeFrameBytes
 		s.freeFrameBytes -= task.frameSize
-		s.updateFrameCacheSaturationLocked(s.cachedFrameTasks,
-			oldFreeFrameBytes)
+		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0 {
+			s.setFrameCacheSaturatedLocked(true)
+		}
 		task.next = nil
 		return task
 	}
