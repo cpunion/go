@@ -2565,6 +2565,69 @@ recursion. It must reduce compiler-owned objects, preserve the 48-byte task
 header and live-stack advantage, and leave timer, file, network, channel,
 defer, panic, Goexit, and direct-C probes green on both MVP platforms.
 
+Factory ABI 3 implements bounded reuse for the typed frames introduced by
+ABI 2. It prepends the current resume context to the compiler-private factory
+entry. A generated factory asks the owning scheduler for a frame with the
+same static resume identity and declared size, and reserves the corresponding
+logical task until the immediately following frame-aware await or spawn
+consumes it. The ordinary exported wrapper passes a nil context and keeps its
+existing root allocation. ABI 1 and ABI 2 remain valid imported capabilities.
+
+Each active scheduler owns at most 256 cached-frame tasks and 32 KiB of
+declared frame payload. The task limit is shared with the existing bounded
+free-task list; the task header remains 48 bytes. Single-executor roots move
+the cache through the four-entry warm native-context pool. Thus the new
+long-lived payload bound is 128 KiB across warm contexts, in addition to the
+existing 48 KiB task-header bound and allocator size-class overhead. Overflow
+contexts and roots that started replacement executors do not retain a cache.
+Race builds do not reuse task or frame identities.
+
+Normal completion clears every pointer-containing field of a cache-owned
+typed frame after copying results to their destinations. Panic, Goexit, and a
+panic between factory reservation and scheduling discard the frame instead.
+This keeps a reused opaque frame from retaining completed arguments or result
+pointers. A real-lowering finalizer probe covers both first use and reuse; the
+runtime tests also cover resume identity, non-head reservations, cancellation,
+cache bounds, deep unwinding, race behavior, and reuse across public roots.
+
+Ten alternating 300 ms Darwin/arm64 samples used `GOMAXPROCS=1`, disabled
+inlining in the target package, and enabled real lowering with `-d=coro=4`:
+
+| Probe | Native task cache | Typed-frame cache | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 1.045 us, 336 B, 4 allocs | 1.055 us, 336 B, 4 allocs | +0.96% time; objects unchanged |
+| recursive yield, depth 64 | 6.376 us, 3,432 B, 68 allocs | 5.420 us, 360 B, 4 allocs | -14.99% time, -89.51% bytes, -94.12% allocs |
+| recursive yield, depth 4,096 | 390.7 us, 381,288 B, 7,940 allocs | 445.5 us, 369,000 B, 7,684 allocs | +14.03% time, -3.22% bytes and allocs |
+
+All three time changes were statistically significant. Their geomean changed
+by -0.72%; the byte and allocation geomeans changed by -53.35% and -61.53%.
+The allocation deltas match the measured 48-byte recursive frame size
+exactly: depth 64 removes 64 frames and 3,072 bytes, while depth 4,096 removes
+the bounded 256 frames and 12,288 bytes. The remaining deep count is
+`4 + 2 * (4096 - 256) = 7684`: four public-root objects followed by one frame
+and one task for every depth beyond the cache. The unchanged public 336 B
+also confirms that the packed cache counters did not grow the root scheduler
+allocation class.
+
+The exact upstream merge-base at revision `5d29d80b6c` still allocates no
+objects in the same probes:
+
+| Probe | Upstream Darwin | Typed-frame cache | Ratio |
+| --- | ---: | ---: | ---: |
+| public yield entry | 46.34 ns, 0 allocs | 1.055 us, 4 allocs | 22.8x |
+| recursive yield, depth 64 | 391.9 ns, 0 allocs | 5.420 us, 4 allocs | 13.8x |
+| recursive yield, depth 4,096 | 18.95 us, 0 allocs | 445.5 us, 7,684 allocs | 23.5x |
+
+The shallow-recursion result validates frame reuse, but the saturated
+depth-4,096 path exposes the next runtime target. A factory currently enters
+the scheduler to attempt or reserve a frame, then the generated caller enters
+again to schedule it. Calls beyond the cache bound retain this extra
+transition without receiving a cached frame. A follow-up should bypass or
+fuse the saturated reservation path without adding task-header or scheduler
+size and without weakening concurrent spawn correctness. Public-root frame,
+scheduler, and wake allocations and the remaining transition overhead stay
+separate targets after that fast path.
+
 ## 16. Work after the MVP
 
 The likely order is:
