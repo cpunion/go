@@ -107,14 +107,10 @@ type stacklessCoroScheduler struct {
 	cachedFrameTasks   uint16
 	cachedFrameBytes   uint16
 	freeOperations     *stacklessCoroOperation
-	// The operation cache is bounded at 64 entries. Keeping its count in
-	// uint32 leaves room for the lock-free frame-cache saturation hint
-	// without growing the scheduler.
-	frameCacheSaturatedState atomic.Uint32
-	freeOperationCount       uint32
-	root                     stacklessCoroTask
-	terminalValues           map[*stacklessCoroTask]any
-	wake                     chan struct{}
+	freeOperationCount int
+	root               stacklessCoroTask
+	terminalValues     map[*stacklessCoroTask]any
+	wake               chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
@@ -135,20 +131,6 @@ type stacklessCoroScheduler struct {
 	// bit asks a native executor to yield its P to a returning foreign call.
 	runnableState    atomic.Uint32
 	foreignReturners atomic.Uint32
-}
-
-func (s *stacklessCoroScheduler) frameCacheSaturated() bool {
-	return s.frameCacheSaturatedState.Load() != 0
-}
-
-// setFrameCacheSaturatedLocked publishes a transition into or out of
-// saturation. The scheduler lock must be held.
-func (s *stacklessCoroScheduler) setFrameCacheSaturatedLocked(saturated bool) {
-	if saturated {
-		s.frameCacheSaturatedState.Store(1)
-	} else {
-		s.frameCacheSaturatedState.Store(0)
-	}
 }
 
 // A stacklessCoroOperation is owned by the runtime registry until its source
@@ -300,10 +282,6 @@ func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 			s.cachedFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine cached-frame ownership")
 		}
-		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-			s.freeFrameBytes == 0 {
-			s.setFrameCacheSaturatedLocked(false)
-		}
 		s.cachedFrameTasks--
 		s.cachedFrameBytes -= task.frameSize
 	}
@@ -352,10 +330,6 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		if s.freeFrameBytes > s.cachedFrameBytes ||
 			s.cachedFrameBytes-s.freeFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine free-frame size")
-		}
-		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-			s.freeFrameBytes == 0 {
-			s.setFrameCacheSaturatedLocked(false)
 		}
 		s.freeFrameBytes += task.frameSize
 	} else {
@@ -456,6 +430,10 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		if task == nil || task.context.scheduler != s {
 			return
 		}
+		if task == &s.root &&
+			task.frameSize == stacklessCoroUncachedFrameLineage {
+			task.frameSize = 0
+		}
 		p := getg()._panic
 		if p == nil || p.goexit {
 			return
@@ -484,6 +462,10 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		}
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
+		if task == &s.root &&
+			task.frameSize == stacklessCoroUncachedFrameLineage {
+			task.frameSize = 0
+		}
 		task.context.scheduler = nil
 
 		switch action {
@@ -559,12 +541,9 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	s := context.scheduler
 	// A marked explicit-frame task carries a saturated lineage without a
-	// shared-state query. A root may fill the cache with sibling spawns, so it
-	// consults the saturation hint before entering the scheduler.
-	if parent.frameSize == stacklessCoroUncachedFrameLineage {
-		return nil
-	}
-	if parent == &s.root && s.frameCacheSaturated() {
+	// shared-state query.
+	if !parent.cacheFrame &&
+		parent.frameSize == stacklessCoroUncachedFrameLineage {
 		return nil
 	}
 	lock(&s.lock)
@@ -583,13 +562,12 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			task.frameSize = uint16(size)
 			s.cachedFrameTasks++
 			s.cachedFrameBytes += uint16(size)
-			if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-				s.freeFrameBytes == 0 {
-				s.setFrameCacheSaturatedLocked(true)
-			}
 		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
 			s.freeFrameBytes == 0 {
 			task.frameSize = stacklessCoroUncachedFrameLineage
+			if parent == &s.root {
+				parent.frameSize = stacklessCoroUncachedFrameLineage
+			}
 		}
 	} else {
 		task.parent = parent
@@ -638,10 +616,6 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 			throw("runtime: invalid stackless coroutine frame cache")
 		}
 		s.freeFrameBytes -= task.frameSize
-		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-			s.freeFrameBytes == 0 {
-			s.setFrameCacheSaturatedLocked(true)
-		}
 		task.next = nil
 		return task
 	}
@@ -1323,7 +1297,7 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 			throw("runtime: invalid stackless coroutine operation cache")
 		}
 	} else {
-		if s.freeOperationCount == 0 ||
+		if s.freeOperationCount <= 0 ||
 			s.freeOperationCount > stacklessCoroOperationCacheSize {
 			unlock(&s.lock)
 			throw("runtime: invalid stackless coroutine operation cache count")
@@ -1369,7 +1343,8 @@ func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperati
 	if raceenabled {
 		return
 	}
-	if s.freeOperationCount > stacklessCoroOperationCacheSize {
+	if s.freeOperationCount < 0 ||
+		s.freeOperationCount > stacklessCoroOperationCacheSize {
 		throw("runtime: invalid stackless coroutine operation cache size")
 	}
 	if s.freeOperationCount == stacklessCoroOperationCacheSize {

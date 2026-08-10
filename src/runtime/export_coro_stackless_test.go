@@ -250,7 +250,7 @@ func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 	lock(&s.lock)
 	count := s.freeOperationCount
 	unlock(&s.lock)
-	return int(count)
+	return count
 }
 
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {

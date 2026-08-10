@@ -1456,7 +1456,7 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		oldProcs := runtime.GOMAXPROCS(1)
 		defer runtime.GOMAXPROCS(oldProcs)
 
-		const children = runtime.StacklessCoroTaskCacheSize + 1
+		const children = runtime.StacklessCoroTaskCacheSize + 2
 		var state int
 		var total atomic.Int32
 		var bypassed bool
