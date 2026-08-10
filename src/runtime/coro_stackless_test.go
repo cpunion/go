@@ -976,6 +976,12 @@ type stacklessCoroLargeFrameCacheTestFrame struct {
 	padding [runtime.StacklessCoroFrameCacheSize / 2]byte
 }
 
+type stacklessCoroUncachedParentTestFrame struct {
+	state    int
+	reserved *bool
+	total    *int
+}
+
 type stacklessCoroDeepFrameCacheTestFrame struct {
 	depth    int
 	state    int
@@ -992,6 +998,34 @@ func stacklessCoroLargeFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	frame.done.Add(1)
 	frame.done = nil
 	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroUncachedParentResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroUncachedParentTestFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.state {
+	case 0:
+		frame.state = 1
+		child := runtime.TakeStacklessCoroFrameForTest(ctx,
+			stacklessCoroFrameCacheResume,
+			unsafe.Sizeof(stacklessCoroFrameCacheTestFrame{}))
+		*frame.reserved =
+			runtime.StacklessCoroReservedFrameCountForTest(ctx) != 0
+		if child == nil {
+			child = unsafe.Pointer(new(stacklessCoroFrameCacheTestFrame))
+		}
+		*(*stacklessCoroFrameCacheTestFrame)(child) =
+			stacklessCoroFrameCacheTestFrame{value: 1, total: frame.total}
+		runtime.AwaitStacklessCoroFrameForTest(ctx, child,
+			stacklessCoroFrameCacheResume)
+		return runtime.StacklessCoroActionWait
+	case 1:
+		frame.reserved = nil
+		frame.total = nil
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
 }
 
 func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
@@ -1325,6 +1359,43 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				return runtime.StacklessCoroActionInvalid
 			}
 		})
+	})
+
+	t.Run("uncached-parent", func(t *testing.T) {
+		var state int
+		var reserved bool
+		var total int
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				frame := runtime.TakeStacklessCoroFrameForTest(ctx,
+					stacklessCoroUncachedParentResume,
+					runtime.StacklessCoroFrameCacheSize+1)
+				if frame != nil {
+					t.Fatalf("oversized cached frame = %p, want nil", frame)
+				}
+				frame = unsafe.Pointer(new(stacklessCoroUncachedParentTestFrame))
+				*(*stacklessCoroUncachedParentTestFrame)(frame) =
+					stacklessCoroUncachedParentTestFrame{
+						reserved: &reserved, total: &total,
+					}
+				runtime.AwaitStacklessCoroFrameForTest(ctx, frame,
+					stacklessCoroUncachedParentResume)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected uncached-parent state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if got, want := reserved, !race.Enabled; got != want {
+			t.Fatalf("uncached-parent child reserved = %t, want %t", got, want)
+		}
+		if total != 1 {
+			t.Fatalf("uncached-parent total = %d, want 1", total)
+		}
 	})
 
 	t.Run("deep-retention", func(t *testing.T) {

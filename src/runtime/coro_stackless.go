@@ -29,6 +29,10 @@ const stacklessCoroWarmExecutorCount = 4
 const stacklessCoroTaskCacheSize = 256
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
+
+// stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
+// created after the task cache saturated. It cannot be a cached frame size.
+const stacklessCoroUncachedFrameLineage = ^uint16(0)
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 const (
@@ -560,10 +564,10 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		throw("runtime: invalid stackless coroutine frame reservation")
 	}
 	s := context.scheduler
-	// An uncached explicit-frame task carries an uncached lineage without a
+	// A marked explicit-frame task carries a saturated lineage without a
 	// shared-state query. A root may fill the cache with sibling spawns, so it
 	// consults the saturation hint before entering the scheduler.
-	if parent != &s.root && !parent.cacheFrame && parent.context.frame != nil {
+	if parent.frameSize == stacklessCoroUncachedFrameLineage {
 		return nil
 	}
 	if parent == &s.root && s.frameCacheSaturated() {
@@ -588,6 +592,9 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			s.cachedFrameBytes += uint16(size)
 			s.updateFrameCacheSaturationLocked(oldCachedTasks,
 				s.freeFrameBytes)
+		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0 {
+			task.frameSize = stacklessCoroUncachedFrameLineage
 		}
 	} else {
 		task.parent = parent
@@ -597,6 +604,22 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	frame := task.context.frame
 	unlock(&s.lock)
 	return frame
+}
+
+// markUncachedFrameLineageLocked records a saturated explicit-frame lineage
+// after a factory bypasses its reservation. The scheduler lock must be held.
+func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
+	parent *stacklessCoroTask, frame unsafe.Pointer) {
+	if frame == nil || task.cacheFrame ||
+		task.frameSize == stacklessCoroUncachedFrameLineage {
+		return
+	}
+	if parent.frameSize == stacklessCoroUncachedFrameLineage ||
+		(parent == &s.root &&
+			s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0) {
+		task.frameSize = stacklessCoroUncachedFrameLineage
+	}
 }
 
 func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
@@ -713,6 +736,7 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	if task == nil {
 		task = s.newTaskLocked(frame, child, parent)
 	}
+	s.markUncachedFrameLineageLocked(task, parent, frame)
 	parent.state = stacklessCoroTaskWaiting
 	s.readyLocked(task)
 	unlock(&s.lock)
@@ -1048,6 +1072,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	} else {
 		task.parent = nil
 	}
+	s.markUncachedFrameLineageLocked(task, parent, frame)
 	s.readyLocked(task)
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
