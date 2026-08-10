@@ -444,6 +444,20 @@ func ExecutorChannelsStacklessCoroForTest(ctx unsafe.Pointer) (bool, bool, bool)
 		scheduler.executorDone != nil
 }
 
+func WakeStacklessCoroForTest(ctx unsafe.Pointer) chan struct{} {
+	context := (*stacklessCoroContext)(ctx)
+	return context.scheduler.wake
+}
+
+func SignalStacklessCoroForTest(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	context.scheduler.signal()
+}
+
+func StacklessCoroWakePoolSizeForTest() int {
+	return len(stacklessCoroWakePool.available)
+}
+
 func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
 	return context.task() == &context.scheduler.root

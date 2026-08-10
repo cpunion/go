@@ -165,8 +165,16 @@ var stacklessCoroOperations struct {
 	head *stacklessCoroOperation
 }
 
+// The bounded wake pool retains channels only after every executor for their
+// previous scheduler has stopped. Race builds keep a distinct synchronization
+// identity for each scheduler instead.
+var stacklessCoroWakePool struct {
+	available chan chan struct{}
+}
+
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
+	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -179,12 +187,12 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
 	s := newStacklessCoroScheduler(frame, resume)
 
 	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
-		nativeScheduler.stopReplacementExecutors()
-		nativeScheduler.finish()
-		return
+		s = nativeScheduler
+	} else {
+		s.run(false)
 	}
-	s.run(false)
 	s.stopReplacementExecutors()
+	s.releaseWake()
 	s.finish()
 }
 
@@ -194,7 +202,7 @@ func newStacklessCoroScheduler(frame unsafe.Pointer,
 		throw("runtime: nil stackless coroutine resume function")
 	}
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+		wake: acquireStacklessCoroWake(),
 	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
@@ -202,6 +210,36 @@ func newStacklessCoroScheduler(frame unsafe.Pointer,
 	s.root.context.frame = frame
 	s.ready(&s.root, false)
 	return s
+}
+
+func acquireStacklessCoroWake() chan struct{} {
+	if !raceenabled {
+		select {
+		case wake := <-stacklessCoroWakePool.available:
+			return wake
+		default:
+		}
+	}
+	return make(chan struct{}, stacklessCoroWarmExecutorCount)
+}
+
+func (s *stacklessCoroScheduler) releaseWake() {
+	wake := s.wake
+	s.wake = nil
+	if !raceenabled {
+		for {
+			select {
+			case <-wake:
+				continue
+			default:
+				select {
+				case stacklessCoroWakePool.available <- wake:
+				default:
+				}
+				return
+			}
+		}
+	}
 }
 
 // newTaskLocked returns a new or recycled non-root task. The scheduler lock
@@ -867,6 +905,7 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 
 	s := newStacklessCoroScheduler(frame, resume)
 	s.run(false)
+	s.releaseWake()
 	if raceenabled {
 		raceacquire(unsafe.Pointer(&s.root))
 	}
