@@ -2609,6 +2609,11 @@ and one task for every depth beyond the cache. The unchanged public 336 B
 also confirms that the packed cache counters did not grow the root scheduler
 allocation class.
 
+Three 200 ms Linux/amd64 samples under QEMU reproduced the exact allocation
+results: public entry used 336 B and four allocations, depth 64 used 360 B
+and four allocations, and depth 4,096 used 369,000 B and 7,684 allocations.
+The translated timings are not compared with native Darwin.
+
 The exact upstream merge-base at revision `5d29d80b6c` still allocates no
 objects in the same probes:
 
