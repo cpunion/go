@@ -430,10 +430,6 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		if task == nil || task.context.scheduler != s {
 			return
 		}
-		if task == &s.root &&
-			task.frameSize == stacklessCoroUncachedFrameLineage {
-			task.frameSize = 0
-		}
 		p := getg()._panic
 		if p == nil || p.goexit {
 			return
@@ -462,10 +458,6 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		}
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
-		if task == &s.root &&
-			task.frameSize == stacklessCoroUncachedFrameLineage {
-			task.frameSize = 0
-		}
 		task.context.scheduler = nil
 
 		switch action {
@@ -530,8 +522,7 @@ func coroFrameCached(ctx unsafe.Pointer) bool {
 // await or spawn operation consumes it.
 func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr) unsafe.Pointer {
-	if ctx == nil || raceenabled || size == 0 ||
-		size > stacklessCoroFrameCacheSize {
+	if ctx == nil || raceenabled || size > stacklessCoroFrameCacheSize {
 		return nil
 	}
 	context := (*stacklessCoroContext)(ctx)
@@ -542,8 +533,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	s := context.scheduler
 	// A marked explicit-frame task carries a saturated lineage without a
 	// shared-state query.
-	if !parent.cacheFrame &&
-		parent.frameSize == stacklessCoroUncachedFrameLineage {
+	if parent.frameSize == stacklessCoroUncachedFrameLineage {
 		return nil
 	}
 	lock(&s.lock)
@@ -565,9 +555,6 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
 			s.freeFrameBytes == 0 {
 			task.frameSize = stacklessCoroUncachedFrameLineage
-			if parent == &s.root {
-				parent.frameSize = stacklessCoroUncachedFrameLineage
-			}
 		}
 	} else {
 		task.parent = parent
@@ -587,10 +574,7 @@ func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 		task.frameSize == stacklessCoroUncachedFrameLineage {
 		return
 	}
-	if parent.frameSize == stacklessCoroUncachedFrameLineage ||
-		(parent == &s.root &&
-			s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-			s.freeFrameBytes == 0) {
+	if parent.frameSize == stacklessCoroUncachedFrameLineage {
 		task.frameSize = stacklessCoroUncachedFrameLineage
 	}
 }

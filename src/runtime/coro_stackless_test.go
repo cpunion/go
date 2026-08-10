@@ -988,10 +988,6 @@ type stacklessCoroDeepFrameCacheTestFrame struct {
 	bypassed *atomic.Int32
 }
 
-type stacklessCoroFrameCacheSpawnTestFrame struct {
-	done *atomic.Int32
-}
-
 func stacklessCoroLargeFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroLargeFrameCacheTestFrame)(
 		runtime.FrameStacklessCoroForTest(ctx))
@@ -1063,14 +1059,6 @@ func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	}
 }
 
-func stacklessCoroFrameCacheSpawnResume(ctx unsafe.Pointer) uint8 {
-	frame := (*stacklessCoroFrameCacheSpawnTestFrame)(
-		runtime.FrameStacklessCoroForTest(ctx))
-	frame.done.Add(1)
-	frame.done = nil
-	return runtime.StacklessCoroActionComplete
-}
-
 func newStacklessCoroFrameCacheTestFrame(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8, value int, total *int) unsafe.Pointer {
 	frame := runtime.TakeStacklessCoroFrameForTest(ctx, resume,
@@ -1090,10 +1078,6 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 			t.Fatalf("frame without context = %p, want nil", frame)
 		}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if frame := runtime.TakeStacklessCoroFrameForTest(ctx,
-				stacklessCoroFrameCacheResume, 0); frame != nil {
-				t.Fatalf("empty cached frame = %p, want nil", frame)
-			}
 			frame := runtime.TakeStacklessCoroFrameForTest(ctx,
 				stacklessCoroFrameCacheResume,
 				runtime.StacklessCoroFrameCacheSize+1)
@@ -1449,53 +1433,6 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		if got := bypassed.Load(); got != wantBypassed {
 			t.Fatalf("deep frame-cache bypasses = %d, want %d",
 				got, wantBypassed)
-		}
-	})
-
-	t.Run("saturated-spawn", func(t *testing.T) {
-		oldProcs := runtime.GOMAXPROCS(1)
-		defer runtime.GOMAXPROCS(oldProcs)
-
-		const children = runtime.StacklessCoroTaskCacheSize + 2
-		var state int
-		var total atomic.Int32
-		var bypassed bool
-		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			switch state {
-			case 0:
-				state = 1
-				for range children {
-					frame := runtime.TakeStacklessCoroFrameForTest(ctx,
-						stacklessCoroFrameCacheSpawnResume,
-						unsafe.Sizeof(stacklessCoroFrameCacheSpawnTestFrame{}))
-					if runtime.StacklessCoroReservedFrameCountForTest(ctx) == 0 {
-						bypassed = true
-					}
-					if frame == nil {
-						frame = unsafe.Pointer(new(stacklessCoroFrameCacheSpawnTestFrame))
-					}
-					*(*stacklessCoroFrameCacheSpawnTestFrame)(frame) =
-						stacklessCoroFrameCacheSpawnTestFrame{done: &total}
-					runtime.SpawnStacklessCoroFrameForTest(ctx, frame,
-						stacklessCoroFrameCacheSpawnResume)
-				}
-				return runtime.StacklessCoroActionYield
-			case 1:
-				if total.Load() != children {
-					return runtime.StacklessCoroActionYield
-				}
-				state = 2
-				return runtime.StacklessCoroActionComplete
-			default:
-				t.Fatalf("unexpected saturated-spawn state %d", state)
-				return runtime.StacklessCoroActionInvalid
-			}
-		})
-		if got := total.Load(); got != children {
-			t.Fatalf("saturated-spawn total = %d, want %d", got, children)
-		}
-		if !race.Enabled && !bypassed {
-			t.Fatal("saturated spawn never bypassed a frame reservation")
 		}
 	})
 
