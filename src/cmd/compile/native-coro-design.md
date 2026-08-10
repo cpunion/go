@@ -1767,6 +1767,10 @@ The runtime:
   switch and returns it to the root owner for replacement-executor shutdown;
   the low-level switch helper does not own scheduler-lifecycle policy or reuse
   a caller local saved on the pre-switch stack;
+- lets a root borrow the bounded logical-task free list retained by its native
+  context, and returns that list before releasing the context only when the
+  root never started replacement executors; replacement executors and race
+  builds do not move the cache;
 - uses common operation ownership for timer, regular-file worker, nonblocking
   socket, and asynchronous C completion;
 - registers ordinary channel send and receive directly in the runtime channel
@@ -2513,6 +2517,42 @@ The explicit frame removes one object from a public entry and almost half the
 objects in recursive lowering, but it does not eliminate the remaining frame
 allocation or scheduler transition cost. Those are separate optimization
 targets; the translated Linux ratios show direction, not native timing.
+
+A native-root follow-up retains the scheduler's bounded logical-task free list
+in its pooled native context between single-executor roots. Each cache remains
+limited to 256 six-word task headers, or 12 KiB on the MVP targets. Only the
+four-entry warm pool retains caches, bounding long-lived task retention at
+48 KiB; contexts returned to the overflow list discard their cache. A root
+that starts replacement executors leaves its cache with the root scheduler,
+preserving the existing native-context release and locked-M handoff order.
+Operation records are not retained across roots: their existing per-root cache
+already covers the steady timer, file, and network loops, and the cross-root
+retention cost had no measured benefit.
+
+Twenty alternating one-second Darwin/arm64 samples isolated depth-64
+recursion. Reusing the logical tasks changed the median from 7.660 us to
+6.799 us (-11.24%), from 6,504 to 3,432 bytes (-47.23%), and from 132 to 68
+allocations (-48.48%). A broader twelve-sample 500 ms gate reproduced the
+allocation counts but had noisier timing: public entry, task sequence,
+100-task burst, and 100 parked tasks had no significant time or allocation
+change. Depth-4,096 recursion fell from 8,196 to 7,940 allocations (-3.12%);
+the 256-entry bound deliberately leaves the remaining simultaneously live
+tasks uncached. A separate timer, file, TCP, blocking-I/O, and blocking-C gate
+reported identical bytes and allocations and no significant time changes.
+
+The same ten-sample gate against exact upstream revision `5d29d80b6c` leaves
+a material lower bound after task reuse:
+
+| Probe | Upstream Darwin | Native task cache | Ratio |
+| --- | ---: | ---: | ---: |
+| public yield entry | 49.24 ns, 0 allocs | 1,106.5 ns, 4 allocs | 22.5x |
+| recursive yield, depth 64 | 400.0 ns, 0 allocs | 6,740 ns, 68 allocs | 16.8x |
+| recursive yield, depth 4,096 | 20.11 us, 0 allocs | 402.3 us, 7,940 allocs | 20.0x |
+
+The remaining recursive objects are typed frames and tasks beyond the bounded
+cache. Public entry also retains its result cell, typed frame, root scheduler,
+and wake channel. Frame/result fusion and root-entry cost therefore remain
+separate optimization targets.
 
 Object inspection shows one typed heap allocation in each eligible factory
 and a direct frame load at resume entry. The task header remains 48 bytes. The
