@@ -560,10 +560,13 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		throw("runtime: invalid stackless coroutine frame reservation")
 	}
 	s := context.scheduler
-	// Once every cache-owned task is active, a positive-sized frame cannot
-	// reuse or claim a slot. Let the following await or spawn allocate its
-	// ordinary task instead of entering the scheduler twice.
-	if s.frameCacheSaturated() {
+	// An uncached explicit-frame task carries an uncached lineage without a
+	// shared-state query. A root may fill the cache with sibling spawns, so it
+	// consults the saturation hint before entering the scheduler.
+	if parent != &s.root && !parent.cacheFrame && parent.context.frame != nil {
+		return nil
+	}
+	if parent == &s.root && s.frameCacheSaturated() {
 		return nil
 	}
 	lock(&s.lock)
