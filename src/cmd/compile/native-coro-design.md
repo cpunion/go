@@ -2768,6 +2768,11 @@ Both runs reproduced every allocation count exactly. The opposite fixed-image
 timing directions, together with the randomized-layout control, show no
 systematic timing regression.
 
+The same twelve-seed randomized-layout control on the native EPYC 9V74 runner
+also found entry, depth 64, and depth 4,096 neutral (`p=0.062`, `0.203`, and
+`0.160`); its timing geomean improved by 0.14%. Every seed again reproduced
+the exact allocation reductions.
+
 For scale, the exact upstream results retained from the same Darwin benchmark
 series were 46.34 ns at entry, 391.9 ns at depth 64, and 18.95 us at depth
 4,096, with no heap allocation. Wake reuse leaves the coroutine path about
