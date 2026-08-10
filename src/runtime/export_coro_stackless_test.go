@@ -199,18 +199,20 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 	}
 	first.next = second
 	s := &stacklessCoroScheduler{
-		reservedTasks: first, cachedFrameTasks: 2, cachedFrameBytes: 2,
+		reservedTasks: first, cachedFrameBytes: 2,
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	lock(&s.lock)
+	s.setTaskCacheCountsLocked(0, 2)
 	s.cancelReservedFrameTasksLocked(firstParent)
-	recycled := s.freeTasks == first && s.freePlainTaskCount == 1
+	freePlain, cachedTasks := s.taskCacheCounts()
+	recycled := s.freeTasks == first && freePlain == 1
 	if raceenabled {
-		recycled = s.freeTasks == nil && s.freePlainTaskCount == 0
+		recycled = s.freeTasks == nil && freePlain == 0
 	}
 	valid := s.reservedTasks == second && second.next == nil &&
 		second.parent == secondParent && second.cacheFrame &&
-		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1 &&
+		cachedTasks == 1 && s.cachedFrameBytes == 1 &&
 		recycled &&
 		first.resume == nil && first.context.frame == nil && !first.cacheFrame
 	unlock(&s.lock)
@@ -228,15 +230,16 @@ func StacklessCoroPreferPlainTaskForTest() bool {
 	plain := new(stacklessCoroTask)
 	cached.next = plain
 	s := &stacklessCoroScheduler{
-		freeTasks: cached, freePlainTaskCount: 1, freeFrameBytes: 1,
-		cachedFrameTasks: 1, cachedFrameBytes: 1,
+		freeTasks: cached, freeFrameBytes: 1, cachedFrameBytes: 1,
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	lock(&s.lock)
+	s.setTaskCacheCountsLocked(1, 1)
 	got := s.newTaskLocked(nil, resume, nil)
+	freePlain, cachedTasks := s.taskCacheCounts()
 	valid := got == plain && s.freeTasks == cached && cached.next == nil &&
-		s.freePlainTaskCount == 0 && s.freeFrameBytes == 1 &&
-		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1
+		freePlain == 0 && s.freeFrameBytes == 1 &&
+		cachedTasks == 1 && s.cachedFrameBytes == 1
 	unlock(&s.lock)
 	return valid
 }

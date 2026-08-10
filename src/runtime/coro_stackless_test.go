@@ -977,8 +977,13 @@ type stacklessCoroLargeFrameCacheTestFrame struct {
 }
 
 type stacklessCoroDeepFrameCacheTestFrame struct {
-	depth int
-	state int
+	depth    int
+	state    int
+	bypassed *atomic.Int32
+}
+
+type stacklessCoroFrameCacheSpawnTestFrame struct {
+	done *atomic.Int32
 }
 
 func stacklessCoroLargeFrameCacheResume(ctx unsafe.Pointer) uint8 {
@@ -995,25 +1000,41 @@ func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	switch frame.state {
 	case 0:
 		if frame.depth == 0 {
+			frame.bypassed = nil
 			return runtime.StacklessCoroActionComplete
 		}
 		frame.state = 1
 		child := runtime.TakeStacklessCoroFrameForTest(ctx,
 			stacklessCoroDeepFrameCacheResume,
 			unsafe.Sizeof(stacklessCoroDeepFrameCacheTestFrame{}))
+		if !race.Enabled &&
+			runtime.StacklessCoroReservedFrameCountForTest(ctx) == 0 {
+			frame.bypassed.Add(1)
+		}
 		if child == nil {
 			child = unsafe.Pointer(new(stacklessCoroDeepFrameCacheTestFrame))
 		}
 		*(*stacklessCoroDeepFrameCacheTestFrame)(child) =
-			stacklessCoroDeepFrameCacheTestFrame{depth: frame.depth - 1}
+			stacklessCoroDeepFrameCacheTestFrame{
+				depth: frame.depth - 1, bypassed: frame.bypassed,
+			}
 		runtime.AwaitStacklessCoroFrameForTest(ctx, child,
 			stacklessCoroDeepFrameCacheResume)
 		return runtime.StacklessCoroActionWait
 	case 1:
+		frame.bypassed = nil
 		return runtime.StacklessCoroActionComplete
 	default:
 		return runtime.StacklessCoroActionInvalid
 	}
+}
+
+func stacklessCoroFrameCacheSpawnResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroFrameCacheSpawnTestFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	frame.done.Add(1)
+	frame.done = nil
+	return runtime.StacklessCoroActionComplete
 }
 
 func newStacklessCoroFrameCacheTestFrame(ctx unsafe.Pointer,
@@ -1304,6 +1325,7 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		frameSize := unsafe.Sizeof(stacklessCoroDeepFrameCacheTestFrame{})
 		var state int
 		var frames [2]unsafe.Pointer
+		var bypassed atomic.Int32
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch state {
 			case 0, 1:
@@ -1326,7 +1348,9 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				}
 				frames[index] = frame
 				*(*stacklessCoroDeepFrameCacheTestFrame)(frame) =
-					stacklessCoroDeepFrameCacheTestFrame{depth: depth}
+					stacklessCoroDeepFrameCacheTestFrame{
+						depth: depth, bypassed: &bypassed,
+					}
 				runtime.AwaitStacklessCoroFrameForTest(ctx, frame,
 					stacklessCoroDeepFrameCacheResume)
 				return runtime.StacklessCoroActionWait
@@ -1339,6 +1363,56 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		})
 		if got, want := frames[0] == frames[1], !race.Enabled; got != want {
 			t.Fatalf("deep-unwind frame reused = %t, want %t", got, want)
+		}
+		if !race.Enabled && bypassed.Load() == 0 {
+			t.Fatal("deep frame cache never bypassed a saturated reservation")
+		}
+	})
+
+	t.Run("saturated-spawn", func(t *testing.T) {
+		oldProcs := runtime.GOMAXPROCS(1)
+		defer runtime.GOMAXPROCS(oldProcs)
+
+		const children = runtime.StacklessCoroTaskCacheSize + 1
+		var state int
+		var total atomic.Int32
+		var bypassed bool
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				for range children {
+					frame := runtime.TakeStacklessCoroFrameForTest(ctx,
+						stacklessCoroFrameCacheSpawnResume,
+						unsafe.Sizeof(stacklessCoroFrameCacheSpawnTestFrame{}))
+					if runtime.StacklessCoroReservedFrameCountForTest(ctx) == 0 {
+						bypassed = true
+					}
+					if frame == nil {
+						frame = unsafe.Pointer(new(stacklessCoroFrameCacheSpawnTestFrame))
+					}
+					*(*stacklessCoroFrameCacheSpawnTestFrame)(frame) =
+						stacklessCoroFrameCacheSpawnTestFrame{done: &total}
+					runtime.SpawnStacklessCoroFrameForTest(ctx, frame,
+						stacklessCoroFrameCacheSpawnResume)
+				}
+				return runtime.StacklessCoroActionYield
+			case 1:
+				if total.Load() != children {
+					return runtime.StacklessCoroActionYield
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected saturated-spawn state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if got := total.Load(); got != children {
+			t.Fatalf("saturated-spawn total = %d, want %d", got, children)
+		}
+		if !race.Enabled && !bypassed {
+			t.Fatal("saturated spawn never bypassed a frame reservation")
 		}
 	})
 

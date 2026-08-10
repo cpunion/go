@@ -23,22 +23,21 @@ const (
 )
 
 type stacklessCoroNativeContext struct {
-	gState             stacklessCoroGState
-	scheduler          *stacklessCoroScheduler
-	freeTasks          *stacklessCoroTask
-	freePlainTaskCount uint16
-	freeFrameBytes     uint16
-	cachedFrameTasks   uint16
-	cachedFrameBytes   uint16
-	schedulerG         *g
-	executor           *g
-	caller             *g
-	nativeG0           *g
-	lockedG            guintptr
-	lockedInt          uint32
-	g0Accurate         bool
-	sigmask            sigset
-	poolNext           *stacklessCoroNativeContext
+	gState           stacklessCoroGState
+	scheduler        *stacklessCoroScheduler
+	freeTasks        *stacklessCoroTask
+	taskCacheState   uint32
+	freeFrameBytes   uint16
+	cachedFrameBytes uint16
+	schedulerG       *g
+	executor         *g
+	caller           *g
+	nativeG0         *g
+	lockedG          guintptr
+	lockedInt        uint32
+	g0Accurate       bool
+	sigmask          sigset
+	poolNext         *stacklessCoroNativeContext
 }
 
 var stacklessCoroNativePool struct {
@@ -85,14 +84,12 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	}
 	if root && ctx.freeTasks != nil {
 		s.freeTasks = ctx.freeTasks
-		s.freePlainTaskCount = ctx.freePlainTaskCount
+		s.taskCacheState.Store(ctx.taskCacheState)
 		s.freeFrameBytes = ctx.freeFrameBytes
-		s.cachedFrameTasks = ctx.cachedFrameTasks
 		s.cachedFrameBytes = ctx.cachedFrameBytes
 		ctx.freeTasks = nil
-		ctx.freePlainTaskCount = 0
+		ctx.taskCacheState = 0
 		ctx.freeFrameBytes = 0
-		ctx.cachedFrameTasks = 0
 		ctx.cachedFrameBytes = 0
 	}
 
@@ -112,14 +109,12 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if root && scheduler.executorState.Load() == stacklessCoroExecutorStateOff &&
 		scheduler.freeTasks != nil {
 		ctx.freeTasks = scheduler.freeTasks
-		ctx.freePlainTaskCount = scheduler.freePlainTaskCount
+		ctx.taskCacheState = scheduler.taskCacheState.Load()
 		ctx.freeFrameBytes = scheduler.freeFrameBytes
-		ctx.cachedFrameTasks = scheduler.cachedFrameTasks
 		ctx.cachedFrameBytes = scheduler.cachedFrameBytes
 		scheduler.freeTasks = nil
-		scheduler.freePlainTaskCount = 0
+		scheduler.taskCacheState.Store(0)
 		scheduler.freeFrameBytes = 0
-		scheduler.cachedFrameTasks = 0
 		scheduler.cachedFrameBytes = 0
 	}
 	releaseStacklessCoroNativeContext(ctx)
@@ -153,9 +148,8 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	// Only the bounded warm pool retains task caches. The overflow list may
 	// grow with peak root concurrency and must not retain one cache per peak.
 	ctx.freeTasks = nil
-	ctx.freePlainTaskCount = 0
+	ctx.taskCacheState = 0
 	ctx.freeFrameBytes = 0
-	ctx.cachedFrameTasks = 0
 	ctx.cachedFrameBytes = 0
 	lock(&stacklessCoroNativePool.lock)
 	ctx.poolNext = stacklessCoroNativePool.overflow
