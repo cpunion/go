@@ -156,6 +156,8 @@ func (s *stacklessCoroScheduler) setTaskCacheCountsLocked(
 	}
 	state := uint32(freePlain) |
 		uint32(cached)<<stacklessCoroCachedTaskShift
+	// Cached frames are nonempty, so zero free bytes means every cache-owned
+	// task is active or reserved.
 	if cached == stacklessCoroTaskCacheSize && s.freeFrameBytes == 0 {
 		state |= stacklessCoroFrameCacheSaturatedBit
 	}
@@ -557,7 +559,8 @@ func coroFrameCached(ctx unsafe.Pointer) bool {
 // await or spawn operation consumes it.
 func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr) unsafe.Pointer {
-	if ctx == nil || raceenabled || size > stacklessCoroFrameCacheSize {
+	if ctx == nil || raceenabled || size == 0 ||
+		size > stacklessCoroFrameCacheSize {
 		return nil
 	}
 	context := (*stacklessCoroContext)(ctx)
@@ -569,7 +572,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	// Once every cache-owned task is active, a positive-sized frame cannot
 	// reuse or claim a slot. Let the following await or spawn allocate its
 	// ordinary task instead of entering the scheduler twice.
-	if size != 0 && s.frameCacheSaturated() {
+	if s.frameCacheSaturated() {
 		return nil
 	}
 	lock(&s.lock)

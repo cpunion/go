@@ -1056,11 +1056,18 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 			t.Fatalf("frame without context = %p, want nil", frame)
 		}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if frame := runtime.TakeStacklessCoroFrameForTest(ctx,
+				stacklessCoroFrameCacheResume, 0); frame != nil {
+				t.Fatalf("empty cached frame = %p, want nil", frame)
+			}
 			frame := runtime.TakeStacklessCoroFrameForTest(ctx,
 				stacklessCoroFrameCacheResume,
 				runtime.StacklessCoroFrameCacheSize+1)
 			if frame != nil {
 				t.Fatalf("oversized cached frame = %p, want nil", frame)
+			}
+			if got := runtime.StacklessCoroReservedFrameCountForTest(ctx); got != 0 {
+				t.Fatalf("unavailable frame reservations = %d, want 0", got)
 			}
 			return runtime.StacklessCoroActionComplete
 		})
