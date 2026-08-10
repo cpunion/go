@@ -1442,8 +1442,13 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		if got, want := frames[0] == frames[1], !race.Enabled; got != want {
 			t.Fatalf("deep-unwind frame reused = %t, want %t", got, want)
 		}
-		if !race.Enabled && bypassed.Load() == 0 {
-			t.Fatal("deep frame cache never bypassed a saturated reservation")
+		wantBypassed := int32(0)
+		if !race.Enabled {
+			wantBypassed = 2 * int32(depth-runtime.StacklessCoroTaskCacheSize)
+		}
+		if got := bypassed.Load(); got != wantBypassed {
+			t.Fatalf("deep frame-cache bypasses = %d, want %d",
+				got, wantBypassed)
 		}
 	})
 
