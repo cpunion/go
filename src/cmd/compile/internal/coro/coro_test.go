@@ -4377,7 +4377,8 @@ import (
 )
 
 type payload struct {
-	value int64
+	value   int64
+	padding [32]byte
 }
 
 var finalized atomic.Int64
@@ -4387,11 +4388,23 @@ func finalize(value *payload) {
 }
 
 //go:noinline
-func cached(value int64) int64 {
-	pointer := &payload{value: value}
-	runtime.SetFinalizer(pointer, finalize)
+func cached(pointer *payload) int64 {
 	runtime.Gosched()
 	result := pointer.value
+	runtime.KeepAlive(pointer)
+	return result
+}
+
+//go:noinline
+func runCached(pointer *payload) int64 {
+	return cached(pointer)
+}
+
+//go:noinline
+func makeAndRun(value int64) int64 {
+	pointer := &payload{value: value}
+	runtime.SetFinalizer(pointer, finalize)
+	result := runCached(pointer)
 	runtime.KeepAlive(pointer)
 	return result
 }
@@ -4410,11 +4423,11 @@ func waitFinalizer(want int64) {
 }
 
 func main() {
-	if cached(41) != 41 {
+	if makeAndRun(41) != 41 {
 		panic("bad first cached result")
 	}
 	waitFinalizer(41)
-	if cached(42) != 42 {
+	if makeAndRun(42) != 42 {
 		panic("bad reused cached result")
 	}
 	waitFinalizer(42)
@@ -4428,7 +4441,7 @@ func main() {
 	exe := filepath.Join(tmp, "coro-frame-cache")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=command-line-arguments=-d=coro=2",
+		"-gcflags=command-line-arguments=-d=coro=4",
 		src)
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
@@ -4439,8 +4452,11 @@ func main() {
 	if err != nil {
 		t.Fatalf("building typed-frame cache test failed: %v\n%s", err, data)
 	}
-	if diagnostic := "skip main.cached:"; strings.Contains(string(data), diagnostic) {
-		t.Fatalf("output contains unexpected %q\n%s", diagnostic, data)
+	for _, function := range []string{"cached", "runCached"} {
+		diagnostic := "skip main." + function + ":"
+		if strings.Contains(string(data), diagnostic) {
+			t.Fatalf("output contains unexpected %q\n%s", diagnostic, data)
+		}
 	}
 
 	cmd = testenv.Command(t, exe)
