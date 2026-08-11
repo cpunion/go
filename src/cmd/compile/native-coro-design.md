@@ -2780,6 +2780,130 @@ series were 46.34 ns at entry, 391.9 ns at depth 64, and 18.95 us at depth
 the result cell, typed root frame, scheduler allocation, and the uncached deep
 frames and tasks remain independent targets.
 
+### 15.7 Saturated task slabs
+
+The bounded frame cache leaves two equal-sized allocation streams after it
+saturates. A depth-4,096 allocation profile attributed 50.19% of allocated
+bytes to compiler-generated typed frames and 49.55% to runtime task objects.
+Each uncached level allocated one 48-byte task on 64-bit targets in addition
+to its typed frame. This change reduces the runtime half without changing the
+compiler/runtime ABI or the ownership of typed frames.
+
+Only a non-race, explicit-frame descendant of a saturated frame-cache lineage
+is eligible for batched task storage. The scheduler first allocates four tasks
+individually. It then allocates arrays of four tasks and links the three unused
+elements into its free list. Four tasks are exactly 192 bytes on 64-bit targets
+and 112 bytes on 32-bit targets. Both are exact allocator size classes and are
+below their respective per-object malloc-header thresholds. The four direct
+allocations avoid charging a complete slab at the first cache-boundary miss.
+
+An unused slab element carries a private free-list marker. An unmarked logical
+goroutine cannot consume it, even when ordinary and slab tasks share the same
+list. Once an element is used, the saturated-lineage marker remains attached
+until completion and prevents that interior pointer from entering the ordinary
+task cache. Otherwise one retained element could keep its whole slab alive in
+a pooled native context. Any never-used elements from the final partial slab
+are removed before the bounded ordinary cache transfers to that context. Race
+builds continue to allocate distinct task identities and do not use slabs.
+
+The slab and direct-allocation counters are bounded by three and four. They
+share the former machine word used by the operation-cache counter, whose bound
+is 64. The scheduler therefore remains 192 bytes on 64-bit targets and 112
+bytes on 32-bit targets. The task remains 48 and 28 bytes respectively. Local
+Linux/386 execution checks both layouts in addition to the normal Darwin/arm64
+and Linux/amd64 tests.
+
+Larger prototypes were rejected because a 16-task, 768-byte object crosses the
+64-bit malloc-header threshold and incurs a larger size-class charge. A
+two-task slab stayed within an exact size class but reduced depth-4,096 task
+allocations by only 25%. Four-task slabs reduce them by 37.43% while leaving
+only a 48-byte steady deep-recursion byte increase. The short direct prefix is
+also material at the boundary: batching immediately would create a much larger
+one-step byte cliff.
+
+The benchmark probes at depths 256, 262, and 264 make the cache boundary and
+the first slab observable. The exact parent is `51017c67c1`; the measured
+runtime is `c13526f50d`:
+
+| Probe | Parent | Task slabs | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 224 B, 3 allocs | 224 B, 3 allocs | unchanged |
+| recursive yield, depth 64 | 248 B, 3 allocs | 248 B, 3 allocs | unchanged |
+| recursive yield, depth 256 | 248 B, 3 allocs | 248 B, 3 allocs | unchanged |
+| recursive yield, depth 262 | 824 B, 15 allocs | 968 B, 15 allocs | +144 B, allocations unchanged |
+| recursive yield, depth 264 | 1,016 B, 19 allocs | 1,064 B, 17 allocs | +48 B, -10.53% allocs |
+| recursive yield, depth 4,096 | 368,888 B, 7,683 allocs | 368,936 B, 4,807 allocs | +48 B, -37.43% allocs |
+
+The depth-262 row is the intentionally exposed worst boundary: it has consumed
+only part of the first slab, so its live-byte charge rises before allocation
+amortization begins. By depth 264 the slab saves two allocation operations.
+At depth 4,096 it replaces 2,876 independently allocated task objects while
+adding only one task's worth of charged storage.
+
+The hot path remains close to the parent. Slab allocation and mixed-list
+selection are isolated behind cache-miss helpers. On Darwin/arm64,
+`newTaskLocked` grows from 240 to 288 bytes; on Linux/amd64 it grows from 278
+to 325 bytes. The ordinary free-task selector is unchanged. Tests cover plain
+task priority, cached-frame traversal, slab isolation, partial-slab disposal,
+the race policy, and 32-bit and 64-bit layout bounds.
+
+The exact-parent Darwin/arm64 comparison used five warm-up pairs, twenty
+alternating-order one-second samples, `GOMAXPROCS=1`, disabled inlining, and
+real coroutine lowering. All six timing probes were statistically neutral:
+
+| Probe | Parent | Task slabs | Significance |
+| --- | ---: | ---: | ---: |
+| public yield entry | 1.657 us | 1.570 us | neutral (`p=0.086`) |
+| recursive yield, depth 64 | 7.697 us | 7.566 us | neutral (`p=0.398`) |
+| recursive yield, depth 256 | 25.62 us | 26.18 us | neutral (`p=0.820`) |
+| recursive yield, depth 262 | 28.73 us | 27.86 us | neutral (`p=0.883`) |
+| recursive yield, depth 264 | 31.03 us | 29.30 us | neutral (`p=0.429`) |
+| recursive yield, depth 4,096 | 627.4 us | 675.7 us | neutral (`p=0.445`) |
+
+The timing geomean changed by -1.05%. Twelve matched Darwin binaries per tree
+were also linked with `-randlayout` seeds 1 through 12, warmed for 100 ms, and
+measured for 750 ms in alternating order. Every timing probe remained neutral;
+the depth-4,096 result had `p=0.843` and the timing geomean changed by -4.72%.
+Every fixed and randomized sample retained the exact allocation results above.
+
+The local translated Linux/amd64 comparison used the same five warm-up and
+twenty one-second sample protocol on a fixed CPU. Its five shallow and boundary
+controls were neutral. Depth 4,096 changed from 1.326 ms to 1.053 ms (-20.56%,
+`p=0.007`). Because the environment reports a VirtualApple CPU, that timing is
+directional rather than a native x86 performance result. It reproduced every
+allocation count exactly.
+
+The native Linux/amd64 comparison ran on an AMD EPYC 9V74 with the same fixed
+layout protocol. Entry changed from 2.786 us to 2.770 us (-0.57%), depth 64
+from 9.412 us to 9.323 us (-0.95%), depth 4,096 from 681.6 us to 670.4 us
+(-1.64%), and the timing geomean by -0.05%. Depths 256 and 264 were neutral.
+The intentionally partial first slab at depth 262 changed from 29.94 us to
+30.94 us (+3.34%). All four non-neutral fixed-image results had `p<0.02`.
+
+The twelve-seed native Linux randomized-layout control made entry, depths 64,
+256, 264, and 4,096 neutral (`p=0.831`, `0.723`, `0.052`, `0.060`, and
+`0.514`). The timing geomean increased by 0.63%. The depth-262 transition
+remained 2.17% slower (`p<0.001`), matching its documented +144-byte charge
+for a partial slab rather than a chance text-layout effect. This is the bounded
+cost of beginning four-object amortization; the next measured depth is neutral and
+the deep case removes 37.43% of allocation operations. Every native fixed and
+randomized sample reproduced the exact allocation table.
+
+The exact candidate toolchain passes the complete runtime test package, the
+stackless-coroutine race and `checkptr=2` sets, the Darwin and Linux/amd64
+focused sets, and the Linux/386 layout set. The architecture probe suite has
+98.1% statement coverage. Combined full and selection-focused runtime
+profiles cover 108 of 119 changed production lines (90.76%); the remaining
+lines are fatal invariant checks for deliberately corrupted free lists and
+counters.
+
+Typed frame allocation remains the other half of deep-recursion allocation
+bytes and the next independent target. It cannot reuse this untyped task-slab
+mechanism directly: compiler-generated frames have distinct GC pointer maps
+and ownership lifetimes. Any frame arena or batch design must preserve those
+typed roots and bounded retention before it can replace the current one-frame
+allocation policy.
+
 ## 16. Work after the MVP
 
 The likely order is:
