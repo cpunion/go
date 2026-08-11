@@ -138,6 +138,64 @@ func TestStacklessCoroNativeTaskReuse(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeDropsOverflowTaskSlots(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	const depth = runtime.StacklessCoroTaskCacheSize +
+		2*runtime.StacklessCoroTaskChunkSize - 2
+	var state int
+	var bypassed atomic.Int32
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			frame := runtime.TakeStacklessCoroFrameForTest(ctx,
+				stacklessCoroDeepFrameCacheResume,
+				unsafe.Sizeof(stacklessCoroDeepFrameCacheTestFrame{}))
+			if frame == nil {
+				frame = unsafe.Pointer(new(stacklessCoroDeepFrameCacheTestFrame))
+			}
+			*(*stacklessCoroDeepFrameCacheTestFrame)(frame) =
+				stacklessCoroDeepFrameCacheTestFrame{
+					depth: depth, bypassed: &bypassed,
+				}
+			runtime.AwaitStacklessCoroFrameForTest(ctx, frame,
+				stacklessCoroDeepFrameCacheResume)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected overflow-task native state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+
+	maxTasks := 0
+	for range 2 * runtime.StacklessCoroWarmExecutorCount {
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			tasks := runtime.StacklessCoroFreeTaskCountForTest(ctx)
+			if tasks > runtime.StacklessCoroTaskCacheSize {
+				t.Fatalf("native context retained %d tasks, limit %d", tasks,
+					runtime.StacklessCoroTaskCacheSize)
+			}
+			if tasks > maxTasks {
+				maxTasks = tasks
+			}
+			free, direct := runtime.StacklessCoroOverflowTaskCountsForTest(ctx)
+			if free != 0 || direct != 0 {
+				t.Fatalf("reused native overflow-task counts = (%d, %d), want zero",
+					free, direct)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	}
+	if maxTasks != runtime.StacklessCoroTaskCacheSize {
+		t.Fatalf("largest reused native task cache = %d, want %d", maxTasks,
+			runtime.StacklessCoroTaskCacheSize)
+	}
+}
+
 func TestStacklessCoroNativeTaskCacheBound(t *testing.T) {
 	const roots = 2 * runtime.StacklessCoroWarmExecutorCount
 	started := make(chan struct{}, roots)

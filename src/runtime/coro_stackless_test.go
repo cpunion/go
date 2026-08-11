@@ -926,8 +926,35 @@ func TestStacklessCoroDeferTerminal(t *testing.T) {
 
 func TestStacklessCoroTaskSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	if got, want := runtime.StacklessCoroTaskSizeForTest(), 6*ptrSize; got != want {
-		t.Fatalf("stackless coroutine task size = %d, want %d", got, want)
+	wantTaskSize := 6 * ptrSize
+	if ptrSize == 4 {
+		wantTaskSize = 7 * ptrSize
+	}
+	if got := runtime.StacklessCoroTaskSizeForTest(); got != wantTaskSize {
+		t.Fatalf("stackless coroutine task size = %d, want %d", got, wantTaskSize)
+	}
+	if got, want := runtime.StacklessCoroTaskChunkSize, 4; got != want {
+		t.Fatalf("stackless coroutine task chunk size = %d, want %d", got, want)
+	}
+	wantChunkSize := uintptr(192)
+	if ptrSize == 4 {
+		wantChunkSize = 112
+	}
+	if got := uintptr(runtime.StacklessCoroTaskChunkSize) *
+		runtime.StacklessCoroTaskSizeForTest(); got != wantChunkSize {
+		t.Fatalf("stackless coroutine task chunk bytes = %d, want %d",
+			got, wantChunkSize)
+	}
+}
+
+func TestStacklessCoroSchedulerSize(t *testing.T) {
+	ptrSize := unsafe.Sizeof(uintptr(0))
+	want := uintptr(192)
+	if ptrSize == 4 {
+		want = 112
+	}
+	if got := runtime.StacklessCoroSchedulerSizeForTest(); got != want {
+		t.Fatalf("stackless coroutine scheduler size = %d, want %d", got, want)
 	}
 }
 
@@ -983,9 +1010,10 @@ type stacklessCoroUncachedParentTestFrame struct {
 }
 
 type stacklessCoroDeepFrameCacheTestFrame struct {
-	depth    int
-	state    int
-	bypassed *atomic.Int32
+	depth          int
+	state          int
+	bypassed       *atomic.Int32
+	overflowCounts *[2]int
 }
 
 func stacklessCoroLargeFrameCacheResume(ctx unsafe.Pointer) uint8 {
@@ -1030,7 +1058,12 @@ func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	switch frame.state {
 	case 0:
 		if frame.depth == 0 {
+			if frame.overflowCounts != nil {
+				frame.overflowCounts[0], frame.overflowCounts[1] =
+					runtime.StacklessCoroOverflowTaskCountsForTest(ctx)
+			}
 			frame.bypassed = nil
+			frame.overflowCounts = nil
 			return runtime.StacklessCoroActionComplete
 		}
 		frame.state = 1
@@ -1047,12 +1080,14 @@ func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
 		*(*stacklessCoroDeepFrameCacheTestFrame)(child) =
 			stacklessCoroDeepFrameCacheTestFrame{
 				depth: frame.depth - 1, bypassed: frame.bypassed,
+				overflowCounts: frame.overflowCounts,
 			}
 		runtime.AwaitStacklessCoroFrameForTest(ctx, child,
 			stacklessCoroDeepFrameCacheResume)
 		return runtime.StacklessCoroActionWait
 	case 1:
 		frame.bypassed = nil
+		frame.overflowCounts = nil
 		return runtime.StacklessCoroActionComplete
 	default:
 		return runtime.StacklessCoroActionInvalid
@@ -1436,6 +1471,74 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		}
 	})
 
+	t.Run("overflow-task-chunks", func(t *testing.T) {
+		const depth = runtime.StacklessCoroTaskCacheSize +
+			2*runtime.StacklessCoroTaskChunkSize - 2
+		var state int
+		var bypassed atomic.Int32
+		var deepest, unwound, afterPlain [2]int
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				frame := runtime.TakeStacklessCoroFrameForTest(ctx,
+					stacklessCoroDeepFrameCacheResume,
+					unsafe.Sizeof(stacklessCoroDeepFrameCacheTestFrame{}))
+				if frame == nil {
+					frame = unsafe.Pointer(new(stacklessCoroDeepFrameCacheTestFrame))
+				}
+				*(*stacklessCoroDeepFrameCacheTestFrame)(frame) =
+					stacklessCoroDeepFrameCacheTestFrame{
+						depth: depth, bypassed: &bypassed,
+						overflowCounts: &deepest,
+					}
+				runtime.AwaitStacklessCoroFrameForTest(ctx, frame,
+					stacklessCoroDeepFrameCacheResume)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				unwound[0], unwound[1] =
+					runtime.StacklessCoroOverflowTaskCountsForTest(ctx)
+				runtime.AwaitStacklessCoroForTest(ctx,
+					func(unsafe.Pointer) uint8 {
+						return runtime.StacklessCoroActionComplete
+					})
+				return runtime.StacklessCoroActionWait
+			case 2:
+				afterPlain[0], afterPlain[1] =
+					runtime.StacklessCoroOverflowTaskCountsForTest(ctx)
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected overflow-task state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if race.Enabled {
+			if deepest != [2]int{} || unwound != [2]int{} ||
+				afterPlain != [2]int{} {
+				t.Fatalf("race overflow-task counts = %v, %v, %v, want zero",
+					deepest, unwound, afterPlain)
+			}
+			return
+		}
+		want := [2]int{
+			runtime.StacklessCoroTaskChunkSize - 2,
+			runtime.StacklessCoroTaskChunkSize,
+		}
+		if deepest != want {
+			t.Fatalf("deepest overflow-task counts = %v, want %v",
+				deepest, want)
+		}
+		if unwound != deepest {
+			t.Fatalf("unwound overflow-task counts = %v, want %v",
+				unwound, deepest)
+		}
+		if afterPlain != deepest {
+			t.Fatalf("overflow-task counts after plain child = %v, want %v",
+				afterPlain, deepest)
+		}
+	})
+
 	t.Run("factory-panic", func(t *testing.T) {
 		var state int
 		var tasksBefore, tasksAfter int
@@ -1488,6 +1591,27 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 	t.Run("prefer-plain-task", func(t *testing.T) {
 		if !runtime.StacklessCoroPreferPlainTaskForTest() {
 			t.Fatal("ordinary task allocation discarded a cached frame")
+		}
+	})
+
+	t.Run("drop-uncached-task", func(t *testing.T) {
+		if !runtime.StacklessCoroUncachedTaskNotRecycledForTest() {
+			t.Fatal("uncached-lineage task entered the ordinary task cache")
+		}
+	})
+
+	t.Run("isolate-overflow-task", func(t *testing.T) {
+		if !runtime.StacklessCoroOverflowTaskIsolationForTest() {
+			t.Fatal("ordinary task allocation consumed an overflow-task slot")
+		}
+	})
+
+	t.Run("select-overflow-task", func(t *testing.T) {
+		if race.Enabled {
+			t.Skip("race builds do not reuse task addresses")
+		}
+		if !runtime.StacklessCoroOverflowTaskSelectionForTest() {
+			t.Fatal("overflow-task selection violated cache priority or isolation")
 		}
 	})
 }

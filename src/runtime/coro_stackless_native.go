@@ -111,6 +111,7 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	ctx.caller = nil
 	if root && scheduler.executorState.Load() == stacklessCoroExecutorStateOff &&
 		scheduler.freeTasks != nil {
+		scheduler.discardFreeOverflowTasks()
 		ctx.freeTasks = scheduler.freeTasks
 		ctx.freePlainTaskCount = scheduler.freePlainTaskCount
 		ctx.freeFrameBytes = scheduler.freeFrameBytes
