@@ -361,6 +361,33 @@ func BenchmarkRecursiveYield64(b *testing.B) {
 	intSink = total
 }
 
+func BenchmarkRecursiveYield256(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveYield(256)
+	}
+	intSink = total
+}
+
+func BenchmarkRecursiveYield262(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveYield(262)
+	}
+	intSink = total
+}
+
+func BenchmarkRecursiveYield264(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveYield(264)
+	}
+	intSink = total
+}
+
 func BenchmarkRecursiveYield4096(b *testing.B) {
 	b.ReportAllocs()
 	total := 0

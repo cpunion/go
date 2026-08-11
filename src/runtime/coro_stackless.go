@@ -27,12 +27,21 @@ const (
 
 const stacklessCoroWarmExecutorCount = 4
 const stacklessCoroTaskCacheSize = 256
+
+// Four tasks occupy the exact 192-byte size class on 64-bit targets and the
+// exact 112-byte size class on 32-bit targets. Both remain below the per-object
+// malloc-header threshold.
+const stacklessCoroTaskChunkSize = 4
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
 // stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
 // created after the task cache saturated. It cannot be a cached frame size.
 const stacklessCoroUncachedFrameLineage = ^uint16(0)
+
+// stacklessCoroFreeOverflowTask marks a never-used task slot from a saturated
+// allocation chunk while that slot is linked on the scheduler free list.
+const stacklessCoroFreeOverflowTask = stacklessCoroUncachedFrameLineage - 1
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 const (
@@ -107,10 +116,14 @@ type stacklessCoroScheduler struct {
 	cachedFrameTasks   uint16
 	cachedFrameBytes   uint16
 	freeOperations     *stacklessCoroOperation
-	freeOperationCount int
-	root               stacklessCoroTask
-	terminalValues     map[*stacklessCoroTask]any
-	wake               chan struct{}
+	// These bounded counters share the former freeOperationCount machine
+	// word without shifting the root or growing the scheduler.
+	freeOperationCount      uint8
+	freeOverflowTaskCount   uint8
+	directOverflowTaskCount uint8
+	root                    stacklessCoroTask
+	terminalValues          map[*stacklessCoroTask]any
+	wake                    chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
@@ -246,22 +259,80 @@ func (s *stacklessCoroScheduler) releaseWake() {
 // must be held.
 func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
 	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
+	if s.freeOverflowTaskCount != 0 {
+		return s.newTaskWithOverflowLocked(frame, resume, parent)
+	}
 	task := s.takeFreeTaskLocked()
 	if task == nil {
-		return &stacklessCoroTask{
-			resume: resume,
-			parent: parent,
-			context: stacklessCoroContext{
-				frame: frame,
-			},
+		if frame == nil {
+			return &stacklessCoroTask{
+				resume: resume,
+				parent: parent,
+			}
 		}
+		return s.newTaskAfterCacheMissLocked(frame, resume, parent)
 	}
+	return initializeStacklessCoroTask(task, frame, resume, parent)
+}
+
+func (s *stacklessCoroScheduler) newTaskWithOverflowLocked(frame unsafe.Pointer,
+	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
+	allowOverflow := !raceenabled && frame != nil && parent != nil &&
+		parent.frameSize == stacklessCoroUncachedFrameLineage
+	task := s.takeFreeOverflowTaskLocked(allowOverflow)
+	if task == nil {
+		if frame == nil {
+			return &stacklessCoroTask{
+				resume: resume,
+				parent: parent,
+			}
+		}
+		return s.newTaskAfterCacheMissLocked(frame, resume, parent)
+	}
+	return initializeStacklessCoroTask(task, frame, resume, parent)
+}
+
+func (s *stacklessCoroScheduler) newTaskAfterCacheMissLocked(
+	frame unsafe.Pointer, resume stacklessCoroResume,
+	parent *stacklessCoroTask) *stacklessCoroTask {
+	uncachedLineage := !raceenabled && parent != nil &&
+		parent.frameSize == stacklessCoroUncachedFrameLineage
+	task := s.allocateTaskLocked(uncachedLineage)
+	return initializeStacklessCoroTask(task, frame, resume, parent)
+}
+
+func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
+	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
 	task.resume = resume
 	task.parent = parent
 	task.context.frame = frame
 	task.cacheFrame = false
 	task.frameSize = 0
 	return task
+}
+
+// allocateTaskLocked batches task storage only after an explicit-frame
+// lineage has saturated the bounded task cache. A short direct-allocation
+// prefix avoids a chunk-sized memory cliff immediately above the cache bound.
+func (s *stacklessCoroScheduler) allocateTaskLocked(
+	uncachedLineage bool) *stacklessCoroTask {
+	if !uncachedLineage ||
+		s.directOverflowTaskCount < uint8(stacklessCoroTaskChunkSize) {
+		if uncachedLineage {
+			s.directOverflowTaskCount++
+		}
+		return new(stacklessCoroTask)
+	}
+
+	tasks := new([stacklessCoroTaskChunkSize]stacklessCoroTask)
+	for i := 1; i < len(tasks); i++ {
+		task := &tasks[i]
+		task.frameSize = stacklessCoroFreeOverflowTask
+		task.next = s.freeTasks
+		s.freeTasks = task
+	}
+	s.freeOverflowTaskCount = uint8(stacklessCoroTaskChunkSize - 1)
+	return &tasks[0]
 }
 
 func (s *stacklessCoroScheduler) takeFreeTaskLocked() *stacklessCoroTask {
@@ -306,11 +377,98 @@ func (s *stacklessCoroScheduler) takeFreeTaskLocked() *stacklessCoroTask {
 	return task
 }
 
+// takeFreeOverflowTaskLocked selects an ordinary task before an unused chunk
+// slot. Unmarked lineages cannot acquire chunk storage. The scheduler lock
+// must be held, and freeOverflowTaskCount must be nonzero.
+func (s *stacklessCoroScheduler) takeFreeOverflowTaskLocked(
+	allowOverflow bool) *stacklessCoroTask {
+	task := s.freeTasks
+	if task == nil || s.freeOverflowTaskCount == 0 {
+		throw("runtime: invalid stackless coroutine overflow task cache")
+	}
+	if s.freePlainTaskCount > stacklessCoroTaskCacheSize {
+		throw("runtime: invalid stackless coroutine task cache count")
+	}
+	var previous *stacklessCoroTask
+	switch {
+	case s.freePlainTaskCount > 0:
+		for task != nil &&
+			(task.cacheFrame || task.frameSize == stacklessCoroFreeOverflowTask) {
+			previous = task
+			task = task.next
+		}
+	case allowOverflow:
+		for task != nil && task.frameSize != stacklessCoroFreeOverflowTask {
+			previous = task
+			task = task.next
+		}
+	default:
+		for task != nil && !task.cacheFrame {
+			previous = task
+			task = task.next
+		}
+	}
+	if task == nil {
+		if s.freePlainTaskCount > 0 || allowOverflow {
+			throw("runtime: invalid stackless coroutine overflow task list")
+		}
+		return nil
+	}
+	if previous == nil {
+		s.freeTasks = task.next
+	} else {
+		previous.next = task.next
+	}
+	task.next = nil
+	if task.cacheFrame {
+		if s.freeFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine frame cache size")
+		}
+		s.freeFrameBytes -= task.frameSize
+		s.discardCachedFrameTaskLocked(task)
+	} else if task.frameSize == stacklessCoroFreeOverflowTask {
+		s.freeOverflowTaskCount--
+	} else {
+		if task.frameSize != 0 || s.freePlainTaskCount == 0 {
+			throw("runtime: invalid stackless coroutine task cache count")
+		}
+		s.freePlainTaskCount--
+	}
+	return task
+}
+
+// discardFreeOverflowTasks drops never-used slots from the final partial
+// chunk before a native context retains the bounded ordinary task cache.
+// The caller must have exclusive ownership of s.
+func (s *stacklessCoroScheduler) discardFreeOverflowTasks() {
+	if s.freeOverflowTaskCount == 0 {
+		return
+	}
+	link := &s.freeTasks
+	for *link != nil {
+		task := *link
+		if !task.cacheFrame && task.frameSize == stacklessCoroFreeOverflowTask {
+			*link = task.next
+			task.next = nil
+			s.freeOverflowTaskCount--
+			if s.freeOverflowTaskCount == 0 {
+				return
+			}
+			continue
+		}
+		link = &task.next
+	}
+	throw("runtime: invalid stackless coroutine overflow task cache")
+}
+
 func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
+	uncachedLineage := task.frameSize == stacklessCoroUncachedFrameLineage
 	task.resume = nil
 	task.context.frame = nil
 	task.cacheFrame = false
-	task.frameSize = 0
+	if !uncachedLineage {
+		task.frameSize = 0
+	}
 }
 
 func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
@@ -331,8 +489,11 @@ func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 // builds must not reuse it for an unrelated logical goroutine.
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	_, hasTerminalValue := s.terminalValues[task]
+	uncachedLineage := !task.cacheFrame &&
+		task.frameSize == stacklessCoroUncachedFrameLineage
 	validFrame := !task.cacheFrame && task.resume == nil &&
-		task.context.frame == nil && task.frameSize == 0
+		task.context.frame == nil &&
+		(task.frameSize == 0 || uncachedLineage)
 	if task.cacheFrame {
 		validFrame = task.resume != nil && task.context.frame != nil &&
 			int(task.frameSize) <= stacklessCoroFrameCacheSize &&
@@ -346,6 +507,10 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		task.context.scheduler != nil ||
 		hasTerminalValue {
 		throw("runtime: invalid stackless coroutine task recycle")
+	}
+	if uncachedLineage {
+		task.frameSize = 0
+		return
 	}
 	if raceenabled {
 		s.discardCachedFrameTaskLocked(task)
@@ -1320,7 +1485,7 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 			throw("runtime: invalid stackless coroutine operation cache")
 		}
 	} else {
-		if s.freeOperationCount <= 0 ||
+		if s.freeOperationCount == 0 ||
 			s.freeOperationCount > stacklessCoroOperationCacheSize {
 			unlock(&s.lock)
 			throw("runtime: invalid stackless coroutine operation cache count")
@@ -1366,8 +1531,7 @@ func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperati
 	if raceenabled {
 		return
 	}
-	if s.freeOperationCount < 0 ||
-		s.freeOperationCount > stacklessCoroOperationCacheSize {
+	if s.freeOperationCount > stacklessCoroOperationCacheSize {
 		throw("runtime: invalid stackless coroutine operation cache size")
 	}
 	if s.freeOperationCount == stacklessCoroOperationCacheSize {

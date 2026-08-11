@@ -11,6 +11,7 @@ import "unsafe"
 const (
 	StacklessCoroWarmExecutorCount  = stacklessCoroWarmExecutorCount
 	StacklessCoroTaskCacheSize      = stacklessCoroTaskCacheSize
+	StacklessCoroTaskChunkSize      = stacklessCoroTaskChunkSize
 	StacklessCoroFrameCacheSize     = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize = stacklessCoroOperationCacheSize
 
@@ -141,6 +142,23 @@ func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
 }
 
+func StacklessCoroSchedulerSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroScheduler{})
+}
+
+func StacklessCoroOverflowTaskCountsForTest(ctx unsafe.Pointer) (int, int) {
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || context.task() == nil {
+		throw("runtime: invalid stackless coroutine overflow task query")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	free := int(s.freeOverflowTaskCount)
+	direct := int(s.directOverflowTaskCount)
+	unlock(&s.lock)
+	return free, direct
+}
+
 func StacklessCoroFreeTaskCountForTest(ctx unsafe.Pointer) int {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task() == nil {
@@ -241,6 +259,118 @@ func StacklessCoroPreferPlainTaskForTest() bool {
 	return valid
 }
 
+func StacklessCoroUncachedTaskNotRecycledForTest() bool {
+	task := &stacklessCoroTask{
+		state:     stacklessCoroTaskComplete,
+		frameSize: stacklessCoroUncachedFrameLineage,
+	}
+	s := &stacklessCoroScheduler{
+		cachedFrameTasks: stacklessCoroTaskCacheSize - 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	s.recycleTaskLocked(task)
+	valid := s.freeTasks == nil && s.freePlainTaskCount == 0 &&
+		task.frameSize == 0
+	unlock(&s.lock)
+	return valid
+}
+
+func StacklessCoroOverflowTaskIsolationForTest() bool {
+	resume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	overflow := &stacklessCoroTask{
+		frameSize: stacklessCoroFreeOverflowTask,
+	}
+	s := &stacklessCoroScheduler{
+		freeTasks: overflow, freeOverflowTaskCount: 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	task := s.newTaskLocked(nil, resume, nil)
+	valid := task != overflow && task.frameSize == 0 &&
+		s.freeTasks == overflow && overflow.next == nil &&
+		s.freeOverflowTaskCount == 1
+	unlock(&s.lock)
+	return valid
+}
+
+func StacklessCoroOverflowTaskSelectionForTest() bool {
+	resume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	frameSize := uint16(unsafe.Sizeof(uintptr(0)))
+	newCachedTask := func() *stacklessCoroTask {
+		return &stacklessCoroTask{
+			resume:     resume,
+			context:    stacklessCoroContext{frame: unsafe.Pointer(new(uintptr))},
+			cacheFrame: true,
+			frameSize:  frameSize,
+		}
+	}
+	newOverflowTask := func() *stacklessCoroTask {
+		return &stacklessCoroTask{frameSize: stacklessCoroFreeOverflowTask}
+	}
+
+	cached := newCachedTask()
+	overflow := newOverflowTask()
+	plain := new(stacklessCoroTask)
+	cached.next = overflow
+	overflow.next = plain
+	s := &stacklessCoroScheduler{
+		freeTasks:             cached,
+		freePlainTaskCount:    1,
+		freeFrameBytes:        frameSize,
+		cachedFrameTasks:      1,
+		freeOverflowTaskCount: 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	task := s.newTaskLocked(nil, resume, nil)
+	valid := task == plain && s.freeTasks == cached && cached.next == overflow &&
+		overflow.next == nil && s.freePlainTaskCount == 0 &&
+		s.freeOverflowTaskCount == 1
+	unlock(&s.lock)
+	if !valid {
+		return false
+	}
+
+	cached = newCachedTask()
+	overflow = newOverflowTask()
+	cached.next = overflow
+	s = &stacklessCoroScheduler{
+		freeTasks:             cached,
+		freeFrameBytes:        frameSize,
+		cachedFrameTasks:      1,
+		freeOverflowTaskCount: 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	parent := &stacklessCoroTask{frameSize: stacklessCoroUncachedFrameLineage}
+	frame := unsafe.Pointer(new(uintptr))
+	lock(&s.lock)
+	task = s.newTaskLocked(frame, resume, parent)
+	valid = task == overflow && s.freeTasks == cached && cached.next == nil &&
+		s.freeOverflowTaskCount == 0
+	unlock(&s.lock)
+	if !valid {
+		return false
+	}
+
+	overflow = newOverflowTask()
+	s = &stacklessCoroScheduler{
+		freeTasks: overflow, freeOverflowTaskCount: 1,
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	lock(&s.lock)
+	task = s.newTaskLocked(frame, resume, nil)
+	valid = task != overflow && task.context.frame == frame &&
+		s.freeTasks == overflow && overflow.next == nil &&
+		s.freeOverflowTaskCount == 1
+	unlock(&s.lock)
+	return valid
+}
+
 func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task() == nil {
@@ -248,7 +378,7 @@ func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 	}
 	s := context.scheduler
 	lock(&s.lock)
-	count := s.freeOperationCount
+	count := int(s.freeOperationCount)
 	unlock(&s.lock)
 	return count
 }
