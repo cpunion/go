@@ -2995,7 +2995,36 @@ task context, reservation state, or a missing live chunk frame.
 
 ## 16. Work after the MVP
 
-The likely order is:
+The 2026-08-12 exact-upstream checkpoint separates performance work from
+surface-area work. The first performance sequence is:
+
+1. Keep positive sleeps on the runtime timer heap, but remove avoidable
+   per-wait timer ownership and global operation-list lookup. Timer expiry,
+   cancellation, early completion, and operation reuse must continue to race
+   through one owner transition. Passing a reusable operation pointer directly
+   to the callback is insufficient because a late callback would create an
+   ABA race with the operation cache.
+2. Replace the public `os.File.Read` and `net.TCPConn.Read` closure/worker
+   fallback with a stable compiler/runtime boundary. A regular-file syscall
+   may still block an M and use the existing replacement-executor protocol;
+   a socket wait should publish a logical completion directly from netpoll
+   instead of parking a worker G in `poll_runtime_pollWait`. The boundary must
+   not teach the compiler private `os`, `net`, or `internal/poll` layouts. The
+   first design review must choose between a tagged G-or-logical waiter in
+   `pollDesc` and a separate logical-wait registry; that representation is not
+   implied by this performance ordering.
+3. Reduce public-root entry transitions and typed frame allocation while
+   retaining exact compiler-generated GC maps, bounded cache retention, and
+   the measured recursion-boundary behavior.
+4. Remove ready-select temporary storage before changing channel-waiter
+   lifetime or ownership.
+
+Each step keeps experiment-off behavior, the direct-C fast path, multi-P
+fixed-work scaling, and the live-task footprint as explicit regression gates.
+The portable benchmark remains an architecture probe; native exact-parent
+comparisons, rather than hosted CI timing thresholds, decide performance.
+
+The likely compatibility order remains:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake
    boundary;
