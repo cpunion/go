@@ -23,11 +23,7 @@ const (
 )
 
 func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	op := stacklessCoroStartOperation(ctx, "read")
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.n = n
-	op.errno = errno
+	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
 	if len(buffer) == 0 {
 		registerStacklessCoroOperation(op)
 		stacklessCoroSocketReadFinish(op, 0, 0)
@@ -41,7 +37,36 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 		stacklessCoroSocketReadFinish(op, -1, uintptr(openErr))
 		return
 	}
+	stacklessCoroSocketReadStart(op, pd, true)
+}
+
+func startStacklessCoroSocketReadWithPollDesc(ctx unsafe.Pointer, pd *pollDesc,
+	fd int, buffer []byte, n *int, errno *uintptr) {
+	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
+	if len(buffer) == 0 {
+		registerStacklessCoroOperation(op)
+		stacklessCoroSocketReadFinish(op, 0, 0)
+		return
+	}
+	if pd == nil {
+		throw("runtime: nil stackless coroutine poll descriptor")
+	}
+	stacklessCoroSocketReadStart(op, pd, false)
+}
+
+func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
+	buffer []byte, n *int, errno *uintptr) *stacklessCoroOperation {
+	op := stacklessCoroStartOperation(ctx, "read")
+	op.fd = int32(fd)
+	op.buffer = buffer
+	op.n = n
+	op.errno = errno
+	return op
+}
+
+func stacklessCoroSocketReadStart(op *stacklessCoroOperation, pd *pollDesc, ownsPollDesc bool) {
 	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	op.ownsPollDesc = ownsPollDesc
 	registerStacklessCoroOperation(op)
 	stacklessCoroSocketReadAttempt(op)
 }
@@ -89,7 +114,7 @@ func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, read
 		throw("runtime: mismatched stackless coroutine socket completion")
 	}
 	op.packet[stacklessCoroPollDescWord] = 0
-	if pd != nil {
+	if pd != nil && op.ownsPollDesc {
 		poll_runtime_pollUnblock(pd)
 		poll_runtime_pollClose(pd)
 	}
@@ -113,10 +138,10 @@ func stacklessCoroNetpollInit() {
 }
 
 // stacklessCoroNetpollReady publishes a pointer-free completion link and
-// makes the single safe completion G runnable through netpoll's return list.
+// returns the single safe completion G when it needs to be made runnable.
 //
 //go:nowritebarrier
-func stacklessCoroNetpollReady(toRun *gList, op *stacklessCoroOperation) {
+func stacklessCoroNetpollReady(op *stacklessCoroOperation) *g {
 	for {
 		head := stacklessCoroNetpoll.head.Load()
 		op.packet[stacklessCoroPollNextWord] = uint64(head)
@@ -129,13 +154,13 @@ func stacklessCoroNetpollReady(toRun *gList, op *stacklessCoroOperation) {
 	for {
 		old := stacklessCoroNetpoll.wake.Load()
 		if old == pdReady {
-			return
+			return nil
 		}
 		if stacklessCoroNetpoll.wake.CompareAndSwap(old, pdReady) {
 			if old > pdWait {
-				toRun.push((*g)(unsafe.Pointer(old)))
+				return (*g)(unsafe.Pointer(old))
 			}
-			return
+			return nil
 		}
 	}
 }

@@ -32,6 +32,7 @@ const (
 	StacklessCoroActionComplete = stacklessCoroActionComplete
 	StacklessCoroActionPanic    = stacklessCoroActionPanic
 	StacklessCoroActionGoexit   = stacklessCoroActionGoexit
+	StacklessCoroPollErrClosing = pollErrClosing
 	StacklessCoroPollErrTimeout = pollErrTimeout
 )
 
@@ -722,6 +723,30 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 
 func SocketReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	coroSocketRead(ctx, fd, buffer, n, errno)
+}
+
+func OpenStacklessCoroPollDescForTest(fd int) (unsafe.Pointer, int) {
+	netpollGenericInit()
+	pd, errno := poll_runtime_pollOpen(uintptr(fd))
+	return unsafe.Pointer(pd), errno
+}
+
+func UnblockStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
+	poll_runtime_pollUnblock((*pollDesc)(descriptor))
+}
+
+func CloseStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
+	poll_runtime_pollClose((*pollDesc)(descriptor))
+}
+
+func ExpireReadStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
+	poll_runtime_pollSetDeadline((*pollDesc)(descriptor), -1, 'r')
+}
+
+func SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
+	fd int, buffer []byte, n *int, errno *uintptr) {
+	startStacklessCoroSocketReadWithPollDesc(ctx,
+		(*pollDesc)(descriptor), fd, buffer, n, errno)
 }
 
 func StacklessCoroReadLengthForTest(length int) int32 {

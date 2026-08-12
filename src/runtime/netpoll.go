@@ -536,7 +536,9 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 		toRun.push(wg)
 	}
 	if coroRead != 0 {
-		netpollCoroDispatch(toRun, coroRead)
+		if gp := netpollCoroDispatch(coroRead); gp != nil {
+			toRun.push(gp)
+		}
 	}
 	return delta
 }
@@ -616,7 +618,9 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 
 // netpollunblock moves either pd.rg (if mode == 'r') or
 // pd.wg (if mode == 'w') into the pdReady state.
-// This returns any goroutine blocked on pd.{rg,wg}.
+// This returns a goroutine that should be made runnable. Usually that is the
+// goroutine blocked on pd.{rg,wg}. A stackless coroutine read token instead
+// publishes its logical completion and may return the poll bridge goroutine.
 // It adds any adjustment to netpollWaiters to *delta;
 // this adjustment should be applied after the goroutine has
 // been marked ready.
@@ -645,6 +649,9 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool, delta *int32) *g {
 				old = pdNil
 			} else if old != pdNil {
 				*delta -= 1
+			}
+			if netpollCoroEnabled && old&netpollCoroTagMask == netpollCoroTag {
+				return netpollCoroDispatch(old &^ netpollCoroTagMask)
 			}
 			return (*g)(unsafe.Pointer(old))
 		}
