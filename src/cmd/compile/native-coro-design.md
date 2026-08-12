@@ -3085,20 +3085,36 @@ operation and netpoll-waiter counts before and after a stop-the-world GC, then
 wake every descriptor and validate its result. Separate cases cover EOF,
 invalid and write-only descriptors, empty buffers and nil result pointers,
 expired poll state, readiness races, the ordinary-G fallback, race builds,
-and `checkptr=2`. The focused profile covers 110 of 120 changed production
-statements (91.67%); the remaining statements are fatal invariants and
-contended-CAS paths.
+and `checkptr=2`. The focused profile covers 125 of 137 changed production
+statements (91.24%). The bridge implementation covers 80 of 86 statements
+(93.02%), and the changed readiness path covers 23 of 25 (92.00%); the
+remaining statements are fatal invariants, contended-CAS paths, and the
+compile-time-disabled branch.
 
 The exact parent is the content merged at `18669e78d9`; the runtime candidate
-is `09cfdcf01f`. On native Darwin/arm64, three warm-up pairs and 20 alternating
-500 ms samples at one P changed the ready socket path from 17.940 us to
-3.446 us. The median paired change is -80.55%, and all 20 pairs favor the
-candidate (two-sided sign test `p<0.001`). A separate benchmark forces every
-read through `EAGAIN`, token publication, platform readiness, the bridge G,
-and retry. Twenty alternating one-second samples changed 15.794 us to
-17.070 us; the paired timing geomean changed by -0.18% and the result is
-statistically neutral (`p=0.824`). Both paths remain at 0 B and 0 allocations
-per read.
+is `2275db58bd`. On native Darwin/arm64, three warm-up pairs and 20 alternating
+500 ms samples at one P changed the ready socket path from 16.787 us to
+3.419 us. The median paired change is -79.32%, and all 20 pairs favor the
+candidate (two-sided sign test `p<0.001`).
+
+A separate benchmark does not let its writer proceed until the netpoll waiter
+count has increased in both trees. It therefore forces the parent worker and
+the candidate token through `EAGAIN`, platform readiness, completion, and
+retry. Two consecutive runs with five warm-up pairs and 20 alternating
+one-second samples each changed the combined median from 20.957 us to
+20.359 us. The median paired change is -2.56%, the paired timing geomean is
++0.21%, and 24 of 40 pairs favor the candidate, making the result
+statistically neutral (`p=0.268`). Both socket paths remain at 0 B and
+0 allocations per read.
+
+The token check shares the ordinary readiness semaphore loop instead of
+loading it twice. A narrow ordinary-readiness control changed 8.9395 ns to
+9.105 ns; the paired median changed by +2.04%, 8 of 20 pairs favored the
+candidate, and the result is neutral (`p=0.503`). An end-to-end public
+`net.TCPConn.Read` control, which still uses the existing worker lowering,
+changed 13.586 us to 13.067 us; 13 of 20 pairs favored the candidate and the
+result is also neutral (`p=0.263`). Its 64 B and one allocation per read are
+unchanged. The narrow control remains at 0 B and 0 allocations.
 
 This checkpoint deliberately owns a private poll descriptor and therefore
 applies only to the explicit raw-descriptor companion. An ordinary
@@ -3109,9 +3125,10 @@ existing poll context under `internal/poll`'s reference and read locks, and
 must let close and deadline publication complete a logical token safely. The
 public `net` lowering remains on the shared worker until that boundary exists.
 
-With `GOEXPERIMENT=nocoro`, the two feature stubs inline completely. The
-Darwin/arm64 `runtime.netpollready` instruction stream is identical to the
-exact parent, so the default toolchain pays no branch or call cost for the
+With `GOEXPERIMENT=nocoro`, the compile-time feature constant removes the token
+branch and the dispatch stub inlines completely. The Darwin/arm64 production
+runtime archive has a `runtime.netpollready` instruction stream identical to
+the exact parent, so the default toolchain pays no branch or call cost for the
 token path.
 
 The remaining performance sequence is:
