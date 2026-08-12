@@ -8,8 +8,11 @@ package runtime
 
 import "unsafe"
 
-const stacklessCoroMaxRead = 1<<31 - 1
-const stacklessCoroBadCompletion = ^uintptr(0)
+const (
+	stacklessCoroMaxRead           = 1<<31 - 1
+	stacklessCoroDirectOperationID = ^uint64(0)
+	stacklessCoroBadCompletion     = ^uintptr(0)
+)
 
 var stacklessCoroReadPool struct {
 	lock mutex
@@ -23,11 +26,45 @@ func init() {
 }
 
 func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	startStacklessCoroRead(ctx, fd, buffer, n, errno, false)
+	op := stacklessCoroStartOperation(ctx, "read")
+	// This operation is completed directly below and is never registered.
+	// It still needs a nonzero identity for the common completion checks.
+	op.id = stacklessCoroDirectOperationID
+	op.buffer = buffer
+	op.n = n
+	op.errno = errno
+
+	var count int32
+	var readErrno uintptr
+	if len(buffer) != 0 {
+		length := len(buffer)
+		if length > stacklessCoroMaxRead {
+			length = stacklessCoroMaxRead
+		}
+		coroEnterSyscall(ctx)
+		count = read(int32(fd), unsafe.Pointer(&buffer[0]), int32(length))
+		coroExitSyscall()
+		if count < 0 {
+			readErrno = uintptr(-count)
+		}
+	}
+	KeepAlive(buffer)
+
+	if op.n != nil {
+		if count < 0 {
+			*op.n = -1
+		} else {
+			*op.n = int(count)
+		}
+	}
+	if op.errno != nil {
+		*op.errno = readErrno
+	}
+	completeStacklessCoroOperation(op)
 }
 
 func coroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	startStacklessCoroRead(ctx, fd, buffer, n, errno, true)
+	startStacklessCoroSocketRead(ctx, fd, buffer, n, errno)
 }
 
 func coroCallRead(ctx unsafe.Pointer, call func()) {
@@ -60,7 +97,6 @@ func startStacklessCoroAsync(ctx unsafe.Pointer, readFD int, result *uint64, err
 	op.fd = int32(readFD)
 	op.errno = errno
 	op.valueOut = result
-	op.poll = true
 	op.async = true
 	registerStacklessCoroOperation(op)
 	return op
@@ -77,13 +113,12 @@ func failStacklessCoroAsync(id uint64, errno uintptr) {
 	completeStacklessCoroOperation(op)
 }
 
-func startStacklessCoroRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr, poll bool) {
+func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	op := stacklessCoroStartOperation(ctx, "read")
 	op.fd = int32(fd)
 	op.buffer = buffer
 	op.n = n
 	op.errno = errno
-	op.poll = poll
 	registerStacklessCoroOperation(op)
 	stacklessCoroReadEnqueue(op)
 }
@@ -159,7 +194,7 @@ func stacklessCoroReadWorkerLoop() {
 			} else if op.async {
 				stacklessCoroAsyncWorker(op.id)
 			} else {
-				stacklessCoroReadWorker(op.id)
+				stacklessCoroSocketReadWorker(op.id)
 			}
 		}
 	}
@@ -179,7 +214,7 @@ func stacklessCoroCallWorker(id uint64) {
 	completeStacklessCoroOperation(op)
 }
 
-func stacklessCoroReadWorker(id uint64) {
+func stacklessCoroSocketReadWorker(id uint64) {
 	op := findStacklessCoroOperation(id)
 	if op == nil {
 		return
@@ -192,17 +227,8 @@ func stacklessCoroReadWorker(id uint64) {
 		if length > stacklessCoroMaxRead {
 			length = stacklessCoroMaxRead
 		}
-		if op.poll {
-			n, errno = stacklessCoroPollRead(op.fd,
-				unsafe.Pointer(&op.buffer[0]), int32(length))
-		} else {
-			entersyscallblock()
-			n = read(op.fd, unsafe.Pointer(&op.buffer[0]), int32(length))
-			exitsyscall()
-			if n < 0 {
-				errno = uintptr(-n)
-			}
-		}
+		n, errno = stacklessCoroPollRead(op.fd,
+			unsafe.Pointer(&op.buffer[0]), int32(length))
 	}
 
 	op = takeStacklessCoroOperation(id)
