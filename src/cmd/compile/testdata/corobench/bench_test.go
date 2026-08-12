@@ -388,6 +388,15 @@ func BenchmarkRecursiveYield264(b *testing.B) {
 	intSink = total
 }
 
+func BenchmarkRecursiveYield267(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveYield(267)
+	}
+	intSink = total
+}
+
 func BenchmarkRecursiveYield4096(b *testing.B) {
 	b.ReportAllocs()
 	total := 0

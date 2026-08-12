@@ -305,7 +305,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 		}
 		call, ok := condition.Cond.(*ir.CallExpr)
 		if !ok || symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) !=
-			"runtime.coroFrameCached" {
+			"runtime.coroFrameNeedsClear" {
 			return
 		}
 		cacheQueries++
@@ -319,6 +319,149 @@ func TestLowerMethodReceiver(t *testing.T) {
 	if cacheQueries != 1 || pointerClears == 0 {
 		t.Fatalf("resume has %d frame-cache queries and %d pointer clears, want one query and pointer clears",
 			cacheQueries, pointerClears)
+	}
+}
+
+func TestLowerRecursiveFrameChunk(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/framechunk", "framechunk")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	recursive := newLowerTestFunc(pkg, "recursive")
+	call := newLowerTestCall(recursive)
+	recursive.Body = ir.Nodes{call, newLowerTestReturn()}
+	function := &Function{
+		Func:    recursive,
+		Local:   MaySuspend,
+		Effect:  MaySuspend,
+		Primary: CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: recursive,
+			CalleeName: symbolName(recursive.Nname), Node: call,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}},
+	}
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		recursive: function,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 1 || result.Skipped != 0 ||
+		function.Factory != FactoryABI3 {
+		t.Fatalf("Lower result = %+v, factory = %v", result, function.Factory)
+	}
+
+	var factory *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.Sym() == resumeFactorySymbol(recursive) {
+			factory = generated
+			break
+		}
+	}
+	if factory == nil {
+		t.Fatal("missing recursive frame factory")
+	}
+
+	takeFrames, allocations, chunks := 0, 0, 0
+	ir.VisitList(factory.Body, func(node ir.Node) {
+		if call, ok := node.(*ir.CallExpr); ok &&
+			symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
+				"runtime.coroTakeFrameChunk" {
+			takeFrames++
+		}
+		allocation, ok := node.(*ir.UnaryExpr)
+		if !ok || allocation.Op() != ir.ONEW {
+			return
+		}
+		allocations++
+		typ := allocation.Type().Elem()
+		if typ.Kind() == types.TARRAY &&
+			typ.NumElem() == explicitFrameChunkSize {
+			chunks++
+		}
+	})
+	if takeFrames != 1 || allocations != 2 || chunks != 1 {
+		t.Fatalf("recursive factory has %d chunk lookups, %d allocations, and %d typed chunks; want 1, 2, and 1",
+			takeFrames, allocations, chunks)
+	}
+}
+
+func TestRecursiveFrameChunkEligibility(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/framechunkeligibility",
+		"framechunkeligibility")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	for _, test := range []struct {
+		name         string
+		await, spawn bool
+		want         bool
+	}{
+		{name: "await", await: true, want: true},
+		{name: "spawn", spawn: true},
+		{name: "mixed", await: true, spawn: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fn := newLowerTestFunc(pkg, "recursive"+test.name)
+			function := &Function{
+				Func: fn, Local: MaySuspend, Effect: MaySuspend,
+				Primary: CoroPrimary,
+			}
+			if test.await {
+				call := newLowerTestCall(fn)
+				fn.Body = append(fn.Body, call)
+				function.Edges = append(function.Edges, Edge{
+					Kind: DirectCall, Callee: fn,
+					CalleeName: symbolName(fn.Nname), Node: call,
+				})
+				function.Sites = append(function.Sites, Site{
+					ID: SiteID(len(function.Sites) + 1), Kind: SiteAwait, Node: call,
+				})
+			}
+			if test.spawn {
+				call := newLowerTestCall(fn)
+				spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, call)
+				spawn.SetTypecheck(1)
+				fn.Body = append(fn.Body, spawn)
+				function.Edges = append(function.Edges, Edge{
+					Kind: GoCall, Callee: fn,
+					CalleeName: symbolName(fn.Nname), Node: call,
+				})
+				function.Sites = append(function.Sites, Site{
+					ID: SiteID(len(function.Sites) + 1), Kind: SiteSpawn, Node: call,
+				})
+			}
+			fn.Body = append(fn.Body, newLowerTestReturn())
+			candidate, err := newLowerCandidate(&Plan{
+				Functions: map[*ir.Func]*Function{fn: function},
+			}, function)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := candidate.selfAwait && !candidate.selfSpawn
+			if got != test.want {
+				t.Fatalf("frame-chunk eligibility = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 

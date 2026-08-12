@@ -165,7 +165,7 @@ var runtimeDecls = [...]struct {
 	{"coroSpawnFrame", funcTag, 126},
 	{"coroPanic", funcTag, 127},
 	{"coroPanicPending", funcTag, 128},
-	{"coroFrameCached", funcTag, 128},
+	{"coroFrameNeedsClear", funcTag, 128},
 	{"coroSleep", funcTag, 129},
 	{"coroChanSend", funcTag, 130},
 	{"coroChanRecv", funcTag, 132},
@@ -285,6 +285,7 @@ var runtimeDecls = [...]struct {
 	{"coroGoexit", funcTag, 137},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 183},
+	{"coroTakeFrameChunk", funcTag, 183},
 }
 
 func runtimeTypes() []*types.Type {

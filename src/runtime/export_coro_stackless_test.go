@@ -9,11 +9,13 @@ package runtime
 import "unsafe"
 
 const (
-	StacklessCoroWarmExecutorCount  = stacklessCoroWarmExecutorCount
-	StacklessCoroTaskCacheSize      = stacklessCoroTaskCacheSize
-	StacklessCoroTaskChunkSize      = stacklessCoroTaskChunkSize
-	StacklessCoroFrameCacheSize     = stacklessCoroFrameCacheSize
-	StacklessCoroOperationCacheSize = stacklessCoroOperationCacheSize
+	StacklessCoroWarmExecutorCount     = stacklessCoroWarmExecutorCount
+	StacklessCoroTaskCacheSize         = stacklessCoroTaskCacheSize
+	StacklessCoroTaskChunkSize         = stacklessCoroTaskChunkSize
+	StacklessCoroFrameChunkSize        = stacklessCoroFrameChunkSize
+	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
+	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
+	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -67,6 +69,15 @@ func AwaitStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
 func TakeStacklessCoroFrameForTest(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8, size uintptr) unsafe.Pointer {
 	return coroTakeFrame(ctx, resume, size)
+}
+
+func TakeStacklessCoroFrameChunkForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr) (unsafe.Pointer, bool) {
+	frame := coroTakeFrameChunk(ctx, resume, size)
+	if frame != nil && frame == ctx {
+		return nil, true
+	}
+	return frame, false
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
@@ -199,6 +210,23 @@ func StacklessCoroReservedFrameCountForTest(ctx unsafe.Pointer) int {
 	}
 	unlock(&s.lock)
 	return count
+}
+
+func StacklessCoroFrameChunkMarkerIsolationForTest() bool {
+	first := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	second := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	parent := &stacklessCoroTask{
+		resume: first, frameSize: stacklessCoroFrameChunkDirectFirst,
+	}
+	task := &stacklessCoroTask{resume: second}
+	s := new(stacklessCoroScheduler)
+	s.markUncachedFrameLineageLocked(task, parent,
+		unsafe.Pointer(new(byte)))
+	return task.frameSize == stacklessCoroUncachedFrameLineage
 }
 
 func StacklessCoroCancelReservedFramesForTest() bool {
@@ -396,8 +424,8 @@ func FrameStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	return coroFrame(ctx)
 }
 
-func FrameCachedStacklessCoroForTest(ctx unsafe.Pointer) bool {
-	return coroFrameCached(ctx)
+func FrameNeedsClearStacklessCoroForTest(ctx unsafe.Pointer) bool {
+	return coroFrameNeedsClear(ctx)
 }
 
 func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
