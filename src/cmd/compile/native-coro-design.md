@@ -2996,15 +2996,25 @@ task context, reservation state, or a missing live chunk frame.
 ## 16. Work after the MVP
 
 The 2026-08-12 exact-upstream checkpoint separates performance work from
-surface-area work. The first performance sequence is:
+surface-area work. Its first performance item is now implemented without a
+second timer heap. Each reusable operation retains one stable timer owner. A
+monotonic generation is passed through the existing runtime timer callback,
+and an atomic active generation makes cancellation and expiry compete for the
+single right to publish completion. A callback from a canceled generation does
+nothing even if the operation has since been reused for a channel or another
+kind of wait.
 
-1. Keep positive sleeps on the runtime timer heap, but remove avoidable
-   per-wait timer ownership and global operation-list lookup. Timer expiry,
-   cancellation, early completion, and operation reuse must continue to race
-   through one owner transition. Passing a reusable operation pointer directly
-   to the callback is insufficient because a late callback would create an
-   ABA race with the operation cache.
-2. Replace the public `os.File.Read` and `net.TCPConn.Read` closure/worker
+Generation wrap retires the owner instead of reusing an ambiguous identity.
+An inactive owner stays with the scheduler's bounded operation cache; race
+builds continue to disable that cache and therefore do not reuse the timer's
+race identity. This removes the timer from the global operation list and
+avoids boxing a numeric callback identity on every wait. Tests exercise expiry,
+cancellation, their race, a deliberately late callback after same-kind and
+cross-kind reuse, and generation wrap.
+
+The remaining performance sequence is:
+
+1. Replace the public `os.File.Read` and `net.TCPConn.Read` closure/worker
    fallback with a stable compiler/runtime boundary. A regular-file syscall
    may still block an M and use the existing replacement-executor protocol;
    a socket wait should publish a logical completion directly from netpoll
@@ -3019,10 +3029,10 @@ surface-area work. The first performance sequence is:
    completion token and finish on a safe G. "Direct" here means removing the
    per-read waiting worker, not running arbitrary completion code in the
    poller.
-3. Reduce public-root entry transitions and typed frame allocation while
+2. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
-4. Remove ready-select temporary storage before changing channel-waiter
+3. Remove ready-select temporary storage before changing channel-waiter
    lifetime or ownership.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P

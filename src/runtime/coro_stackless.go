@@ -165,13 +165,14 @@ type stacklessCoroScheduler struct {
 	foreignReturners atomic.Uint32
 }
 
-// A stacklessCoroOperation is owned by the runtime registry until its source
-// publishes a terminal fact. Source callbacks carry only id.
+// A stacklessCoroOperation is owned by its source until that source publishes
+// a terminal fact. Registered sources carry only id. Timers use a stable
+// owner and generation so a late callback cannot complete a reused operation.
 type stacklessCoroOperation struct {
 	id        uint64
 	scheduler *stacklessCoroScheduler
 	task      *stacklessCoroTask
-	timer     *timer
+	timer     *stacklessCoroTimer
 	channel   *hchan
 	element   unsafe.Pointer
 	received  *bool
@@ -189,6 +190,21 @@ type stacklessCoroOperation struct {
 	async     bool
 	next      *stacklessCoroOperation
 	workNext  *stacklessCoroOperation
+}
+
+// A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
+// active is the generation that may publish completion. A callback from an
+// earlier generation observes a different value and does nothing.
+type stacklessCoroTimer struct {
+	timer     timer
+	operation *stacklessCoroOperation
+	sequence  uintptr
+	active    atomic.Uintptr
+}
+
+type stacklessCoroTimerToken struct {
+	timer    *stacklessCoroTimer
+	sequence uintptr
 }
 
 var stacklessCoroOperations struct {
@@ -1445,12 +1461,11 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 	completeStacklessCoroOperation(op)
 }
 
-func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
+func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) stacklessCoroTimerToken {
 	op := stacklessCoroStartOperation(ctx, "sleep")
-	id := registerStacklessCoroOperation(op)
-	t := new(timer)
-	t.init(stacklessCoroTimerReady, id)
-	op.timer = t
+	t, sequence := op.nextTimer()
+	op.id = uint64(sequence)
+	t.active.Store(sequence)
 
 	when := nanotime()
 	if ns > 0 {
@@ -1459,20 +1474,35 @@ func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) uint64 {
 			when = maxWhen
 		}
 	}
-	t.reset(when, 0)
-	return id
+	t.timer.modify(when, 0, stacklessCoroTimerReady, t, sequence)
+	return stacklessCoroTimerToken{timer: t, sequence: sequence}
 }
 
-func cancelStacklessCoroTimer(id uint64) bool {
-	op := takeStacklessCoroOperation(id)
-	if op == nil {
+func (op *stacklessCoroOperation) nextTimer() (*stacklessCoroTimer, uintptr) {
+	t := op.timer
+	if t != nil && (t.operation != op || t.active.Load() != 0) {
+		throw("runtime: invalid stackless coroutine timer reuse")
+	}
+	if t == nil || t.sequence == ^uintptr(0) {
+		t = &stacklessCoroTimer{operation: op}
+		t.timer.init(stacklessCoroTimerReady, t)
+		op.timer = t
+	}
+	t.sequence++
+	return t, t.sequence
+}
+
+func cancelStacklessCoroTimer(token stacklessCoroTimerToken) bool {
+	t := token.timer
+	if t == nil || token.sequence == 0 ||
+		!t.active.CompareAndSwap(token.sequence, 0) {
 		return false
 	}
-	if op.timer == nil {
+	op := t.operation
+	if op == nil || op.timer != t || op.id != uint64(token.sequence) {
 		throw("runtime: canceled stackless coroutine operation is not a timer")
 	}
-	op.timer.stop()
-	op.timer = nil
+	t.timer.stop()
 	completeStacklessCoroOperation(op)
 	return true
 }
@@ -1652,12 +1682,15 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
 	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
-		op.timer != nil || op.timerWait || op.next != nil || op.workNext != nil {
+		(op.timer != nil && op.timer.active.Load() != 0) ||
+		op.timerWait || op.next != nil || op.workNext != nil {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	s := op.scheduler
 	task := op.task
+	t := op.timer
 	*op = stacklessCoroOperation{}
+	op.timer = t
 	return s, task
 }
 
@@ -2128,16 +2161,15 @@ func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 	return op
 }
 
-func stacklessCoroTimerReady(arg any, _ uintptr, _ int64) {
-	id, ok := arg.(uint64)
-	if !ok {
-		throw("runtime: invalid stackless coroutine timer ID")
-	}
-	op := takeStacklessCoroOperation(id)
-	if op == nil {
+func stacklessCoroTimerReady(arg any, sequence uintptr, _ int64) {
+	t := arg.(*stacklessCoroTimer)
+	if !t.active.CompareAndSwap(sequence, 0) {
 		return
 	}
-	op.timer = nil
+	op := t.operation
+	if op == nil || op.timer != t || op.id != uint64(sequence) {
+		throw("runtime: invalid stackless coroutine timer completion")
+	}
 	completeStacklessCoroOperation(op)
 }
 

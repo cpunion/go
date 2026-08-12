@@ -560,12 +560,41 @@ func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	return unsafe.Pointer(found)
 }
 
-func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) uint64 {
+type StacklessCoroTimerTokenForTest = stacklessCoroTimerToken
+
+func StartSleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) StacklessCoroTimerTokenForTest {
 	return startStacklessCoroTimer(ctx, ns)
 }
 
-func CancelSleepStacklessCoroForTest(id uint64) bool {
-	return cancelStacklessCoroTimer(id)
+func CancelSleepStacklessCoroForTest(token StacklessCoroTimerTokenForTest) bool {
+	return cancelStacklessCoroTimer(token)
+}
+
+func ReadySleepStacklessCoroForTest(token StacklessCoroTimerTokenForTest) {
+	stacklessCoroTimerReady(token.timer, token.sequence, 0)
+}
+
+func StacklessCoroTimerOperationForTest(token StacklessCoroTimerTokenForTest) unsafe.Pointer {
+	if token.timer == nil {
+		return nil
+	}
+	return unsafe.Pointer(token.timer.operation)
+}
+
+func StacklessCoroTimerOwnerForTest(token StacklessCoroTimerTokenForTest) unsafe.Pointer {
+	return unsafe.Pointer(token.timer)
+}
+
+func CheckStacklessCoroTimerWrapForTest() bool {
+	op := new(stacklessCoroOperation)
+	first, sequence := op.nextTimer()
+	if sequence != 1 {
+		return false
+	}
+	first.sequence = ^uintptr(0)
+	second, sequence := op.nextTimer()
+	return second != first && sequence == 1 && second.operation == op &&
+		op.timer == second
 }
 
 func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
