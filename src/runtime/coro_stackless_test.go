@@ -3618,11 +3618,11 @@ func TestStacklessCoroSleepProgress(t *testing.T) {
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	var state int
-	var id uint64
+	var token runtime.StacklessCoroTimerTokenForTest
 	var progressed, canceled bool
 	progress := func(unsafe.Pointer) uint8 {
 		progressed = true
-		canceled = runtime.CancelSleepStacklessCoroForTest(id)
+		canceled = runtime.CancelSleepStacklessCoroForTest(token)
 		return runtime.StacklessCoroActionComplete
 	}
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -3630,7 +3630,7 @@ func TestStacklessCoroSleepProgress(t *testing.T) {
 		case 0:
 			state = 1
 			runtime.SpawnStacklessCoroForTest(ctx, progress)
-			id = runtime.StartSleepStacklessCoroForTest(ctx, int64(delay))
+			token = runtime.StartSleepStacklessCoroForTest(ctx, int64(delay))
 			return runtime.StacklessCoroActionWait
 		case 1:
 			state = 2
@@ -3647,21 +3647,31 @@ func TestStacklessCoroSleepProgress(t *testing.T) {
 }
 
 func TestStacklessCoroSleepCancel(t *testing.T) {
-	var state int
-	var id uint64
+	const maxDuration = int64(^uint64(0) >> 1)
+	var state, round int
+	var token runtime.StacklessCoroTimerTokenForTest
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
 			state = 1
-			id = runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
-			if !runtime.CancelSleepStacklessCoroForTest(id) {
+			delay := int64(time.Hour)
+			if round != 0 {
+				delay = maxDuration
+			}
+			token = runtime.StartSleepStacklessCoroForTest(ctx, delay)
+			if !runtime.CancelSleepStacklessCoroForTest(token) {
 				t.Fatal("canceling live timer failed")
 			}
-			if runtime.CancelSleepStacklessCoroForTest(id) {
+			if runtime.CancelSleepStacklessCoroForTest(token) {
 				t.Fatal("canceling stale timer succeeded")
 			}
 			return runtime.StacklessCoroActionWait
 		case 1:
+			if round == 0 {
+				round = 1
+				state = 0
+				return runtime.StacklessCoroActionYield
+			}
 			state = 2
 			return runtime.StacklessCoroActionComplete
 		default:
@@ -3698,6 +3708,51 @@ func TestStacklessCoroSleepCancelRace(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroTimerOwnerReuse(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var first, second runtime.StacklessCoroTimerTokenForTest
+	var firstOwner, secondOwner unsafe.Pointer
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			first = runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
+			firstOwner = runtime.StacklessCoroTimerOwnerForTest(first)
+			if !runtime.CancelSleepStacklessCoroForTest(first) {
+				t.Fatal("canceling first reusable timer failed")
+			}
+			state = 1
+			return runtime.StacklessCoroActionWait
+		case 1:
+			second = runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
+			secondOwner = runtime.StacklessCoroTimerOwnerForTest(second)
+			runtime.ReadySleepStacklessCoroForTest(first)
+			if runtime.CancelSleepStacklessCoroForTest(first) {
+				t.Fatal("canceling stale reusable timer succeeded")
+			}
+			if !runtime.CancelSleepStacklessCoroForTest(second) {
+				t.Fatal("late callback consumed reused timer")
+			}
+			state = 2
+			return runtime.StacklessCoroActionWait
+		case 2:
+			state = 3
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected timer owner reuse state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if got, want := firstOwner == secondOwner, !race.Enabled; got != want {
+		t.Fatalf("timer owner reused = %t, want %t", got, want)
+	}
+	if !runtime.CheckStacklessCoroTimerWrapForTest() {
+		t.Fatal("timer generation wrap reused an old owner")
+	}
+}
+
 func TestStacklessCoroOperationReuse(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
@@ -3725,13 +3780,14 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 		callRelease := make(chan struct{})
 		value := 42
 		var tokens [3]unsafe.Pointer
+		var timer runtime.StacklessCoroTimerTokenForTest
 		state := 0
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch state {
 			case 0:
-				id := runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
-				tokens[0] = runtime.StacklessCoroOperationTokenForTest(ctx)
-				if !runtime.CancelSleepStacklessCoroForTest(id) {
+				timer = runtime.StartSleepStacklessCoroForTest(ctx, int64(time.Hour))
+				tokens[0] = runtime.StacklessCoroTimerOperationForTest(timer)
+				if !runtime.CancelSleepStacklessCoroForTest(timer) {
 					t.Fatal("canceling operation reuse timer failed")
 				}
 				state = 1
@@ -3740,6 +3796,7 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				cacheCount(t, ctx)
 				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
 				tokens[1] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				runtime.ReadySleepStacklessCoroForTest(timer)
 				close(startReceiver)
 				state = 2
 				return runtime.StacklessCoroActionWait
@@ -3779,7 +3836,7 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 
 	t.Run("bounded", func(t *testing.T) {
 		const operations = runtime.StacklessCoroOperationCacheSize + 1
-		ids := make([]uint64, operations)
+		timers := make([]runtime.StacklessCoroTimerTokenForTest, operations)
 		var started, completed atomic.Int32
 		parentState := 0
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -3791,7 +3848,7 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 					runtime.SpawnStacklessCoroForTest(ctx, func(childCtx unsafe.Pointer) uint8 {
 						switch childState {
 						case 0:
-							ids[index] = runtime.StartSleepStacklessCoroForTest(
+							timers[index] = runtime.StartSleepStacklessCoroForTest(
 								childCtx, int64(time.Hour))
 							started.Add(1)
 							childState = 1
@@ -3812,9 +3869,9 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				if started.Load() != operations {
 					return runtime.StacklessCoroActionYield
 				}
-				for _, id := range ids {
-					if !runtime.CancelSleepStacklessCoroForTest(id) {
-						t.Fatalf("canceling bounded operation %d failed", id)
+				for i, timer := range timers {
+					if !runtime.CancelSleepStacklessCoroForTest(timer) {
+						t.Fatalf("canceling bounded operation %d failed", i)
 					}
 				}
 				want := runtime.StacklessCoroOperationCacheSize
