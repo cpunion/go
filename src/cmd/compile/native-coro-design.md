@@ -2904,6 +2904,95 @@ and ownership lifetimes. Any frame arena or batch design must preserve those
 typed roots and bounded retention before it can replace the current one-frame
 allocation policy.
 
+### 15.8 Saturated typed-frame chunks
+
+The task-slab change leaves compiler-generated frames as the larger remaining
+deep-recursion allocation stream. A runtime-owned untyped arena is not valid
+for them: every generated frame has its own GC pointer map, and retaining an
+interior pointer must keep that exact typed allocation live. This change
+batches those frames without weakening either property.
+
+The compiler enables frame chunks only for a factory with a structured
+self-recursive `await` and no self-recursive `spawn`. Await suspends the parent
+before starting its child, so only one adjacent element can be requested from
+that parent. Spawn may create concurrent siblings and is deliberately
+ineligible, even when the same function also awaits itself. Nonrecursive,
+indirect, mismatched-resume, zero-sized, oversized, and race-enabled paths
+retain the ordinary one-frame policy.
+
+An eligible factory passes the runtime type descriptor for its generated
+`[4]frame` type. At a chunk boundary, the runtime calls `newobject` with that
+descriptor; the allocation therefore carries the compiler-generated exact GC
+map. The live parent frame keeps the array reachable while the child consumes
+the adjacent element. The runtime validates the descriptor's array kind,
+length, element size, and total size before using it. No untyped frame pool,
+new task field, ABI version, or source annotation is introduced.
+
+The existing `frameSize` word encodes the bounded saturated-lineage phase.
+Six single-frame allocations precede the first four-frame chunk, starting two
+levels after the four-task direct prefix. This stagger prevents both first
+chunk charges from landing at the same recursion depth. Each chunk element
+records whether its following self-recursive child starts a new typed array or
+uses the next element. Completion clears pointer fields from chunk elements,
+because an active adjacent element may retain their shared typed allocation.
+
+An earlier protocol returned the task context as a sentinel and made the
+generated factory allocate `[4]frame`. It preserved GC safety but enlarged the
+recursive factory from 192 to 240 bytes and added comparisons on every shallow
+cache hit. The final protocol moves typed allocation into the runtime through
+the standard type descriptor and `newobject` path. The factory returns to one
+runtime call and one nil check, exactly the parent's 192-byte factory and
+432-byte resume on Darwin/arm64. The nonrecursive factory and resume remain
+160 and 176 bytes. `coroTakeFrame` grows from 544 to 560 bytes, and the new
+`coroTakeFrameChunk` is 864 bytes.
+
+The boundary probes distinguish the first partial chunk from the first fully
+amortized chunk. The exact parent is `c1fd783614`; the candidate is
+`f2902f145e`:
+
+| Probe | Parent | Frame chunks | Change |
+| --- | ---: | ---: | ---: |
+| public yield entry | 224 B, 3 allocs | 224 B, 3 allocs | unchanged |
+| recursive yield, depth 64 | 248 B, 3 allocs | 248 B, 3 allocs | unchanged |
+| recursive yield, depth 256 | 248 B, 3 allocs | 248 B, 3 allocs | unchanged |
+| recursive yield, depth 262 | 968 B, 15 allocs | 968 B, 15 allocs | unchanged |
+| recursive yield, depth 264 | 1,064 B, 17 allocs | 1,176 B, 17 allocs | +112 B, allocations unchanged |
+| recursive yield, depth 267 | 1,400 B, 21 allocs | 1,368 B, 18 allocs | -32 B, -14.29% allocs |
+| recursive yield, depth 4,096 | 368,936 B, 4,807 allocs | 338,392 B, 1,933 allocs | -8.28% B, -59.79% allocs |
+
+Depth 264 exposes the intentional worst boundary: it charges a complete typed
+array before all four elements are used. Depth 267 consumes the first complete
+chunk and already saves three allocations. At depth 4,096, typed-frame chunks
+remove 2,874 allocations in addition to the task-slab savings inherited from
+the parent.
+
+The authoritative timing comparison ran natively on Linux/amd64, compiling
+the same candidate probe source with both exact-parent and candidate
+toolchains. Twenty alternating one-second fixed-layout samples and twelve
+independently linked randomized-layout seeds used `GOMAXPROCS=1` and disabled
+inlining. The fixed layout changed depth 4,096 from 678.7 us to 659.6 us
+(-2.81%, `p<0.001`); the timing geomean increased by 1.41%. The fixed entry,
+depths 64, 256, 262, and 267 changed by +1.00%, +1.38%, +1.24%, +1.66%, and
++1.23%. The partial depth-264 boundary changed by +6.37%.
+
+Randomized layouts made entry, depths 64, 256, and 267 statistically neutral.
+Depth 4,096 remained 2.34% faster (`p=0.006`), while depth 262 was 1.15%
+slower (`p=0.024`) and the partial depth-264 boundary was 4.24% slower
+(`p=0.006`). The timing geomean increased by 0.83%. Every fixed and randomized
+sample reproduced the allocation table exactly. The persistent depth-264 cost
+is therefore the explicit +112-byte partial-chunk boundary, not a hidden
+shallow-path allocation or a chance text layout.
+
+The exact candidate passes complete compiler-lowering and runtime packages on
+Darwin/arm64 and controlled Linux/amd64, focused race and `checkptr=2` tests,
+direct Linux/386 execution, generated-builtin consistency, and the portable
+architecture probes. The latter retain 98.1% statement coverage. Full
+profiles report 93.1% for the compiler coroutine package and 71.3% for the
+runtime package. Of 142 new executable production lines, 134 are covered
+(94.37%): compiler lowering covers 38 of 38 and runtime covers 96 of 104. The
+eight uncovered runtime lines are fatal checks requiring deliberately invalid
+task context, reservation state, or a missing live chunk frame.
+
 ## 16. Work after the MVP
 
 The likely order is:
