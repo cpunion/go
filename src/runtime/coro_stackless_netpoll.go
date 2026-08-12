@@ -35,7 +35,6 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 		return
 	}
 
-	stacklessCoroNetpollInit()
 	netpollGenericInit()
 	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
 	if openErr != 0 {
@@ -43,6 +42,7 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 		stacklessCoroSocketReadFinish(op, -1, uintptr(openErr))
 		return
 	}
+	stacklessCoroNetpollInit()
 	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	registerStacklessCoroOperation(op)
 	stacklessCoroSocketReadAttempt(op)
