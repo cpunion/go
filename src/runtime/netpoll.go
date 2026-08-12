@@ -496,8 +496,33 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 	var rg, wg *g
 	var coroRead uintptr
 	if mode == 'r' || mode == 'r'+'w' {
-		coroRead = netpollCoroReadReady(pd, &delta)
-		if coroRead == 0 {
+		if netpollCoroEnabled {
+			// Keep the ordinary and coroutine cases in one semaphore loop to
+			// avoid a second load on every network read event.
+			for {
+				old := pd.rg.Load()
+				if old&netpollCoroTagMask == netpollCoroTag {
+					if !pd.rg.CompareAndSwap(old, pdNil) {
+						continue
+					}
+					delta--
+					coroRead = old &^ netpollCoroTagMask
+					break
+				}
+				if old == pdReady {
+					break
+				}
+				if pd.rg.CompareAndSwap(old, pdReady) {
+					if old == pdWait {
+						old = pdNil
+					} else if old != pdNil {
+						delta--
+					}
+					rg = (*g)(unsafe.Pointer(old))
+					break
+				}
+			}
+		} else {
 			rg = netpollunblock(pd, 'r', true, &delta)
 		}
 	}

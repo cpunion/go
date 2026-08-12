@@ -4355,6 +4355,16 @@ func TestStacklessCoroPollArm(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroOrdinaryNetpollStates(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	runtime.StacklessCoroOrdinaryNetpollStatesForTest(fds[0])
+}
+
 func TestStacklessCoroSocketReadConcurrent(t *testing.T) {
 	const readers = 32
 	type result struct {

@@ -6,10 +6,11 @@
 
 package runtime
 
-//go:nowritebarrier
-func netpollCoroReadReady(*pollDesc, *int32) uintptr {
-	return 0
-}
+const (
+	netpollCoroEnabled = false
+	netpollCoroTagMask = uintptr(3)
+	netpollCoroTag     = uintptr(3)
+)
 
 //go:nowritebarrier
 func netpollCoroDispatch(*gList, uintptr) {

@@ -235,6 +235,18 @@ func BenchmarkStacklessCoroSocketReadWait(b *testing.B) {
 	benchmarkStacklessCoroSocketRead(b, true)
 }
 
+func BenchmarkStacklessCoroOrdinaryNetpollReady(b *testing.B) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	b.ReportAllocs()
+	b.ResetTimer()
+	runtime.StacklessCoroOrdinaryNetpollReadyForTest(fds[0], b.N)
+}
+
 func benchmarkStacklessCoroSocketRead(b *testing.B, wait bool) {
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 	if err != nil {

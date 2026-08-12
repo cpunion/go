@@ -563,6 +563,52 @@ func StacklessCoroNetpollWaiterCountForTest() uint32 {
 	return netpollWaiters.Load()
 }
 
+func StacklessCoroOrdinaryNetpollReadyForTest(fd, iterations int) {
+	netpollGenericInit()
+	pd, errno := poll_runtime_pollOpen(uintptr(fd))
+	if errno != 0 {
+		throw("runtime: failed to open ordinary netpoll benchmark descriptor")
+	}
+	for range iterations {
+		pd.rg.Store(pdNil)
+		var toRun gList
+		if delta := netpollready(&toRun, pd, 'r'); delta != 0 || !toRun.empty() {
+			throw("runtime: unexpected ordinary netpoll readiness result")
+		}
+	}
+	pd.rg.Store(pdNil)
+	poll_runtime_pollUnblock(pd)
+	poll_runtime_pollClose(pd)
+}
+
+func StacklessCoroOrdinaryNetpollStatesForTest(fd int) {
+	netpollGenericInit()
+	pd, errno := poll_runtime_pollOpen(uintptr(fd))
+	if errno != 0 {
+		throw("runtime: failed to open ordinary netpoll test descriptor")
+	}
+	check := func(wantDelta int32, want *g) {
+		var toRun gList
+		if delta := netpollready(&toRun, pd, 'r'); delta != wantDelta {
+			throw("runtime: unexpected ordinary netpoll readiness delta")
+		}
+		if got := toRun.pop(); got != want || !toRun.empty() {
+			throw("runtime: unexpected ordinary netpoll readiness list")
+		}
+	}
+	pd.rg.Store(pdNil)
+	check(0, nil)
+	check(0, nil)
+	pd.rg.Store(pdWait)
+	check(0, nil)
+	gp := getg()
+	pd.rg.Store(uintptr(unsafe.Pointer(gp)))
+	check(-1, gp)
+	pd.rg.Store(pdNil)
+	poll_runtime_pollUnblock(pd)
+	poll_runtime_pollClose(pd)
+}
+
 func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, errno int, tokenMatches bool, delta int32) {
 	netpollGenericInit()
 	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
@@ -587,7 +633,18 @@ func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, err
 	}
 	waiting, errno = netpollCoroReadArm(pd, op)
 	if waiting {
-		token := netpollCoroReadReady(pd, &delta)
+		var token uintptr
+		for {
+			old := pd.rg.Load()
+			if old&netpollCoroTagMask != netpollCoroTag {
+				break
+			}
+			if pd.rg.CompareAndSwap(old, pdNil) {
+				delta--
+				token = old &^ netpollCoroTagMask
+				break
+			}
+		}
 		tokenMatches = token == uintptr(unsafe.Pointer(op))
 		netpollAdjustWaiters(delta)
 	}

@@ -9,6 +9,7 @@ package runtime
 import "unsafe"
 
 const (
+	netpollCoroEnabled = true
 	netpollCoroTagMask = uintptr(3)
 	netpollCoroTag     = uintptr(3)
 )
@@ -42,23 +43,6 @@ func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
 				return true, pollNoError
 			}
 			netpollAdjustWaiters(-1)
-		}
-	}
-}
-
-// netpollCoroReadReady removes and returns a logical read token. It runs in
-// the platform poller's no-write-barrier path.
-//
-//go:nowritebarrier
-func netpollCoroReadReady(pd *pollDesc, delta *int32) uintptr {
-	for {
-		old := pd.rg.Load()
-		if old&netpollCoroTagMask != netpollCoroTag {
-			return 0
-		}
-		if pd.rg.CompareAndSwap(old, pdNil) {
-			*delta -= 1
-			return old &^ netpollCoroTagMask
 		}
 	}
 }
