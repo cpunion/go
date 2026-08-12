@@ -602,3 +602,135 @@ recover at 1.242 us -> 1.219 us (-1.85%, `p=0.008`); both recursive probes
 were neutral. These small translated-Linux changes are retained as supporting
 data. The cross-platform conclusion is the exact one-object reduction, not a
 general timing claim.
+
+### Latest-upstream architecture checkpoint
+
+The 2026-08-12 checkpoint follows the repository's merge-based maintenance
+model. It compares Go development revision `9549c91031` with the coroutine
+tree after merging that exact revision at `d64e2793c2`. The source probes are
+identical, inlining is disabled, and `run.bash` verified the official revision
+as the candidate's exact upstream merge-base. It discarded three warm-up
+pairs, alternated execution order over ten 500 ms samples, used ten samples
+at each processor count, and measured the 10,000-task footprint in six
+independent processes.
+
+Darwin ran natively on an Apple M4 Max. The host had unrelated concurrent
+load, which widened several official-baseline distributions; the table is an
+architecture-scale checkpoint rather than a release threshold. Linux/amd64
+ran under VirtualApple translation and had still wider scheduling variance.
+Its timings validate direction and expose sensitivity to executor or worker
+hops, but are not native x86 performance results. Each entry is the median
+official result followed by the median coroutine result. A tilde marks a
+difference that was not statistically significant.
+
+| Probe | Darwin arm64 | Translated Linux amd64 |
+| --- | ---: | ---: |
+| amortized logical yield | 125.80 ns -> 46.43 ns (-63%) | 227.7 ns -> 188.0 ns (~) |
+| one public coroutine entry | 127.5 ns -> 2.630 us (20.6x) | 356.9 ns -> 5.900 us (16.5x) |
+| recursive yield, depth 4,096 | 43.81 us -> 1.235 ms (28.2x) | 36.85 us -> 6.584 ms (179x) |
+| park and wake 100 tasks | 49.90 us -> 71.69 us (1.44x) | 83.00 us -> 328.95 us (3.96x) |
+| channel round trip | 495.9 ns -> 718.0 ns (1.45x) | 994.9 ns -> 4.930 us (4.96x) |
+| ready `select` | 99.72 ns -> 687.20 ns (6.89x) | 312.6 ns -> 3.325 us (10.6x) |
+| `Sleep(1ns)` adapter | 277.2 ns -> 16.633 us (60.0x) | 649.1 ns -> 411.07 us (633x) |
+| ready file-read adapter | 748.0 ns -> 21.642 us (28.9x) | 596.3 ns -> 521.47 us (874x) |
+| ready TCP-read adapter | 662.6 ns -> 20.756 us (31.3x) | 917.1 ns -> 542.13 us (591x) |
+| blocking file read and sibling release | 4.154 us -> 30.979 us (7.46x) | 9.281 us -> 765.94 us (82.5x) |
+| blocking TCP read and sibling release | 27.86 us -> 60.99 us (2.19x) | 22.24 us -> 786.05 us (35.3x) |
+| scalar C call | 44.34 ns -> 35.54 ns (-20%) | 235.8 ns -> 224.1 ns (~) |
+| three concurrent blocking C calls | 413.4 us -> 236.8 us (-43%) | 10.949 ms -> 5.353 ms (-51%) |
+| eight concurrent blocking C calls | 884.8 us -> 546.3 us (-38%) | 27.80 ms -> 16.12 ms (-42%) |
+| park and wake 10,000 tasks | 16.02 ms -> 831.56 ms (51.9x) | 21.77 ms -> 833.09 ms (38.3x) |
+
+The separate entry metric for the blocking-C groups improved by 79% and 72%
+for three and eight calls on Darwin, and by 84% and 75% under translated
+Linux. Ordinary scalar, aggregate, errno, and libm direct calls remained
+allocation-free. Aggregate, errno, and libm timing was neutral on Darwin;
+all four short-call timings were neutral in the translated environment. The
+translated environment amplifies the ordinary cgo handoff, so the native
+Darwin result is the more representative magnitude.
+
+The fixed-work scheduler remained statistically level with official Go at two
+and four Ps on Darwin and at one, two, and four Ps under translated Linux.
+Darwin's single-P row measured 4.4% faster, but the official sample was
+variable and is not classified as a general speedup. Steady sequential and
+burst task probes allocated nothing in either implementation. Their Darwin
+times favored the coroutine path in this run while translated Linux was
+neutral, so they are likewise retained as controls rather than speed claims.
+
+The deterministic allocation results better isolate the remaining costs:
+
+| Probe | Official Go | Coroutine |
+| --- | ---: | ---: |
+| one public coroutine entry | 0 B, 0 allocs | 224 B, 3 allocs |
+| recursive yield, depth 4,096 | 0 B, 0 allocs | 338,392 B, 1,933 allocs |
+| park and wake 100 tasks | 112 B, 1 alloc | about 18.2 KiB, 137 allocs |
+| channel round trip | 0 B, 0 allocs | 224 B, 2 allocs |
+| ready `select` | 0 B, 0 allocs | 132 B, 3 allocs |
+| `Sleep(1ns)` | 0 B, 0 allocs | 104 B, 2 allocs |
+| ready file or TCP read | 0 B, 0 allocs | 64 B, 1 alloc |
+| blocking file or TCP read | 0 B, 0 allocs | about 596 B, 16 allocs |
+| ordinary direct C call | 0 B, 0 allocs | 0 B, 0 allocs |
+
+A separate rate-one allocation profile over 10,000 positive sleeps attributed
+one 96-byte allocation per wait to the `new(timer)` call. The remaining
+amortized bytes are consistent with boxing the numeric operation identity for
+the timer callback argument. Operation-header reuse is already active. The
+timer target is therefore ownership and identity overhead around the existing
+runtime timer heap, not a second timer implementation.
+
+The corresponding rate-one ready-file profile attributed its single 64-byte
+allocation per read to the compiler-generated call closure at the public
+`os.File.Read` site. The operation header is already reused, after which the
+closure still crosses the shared worker queue. This isolates the public
+lowering boundary and worker handoff, rather than the operation cache, as the
+file and socket target.
+
+For 10,000 simultaneously parked tasks, live heap fell from 623.1 B to
+356.6 B per task and live stack fell from 2,048 B to 6.554 B per task. Live
+objects rose from 2.002 to 3.253 per task, and the operation performed 40,040
+allocations instead of 20,020. This preserves the experiment's central space
+advantage while making the current park/wake time and object cost explicit.
+
+Compared with the 2026-08-02 exact-upstream checkpoint, subsequent bounded
+reuse and saturated-lineage work reduced public-entry allocation from 584 B
+and eight allocations to 224 B and three allocations. Depth-4,096 recursion
+fell from about 464.6 KiB and 16,393 allocations to 330.5 KiB and 1,933
+allocations. The 100-task park/wake probe fell from 20,225 B and 337
+allocations to about 18.2 KiB and 137 allocations. Live objects per parked
+task fell from 4.253 to 3.253. Timing is not compared across those two host
+runs because their load and upstream revisions differ.
+
+#### Disabled-experiment control
+
+A third build compiled the merged tree with `GOEXPERIMENT=nocoro` and compared
+it with the official toolchain. The control used prebuilt binaries, three
+warm-up pairs, ten alternating-order 500 ms samples, the same processor-count
+matrix, and the same six-process footprint measurement. On each platform, 27
+of the 28 timing rows were statistically neutral. The lone fixed-layout
+difference was not the same operation: aggregate C calls measured 31% slower
+on Darwin (`p=0.007`), while depth-4,096 recursion measured 106% slower
+under translated Linux (`p=0.035`).
+
+Those two rows were repeated across linked layouts. Twelve matched Darwin
+`-randlayout` seeds made the aggregate C result neutral (`p=0.671`), and ten
+matched translated-Linux seeds made the recursion result neutral (`p=0.739`).
+All operation allocation counts matched, as did live heap and object counts;
+live stack was also statistically level. The different fixed-layout outliers
+and neutral layout controls provide no evidence of a systematic regression
+when the experiment is disabled.
+
+This checkpoint makes the next order of performance work concrete:
+
+1. keep positive-duration waits on the runtime timer heap while reducing their
+   per-wait timer allocation and global operation lookup, then replace the
+   public file and socket closure/worker path with stable runtime integration;
+   regular files still need a blocking-M handoff, while sockets should attach
+   logical completion directly to netpoll readiness;
+2. reduce the fixed root-entry transition and typed frame allocation costs,
+   with the depth-boundary probes guarding the existing bounded-retention and
+   exact-GC-map rules; and
+3. remove ready-`select` temporary storage before changing channel waiter
+   lifetime.
+
+The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
+and live task footprint are regression gates for each of those changes.
