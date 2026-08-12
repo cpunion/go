@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -32,6 +33,12 @@ const stacklessCoroTaskCacheSize = 256
 // exact 112-byte size class on 32-bit targets. Both remain below the per-object
 // malloc-header threshold.
 const stacklessCoroTaskChunkSize = 4
+const stacklessCoroFrameChunkSize = 4
+
+// Start typed-frame chunks two tasks after the task-chunk boundary. The
+// stagger keeps their first-element allocation charges from occurring at the
+// same recursive depth.
+const stacklessCoroFrameChunkDirectCount = 6
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
@@ -42,6 +49,18 @@ const stacklessCoroUncachedFrameLineage = ^uint16(0)
 // stacklessCoroFreeOverflowTask marks a never-used task slot from a saturated
 // allocation chunk while that slot is linked on the scheduler free list.
 const stacklessCoroFreeOverflowTask = stacklessCoroUncachedFrameLineage - 1
+
+// A recursive typed-frame chunk uses task-local markers. Direct markers count
+// the single-frame prefix. Element markers identify a frame whose following
+// recursive child can use the adjacent element of the same typed allocation.
+const (
+	stacklessCoroFrameChunkDirectFirst = stacklessCoroFreeOverflowTask - 1
+	stacklessCoroFrameChunkDirectLast  = stacklessCoroFrameChunkDirectFirst -
+		stacklessCoroFrameChunkDirectCount
+	stacklessCoroFrameChunkFirst = stacklessCoroFrameChunkDirectLast - 1
+	stacklessCoroFrameChunkLast  = stacklessCoroFrameChunkFirst -
+		(stacklessCoroFrameChunkSize - 1)
+)
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 
 const (
@@ -278,7 +297,7 @@ func (s *stacklessCoroScheduler) newTaskLocked(frame unsafe.Pointer,
 func (s *stacklessCoroScheduler) newTaskWithOverflowLocked(frame unsafe.Pointer,
 	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
 	allowOverflow := !raceenabled && frame != nil && parent != nil &&
-		parent.frameSize == stacklessCoroUncachedFrameLineage
+		isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	task := s.takeFreeOverflowTaskLocked(allowOverflow)
 	if task == nil {
 		if frame == nil {
@@ -296,7 +315,7 @@ func (s *stacklessCoroScheduler) newTaskAfterCacheMissLocked(
 	frame unsafe.Pointer, resume stacklessCoroResume,
 	parent *stacklessCoroTask) *stacklessCoroTask {
 	uncachedLineage := !raceenabled && parent != nil &&
-		parent.frameSize == stacklessCoroUncachedFrameLineage
+		isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	task := s.allocateTaskLocked(uncachedLineage)
 	return initializeStacklessCoroTask(task, frame, resume, parent)
 }
@@ -462,7 +481,7 @@ func (s *stacklessCoroScheduler) discardFreeOverflowTasks() {
 }
 
 func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
-	uncachedLineage := task.frameSize == stacklessCoroUncachedFrameLineage
+	uncachedLineage := isStacklessCoroUncachedFrameLineage(task.frameSize)
 	task.resume = nil
 	task.context.frame = nil
 	task.cacheFrame = false
@@ -490,7 +509,7 @@ func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	_, hasTerminalValue := s.terminalValues[task]
 	uncachedLineage := !task.cacheFrame &&
-		task.frameSize == stacklessCoroUncachedFrameLineage
+		isStacklessCoroUncachedFrameLineage(task.frameSize)
 	validFrame := !task.cacheFrame && task.resume == nil &&
 		task.context.frame == nil &&
 		(task.frameSize == 0 || uncachedLineage)
@@ -706,17 +725,29 @@ func coroFrame(ctx unsafe.Pointer) unsafe.Pointer {
 	return context.frame
 }
 
-// coroFrameCached reports whether the current typed frame owns bounded cache
-// capacity. Compiler-generated completion paths clear its pointer fields
-// before the runtime retains it.
-func coroFrameCached(ctx unsafe.Pointer) bool {
+func isStacklessCoroUncachedFrameLineage(marker uint16) bool {
+	return marker == stacklessCoroUncachedFrameLineage ||
+		marker <= stacklessCoroFrameChunkDirectFirst &&
+			marker >= stacklessCoroFrameChunkLast
+}
+
+func isStacklessCoroFrameChunkElement(marker uint16) bool {
+	return marker <= stacklessCoroFrameChunkFirst &&
+		marker >= stacklessCoroFrameChunkLast
+}
+
+// coroFrameNeedsClear reports whether another runtime-owned reference can
+// retain the current typed allocation after this frame completes. Generated
+// completion paths clear pointer fields before returning such a frame.
+func coroFrameNeedsClear(ctx unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil ||
 		task.state != stacklessCoroTaskRunning || !task.resuming {
-		throw("runtime: invalid stackless coroutine frame-cache query")
+		throw("runtime: invalid stackless coroutine frame-clear query")
 	}
-	return task.cacheFrame
+	return task.cacheFrame ||
+		isStacklessCoroFrameChunkElement(task.frameSize)
 }
 
 // coroTakeFrame reserves a task for a compiler-generated frame factory and
@@ -734,9 +765,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		throw("runtime: invalid stackless coroutine frame reservation")
 	}
 	s := context.scheduler
-	// A marked explicit-frame task carries a saturated lineage without a
-	// shared-state query.
-	if parent.frameSize == stacklessCoroUncachedFrameLineage {
+	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
 		return nil
 	}
 	lock(&s.lock)
@@ -769,16 +798,124 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	return frame
 }
 
+// coroTakeFrameChunk extends coroTakeFrame for compiler-proven structured
+// self recursion. chunkType describes the generated [4]frame allocation, so
+// newobject preserves its exact GC pointer map.
+func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
+	size uintptr, chunkType *_type) unsafe.Pointer {
+	if ctx == nil || raceenabled || size > stacklessCoroFrameCacheSize {
+		return nil
+	}
+	context := (*stacklessCoroContext)(ctx)
+	parent := context.task()
+	if context.scheduler == nil || parent == nil || child == nil {
+		throw("runtime: invalid stackless coroutine frame reservation")
+	}
+	s := context.scheduler
+	// A marked explicit-frame task carries a saturated lineage without a
+	// shared-state query.
+	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
+		chunkEligible := size != 0 &&
+			size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
+			validStacklessCoroFrameChunkType(chunkType, size) &&
+			parent.resume != nil &&
+			stacklessCoroResumeIdentity(parent.resume) ==
+				stacklessCoroResumeIdentity(child)
+		if !chunkEligible {
+			return nil
+		}
+		switch marker := parent.frameSize; {
+		case marker == stacklessCoroFrameChunkDirectLast ||
+			marker == stacklessCoroFrameChunkLast:
+			return newobject(chunkType)
+		case marker <= stacklessCoroFrameChunkFirst &&
+			marker > stacklessCoroFrameChunkLast:
+			if parent.context.frame == nil {
+				throw("runtime: missing stackless coroutine frame chunk")
+			}
+			return add(parent.context.frame, size)
+		default:
+			return nil
+		}
+	}
+	lock(&s.lock)
+	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+		parent.readyPending ||
+		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine frame reservation outside resume")
+	}
+	task := s.takeCachedFrameTaskLocked(child, uint16(size))
+	if task == nil {
+		task = s.newTaskLocked(nil, child, parent)
+		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
+			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
+			task.cacheFrame = true
+			task.frameSize = uint16(size)
+			s.cachedFrameTasks++
+			s.cachedFrameBytes += uint16(size)
+		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			s.freeFrameBytes == 0 {
+			task.frameSize = stacklessCoroUncachedFrameLineage
+			if size != 0 &&
+				size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
+				validStacklessCoroFrameChunkType(chunkType, size) {
+				task.frameSize = stacklessCoroFrameChunkDirectFirst
+			}
+		}
+	} else {
+		task.parent = parent
+	}
+	task.next = s.reservedTasks
+	s.reservedTasks = task
+	frame := task.context.frame
+	unlock(&s.lock)
+	return frame
+}
+
+func validStacklessCoroFrameChunkType(chunkType *_type, size uintptr) bool {
+	if chunkType == nil || chunkType.Kind() != abi.Array {
+		return false
+	}
+	array := (*arraytype)(unsafe.Pointer(chunkType))
+	return array.Len == stacklessCoroFrameChunkSize &&
+		array.Elem != nil && array.Elem.Size_ == size &&
+		chunkType.Size_ == size*stacklessCoroFrameChunkSize
+}
+
 // markUncachedFrameLineageLocked records a saturated explicit-frame lineage
 // after a factory bypasses its reservation. The scheduler lock must be held.
 func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 	parent *stacklessCoroTask, frame unsafe.Pointer) {
 	if frame == nil || task.cacheFrame ||
-		task.frameSize == stacklessCoroUncachedFrameLineage {
+		isStacklessCoroUncachedFrameLineage(task.frameSize) {
 		return
 	}
-	if parent.frameSize == stacklessCoroUncachedFrameLineage {
-		task.frameSize = stacklessCoroUncachedFrameLineage
+	marker := parent.frameSize
+	if !isStacklessCoroUncachedFrameLineage(marker) {
+		return
+	}
+	task.frameSize = stacklessCoroUncachedFrameLineage
+	if parent.resume == nil || task.resume == nil ||
+		stacklessCoroResumeIdentity(parent.resume) !=
+			stacklessCoroResumeIdentity(task.resume) {
+		return
+	}
+	switch {
+	case marker <= stacklessCoroFrameChunkDirectFirst &&
+		marker >= stacklessCoroFrameChunkDirectLast:
+		if marker == stacklessCoroFrameChunkDirectLast {
+			task.frameSize = stacklessCoroFrameChunkFirst
+		} else {
+			task.frameSize = marker - 1
+		}
+	case marker <= stacklessCoroFrameChunkFirst &&
+		marker >= stacklessCoroFrameChunkLast:
+		if marker == stacklessCoroFrameChunkLast {
+			task.frameSize = stacklessCoroFrameChunkFirst
+		} else {
+			task.frameSize = marker - 1
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
@@ -23,6 +24,10 @@ const (
 	actionPanic
 	actionGoexit
 )
+
+// Keep this in sync with runtime.stacklessCoroFrameChunkSize. The array length
+// is part of compiler-generated typed storage rather than the factory ABI.
+const explicitFrameChunkSize = 4
 
 // LowerResult summarizes one package lowering pass.
 type LowerResult struct {
@@ -50,6 +55,8 @@ type lowerCandidate struct {
 	resultPtrs    []*ir.Name
 	factory       *ir.Func
 	factoryABI    FactoryABI
+	selfAwait     bool
+	selfSpawn     bool
 }
 
 type lowerDirectCall struct {
@@ -670,6 +677,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 			}
 			candidate.dependencies[edge.Callee] = true
+			if edge.Callee == fn {
+				candidate.selfAwait = true
+			}
 		case SiteSpawn:
 			if !goCalls[call] {
 				return nil, fmt.Errorf("nested spawn site %d", site.ID)
@@ -686,6 +696,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("spawn target may panic")
 			}
 			candidate.dependencies[edge.Callee] = true
+			if edge.Callee == fn {
+				candidate.selfSpawn = true
+			}
 		case SiteForeign:
 			if site.Foreign != DirectNoBlock && site.Foreign != DirectMayBlock &&
 				site.Foreign != AsyncOperation {
@@ -3653,7 +3666,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.Int64Val(ret.Results[0]) == int64(actionComplete) &&
 			len(pointerClears) != 0 {
 			cacheFrame := typecheck.Call(ret.Pos(),
-				typecheck.LookupRuntime("coroFrameCached"),
+				typecheck.LookupRuntime("coroFrameNeedsClear"),
 				ir.Nodes{resume.Dcl[0]}, false)
 			clear := ir.NewIfStmt(ret.Pos(), cacheFrame,
 				slices.Clone(pointerClears), nil)
@@ -3710,20 +3723,39 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations = append(declarations,
 		ir.NewDecl(pos, ir.ODCL, factoryResume),
 		ir.NewAssignStmt(pos, factoryResume, resume.OClosure))
-	takeFrame := typecheck.Call(pos,
-		typecheck.LookupRuntime("coroTakeFrame"), ir.Nodes{
-			factoryCtx,
-			factoryResume,
-			typedInt(pos, types.Types[types.TUINTPTR], frameType.Size()),
-		}, false)
-	declarations = append(declarations,
-		ir.NewAssignStmt(pos, factoryFrame,
-			typecheck.ConvNop(takeFrame, framePointerType)))
-	missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
-		ir.NewNilExpr(pos, framePointerType))
-	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
-		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
-			typedNew(pos, frameType))}, nil))
+	frameSize := typedInt(pos, types.Types[types.TUINTPTR], frameType.Size())
+	// Await suspends the parent before starting its child. A recursive spawn
+	// can create concurrent siblings from the same parent, so those factories
+	// must not hand out the same adjacent array element.
+	if candidate.selfAwait && !candidate.selfSpawn {
+		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
+		takeFrame := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroTakeFrameChunk"), ir.Nodes{
+				factoryCtx, factoryResume, frameSize,
+				reflectdata.TypePtrAt(pos, frameChunkType),
+			}, false)
+		declarations = append(declarations,
+			ir.NewAssignStmt(pos, factoryFrame,
+				typecheck.ConvNop(takeFrame, framePointerType)))
+		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
+			ir.NewNilExpr(pos, framePointerType))
+		declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
+			ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
+				typedNew(pos, frameType))}, nil))
+	} else {
+		takeFrame := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroTakeFrame"), ir.Nodes{
+				factoryCtx, factoryResume, frameSize,
+			}, false)
+		declarations = append(declarations,
+			ir.NewAssignStmt(pos, factoryFrame,
+				typecheck.ConvNop(takeFrame, framePointerType)))
+		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
+			ir.NewNilExpr(pos, framePointerType))
+		declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
+			ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
+				typedNew(pos, frameType))}, nil))
+	}
 	for i, variable := range closureVars {
 		declarations = append(declarations, ir.NewAssignStmt(pos,
 			explicitFrameField(variable.Pos(), factoryFrame, fields[i]),

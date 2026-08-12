@@ -966,7 +966,7 @@ type stacklessCoroFrameCacheTestFrame struct {
 func stacklessCoroFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroFrameCacheTestFrame)(
 		runtime.FrameStacklessCoroForTest(ctx))
-	runtime.FrameCachedStacklessCoroForTest(ctx)
+	runtime.FrameNeedsClearStacklessCoroForTest(ctx)
 	*frame.total += frame.value
 	frame.total = nil
 	return runtime.StacklessCoroActionComplete
@@ -1014,6 +1014,22 @@ type stacklessCoroDeepFrameCacheTestFrame struct {
 	state          int
 	bypassed       *atomic.Int32
 	overflowCounts *[2]int
+}
+
+type stacklessCoroFrameChunkTestFrame struct {
+	depth   int
+	state   int
+	tracker *stacklessCoroFrameChunkTracker
+}
+
+type stacklessCoroFrameChunkTracker struct {
+	chunks        int
+	adjacent      int
+	clearRequired int
+	direct        int
+	next          uintptr
+	remaining     int
+	invalid       bool
 }
 
 func stacklessCoroLargeFrameCacheResume(ctx unsafe.Pointer) uint8 {
@@ -1094,6 +1110,74 @@ func stacklessCoroDeepFrameCacheResume(ctx unsafe.Pointer) uint8 {
 	}
 }
 
+func stacklessCoroFrameChunkResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroFrameChunkTestFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	needsClear := runtime.FrameNeedsClearStacklessCoroForTest(ctx)
+	if needsClear {
+		frame.tracker.clearRequired++
+	} else {
+		frame.tracker.direct++
+	}
+	switch frame.state {
+	case 0:
+		if frame.depth == 0 {
+			frame.tracker = nil
+			return runtime.StacklessCoroActionComplete
+		}
+		frame.state = 1
+		if frame.depth == 2*runtime.StacklessCoroFrameChunkSize-2 {
+			other, chunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+				stacklessCoroFrameCacheOtherResume,
+				unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{}))
+			zero, zeroChunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+				stacklessCoroFrameChunkResume, 0)
+			large, largeChunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+				stacklessCoroFrameChunkResume,
+				runtime.StacklessCoroFrameCacheSize/
+					runtime.StacklessCoroFrameChunkSize+1)
+			if other != nil || chunk || zero != nil || zeroChunk ||
+				large != nil || largeChunk {
+				frame.tracker.invalid = true
+			}
+		}
+		child, chunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+			stacklessCoroFrameChunkResume,
+			unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{}))
+		tracker := frame.tracker
+		if chunk {
+			if child == nil || tracker.remaining != 0 {
+				tracker.invalid = true
+			}
+			tracker.chunks++
+			tracker.next = uintptr(child) +
+				unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{})
+			tracker.remaining = runtime.StacklessCoroFrameChunkSize - 1
+		} else if child == nil {
+			child = unsafe.Pointer(new(stacklessCoroFrameChunkTestFrame))
+		} else if tracker.remaining != 0 {
+			if uintptr(child) != tracker.next {
+				tracker.invalid = true
+			}
+			tracker.adjacent++
+			tracker.remaining--
+			tracker.next += unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{})
+		}
+		*(*stacklessCoroFrameChunkTestFrame)(child) =
+			stacklessCoroFrameChunkTestFrame{
+				depth: frame.depth - 1, tracker: tracker,
+			}
+		runtime.AwaitStacklessCoroFrameForTest(ctx, child,
+			stacklessCoroFrameChunkResume)
+		return runtime.StacklessCoroActionWait
+	case 1:
+		frame.tracker = nil
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
 func newStacklessCoroFrameCacheTestFrame(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8, value int, total *int) unsafe.Pointer {
 	frame := runtime.TakeStacklessCoroFrameForTest(ctx, resume,
@@ -1112,12 +1196,24 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 			stacklessCoroFrameCacheResume, 1); frame != nil {
 			t.Fatalf("frame without context = %p, want nil", frame)
 		}
+		if frame, chunk := runtime.TakeStacklessCoroFrameChunkForTest(nil,
+			stacklessCoroFrameCacheResume, 1); frame != nil || chunk {
+			t.Fatalf("frame chunk without context = (%p, %t), want nil, false",
+				frame, chunk)
+		}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			frame := runtime.TakeStacklessCoroFrameForTest(ctx,
 				stacklessCoroFrameCacheResume,
 				runtime.StacklessCoroFrameCacheSize+1)
 			if frame != nil {
 				t.Fatalf("oversized cached frame = %p, want nil", frame)
+			}
+			frame, chunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+				stacklessCoroFrameCacheResume,
+				runtime.StacklessCoroFrameCacheSize+1)
+			if frame != nil || chunk {
+				t.Fatalf("oversized frame chunk = (%p, %t), want nil, false",
+					frame, chunk)
 			}
 			if got := runtime.StacklessCoroReservedFrameCountForTest(ctx); got != 0 {
 				t.Fatalf("unavailable frame reservations = %d, want 0", got)
@@ -1468,6 +1564,65 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		if got := bypassed.Load(); got != wantBypassed {
 			t.Fatalf("deep frame-cache bypasses = %d, want %d",
 				got, wantBypassed)
+		}
+	})
+
+	t.Run("recursive-frame-chunks", func(t *testing.T) {
+		if !runtime.StacklessCoroFrameChunkMarkerIsolationForTest() {
+			t.Fatal("frame-chunk marker crossed resume identities")
+		}
+		valid, missing, wrongKind, wrongLength, wrongElementSize :=
+			runtime.ValidStacklessCoroFrameChunkTypesForTest()
+		if !valid || missing || wrongKind || wrongLength || wrongElementSize {
+			t.Fatalf("frame-chunk types = (%t, %t, %t, %t, %t), want (true, false, false, false, false)",
+				valid, missing, wrongKind, wrongLength, wrongElementSize)
+		}
+		const depth = runtime.StacklessCoroTaskCacheSize +
+			runtime.StacklessCoroFrameChunkDirectCount +
+			2*runtime.StacklessCoroFrameChunkSize
+		var state int
+		var tracker stacklessCoroFrameChunkTracker
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0, 1:
+				state++
+				frame, chunk := runtime.TakeStacklessCoroFrameChunkForTest(ctx,
+					stacklessCoroFrameChunkResume,
+					unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{}))
+				if chunk {
+					t.Fatal("root frame requested a chunk")
+				}
+				if frame == nil {
+					frame = unsafe.Pointer(new(stacklessCoroFrameChunkTestFrame))
+				}
+				*(*stacklessCoroFrameChunkTestFrame)(frame) =
+					stacklessCoroFrameChunkTestFrame{
+						depth: depth, tracker: &tracker,
+					}
+				runtime.AwaitStacklessCoroFrameForTest(ctx, frame,
+					stacklessCoroFrameChunkResume)
+				return runtime.StacklessCoroActionWait
+			case 2:
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected frame-chunk state %d", state)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if tracker.invalid || tracker.remaining != 0 {
+			t.Fatalf("invalid frame-chunk sequence: %+v", tracker)
+		}
+		if race.Enabled {
+			if tracker.chunks != 0 || tracker.adjacent != 0 ||
+				tracker.clearRequired != 0 || tracker.direct == 0 {
+				t.Fatalf("race frame chunks = %+v, want distinct frames", tracker)
+			}
+			return
+		}
+		if tracker.chunks != 4 ||
+			tracker.adjacent != 4*(runtime.StacklessCoroFrameChunkSize-1) ||
+			tracker.clearRequired == 0 || tracker.direct == 0 {
+			t.Fatalf("frame chunks = %+v, want four complete chunks", tracker)
 		}
 	})
 

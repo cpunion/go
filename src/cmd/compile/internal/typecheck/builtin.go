@@ -165,7 +165,7 @@ var runtimeDecls = [...]struct {
 	{"coroSpawnFrame", funcTag, 126},
 	{"coroPanic", funcTag, 127},
 	{"coroPanicPending", funcTag, 128},
-	{"coroFrameCached", funcTag, 128},
+	{"coroFrameNeedsClear", funcTag, 128},
 	{"coroSleep", funcTag, 129},
 	{"coroChanSend", funcTag, 130},
 	{"coroChanRecv", funcTag, 132},
@@ -285,10 +285,11 @@ var runtimeDecls = [...]struct {
 	{"coroGoexit", funcTag, 137},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 183},
+	{"coroTakeFrameChunk", funcTag, 184},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [184]*types.Type
+	var typs [185]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -473,6 +474,7 @@ func runtimeTypes() []*types.Type {
 	typs[181] = newSig(params(typs[7]), params(typs[7]))
 	typs[182] = newSig(params(typs[7]), params(typs[10]))
 	typs[183] = newSig(params(typs[7], typs[123], typs[5]), params(typs[7]))
+	typs[184] = newSig(params(typs[7], typs[123], typs[5], typs[1]), params(typs[7]))
 	return typs[:]
 }
 

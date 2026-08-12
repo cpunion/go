@@ -6,14 +6,25 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
+
+type stacklessCoroFrameChunkExportFrame struct {
+	depth   int
+	state   int
+	tracker unsafe.Pointer
+}
 
 const (
-	StacklessCoroWarmExecutorCount  = stacklessCoroWarmExecutorCount
-	StacklessCoroTaskCacheSize      = stacklessCoroTaskCacheSize
-	StacklessCoroTaskChunkSize      = stacklessCoroTaskChunkSize
-	StacklessCoroFrameCacheSize     = stacklessCoroFrameCacheSize
-	StacklessCoroOperationCacheSize = stacklessCoroOperationCacheSize
+	StacklessCoroWarmExecutorCount     = stacklessCoroWarmExecutorCount
+	StacklessCoroTaskCacheSize         = stacklessCoroTaskCacheSize
+	StacklessCoroTaskChunkSize         = stacklessCoroTaskChunkSize
+	StacklessCoroFrameChunkSize        = stacklessCoroFrameChunkSize
+	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
+	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
+	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -67,6 +78,33 @@ func AwaitStacklessCoroFrameForTest(ctx, frame unsafe.Pointer,
 func TakeStacklessCoroFrameForTest(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8, size uintptr) unsafe.Pointer {
 	return coroTakeFrame(ctx, resume, size)
+}
+
+func TakeStacklessCoroFrameChunkForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr) (unsafe.Pointer, bool) {
+	chunk := false
+	if ctx != nil {
+		marker := (*stacklessCoroContext)(ctx).task().frameSize
+		chunk = marker == stacklessCoroFrameChunkDirectLast ||
+			marker == stacklessCoroFrameChunkLast
+	}
+	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroFrameChunkExportFrame]()
+	frame := coroTakeFrameChunk(ctx, resume, size, frameType)
+	return frame, chunk && frame != nil
+}
+
+func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,
+	wrongKind, wrongLength, wrongElementSize bool) {
+	integer := abi.TypeFor[uintptr]()
+	validChunk := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroFrameChunkExportFrame]()
+	shortChunk := abi.TypeFor[[stacklessCoroFrameChunkSize - 1]stacklessCoroFrameChunkExportFrame]()
+	byteChunk := abi.TypeFor[[stacklessCoroFrameChunkSize]byte]()
+	size := unsafe.Sizeof(stacklessCoroFrameChunkExportFrame{})
+	return validStacklessCoroFrameChunkType(validChunk, size),
+		validStacklessCoroFrameChunkType(nil, size),
+		validStacklessCoroFrameChunkType(integer, size),
+		validStacklessCoroFrameChunkType(shortChunk, size),
+		validStacklessCoroFrameChunkType(byteChunk, size)
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
@@ -199,6 +237,23 @@ func StacklessCoroReservedFrameCountForTest(ctx unsafe.Pointer) int {
 	}
 	unlock(&s.lock)
 	return count
+}
+
+func StacklessCoroFrameChunkMarkerIsolationForTest() bool {
+	first := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	second := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	parent := &stacklessCoroTask{
+		resume: first, frameSize: stacklessCoroFrameChunkDirectFirst,
+	}
+	task := &stacklessCoroTask{resume: second}
+	s := new(stacklessCoroScheduler)
+	s.markUncachedFrameLineageLocked(task, parent,
+		unsafe.Pointer(new(byte)))
+	return task.frameSize == stacklessCoroUncachedFrameLineage
 }
 
 func StacklessCoroCancelReservedFramesForTest() bool {
@@ -396,8 +451,8 @@ func FrameStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	return coroFrame(ctx)
 }
 
-func FrameCachedStacklessCoroForTest(ctx unsafe.Pointer) bool {
-	return coroFrameCached(ctx)
+func FrameNeedsClearStacklessCoroForTest(ctx unsafe.Pointer) bool {
+	return coroFrameNeedsClear(ctx)
 }
 
 func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
