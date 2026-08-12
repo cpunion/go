@@ -37,12 +37,9 @@ func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uint
 	var count int32
 	var readErrno uintptr
 	if len(buffer) != 0 {
-		length := len(buffer)
-		if length > stacklessCoroMaxRead {
-			length = stacklessCoroMaxRead
-		}
 		coroEnterSyscall(ctx)
-		count = read(int32(fd), unsafe.Pointer(&buffer[0]), int32(length))
+		count = read(int32(fd), unsafe.Pointer(&buffer[0]),
+			stacklessCoroReadLength(len(buffer)))
 		coroExitSyscall()
 		if count < 0 {
 			readErrno = uintptr(-count)
@@ -61,6 +58,13 @@ func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uint
 		*op.errno = readErrno
 	}
 	completeStacklessCoroOperation(op)
+}
+
+func stacklessCoroReadLength(length int) int32 {
+	if length > stacklessCoroMaxRead {
+		return stacklessCoroMaxRead
+	}
+	return int32(length)
 }
 
 func coroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
@@ -111,16 +115,6 @@ func failStacklessCoroAsync(id uint64, errno uintptr) {
 		*op.errno = errno
 	}
 	completeStacklessCoroOperation(op)
-}
-
-func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	op := stacklessCoroStartOperation(ctx, "read")
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.n = n
-	op.errno = errno
-	registerStacklessCoroOperation(op)
-	stacklessCoroReadEnqueue(op)
 }
 
 func stacklessCoroReadEnqueue(op *stacklessCoroOperation) {
@@ -194,7 +188,7 @@ func stacklessCoroReadWorkerLoop() {
 			} else if op.async {
 				stacklessCoroAsyncWorker(op.id)
 			} else {
-				stacklessCoroSocketReadWorker(op.id)
+				throw("runtime: invalid stackless coroutine worker operation")
 			}
 		}
 	}
@@ -210,40 +204,6 @@ func stacklessCoroCallWorker(id uint64) {
 	op = takeStacklessCoroOperation(id)
 	if op == nil {
 		return
-	}
-	completeStacklessCoroOperation(op)
-}
-
-func stacklessCoroSocketReadWorker(id uint64) {
-	op := findStacklessCoroOperation(id)
-	if op == nil {
-		return
-	}
-
-	var n int32
-	var errno uintptr
-	if len(op.buffer) != 0 {
-		length := len(op.buffer)
-		if length > stacklessCoroMaxRead {
-			length = stacklessCoroMaxRead
-		}
-		n, errno = stacklessCoroPollRead(op.fd,
-			unsafe.Pointer(&op.buffer[0]), int32(length))
-	}
-
-	op = takeStacklessCoroOperation(id)
-	if op == nil {
-		return
-	}
-	if op.n != nil {
-		if n < 0 {
-			*op.n = -1
-		} else {
-			*op.n = int(n)
-		}
-	}
-	if op.errno != nil {
-		*op.errno = errno
 	}
 	completeStacklessCoroOperation(op)
 }

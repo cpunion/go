@@ -494,8 +494,12 @@ func poll_runtime_pollUnblock(pd *pollDesc) {
 func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 	delta := int32(0)
 	var rg, wg *g
+	var coroRead uintptr
 	if mode == 'r' || mode == 'r'+'w' {
-		rg = netpollunblock(pd, 'r', true, &delta)
+		coroRead = netpollCoroReadReady(pd, &delta)
+		if coroRead == 0 {
+			rg = netpollunblock(pd, 'r', true, &delta)
+		}
 	}
 	if mode == 'w' || mode == 'r'+'w' {
 		wg = netpollunblock(pd, 'w', true, &delta)
@@ -505,6 +509,9 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 	}
 	if wg != nil {
 		toRun.push(wg)
+	}
+	if coroRead != 0 {
+		netpollCoroDispatch(toRun, coroRead)
 	}
 	return delta
 }

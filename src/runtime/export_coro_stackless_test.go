@@ -32,6 +32,7 @@ const (
 	StacklessCoroActionComplete = stacklessCoroActionComplete
 	StacklessCoroActionPanic    = stacklessCoroActionPanic
 	StacklessCoroActionGoexit   = stacklessCoroActionGoexit
+	StacklessCoroPollErrTimeout = pollErrTimeout
 )
 
 func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
@@ -540,6 +541,67 @@ func StacklessCoroOperationCountForTest() int {
 	return count
 }
 
+func StacklessCoroPollWaitCountForTest() int {
+	lock(&stacklessCoroOperations.lock)
+	count := 0
+	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+		if !op.pollRead || op.packet[stacklessCoroPollDescWord] == 0 {
+			continue
+		}
+		pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
+		token := pd.rg.Load()
+		if token&netpollCoroTagMask == netpollCoroTag &&
+			token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op)) {
+			count++
+		}
+	}
+	unlock(&stacklessCoroOperations.lock)
+	return count
+}
+
+func StacklessCoroNetpollWaiterCountForTest() uint32 {
+	return netpollWaiters.Load()
+}
+
+func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, errno int, tokenMatches bool, delta int32) {
+	netpollGenericInit()
+	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
+	if openErr != 0 {
+		return false, openErr, false, 0
+	}
+	op := new(stacklessCoroOperation)
+	if ready {
+		var toRun gList
+		delta = netpollready(&toRun, pd, 'r')
+		if !toRun.empty() {
+			throw("runtime: unexpected poll goroutine in coroutine arm test")
+		}
+		netpollAdjustWaiters(delta)
+		delta = 0
+	}
+	if timeout {
+		lock(&pd.lock)
+		pd.rd = -1
+		pd.publishInfo()
+		unlock(&pd.lock)
+	}
+	waiting, errno = netpollCoroReadArm(pd, op)
+	if waiting {
+		token := netpollCoroReadReady(pd, &delta)
+		tokenMatches = token == uintptr(unsafe.Pointer(op))
+		netpollAdjustWaiters(delta)
+	}
+	if timeout {
+		lock(&pd.lock)
+		pd.rd = 0
+		pd.publishInfo()
+		unlock(&pd.lock)
+	}
+	poll_runtime_pollUnblock(pd)
+	poll_runtime_pollClose(pd)
+	return
+}
+
 func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task() == nil {
@@ -603,6 +665,34 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 
 func SocketReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	coroSocketRead(ctx, fd, buffer, n, errno)
+}
+
+func StacklessCoroReadLengthForTest(length int) int32 {
+	return stacklessCoroReadLength(length)
+}
+
+func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
+	op := stacklessCoroStartOperation(ctx, "expired read")
+	op.fd = int32(fd)
+	op.buffer = buffer
+	op.n = n
+	op.errno = errno
+	op.pollRead = true
+	stacklessCoroNetpollInit()
+	netpollGenericInit()
+	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
+	if openErr != 0 {
+		registerStacklessCoroOperation(op)
+		stacklessCoroSocketReadFinish(op, -1, uintptr(openErr))
+		return
+	}
+	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	registerStacklessCoroOperation(op)
+	lock(&pd.lock)
+	pd.rd = -1
+	pd.publishInfo()
+	unlock(&pd.lock)
+	stacklessCoroSocketReadAttempt(op)
 }
 
 func CallReadStacklessCoroForTest(ctx unsafe.Pointer, call func()) {
