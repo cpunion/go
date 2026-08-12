@@ -185,10 +185,13 @@ type stacklessCoroOperation struct {
 	n         *int
 	errno     *uintptr
 	valueOut  *uint64
-	packet    [2]uint64
-	async     bool
-	next      *stacklessCoroOperation
-	workNext  *stacklessCoroOperation
+	// packet holds an asynchronous C reply or, for a socket read, the
+	// pointer-free poll descriptor and completion link. The operation
+	// registry remains the GC root for a linked socket operation.
+	packet   [2]uint64
+	async    bool
+	next     *stacklessCoroOperation
+	workNext *stacklessCoroOperation
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.

@@ -4123,7 +4123,8 @@ func TestStacklessCoroSocketReadProgress(t *testing.T) {
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	progress := make(chan struct{})
-	writeDone := stacklessCoroProgressWrite(fds[1], progress, "poll", nil)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	writeDone := stacklessCoroProgressWrite(fds[1], progress, "poll", runtime.GC)
 
 	var state, n int
 	var errno uintptr
@@ -4154,9 +4155,17 @@ func TestStacklessCoroSocketReadProgress(t *testing.T) {
 	if write.rescued {
 		t.Fatal("socket read blocked sibling scheduling")
 	}
+	if write.operations != baselineOperations+1 {
+		t.Fatalf("registered operations during socket read = %d, want %d",
+			write.operations, baselineOperations+1)
+	}
 	if n != 4 || errno != 0 || string(buffer) != "poll" {
 		t.Fatalf("read = (%d, %d, %q), want (4, 0, %q)",
 			n, errno, buffer, "poll")
+	}
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("registered operations after socket read = %d, want %d",
+			operations, baselineOperations)
 	}
 }
 
@@ -4192,6 +4201,270 @@ func TestStacklessCoroSocketReadEOF(t *testing.T) {
 	})
 	if n != 0 || errno != 0 {
 		t.Fatalf("read at EOF = (%d, %d), want (0, 0)", n, errno)
+	}
+}
+
+func TestStacklessCoroSocketReadError(t *testing.T) {
+	var state, n int
+	var errno uintptr
+	buffer := make([]byte, 1)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SocketReadStacklessCoroForTest(ctx, -1, buffer, &n, &errno)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if n != -1 || errno == 0 {
+		t.Fatalf("read from invalid socket = (%d, %d), want (-1, errno)",
+			n, errno)
+	}
+}
+
+func TestStacklessCoroSocketReadWriteOnly(t *testing.T) {
+	fds := stacklessCoroPipe(t)
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	var state, n int
+	var errno uintptr
+	buffer := make([]byte, 1)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SocketReadStacklessCoroForTest(ctx, fds[1], buffer, &n, &errno)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if n != -1 || errno == 0 {
+		t.Fatalf("read from write-only descriptor = (%d, %d), want (-1, errno)",
+			n, errno)
+	}
+}
+
+func TestStacklessCoroSocketReadExpired(t *testing.T) {
+	fds := stacklessCoroPipe(t)
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	var state, n int
+	var errno uintptr
+	buffer := make([]byte, 1)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SocketReadExpiredStacklessCoroForTest(ctx,
+				fds[0], buffer, &n, &errno)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if n != -1 || errno != runtime.StacklessCoroPollErrTimeout {
+		t.Fatalf("expired socket read = (%d, %d), want (-1, %d)",
+			n, errno, runtime.StacklessCoroPollErrTimeout)
+	}
+}
+
+func TestStacklessCoroSocketReadEmpty(t *testing.T) {
+	state := 0
+	n := -1
+	errno := ^uintptr(0)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SocketReadStacklessCoroForTest(ctx, -1, nil, &n, &errno)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if n != 0 || errno != 0 {
+		t.Fatalf("empty socket read = (%d, %d), want (0, 0)", n, errno)
+	}
+	nilState := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if nilState == 0 {
+			nilState = 1
+			runtime.SocketReadStacklessCoroForTest(ctx, -1, nil, nil, nil)
+			return runtime.StacklessCoroActionWait
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+}
+
+func TestStacklessCoroReadLength(t *testing.T) {
+	if got := runtime.StacklessCoroReadLengthForTest(1); got != 1 {
+		t.Fatalf("read length = %d, want 1", got)
+	}
+	if ^uint(0)>>63 != 0 {
+		length := int64(1<<31 - 1)
+		if got := runtime.StacklessCoroReadLengthForTest(int(length + 1)); got != int32(length) {
+			t.Fatalf("large read length = %d, want %d", got, length)
+		}
+	}
+}
+
+func TestStacklessCoroPollArm(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	waiting, errno, tokenMatches, delta :=
+		runtime.StacklessCoroPollArmForTest(fds[0], false, false)
+	if !waiting || errno != 0 || !tokenMatches || delta != -1 {
+		t.Fatalf("poll arm = (%t, %d, %t, %d), want (true, 0, true, -1)",
+			waiting, errno, tokenMatches, delta)
+	}
+	waiting, errno, tokenMatches, delta =
+		runtime.StacklessCoroPollArmForTest(fds[0], true, false)
+	if waiting || errno != 0 || tokenMatches || delta != 0 {
+		t.Fatalf("ready poll arm = (%t, %d, %t, %d), want (false, 0, false, 0)",
+			waiting, errno, tokenMatches, delta)
+	}
+	waiting, errno, tokenMatches, delta =
+		runtime.StacklessCoroPollArmForTest(fds[0], false, true)
+	if waiting || errno != runtime.StacklessCoroPollErrTimeout ||
+		tokenMatches || delta != 0 {
+		t.Fatalf("expired poll arm = (%t, %d, %t, %d), want (false, %d, false, 0)",
+			waiting, errno, tokenMatches, delta,
+			runtime.StacklessCoroPollErrTimeout)
+	}
+}
+
+func TestStacklessCoroOrdinaryNetpollStates(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	runtime.StacklessCoroOrdinaryNetpollStatesForTest(fds[0])
+}
+
+func TestStacklessCoroSocketReadConcurrent(t *testing.T) {
+	const readers = 32
+	type result struct {
+		index int
+		n     int
+		errno uintptr
+		value byte
+	}
+
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	baselineWaiters := runtime.StacklessCoroNetpollWaiterCountForTest()
+	fds := make([][2]int, readers)
+	for i := range fds {
+		pair, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fds[i] = pair
+		if err := syscall.SetNonblock(pair[0], true); err != nil {
+			t.Fatal(err)
+		}
+		defer syscall.Close(pair[0])
+		defer syscall.Close(pair[1])
+	}
+
+	done := make(chan result, readers)
+	for i := range fds {
+		go func(index int) {
+			state := 0
+			n := -1
+			errno := ^uintptr(0)
+			buffer := make([]byte, 1)
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					runtime.SocketReadStacklessCoroForTest(ctx,
+						fds[index][0], buffer, &n, &errno)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					state = 2
+					return runtime.StacklessCoroActionComplete
+				default:
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+			done <- result{index: index, n: n, errno: errno, value: buffer[0]}
+		}(i)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.StacklessCoroPollWaitCountForTest() != readers {
+		if time.Now().After(deadline) {
+			for i := range fds {
+				syscall.Write(fds[i][1], []byte{byte(i)})
+			}
+			t.Fatalf("logical poll waiters = %d, want %d",
+				runtime.StacklessCoroPollWaitCountForTest(), readers)
+		}
+		runtime.Gosched()
+	}
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations+readers {
+		t.Fatalf("registered socket operations = %d, want %d",
+			operations, baselineOperations+readers)
+	}
+	if waiters := runtime.StacklessCoroNetpollWaiterCountForTest(); waiters != baselineWaiters+readers {
+		t.Fatalf("netpoll waiters = %d, want %d", waiters,
+			baselineWaiters+readers)
+	}
+
+	runtime.GC()
+	for i := range fds {
+		if _, err := syscall.Write(fds[i][1], []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	timeout := time.After(5 * time.Second)
+	for range readers {
+		select {
+		case got := <-done:
+			if got.n != 1 || got.errno != 0 || got.value != byte(got.index) {
+				t.Fatalf("socket %d read = (%d, %d, %d), want (1, 0, %d)",
+					got.index, got.n, got.errno, got.value, byte(got.index))
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for logical poll completions")
+		}
+	}
+	if waiters := runtime.StacklessCoroPollWaitCountForTest(); waiters != 0 {
+		t.Fatalf("logical poll waiters after completion = %d, want 0", waiters)
+	}
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("registered operations after socket completion = %d, want %d",
+			operations, baselineOperations)
+	}
+	if waiters := runtime.StacklessCoroNetpollWaiterCountForTest(); waiters != baselineWaiters {
+		t.Fatalf("netpoll waiters after socket completion = %d, want %d",
+			waiters, baselineWaiters)
 	}
 }
 

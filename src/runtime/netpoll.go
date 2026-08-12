@@ -494,8 +494,37 @@ func poll_runtime_pollUnblock(pd *pollDesc) {
 func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 	delta := int32(0)
 	var rg, wg *g
+	var coroRead uintptr
 	if mode == 'r' || mode == 'r'+'w' {
-		rg = netpollunblock(pd, 'r', true, &delta)
+		if netpollCoroEnabled {
+			// Keep the ordinary and coroutine cases in one semaphore loop to
+			// avoid a second load on every network read event.
+			for {
+				old := pd.rg.Load()
+				if old&netpollCoroTagMask == netpollCoroTag {
+					if !pd.rg.CompareAndSwap(old, pdNil) {
+						continue
+					}
+					delta--
+					coroRead = old &^ netpollCoroTagMask
+					break
+				}
+				if old == pdReady {
+					break
+				}
+				if pd.rg.CompareAndSwap(old, pdReady) {
+					if old == pdWait {
+						old = pdNil
+					} else if old != pdNil {
+						delta--
+					}
+					rg = (*g)(unsafe.Pointer(old))
+					break
+				}
+			}
+		} else {
+			rg = netpollunblock(pd, 'r', true, &delta)
+		}
 	}
 	if mode == 'w' || mode == 'r'+'w' {
 		wg = netpollunblock(pd, 'w', true, &delta)
@@ -505,6 +534,9 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 	}
 	if wg != nil {
 		toRun.push(wg)
+	}
+	if coroRead != 0 {
+		netpollCoroDispatch(toRun, coroRead)
 	}
 	return delta
 }

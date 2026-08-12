@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -228,6 +229,26 @@ func BenchmarkStacklessCoroFileRead(b *testing.B) {
 }
 
 func BenchmarkStacklessCoroSocketRead(b *testing.B) {
+	benchmarkStacklessCoroSocketRead(b, false)
+}
+
+func BenchmarkStacklessCoroSocketReadWait(b *testing.B) {
+	benchmarkStacklessCoroSocketRead(b, true)
+}
+
+func BenchmarkStacklessCoroOrdinaryNetpollReady(b *testing.B) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	b.ReportAllocs()
+	b.ResetTimer()
+	runtime.StacklessCoroOrdinaryNetpollReadyForTest(fds[0], b.N)
+}
+
+func benchmarkStacklessCoroSocketRead(b *testing.B, wait bool) {
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		b.Fatal(err)
@@ -238,10 +259,33 @@ func BenchmarkStacklessCoroSocketRead(b *testing.B) {
 		b.Fatal(err)
 	}
 
+	baselineWaiters := runtime.StacklessCoroNetpollWaiterCountForTest()
+	var timedOut atomic.Bool
+	watchdog := time.AfterFunc(30*time.Second, func() {
+		timedOut.Store(true)
+	})
+	defer watchdog.Stop()
+	ready := make(chan struct{}, 1)
 	writeDone := make(chan error, 1)
 	go func() {
 		var err error
 		for range b.N {
+			if wait {
+				<-ready
+				for runtime.StacklessCoroNetpollWaiterCountForTest() != baselineWaiters+1 {
+					if timedOut.Load() {
+						err = syscall.ETIMEDOUT
+						// Let an operation that was enqueued but not yet armed
+						// finish before the benchmark reports the timeout.
+						_, _ = syscall.Write(fds[1], []byte{1})
+						break
+					}
+					runtime.Gosched()
+				}
+				if err != nil {
+					break
+				}
+			}
 			_, err = syscall.Write(fds[1], []byte{1})
 			if err != nil {
 				break
@@ -272,6 +316,9 @@ func BenchmarkStacklessCoroSocketRead(b *testing.B) {
 		errno = ^uintptr(0)
 		pending = true
 		runtime.SocketReadStacklessCoroForTest(ctx, fds[0], buffer, &n, &errno)
+		if wait {
+			ready <- struct{}{}
+		}
 		return runtime.StacklessCoroActionWait
 	})
 	b.StopTimer()
