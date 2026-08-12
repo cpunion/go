@@ -4311,6 +4311,155 @@ func TestStacklessCoroSocketReadEmpty(t *testing.T) {
 		}
 		return runtime.StacklessCoroActionComplete
 	})
+	borrowedState := 0
+	borrowedN := -1
+	borrowedErrno := ^uintptr(0)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if borrowedState == 0 {
+			borrowedState = 1
+			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+				nil, -1, nil, &borrowedN, &borrowedErrno)
+			return runtime.StacklessCoroActionWait
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+	if borrowedN != 0 || borrowedErrno != 0 {
+		t.Fatalf("empty borrowed socket read = (%d, %d), want (0, 0)",
+			borrowedN, borrowedErrno)
+	}
+}
+
+func TestStacklessCoroSocketReadBorrowedPollDesc(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+
+	descriptor, errno := runtime.OpenStacklessCoroPollDescForTest(fds[0])
+	if errno != 0 {
+		t.Fatalf("open poll descriptor: errno %d", errno)
+	}
+	defer func() {
+		if descriptor != nil {
+			runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+			runtime.CloseStacklessCoroPollDescForTest(descriptor)
+		}
+	}()
+	if _, err := syscall.Write(fds[1], []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+
+	var state, n int
+	var readErrno uintptr
+	buffer := make([]byte, 2)
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0, 1:
+			index := state
+			state++
+			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+				descriptor, fds[0], buffer[index:index+1], &n, &readErrno)
+			return runtime.StacklessCoroActionWait
+		case 2:
+			state = 3
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if state != 3 || n != 1 || readErrno != 0 || string(buffer) != "ok" {
+		t.Fatalf("borrowed reads = (state %d, %d, %d, %q), want (3, 1, 0, %q)",
+			state, n, readErrno, buffer, "ok")
+	}
+}
+
+func TestStacklessCoroSocketReadBorrowedPollDescDeadline(t *testing.T) {
+	testStacklessCoroSocketReadBorrowedPollDescWake(t, true)
+}
+
+func TestStacklessCoroSocketReadBorrowedPollDescClose(t *testing.T) {
+	testStacklessCoroSocketReadBorrowedPollDescWake(t, false)
+}
+
+func testStacklessCoroSocketReadBorrowedPollDescWake(t *testing.T, deadline bool) {
+	t.Helper()
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+
+	descriptor, errno := runtime.OpenStacklessCoroPollDescForTest(fds[0])
+	if errno != 0 {
+		t.Fatalf("open poll descriptor: errno %d", errno)
+	}
+	baseline := runtime.StacklessCoroPollWaitCountForTest()
+	var state, n int
+	var readErrno uintptr
+	buffer := make([]byte, 1)
+	done := make(chan struct{})
+	go func() {
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+					descriptor, fds[0], buffer, &n, &readErrno)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		close(done)
+	}()
+
+	waiting := stacklessCoroWaitForPollCount(baseline + 1)
+	if deadline {
+		runtime.ExpireReadStacklessCoroPollDescForTest(descriptor)
+	} else {
+		runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		if deadline {
+			runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+		}
+		select {
+		case <-done:
+			runtime.CloseStacklessCoroPollDescForTest(descriptor)
+			t.Fatal("borrowed poll descriptor did not wake the coroutine read")
+		case <-time.After(5 * time.Second):
+			t.Fatal("borrowed poll descriptor remained blocked after fallback close")
+		}
+	}
+	if deadline {
+		runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+	}
+	runtime.CloseStacklessCoroPollDescForTest(descriptor)
+	if !waiting {
+		t.Fatal("coroutine read did not arm its borrowed poll descriptor")
+	}
+	wantErrno := uintptr(runtime.StacklessCoroPollErrClosing)
+	if deadline {
+		wantErrno = runtime.StacklessCoroPollErrTimeout
+	}
+	if state != 2 || n != -1 || readErrno != wantErrno {
+		t.Fatalf("borrowed wake = (state %d, %d, %d), want (2, -1, %d)",
+			state, n, readErrno, wantErrno)
+	}
 }
 
 func TestStacklessCoroReadLength(t *testing.T) {
@@ -4568,6 +4717,17 @@ func stacklessCoroPipe(t *testing.T) [2]int {
 		t.Fatal(err)
 	}
 	return fds
+}
+
+func stacklessCoroWaitForPollCount(want int) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.StacklessCoroPollWaitCountForTest() != want {
+		if time.Now().After(deadline) {
+			return false
+		}
+		runtime.Gosched()
+	}
+	return true
 }
 
 type stacklessCoroWriteResult struct {

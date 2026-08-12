@@ -48,7 +48,7 @@ func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
 }
 
 //go:nowritebarrier
-func netpollCoroDispatch(toRun *gList, token uintptr) {
-	stacklessCoroNetpollReady(toRun,
+func netpollCoroDispatch(token uintptr) *g {
+	return stacklessCoroNetpollReady(
 		(*stacklessCoroOperation)(unsafe.Pointer(token)))
 }
