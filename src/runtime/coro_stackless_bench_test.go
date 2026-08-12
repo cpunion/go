@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -258,6 +259,12 @@ func benchmarkStacklessCoroSocketRead(b *testing.B, wait bool) {
 		b.Fatal(err)
 	}
 
+	baselineWaiters := runtime.StacklessCoroNetpollWaiterCountForTest()
+	var timedOut atomic.Bool
+	watchdog := time.AfterFunc(30*time.Second, func() {
+		timedOut.Store(true)
+	})
+	defer watchdog.Stop()
 	ready := make(chan struct{}, 1)
 	writeDone := make(chan error, 1)
 	go func() {
@@ -265,6 +272,19 @@ func benchmarkStacklessCoroSocketRead(b *testing.B, wait bool) {
 		for range b.N {
 			if wait {
 				<-ready
+				for runtime.StacklessCoroNetpollWaiterCountForTest() != baselineWaiters+1 {
+					if timedOut.Load() {
+						err = syscall.ETIMEDOUT
+						// Let an operation that was enqueued but not yet armed
+						// finish before the benchmark reports the timeout.
+						_, _ = syscall.Write(fds[1], []byte{1})
+						break
+					}
+					runtime.Gosched()
+				}
+				if err != nil {
+					break
+				}
 			}
 			_, err = syscall.Write(fds[1], []byte{1})
 			if err != nil {
