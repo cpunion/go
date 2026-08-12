@@ -88,6 +88,7 @@ func (s *Server) setHTTP2Config(conf http2ExternalServerConfig) {
 	}
 	s.h2Config = conf
 	s.h2Config.ServeConnFunc(s.serveHTTP2Conn)
+	s.configureHTTP2()
 }
 
 func (s *Server) serveHTTP2Conn(ctx context.Context, nc net.Conn, h Handler, sawClientPreface bool, upgradeReq *Request, settings []byte) {
@@ -122,7 +123,6 @@ func http2ServerRequestFromRequest(req *Request) *http2.ServerRequest {
 		RemoteAddr:    req.RemoteAddr,
 		RequestURI:    req.RequestURI,
 		TLS:           req.TLS,
-		MultipartForm: req.MultipartForm,
 	}
 }
 
@@ -146,7 +146,6 @@ func (h http2Handler) ServeHTTP(w *http2.ResponseWriter, req *http2.ServerReques
 		ContentLength: req.ContentLength,
 		RemoteAddr:    req.RemoteAddr,
 		TLS:           req.TLS,
-		MultipartForm: req.MultipartForm,
 	})
 }
 

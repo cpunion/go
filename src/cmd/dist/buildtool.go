@@ -59,6 +59,7 @@ var bootstrapDirs = []string{
 	"cmd/internal/telemetry/counter",
 	"cmd/link",
 	"cmd/link/internal/...",
+	"cmd/preprofile",
 	"compress/flate",
 	"compress/zlib",
 	"container/heap",
@@ -124,7 +125,7 @@ var ignoreSuffixes = []string{
 	"~",
 }
 
-const minBootstrap = "go1.24.6"
+const minBootstrap = "go1.26.0"
 
 var tryDirs = []string{
 	"sdk/" + minBootstrap,

@@ -405,6 +405,14 @@
 (CondSelect <t> x y (SET(EQ|NE|L|G|LE|GE|A|B|AE|BE|EQF|NEF|GF|GEF) cond)) && is16BitInt(t)
     => (CMOVW(EQ|NE|LT|GT|LE|GE|HI|CS|CC|LS|EQF|NEF|GTF|GEF) y x cond)
 
+// Float min/max comparison-select idioms lower to a single instruction.
+// These ops carry their semantics directly (no embedded comparison), so the
+// lowering always triggers.
+(Min64FSel ...) => (MINSD ...)
+(Min32FSel ...) => (MINSS ...)
+(Max64FSel ...) => (MAXSD ...)
+(Max32FSel ...) => (MAXSS ...)
+
 (CondSelect <t> x y check) && !check.Type.IsFlags() && check.Type.Size() == 8 && (is64BitInt(t) || isPtr(t))
     => (CMOVQNE y x (CMPQconst [0] check))
 (CondSelect <t> x y check) && !check.Type.IsFlags() && check.Type.Size() == 8 && is32BitInt(t)
@@ -524,6 +532,22 @@
 (Select1     (AddTupleFirst32   _ tuple)) => (Select1 tuple)
 (Select0 <t> (AddTupleFirst64 val tuple)) => (ADDQ val (Select0 <t> tuple))
 (Select1     (AddTupleFirst64   _ tuple)) => (Select1 tuple)
+
+(Select1 xadd:(XADDLlock [off] {sym} val ptr mem)) && xadd.Uses == 1 && clobber(xadd) => (ADDLlock [off] {sym} ptr val mem)
+(Select1 xadd:(XADDQlock [off] {sym} val ptr mem)) && xadd.Uses == 1 && clobber(xadd) => (ADDQlock [off] {sym} ptr val mem)
+// FIXME: remove when we teach rewrite to remove dead values
+(AddTupleFirst32 _ _) && v.Uses == 0 => (Invalid)
+(AddTupleFirst64 _ _) && v.Uses == 0 => (Invalid)
+
+// Atomic subtracts.
+(ADDLlock [off] {sym} ptr n:(NEGL val) mem) && n.Uses == 1 => (SUBLlock [off] {sym} ptr val mem)
+(ADDQlock [off] {sym} ptr n:(NEGQ val) mem) && n.Uses == 1 => (SUBQlock [off] {sym} ptr val mem)
+
+// Atomic inc and dec.
+(ADDLlock [off] {sym} ptr (MOVLconst [1]) mem) => (INCLlock [off] {sym} ptr mem)
+(ADDQlock [off] {sym} ptr (MOVQconst [1]) mem) => (INCQlock [off] {sym} ptr mem)
+(ADDLlock [off] {sym} ptr (MOVLconst [-1]) mem) => (DECLlock [off] {sym} ptr mem)
+(ADDQlock [off] {sym} ptr (MOVQconst [-1]) mem) => (DECQlock [off] {sym} ptr mem)
 
 // Atomic compare and swap.
 (AtomicCompareAndSwap32 ptr old new_ mem) => (CMPXCHGLlock ptr old new_ mem)
@@ -1019,6 +1043,10 @@
 	((ADD|AND|OR|XOR)Qconstmodify [ValAndOff(valoff1).addOffset32(off2)] {sym} base mem)
 ((ADD|AND|OR|XOR)Lconstmodify [valoff1] {sym} (ADDQconst [off2] base) mem) && ValAndOff(valoff1).canAdd32(off2) =>
 	((ADD|AND|OR|XOR)Lconstmodify [ValAndOff(valoff1).addOffset32(off2)] {sym} base mem)
+((ADD|AND|OR|XOR)Wconstmodify [valoff1] {sym} (ADDQconst [off2] base) mem) && ValAndOff(valoff1).canAdd32(off2) =>
+	((ADD|AND|OR|XOR)Wconstmodify [ValAndOff(valoff1).addOffset32(off2)] {sym} base mem)
+((ADD|AND|OR|XOR)Bconstmodify [valoff1] {sym} (ADDQconst [off2] base) mem) && ValAndOff(valoff1).canAdd32(off2) =>
+	((ADD|AND|OR|XOR)Bconstmodify [ValAndOff(valoff1).addOffset32(off2)] {sym} base mem)
 ((ADD|SUB|AND|OR|XOR)Qmodify [off1] {sym} (ADDQconst [off2] base) val mem) && is32Bit(int64(off1)+int64(off2)) =>
 	((ADD|SUB|AND|OR|XOR)Qmodify [off1+off2] {sym} base val mem)
 ((ADD|SUB|AND|OR|XOR)Lmodify [off1] {sym} (ADDQconst [off2] base) val mem) && is32Bit(int64(off1)+int64(off2)) =>
@@ -1076,6 +1104,12 @@
 ((ADD|AND|OR|XOR)Lconstmodify [valoff1] {sym1} (LEAQ [off2] {sym2} base) mem)
 	&& ValAndOff(valoff1).canAdd32(off2) && canMergeSym(sym1, sym2) =>
 	((ADD|AND|OR|XOR)Lconstmodify [ValAndOff(valoff1).addOffset32(off2)] {mergeSym(sym1,sym2)} base mem)
+((ADD|AND|OR|XOR)Wconstmodify [valoff1] {sym1} (LEAQ [off2] {sym2} base) mem)
+	&& ValAndOff(valoff1).canAdd32(off2) && canMergeSym(sym1, sym2) =>
+	((ADD|AND|OR|XOR)Wconstmodify [ValAndOff(valoff1).addOffset32(off2)] {mergeSym(sym1,sym2)} base mem)
+((ADD|AND|OR|XOR)Bconstmodify [valoff1] {sym1} (LEAQ [off2] {sym2} base) mem)
+	&& ValAndOff(valoff1).canAdd32(off2) && canMergeSym(sym1, sym2) =>
+	((ADD|AND|OR|XOR)Bconstmodify [ValAndOff(valoff1).addOffset32(off2)] {mergeSym(sym1,sym2)} base mem)
 ((ADD|SUB|AND|OR|XOR)Qmodify [off1] {sym1} (LEAQ [off2] {sym2} base) val mem)
 	&& is32Bit(int64(off1)+int64(off2)) && canMergeSym(sym1, sym2) =>
 	((ADD|SUB|AND|OR|XOR)Qmodify [off1+off2] {mergeSym(sym1,sym2)} base val mem)
@@ -1474,6 +1508,17 @@
 (MOVLstore [off] {sym} ptr a:((ADD|AND|OR|XOR)Lconst [c] l:(MOVLload [off] {sym} ptr2 mem)) mem)
 	&& isSamePtr(ptr, ptr2) && a.Uses == 1 && l.Uses == 1 && clobber(l, a) =>
 	((ADD|AND|OR|XOR)Lconstmodify {sym} [makeValAndOff(int32(c),off)] ptr mem)
+// Sub-word read-modify-write. The narrow store keeps only the low 8/16 bits of
+// the 32-bit result, so ADDB/ADDW etc. with the same constant is equivalent.
+// The constant is restricted to an 8-bit immediate: it keeps every form we emit
+// encodable as imm8 (or INC/DEC), which also avoids the 16-bit immediates that
+// cause length-changing-prefix stalls.
+(MOVWstore [off] {sym} ptr a:((ADD|AND|OR|XOR)Lconst [c] l:(MOVWload [off] {sym} ptr2 mem)) mem)
+	&& isSamePtr(ptr, ptr2) && a.Uses == 1 && l.Uses == 1 && c == int32(int8(c)) && clobber(l, a) =>
+	((ADD|AND|OR|XOR)Wconstmodify {sym} [makeValAndOff(int32(c),off)] ptr mem)
+(MOVBstore [off] {sym} ptr a:((ADD|AND|OR|XOR)Lconst [c] l:(MOVBload [off] {sym} ptr2 mem)) mem)
+	&& isSamePtr(ptr, ptr2) && a.Uses == 1 && l.Uses == 1 && c == int32(int8(c)) && clobber(l, a) =>
+	((ADD|AND|OR|XOR)Bconstmodify {sym} [makeValAndOff(int32(c),off)] ptr mem)
 
 // float <-> int register moves, with no conversion.
 // These come up when compiling math.{Float{32,64}bits,Float{32,64}frombits}.
@@ -1602,7 +1647,6 @@
 
 // CPUID feature: BMI1.
 (AND(Q|L) x (NOT(Q|L) y))               && buildcfg.GOAMD64 >= 3 => (ANDN(Q|L) x y)
-(SUB(Q|L) x (AND(Q|L) x y))             && buildcfg.GOAMD64 >= 3 => (ANDN(Q|L) x y)
 (AND(Q|L) x (NEG(Q|L) x))               && buildcfg.GOAMD64 >= 3 => (BLSI(Q|L) x)
 (XOR(Q|L) x (ADD(Q|L)const [-1] x))     && buildcfg.GOAMD64 >= 3 => (BLSMSK(Q|L) x)
 (AND(Q|L) <t> x (ADD(Q|L)const [-1] x)) && buildcfg.GOAMD64 >= 3 => (Select0 <t> (BLSR(Q|L) x))
@@ -1869,6 +1913,19 @@
 (VMOVDQUstore(128|256|512) [off1] {sym} x:(ADDQconst [off2] ptr) val mem) && is32Bit(int64(off1)+int64(off2)) => (VMOVDQUstore(128|256|512) [off1+off2] {sym} ptr val mem)
 (VMOVDQUload(128|256|512) [off1] {sym1} x:(LEAQ [off2] {sym2} base) mem) && is32Bit(int64(off1)+int64(off2)) && canMergeSym(sym1, sym2) => (VMOVDQUload(128|256|512) [off1+off2] {mergeSym(sym1, sym2)} base mem)
 (VMOVDQUstore(128|256|512) [off1] {sym1} x:(LEAQ [off2] {sym2} base) val mem) && is32Bit(int64(off1)+int64(off2)) && canMergeSym(sym1, sym2) => (VMOVDQUstore(128|256|512) [off1+off2] {mergeSym(sym1, sym2)} base val mem)
+
+// Multiplication of numbers that are the power of 2 can be converted to left shift log(x)
+(VPMULLQ128 x (VPBROADCASTQ128 (VMOVQ (MOVQconst [c])))) && isPowerOfTwo(c) => (VPSLLQ128const [uint8(log64(c))] x)
+(VPMULLQ256 x (VPBROADCASTQ256 (VMOVQ (MOVQconst [c])))) && isPowerOfTwo(c) => (VPSLLQ256const [uint8(log64(c))] x)
+(VPMULLQ512 x (VPBROADCASTQ512 (VMOVQ (MOVQconst [c])))) && isPowerOfTwo(c) => (VPSLLQ512const [uint8(log64(c))] x)
+
+(VPMULLD128 x (VPBROADCASTD128 (VMOVD (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLD128const [uint8(log32(int32(c)))] x)
+(VPMULLD256 x (VPBROADCASTD256 (VMOVD (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLD256const [uint8(log32(int32(c)))] x)
+(VPMULLD512 x (VPBROADCASTD512 (VMOVD (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLD512const [uint8(log32(int32(c)))] x)
+
+(VPMULLW128 x (VPBROADCASTW128 (VMOVQ (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLW128const [uint8(log16(int16(c)))] x) // use VMOVQ because VMOVW doesn't exist
+(VPMULLW256 x (VPBROADCASTW256 (VMOVQ (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLW256const [uint8(log16(int16(c)))] x)
+(VPMULLW512 x (VPBROADCASTW512 (VMOVQ (MOVLconst [c])))) && isPowerOfTwo(c) => (VPSLLW512const [uint8(log16(int16(c)))] x)
 
 // 2-op VPTEST optimizations
 (SETEQ (VPTEST x:(VPAND(128|256) j k) y)) && x == y && x.Uses == 2 => (SETEQ (VPTEST j k))
