@@ -28,7 +28,6 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 	op.buffer = buffer
 	op.n = n
 	op.errno = errno
-	op.pollRead = true
 	if len(buffer) == 0 {
 		registerStacklessCoroOperation(op)
 		stacklessCoroSocketReadFinish(op, 0, 0)
@@ -42,7 +41,6 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 		stacklessCoroSocketReadFinish(op, -1, uintptr(openErr))
 		return
 	}
-	stacklessCoroNetpollInit()
 	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	registerStacklessCoroOperation(op)
 	stacklessCoroSocketReadAttempt(op)
@@ -75,6 +73,7 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 			return
 		}
 		if waiting {
+			stacklessCoroNetpollInit()
 			return
 		}
 	}

@@ -190,7 +190,6 @@ type stacklessCoroOperation struct {
 	// registry remains the GC root for a linked socket operation.
 	packet   [2]uint64
 	async    bool
-	pollRead bool
 	next     *stacklessCoroOperation
 	workNext *stacklessCoroOperation
 }

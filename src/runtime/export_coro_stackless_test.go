@@ -545,7 +545,7 @@ func StacklessCoroPollWaitCountForTest() int {
 	lock(&stacklessCoroOperations.lock)
 	count := 0
 	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		if !op.pollRead || op.packet[stacklessCoroPollDescWord] == 0 {
+		if op.async || op.packet[stacklessCoroPollDescWord] == 0 {
 			continue
 		}
 		pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
@@ -734,8 +734,6 @@ func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []
 	op.buffer = buffer
 	op.n = n
 	op.errno = errno
-	op.pollRead = true
-	stacklessCoroNetpollInit()
 	netpollGenericInit()
 	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
 	if openErr != 0 {
