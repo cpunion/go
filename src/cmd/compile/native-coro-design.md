@@ -3012,7 +3012,13 @@ surface-area work. The first performance sequence is:
    not teach the compiler private `os`, `net`, or `internal/poll` layouts. The
    first design review must choose between a tagged G-or-logical waiter in
    `pollDesc` and a separate logical-wait registry; that representation is not
-   implied by this performance ordering.
+   implied by this performance ordering. `netpollready` may run while the
+   world is stopped and is `nowritebarrier`, so it cannot directly enqueue a
+   pointer-rich logical task or take the coroutine scheduler through its
+   ordinary completion path. Readiness must first publish a pointer-free
+   completion token and finish on a safe G. "Direct" here means removing the
+   per-read waiting worker, not running arbitrary completion code in the
+   poller.
 3. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
