@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -798,11 +799,10 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 }
 
 // coroTakeFrameChunk extends coroTakeFrame for compiler-proven structured
-// self recursion. Returning ctx asks the generated factory to allocate a
-// typed array. Any other non-nil result is cached storage or the next element
-// of the parent's array; a frame allocation cannot alias its task context.
+// self recursion. chunkType describes the generated [4]frame allocation, so
+// newobject preserves its exact GC pointer map.
 func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
-	size uintptr) unsafe.Pointer {
+	size uintptr, chunkType *_type) unsafe.Pointer {
 	if ctx == nil || raceenabled || size > stacklessCoroFrameCacheSize {
 		return nil
 	}
@@ -817,6 +817,7 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
 		chunkEligible := size != 0 &&
 			size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
+			validStacklessCoroFrameChunkType(chunkType, size) &&
 			parent.resume != nil &&
 			stacklessCoroResumeIdentity(parent.resume) ==
 				stacklessCoroResumeIdentity(child)
@@ -826,7 +827,7 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 		switch marker := parent.frameSize; {
 		case marker == stacklessCoroFrameChunkDirectLast ||
 			marker == stacklessCoroFrameChunkLast:
-			return ctx
+			return newobject(chunkType)
 		case marker <= stacklessCoroFrameChunkFirst &&
 			marker > stacklessCoroFrameChunkLast:
 			if parent.context.frame == nil {
@@ -857,7 +858,8 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 			s.freeFrameBytes == 0 {
 			task.frameSize = stacklessCoroUncachedFrameLineage
 			if size != 0 &&
-				size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize {
+				size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
+				validStacklessCoroFrameChunkType(chunkType, size) {
 				task.frameSize = stacklessCoroFrameChunkDirectFirst
 			}
 		}
@@ -869,6 +871,16 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	frame := task.context.frame
 	unlock(&s.lock)
 	return frame
+}
+
+func validStacklessCoroFrameChunkType(chunkType *_type, size uintptr) bool {
+	if chunkType == nil || chunkType.Kind() != abi.Array {
+		return false
+	}
+	array := (*arraytype)(unsafe.Pointer(chunkType))
+	return array.Len == stacklessCoroFrameChunkSize &&
+		array.Elem != nil && array.Elem.Size_ == size &&
+		chunkType.Size_ == size*stacklessCoroFrameChunkSize
 }
 
 // markUncachedFrameLineageLocked records a saturated explicit-frame lineage

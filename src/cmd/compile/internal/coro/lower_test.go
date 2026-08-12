@@ -372,12 +372,15 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		t.Fatal("missing recursive frame factory")
 	}
 
-	takeFrames, allocations, chunks := 0, 0, 0
+	takeFrames, allocations, chunks, chunkTypes := 0, 0, 0, 0
 	ir.VisitList(factory.Body, func(node ir.Node) {
 		if call, ok := node.(*ir.CallExpr); ok &&
 			symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
 				"runtime.coroTakeFrameChunk" {
 			takeFrames++
+			if len(call.Args) == 4 && call.Args[3].Type().IsPtr() {
+				chunkTypes++
+			}
 		}
 		allocation, ok := node.(*ir.UnaryExpr)
 		if !ok || allocation.Op() != ir.ONEW {
@@ -390,9 +393,9 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 			chunks++
 		}
 	})
-	if takeFrames != 1 || allocations != 2 || chunks != 1 {
-		t.Fatalf("recursive factory has %d chunk lookups, %d allocations, and %d typed chunks; want 1, 2, and 1",
-			takeFrames, allocations, chunks)
+	if takeFrames != 1 || allocations != 1 || chunks != 0 || chunkTypes != 1 {
+		t.Fatalf("recursive factory has %d chunk lookups, %d allocations, %d local chunks, and %d chunk types; want 1, 1, 0, and 1",
+			takeFrames, allocations, chunks, chunkTypes)
 	}
 }
 

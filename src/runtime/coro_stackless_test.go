@@ -1146,11 +1146,9 @@ func stacklessCoroFrameChunkResume(ctx unsafe.Pointer) uint8 {
 			unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{}))
 		tracker := frame.tracker
 		if chunk {
-			if child != nil || tracker.remaining != 0 {
+			if child == nil || tracker.remaining != 0 {
 				tracker.invalid = true
 			}
-			frames := new([runtime.StacklessCoroFrameChunkSize]stacklessCoroFrameChunkTestFrame)
-			child = unsafe.Pointer(&frames[0])
 			tracker.chunks++
 			tracker.next = uintptr(child) +
 				unsafe.Sizeof(stacklessCoroFrameChunkTestFrame{})
@@ -1572,6 +1570,12 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 	t.Run("recursive-frame-chunks", func(t *testing.T) {
 		if !runtime.StacklessCoroFrameChunkMarkerIsolationForTest() {
 			t.Fatal("frame-chunk marker crossed resume identities")
+		}
+		valid, missing, wrongKind, wrongLength, wrongElementSize :=
+			runtime.ValidStacklessCoroFrameChunkTypesForTest()
+		if !valid || missing || wrongKind || wrongLength || wrongElementSize {
+			t.Fatalf("frame-chunk types = (%t, %t, %t, %t, %t), want (true, false, false, false, false)",
+				valid, missing, wrongKind, wrongLength, wrongElementSize)
 		}
 		const depth = runtime.StacklessCoroTaskCacheSize +
 			runtime.StacklessCoroFrameChunkDirectCount +

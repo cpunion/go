@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
@@ -3727,34 +3728,20 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
 	if candidate.selfAwait && !candidate.selfSpawn {
-		factoryFrameRaw := typecheck.TempAt(pos, factory, unsafePointerType)
-		declarations = append(declarations,
-			ir.NewDecl(pos, ir.ODCL, factoryFrameRaw))
+		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
 		takeFrame := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTakeFrameChunk"), ir.Nodes{
 				factoryCtx, factoryResume, frameSize,
+				reflectdata.TypePtrAt(pos, frameChunkType),
 			}, false)
 		declarations = append(declarations,
-			ir.NewAssignStmt(pos, factoryFrameRaw, takeFrame),
 			ir.NewAssignStmt(pos, factoryFrame,
-				typecheck.ConvNop(factoryFrameRaw, framePointerType)))
-
-		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
-		chunkAllocation := typecheck.ConvNop(
-			typecheck.ConvNop(typedNew(pos, frameChunkType), unsafePointerType),
-			framePointerType)
-		singleAllocation := typedNew(pos, frameType)
-		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrameRaw,
-			ir.NewNilExpr(pos, unsafePointerType))
-		chunkFrame := ir.NewLogicalExpr(pos, ir.OANDAND,
-			ir.NewBinaryExpr(pos, ir.ONE, factoryFrameRaw,
-				ir.NewNilExpr(pos, unsafePointerType)),
-			ir.NewBinaryExpr(pos, ir.OEQ, factoryFrameRaw, factoryCtx))
-		declarations = append(declarations,
-			ir.NewIfStmt(pos, chunkFrame,
-				ir.Nodes{ir.NewAssignStmt(pos, factoryFrame, chunkAllocation)}, nil),
-			ir.NewIfStmt(pos, missingFrame,
-				ir.Nodes{ir.NewAssignStmt(pos, factoryFrame, singleAllocation)}, nil))
+				typecheck.ConvNop(takeFrame, framePointerType)))
+		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
+			ir.NewNilExpr(pos, framePointerType))
+		declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
+			ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
+				typedNew(pos, frameType))}, nil))
 	} else {
 		takeFrame := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTakeFrame"), ir.Nodes{

@@ -6,7 +6,16 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
+
+type stacklessCoroFrameChunkExportFrame struct {
+	depth   int
+	state   int
+	tracker unsafe.Pointer
+}
 
 const (
 	StacklessCoroWarmExecutorCount     = stacklessCoroWarmExecutorCount
@@ -73,11 +82,29 @@ func TakeStacklessCoroFrameForTest(ctx unsafe.Pointer,
 
 func TakeStacklessCoroFrameChunkForTest(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8, size uintptr) (unsafe.Pointer, bool) {
-	frame := coroTakeFrameChunk(ctx, resume, size)
-	if frame != nil && frame == ctx {
-		return nil, true
+	chunk := false
+	if ctx != nil {
+		marker := (*stacklessCoroContext)(ctx).task().frameSize
+		chunk = marker == stacklessCoroFrameChunkDirectLast ||
+			marker == stacklessCoroFrameChunkLast
 	}
-	return frame, false
+	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroFrameChunkExportFrame]()
+	frame := coroTakeFrameChunk(ctx, resume, size, frameType)
+	return frame, chunk && frame != nil
+}
+
+func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,
+	wrongKind, wrongLength, wrongElementSize bool) {
+	integer := abi.TypeFor[uintptr]()
+	validChunk := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroFrameChunkExportFrame]()
+	shortChunk := abi.TypeFor[[stacklessCoroFrameChunkSize - 1]stacklessCoroFrameChunkExportFrame]()
+	byteChunk := abi.TypeFor[[stacklessCoroFrameChunkSize]byte]()
+	size := unsafe.Sizeof(stacklessCoroFrameChunkExportFrame{})
+	return validStacklessCoroFrameChunkType(validChunk, size),
+		validStacklessCoroFrameChunkType(nil, size),
+		validStacklessCoroFrameChunkType(integer, size),
+		validStacklessCoroFrameChunkType(shortChunk, size),
+		validStacklessCoroFrameChunkType(byteChunk, size)
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
