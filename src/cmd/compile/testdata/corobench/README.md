@@ -711,6 +711,29 @@ closure still crosses the shared worker queue. This isolates the public
 lowering boundary and worker handoff, rather than the operation cache, as the
 file and socket target.
 
+The next runtime-only checkpoint removes that worker path from the explicit
+`runtime/coro.FileRead` companion. Its syscall remains on the calling M while
+compensated syscall entry lets a replacement executor run logical siblings.
+It completes through the common early-ready protocol without registering the
+operation, and it does not count the syscall as a cgo call. The ordinary
+`os.File.Read` benchmark and its 64-byte closure allocation above are unchanged;
+connecting that public source call is the next compiler/library boundary.
+
+The dedicated runtime adapter benchmark used three warm-up pairs followed by
+20 alternating 500 ms samples at one P. On native Darwin/arm64 it changed from
+28.14 us to 748.4 ns (-97.34%, `p<0.001`). Both exact binaries reported 0 B
+and 0 allocations per read. The controlled translated Linux/amd64 run changed
+128.19 us to 561.6 ns (-99.56%, `p<0.001`). All Linux samples reported zero
+allocations; parent process setup amortized to 0--6 B/op, while every candidate
+sample reported 0 B/op. Because that environment identifies its CPU as
+VirtualApple, the timing is directional rather than a native x86 result. Tests
+additionally hold a file syscall blocked, run a sibling and a stop-the-world
+GC on replacement capacity, and only then release the read.
+
+Darwin controls for entry, yield, timer, channel, and socket read were all
+statistically neutral across the same 20 alternating samples; the timing
+geomean changed by -1.05%, and every allocation result matched exactly.
+
 For 10,000 simultaneously parked tasks, live heap fell from 623.1 B to
 356.6 B per task and live stack fell from 2,048 B to 6.554 B per task. Live
 objects rose from 2.002 to 3.253 per task, and the operation performed 40,040
@@ -748,13 +771,14 @@ when the experiment is disabled.
 With positive-duration timer ownership addressed, the next order of
 performance work is:
 
-1. replace the public file and socket closure/worker path with stable runtime
-   integration; regular files still need a blocking-M handoff, while sockets
-   should attach logical completion directly to netpoll readiness;
-2. reduce the fixed root-entry transition and typed frame allocation costs,
+1. connect ordinary file reads to the now-direct blocking-M runtime boundary
+   without exposing private library layouts to the compiler;
+2. replace the socket worker with a pointer-free netpoll readiness token and
+   completion on a safe G;
+3. reduce the fixed root-entry transition and typed frame allocation costs,
    with the depth-boundary probes guarding the existing bounded-retention and
    exact-GC-map rules; and
-3. remove ready-`select` temporary storage before changing channel waiter
+4. remove ready-`select` temporary storage before changing channel waiter
    lifetime.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,

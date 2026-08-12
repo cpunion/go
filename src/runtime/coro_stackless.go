@@ -155,8 +155,8 @@ type stacklessCoroScheduler struct {
 	executorManagerDone chan struct{}
 	executorState       atomic.Uint32
 	// executorCount includes the original driver. blockingExecutors counts
-	// drivers that entered a blocking foreign call but have not yet returned
-	// with a P.
+	// drivers that entered a blocking native operation but have not yet
+	// returned with a P.
 	executorCount     atomic.Uint32
 	blockingExecutors atomic.Uint32
 	// runnableState stores the runnable count in its low 31 bits. The high
@@ -184,7 +184,6 @@ type stacklessCoroOperation struct {
 	call      func()
 	n         *int
 	errno     *uintptr
-	poll      bool
 	valueOut  *uint64
 	packet    [2]uint64
 	async     bool
@@ -1631,6 +1630,55 @@ func coroExitBlocking() {
 	}
 }
 
+// coroEnterSyscall reserves replacement capacity, saves its caller as the
+// syscall continuation, and enters a blocking syscall without marking it as a
+// foreign call. Its caller remains active until coroExitSyscall.
+//
+//go:nosplit
+func coroEnterSyscall(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine syscall")
+	}
+	scheduler := context.scheduler
+	tracked := scheduler.executorState.Load() == stacklessCoroExecutorStateRunning
+	handoff := tracked && scheduler.enterBlockingExecutor()
+
+	gp := getg()
+	state := gp.stacklessCoro
+	if tracked && state == nil {
+		throw("runtime: missing stackless coroutine executor state")
+	}
+	if state != nil && state.blockingScheduler != nil {
+		throw("runtime: nested stackless coroutine blocking call")
+	}
+	if tracked {
+		state.blockingScheduler = scheduler
+	}
+
+	pc := sys.GetCallerPC()
+	sp := sys.GetCallerSP()
+	bp := getcallerfp()
+	if handoff {
+		reentersyscallblock(pc, sp, bp)
+	} else {
+		reentersyscall(pc, sp, bp)
+	}
+}
+
+//go:nosplit
+func coroExitSyscall() {
+	exitsyscall()
+	gp := getg()
+	state := gp.stacklessCoro
+	if state != nil && state.blockingScheduler != nil {
+		scheduler := state.blockingScheduler
+		state.blockingScheduler = nil
+		scheduler.leaveBlockingExecutor()
+	}
+}
+
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
@@ -2067,8 +2115,8 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 }
 
 // enterBlockingExecutor notifies replacement capacity and records an executor
-// entering a blocking foreign call. It reports whether the executor should
-// promptly release its P.
+// entering a blocking native operation. It reports whether the executor
+// should promptly release its P.
 //
 // coroEnterBlocking keeps schedulers without replacement executors on the
 // ordinary direct-C path and does not call this slow path.

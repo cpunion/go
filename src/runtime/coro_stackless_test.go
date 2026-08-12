@@ -4015,7 +4015,8 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	progress := make(chan struct{})
-	writeDone := stacklessCoroProgressWrite(fds[1], progress, "file")
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	writeDone := stacklessCoroProgressWrite(fds[1], progress, "file", runtime.GC)
 
 	var state, n int
 	var errno uintptr
@@ -4046,6 +4047,10 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 	if write.rescued {
 		t.Fatal("file read blocked sibling scheduling")
 	}
+	if write.operations != baselineOperations {
+		t.Fatalf("registered operations during direct file read = %d, want %d",
+			write.operations, baselineOperations)
+	}
 	if n != 4 || errno != 0 || string(buffer) != "file" {
 		t.Fatalf("read = (%d, %d, %q), want (4, 0, %q)",
 			n, errno, buffer, "file")
@@ -4053,6 +4058,7 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 }
 
 func TestStacklessCoroFileReadError(t *testing.T) {
+	cgoCalls := runtime.NumCgoCall()
 	var state, n int
 	var errno uintptr
 	buffer := make([]byte, 1)
@@ -4073,6 +4079,9 @@ func TestStacklessCoroFileReadError(t *testing.T) {
 	if n != -1 || errno == 0 {
 		t.Fatalf("read from invalid descriptor = (%d, %d), want (-1, errno)",
 			n, errno)
+	}
+	if got := runtime.NumCgoCall(); got != cgoCalls {
+		t.Fatalf("NumCgoCall after file read = %d, want %d", got, cgoCalls)
 	}
 }
 
@@ -4114,7 +4123,7 @@ func TestStacklessCoroSocketReadProgress(t *testing.T) {
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	progress := make(chan struct{})
-	writeDone := stacklessCoroProgressWrite(fds[1], progress, "poll")
+	writeDone := stacklessCoroProgressWrite(fds[1], progress, "poll", nil)
 
 	var state, n int
 	var errno uintptr
@@ -4289,11 +4298,12 @@ func stacklessCoroPipe(t *testing.T) [2]int {
 }
 
 type stacklessCoroWriteResult struct {
-	err     error
-	rescued bool
+	err        error
+	rescued    bool
+	operations int
 }
 
-func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string) <-chan stacklessCoroWriteResult {
+func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string, beforeWrite func()) <-chan stacklessCoroWriteResult {
 	done := make(chan stacklessCoroWriteResult, 1)
 	go func() {
 		rescued := false
@@ -4303,8 +4313,14 @@ func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string) <
 			// Keep a scheduling regression from hanging the runtime test.
 			rescued = true
 		}
+		if beforeWrite != nil {
+			beforeWrite()
+		}
+		operations := runtime.StacklessCoroOperationCountForTest()
 		_, err := syscall.Write(fd, []byte(data))
-		done <- stacklessCoroWriteResult{err: err, rescued: rescued}
+		done <- stacklessCoroWriteResult{
+			err: err, rescued: rescued, operations: operations,
+		}
 	}()
 	return done
 }

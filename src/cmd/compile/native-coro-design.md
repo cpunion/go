@@ -3012,14 +3012,61 @@ avoids boxing a numeric callback identity on every wait. Tests exercise expiry,
 cancellation, their race, a deliberately late callback after same-kind and
 cross-kind reuse, and generation wrap.
 
+The next checkpoint implements the runtime half of the regular-file path.
+The explicit `runtime/coro.FileRead` companion now performs `read` on the
+calling M. A dedicated compensated-syscall boundary releases the P when
+logical work is runnable, so a replacement executor can continue sibling
+tasks even with `GOMAXPROCS=1`. Unlike the direct-C boundary, syscall entry
+does not enter foreign-call state or increment `runtime.NumCgoCall`.
+
+The operation still enters the common waiting state before the syscall. It is
+completed directly when `read` returns, without the global operation registry
+or shared worker queue. Completion while the generated resume is active uses
+the existing early-ready transition; the resume then returns `wait` and the
+scheduler consumes the pending readiness normally. The operation's local
+nonzero identity is never exposed to another thread or callback. The active
+helper frame and operation retain the typed buffer and result pointers while
+the G is in syscall state.
+
+This checkpoint deliberately does not change ordinary `os.File.Read` lowering.
+That source path still captures a typed result closure and crosses the shared
+worker queue. The explicit companion therefore establishes and measures the
+runtime ABI and blocking-M semantics before a separate compiler/public-library
+change removes that closure. Socket reads also retain their registered
+poll-worker path until readiness can be represented safely in netpoll.
+
+Tests cover a blocked read with sibling progress and a stop-the-world GC,
+success, invalid descriptors, empty buffers, operation reuse, early readiness,
+and race builds. They also verify that a direct file wait is absent from the
+operation registry and leaves `NumCgoCall` unchanged. The focused profile
+covers 75 of 79 changed production statements (94.94%); the four uncovered
+statements are three fatal invariant paths and the read-length clamp that
+requires a buffer larger than 2 GiB.
+
+On native Darwin/arm64, three warm-up pairs and 20 alternating 500 ms samples
+at one P changed the explicit file adapter from 28.14 us to 748.4 ns
+(-97.34%, `p<0.001`). Both binaries used 0 B and 0 allocations per read.
+The controlled translated Linux/amd64 run used the same protocol and changed
+128.19 us to 561.6 ns (-99.56%, `p<0.001`). Every sample reported zero
+allocations; process-level setup amortized to 0--6 B/op in parent samples,
+while every candidate sample reported 0 B/op. The environment identifies its
+CPU as VirtualApple, so the Linux timing is directional rather than a native
+x86 performance result.
+
+Five Darwin runtime controls used the same 20-sample alternating protocol.
+Entry, yield, timer, channel, and socket-read time were all statistically
+neutral (`p=0.678`, `0.449`, `0.383`, `0.304`, and `0.659`); their timing
+geomean changed by -1.05%. Every allocation result matched exactly. This
+separates the file result from a general scheduler, timer, channel, or worker
+shift.
+
 The remaining performance sequence is:
 
-1. Replace the public `os.File.Read` and `net.TCPConn.Read` closure/worker
-   fallback with a stable compiler/runtime boundary. A regular-file syscall
-   may still block an M and use the existing replacement-executor protocol;
-   a socket wait should publish a logical completion directly from netpoll
-   instead of parking a worker G in `poll_runtime_pollWait`. The boundary must
-   not teach the compiler private `os`, `net`, or `internal/poll` layouts. The
+1. Connect ordinary `os.File.Read` lowering to the explicit runtime boundary
+   without teaching the compiler private `os` or `internal/poll` layouts.
+   Preserve error projection and typed result ownership while removing the
+   generated closure and worker dispatch.
+2. Replace the `net.TCPConn.Read` worker with logical netpoll integration. The
    first design review must choose between a tagged G-or-logical waiter in
    `pollDesc` and a separate logical-wait registry; that representation is not
    implied by this performance ordering. `netpollready` may run while the
@@ -3029,10 +3076,10 @@ The remaining performance sequence is:
    completion token and finish on a safe G. "Direct" here means removing the
    per-read waiting worker, not running arbitrary completion code in the
    poller.
-2. Reduce public-root entry transitions and typed frame allocation while
+3. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
-3. Remove ready-select temporary storage before changing channel-waiter
+4. Remove ready-select temporary storage before changing channel-waiter
    lifetime or ownership.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
