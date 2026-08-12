@@ -5,6 +5,8 @@
 package work
 
 import (
+	"cmd/go/internal/cache"
+	"crypto/sha256"
 	"internal/buildcfg"
 	"internal/testenv"
 	"io/fs"
@@ -73,6 +75,60 @@ func TestCgoDirectAssembly(t *testing.T) {
 	cfg.Experiment = experiment
 	if cgoDirectAssembly(new(load.Package)) {
 		t.Error("cgoDirectAssembly accepted a package without cgo")
+	}
+}
+
+func TestCacheRunCgoDirectAssembly(t *testing.T) {
+	objdir := t.TempDir() + string(filepath.Separator)
+	files := map[string]string{
+		"_cgo_export.c": "export c",
+		"_cgo_export.h": "export h",
+		"_cgo_main.c":   "main c",
+		"_cgo_direct.s": "direct assembly",
+		"input.cgo1.go": "package p",
+		"input.cgo2.c":  "input c",
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(objdir+name, []byte(contents), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := &Action{
+		Objdir:   objdir,
+		Package:  new(load.Package),
+		actionID: cache.ActionID(sha256.Sum256([]byte(objdir))),
+	}
+	pr := &runCgoProvider{
+		goFiles:    []string{objdir + "input.cgo1.go"},
+		goAsmFiles: []string{objdir + "_cgo_direct.s"},
+	}
+	b := NewBuilder(t.TempDir(), nil)
+	if err := b.cacheRunCgoOutputs(a, pr); err != nil {
+		t.Fatal(err)
+	}
+	for name := range files {
+		if err := os.Remove(objdir + name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := b.loadCachedRunCgoOutputs(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.goFiles, pr.goFiles) {
+		t.Errorf("goFiles = %q, want %q", got.goFiles, pr.goFiles)
+	}
+	if !reflect.DeepEqual(got.goAsmFiles, pr.goAsmFiles) {
+		t.Errorf("goAsmFiles = %q, want %q", got.goAsmFiles, pr.goAsmFiles)
+	}
+	data, err := os.ReadFile(objdir + "_cgo_direct.s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), files["_cgo_direct.s"]; got != want {
+		t.Errorf("restored direct assembly = %q, want %q", got, want)
 	}
 }
 

@@ -35,7 +35,7 @@ type Func struct {
 	bid idAlloc // block ID allocator
 	vid idAlloc // value ID allocator
 
-	HTMLWriter     *HTMLWriter    // html writer, for debugging
+	FatalCleanup   func()         // cleanup function to run before reporting a fatal error
 	PrintOrHtmlSSA bool           // true if GOSSAFUNC matches, true even if fe.Log() (spew phase results to stdout) is false.  There's an odd dependence on this in debug.go for method logf.
 	ruleMatches    map[string]int // number of times countRule was called during compilation for any given string
 	ABI0           *abi.ABIConfig // ABI configuration for ABI0
@@ -753,17 +753,17 @@ func (f *Func) Warnl(pos src.XPos, msg string, args ...any) { f.fe.Warnl(pos, ms
 func (f *Func) Logf(msg string, args ...any)                { f.fe.Logf(msg, args...) }
 func (f *Func) Log() bool                                   { return f.fe.Log() }
 
-func (f *Func) Fatalf(msg string, args ...any) {
-	stats := "crashed"
+func (f *Func) Fatalf(msg string, args ...any) { f.FatalfWithPos(f.Entry.Pos, msg, args...) }
+
+func (f *Func) FatalfWithPos(pos src.XPos, msg string, args ...any) {
 	if f.Log() {
-		f.Logf("  pass %s end %s\n", f.pass.name, stats)
+		f.Logf("  pass %s end crashed\n", f.pass.name)
 		printFunc(f)
 	}
-	if f.HTMLWriter != nil {
-		f.HTMLWriter.WritePhase(f.pass.name, fmt.Sprintf("%s <span class=\"stats\">%s</span>", f.pass.name, stats))
-		f.HTMLWriter.flushPhases()
+	if f.FatalCleanup != nil {
+		f.FatalCleanup()
 	}
-	f.fe.Fatalf(f.Entry.Pos, msg, args...)
+	f.fe.Fatalf(pos, msg, args...)
 }
 
 // postorder returns the reachable blocks in f in a postorder traversal.

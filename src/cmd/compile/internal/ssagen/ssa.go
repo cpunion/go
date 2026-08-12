@@ -296,7 +296,7 @@ func (s *state) emitOpenDeferInfo() {
 
 // buildssa builds an SSA function for fn.
 // worker indicates which of the backend workers is doing the processing.
-func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
+func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWriter) {
 	name := ir.FuncName(fn)
 
 	abiSelf := abiForFunc(fn, ssaConfig.ABI0, ssaConfig.ABI1)
@@ -379,6 +379,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	s.f.Entry = s.f.NewBlock(block.BlockPlain)
 	s.f.Entry.Pos = fn.Pos()
 	s.f.IsPgoHot = isPgoHot
+	var htmlWriter *ssa.HTMLWriter
 
 	if printssa {
 		ssaDF := ssaDumpFile
@@ -387,10 +388,11 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 			ssaD := filepath.Dir(ssaDF)
 			os.MkdirAll(ssaD, 0755)
 		}
-		s.f.HTMLWriter = ssa.NewHTMLWriter(ssaDF, s.f, ssaDumpCFG)
+		htmlWriter = ssa.NewHTMLWriter(ssaDF, s.f, ssaDumpCFG)
 		// TODO: generate and print a mapping from nodes to values and blocks
-		dumpSourcesColumn(s.f.HTMLWriter, fn)
-		s.f.HTMLWriter.WriteAST("AST", astBuf)
+		dumpSourcesColumn(htmlWriter, fn)
+		htmlWriter.WriteAST("AST", astBuf)
+		s.f.FatalCleanup = htmlWriter.FatalCleanup
 	}
 
 	// Allocate starting values
@@ -590,13 +592,13 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 		}
 	}
 
-	s.f.HTMLWriter.WritePhase("before insert phis", "before insert phis")
+	htmlWriter.WritePhase("before insert phis", "before insert phis")
 
 	s.insertPhis()
 
 	// Main call to ssa package to compile function.
 	if buildcfg.Experiment.Coro && base.Debug.Coro > 2 {
-		handled := ssa.CompileWithLoweringHook(s.f, func(f *ssa.Func) bool {
+		handled := ssa.CompileWithLoweringHook(s.f, htmlWriter, func(f *ssa.Func) bool {
 			coro.DumpPreLowerSSA(os.Stderr, f)
 			return false
 		})
@@ -604,7 +606,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 			s.Fatalf("report-only coroutine backend unexpectedly handled %s", s.f.Name)
 		}
 	} else {
-		ssa.Compile(s.f)
+		ssa.Compile(s.f, htmlWriter)
 	}
 
 	fe.AllocFrame(s.f)
@@ -631,7 +633,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 		}
 	}
 
-	return s.f
+	return s.f, htmlWriter
 }
 
 func (s *state) storeParameterRegsToStack(abi *abi.ABIConfig, paramAssignment *abi.ABIParamAssignment, n *ir.Name, addr *ssa.Value, pointersOnly bool) {
@@ -847,7 +849,7 @@ func (s *state) sizeSpecializedMallocEnabled() bool {
 		return false
 	}
 
-	return buildcfg.Experiment.SizeSpecializedMalloc && !base.Flag.Cfg.Instrumenting
+	return !base.Flag.Cfg.Instrumenting
 }
 
 // setHeapaddr allocates a new PAUTO variable to store ptr (which must be non-nil)
@@ -6992,7 +6994,7 @@ func emitWrappedFuncInfo(e *ssafn, pp *objw.Progs) {
 }
 
 // genssa appends entries to pp for each instruction in f.
-func genssa(f *ssa.Func, pp *objw.Progs) {
+func genssa(htmlWriter *ssa.HTMLWriter, f *ssa.Func, pp *objw.Progs) {
 	var s State
 	s.ABI = f.OwnAux.Fn.ABI()
 
@@ -7444,7 +7446,7 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 			f.Logf(" %-6s\t%.5d (%s)\t%s\n", s, p.Pc, p.InnermostLineNumber(), p.InstructionString())
 		}
 	}
-	if f.HTMLWriter != nil { // spew to ssa.html
+	if htmlWriter != nil { // spew to ssa.html
 		var buf strings.Builder
 		buf.WriteString("<code>")
 		buf.WriteString("<dl class=\"ssa-gen\">")
@@ -7493,7 +7495,7 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 		}
 		buf.WriteString("</dl>")
 		buf.WriteString("</code>")
-		f.HTMLWriter.WriteColumn("genssa", "genssa", "ssa-prog", buf.String())
+		htmlWriter.WriteColumn("genssa", "genssa", "ssa-prog", buf.String())
 	}
 	if ssa.GenssaDump[f.Name] {
 		fi := f.DumpFileForPhase("genssa")
@@ -7544,8 +7546,8 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 		}
 	}
 
-	f.HTMLWriter.Close()
-	f.HTMLWriter = nil
+	htmlWriter.Close()
+	htmlWriter = nil
 }
 
 func defframe(s *State, e *ssafn, f *ssa.Func) {
