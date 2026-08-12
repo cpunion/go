@@ -666,17 +666,43 @@ The deterministic allocation results better isolate the remaining costs:
 | park and wake 100 tasks | 112 B, 1 alloc | about 18.2 KiB, 137 allocs |
 | channel round trip | 0 B, 0 allocs | 224 B, 2 allocs |
 | ready `select` | 0 B, 0 allocs | 132 B, 3 allocs |
-| `Sleep(1ns)` | 0 B, 0 allocs | 104 B, 2 allocs |
+| `Sleep(1ns)` | 0 B, 0 allocs | 0 B, 0 allocs |
 | ready file or TCP read | 0 B, 0 allocs | 64 B, 1 alloc |
 | blocking file or TCP read | 0 B, 0 allocs | about 596 B, 16 allocs |
 | ordinary direct C call | 0 B, 0 allocs | 0 B, 0 allocs |
 
 A separate rate-one allocation profile over 10,000 positive sleeps attributed
 one 96-byte allocation per wait to the `new(timer)` call. The remaining
-amortized bytes are consistent with boxing the numeric operation identity for
-the timer callback argument. Operation-header reuse is already active. The
-timer target is therefore ownership and identity overhead around the existing
-runtime timer heap, not a second timer implementation.
+amortized bytes were consistent with boxing the numeric operation identity for
+the timer callback argument. Operation-header reuse was already active, so the
+next checkpoint changed ownership and identity around the existing runtime
+timer heap rather than adding a second timer implementation.
+
+The operation now retains a stable timer owner and passes a generation through
+the existing timer callback. An atomic active generation gives either expiry
+or cancellation the right to complete the operation; a callback from an older
+generation is inert even after cross-kind operation reuse. Generation wrap
+retires the owner. This removes both the global operation lookup and steady
+timer callback identity boxing.
+
+On native Darwin/arm64, the exact-parent and candidate binaries used three
+warm-up pairs followed by 20 alternating 500 ms samples at one P. Positive
+sleep allocation fell from 103--104 B and one or two integer-reported
+allocations per wait to 0 B and 0 allocations. The source profile and longer
+samples approach the expected pre-change steady state of 104 B and two
+allocations; shorter samples include the runtime's static small-integer boxes.
+Time was statistically neutral: 90.09 us versus 92.68 us (`p=0.883`).
+
+The controlled Linux/amd64 environment used the same sample order and exact
+runtime/compiler source pair. It independently reproduced 104 B and two
+allocations versus 0 B and 0 allocations. Time was again neutral: 39.42 us
+versus 39.32 us (`p=0.841`).
+
+A process-cold, single-iteration control measured 1,888 B and 12 allocations
+before versus 1,920 B and 12 allocations after. The reusable owner therefore
+adds 32 bytes to the first operation's retained timer object without adding an
+allocation; subsequent positive waits on the cached operation allocate
+nothing.
 
 The corresponding rate-one ready-file profile attributed its single 64-byte
 allocation per read to the compiler-generated call closure at the public
@@ -719,13 +745,12 @@ live stack was also statistically level. The different fixed-layout outliers
 and neutral layout controls provide no evidence of a systematic regression
 when the experiment is disabled.
 
-This checkpoint makes the next order of performance work concrete:
+With positive-duration timer ownership addressed, the next order of
+performance work is:
 
-1. keep positive-duration waits on the runtime timer heap while reducing their
-   per-wait timer allocation and global operation lookup, then replace the
-   public file and socket closure/worker path with stable runtime integration;
-   regular files still need a blocking-M handoff, while sockets should attach
-   logical completion directly to netpoll readiness;
+1. replace the public file and socket closure/worker path with stable runtime
+   integration; regular files still need a blocking-M handoff, while sockets
+   should attach logical completion directly to netpoll readiness;
 2. reduce the fixed root-entry transition and typed frame allocation costs,
    with the depth-boundary probes guarding the existing bounded-retention and
    exact-GC-map rules; and
