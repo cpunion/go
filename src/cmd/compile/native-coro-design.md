@@ -3160,6 +3160,52 @@ C targets intentionally remain plain because transparent direct C calls are
 currently supported only on Darwin/arm64 and Linux/amd64. The complete direct
 C audit passes on native Darwin/arm64 and on the Linux/amd64 CI runner.
 
+The following runtime checkpoint makes the readiness token safe to use with a
+poll descriptor owned by `internal/poll`. Readiness still consumes the token
+in `netpollready`'s measured inline loop. Close, an expired deadline, and the
+other non-readiness wake paths now recognize the same tag after their existing
+`netpollunblock` compare-and-swap. Both paths publish through one pointer-free
+completion queue and return the bridge G, if it needs to be made runnable, to
+the caller's existing `gList` or `netpollgoready` path. No continuation runs
+under the poll-descriptor lock or in a no-write-barrier event callback.
+
+A socket operation records whether it opened a private poll descriptor or
+borrowed its owner's descriptor. The private raw-descriptor adapter retains
+its existing unblock-and-close cleanup. Completion of a borrowed operation
+leaves the descriptor registered and usable for later reads; its library owner
+will continue to hold the read and reference locks and remains solely
+responsible for close. The ownership bit fits in existing alignment padding.
+Tests exercise two reads through one borrowed descriptor, an empty read that
+does not inspect the descriptor, and logical completion through both deadline
+and close publication. The focused normal, race, and `checkptr=2` repetitions
+pass on Darwin/arm64 and Linux/arm64. All `TestStacklessCoro*` tests also pass
+race and `checkptr=2` on both platforms.
+
+The complete coroutine runtime passes in 293.346 seconds on Darwin/arm64 and
+574.209 seconds on Linux/arm64. The compiler coroutine package passes in
+305.516 seconds on the loaded Darwin host. The focused coverage profile marks
+28 of 31 changed executable production lines (90.32%); the three uncovered
+lines are the invalid nil-descriptor throw and the already-signaled bridge
+fast return. On both arm64 platforms, the normalized `nocoro` instruction
+stream for `netpollready` plus `netpollunblock` is identical to the exact
+parent, with SHA-256
+`c8d14d2e2feefbbfeb473ce154f2c851b37d176bfa0f9b0081a0e1556190019e`.
+
+Restoring the inline readiness loop after measuring a first shared-call draft
+keeps the ordinary feature-on path stable. A Darwin/arm64 ten-sample check
+changed the median from 12.00 ns to 11.65 ns, with 0 B and 0 allocations. The
+Linux VM remained too noisy for absolute timing: in 20 fixed-CPU alternating
+pairs the candidate won 9 pairs (`p=0.824`), and every sample remained at 0 B
+and 0 allocations. The result is treated as neutral rather than as evidence
+for either a regression or an improvement.
+
+This checkpoint deliberately stops before exposing a library companion. The
+next layer must keep poll status separate from syscall errno, apply
+`internal/poll.convertErr` and EOF projection in the owning package, and hold
+the existing FD read lock across suspension. The compiler must call that
+library-owned start/finish boundary rather than learn `poll.FD`, `pollDesc`,
+`netFD`, or `os.File` layout.
+
 The remaining performance sequence is:
 
 1. Connect ordinary `os.File.Read` lowering to the explicit runtime boundary
