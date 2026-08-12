@@ -3060,22 +3060,71 @@ geomean changed by -1.05%. Every allocation result matched exactly. This
 separates the file result from a general scheduler, timer, channel, or worker
 shift.
 
+The following checkpoint implements the runtime half of nonblocking socket
+reads. The explicit `runtime/coro.SocketRead` companion now attempts the raw
+read on its caller and, after `EAGAIN`, installs a tagged logical token in the
+read semaphore of a private `pollDesc`. The tag is distinct from `pdReady`,
+`pdWait`, nil, and aligned G pointers. The operation registry remains the GC
+root while the semaphore and completion queue carry only `uintptr` values.
+The poll descriptor and queue link reuse the operation's two pointer-free
+packet words, so the operation header does not grow.
+
+`netpollready` only consumes the token and appends it to a lock-free list. It
+does not project results or enter the coroutine scheduler because it can run
+with the world stopped and may not use write barriers. A single persistent
+bridge G is made runnable through the poller's ordinary return list. That G
+drains the tokens, retries the nonblocking reads, closes each private poll
+descriptor, and publishes completion through the common operation protocol.
+The logical waiter count is incremented before token publication and removed
+through `netpollready`'s existing delta, preserving the scheduler's decision
+to block in the platform poller.
+
+The focused tests force 32 independent reads to be armed simultaneously at
+`GOMAXPROCS=1`, beyond the former four-worker capacity. They verify the exact
+operation and netpoll-waiter counts before and after a stop-the-world GC, then
+wake every descriptor and validate its result. Separate cases cover EOF,
+invalid and write-only descriptors, empty buffers and nil result pointers,
+expired poll state, readiness races, the ordinary-G fallback, race builds,
+and `checkptr=2`. The focused profile covers 110 of 120 changed production
+statements (91.67%); the remaining statements are fatal invariants and
+contended-CAS paths.
+
+The exact parent is the content merged at `18669e78d9`; the runtime candidate
+is `09cfdcf01f`. On native Darwin/arm64, three warm-up pairs and 20 alternating
+500 ms samples at one P changed the ready socket path from 17.940 us to
+3.446 us. The median paired change is -80.55%, and all 20 pairs favor the
+candidate (two-sided sign test `p<0.001`). A separate benchmark forces every
+read through `EAGAIN`, token publication, platform readiness, the bridge G,
+and retry. Twenty alternating one-second samples changed 15.794 us to
+17.070 us; the paired timing geomean changed by -0.18% and the result is
+statistically neutral (`p=0.824`). Both paths remain at 0 B and 0 allocations
+per read.
+
+This checkpoint deliberately owns a private poll descriptor and therefore
+applies only to the explicit raw-descriptor companion. An ordinary
+`net.TCPConn` already owns a descriptor through `internal/poll`; opening a
+second one would conflict with the platform poller and would not preserve
+close or deadline semantics. The next library/compiler boundary must pass the
+existing poll context under `internal/poll`'s reference and read locks, and
+must let close and deadline publication complete a logical token safely. The
+public `net` lowering remains on the shared worker until that boundary exists.
+
+With `GOEXPERIMENT=nocoro`, the two feature stubs inline completely. The
+Darwin/arm64 `runtime.netpollready` instruction stream is identical to the
+exact parent, so the default toolchain pays no branch or call cost for the
+token path.
+
 The remaining performance sequence is:
 
 1. Connect ordinary `os.File.Read` lowering to the explicit runtime boundary
    without teaching the compiler private `os` or `internal/poll` layouts.
    Preserve error projection and typed result ownership while removing the
    generated closure and worker dispatch.
-2. Replace the `net.TCPConn.Read` worker with logical netpoll integration. The
-   first design review must choose between a tagged G-or-logical waiter in
-   `pollDesc` and a separate logical-wait registry; that representation is not
-   implied by this performance ordering. `netpollready` may run while the
-   world is stopped and is `nowritebarrier`, so it cannot directly enqueue a
-   pointer-rich logical task or take the coroutine scheduler through its
-   ordinary completion path. Readiness must first publish a pointer-free
-   completion token and finish on a safe G. "Direct" here means removing the
-   per-read waiting worker, not running arbitrary completion code in the
-   poller.
+2. Connect `net.TCPConn.Read` to the tagged-token runtime boundary through a
+   library-owned companion. Reuse the existing `internal/poll` context and
+   descriptor lifetime instead of teaching the compiler its private layout or
+   registering the raw descriptor twice. Integrate close, deadlines, stale
+   readiness, and error conversion before removing the public worker path.
 3. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
