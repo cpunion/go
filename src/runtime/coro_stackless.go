@@ -165,6 +165,10 @@ type stacklessCoroScheduler struct {
 	foreignReturners atomic.Uint32
 }
 
+func (s *stacklessCoroScheduler) isPullComparison() bool {
+	return s.tail == &stacklessCoroPullComparisonMarker
+}
+
 // A stacklessCoroOperation is owned by its source until that source publishes
 // a terminal fact. Registered sources carry only id. Timers use a stable
 // owner and generation so a late callback cannot complete a reused operation.
@@ -217,6 +221,12 @@ var stacklessCoroOperations struct {
 	next uint64
 	head *stacklessCoroOperation
 }
+
+// stacklessCoroPullComparisonMarker is a test-driver sentinel. A real queue
+// tail can never refer to it. The comparison reuses head for its current
+// structured leaf, which keeps the production scheduler in its original size
+// class.
+var stacklessCoroPullComparisonMarker stacklessCoroTask
 
 // The bounded wake pool retains channels only after every executor for their
 // previous scheduler has stopped. Race builds keep a distinct synchronization
@@ -1819,13 +1829,22 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
-	if s.tail == nil {
+	var runnable uint32
+	if s.isPullComparison() {
+		// A pull comparison root has one active structured leaf. An event
+		// publishes readiness for that leaf and rings the root doorbell; it
+		// does not enqueue the exact continuation. Child completion replaces
+		// the leaf with its parent before the next polling episode.
 		s.head = task
 	} else {
-		s.tail.next = task
+		if s.tail == nil {
+			s.head = task
+		} else {
+			s.tail.next = task
+		}
+		s.tail = task
+		runnable = s.runnableState.Add(1)
 	}
-	s.tail = task
-	runnable := s.runnableState.Add(1)
 	if raceenabled {
 		// Runtime mutex operations are invisible to the race detector.
 		// Merge both the previous resume episode and the producer that made
@@ -1837,16 +1856,19 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
+	pull := s.isPullComparison()
 	task := s.head
-	if task == nil {
+	if task == nil || pull && task.state != stacklessCoroTaskRunnable {
 		unlock(&s.lock)
 		return nil
 	}
-	s.head = task.next
-	if s.head == nil {
-		s.tail = nil
+	if !pull {
+		s.head = task.next
+		if s.head == nil {
+			s.tail = nil
+		}
+		s.runnableState.Add(-1)
 	}
-	s.runnableState.Add(-1)
 	task.next = nil
 	if task.state != stacklessCoroTaskRunnable || task.resuming ||
 		task.readyPending {

@@ -45,6 +45,28 @@ func RunStacklessCoroFrameForTest(frame unsafe.Pointer,
 	coroRunFrame(frame, resume)
 }
 
+// RunStacklessCoroPullFrameForTest runs the same resume ABI, task
+// representation, typed frames, and operation sources as the push driver, but
+// completion only rings the root doorbell. The root then polls its current
+// structured leaf. It supports one structured await lineage, not independent
+// spawn or blocking foreign calls. It is a measurement aid, not a supported
+// execution mode.
+func RunStacklessCoroPullFrameForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	s := newStacklessCoroScheduler(frame, resume)
+	s.tail = &stacklessCoroPullComparisonMarker
+	s.runnableState.Store(0)
+
+	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
+		s = nativeScheduler
+	} else {
+		s.run(false)
+	}
+	s.stopReplacementExecutors()
+	s.releaseWake()
+	s.finish()
+}
+
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
