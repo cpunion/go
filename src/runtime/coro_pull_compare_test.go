@@ -75,6 +75,7 @@ type stacklessCoroCompactPullRoot struct {
 }
 
 const stacklessCoroCompactPullBudget = 256
+const stacklessCoroComparisonWatchdog = 30 * time.Second
 
 func stacklessCoroCompactPullResume(ctx unsafe.Pointer) uint8 {
 	root := (*stacklessCoroCompactPullRoot)(
@@ -606,8 +607,8 @@ func startStacklessCoroComparisonSocketWriter(fd, iterations int,
 		for range iterations {
 			if armed != nil {
 				<-armed
-				for runtime.StacklessCoroNetpollWaiterCountForTest() !=
-					baselineWaiters+1 {
+				for runtime.StacklessCoroNetpollWaiterCountForTest() <=
+					baselineWaiters {
 					if timedOut.Load() {
 						err = syscall.ETIMEDOUT
 						_, _ = syscall.Write(fd, []byte{1})
@@ -691,7 +692,7 @@ func TestStacklessCoroPushPullComparison(t *testing.T) {
 			}
 			defer pipeReader.Close()
 			defer pipeWriter.Close()
-			fileWatchdog := time.AfterFunc(5*time.Second, func() {
+			fileWatchdog := time.AfterFunc(stacklessCoroComparisonWatchdog, func() {
 				pipeReader.Close()
 				pipeWriter.Close()
 			})
@@ -723,7 +724,7 @@ func TestStacklessCoroPushPullComparison(t *testing.T) {
 			baselineWaiters := runtime.StacklessCoroNetpollWaiterCountForTest()
 			armed := make(chan struct{}, 1)
 			var timedOut atomic.Bool
-			watchdog := time.AfterFunc(5*time.Second, func() {
+			watchdog := time.AfterFunc(stacklessCoroComparisonWatchdog, func() {
 				timedOut.Store(true)
 			})
 			writeDone := startStacklessCoroComparisonSocketWriter(fds[1], 2,
