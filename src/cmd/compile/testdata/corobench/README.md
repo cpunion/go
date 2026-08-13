@@ -802,16 +802,51 @@ the exact parent. The remaining gap to official Go is the coroutine scheduler
 handoff and logical-operation cost around a genuinely blocking call, not this
 library boundary.
 
+#### Channel waiter cache reuse
+
+This checkpoint retains one cleared channel or select waiter on each cached
+stackless operation. Its exact parent is the merged public-read revision
+`0532f91256`. Completion clears all operation and queue references before
+reuse. Select completion performs that cleanup while its ordered channel locks
+are held, drops those locks, and then retains one waiter; additional select
+waiters become garbage with the selection descriptor. The ordinary per-P
+`sudog` cache remains reserved for goroutine-owned waiters. The retained
+pointer remains a GC root while active; additional select waiters are rooted
+in the selection descriptor before allocation can reach a safe point.
+
+Fixed-count, one-P runs of 10,000 operations give the following deterministic
+allocation result. The Linux file-byte difference is benchmark rounding: the
+object-count reduction agrees on both targets.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| channel round trip | 224 B, 2 allocs -> 0 B, 0 allocs | 224 B, 2 allocs -> 0 B, 0 allocs |
+| ready select | 132 B, 3 allocs -> 132 B, 3 allocs | 132 B, 3 allocs -> 132 B, 3 allocs |
+| blocking file and release | 584 B, 16 allocs -> 360 B, 14 allocs | 585 B, 16 allocs -> 361 B, 14 allocs |
+| blocking TCP and release | 584 B, 16 allocs -> 360 B, 14 allocs | 584 B, 16 allocs -> 360 B, 14 allocs |
+
+Twenty alternating 300 ms Darwin/arm64 samples were also collected on the
+loaded Apple M4 Max host. Channel round-trip medians were 1,606.5 ns for the
+parent and 1,346 ns for the candidate; the candidate won 15 of 20 pairs, with
+a paired median change of -16.96% and an exploratory sign-test `p=0.041`.
+Ready select and both blocking probes split their pairs 10 to 10. Their timing
+is therefore treated as neutral. The stable allocation counts, rather than
+these host-sensitive timings, are the checkpoint's performance result.
+
+A 10,000-operation allocation profile attributes all remaining blocking-file
+objects to the generated child factories: eight objects per read task and six
+per release task. No channel waiter remains in the allocation root. That makes
+compiler frame and captured-cell fusion the next independent allocation
+target.
+
 The next order of performance work is:
 
-1. reduce blocking-call scheduler handoff and logical-operation allocation
-   while preserving the lower-cost M replacement boundary and sibling
-   progress;
-2. reduce the fixed root-entry transition and typed frame allocation costs,
-   with the depth-boundary probes guarding the existing bounded-retention and
-   exact-GC-map rules; and
-3. remove ready-`select` temporary storage before changing channel waiter
-   lifetime.
+1. fuse generated factory frames and captured cells, with the depth-boundary
+   probes guarding bounded retention and exact GC maps;
+2. reduce the remaining blocking-call scheduler handoff and root-entry
+   transitions while preserving the lower-cost M replacement boundary and
+   sibling progress; and
+3. remove ready-`select` temporary storage.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
 and live task footprint are regression gates for each of those changes.

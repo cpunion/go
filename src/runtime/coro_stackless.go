@@ -165,26 +165,38 @@ type stacklessCoroScheduler struct {
 	foreignReturners atomic.Uint32
 }
 
-// A stacklessCoroOperation is owned by its source until that source publishes
-// a terminal fact. Registered sources carry only id. Timers use a stable
-// owner and generation so a late callback cannot complete a reused operation.
+// A stacklessCoroOperation retains reusable resources after clearing the state
+// owned by a completed source. Keeping those resources outside state avoids a
+// transient unrooted pointer while a native executor clears the operation.
 type stacklessCoroOperation struct {
+	stacklessCoroOperationState
+	timer  *stacklessCoroTimer
+	waiter *sudog
+}
+
+// A stacklessCoroOperationState is owned by its source until that source
+// publishes a terminal fact. Registered sources carry only id. Timers use a
+// stable owner and generation so a late callback cannot complete a reused
+// operation.
+type stacklessCoroOperationState struct {
 	id        uint64
 	scheduler *stacklessCoroScheduler
 	task      *stacklessCoroTask
-	timer     *stacklessCoroTimer
 	channel   *hchan
 	element   unsafe.Pointer
 	received  *bool
 	send      bool
 	timerWait bool
-	selection *stacklessCoroSelect
-	fd        int32
-	buffer    []byte
-	call      func()
-	n         *int
-	errno     *uintptr
-	valueOut  *uint64
+	// waiterActive keeps the retained waiter rooted by waiter while it is
+	// also linked from a channel queue.
+	waiterActive bool
+	selection    *stacklessCoroSelect
+	fd           int32
+	buffer       []byte
+	call         func()
+	n            *int
+	errno        *uintptr
+	valueOut     *uint64
 	// packet holds an asynchronous C reply or, for a socket read, the
 	// pointer-free poll descriptor and completion link. The operation
 	// registry remains the GC root for a linked socket operation.
@@ -1449,7 +1461,7 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 	if waiter != nil {
 		waiter.coro.clear()
 		waiter.c.set(nil)
-		releaseStacklessCoroSudog(waiter)
+		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
 	}
 	if op.timerWait {
 		unblockTimerChan(op.channel)
@@ -1737,14 +1749,12 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
 	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
 		(op.timer != nil && op.timer.active.Load() != 0) ||
-		op.timerWait || op.next != nil || op.workNext != nil {
+		op.timerWait || op.waiterActive || op.next != nil || op.workNext != nil {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	s := op.scheduler
 	task := op.task
-	t := op.timer
-	*op = stacklessCoroOperation{}
-	op.timer = t
+	op.stacklessCoroOperationState = stacklessCoroOperationState{}
 	return s, task
 }
 

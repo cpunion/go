@@ -482,6 +482,37 @@ func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
 	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
 }
 
+type StacklessCoroChannelWaiterCacheForTest struct {
+	operation stacklessCoroOperation
+}
+
+func NewStacklessCoroChannelWaiterCacheForTest() *StacklessCoroChannelWaiterCacheForTest {
+	return new(StacklessCoroChannelWaiterCacheForTest)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) Cycle() {
+	var slot *sudog
+	sg := newStacklessCoroSudog(&cache.operation, &slot)
+	if sg != slot {
+		throw("runtime: lost stackless coroutine test waiter root")
+	}
+	releaseStacklessCoroSudog(unsafe.Pointer(&cache.operation), sg)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) CycleAcrossGC() {
+	newStacklessCoroSudog(&cache.operation, nil)
+	GC()
+	sg := cache.operation.waiter
+	if sg == nil {
+		throw("runtime: lost active stackless coroutine test waiter")
+	}
+	releaseStacklessCoroSudog(unsafe.Pointer(&cache.operation), sg)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) Valid() bool {
+	return validReleasedStacklessCoroSudog(cache.operation.waiter)
+}
+
 type StacklessCoroSelectCasesForTest struct {
 	cases  []scase
 	nsends int

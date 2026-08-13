@@ -31,7 +31,7 @@ func stacklessCoroSelectTry(unsafe.Pointer) bool {
 	return false
 }
 
-func releaseStacklessCoroSudog(*sudog) {
+func releaseStacklessCoroSudog(unsafe.Pointer, *sudog) {
 	throw("runtime: stackless coroutine channel waiter without experiment")
 }
 

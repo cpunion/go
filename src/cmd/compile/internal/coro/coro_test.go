@@ -3597,7 +3597,7 @@ type namedBool bool
 
 const manyRounds = 256
 
-var evaluated int
+var evaluated atomic.Int32
 var sendChannel chan int
 var manyChannel chan int
 var manyReady atomic.Uint32
@@ -3606,7 +3606,7 @@ var gcDone atomic.Uint32
 
 //go:noinline
 func nextValue() int {
-	evaluated++
+	evaluated.Add(1)
 	return 7
 }
 
@@ -3715,12 +3715,14 @@ func main() {
 	ch := make(chan int)
 	sendChannel = ch
 	go send()
-	runtime.Gosched()
-	if evaluated != 1 {
+	for attempts := 0; evaluated.Load() == 0 && attempts < 1<<20; attempts++ {
+		runtime.Gosched()
+	}
+	if evaluated.Load() != 1 {
 		panic("send value was not evaluated before blocking")
 	}
 	value, ok := receive(ch)
-	if value != 7 || !ok || evaluated != 1 {
+	if value != 7 || !ok || evaluated.Load() != 1 {
 		panic("bad unbuffered channel result")
 	}
 
