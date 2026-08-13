@@ -1227,11 +1227,15 @@ never invokes the continuation.
 This removes the per-operation goroutine and its stack without introducing a
 parallel channel implementation. A parked goroutine releases its own `sudog`
 after wakeup, but a logical waiter has no resumed `g` to perform that cleanup.
-It therefore uses a dedicated heap `sudog` that becomes garbage after the
-waker removes and clears it, instead of returning the waiter to an ordinary
-per-P cache from the waker's execution context. The non-experiment `sudog`
-extension has zero size and leaves the 64-bit structure at 104 bytes; the
-experiment-only owner pointer makes it 112 bytes.
+The completion producer instead clears the logical waiter's operation,
+channel, element, and queue links after dropping the channel lock, then returns
+it to the ordinary per-P `sudog` cache. Select completion clears every winner
+and loser while the ordered channel locks are held, releases those locks, and
+only then returns the waiters to the same cache. Reuse therefore keeps the
+existing bounded per-P and central-cache lifetime without acquiring scheduler
+cache locks beneath a channel lock. The non-experiment `sudog` extension has
+zero size and leaves the 64-bit structure at 104 bytes; the experiment-only
+owner pointer makes it 112 bytes.
 
 A blocked logical select owns one operation record, one atomic arbitration
 bit, and one `sudog` per non-nil case. The waiters enter the existing channel
@@ -2107,9 +2111,9 @@ preceding channel commit with the shared wait-queue implementation:
 
 The direct path is approximately 51.6 times faster on Darwin and 66.7 times
 faster on translated Linux in this microbenchmark, and removes one allocation.
-Its dedicated 112-byte logical `sudog` increases bytes per handoff by about 80
-relative to the worker baseline; a coroutine-specific waiter pool is a
-separate optimization after the ownership model is stable.
+That checkpoint still allocated its 112-byte logical `sudog`; the later
+ordinary-cache reuse checkpoint removes the two waiters from a complete
+send/receive round trip.
 
 A compiler-generated yield loop was also compared with the integration branch
 using 20 interleaved 500 ms samples on Darwin/arm64. The baseline and
@@ -3255,16 +3259,29 @@ and logical-operation problem rather than a library-boundary regression; the
 complete data and host-load qualification are recorded in the architecture
 probe README.
 
+The following runtime-only checkpoint returns cleared stackless channel and
+select waiters to the ordinary bounded `sudog` cache. A channel round trip falls
+from 224 B and two allocations to zero on both Darwin/arm64 and translated
+Linux/amd64. Blocking file and TCP probes fall from 584 B and 16 allocations to
+360 B and 14 allocations on Darwin; translated Linux reports the same object
+counts and either 360 or 361 B after benchmark rounding. Ready select remains
+132 B and three allocations because its descriptor storage is independent of
+waiter lifetime. A fixed-count allocation profile assigns all 14 remaining
+blocking objects to generated child factory frames and captured cells, making
+their fusion the next independent allocation target. Alternating Darwin timing
+was directional for channel round trips and neutral for ready select and both
+blocking probes; the exact measurements and load qualification are in the
+architecture probe README.
+
 The remaining performance sequence is:
 
-1. Reduce blocking-call scheduler handoff and logical-operation allocation
-   while retaining the lower-cost M replacement boundary and sibling
-   progress.
-2. Reduce public-root entry transitions and typed frame allocation while
-   retaining exact compiler-generated GC maps, bounded cache retention, and
-   the measured recursion-boundary behavior.
-3. Remove ready-select temporary storage before changing channel-waiter
-   lifetime or ownership.
+1. Fuse generated factory frames and captured cells while retaining exact
+   compiler-generated GC maps, bounded cache retention, and the measured
+   recursion-boundary behavior.
+2. Reduce the remaining blocking-call scheduler handoff and public-root entry
+   transitions while retaining the lower-cost M replacement boundary and
+   sibling progress.
+3. Remove ready-select temporary storage.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
 fixed-work scaling, and the live-task footprint as explicit regression gates.
