@@ -761,10 +761,10 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
-		idlePollSkip = nil
 
 		switch action {
 		case stacklessCoroActionYield:
+			idlePollSkip = nil
 			foreignReturner := s.yield(task)
 			if !native || foreignReturner {
 				// Cooperate with the host scheduler when this target has no
@@ -776,10 +776,13 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 			s.waiting(task)
 			idlePollSkip = task
 		case stacklessCoroActionComplete:
+			idlePollSkip = nil
 			s.complete(task)
 		case stacklessCoroActionPanic:
+			idlePollSkip = nil
 			s.terminate(task)
 		case stacklessCoroActionGoexit:
+			idlePollSkip = nil
 			s.goexit(task)
 		default:
 			throw("runtime: invalid stackless coroutine action")
