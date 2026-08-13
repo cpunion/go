@@ -2464,9 +2464,10 @@ boundaries.
 
 The initial ABI 2 subset contained only yield and structured-await state
 machines. The first measured extension also admits channel transition sites
-when the function has no range-variable capture. Run-to-completion functions,
-source closures, channel ranges, defer or terminal behavior, and timer, file,
-poll, spawn, or foreign transition sites retain factory ABI 1. An ABI 1 caller
+when the function has no range-variable capture. At that checkpoint,
+run-to-completion functions, source closures, channel ranges, defer or
+terminal behavior, and timer, file, poll, spawn, or foreign transition sites
+retained factory ABI 1. An ABI 1 caller
 can still await or spawn an ABI 2 child. These restrictions keep closure and
 cleanup ownership unchanged while the typed-frame layout is validated; they
 are fallback rules, not source annotations.
@@ -2491,6 +2492,31 @@ timing changes was statistically significant. Linux timing was collected in
 an amd64 virtual machine on an arm64 host and is therefore directional, while
 the allocation result is architecture independent and agrees with the
 Darwin disassembly.
+
+Revision `f50e5d25e6` extends the same explicit-frame proof to timer, file,
+and poll transitions. These transitions already store their suspended values
+in the generated resume frame, so the extension needs no new runtime entry,
+factory ABI, source annotation, or object layout. Spawn and foreign
+transitions, source closures, channel ranges, defer, and terminal behavior
+retain their conservative fallbacks.
+
+The exact parent is the final channel-waiter revision `d259cdcf7f`, merged by
+pull request 73. Fixed-count, one-P runs of 10,000 lowered operations produced
+the same object counts on native Darwin/arm64 and translated Linux/amd64:
+
+| Probe | Parent | Explicit I/O frame |
+| --- | ---: | ---: |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file read | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and sibling release | 360 B, 14 allocs | 104 B, 2 allocs |
+| blocking TCP and sibling release | 360 B, 14 allocs | 104 B, 2 allocs |
+
+An allocation-rate-one profile attributes the twelve removed objects to the
+generated read and release factories. The two remaining per-operation objects
+come from `waitForEpoch` and the release task. The compiler lowering suite,
+the real timer/file/network probe, its coverage and disassembly audit, and a
+clean experiment toolchain build pass on both MVP targets.
 
 The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
 inlining, enabled real lowering with `-d=coro=4`, and reports the median of
