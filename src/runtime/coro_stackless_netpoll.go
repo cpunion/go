@@ -116,6 +116,31 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 	}
 }
 
+// stacklessCoroPollReadAtIdle claims one read that still belongs to s and was
+// not armed by skip's immediately preceding resume. This lets readiness
+// produced by another task in the same scheduler complete without a locked-M
+// round trip. An unavailable read is rearmed before this function returns.
+func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
+	skip *stacklessCoroTask) bool {
+	lock(&stacklessCoroOperations.lock)
+	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+		if op.scheduler != s || op.task == skip || op.async ||
+			op.packet[stacklessCoroPollDescWord] == 0 {
+			continue
+		}
+		pd := (*pollDesc)(unsafe.Pointer(
+			uintptr(op.packet[stacklessCoroPollDescWord])))
+		if !netpollCoroReadClaim(pd, op) {
+			continue
+		}
+		unlock(&stacklessCoroOperations.lock)
+		stacklessCoroSocketReadAttempt(op)
+		return true
+	}
+	unlock(&stacklessCoroOperations.lock)
+	return false
+}
+
 func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
 	status := uintptr(pollErr)
 	if !op.ownsPollDesc {

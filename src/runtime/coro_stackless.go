@@ -42,6 +42,10 @@ const stacklessCoroFrameChunkDirectCount = 6
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
+// A short bounded retry window covers local pipe and loopback delivery without
+// turning a genuinely external read into polling.
+const stacklessCoroIdlePollAttempts = 4
+
 // stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
 // created after the task cache saturated. It cannot be a cached frame size.
 const stacklessCoroUncachedFrameLineage = ^uint16(0)
@@ -695,6 +699,7 @@ func (scope *stacklessCoroRunScope) leave() {
 // episode after this native activation has unwound.
 func (s *stacklessCoroScheduler) runTasks(native bool) {
 	var task *stacklessCoroTask
+	var idlePollSkip *stacklessCoroTask
 	defer func() {
 		if task == nil || task.context.scheduler != s {
 			return
@@ -713,6 +718,21 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 	for !s.rootComplete() {
 		task = s.take()
+		if task == nil && native && s.executorCount.Load() == 1 {
+			for attempt := 0; attempt < stacklessCoroIdlePollAttempts &&
+				stacklessCoroPollReadAtIdle(s, idlePollSkip); attempt++ {
+				// A successful retry may have made its waiter runnable. Take it
+				// before another bounded retry; if the read remains unavailable,
+				// the scheduler parks after the final attempt.
+				task = s.take()
+				if task != nil {
+					break
+				}
+				if attempt+1 < stacklessCoroIdlePollAttempts {
+					procyield(30)
+				}
+			}
+		}
 		if task == nil {
 			if s.executorStop == nil {
 				<-s.wake
@@ -728,6 +748,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
+		idlePollSkip = nil
 
 		switch action {
 		case stacklessCoroActionYield:
@@ -740,6 +761,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 			}
 		case stacklessCoroActionWait:
 			s.waiting(task)
+			idlePollSkip = task
 		case stacklessCoroActionComplete:
 			s.complete(task)
 		case stacklessCoroActionPanic:

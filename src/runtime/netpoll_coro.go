@@ -47,6 +47,18 @@ func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
 	}
 }
 
+// netpollCoroReadClaim removes an armed coroutine read before netpoll has
+// consumed it. The caller may retry the nonblocking read after a successful
+// claim.
+func netpollCoroReadClaim(pd *pollDesc, op *stacklessCoroOperation) bool {
+	token := uintptr(unsafe.Pointer(op)) | netpollCoroTag
+	if !pd.rg.CompareAndSwap(token, pdNil) {
+		return false
+	}
+	netpollAdjustWaiters(-1)
+	return true
+}
+
 //go:nowritebarrier
 func netpollCoroDispatch(token uintptr) *g {
 	return stacklessCoroNetpollReady(
