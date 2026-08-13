@@ -117,15 +117,17 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 }
 
 // stacklessCoroPollReadAtIdle claims one read that still belongs to s and does
-// not belong to skip. The caller changes skip between bounded attempts so
-// multiple waiters get a chance. This lets readiness produced by another task
-// in the same scheduler complete without a locked-M round trip. An unavailable
-// read is rearmed before this function returns.
+// not belong to either excluded task. The caller permanently excludes the task
+// that just armed and rotates the second exclusion between bounded attempts so
+// multiple older waiters get a chance. This lets readiness produced by another
+// task in the same scheduler complete without a locked-M round trip. An
+// unavailable read is rearmed before this function returns.
 func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
-	skip *stacklessCoroTask) *stacklessCoroTask {
+	exclude, previous *stacklessCoroTask) *stacklessCoroTask {
 	lock(&stacklessCoroOperations.lock)
 	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		if op.scheduler != s || op.task == skip || op.async ||
+		if op.scheduler != s || op.task == exclude ||
+			op.task == previous || op.async ||
 			op.packet[stacklessCoroPollDescWord] == 0 {
 			continue
 		}

@@ -709,8 +709,8 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 		throw("runtime: failed to arm coroutine idle-retry descriptor")
 	}
 
-	skipped = stacklessCoroPollReadAtIdle(s, task) == nil
-	claimed = stacklessCoroPollReadAtIdle(s, nil) == task
+	skipped = stacklessCoroPollReadAtIdle(s, task, nil) == nil
+	claimed = stacklessCoroPollReadAtIdle(s, nil, nil) == task
 	token := pd.rg.Load()
 	rearmed = token&netpollCoroTagMask == netpollCoroTag &&
 		token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op))

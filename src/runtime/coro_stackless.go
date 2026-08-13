@@ -719,9 +719,15 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 	for !s.rootComplete() {
 		task = s.take()
 		if task == nil && native && s.executorCount.Load() == 1 {
-			skip := idlePollSkip
+			var previous *stacklessCoroTask
 			for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
-				claimed := stacklessCoroPollReadAtIdle(s, skip)
+				claimed := stacklessCoroPollReadAtIdle(s, idlePollSkip, previous)
+				if claimed == nil && previous != nil {
+					// Every other waiter had a chance. Start another bounded pass
+					// while continuing to exclude the task that just armed.
+					previous = nil
+					claimed = stacklessCoroPollReadAtIdle(s, idlePollSkip, nil)
+				}
 				if claimed == nil {
 					break
 				}
@@ -732,7 +738,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 				if task != nil {
 					break
 				}
-				skip = claimed
+				previous = claimed
 				if attempt+1 < stacklessCoroIdlePollAttempts {
 					procyield(30)
 				}
