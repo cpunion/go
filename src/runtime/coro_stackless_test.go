@@ -2341,12 +2341,15 @@ func TestStacklessCoroSelect(t *testing.T) {
 func TestStacklessCoroSelectBlocked(t *testing.T) {
 	first := make(chan int)
 	second := make(chan int)
+	var disabled chan int
 	value := -1
 	chosen := -1
 	received := false
 	cases := runtime.NewStacklessCoroSelectCasesForTest(
-		[]any{first, second},
-		[]unsafe.Pointer{unsafe.Pointer(&value), unsafe.Pointer(&value)}, 0)
+		[]any{first, disabled, second},
+		[]unsafe.Pointer{
+			unsafe.Pointer(&value), unsafe.Pointer(&value), unsafe.Pointer(&value),
+		}, 0)
 	baselineOperations := runtime.StacklessCoroOperationCountForTest()
 	peerDone := make(chan struct{})
 	go func() {
@@ -2382,8 +2385,8 @@ func TestStacklessCoroSelectBlocked(t *testing.T) {
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
-			if chosen != 1 || !received || value != 61 {
-				t.Fatalf("blocked select = (%d, %t, %d), want (1, true, 61)",
+			if chosen != 2 || !received || value != 61 {
+				t.Fatalf("blocked select = (%d, %t, %d), want (2, true, 61)",
 					chosen, received, value)
 			}
 			for _, channel := range []chan int{first, second} {

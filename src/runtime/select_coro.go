@@ -320,7 +320,9 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 		waiter.waitlink = nil
 	}
 	selunlock(selection.cases, selection.lockOrder)
-	for i, waiter := range selection.waiters {
+	for _, casei := range selection.lockOrder {
+		i := int(casei)
+		waiter := selection.waiters[i]
 		releaseStacklessCoroSudog(waiter)
 		selection.waiters[i] = nil
 	}
