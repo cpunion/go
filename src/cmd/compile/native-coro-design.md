@@ -1232,10 +1232,12 @@ channel, element, and queue links after dropping the channel lock, then returns
 it to the ordinary per-P `sudog` cache. Select completion clears every winner
 and loser while the ordered channel locks are held, releases those locks, and
 only then returns the waiters to the same cache. Reuse therefore keeps the
-existing bounded per-P and central-cache lifetime without acquiring scheduler
-cache locks beneath a channel lock. The non-experiment `sudog` extension has
-zero size and leaves the 64-bit structure at 104 bytes; the experiment-only
-owner pointer makes it 112 bytes.
+existing bounded per-P and central-cache lifetime. Acquisition follows the
+ordinary channel and select lock order, which may call `acquireSudog` while
+channel locks are held; completion does not reverse that relationship because
+it calls `releaseSudog` only after dropping those locks. The non-experiment
+`sudog` extension has zero size and leaves the 64-bit structure at 104 bytes;
+the experiment-only owner pointer makes it 112 bytes.
 
 A blocked logical select owns one operation record, one atomic arbitration
 bit, and one `sudog` per non-nil case. The waiters enter the existing channel
