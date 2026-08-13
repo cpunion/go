@@ -227,6 +227,8 @@ type stacklessCoroComparisonTimerFrame struct {
 	armed                chan<- struct{}
 	progress             *atomic.Bool
 	progressAtCompletion bool
+	token                runtime.StacklessCoroTimerTokenForTest
+	manualTimer          bool
 }
 
 type stacklessCoroComparisonFootprintFrame struct {
@@ -292,8 +294,13 @@ func stacklessCoroComparisonTimerResume(ctx unsafe.Pointer) uint8 {
 		return runtime.StacklessCoroActionComplete
 	}
 	frame.pending = true
-	if !runtime.SleepStacklessCoroForTest(ctx, frame.delay) {
-		return runtime.StacklessCoroActionInvalid
+	if frame.manualTimer {
+		frame.token = runtime.StartSleepStacklessCoroForTest(ctx,
+			int64(time.Hour))
+	} else {
+		if !runtime.SleepStacklessCoroForTest(ctx, frame.delay) {
+			return runtime.StacklessCoroActionInvalid
+		}
 	}
 	if frame.armed != nil {
 		frame.armed <- struct{}{}
@@ -651,21 +658,27 @@ func TestStacklessCoroPushPullComparison(t *testing.T) {
 			}
 			timerArmed := make(chan struct{}, 1)
 			progressDone := make(chan struct{})
+			cancelDone := make(chan bool, 1)
 			var progress atomic.Bool
+			timerFrame := &stacklessCoroComparisonTimerFrame{
+				remaining:   1,
+				armed:       timerArmed,
+				progress:    &progress,
+				manualTimer: true,
+			}
 			go func() {
 				<-timerArmed
 				progress.Store(true)
+				cancelDone <- runtime.CancelSleepStacklessCoroForTest(
+					timerFrame.token)
 				close(progressDone)
 			}()
-			timerFrame := &stacklessCoroComparisonTimerFrame{
-				remaining: 1,
-				delay:     int64(20 * time.Millisecond),
-				armed:     timerArmed,
-				progress:  &progress,
-			}
 			driver.run(unsafe.Pointer(timerFrame),
 				stacklessCoroComparisonTimerResume)
 			<-progressDone
+			if !<-cancelDone {
+				t.Fatal("progress goroutine did not cancel pending timer")
+			}
 			if !timerFrame.progressAtCompletion {
 				t.Fatal("runnable goroutine made no progress while timer waited")
 			}
