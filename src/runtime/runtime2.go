@@ -401,7 +401,7 @@ func (p *maybeTraceableChan) get() *hchan {
 //
 // sudogs are ordinarily allocated from a special pool. Use acquireSudog and
 // releaseSudog to allocate and free them. Stackless coroutine channel
-// operations use the same pool; see newStacklessCoroSudog.
+// operations retain their own bounded waiter; see newStacklessCoroSudog.
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on

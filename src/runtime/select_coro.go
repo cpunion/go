@@ -130,14 +130,13 @@ func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
 		casi = int(casei)
 		cas = &cases[casi]
 		c = cas.c
-		sg = newStacklessCoroSudog()
+		sg = newStacklessCoroSudog(op, &op.selection.waiters[casi])
 		sg.releasetime = 0
 		sg.elem.set(cas.elem)
 		sg.waitlink = nil
 		sg.coro.set(unsafe.Pointer(op))
 		sg.isSelect = true
 		sg.c.set(c)
-		op.selection.waiters[casi] = sg
 		if casi < nsends {
 			c.sendq.enqueue(sg)
 		} else {
@@ -323,7 +322,7 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 	for _, casei := range selection.lockOrder {
 		i := int(casei)
 		waiter := selection.waiters[i]
-		releaseStacklessCoroSudog(waiter)
+		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
 		selection.waiters[i] = nil
 	}
 

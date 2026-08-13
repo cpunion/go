@@ -1228,16 +1228,19 @@ This removes the per-operation goroutine and its stack without introducing a
 parallel channel implementation. A parked goroutine releases its own `sudog`
 after wakeup, but a logical waiter has no resumed `g` to perform that cleanup.
 The completion producer instead clears the logical waiter's operation,
-channel, element, and queue links after dropping the channel lock, then returns
-it to the ordinary per-P `sudog` cache. Select completion clears every winner
-and loser while the ordered channel locks are held, releases those locks, and
-only then returns the waiters to the same cache. Reuse therefore keeps the
-existing bounded per-P and central-cache lifetime. Acquisition follows the
-ordinary channel and select lock order, which may call `acquireSudog` while
-channel locks are held; completion does not reverse that relationship because
-it calls `releaseSudog` only after dropping those locks. The non-experiment
-`sudog` extension has zero size and leaves the 64-bit structure at 104 bytes;
-the experiment-only owner pointer makes it 112 bytes.
+channel, element, and queue links after dropping the channel lock, then retains
+one cleared waiter on the completed operation. Select completion clears every
+winner and loser while the ordered channel locks are held, releases those
+locks, and then retains one waiter; additional select waiters become garbage
+with the cleared selection descriptor. Keeping this cache on the logical
+operation separates waiters without a parked `g` from the ordinary per-P
+waiter lifecycle. The 64-entry operation-cache bound also limits retained
+logical waiters to 64 per scheduler. The retained pointer remains installed
+while its waiter is active, and additional select waiters are published in the
+selection descriptor before allocation may reach a GC safe point. Thus a
+native executor never carries a waiter as its only transient GC root. The
+non-experiment `sudog` extension has zero size and leaves the 64-bit structure
+at 104 bytes; the experiment-only owner pointer makes it 112 bytes.
 
 A blocked logical select owns one operation record, one atomic arbitration
 bit, and one `sudog` per non-nil case. The waiters enter the existing channel
@@ -3261,8 +3264,8 @@ and logical-operation problem rather than a library-boundary regression; the
 complete data and host-load qualification are recorded in the architecture
 probe README.
 
-The following runtime-only checkpoint returns cleared stackless channel and
-select waiters to the ordinary bounded `sudog` cache. A channel round trip falls
+The following runtime-only checkpoint retains one cleared stackless channel or
+select waiter with each cached logical operation. A channel round trip falls
 from 224 B and two allocations to zero on both Darwin/arm64 and translated
 Linux/amd64. Blocking file and TCP probes fall from 584 B and 16 allocations to
 360 B and 14 allocations on Darwin; translated Linux reports the same object

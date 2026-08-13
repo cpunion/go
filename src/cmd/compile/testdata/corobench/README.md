@@ -804,12 +804,15 @@ library boundary.
 
 #### Channel waiter cache reuse
 
-Runtime revision `1984783e81` reuses the ordinary bounded `sudog` cache for
-stackless channel and select waiters. Its exact parent is the merged public-read
-revision `0532f91256`. Completion clears all operation and queue references
-before reuse. Select completion performs that cleanup while its ordered channel
-locks are held, drops those locks, and only then returns the waiters to the
-cache.
+This checkpoint retains one cleared channel or select waiter on each cached
+stackless operation. Its exact parent is the merged public-read revision
+`0532f91256`. Completion clears all operation and queue references before
+reuse. Select completion performs that cleanup while its ordered channel locks
+are held, drops those locks, and then retains one waiter; additional select
+waiters become garbage with the selection descriptor. The ordinary per-P
+`sudog` cache remains reserved for goroutine-owned waiters. The retained
+pointer remains a GC root while active; additional select waiters are rooted
+in the selection descriptor before allocation can reach a safe point.
 
 Fixed-count, one-P runs of 10,000 operations give the following deterministic
 allocation result. The Linux file-byte difference is benchmark rounding: the
