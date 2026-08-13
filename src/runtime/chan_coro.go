@@ -17,29 +17,28 @@ import (
 // every ordinary channel operation when the experiment is disabled. Waiter
 // matching and completion still use the common send and recv paths.
 
-// newStacklessCoroSudog allocates a waiter owned by its channel operation.
-// Unlike a parked goroutine, a logical task has no owner that can return the
-// waiter to a per-P cache after wakeup. The object becomes garbage after the
-// waker removes it from the channel queue.
+// newStacklessCoroSudog acquires a waiter owned by its channel operation.
+// The operation completion path returns the waiter after dropping channel
+// locks, so stackless channel operations can share the ordinary sudog cache.
 //
 //go:nosplit
 func newStacklessCoroSudog() *sudog {
-	// Match acquireSudog's allocation rule. A caller may hold an hchan lock,
-	// so prevent new from starting a collection that needs a sudog itself.
-	mp := acquirem()
-	sg := new(sudog)
-	releasem(mp)
+	sg := acquireSudog()
+	// Ordinary channel operations leave their G on a cached sudog and
+	// overwrite it on reuse. A stackless waiter has no parked G.
+	sg.g = nil
 	return sg
 }
 
 // releaseStacklessCoroSudog checks that the waiter no longer retains channel
-// state. Its storage is reclaimed by the garbage collector.
+// state before returning it to the ordinary sudog cache.
 func releaseStacklessCoroSudog(sg *sudog) {
 	if sg.g != nil || sg.elem.get() != nil || sg.coro.get() != nil ||
 		sg.next != nil || sg.prev != nil || sg.waitlink != nil ||
 		sg.c.get() != nil || sg.isSelect {
 		throw("runtime: invalid released stackless coroutine channel waiter")
 	}
+	releaseSudog(sg)
 }
 
 // chansendStackless starts op without parking the executor goroutine.
@@ -88,7 +87,6 @@ func chansendStackless(op *stacklessCoroOperation) {
 	sg.releasetime = 0
 	sg.elem.set(op.element)
 	sg.waitlink = nil
-	sg.g = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)
@@ -154,7 +152,6 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 	sg.releasetime = 0
 	sg.elem.set(op.element)
 	sg.waitlink = nil
-	sg.g = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)

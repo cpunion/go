@@ -482,6 +482,11 @@ func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
 	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
 }
 
+func CycleStacklessCoroChannelWaiterForTest() {
+	sg := newStacklessCoroSudog()
+	releaseStacklessCoroSudog(sg)
+}
+
 type StacklessCoroSelectCasesForTest struct {
 	cases  []scase
 	nsends int

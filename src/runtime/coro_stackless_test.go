@@ -2246,6 +2246,14 @@ func TestStacklessCoroChannel(t *testing.T) {
 	})
 }
 
+func TestStacklessCoroChannelWaiterCache(t *testing.T) {
+	if got := testing.AllocsPerRun(100, func() {
+		runtime.CycleStacklessCoroChannelWaiterForTest()
+	}); got != 0 {
+		t.Fatalf("cached channel waiter allocations = %v, want 0", got)
+	}
+}
+
 func TestStacklessCoroSelect(t *testing.T) {
 	send := make(chan int, 1)
 	ready := make(chan int, 1)
