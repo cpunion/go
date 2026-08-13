@@ -2518,6 +2518,38 @@ come from `waitForEpoch` and the release task. The compiler lowering suite,
 the real timer/file/network probe, its coverage and disassembly audit, and a
 clean experiment toolchain build pass on both MVP targets.
 
+Revision `d103ba4e1d` fixes identity churn inside that bounded cache. On a
+miss, the generic task allocator previously repurposed a completed typed-frame
+task when no plain task was free. Alternating two resume identities therefore
+discarded and reallocated both frames even though the cache had room. The
+reservation path now reuses a plain task when one exists and otherwise creates
+another cache-owned task while the existing 256-task and 32 KiB limits have
+capacity.
+Selection after either limit is reached is unchanged. Race builds continue to
+use distinct task and frame identities.
+
+The exact parent is `cf30715f3e`. Fixed-count, one-P runs of 10,000 lowered
+operations produced identical allocation results on native Darwin/arm64 and
+translated Linux/amd64:
+
+| Probe | Parent | Preserved identities |
+| --- | ---: | ---: |
+| channel round trip | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready select | 132 B, 3 allocs | 132 B, 3 allocs |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file or TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and sibling release | 104 B, 2 allocs | 0 B, 0 allocs |
+| blocking TCP and sibling release | 104 B, 2 allocs | 0 B, 0 allocs |
+
+A rate-one profile no longer contains an operation-linear factory allocation.
+Ten alternating 300 ms Darwin pairs found both blocking timings neutral:
+file changed from 8.626 us to 8.739 us (`p=0.739`), TCP from 15.80 us to
+15.33 us (`p=0.280`), and their timing geomean changed by -0.87%. The focused
+runtime helper has 100% statement coverage. Normal, race, checkptr, low-GC,
+cache-boundary, and real file/network progress probes pass on both MVP
+targets. The scheduler, task, and native-context layouts and their documented
+retention limits are unchanged.
+
 The first Darwin/arm64 performance gate used `GOMAXPROCS=1`, disabled
 inlining, enabled real lowering with `-d=coro=4`, and reports the median of
 five 300 ms samples:
