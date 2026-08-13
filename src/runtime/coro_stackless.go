@@ -719,8 +719,12 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 	for !s.rootComplete() {
 		task = s.take()
 		if task == nil && native && s.executorCount.Load() == 1 {
-			for attempt := 0; attempt < stacklessCoroIdlePollAttempts &&
-				stacklessCoroPollReadAtIdle(s, idlePollSkip); attempt++ {
+			skip := idlePollSkip
+			for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
+				claimed := stacklessCoroPollReadAtIdle(s, skip)
+				if claimed == nil {
+					break
+				}
 				// A successful retry may have made its waiter runnable. Take it
 				// before another bounded retry; if the read remains unavailable,
 				// the scheduler parks after the final attempt.
@@ -728,6 +732,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 				if task != nil {
 					break
 				}
+				skip = claimed
 				if attempt+1 < stacklessCoroIdlePollAttempts {
 					procyield(30)
 				}

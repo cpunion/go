@@ -6,6 +6,6 @@
 
 package runtime
 
-func stacklessCoroPollReadAtIdle(*stacklessCoroScheduler, *stacklessCoroTask) bool {
-	return false
+func stacklessCoroPollReadAtIdle(*stacklessCoroScheduler, *stacklessCoroTask) *stacklessCoroTask {
+	return nil
 }
