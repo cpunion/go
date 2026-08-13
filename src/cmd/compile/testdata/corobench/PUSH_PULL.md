@@ -124,6 +124,81 @@ GOEXPERIMENT=coro go test runtime \
   -run '^TestStacklessCoroPushPull(Comparison|DirectCComparison)$'
 ```
 
+## Darwin arm64 results, 2026-08-13
+
+Revision `77bd3a94d22b4f8e7792b3e22846a7a58cc62e3e` was measured on an
+Apple M4 Max with ten alternating 500 ms timing samples and six
+independent-process footprint samples. The machine was not quiet: its load
+averages at the start were 45.51, 103.10, and 123.78. Allocation and live-set
+metrics were stable across every sample, but absolute timings and timing
+ratios require a repeat on an otherwise idle machine.
+
+The controlled comparison produced identical object costs. At structured
+depth 4096:
+
+| Metric | `Push` | same-representation `Pull` |
+| --- | ---: | ---: |
+| allocated bytes/op | 315,616 | 315,616 |
+| allocations/op | 7,938 | 7,938 |
+| parked heap bytes | 470,616 | 470,616 |
+| parked heap objects | 8,252 | 8,252 |
+| GC-scanned heap bytes | 394,968 | 394,968 |
+| parked native-stack bytes | 65,536 | 65,536 |
+
+`benchstat` found no significant `Push`/`Pull` timing difference at the 0.05
+level for entry, yield, any await depth, timer, ready or blocked file I/O,
+ready or blocked socket I/O, or direct C calls. Consequently this run gives
+no evidence that replacing exact-task delivery with root wake-and-poll has
+an independent performance benefit.
+
+`CompactPull` did reduce the cost of a deep structured chain:
+
+| Depth-4096 metric | `Push` | `CompactPull` | Change |
+| --- | ---: | ---: | ---: |
+| allocated bytes/op | 315,616 | 131,312 | -58.40% |
+| allocations/op | 7,938 | 4,098 | -48.37% |
+| parked heap bytes | 470,616 | 274,024 | -41.77% |
+| parked heap objects | 8,252 | 4,156 | -49.64% |
+| GC-scanned heap bytes | 394,968 | 198,384 | -49.77% |
+| parked native-stack bytes | 65,536 | 65,536 | 0% |
+
+At depths 1 through 256, however, compact frames used 16 more allocated bytes
+per operation and exactly the same allocation count as `Push`. The change at
+depth 4096 aligns with the push scheduler's 256-task cache limit: compact
+frames avoid the additional task object for structured children beyond that
+cache. This is evidence for task/frame fusion or lifetime coalescing, not for
+a public pull execution model.
+
+For context, the depth-4096 stackful baseline parked 10,232 heap bytes in 52
+objects plus 262,144 stack bytes. It scanned 432 heap bytes and 196,944 stack
+bytes. `CompactPull` therefore brought total GC-scanned memory close to the
+stackful baseline while retaining a smaller native stack, but still used more
+combined heap and stack memory: 339,560 bytes versus 272,376 bytes. The
+unfused `Push` total was 536,152 bytes.
+
+The nonblocking foreign-call reference also preserved the existing
+direct-call result. Its median was 20.20 ns/call versus 205.25 ns/call for
+ordinary cgo (-90.16%, `p=0.000`, ten samples). Both distributions were very
+wide under the recorded load, so this establishes the direction rather than
+a release-quality absolute number. Wrapping the direct call in either
+stackless scheduler did not allocate; `Push` versus `Pull` was not
+statistically distinguishable.
+
+All focused comparison and stackless coroutine tests passed on darwin/arm64
+and linux/amd64, including focused race runs. The new runtime lines reached
+100% patch coverage under the stackless coroutine test set. A full
+darwin/arm64 `go test runtime` run reached its ten-minute package timeout
+while unrelated standard stress tests were still running under the high host
+load; it showed no comparison assertion failure. Linux timing was not used
+because that validation ran through an amd64 container on an arm64 host.
+
+These results favor a hybrid direction: retain push scheduling between
+independently runnable roots and for event delivery, while investigating
+compiler fusion of provably structured await chains inside a root. The
+optimization does not require source annotations or a separately exposed
+Rust-style pull API, and it does not change the M-handoff requirement for a
+blocking C call.
+
 ## Interpretation gates
 
 A pull implementation is worth pursuing only if the measurements separate
