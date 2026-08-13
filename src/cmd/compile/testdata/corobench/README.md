@@ -839,9 +839,35 @@ per release task. No channel waiter remains in the allocation root. That makes
 compiler frame and captured-cell fusion the next independent allocation
 target.
 
+#### Explicit frames for timer and I/O transitions
+
+Revision `f50e5d25e6` admits timer, file, and poll transition sites to the
+existing explicit typed-frame factory. The change uses the existing factory
+ABI and runtime frame cache; functions with spawn or foreign transitions,
+source closures, channel ranges, defer, or terminal behavior still use the
+conservative closure-backed path.
+
+The exact parent is `d259cdcf7f`, the final revision merged by pull request 73.
+Fixed-count, one-P runs of 10,000 lowered operations produced identical object
+counts on native Darwin/arm64 and translated Linux/amd64:
+
+| Probe | Parent | Explicit I/O frame |
+| --- | ---: | ---: |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file read | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and release | 360 B, 14 allocs | 104 B, 2 allocs |
+| blocking TCP and release | 360 B, 14 allocs | 104 B, 2 allocs |
+
+An allocation-rate-one profile assigns one remaining object to
+`waitForEpoch.coro` and one to `blockingFileRelease.coro` per round. The read
+task itself is now allocation-free. Timing from the loaded Darwin host and
+translated Linux is retained only as diagnostic data; the exact twelve-object
+reduction is the performance result.
+
 The next order of performance work is:
 
-1. fuse generated factory frames and captured cells, with the depth-boundary
+1. remove the two remaining helper-task frame objects, with the depth-boundary
    probes guarding bounded retention and exact GC maps;
 2. reduce the remaining blocking-call scheduler handoff and root-entry
    transitions while preserving the lower-cost M replacement boundary and
