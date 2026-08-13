@@ -3243,12 +3243,27 @@ expired file and TCP deadlines, EOF, close publication, and the contended
 fallback. Runtime tests continue to cover borrowed-descriptor readiness,
 deadline, close, stale completion, and raw syscall status independently.
 
+A native Darwin/arm64 comparison against the exact parent used three warm-up
+rounds and 12 Latin-square-ordered 500 ms samples at one P. Ready file and TCP
+reads removed their remaining 64-byte closure allocation and improved by
+96.66% and 97.25%, respectively. Both candidate timings were statistically
+indistinguishable from the official merge-base toolchain. Blocking file and
+TCP timings were statistically unchanged from the exact parent, while their
+per-operation bytes fell from 596 to 584 and their 16 allocations remained.
+The large blocking gap to official Go therefore remains a scheduler handoff
+and logical-operation problem rather than a library-boundary regression; the
+complete data and host-load qualification are recorded in the architecture
+probe README.
+
 The remaining performance sequence is:
 
-1. Reduce public-root entry transitions and typed frame allocation while
+1. Reduce blocking-call scheduler handoff and logical-operation allocation
+   while retaining the lower-cost M replacement boundary and sibling
+   progress.
+2. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
-2. Remove ready-select temporary storage before changing channel-waiter
+3. Remove ready-select temporary storage before changing channel-waiter
    lifetime or ownership.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P

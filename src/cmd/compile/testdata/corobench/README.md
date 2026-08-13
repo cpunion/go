@@ -30,11 +30,12 @@ The I/O benchmarks intentionally use the ordinary public APIs. Regular files
 use the compensated-syscall boundary, while pollable pipes and TCP connections
 borrow their existing poll descriptors; none of these common paths creates a
 read closure or uses the worker pool. A concurrent read that cannot acquire the
-same descriptor's read lock is the bounded worker fallback. The blocking probes release each
-public read with a one-byte raw write syscall that cannot fill the empty pipe
-or socket buffer; this keeps the release path out of the unsupported public
-write lowering. A preceding `Sleep(0)` keeps the release worker on the
-automatically colored path without adding a positive-duration timer.
+same descriptor's read lock is the bounded worker fallback. The blocking
+probes release each public read with a one-byte raw write syscall that cannot
+fill the empty pipe or socket buffer; this keeps the release path out of the
+unsupported public write lowering. A preceding `Sleep(0)` keeps the release
+worker on the automatically colored path without adding a positive-duration
+timer.
 
 Every probe is interpreted as one of three capability states. A native fast
 path is a performance result. An adapter fallback is an end-to-end measurement
@@ -775,17 +776,41 @@ live stack was also statistically level. The different fixed-layout outliers
 and neutral layout controls provide no evidence of a systematic regression
 when the experiment is disabled.
 
-With positive-duration timer ownership addressed, the next order of
-performance work is:
+#### Public read library boundary
 
-1. connect ordinary file reads to the now-direct blocking-M runtime boundary
-   without exposing private library layouts to the compiler;
-2. replace the socket worker with a pointer-free netpoll readiness token and
-   completion on a safe G;
-3. reduce the fixed root-entry transition and typed frame allocation costs,
+Revision `98a0445e59` connects ordinary `os.File.Read` and
+`net.TCPConn.Read` calls to library-owned start and finish methods. Its exact
+parent is `7b768d219c`, and official revision `9549c91031` is the merge base.
+The native Darwin/arm64 comparison used separate binaries built from the same
+probe sources, three warm-up rounds, and 12 Latin-square-ordered 500 ms
+samples at one P. The Apple M4 Max host had substantial unrelated load; the
+wide timing distributions are retained in the statistical comparison rather
+than treated as release thresholds.
+
+| Probe | Exact parent -> candidate | Official -> candidate | Parent allocation -> candidate |
+| --- | ---: | ---: | ---: |
+| ready file read | 90.758 us -> 3.035 us (-96.66%, `p<0.001`) | 1.985 us -> 3.035 us (`p=0.114`, neutral) | 64 B, 1 alloc -> 0 B, 0 allocs |
+| ready TCP read | 105.911 us -> 2.915 us (-97.25%, `p<0.001`) | 2.223 us -> 2.915 us (`p=0.291`, neutral) | 64 B, 1 alloc -> 0 B, 0 allocs |
+| blocking file read and sibling release | 162.4 us -> 195.2 us (`p=0.347`, neutral) | 12.05 us -> 195.17 us (+1,520%, `p<0.001`) | 596 B, 16 allocs -> 584 B, 16 allocs |
+| blocking TCP read and sibling release | 444.5 us -> 372.5 us (`p=0.713`, neutral) | 178.0 us -> 372.5 us (+109%, `p=0.024`) | 596 B, 16 allocs -> 584 B, 16 allocs |
+
+The ready paths therefore remove the worker closure and recover both
+zero-allocation behavior and timing statistically indistinguishable from the
+official implementation on this host. All blocking samples completed without
+a watchdog timeout, and neither blocking result regressed statistically from
+the exact parent. The remaining gap to official Go is the coroutine scheduler
+handoff and logical-operation cost around a genuinely blocking call, not this
+library boundary.
+
+The next order of performance work is:
+
+1. reduce blocking-call scheduler handoff and logical-operation allocation
+   while preserving the lower-cost M replacement boundary and sibling
+   progress;
+2. reduce the fixed root-entry transition and typed frame allocation costs,
    with the depth-boundary probes guarding the existing bounded-retention and
    exact-GC-map rules; and
-4. remove ready-`select` temporary storage before changing channel waiter
+3. remove ready-`select` temporary storage before changing channel waiter
    lifetime.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
