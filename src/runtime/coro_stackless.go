@@ -353,6 +353,20 @@ func (s *stacklessCoroScheduler) newTaskAfterCacheMissLocked(
 	return initializeStacklessCoroTask(task, frame, resume, parent)
 }
 
+// newFrameReservationTaskLocked preserves completed typed frames while the
+// bounded frame cache still has room for another resume identity.
+func (s *stacklessCoroScheduler) newFrameReservationTaskLocked(
+	resume stacklessCoroResume, parent *stacklessCoroTask,
+	size uintptr) *stacklessCoroTask {
+	cacheHasRoom := s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
+		uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize
+	if cacheHasRoom && s.freePlainTaskCount == 0 {
+		return initializeStacklessCoroTask(new(stacklessCoroTask), nil,
+			resume, parent)
+	}
+	return s.newTaskLocked(nil, resume, parent)
+}
+
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
 	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
 	task.resume = resume
@@ -810,7 +824,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
-		task = s.newTaskLocked(nil, child, parent)
+		task = s.newFrameReservationTaskLocked(child, parent, size)
 		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 			task.cacheFrame = true
@@ -880,7 +894,7 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
-		task = s.newTaskLocked(nil, child, parent)
+		task = s.newFrameReservationTaskLocked(child, parent, size)
 		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 			task.cacheFrame = true

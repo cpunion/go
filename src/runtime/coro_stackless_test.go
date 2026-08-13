@@ -1294,13 +1294,16 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 
 	t.Run("resume-identity", func(t *testing.T) {
 		var state, total int
-		var frames [2]unsafe.Pointer
-		resumes := [2]func(unsafe.Pointer) uint8{
+		var frames [3]unsafe.Pointer
+		resumes := [3]func(unsafe.Pointer) uint8{
 			stacklessCoroFrameCacheResume,
 			stacklessCoroFrameCacheOtherResume,
+			stacklessCoroFrameCacheResume,
 		}
-		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if state == 2 {
+		// Use a fresh inline scheduler so preexisting native-context cache
+		// entries cannot make this capacity-sensitive identity test evict A.
+		runtime.RunStacklessCoroInlineForTest(func(ctx unsafe.Pointer) uint8 {
+			if state == len(frames) {
 				return runtime.StacklessCoroActionComplete
 			}
 			index := state
@@ -1311,11 +1314,14 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				resumes[index])
 			return runtime.StacklessCoroActionWait
 		})
-		if total != 3 {
-			t.Fatalf("frame total = %d, want 3", total)
+		if total != 6 {
+			t.Fatalf("frame total = %d, want 6", total)
 		}
 		if frames[0] == frames[1] {
 			t.Fatal("frame cache crossed resume identities")
+		}
+		if got, want := frames[0] == frames[2], !race.Enabled; got != want {
+			t.Fatalf("first frame identity reused = %t, want %t", got, want)
 		}
 	})
 

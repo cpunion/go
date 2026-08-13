@@ -865,14 +865,41 @@ task itself is now allocation-free. Timing from the loaded Darwin host and
 translated Linux is retained only as diagnostic data; the exact twelve-object
 reduction is the performance result.
 
+#### Preserve distinct cached frame identities
+
+Revision `d103ba4e1d` prevents a new frame identity from consuming a completed
+typed-frame task while the bounded cache still has room. The allocator first
+reuses an ordinary free task; if none exists, it adds a cache-owned task rather
+than discarding another resume identity. Behavior at the existing 256-task or
+32 KiB limit is unchanged, as are the scheduler and task layouts. Race builds
+still disable identity reuse.
+
+The exact parent is `cf30715f3e`. Fixed-count, one-P runs of 10,000 lowered
+operations matched on native Darwin/arm64 and translated Linux/amd64:
+
+| Probe | Parent | Preserved identities |
+| --- | ---: | ---: |
+| channel round trip | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready select | 132 B, 3 allocs | 132 B, 3 allocs |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file or TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and release | 104 B, 2 allocs | 0 B, 0 allocs |
+| blocking TCP and release | 104 B, 2 allocs | 0 B, 0 allocs |
+
+A rate-one profile shows only cold calibration and setup objects; no factory
+allocation scales with the 10,000 operations. Ten alternating 300 ms Darwin
+pairs found file timing neutral at 8.626 us versus 8.739 us (`p=0.739`) and
+TCP timing neutral at 15.80 us versus 15.33 us (`p=0.280`). The timing geomean
+changed by -0.87%. Under checkptr, the file probe similarly changed from
+105 B and three allocations to 1 B and one allocation, removing the same
+104 B and two target objects.
+
 The next order of performance work is:
 
-1. remove the two remaining helper-task frame objects, with the depth-boundary
-   probes guarding bounded retention and exact GC maps;
-2. reduce the remaining blocking-call scheduler handoff and root-entry
+1. reduce the remaining blocking-call scheduler handoff and root-entry
    transitions while preserving the lower-cost M replacement boundary and
    sibling progress; and
-3. remove ready-`select` temporary storage.
+2. remove ready-`select` temporary storage.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
 and live task footprint are regression gates for each of those changes.
