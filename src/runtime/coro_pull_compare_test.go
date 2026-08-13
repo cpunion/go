@@ -220,10 +220,13 @@ func stacklessCoroComparisonAwaitResume(ctx unsafe.Pointer) uint8 {
 }
 
 type stacklessCoroComparisonTimerFrame struct {
-	remaining int
-	completed int
-	pending   bool
-	delay     int64
+	remaining            int
+	completed            int
+	pending              bool
+	delay                int64
+	armed                chan<- struct{}
+	progress             *atomic.Bool
+	progressAtCompletion bool
 }
 
 type stacklessCoroComparisonFootprintFrame struct {
@@ -279,6 +282,9 @@ func stacklessCoroComparisonTimerResume(ctx unsafe.Pointer) uint8 {
 		runtime.FrameStacklessCoroForTest(ctx))
 	if frame.pending {
 		frame.pending = false
+		if frame.progress != nil {
+			frame.progressAtCompletion = frame.progress.Load()
+		}
 		frame.completed++
 		frame.remaining--
 	}
@@ -288,6 +294,10 @@ func stacklessCoroComparisonTimerResume(ctx unsafe.Pointer) uint8 {
 	frame.pending = true
 	if !runtime.SleepStacklessCoroForTest(ctx, frame.delay) {
 		return runtime.StacklessCoroActionInvalid
+	}
+	if frame.armed != nil {
+		frame.armed <- struct{}{}
+		frame.armed = nil
 	}
 	return runtime.StacklessCoroActionWait
 }
@@ -613,6 +623,9 @@ func startStacklessCoroComparisonSocketWriter(fd, iterations int,
 }
 
 func TestStacklessCoroPushPullComparison(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
 	fd, err := syscall.Open("/dev/zero", syscall.O_RDONLY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -635,6 +648,26 @@ func TestStacklessCoroPushPullComparison(t *testing.T) {
 			if got := runStacklessCoroComparisonTimer(driver, 2,
 				time.Nanosecond); got != 2 {
 				t.Fatalf("timer comparison completed %d timers, want 2", got)
+			}
+			timerArmed := make(chan struct{}, 1)
+			progressDone := make(chan struct{})
+			var progress atomic.Bool
+			go func() {
+				<-timerArmed
+				progress.Store(true)
+				close(progressDone)
+			}()
+			timerFrame := &stacklessCoroComparisonTimerFrame{
+				remaining: 1,
+				delay:     int64(20 * time.Millisecond),
+				armed:     timerArmed,
+				progress:  &progress,
+			}
+			driver.run(unsafe.Pointer(timerFrame),
+				stacklessCoroComparisonTimerResume)
+			<-progressDone
+			if !timerFrame.progressAtCompletion {
+				t.Fatal("runnable goroutine made no progress while timer waited")
 			}
 			if got := runStacklessCoroComparisonFile(driver, fd, 2); got != 2 {
 				t.Fatalf("file comparison completed %d reads, want 2", got)
