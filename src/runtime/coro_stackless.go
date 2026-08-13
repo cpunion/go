@@ -718,43 +718,45 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 	for !s.rootComplete() {
 		task = s.take()
-		if task == nil && native {
-			var previous *stacklessCoroTask
-			for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
-				claimed := stacklessCoroPollReadAtIdle(s, idlePollSkip, previous)
-				if claimed == nil && previous != nil {
-					// Every other waiter had a chance. Start another bounded pass
-					// while continuing to exclude the task that just armed.
-					previous = nil
-					claimed = stacklessCoroPollReadAtIdle(s, idlePollSkip, nil)
-				}
-				if claimed == nil {
-					break
-				}
-				// A successful retry may have made its waiter runnable. Take it
-				// before another bounded retry; if the read remains unavailable,
-				// the scheduler parks after the final attempt.
-				task = s.take()
-				if task != nil {
-					break
-				}
-				previous = claimed
-				if attempt+1 < stacklessCoroIdlePollAttempts {
-					procyield(30)
-				}
-			}
-		}
 		if task == nil {
-			if s.executorStop == nil {
-				<-s.wake
-			} else {
-				select {
-				case <-s.wake:
-				case <-s.executorStop:
-					return
+			if native {
+				var previous *stacklessCoroTask
+				for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
+					claimed := stacklessCoroPollReadAtIdle(s, idlePollSkip, previous)
+					if claimed == nil && previous != nil {
+						// Every other waiter had a chance. Start another bounded pass
+						// while continuing to exclude the task that just armed.
+						previous = nil
+						claimed = stacklessCoroPollReadAtIdle(s, idlePollSkip, nil)
+					}
+					if claimed == nil {
+						break
+					}
+					// A successful retry may have made its waiter runnable. Take it
+					// before another bounded retry; if the read remains unavailable,
+					// the scheduler parks after the final attempt.
+					task = s.take()
+					if task != nil {
+						break
+					}
+					previous = claimed
+					if attempt+1 < stacklessCoroIdlePollAttempts {
+						procyield(30)
+					}
 				}
 			}
-			continue
+			if task == nil {
+				if s.executorStop == nil {
+					<-s.wake
+				} else {
+					select {
+					case <-s.wake:
+					case <-s.executorStop:
+						return
+					}
+				}
+				continue
+			}
 		}
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
