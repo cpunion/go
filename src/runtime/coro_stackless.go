@@ -718,7 +718,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 	for !s.rootComplete() {
 		task = s.take()
-		if task == nil && native && s.executorCount.Load() == 1 {
+		if task == nil && native {
 			var previous *stacklessCoroTask
 			for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
 				claimed := stacklessCoroPollReadAtIdle(s, idlePollSkip, previous)
