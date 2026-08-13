@@ -124,12 +124,28 @@ type lowerSelectCase struct {
 	elementValue *ir.Name
 }
 
+type lowerRead struct {
+	call      *ir.CallExpr
+	statement ir.Node
+	receiver  *ir.Name
+	buffer    *ir.Name
+	n         *ir.Name
+	err       *ir.Name
+	dummyErr  *ir.Name
+	direct    *ir.Name
+	status    *ir.Name
+	wait      *ir.Name
+	start     ir.Node
+	finish    ir.Node
+}
+
 type lowerState struct {
 	body       []ir.Node
 	transition SiteKind
 	call       *ir.CallExpr
 	channel    *lowerChannel
 	selection  *lowerSelect
+	read       *lowerRead
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -2043,7 +2059,7 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	}
 	resume.Body = append(resume.Body, body...)
 	resume.Body = append(resume.Body, complete(pos)...)
-	finishLowering(candidate, resume, declarations, nil)
+	finishLowering(candidate, resume, declarations)
 	return nil
 }
 
@@ -2774,9 +2790,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				if candidate.transitions[call] == SiteGoexit {
 					stateNext = cleanupState
 				}
+				var read *lowerRead
+				if ordinaryReadOperation(call) {
+					read = &lowerRead{call: call, statement: stmt}
+					stateNext = addState(lowerState{
+						read:      read,
+						next:      stateNext,
+						thenState: -1,
+						elseState: -1,
+					})
+				}
 				return addState(lowerState{
 					transition: candidate.transitions[call],
 					call:       call,
+					read:       read,
 					statement:  stmt,
 					next:       stateNext,
 					thenState:  -1,
@@ -3019,8 +3046,73 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	}
 
+	preparedReads := make(map[*lowerRead]bool)
+	for i := range states {
+		state := &states[i]
+		read := state.read
+		if read == nil || state.transition == SiteInvalid || preparedReads[read] {
+			continue
+		}
+		preparedReads[read] = true
+		if len(read.call.Args) != 2 {
+			return fmt.Errorf("%s: ordinary read has %d arguments, want receiver and buffer",
+				ir.PkgFuncName(fn), len(read.call.Args))
+		}
+		targets, err := callResultTargets(read.call, read.statement, 2)
+		if err != nil {
+			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+		}
+		for i, target := range targets {
+			if target == nil {
+				continue
+			}
+			if _, ok := target.(*ir.Name); !ok {
+				return fmt.Errorf("%s: ordinary read result %d is not a variable",
+					ir.PkgFuncName(fn), i)
+			}
+		}
+		read.start, err = ordinaryReadMethod(read.call.Pos(),
+			read.call.Args[0].Type(), "coroReadStart")
+		if err != nil {
+			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+		}
+		read.finish, err = ordinaryReadMethod(read.call.Pos(),
+			read.call.Args[0].Type(), "coroReadFinish")
+		if err != nil {
+			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
+		}
+		read.receiver = typecheck.TempAt(read.call.Pos(), factory,
+			read.call.Args[0].Type())
+		read.buffer = typecheck.TempAt(read.call.Pos(), resume,
+			read.call.Args[1].Type())
+		read.wait = typecheck.TempAt(read.call.Pos(), resume,
+			types.Types[types.TBOOL])
+		read.n, _ = targets[0].(*ir.Name)
+		if read.n == nil {
+			read.n = typecheck.TempAt(read.call.Pos(), factory,
+				types.Types[types.TINT])
+			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL, read.n))
+		}
+		read.err, _ = targets[1].(*ir.Name)
+		if read.err == nil {
+			read.dummyErr = typecheck.TempAt(read.call.Pos(), factory,
+				types.ErrorType)
+			read.err = read.dummyErr
+			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL,
+				read.dummyErr))
+		}
+		read.direct = typecheck.TempAt(read.call.Pos(), factory,
+			types.Types[types.TBOOL])
+		read.status = typecheck.TempAt(read.call.Pos(), factory,
+			types.Types[types.TUINTPTR])
+		for _, name := range []*ir.Name{
+			read.receiver, read.direct, read.status,
+		} {
+			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL, name))
+		}
+	}
+
 	cases := make([]*ir.CaseClause, len(states))
-	var readAssignments []*ir.AssignListStmt
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
 		for _, stmt := range state.body {
@@ -3238,6 +3330,30 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
 			}))
+		} else if state.read != nil && state.transition == SiteInvalid {
+			if state.next < 0 {
+				return fmt.Errorf("%s: read finish state %d has no continuation",
+					ir.PkgFuncName(fn), i)
+			}
+			read := state.read
+			body = append(body, typecheck.Call(read.call.Pos(), read.finish,
+				ir.Nodes{
+					edit(read.receiver),
+					typecheck.NodAddr(edit(read.n)),
+					typecheck.NodAddr(edit(read.err)),
+					edit(read.direct), edit(read.status),
+				}, false))
+			for _, name := range []*ir.Name{read.receiver, read.dummyErr} {
+				if name == nil {
+					continue
+				}
+				body = append(body, ir.NewAssignStmt(read.call.Pos(),
+					edit(name), ir.NewZero(read.call.Pos(), name.Type())))
+			}
+			body = append(body,
+				ir.NewAssignStmt(pos, resumePC,
+					typedInt(pos, types.Types[types.TUINT32], int64(state.next))),
+				ir.NewBranchStmt(pos, ir.OCONTINUE, nil))
 		} else if state.transition != SiteInvalid {
 			if state.next < 0 {
 				return fmt.Errorf("%s: state %d transition has no continuation",
@@ -3389,73 +3505,37 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				)
 			case SiteFile, SitePoll:
 				if ordinaryReadOperation(state.call) {
-					var init ir.Nodes
-					oldCurFunc := ir.CurFunc
-					ir.CurFunc = resume
-					call := typecheck.MakeCallClosure(state.call.Pos(),
-						edit(state.call), &init)
-					if assignment, ok := state.statement.(*ir.AssignListStmt); ok {
-						closure, ok := call.(*ir.ClosureExpr)
-						if !ok {
-							return fmt.Errorf("%s: read assignment has no call closure",
-								ir.PkgFuncName(fn))
-						}
-						workerCaptures := make(map[*ir.Name]*ir.Name)
-						for i, lhs := range assignment.Lhs {
-							name, ok := lhs.(*ir.Name)
-							if !ok {
-								return fmt.Errorf("%s: read result %d is not a variable",
-									ir.PkgFuncName(fn), i)
-							}
-							edited := edit(lhs)
-							var dereference *ir.StarExpr
-							switch target := edited.(type) {
-							case *ir.Name:
-								name = target
-							case *ir.StarExpr:
-								dereference = target
-								name, ok = target.X.(*ir.Name)
-							default:
-								ok = false
-							}
-							if !ok || name == nil {
-								return fmt.Errorf("%s: read result %d is not a variable",
-									ir.PkgFuncName(fn), i)
-							}
-							if name.Class == ir.PEXTERN || ir.IsBlank(name) {
-								assignment.Lhs[i] = name
-								continue
-							}
-							if name.Curfn != resume {
-								return fmt.Errorf("%s: read result %d has unsupported owner",
-									ir.PkgFuncName(fn), i)
-							}
-							canonical := name.Canonical()
-							captured := workerCaptures[canonical]
-							if captured == nil {
-								captured = ir.NewClosureVar(name.Pos(), closure.Func, name)
-								workerCaptures[canonical] = captured
-							}
-							if dereference != nil {
-								assignment.Lhs[i] = typedDeref(
-									dereference.Pos(), captured,
-									dereference.Type())
-							} else {
-								assignment.Lhs[i] = captured
-							}
-						}
-						assignment.Def = false
-						assignment.Rhs = ir.Nodes{state.call}
-						closure.Func.Body = []ir.Node{assignment}
-						readAssignments = append(readAssignments, assignment)
+					read := state.read
+					if read == nil {
+						return fmt.Errorf("%s: ordinary read has no lowering plan",
+							ir.PkgFuncName(fn))
 					}
-					ir.CurFunc = oldCurFunc
-					for _, stmt := range init {
-						body = append(body, stmt)
+					for _, init := range state.call.Init() {
+						body = append(body, edit(init))
 					}
-					body = append(body, typecheck.Call(state.call.Pos(),
-						typecheck.LookupRuntime("coroCallRead"),
-						ir.Nodes{ctx, call}, false))
+					body = append(body,
+						ir.NewAssignStmt(state.call.Pos(), edit(read.receiver),
+							edit(state.call.Args[0])),
+						ir.NewAssignStmt(state.call.Pos(), edit(read.buffer),
+							edit(state.call.Args[1])))
+					wait := typecheck.Call(state.call.Pos(), read.start, ir.Nodes{
+						edit(read.receiver), ctx, edit(read.buffer),
+						typecheck.NodAddr(edit(read.n)),
+						typecheck.NodAddr(edit(read.err)),
+						typecheck.NodAddr(edit(read.direct)),
+						typecheck.NodAddr(edit(read.status)),
+					}, false)
+					body = append(body,
+						ir.NewAssignStmt(state.call.Pos(), edit(read.wait), wait),
+						ir.NewAssignStmt(state.call.Pos(), edit(read.buffer),
+							ir.NewZero(state.call.Pos(), read.buffer.Type())),
+						ir.NewIfStmt(state.call.Pos(), edit(read.wait), ir.Nodes{
+							ir.NewReturnStmt(state.call.Pos(), []ir.Node{
+								typedInt(state.call.Pos(),
+									types.Types[types.TUINT8], int64(actionWait)),
+							}),
+						}, nil),
+						ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil))
 					action = actionWait
 					break
 				}
@@ -3560,12 +3640,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}),
 		}, false))
 
-	finishLowering(candidate, resume, declarations, readAssignments)
+	finishLowering(candidate, resume, declarations)
 	return nil
 }
 
 func finishLowering(candidate *lowerCandidate, resume *ir.Func,
-	declarations ir.Nodes, readAssignments []*ir.AssignListStmt) {
+	declarations ir.Nodes) {
 	if candidate.factoryABI == FactoryABI3 {
 		finishExplicitFrameLowering(candidate, resume, declarations)
 		return
@@ -3599,9 +3679,6 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	fn.Body = []ir.Node{run, ir.NewReturnStmt(pos, nil)}
 	typecheck.Stmts(fn.Body)
 	ir.CurFunc = oldCurFunc
-	for _, assignment := range readAssignments {
-		assignment.SetOp(ir.OAS2FUNC)
-	}
 
 	// The source inline body no longer describes the physical primary.
 	fn.Inl = nil
@@ -4082,6 +4159,23 @@ func ordinaryReadOperation(call *ir.CallExpr) bool {
 		return true
 	}
 	return false
+}
+
+func ordinaryReadMethod(pos src.XPos, receiver *types.Type, name string) (ir.Node, error) {
+	base := types.ReceiverBaseType(receiver)
+	if base == nil || base.Sym() == nil || base.Sym().Pkg == nil {
+		return nil, fmt.Errorf("ordinary read receiver %v has no named base type",
+			receiver)
+	}
+	sym := base.Sym().Pkg.Lookup(name)
+	typecheck.CalcMethods(base)
+	for _, method := range base.AllMethods() {
+		if method.Sym == sym {
+			return typecheck.NewMethodExpr(pos, receiver, sym), nil
+		}
+	}
+	return nil, fmt.Errorf("ordinary read receiver %v has no %s method",
+		receiver, name)
 }
 
 func validateCgoErrnoCall(call *ir.CallExpr, stmt ir.Node,

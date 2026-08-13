@@ -26,12 +26,14 @@ implementations differ most:
 - groups of three blocking C calls, plus a self-timed capacity probe with
   eight concurrent calls.
 
-The I/O benchmarks intentionally use the ordinary public APIs. They therefore
-include the experiment's current closure and worker-pool adaptation rather
-than measuring only lower-level runtime helpers. The blocking probes release
-each public read with a one-byte raw write syscall that cannot fill the empty
-pipe or socket buffer; this keeps the release path out of the unsupported
-public write lowering. A preceding `Sleep(0)` keeps the release worker on the
+The I/O benchmarks intentionally use the ordinary public APIs. Regular files
+use the compensated-syscall boundary, while pollable pipes and TCP connections
+borrow their existing poll descriptors; none of these common paths creates a
+read closure or uses the worker pool. A concurrent read that cannot acquire the
+same descriptor's read lock is the bounded worker fallback. The blocking probes release each
+public read with a one-byte raw write syscall that cannot fill the empty pipe
+or socket buffer; this keeps the release path out of the unsupported public
+write lowering. A preceding `Sleep(0)` keeps the release worker on the
 automatically colored path without adding a positive-duration timer.
 
 Every probe is interpreted as one of three capability states. A native fast
@@ -236,10 +238,15 @@ coroutine scheduler still does not scale fixed work across multiple Ps. Those
 are separate executor-capacity and multi-P scheduling tasks.
 
 `check.bash` runs the coroutine correctness and coverage test, verifies the
-lowering audit, and checks the direct C symbols without collecting performance
-data. CI runs the correctness test with both toolchains, invokes this check,
-and retains its artifacts. It does not enforce performance thresholds:
-hosted-runner measurements are not stable enough for that purpose.
+lowering audit, checks that each ready, blocked, and contended public read
+resume calls the library-owned
+start/finish boundary without the generic read worker, and checks the direct C
+symbols without collecting performance data. Its merged public-read and
+`internal/poll` profiles require at least 90% statement coverage for every new
+library helper. CI runs the correctness test with both toolchains, invokes
+this check, and retains its artifacts. It does not enforce performance
+thresholds: hosted-runner measurements are not stable enough for that
+purpose.
 
 ### Elastic blocking C capacity
 

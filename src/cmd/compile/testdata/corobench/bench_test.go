@@ -103,6 +103,24 @@ func TestProbes(t *testing.T) {
 	pipeReader.Close()
 	pipeWriter.Close()
 
+	contentionProcs := runtime.GOMAXPROCS(1)
+	pipeReader, pipeWriter, err = os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentionWatchdog := time.AfterFunc(5*time.Second, func() {
+		pipeReader.Close()
+		pipeWriter.Close()
+	})
+	if err := contendedFileReads(pipeReader, pipeWriter.Fd()); err != nil {
+		t.Errorf("contendedFileReads() = %v, want nil", err)
+	}
+	if !contentionWatchdog.Stop() {
+		t.Error("contended file reads timed out")
+	}
+	pipeReader.Close()
+	pipeWriter.Close()
+
 	reader, writer, cleanup = newTCPPair(t)
 	networkWatchdog := time.AfterFunc(5*time.Second, cleanup)
 	if got, err := blockingTCPRoundTrips(reader, tcpFD(t, writer), 2); err != nil || got != 2 {
@@ -113,6 +131,17 @@ func TestProbes(t *testing.T) {
 		t.Error("blocking TCP probe timed out")
 	}
 	cleanup()
+
+	reader, writer, cleanup = newTCPPair(t)
+	contentionWatchdog = time.AfterFunc(5*time.Second, cleanup)
+	if err := contendedTCPReads(reader, tcpFD(t, writer)); err != nil {
+		t.Errorf("contendedTCPReads() = %v, want nil", err)
+	}
+	if !contentionWatchdog.Stop() {
+		t.Error("contended TCP reads timed out")
+	}
+	cleanup()
+	runtime.GOMAXPROCS(contentionProcs)
 
 	if got := cScalarCalls(3); got != 4 {
 		t.Errorf("cScalarCalls(3) = %d, want 4", got)
@@ -290,6 +319,33 @@ func TestProbeEdges(t *testing.T) {
 	if _, err := fileReads(file, make([]byte, 1), 1); err == nil {
 		t.Error("fileReads on a closed file succeeded")
 	}
+	if _, err := fileReads(nil, make([]byte, 1), 1); err == nil {
+		t.Error("fileReads on a nil file succeeded")
+	}
+
+	file, err = os.Open("/dev/zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileReads(file, nil, 1); !errors.Is(err, io.ErrNoProgress) {
+		t.Errorf("zero-length fileReads error = %v, want io.ErrNoProgress", err)
+	}
+	file.Close()
+
+	deadlineReader, deadlineWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deadlineReader.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		deadlineReader.Close()
+		deadlineWriter.Close()
+		t.Fatal(err)
+	}
+	if _, err := fileReads(deadlineReader, make([]byte, 1), 1); err == nil {
+		t.Error("fileReads after an expired deadline succeeded")
+	}
+	deadlineReader.Close()
+	deadlineWriter.Close()
 
 	file, err = os.Open("/dev/zero")
 	if err != nil {
@@ -321,6 +377,16 @@ func TestProbeEdges(t *testing.T) {
 	}
 	if _, err := tcpReads(reader, make([]byte, 1), 1); err == nil {
 		t.Error("tcpReads on a closed connection succeeded")
+	}
+	cleanup()
+
+	if _, err := tcpReads(new(net.TCPConn), make([]byte, 1), 1); err == nil {
+		t.Error("tcpReads on a zero connection succeeded")
+	}
+
+	reader, tcpWriter, cleanup = newTCPPair(t)
+	if _, err := tcpReads(reader, nil, 1); !errors.Is(err, io.ErrNoProgress) {
+		t.Errorf("zero-length tcpReads error = %v, want io.ErrNoProgress", err)
 	}
 	cleanup()
 

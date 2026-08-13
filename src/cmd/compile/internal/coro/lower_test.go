@@ -224,7 +224,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 	var factoryCall *ir.CallExpr
 	ir.Visit(method, func(node ir.Node) {
 		call, ok := node.(*ir.CallExpr)
-		if !ok {
+		if !ok || call.Fun == nil {
 			return
 		}
 		if got := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))); got == wantFactory {
@@ -767,17 +767,59 @@ func TestLowerStateMachines(t *testing.T) {
 	socketReader.Body = []ir.Node{socketCall, newLowerTestReturn()}
 
 	osPkg := types.NewPkg("os", "os")
+	fileName := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, osPkg.Lookup("File"))
+	fileType := types.NewNamed(fileName)
+	fileName.SetType(fileType)
+	fileName.SetTypecheck(1)
+	fileType.SetUnderlying(types.NewStruct(nil))
+	filePointer := types.NewPtr(fileType)
+	ordinaryReadReceiver := types.NewField(src.NoXPos, nil, filePointer)
+	ordinaryReadBuffer := types.NewField(src.NoXPos, nil,
+		types.NewSlice(types.ByteType))
 	ordinaryReadResults := []*types.Field{
 		types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
 		types.NewField(src.NoXPos, nil, types.ErrorType),
 	}
 	ordinaryRead := ir.NewFunc(src.NoXPos, src.NoXPos,
 		osPkg.Lookup("(*File).Read"),
-		types.NewSignature(nil, nil, ordinaryReadResults))
+		types.NewSignature(ordinaryReadReceiver,
+			[]*types.Field{ordinaryReadBuffer}, ordinaryReadResults))
 	ordinaryRead.DeclareParams(true)
-	ordinaryReadCall := newLowerTestCall(ordinaryRead)
-	ordinaryReadCall.SetType(ordinaryRead.Type().ResultsTuple())
+	startParams := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(src.NoXPos, nil, ordinaryReadBuffer.Type),
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TINT])),
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.ErrorType)),
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TBOOL])),
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TUINTPTR])),
+	}
+	startResults := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.Types[types.TBOOL]),
+	}
+	finishParams := []*types.Field{
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TINT])),
+		types.NewField(src.NoXPos, nil, types.NewPtr(types.ErrorType)),
+		types.NewField(src.NoXPos, nil, types.Types[types.TBOOL]),
+		types.NewField(src.NoXPos, nil, types.Types[types.TUINTPTR]),
+	}
+	readMethods := []*types.Field{
+		types.NewField(src.NoXPos, osPkg.Lookup("Read"), ordinaryRead.Type()),
+		types.NewField(src.NoXPos, osPkg.Lookup("coroReadStart"),
+			types.NewSignature(ordinaryReadReceiver, startParams, startResults)),
+		types.NewField(src.NoXPos, osPkg.Lookup("coroReadFinish"),
+			types.NewSignature(ordinaryReadReceiver, finishParams, nil)),
+	}
+	fileType.SetMethods(readMethods)
+	fileType.SetAllMethods(readMethods)
 	ordinaryFileReader := newLowerTestFunc(pkg, "ordinaryFileReader")
+	ordinaryReadFile := ordinaryFileReader.NewLocal(src.NoXPos,
+		pkg.Lookup("ordinaryReadFile"), filePointer)
+	ordinaryReadBytes := ordinaryFileReader.NewLocal(src.NoXPos,
+		pkg.Lookup("ordinaryReadBytes"), ordinaryReadBuffer.Type)
+	ordinaryReadCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		ordinaryRead.Nname, ir.Nodes{ordinaryReadFile, ordinaryReadBytes})
+	ordinaryReadCall.SetTypecheck(1)
+	ordinaryReadCall.SetType(ordinaryRead.Type().ResultsTuple())
 	ordinaryReadN := ordinaryFileReader.NewLocal(src.NoXPos,
 		pkg.Lookup("ordinaryReadN"), types.Types[types.TINT])
 	ordinaryReadErr := ordinaryFileReader.NewLocal(src.NoXPos,
@@ -786,10 +828,21 @@ func TestLowerStateMachines(t *testing.T) {
 		ir.OAS2FUNC, ir.Nodes{ordinaryReadN, ordinaryReadErr},
 		ir.Nodes{ordinaryReadCall})
 	ordinaryReadAssign.SetTypecheck(1)
+	ordinaryDiscardCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		ordinaryRead.Nname, ir.Nodes{ordinaryReadFile, ordinaryReadBytes})
+	ordinaryDiscardCall.SetTypecheck(1)
+	ordinaryDiscardCall.SetType(ordinaryRead.Type().ResultsTuple())
+	ordinaryDiscardAssign := ir.NewAssignListStmt(src.NoXPos,
+		ir.OAS2FUNC, ir.Nodes{ir.BlankNode, ir.BlankNode},
+		ir.Nodes{ordinaryDiscardCall})
+	ordinaryDiscardAssign.SetTypecheck(1)
 	ordinaryFileReader.Body = []ir.Node{
+		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadFile),
+		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadBytes),
 		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadN),
 		ir.NewDecl(src.NoXPos, ir.ODCL, ordinaryReadErr),
 		ordinaryReadAssign,
+		ordinaryDiscardAssign,
 		newLowerTestReturn(),
 	}
 
@@ -1199,7 +1252,12 @@ func TestLowerStateMachines(t *testing.T) {
 	repeatedReadNDecl := ir.NewDecl(src.NoXPos, ir.ODCL, repeatedReadN)
 	repeatedReadErrDecl := ir.NewDecl(src.NoXPos, ir.ODCL,
 		repeatedReadErr)
-	repeatedReadCall := newLowerTestCall(ordinaryRead)
+	repeatedReadCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC,
+		ordinaryRead.Nname, ir.Nodes{
+			ir.NewNilExpr(src.NoXPos, filePointer),
+			ir.NewNilExpr(src.NoXPos, ordinaryReadBuffer.Type),
+		})
+	repeatedReadCall.SetTypecheck(1)
 	repeatedReadCall.SetType(ordinaryRead.Type().ResultsTuple())
 	repeatedReadAssign := ir.NewAssignListStmt(src.NoXPos,
 		ir.OAS2FUNC, ir.Nodes{repeatedReadN, repeatedReadErr},
@@ -1318,9 +1376,10 @@ func TestLowerStateMachines(t *testing.T) {
 			Local:   MaySuspend,
 			Effect:  MaySuspend,
 			Primary: CoroPrimary,
-			Sites: []Site{{
-				ID: 1, Kind: SiteFile, Node: ordinaryReadCall,
-			}},
+			Sites: []Site{
+				{ID: 1, Kind: SiteFile, Node: ordinaryReadCall},
+				{ID: 2, Kind: SiteFile, Node: ordinaryDiscardCall},
+			},
 		},
 		asyncCaller: {
 			Func:    asyncCaller,
@@ -1773,26 +1832,33 @@ func TestLowerStateMachines(t *testing.T) {
 	if repeatedReadResume == nil {
 		t.Fatal("repeated read has no generated resume function")
 	}
-	var readResultStores int
-	for _, generated := range typecheck.Target.Funcs {
-		if generated.ClosureParent != repeatedReadResume {
-			continue
+	var readStarts, readFinishes, readWorkers int
+	var readCalls []string
+	ir.Visit(repeatedReadResume, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok || call.Fun == nil {
+			return
 		}
-		ir.Visit(generated, func(node ir.Node) {
-			assign, ok := node.(*ir.AssignListStmt)
-			if !ok {
-				return
+		name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
+		if selector, ok := call.Fun.(*ir.SelectorExpr); ok {
+			switch selector.Sel.Name {
+			case "coroReadStart":
+				readStarts++
+			case "coroReadFinish":
+				readFinishes++
 			}
-			for _, target := range assign.Lhs {
-				if _, ok := target.(*ir.StarExpr); ok {
-					readResultStores++
-				}
-			}
-		})
-	}
-	if readResultStores != 2 {
-		t.Errorf("repeated read pointer result stores = %d, want 2",
-			readResultStores)
+		}
+		if name != "" {
+			readCalls = append(readCalls, name)
+		}
+		switch name {
+		case "runtime.coroCallRead":
+			readWorkers++
+		}
+	})
+	if readStarts != 1 || readFinishes != 1 || readWorkers != 0 {
+		t.Errorf("repeated read lowering = (%d starts, %d finishes, %d workers), want (1, 1, 0); calls %v",
+			readStarts, readFinishes, readWorkers, readCalls)
 	}
 
 	var runResume *ir.Func
@@ -1940,6 +2006,28 @@ func TestLowerStateMachines(t *testing.T) {
 		if !hasFactory {
 			t.Errorf("%s has no resume factory", fn.Sym().Name)
 		}
+	}
+}
+
+func TestOrdinaryReadMethodErrors(t *testing.T) {
+	prepareLowerTest(t)
+
+	if _, err := ordinaryReadMethod(src.NoXPos,
+		types.NewPtr(types.NewStruct(nil)), "coroReadStart"); err == nil ||
+		!strings.Contains(err.Error(), "no named base type") {
+		t.Fatalf("unnamed receiver error = %v", err)
+	}
+
+	pkg := types.NewPkg("example.com/coro/readmethod", "readmethod")
+	name := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, pkg.Lookup("Reader"))
+	typ := types.NewNamed(name)
+	name.SetType(typ)
+	name.SetTypecheck(1)
+	typ.SetUnderlying(types.NewStruct(nil))
+	if _, err := ordinaryReadMethod(src.NoXPos,
+		types.NewPtr(typ), "coroReadStart"); err == nil ||
+		!strings.Contains(err.Error(), "no coroReadStart method") {
+		t.Fatalf("missing method error = %v", err)
 	}
 }
 

@@ -26,6 +26,24 @@ func init() {
 }
 
 func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
+	coroFileRead1(ctx, fd, buffer, n, errno, false)
+}
+
+func coroPublicFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
+	coroFileRead1(ctx, fd, buffer, n, errno, true)
+}
+
+//go:linkname poll_runtime_coroFileRead internal/poll.runtime_coroFileRead
+func poll_runtime_coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
+	coroPublicFileRead(ctx, fd, buffer, n, errno)
+}
+
+//go:linkname poll_runtime_coroCallRead internal/poll.runtime_coroCallRead
+func poll_runtime_coroCallRead(ctx unsafe.Pointer, call func()) {
+	coroCallRead(ctx, call)
+}
+
+func coroFileRead1(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr, retryEINTR bool) {
 	op := stacklessCoroStartOperation(ctx, "read")
 	// This operation is completed directly below and is never registered.
 	// It still needs a nonzero identity for the common completion checks.
@@ -38,8 +56,13 @@ func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uint
 	var readErrno uintptr
 	if len(buffer) != 0 {
 		coroEnterSyscall(ctx)
-		count = read(int32(fd), unsafe.Pointer(&buffer[0]),
-			stacklessCoroReadLength(len(buffer)))
+		for {
+			count = read(int32(fd), unsafe.Pointer(&buffer[0]),
+				stacklessCoroReadLength(len(buffer)))
+			if count != -_EINTR || !retryEINTR {
+				break
+			}
+		}
 		coroExitSyscall()
 		if count < 0 {
 			readErrno = uintptr(-count)

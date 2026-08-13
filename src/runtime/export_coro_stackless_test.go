@@ -721,6 +721,10 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 	coroFileRead(ctx, fd, buffer, n, errno)
 }
 
+func PublicFileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
+	poll_runtime_coroFileRead(ctx, fd, buffer, n, errno)
+}
+
 func SocketReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	coroSocketRead(ctx, fd, buffer, n, errno)
 }
@@ -745,8 +749,11 @@ func ExpireReadStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
 
 func SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
 	fd int, buffer []byte, n *int, errno *uintptr) {
-	startStacklessCoroSocketReadWithPollDesc(ctx,
-		(*pollDesc)(descriptor), fd, buffer, n, errno)
+	poll_runtime_coroSocketRead(ctx, uintptr(descriptor), fd, buffer, n, errno)
+}
+
+func StacklessCoroPollErrorStatusForTest(pollErr int) uintptr {
+	return stacklessCoroPollErrorTag | uintptr(pollErr)
 }
 
 func StacklessCoroReadLengthForTest(length int) int32 {
@@ -759,6 +766,7 @@ func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []
 	op.buffer = buffer
 	op.n = n
 	op.errno = errno
+	op.ownsPollDesc = true
 	netpollGenericInit()
 	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
 	if openErr != 0 {
@@ -776,7 +784,7 @@ func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []
 }
 
 func CallReadStacklessCoroForTest(ctx unsafe.Pointer, call func()) {
-	coroCallRead(ctx, call)
+	poll_runtime_coroCallRead(ctx, call)
 }
 
 func EnterForeignStacklessCoroForTest() {
