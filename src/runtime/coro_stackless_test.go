@@ -4058,30 +4058,40 @@ func TestStacklessCoroFileReadProgress(t *testing.T) {
 }
 
 func TestStacklessCoroFileReadError(t *testing.T) {
-	cgoCalls := runtime.NumCgoCall()
-	var state, n int
-	var errno uintptr
-	buffer := make([]byte, 1)
-	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-		switch state {
-		case 0:
-			state = 1
-			runtime.FileReadStacklessCoroForTest(ctx, -1, buffer, &n, &errno)
-			return runtime.StacklessCoroActionWait
-		case 1:
-			state = 2
-			return runtime.StacklessCoroActionComplete
-		default:
-			t.Fatalf("unexpected state %d", state)
-			return runtime.StacklessCoroActionInvalid
-		}
-	})
-	if n != -1 || errno == 0 {
-		t.Fatalf("read from invalid descriptor = (%d, %d), want (-1, errno)",
-			n, errno)
-	}
-	if got := runtime.NumCgoCall(); got != cgoCalls {
-		t.Fatalf("NumCgoCall after file read = %d, want %d", got, cgoCalls)
+	for _, test := range []struct {
+		name string
+		read func(unsafe.Pointer, int, []byte, *int, *uintptr)
+	}{
+		{"explicit", runtime.FileReadStacklessCoroForTest},
+		{"public", runtime.PublicFileReadStacklessCoroForTest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cgoCalls := runtime.NumCgoCall()
+			var state, n int
+			var errno uintptr
+			buffer := make([]byte, 1)
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					test.read(ctx, -1, buffer, &n, &errno)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					state = 2
+					return runtime.StacklessCoroActionComplete
+				default:
+					t.Fatalf("unexpected state %d", state)
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+			if n != -1 || errno == 0 {
+				t.Fatalf("read from invalid descriptor = (%d, %d), want (-1, errno)",
+					n, errno)
+			}
+			if got := runtime.NumCgoCall(); got != cgoCalls {
+				t.Fatalf("NumCgoCall after file read = %d, want %d", got, cgoCalls)
+			}
+		})
 	}
 }
 
@@ -4452,9 +4462,11 @@ func testStacklessCoroSocketReadBorrowedPollDescWake(t *testing.T, deadline bool
 	if !waiting {
 		t.Fatal("coroutine read did not arm its borrowed poll descriptor")
 	}
-	wantErrno := uintptr(runtime.StacklessCoroPollErrClosing)
+	wantErrno := runtime.StacklessCoroPollErrorStatusForTest(
+		runtime.StacklessCoroPollErrClosing)
 	if deadline {
-		wantErrno = runtime.StacklessCoroPollErrTimeout
+		wantErrno = runtime.StacklessCoroPollErrorStatusForTest(
+			runtime.StacklessCoroPollErrTimeout)
 	}
 	if state != 2 || n != -1 || readErrno != wantErrno {
 		t.Fatalf("borrowed wake = (state %d, %d, %d), want (2, -1, %d)",

@@ -25,14 +25,96 @@ lowering_output="$output_dir/lowering.txt"
 symbols_output="$output_dir/coro.symbols"
 test_binary="$output_dir/coro.test"
 build_output="$output_dir/build.txt"
+read_output="$output_dir/read-lowering.txt"
+correctness_output="$output_dir/correctness.txt"
+public_coverage_output="$output_dir/public-read-coverage.txt"
+poll_coverage_output="$output_dir/poll-read-coverage.txt"
+probe_coverage="$output_dir/probes.cover"
+public_coverage="$output_dir/public-read.cover"
+poll_coverage="$output_dir/poll-read.cover"
+merged_coverage="$output_dir/combined.cover"
+coverage_functions="$output_dir/coverage-functions.txt"
 
 cd "$script_dir"
 export GO111MODULE=off
 export GOEXPERIMENT=coro
 
-"$coro_goroot/bin/go" test -count=1 -cover
-"$coro_goroot/bin/go" test -a -run '^$' -count=1 \
-	-gcflags='-l -N -d=coro=4' >"$lowering_output" 2>&1
+if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
+	-coverprofile="$probe_coverage" -gcflags='-l -d=coro=4' \
+	>"$correctness_output" 2>&1; then
+	tail -n 100 "$correctness_output" >&2
+	exit 1
+fi
+if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
+	-coverpkg='internal/poll,os,net' -coverprofile="$public_coverage" \
+	-gcflags='-l -d=coro=4' >"$public_coverage_output" 2>&1; then
+	tail -n 100 "$public_coverage_output" >&2
+	exit 1
+fi
+if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
+	-coverprofile="$poll_coverage" internal/poll -run '^TestCoroRead' \
+	>"$poll_coverage_output" 2>&1; then
+	tail -n 100 "$poll_coverage_output" >&2
+	exit 1
+fi
+awk '
+	$1 == "mode:" {
+		if (!mode) {
+			mode = $2
+		}
+		next
+	}
+	{
+		key = $1 " " $2
+		if (!(key in seen)) {
+			order[++count] = key
+			seen[key] = 1
+			hits[key] = $3
+		} else if ($3 > hits[key]) {
+			hits[key] = $3
+		}
+	}
+	END {
+		print "mode: " mode
+		for (i = 1; i <= count; i++) {
+			print order[i], hits[order[i]]
+		}
+	}
+' "$probe_coverage" "$public_coverage" "$poll_coverage" \
+	>"$merged_coverage"
+"$coro_goroot/bin/go" tool cover -func="$merged_coverage" \
+	>"$coverage_functions"
+coverage_targets=(
+	'internal/poll/fd_coro_unix.go:tryReadLock'
+	'internal/poll/fd_coro_unix.go:CoroReadStart'
+	'internal/poll/fd_coro_unix.go:CoroReadFinish'
+	'internal/poll/fd_coro_unix.go:CoroCallRead'
+	'os/file_coro.go:coroReadStart'
+	'os/file_coro.go:coroReadFinish'
+	'net/fd_coro.go:coroReadStart'
+	'net/fd_coro.go:coroReadFinish'
+	'net/fd_coro.go:coroReadError'
+)
+for target in "${coverage_targets[@]}"; do
+	file=${target%:*}
+	function_name=${target##*:}
+	percentage=$(awk -v file="$file" -v fn="$function_name" '
+		index($1, file ":") == 1 && $2 == fn { print $3 }
+	' "$coverage_functions")
+	if [[ -z "$percentage" ]]; then
+		echo "missing coverage for $file $function_name" >&2
+		exit 1
+	fi
+	if ! awk -v value="${percentage%\%}" 'BEGIN { exit value >= 90 ? 0 : 1 }'; then
+		echo "$file $function_name coverage is $percentage, want at least 90%" >&2
+		exit 1
+	fi
+done
+if ! "$coro_goroot/bin/go" test -a -run '^$' -count=1 \
+	-gcflags='-l -d=coro=4' >"$lowering_output" 2>&1; then
+	tail -n 100 "$lowering_output" >&2
+	exit 1
+fi
 
 expected=(
 	yieldLoop
@@ -57,9 +139,17 @@ expected=(
 	fileReads
 	tcpReads
 	waitForEpoch
+	contendedFileRead
+	contendedFileRead1
+	contendedFileRead2
+	contendedFileReads
 	blockingFileRead
 	blockingFileRelease
 	blockingFileRoundTrips
+	contendedTCPRead
+	contendedTCPRead1
+	contendedTCPRead2
+	contendedTCPReads
 	blockingTCPRead
 	blockingTCPRelease
 	blockingTCPRoundTrips
@@ -97,6 +187,39 @@ fi
 for function in "${expected[@]}"; do
 	if ! grep -Eq "\\.${function}\\.coro$" "$symbols_output"; then
 		echo "missing lowered coroutine symbol for $function" >&2
+		exit 1
+	fi
+done
+
+: >"$read_output"
+read_functions=(
+	fileReads
+	blockingFileRead
+	contendedFileRead
+	tcpReads
+	blockingTCPRead
+	contendedTCPRead
+)
+for function in "${read_functions[@]}"; do
+	disassembly=$("$coro_goroot/bin/go" tool objdump \
+		-s "${function}\\.coro\\.func[0-9]+$" "$test_binary")
+	printf '%s\n' "$disassembly" >>"$read_output"
+	case "$function" in
+	fileReads | blockingFileRead | contendedFileRead)
+		read_type='os.(*File)'
+		;;
+	tcpReads | blockingTCPRead | contendedTCPRead)
+		read_type='net.(*conn)'
+		;;
+	esac
+	for phase in Start Finish; do
+		if ! grep -Fq "$read_type.coroRead$phase" <<<"$disassembly"; then
+			echo "$function does not call $read_type.coroRead$phase" >&2
+			exit 1
+		fi
+	done
+	if grep -Fq 'runtime.coroCallRead' <<<"$disassembly"; then
+		echo "$function still calls the generic read worker" >&2
 		exit 1
 	fi
 done

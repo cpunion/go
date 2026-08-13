@@ -22,6 +22,8 @@ const (
 	stacklessCoroPollNextWord
 )
 
+const stacklessCoroPollErrorTag = ^uintptr(0) ^ (^uintptr(0) >> 1)
+
 func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
 	if len(buffer) == 0 {
@@ -40,18 +42,25 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 	stacklessCoroSocketReadStart(op, pd, true)
 }
 
-func startStacklessCoroSocketReadWithPollDesc(ctx unsafe.Pointer, pd *pollDesc,
+func startStacklessCoroSocketReadWithPollDesc(ctx unsafe.Pointer, pd uintptr,
 	fd int, buffer []byte, n *int, errno *uintptr) {
+	descriptor := (*pollDesc)(unsafe.Pointer(pd))
 	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
 	if len(buffer) == 0 {
 		registerStacklessCoroOperation(op)
 		stacklessCoroSocketReadFinish(op, 0, 0)
 		return
 	}
-	if pd == nil {
+	if descriptor == nil {
 		throw("runtime: nil stackless coroutine poll descriptor")
 	}
-	stacklessCoroSocketReadStart(op, pd, false)
+	stacklessCoroSocketReadStart(op, descriptor, false)
+}
+
+//go:linkname poll_runtime_coroSocketRead internal/poll.runtime_coroSocketRead
+func poll_runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr,
+	fd int, buffer []byte, n *int, errno *uintptr) {
+	startStacklessCoroSocketReadWithPollDesc(ctx, pd, fd, buffer, n, errno)
 }
 
 func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
@@ -78,12 +87,15 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 	}
 	for {
 		if resetErr := poll_runtime_pollReset(pd, 'r'); resetErr != pollNoError {
-			stacklessCoroSocketReadFinish(op, -1, uintptr(resetErr))
+			stacklessCoroSocketReadPollFinish(op, resetErr)
 			return
 		}
 		count := read(op.fd, unsafe.Pointer(&op.buffer[0]),
 			stacklessCoroReadLength(len(op.buffer)))
 		KeepAlive(op.buffer)
+		if count == -_EINTR && !op.ownsPollDesc {
+			continue
+		}
 		if count != -_EAGAIN {
 			var readErrno uintptr
 			if count < 0 {
@@ -94,7 +106,7 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 		}
 		waiting, waitErr := netpollCoroReadArm(pd, op)
 		if waitErr != pollNoError {
-			stacklessCoroSocketReadFinish(op, -1, uintptr(waitErr))
+			stacklessCoroSocketReadPollFinish(op, waitErr)
 			return
 		}
 		if waiting {
@@ -102,6 +114,14 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 			return
 		}
 	}
+}
+
+func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
+	status := uintptr(pollErr)
+	if !op.ownsPollDesc {
+		status |= stacklessCoroPollErrorTag
+	}
+	stacklessCoroSocketReadFinish(op, -1, status)
 }
 
 func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, readErrno uintptr) {

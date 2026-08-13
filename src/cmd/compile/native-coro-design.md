@@ -3206,21 +3206,64 @@ the existing FD read lock across suspension. The compiler must call that
 library-owned start/finish boundary rather than learn `poll.FD`, `pollDesc`,
 `netFD`, or `os.File` layout.
 
+The next checkpoint adds that library/compiler boundary for ordinary
+`os.File.Read` and `net.TCPConn.Read`. The compiler recognizes the same two
+public calls as before, but now resolves unexported `coroReadStart` and
+`coroReadFinish` methods from the receiver's method set. It does not import or
+encode any `os`, `net`, or `internal/poll` field layout. A generated start
+state snapshots the receiver, passes the result slots to the library, and
+returns a wait action only when the library reports an outstanding operation.
+A distinct finish state applies the public result projection after wakeup.
+The buffer is a resume-local snapshot because the runtime operation or the
+rare fallback closure has retained its own slice by the time start returns;
+only the receiver and scalar completion state remain in the logical frame.
+Discarded results use private slots, while ordinary results are written
+directly to their normalized destinations.
+
+`internal/poll` owns descriptor serialization and lifetime. Its start helper
+tries the existing FD read lock and has three outcomes: an immediate result, a
+direct operation that retains the lock through finish, or a bounded-worker
+fallback when another read already owns the lock. A regular or explicitly
+blocking file uses the compensated-syscall boundary. A nonblocking pollable
+descriptor borrows its existing runtime poll context, so TCP and pollable
+pipe reads do not register the descriptor a second time. Finish distinguishes
+tagged poll status from raw syscall errno, converts poll errors in
+`internal/poll`, applies the existing EOF rule, and then releases the read
+lock. The `os` and `net` companions retain their existing validation,
+`PathError`, `SyscallError`, `OpError`, address, EOF, and `KeepAlive`
+semantics. Only same-descriptor read-lock contention constructs the old
+worker closure.
+
+The portable probes now force ready, genuinely blocked, and two-reader
+contended file and TCP paths through the ordinary public APIs. Their artifact
+audit requires every generated read resume to call the library start and
+finish methods and rejects a direct `runtime.coroCallRead` reference. Edge
+tests cover nil and closed files, a zero connection, zero-length reads,
+expired file and TCP deadlines, EOF, close publication, and the contended
+fallback. Runtime tests continue to cover borrowed-descriptor readiness,
+deadline, close, stale completion, and raw syscall status independently.
+
+A native Darwin/arm64 comparison against the exact parent used three warm-up
+rounds and 12 Latin-square-ordered 500 ms samples at one P. Ready file and TCP
+reads removed their remaining 64-byte closure allocation and improved by
+96.66% and 97.25%, respectively. Both candidate timings were statistically
+indistinguishable from the official merge-base toolchain. Blocking file and
+TCP timings were statistically unchanged from the exact parent, while their
+per-operation bytes fell from 596 to 584 and their 16 allocations remained.
+The large blocking gap to official Go therefore remains a scheduler handoff
+and logical-operation problem rather than a library-boundary regression; the
+complete data and host-load qualification are recorded in the architecture
+probe README.
+
 The remaining performance sequence is:
 
-1. Connect ordinary `os.File.Read` lowering to the explicit runtime boundary
-   without teaching the compiler private `os` or `internal/poll` layouts.
-   Preserve error projection and typed result ownership while removing the
-   generated closure and worker dispatch.
-2. Connect `net.TCPConn.Read` to the tagged-token runtime boundary through a
-   library-owned companion. Reuse the existing `internal/poll` context and
-   descriptor lifetime instead of teaching the compiler its private layout or
-   registering the raw descriptor twice. Integrate close, deadlines, stale
-   readiness, and error conversion before removing the public worker path.
-3. Reduce public-root entry transitions and typed frame allocation while
+1. Reduce blocking-call scheduler handoff and logical-operation allocation
+   while retaining the lower-cost M replacement boundary and sibling
+   progress.
+2. Reduce public-root entry transitions and typed frame allocation while
    retaining exact compiler-generated GC maps, bounded cache retention, and
    the measured recursion-boundary behavior.
-4. Remove ready-select temporary storage before changing channel-waiter
+3. Remove ready-select temporary storage before changing channel-waiter
    lifetime or ownership.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P

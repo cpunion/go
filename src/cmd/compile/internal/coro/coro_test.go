@@ -227,6 +227,7 @@ func TestYieldLowering(t *testing.T) {
 	program := `package main
 
 import (
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -251,6 +252,8 @@ var ordinaryFile *os.File
 var ordinaryFileBuffer = make([]byte, 4)
 var ordinaryFileN int
 var ordinaryFileErr error
+var ordinaryFileEOFOK bool
+var ordinaryFileZeroOK bool
 var socketFD int
 var socketBuffer = make([]byte, 4)
 var socketN int
@@ -262,6 +265,7 @@ var ordinarySocketErr error
 var ordinarySocketReadOK bool
 var ordinarySocketDeadlineOK bool
 var ordinarySocketCloseOK bool
+var ordinarySocketZeroOK bool
 var socketProgress int
 var parameterResult int
 var returnedResult int
@@ -332,6 +336,11 @@ func socketReader() {
 //go:noinline
 func ordinaryFileReader() {
 	ordinaryFileN, ordinaryFileErr = ordinaryFile.Read(ordinaryFileBuffer)
+}
+
+//go:noinline
+func ordinaryFileDiscard() {
+	_, _ = ordinaryFile.Read(ordinaryFileBuffer[:1])
 }
 
 //go:noinline
@@ -469,6 +478,18 @@ func main() {
 	}
 	ordinaryFile = file
 	ordinaryFileReader()
+	ordinaryFileN, ordinaryFileErr = ordinaryFile.Read(ordinaryFileBuffer[:1])
+	ordinaryFileEOFOK = ordinaryFileN == 0 && ordinaryFileErr == io.EOF
+	ordinaryFileN, ordinaryFileErr = ordinaryFile.Read(ordinaryFileBuffer[:0])
+	ordinaryFileZeroOK = ordinaryFileN == 0 && ordinaryFileErr == nil
+	if _, err := file.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	ordinaryFileDiscard()
+	if _, err := file.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	ordinaryFileReader()
 
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -516,6 +537,8 @@ func main() {
 	ordinarySocketReader()
 	ordinarySocketReadOK = ordinarySocketN == 4 && ordinarySocketErr == nil &&
 		string(ordinarySocketBuffer) == "net!"
+	ordinarySocketN, ordinarySocketErr = ordinarySocket.Read(ordinarySocketBuffer[:0])
+	ordinarySocketZeroOK = ordinarySocketN == 0 && ordinarySocketErr == nil
 
 	if err := server.SetReadDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
 		panic(err)
@@ -552,10 +575,12 @@ func main() {
 		!slept || sleepElapsed < 5*time.Millisecond ||
 		fileN != 4 || fileErrno != 0 || string(fileBuffer) != "file" ||
 		ordinaryFileN != 4 || ordinaryFileErr != nil || string(ordinaryFileBuffer) != "file" ||
+		!ordinaryFileEOFOK || !ordinaryFileZeroOK ||
 		socketN != 4 || socketErrno != 0 || string(socketBuffer) != "poll" ||
 		!ordinarySocketReadOK ||
 		!ordinarySocketDeadlineOK ||
 		!ordinarySocketCloseOK ||
+		!ordinarySocketZeroOK ||
 		socketProgress != 3 {
 		println("nested", nestedResult, nestedElseResult, nestedReturnResult, nestedEvaluationCount)
 		println("basic", next, result, childStage, parentSaw, spawnStage, spawnSaw)
@@ -583,7 +608,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=19"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=20"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
@@ -611,6 +636,21 @@ func main() {
 	}
 	if !strings.Contains(disassembly, "runtime.coroTerminalAction") {
 		t.Fatalf("generated resume function does not check for a recovered panic\n%s",
+			disassembly)
+	}
+	for _, helper := range []string{
+		"os.(*File).coroReadStart",
+		"os.(*File).coroReadFinish",
+		"net.(*conn).coroReadStart",
+		"net.(*conn).coroReadFinish",
+	} {
+		if !strings.Contains(disassembly, helper) {
+			t.Fatalf("generated resume functions do not call %s\n%s",
+				helper, disassembly)
+		}
+	}
+	if strings.Contains(disassembly, "runtime.coroCallRead") {
+		t.Fatalf("generated resume function still constructs a read worker closure\n%s",
 			disassembly)
 	}
 
@@ -651,12 +691,26 @@ var fileBuffer = make([]byte, 4)
 var fileN int
 var fileErr error
 
+var contendedFileStage int32
+var contendedFileDone int32
+var contendedFileRescued int32
+var contendedFileN [2]int
+var contendedFileErr [2]error
+var contendedFileBuffer [2][4]byte
+
 var netProgress int32
 var netRescued int32
 var netReader *net.TCPConn
 var netBuffer = make([]byte, 4)
 var netN int
 var netErr error
+
+var contendedStage int32
+var contendedDone int32
+var contendedRescued int32
+var contendedN [2]int
+var contendedErr [2]error
+var contendedBuffer [2][4]byte
 
 //go:noinline
 func timerProgressor() {
@@ -684,6 +738,15 @@ func fileWaiter() {
 }
 
 //go:noinline
+func contendedFileRead(index int) {
+	atomic.StoreInt32(&contendedFileStage, int32(index+1))
+	n, err := fileReader.Read(contendedFileBuffer[index][:])
+	contendedFileN[index] = n
+	contendedFileErr[index] = err
+	atomic.AddInt32(&contendedFileDone, 1)
+}
+
+//go:noinline
 func netProgressor() {
 	atomic.StoreInt32(&netProgress, 1)
 	runtime.Gosched()
@@ -693,6 +756,15 @@ func netProgressor() {
 func netWaiter() {
 	go netProgressor()
 	netN, netErr = netReader.Read(netBuffer)
+}
+
+//go:noinline
+func contendedNetRead(index int) {
+	atomic.StoreInt32(&contendedStage, int32(index+1))
+	n, err := netReader.Read(contendedBuffer[index][:])
+	contendedN[index] = n
+	contendedErr[index] = err
+	atomic.AddInt32(&contendedDone, 1)
 }
 
 func main() {
@@ -732,6 +804,25 @@ func main() {
 	}()
 	fileWaiter()
 
+	go contendedFileRead(0)
+	for atomic.LoadInt32(&contendedFileStage) < 1 {
+		runtime.Gosched()
+	}
+	go contendedFileRead(1)
+	for atomic.LoadInt32(&contendedFileStage) < 2 {
+		runtime.Gosched()
+	}
+	if _, err := writeFile.Write([]byte("one!two!")); err != nil {
+		panic(err)
+	}
+	fileContentionDeadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&contendedFileDone) != 2 && time.Now().Before(fileContentionDeadline) {
+		runtime.Gosched()
+	}
+	if atomic.LoadInt32(&contendedFileDone) != 2 {
+		atomic.StoreInt32(&contendedFileRescued, 1)
+	}
+
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		panic(err)
@@ -767,11 +858,40 @@ func main() {
 	}()
 	netWaiter()
 
+	go contendedNetRead(0)
+	for atomic.LoadInt32(&contendedStage) < 1 {
+		runtime.Gosched()
+	}
+	go contendedNetRead(1)
+	for atomic.LoadInt32(&contendedStage) < 2 {
+		runtime.Gosched()
+	}
+	if _, err := client.Write([]byte("one!two!")); err != nil {
+		panic(err)
+	}
+	contentionDeadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&contendedDone) != 2 && time.Now().Before(contentionDeadline) {
+		runtime.Gosched()
+	}
+	if atomic.LoadInt32(&contendedDone) != 2 {
+		atomic.StoreInt32(&contendedRescued, 1)
+	}
+
 	if !timerOK ||
 		atomic.LoadInt32(&fileRescued) != 0 ||
 		fileN != 4 || fileErr != nil || string(fileBuffer) != "file" ||
+		atomic.LoadInt32(&contendedFileRescued) != 0 ||
+		contendedFileN != [2]int{4, 4} ||
+		contendedFileErr != [2]error{} ||
+		string(contendedFileBuffer[0][:]) != "one!" ||
+		string(contendedFileBuffer[1][:]) != "two!" ||
 		atomic.LoadInt32(&netRescued) != 0 ||
-		netN != 4 || netErr != nil || string(netBuffer) != "net!" {
+		netN != 4 || netErr != nil || string(netBuffer) != "net!" ||
+		atomic.LoadInt32(&contendedRescued) != 0 ||
+		contendedN != [2]int{4, 4} ||
+		contendedErr != [2]error{} ||
+		string(contendedBuffer[0][:]) != "one!" ||
+		string(contendedBuffer[1][:]) != "two!" {
 		panic("operation blocked stackless scheduling")
 	}
 	println("stackless-coro-operation-progress-ok")

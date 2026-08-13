@@ -13,3 +13,15 @@ package poll
 func (fd *FD) EOFError(n int, err error) error {
 	return fd.eofError(n, err)
 }
+
+func (fd *FD) CoroTestReadLock() error {
+	return fd.readLock()
+}
+
+func (fd *FD) CoroTestReadUnlock() {
+	fd.readUnlock()
+}
+
+func (fd *FD) CoroTestMarkClosed() {
+	fd.fdmu.increfAndClose()
+}
