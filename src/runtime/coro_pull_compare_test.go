@@ -749,6 +749,33 @@ func TestStacklessCoroPushPullComparison(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSelfFramePullFallback(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	tracker := &stacklessCoroSelfFrameTracker{
+		rootDepth: 8, roundsRemaining: 1,
+	}
+	stacklessCoroSelfFrameActive = tracker
+	defer func() { stacklessCoroSelfFrameActive = nil }()
+	root := &runtime.StacklessCoroSelfFrameForTest{
+		Depth: tracker.rootDepth,
+		Value: &tracker.total,
+	}
+	runtime.RunStacklessCoroPullFrameForTest(unsafe.Pointer(root),
+		stacklessCoroSelfFrameResume)
+	if tracker.total != tracker.rootDepth+1 {
+		t.Fatalf("completed frames = %d, want %d",
+			tracker.total, tracker.rootDepth+1)
+	}
+	if tracker.firstAwaitAction != runtime.StacklessCoroActionWait ||
+		tracker.firstAwaitFused {
+		t.Fatalf("first await = (action %d, fused %t), want (%d, false)",
+			tracker.firstAwaitAction, tracker.firstAwaitFused,
+			runtime.StacklessCoroActionWait)
+	}
+}
+
 func stacklessCoroComparisonCompleteResume(unsafe.Pointer) uint8 {
 	return runtime.StacklessCoroActionComplete
 }

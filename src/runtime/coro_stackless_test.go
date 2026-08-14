@@ -1260,7 +1260,10 @@ func TestStacklessCoroSelfFrameFusion(t *testing.T) {
 	})
 
 	t.Run("panic-unwind", func(t *testing.T) {
-		tracker := &stacklessCoroSelfFrameTracker{rootDepth: 16, panicLeaf: true}
+		depth := runtime.StacklessCoroTaskCacheSize +
+			runtime.StacklessCoroFrameChunkDirectCount +
+			2*runtime.StacklessCoroFrameChunkSize
+		tracker := &stacklessCoroSelfFrameTracker{rootDepth: depth, panicLeaf: true}
 		defer func() {
 			stacklessCoroSelfFrameActive = nil
 			if value := recover(); value != "stackless coroutine fused-frame panic" {
