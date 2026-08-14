@@ -46,6 +46,10 @@ const stacklessCoroOperationCacheSize = 64
 // turning a genuinely external read into polling.
 const stacklessCoroIdlePollAttempts = 4
 
+// Limit a cold-path registry scan to one scheduler's bounded operation cache.
+// Missing a read only preserves the ordinary netpoll wake path.
+const stacklessCoroIdlePollScanLimit = stacklessCoroOperationCacheSize
+
 // stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
 // created after the task cache saturated. It cannot be a cached frame size.
 const stacklessCoroUncachedFrameLineage = ^uint16(0)

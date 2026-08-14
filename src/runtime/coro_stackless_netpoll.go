@@ -125,7 +125,10 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 	exclude, previous *stacklessCoroTask) *stacklessCoroTask {
 	lock(&stacklessCoroOperations.lock)
-	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+	scanned := 0
+	for op := stacklessCoroOperations.head; op != nil &&
+		scanned < stacklessCoroIdlePollScanLimit; op = op.next {
+		scanned++
 		if op.scheduler != s || op.task == exclude ||
 			op.task == previous || op.async ||
 			op.packet[stacklessCoroPollDescWord] == 0 {
