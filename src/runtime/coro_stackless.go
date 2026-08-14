@@ -763,9 +763,10 @@ func (scope *stacklessCoroRunScope) leave() {
 	}
 }
 
-// runTasks drives the ready queue until the root completes or one resume
-// panics. A recovered panic returns to run, which starts another queue-driving
-// episode after this native activation has unwound.
+// runTasks drives the ready queue until the root completes, one resume panics,
+// or a non-parking episode exhausts ready work. A recovered panic returns to
+// run, which starts another queue-driving episode after this native activation
+// has unwound.
 func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
@@ -2237,6 +2238,9 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 		}
 	}
 	for !s.rootComplete() {
+		// Run ready work on the fixed native stack, but park this ordinary G
+		// between episodes. Keeping an idle synthetic executor locked to its M
+		// would make every blocking-call handoff pay stoplockedm/startlockedm.
 		if coroRunOnNativeStack(s) == nil {
 			s.run(false)
 			break

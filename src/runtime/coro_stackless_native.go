@@ -37,9 +37,11 @@ type stacklessCoroNativeContext struct {
 	lockedG            guintptr
 	lockedInt          uint32
 	g0Accurate         bool
-	root               bool
-	sigmask            sigset
-	poolNext           *stacklessCoroNativeContext
+	// root keeps the public driver active across an empty ready queue.
+	// Replacement activations drain ready work and park on their caller G.
+	root     bool
+	sigmask  sigset
+	poolNext *stacklessCoroNativeContext
 }
 
 var stacklessCoroNativePool struct {
