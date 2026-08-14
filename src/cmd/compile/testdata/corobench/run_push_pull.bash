@@ -49,7 +49,8 @@ fi
 	git -C "$goroot" diff --stat
 } >"$manifest"
 
-CGO_ENABLED=1 GOEXPERIMENT=coro "$goroot/bin/go" test -c runtime \
+CGO_ENABLED=1 GOEXPERIMENT=coro "$goroot/bin/go" test \
+	-tags=coropullcompare -c runtime \
 	-o "$test_binary"
 
 regular='^BenchmarkStacklessCoroPushPull(Entry|Yield|Await1|Await8|Await64|Await256|Await4096|Timer|FileReady|FileBlocked|SocketReady|SocketBlocked|DirectCSteady|DirectCEpisodes)$'

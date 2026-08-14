@@ -122,7 +122,7 @@ multi-subbenchmark process.
 Correctness alone can be checked with:
 
 ```
-GOEXPERIMENT=coro go test runtime \
+GOEXPERIMENT=coro go test -tags=coropullcompare runtime \
   -run '^TestStacklessCoroPushPull(Comparison|DirectCComparison)$'
 ```
 

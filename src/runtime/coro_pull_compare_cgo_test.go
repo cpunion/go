@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build cgo && goexperiment.coro && ((darwin && arm64) || (linux && amd64))
+//go:build cgo && goexperiment.coro && coropullcompare && ((darwin && arm64) || (linux && amd64))
 
 package runtime_test
 
