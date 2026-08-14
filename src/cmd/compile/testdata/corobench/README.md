@@ -6,6 +6,10 @@ exact upstream merge-base. The same source directory is compiled by both
 toolchains. It imports no private coroutine package and uses no source
 annotation to select coroutine functions.
 
+[`PUSH_PULL.md`](PUSH_PULL.md) defines the controlled comparison between the
+current exact-task push queue, a Rust-like wake-and-poll driver with identical
+task representation, and a compact structured-frame pull model.
+
 These are architecture probes, not a complete language or standard-library
 benchmark suite. The first set deliberately prioritizes places where the
 implementations differ most:

@@ -87,6 +87,15 @@ jobs:
           internal/buildcfg
           runtime
 
+      - name: Test push and pull comparison
+        env:
+          GOEXPERIMENT: coro
+        run: |
+          ./bin/go test -tags=coropullcompare -count=1 -cover \
+            runtime -run '^TestStacklessCoro'
+          ./bin/go test -race -tags=coropullcompare -count=1 \
+            runtime -run '^TestStacklessCoroPushPull'
+
       - name: Test coroutine architecture probes
         working-directory: src/cmd/compile/testdata/corobench
         env:
