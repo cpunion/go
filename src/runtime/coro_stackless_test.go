@@ -2211,6 +2211,134 @@ func TestStacklessCoroRootSchedulerPool(t *testing.T) {
 	}
 }
 
+type stacklessCoroRootFrameCacheTestFrame struct {
+	value      int
+	total      *int
+	needsClear *bool
+}
+
+func stacklessCoroRootFrameCacheResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroRootFrameCacheTestFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	*frame.needsClear = runtime.FrameNeedsClearStacklessCoroForTest(ctx)
+	*frame.total += frame.value
+	frame.total = nil
+	frame.needsClear = nil
+	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroRootFrameCacheOtherResume(unsafe.Pointer) uint8 {
+	return runtime.StacklessCoroActionComplete
+}
+
+func TestStacklessCoroRootFrameCache(t *testing.T) {
+	runtime.ClearStacklessCoroRootFramePoolForTest()
+	defer runtime.ClearStacklessCoroRootFramePoolForTest()
+
+	size := unsafe.Sizeof(stacklessCoroRootFrameCacheTestFrame{})
+	for _, invalid := range []struct {
+		resume func(unsafe.Pointer) uint8
+		size   uintptr
+	}{
+		{nil, size},
+		{stacklessCoroRootFrameCacheResume, 0},
+		{stacklessCoroRootFrameCacheResume,
+			runtime.StacklessCoroFrameCacheSize + 1},
+	} {
+		if got := runtime.TakeRootStacklessCoroFrameForTest(
+			invalid.resume, invalid.size); got != nil {
+			t.Fatalf("invalid root frame cache lookup returned %p", got)
+		}
+	}
+	total := 0
+	needsClear := false
+	frame := &stacklessCoroRootFrameCacheTestFrame{
+		value: 1, total: &total, needsClear: &needsClear,
+	}
+	quiescent := runtime.RunCachedStacklessCoroFrameForTest(
+		unsafe.Pointer(frame), stacklessCoroRootFrameCacheResume, size)
+	if total != 1 {
+		t.Fatalf("root frame total = %d, want 1", total)
+	}
+	if race.Enabled {
+		if quiescent || needsClear {
+			t.Fatalf("race root frame = (quiescent %t, clear %t), want false, false",
+				quiescent, needsClear)
+		}
+		runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(frame),
+			stacklessCoroRootFrameCacheResume, size)
+		if got := runtime.TakeRootStacklessCoroFrameForTest(
+			stacklessCoroRootFrameCacheResume, size); got != nil {
+			t.Fatalf("race root frame cache returned %p", got)
+		}
+		return
+	}
+	if !quiescent || !needsClear {
+		t.Fatalf("root frame = (quiescent %t, clear %t), want true, true",
+			quiescent, needsClear)
+	}
+	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(frame),
+		stacklessCoroRootFrameCacheResume, size)
+	if got := runtime.StacklessCoroRootFramePoolSizeForTest(); got != 1 {
+		t.Fatalf("root frame pool size = %d, want 1", got)
+	}
+	if got := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheResume, size+1); got != nil {
+		t.Fatalf("root frame cache returned %p for the wrong size", got)
+	}
+	if got := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheOtherResume, size); got != nil {
+		t.Fatalf("root frame cache returned %p for the wrong resume", got)
+	}
+	if got := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheResume, size); got != unsafe.Pointer(frame) {
+		t.Fatalf("root frame cache returned %p, want %p", got, frame)
+	}
+
+	const roots = runtime.StacklessCoroWarmExecutorCount + 1
+	frames := make([]stacklessCoroRootFrameCacheTestFrame, roots)
+	for i := range frames {
+		needsClear := false
+		frames[i] = stacklessCoroRootFrameCacheTestFrame{
+			value: i + 1, total: &total, needsClear: &needsClear,
+		}
+		if !runtime.RunCachedStacklessCoroFrameForTest(
+			unsafe.Pointer(&frames[i]), stacklessCoroRootFrameCacheResume,
+			size) {
+			t.Fatalf("root frame %d did not become quiescent", i)
+		}
+		runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(&frames[i]),
+			stacklessCoroRootFrameCacheResume, size)
+	}
+	if got := runtime.StacklessCoroRootFramePoolSizeForTest(); got !=
+		runtime.StacklessCoroWarmExecutorCount {
+		t.Fatalf("bounded root frame pool size = %d, want %d", got,
+			runtime.StacklessCoroWarmExecutorCount)
+	}
+	seen := make(map[unsafe.Pointer]bool)
+	for range runtime.StacklessCoroWarmExecutorCount {
+		got := runtime.TakeRootStacklessCoroFrameForTest(
+			stacklessCoroRootFrameCacheResume, size)
+		if got == nil || seen[got] {
+			t.Fatalf("root frame cache returned invalid frame %p", got)
+		}
+		seen[got] = true
+	}
+	if got := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheResume, size); got != nil {
+		t.Fatalf("empty root frame cache returned %p", got)
+	}
+	runtime.ReleaseRootStacklessCoroFrameForTest(nil,
+		stacklessCoroRootFrameCacheResume, size)
+	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(frame), nil, size)
+	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(frame),
+		stacklessCoroRootFrameCacheResume,
+		runtime.StacklessCoroFrameCacheSize+1)
+	if got := runtime.StacklessCoroRootFramePoolSizeForTest(); got != 0 {
+		t.Fatalf("invalid releases left %d root frames", got)
+	}
+}
+
 func TestStacklessCoroEmbeddedRoot(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		if !runtime.RootEmbeddedStacklessCoroForTest(ctx) {

@@ -3702,11 +3702,24 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	closureVars := slices.Clone(resume.ClosureVars)
 	fields := make([]*types.Field, len(closureVars))
 	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
+	outerFields := make(map[*ir.Name]*types.Field, len(closureVars))
 	for i, variable := range closureVars {
 		field := types.NewField(variable.Pos(),
 			typecheck.LookupNum("F", i), variable.Type())
 		fields[i] = field
 		replacements[variable] = field
+		outerFields[variable.Outer.Canonical()] = field
+	}
+	resultValueFields := make([]*types.Field, len(candidate.resultValues))
+	rootResultValueFields := make(map[*types.Field]bool,
+		len(candidate.resultValues))
+	rootResultTargets := make(map[*ir.Name]*types.Field,
+		len(candidate.resultPtrs))
+	for i, value := range candidate.resultValues {
+		resultValueFields[i] = outerFields[value.Canonical()]
+		rootResultValueFields[resultValueFields[i]] = true
+		rootResultTargets[candidate.resultPtrs[i].Canonical()] =
+			resultValueFields[i]
 	}
 	frameType := types.NewStruct(fields)
 	frameType.SetNoalg(true)
@@ -3729,12 +3742,28 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	resume.ClosureVars = nil
 	var pointerClears ir.Nodes
 	for _, field := range fields {
-		if !field.Type.HasPointers() {
+		if !field.Type.HasPointers() || rootResultValueFields[field] {
 			continue
 		}
 		pointerClears = append(pointerClears, ir.NewAssignStmt(pos,
 			explicitFrameField(pos, frame, field),
 			ir.NewZero(pos, field.Type)))
+	}
+	var resultPointerClears ir.Nodes
+	for i, resultField := range resultValueFields {
+		if !resultField.Type.HasPointers() {
+			continue
+		}
+		targetField := outerFields[candidate.resultPtrs[i].Canonical()]
+		target := explicitFrameField(pos, frame, targetField)
+		selfTarget := typecheck.NodAddr(
+			explicitFrameField(pos, frame, resultField))
+		externalTarget := ir.NewBinaryExpr(pos, ir.ONE, target, selfTarget)
+		clear := ir.NewAssignStmt(pos,
+			explicitFrameField(pos, frame, resultField),
+			ir.NewZero(pos, resultField.Type))
+		resultPointerClears = append(resultPointerClears,
+			ir.NewIfStmt(pos, externalTarget, ir.Nodes{clear}, nil))
 	}
 	var clearCompletedFrame func(ir.Node) ir.Node
 	clearCompletedFrame = func(node ir.Node) ir.Node {
@@ -3742,12 +3771,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			len(ret.Results) == 1 &&
 			ir.IsConst(ret.Results[0], constant.Int) &&
 			ir.Int64Val(ret.Results[0]) == int64(actionComplete) &&
-			len(pointerClears) != 0 {
+			len(pointerClears)+len(resultPointerClears) != 0 {
 			cacheFrame := typecheck.Call(ret.Pos(),
 				typecheck.LookupRuntime("coroFrameNeedsClear"),
 				ir.Nodes{resume.Dcl[0]}, false)
-			clear := ir.NewIfStmt(ret.Pos(), cacheFrame,
-				slices.Clone(pointerClears), nil)
+			clears := slices.Clone(resultPointerClears)
+			clears = append(clears, pointerClears...)
+			clear := ir.NewIfStmt(ret.Pos(), cacheFrame, clears, nil)
 			return ir.NewBlockStmt(ret.Pos(), ir.Nodes{clear, ret})
 		}
 		ir.EditChildren(node, clearCompletedFrame)
@@ -3801,7 +3831,16 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations = append(declarations,
 		ir.NewDecl(pos, ir.ODCL, factoryResume),
 		ir.NewAssignStmt(pos, factoryResume, resume.OClosure))
-	frameSize := typedInt(pos, types.Types[types.TUINTPTR], frameType.Size())
+	frameSize := func() ir.Node {
+		return typedInt(pos, types.Types[types.TUINTPTR], frameType.Size())
+	}
+	takeRootFrame := typecheck.Call(pos,
+		typecheck.LookupRuntime("coroTakeRootFrame"), ir.Nodes{
+			factoryResume, frameSize(),
+		}, false)
+	rootAssignment := ir.NewAssignStmt(pos, factoryFrame,
+		typecheck.ConvNop(takeRootFrame, framePointerType))
+	var takeChildFrame ir.Node
 	// Await suspends the parent before starting its child. A recursive spawn
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
@@ -3809,35 +3848,44 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
 		takeFrame := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTakeFrameChunk"), ir.Nodes{
-				factoryCtx, factoryResume, frameSize,
+				factoryCtx, factoryResume, frameSize(),
 				reflectdata.TypePtrAt(pos, frameChunkType),
 			}, false)
-		declarations = append(declarations,
-			ir.NewAssignStmt(pos, factoryFrame,
-				typecheck.ConvNop(takeFrame, framePointerType)))
-		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
-			ir.NewNilExpr(pos, framePointerType))
-		declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
-			ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
-				typedNew(pos, frameType))}, nil))
+		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
+			typecheck.ConvNop(takeFrame, framePointerType))
 	} else {
 		takeFrame := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTakeFrame"), ir.Nodes{
-				factoryCtx, factoryResume, frameSize,
+				factoryCtx, factoryResume, frameSize(),
 			}, false)
-		declarations = append(declarations,
-			ir.NewAssignStmt(pos, factoryFrame,
-				typecheck.ConvNop(takeFrame, framePointerType)))
-		missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
-			ir.NewNilExpr(pos, framePointerType))
-		declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
-			ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
-				typedNew(pos, frameType))}, nil))
+		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
+			typecheck.ConvNop(takeFrame, framePointerType))
 	}
+	isRootFactory := func() ir.Node {
+		return ir.NewBinaryExpr(pos, ir.OEQ, factoryCtx,
+			ir.NewNilExpr(pos, factoryCtx.Type()))
+	}
+	declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(),
+		ir.Nodes{rootAssignment}, ir.Nodes{takeChildFrame}))
+	missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
+		ir.NewNilExpr(pos, framePointerType))
+	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
+		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
+			typedNew(pos, frameType))}, nil))
 	for i, variable := range closureVars {
-		declarations = append(declarations, ir.NewAssignStmt(pos,
-			explicitFrameField(variable.Pos(), factoryFrame, fields[i]),
-			variable.Outer))
+		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
+		resultField := rootResultTargets[variable.Outer.Canonical()]
+		if resultField == nil {
+			declarations = append(declarations,
+				ir.NewAssignStmt(pos, target, variable.Outer))
+			continue
+		}
+		selfTarget := typecheck.NodAddr(explicitFrameField(variable.Pos(),
+			factoryFrame, resultField))
+		rootResult := ir.NewAssignStmt(pos, target, selfTarget)
+		childResult := ir.NewAssignStmt(pos, target, variable.Outer)
+		declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(),
+			ir.Nodes{rootResult}, ir.Nodes{childResult}))
 	}
 
 	oldCurFunc := ir.CurFunc
@@ -3862,23 +3910,48 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		args = append(args, argument)
 	}
 	for _, field := range fn.Type().Results() {
-		result, _ := field.Nname.(ir.Node)
-		args = append(args, typecheck.NodAddr(result))
+		args = append(args, ir.NewNilExpr(pos, types.NewPtr(field.Type)))
 	}
 	newFrame := typecheck.TempAt(pos, fn, unsafePointerType)
 	newResume := typecheck.TempAt(pos, fn, stacklessResumeType())
+	quiescentRoot := typecheck.TempAt(pos, fn, types.Types[types.TBOOL])
 	makeFrame := typecheck.Call(pos, factory.Nname, args, false)
 	assignFrame := ir.NewAssignListStmt(pos, ir.OAS2,
 		ir.Nodes{newFrame, newResume}, ir.Nodes{makeFrame})
 	run := typecheck.Call(pos, typecheck.LookupRuntime("coroRunFrame"),
-		ir.Nodes{newFrame, newResume}, false)
+		ir.Nodes{newFrame, newResume, frameSize()}, false)
+	runFrame := ir.NewAssignStmt(pos, quiescentRoot, run)
+	copyResults := make(ir.Nodes, 0, len(resultValueFields))
+	var clearResultPointers ir.Nodes
+	for i, field := range fn.Type().Results() {
+		result, _ := field.Nname.(ir.Node)
+		typedFrame := typecheck.ConvNop(newFrame, framePointerType)
+		copyResults = append(copyResults, ir.NewAssignStmt(pos, result,
+			explicitFrameField(pos, typedFrame, resultValueFields[i])))
+		if resultValueFields[i].Type.HasPointers() {
+			typedFrame = typecheck.ConvNop(newFrame, framePointerType)
+			clearResultPointers = append(clearResultPointers,
+				ir.NewAssignStmt(pos,
+					explicitFrameField(pos, typedFrame, resultValueFields[i]),
+					ir.NewZero(pos, resultValueFields[i].Type)))
+		}
+	}
+	releaseFrame := typecheck.Call(pos,
+		typecheck.LookupRuntime("coroReleaseRootFrame"), ir.Nodes{
+			newFrame, newResume, frameSize(),
+		}, false)
 	fn.Body = []ir.Node{
 		ir.NewDecl(pos, ir.ODCL, newFrame),
 		ir.NewDecl(pos, ir.ODCL, newResume),
+		ir.NewDecl(pos, ir.ODCL, quiescentRoot),
 		assignFrame,
-		run,
-		ir.NewReturnStmt(pos, nil),
+		runFrame,
 	}
+	fn.Body = append(fn.Body, copyResults...)
+	fn.Body = append(fn.Body, clearResultPointers...)
+	fn.Body = append(fn.Body,
+		ir.NewIfStmt(pos, quiescentRoot, ir.Nodes{releaseFrame}, nil),
+		ir.NewReturnStmt(pos, nil))
 	typecheck.Stmts(fn.Body)
 	ir.CurFunc = oldCurFunc
 

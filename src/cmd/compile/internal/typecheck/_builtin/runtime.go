@@ -194,7 +194,9 @@ func block()
 
 // stackless coroutine scheduler
 func coroRun(func(unsafe.Pointer) uint8)
-func coroRunFrame(unsafe.Pointer, func(unsafe.Pointer) uint8)
+func coroRunFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr) bool
+func coroTakeRootFrame(func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
+func coroReleaseRootFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr)
 func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroAwaitFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)

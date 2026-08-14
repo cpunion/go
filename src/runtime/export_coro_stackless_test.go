@@ -43,7 +43,22 @@ func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 
 func RunStacklessCoroFrameForTest(frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) {
-	coroRunFrame(frame, resume)
+	coroRunFrame(frame, resume, 0)
+}
+
+func RunCachedStacklessCoroFrameForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr) bool {
+	return coroRunFrame(frame, resume, size)
+}
+
+func TakeRootStacklessCoroFrameForTest(resume func(unsafe.Pointer) uint8,
+	size uintptr) unsafe.Pointer {
+	return coroTakeRootFrame(resume, size)
+}
+
+func ReleaseRootStacklessCoroFrameForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr) {
+	coroReleaseRootFrame(frame, resume, size)
 }
 
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
@@ -954,6 +969,22 @@ func StacklessCoroWakePoolSizeForTest() int {
 
 func StacklessCoroRootSchedulerPoolSizeForTest() int {
 	return len(stacklessCoroRootSchedulerPool.available)
+}
+
+func StacklessCoroRootFramePoolSizeForTest() int {
+	return len(stacklessCoroRootFramePool.available)
+}
+
+func ClearStacklessCoroRootFramePoolForTest() int {
+	count := 0
+	for {
+		select {
+		case <-stacklessCoroRootFramePool.available:
+			count++
+		default:
+			return count
+		}
+	}
 }
 
 func SchedulerStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {

@@ -4510,6 +4510,15 @@ func finalize(value *payload) {
 }
 
 //go:noinline
+func cachedResults(set bool) (number int64, pointer *payload) {
+	runtime.Gosched()
+	if set {
+		return 47, &payload{value: 53}
+	}
+	return
+}
+
+//go:noinline
 func cached(pointer *payload) int64 {
 	runtime.Gosched()
 	result := pointer.value
@@ -4545,6 +4554,14 @@ func waitFinalizer(want int64) {
 }
 
 func main() {
+	number, pointer := cachedResults(true)
+	if number != 47 || pointer == nil || pointer.value != 53 {
+		panic("bad first cached root results")
+	}
+	number, pointer = cachedResults(false)
+	if number != 0 || pointer != nil {
+		panic("cached root retained stale results")
+	}
 	if makeAndRun(41) != 41 {
 		panic("bad first cached result")
 	}
