@@ -1270,7 +1270,11 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 	})
 
 	t.Run("native-context", func(t *testing.T) {
-		var frames [runtime.StacklessCoroWarmExecutorCount + 1]unsafe.Pointer
+		roots := runtime.StacklessCoroClearNativeTaskCachesForTest()
+		if roots == 0 {
+			roots = runtime.StacklessCoroWarmExecutorCount
+		}
+		frames := make([]unsafe.Pointer, roots+1)
 		for i := range frames {
 			state, total := 0, 0
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {

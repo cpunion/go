@@ -38,6 +38,21 @@ func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 	return
 }
 
+func StacklessCoroClearNativeTaskCachesForTest() int {
+	available := stacklessCoroNativePool.available
+	count := len(available)
+	for range count {
+		ctx := <-available
+		ctx.freeTasks = nil
+		ctx.freePlainTaskCount = 0
+		ctx.freeFrameBytes = 0
+		ctx.cachedFrameTasks = 0
+		ctx.cachedFrameBytes = 0
+		available <- ctx
+	}
+	return count
+}
+
 var stacklessCoroNativeReplacementDrainTest struct {
 	runs   int
 	native bool
