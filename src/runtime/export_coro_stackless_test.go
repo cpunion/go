@@ -25,6 +25,7 @@ const (
 	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
 	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
+	StacklessCoroSelectCaseCacheSize   = stacklessCoroSelectCaseCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -180,6 +181,10 @@ func DeferRecoverStacklessCoroForTest(token unsafe.Pointer) any {
 
 func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
+}
+
+func StacklessCoroOperationSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroOperation{})
 }
 
 func StacklessCoroSchedulerSizeForTest() uintptr {
@@ -516,6 +521,34 @@ func (cache *StacklessCoroChannelWaiterCacheForTest) Valid() bool {
 type StacklessCoroSelectCasesForTest struct {
 	cases  []scase
 	nsends int
+}
+
+type StacklessCoroSelectStorageForTest struct {
+	selection stacklessCoroSelect
+	cases     [stacklessCoroSelectCaseCacheSize + 1]scase
+	chosen    int
+	received  bool
+}
+
+func NewStacklessCoroSelectStorageForTest() *StacklessCoroSelectStorageForTest {
+	return new(StacklessCoroSelectStorageForTest)
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Cycle(n int) {
+	if n < 0 || n > len(cache.cases) {
+		throw("runtime: invalid stackless coroutine select cache test size")
+	}
+	cache.selection.prepare(cache.cases[:n], n, n, 0,
+		&cache.chosen, &cache.received)
+	cache.selection.clear()
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Valid() bool {
+	return cache.selection.validCache()
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Capacities() (locks, waiters int) {
+	return cap(cache.selection.lockOrder), cap(cache.selection.waiters)
 }
 
 func NewStacklessCoroSelectCasesForTest(channels []any,
