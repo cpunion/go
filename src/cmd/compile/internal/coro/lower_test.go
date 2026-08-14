@@ -379,10 +379,11 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	}
 
 	takeFrames, allocations, chunks, chunkTypes := 0, 0, 0, 0
+	var frameType *types.Type
 	ir.VisitList(factory.Body, func(node ir.Node) {
 		if call, ok := node.(*ir.CallExpr); ok &&
 			symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
-				"runtime.coroTakeFrameChunk" {
+				"runtime.coroTakeSelfFrame" {
 			takeFrames++
 			if len(call.Args) == 4 && call.Args[3].Type().IsPtr() {
 				chunkTypes++
@@ -394,6 +395,9 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		}
 		allocations++
 		typ := allocation.Type().Elem()
+		if typ.Kind() == types.TSTRUCT {
+			frameType = typ
+		}
 		if typ.Kind() == types.TARRAY &&
 			typ.NumElem() == explicitFrameChunkSize {
 			chunks++
@@ -402,6 +406,37 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	if takeFrames != 1 || allocations != 1 || chunks != 0 || chunkTypes != 1 {
 		t.Fatalf("recursive factory has %d chunk lookups, %d allocations, %d local chunks, and %d chunk types; want 1, 1, 0, and 1",
 			takeFrames, allocations, chunks, chunkTypes)
+	}
+	if frameType == nil || frameType.NumFields() < 3 ||
+		!frameType.FieldType(0).IsUnsafePtr() ||
+		!frameType.FieldType(1).IsUnsafePtr() ||
+		frameType.FieldType(2) != types.Types[types.TUINT8] ||
+		frameType.FieldOff(0) != 0 ||
+		frameType.FieldOff(1) != int64(types.PtrSize) ||
+		frameType.FieldOff(2) != int64(2*types.PtrSize) {
+		t.Fatalf("recursive frame header = %v, want parent, owner, and marker prefix",
+			frameType)
+	}
+	runtimeCalls := make(map[string]int)
+	for _, generated := range typecheck.Target.Funcs {
+		ir.VisitList(generated.Body, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
+			runtimeCalls[name]++
+		})
+	}
+	for _, name := range []string{
+		"runtime.coroTakeSelfFrame",
+		"runtime.coroAwaitSelfFrame",
+		"runtime.coroCompleteSelfFrame",
+	} {
+		if runtimeCalls[name] != 1 {
+			t.Errorf("lowered recursive function has %d %s calls, want one",
+				runtimeCalls[name], name)
+		}
 	}
 }
 

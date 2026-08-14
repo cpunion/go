@@ -1003,6 +1003,281 @@ func TestStacklessCoroSchedulerSize(t *testing.T) {
 	}
 }
 
+type stacklessCoroSelfFrameTracker struct {
+	rootDepth            int
+	total                int
+	firstAwaitAction     uint8
+	firstAwaitFused      bool
+	spawnAwaitSibling    bool
+	spawnCompleteSibling bool
+	panicLeaf            bool
+	sleepLeaf            bool
+	order                int
+	awaitSiblingOrder    int
+	firstChildOrder      int
+	completeSiblingOrder int
+	completeParentOrder  int
+	sawCacheOwner        bool
+	sawDirectFirst       bool
+	sawDirectLast        bool
+	sawChunkFirst        bool
+	sawChunkLast         bool
+	roundsRemaining      int
+}
+
+var stacklessCoroSelfFrameActive *stacklessCoroSelfFrameTracker
+
+func stacklessCoroSelfFrameAwaitSibling(unsafe.Pointer) uint8 {
+	tracker := stacklessCoroSelfFrameActive
+	tracker.order++
+	tracker.awaitSiblingOrder = tracker.order
+	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroSelfFrameCompleteSibling(unsafe.Pointer) uint8 {
+	tracker := stacklessCoroSelfFrameActive
+	tracker.order++
+	tracker.completeSiblingOrder = tracker.order
+	return runtime.StacklessCoroActionComplete
+}
+
+func completeStacklessCoroSelfFrame(ctx unsafe.Pointer,
+	frame *runtime.StacklessCoroSelfFrameForTest,
+	tracker *stacklessCoroSelfFrameTracker) uint8 {
+	frame.State = 2
+	tracker.total++
+	if frame.Parent != nil {
+		if runtime.FrameNeedsClearStacklessCoroForTest(ctx) {
+			frame.Value = nil
+		}
+		return runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+	}
+	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroSelfFrameActive
+	if terminal := runtime.TerminalActionStacklessCoroForTest(ctx); terminal != runtime.StacklessCoroActionInvalid {
+		return terminal
+	}
+	frame := (*runtime.StacklessCoroSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		if frame.Depth == tracker.rootDepth-1 {
+			tracker.order++
+			tracker.firstChildOrder = tracker.order
+		}
+		if frame.Depth == 0 {
+			if tracker.panicLeaf {
+				panic("stackless coroutine fused-frame panic")
+			}
+			if tracker.spawnCompleteSibling {
+				tracker.spawnCompleteSibling = false
+				runtime.SpawnStacklessCoroForTest(ctx,
+					stacklessCoroSelfFrameCompleteSibling)
+			}
+			if tracker.sleepLeaf {
+				tracker.sleepLeaf = false
+				frame.State = 3
+				if runtime.SleepStacklessCoroForTest(ctx, 1) {
+					return runtime.StacklessCoroActionWait
+				}
+			}
+			return completeStacklessCoroSelfFrame(ctx, frame, tracker)
+		}
+		if frame.Depth == tracker.rootDepth && tracker.spawnAwaitSibling {
+			tracker.spawnAwaitSibling = false
+			runtime.SpawnStacklessCoroForTest(ctx,
+				stacklessCoroSelfFrameAwaitSibling)
+		}
+		childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+			stacklessCoroSelfFrameResume)
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(new(runtime.StacklessCoroSelfFrameForTest))
+		}
+		child := (*runtime.StacklessCoroSelfFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroSelfFrameForTest{
+			Depth: frame.Depth - 1,
+			Value: frame.Value,
+		}
+		frame.State = 1
+		action := runtime.AwaitStacklessCoroSelfFrameForTest(ctx, childPointer,
+			stacklessCoroSelfFrameResume)
+		if child.Owner != nil {
+			tracker.sawCacheOwner = true
+		}
+		switch child.Marker {
+		case runtime.StacklessCoroFusedFrameDirectFirst:
+			tracker.sawDirectFirst = true
+		case runtime.StacklessCoroFusedFrameDirectLast:
+			tracker.sawDirectLast = true
+		case runtime.StacklessCoroFusedFrameChunkFirst:
+			tracker.sawChunkFirst = true
+		case runtime.StacklessCoroFusedFrameChunkLast:
+			tracker.sawChunkLast = true
+		}
+		if frame.Depth == tracker.rootDepth {
+			tracker.firstAwaitAction = action
+			tracker.firstAwaitFused = child.Parent != nil
+		}
+		return action
+	case 1:
+		if frame.Depth == 1 && tracker.completeSiblingOrder != 0 {
+			tracker.order++
+			tracker.completeParentOrder = tracker.order
+		}
+		if frame.Depth == tracker.rootDepth && tracker.roundsRemaining > 1 {
+			tracker.roundsRemaining--
+			frame.State = 0
+			return runtime.StacklessCoroActionYield
+		}
+		return completeStacklessCoroSelfFrame(ctx, frame, tracker)
+	case 3:
+		return completeStacklessCoroSelfFrame(ctx, frame, tracker)
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func runStacklessCoroSelfFrames(t *testing.T, tracker *stacklessCoroSelfFrameTracker) {
+	t.Helper()
+	if tracker.roundsRemaining == 0 {
+		tracker.roundsRemaining = 1
+	}
+	stacklessCoroSelfFrameActive = tracker
+	defer func() { stacklessCoroSelfFrameActive = nil }()
+	root := &runtime.StacklessCoroSelfFrameForTest{
+		Depth: tracker.rootDepth,
+		Value: &tracker.total,
+	}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroSelfFrameResume)
+}
+
+func TestStacklessCoroSelfFrameFusion(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+
+	t.Run("direct", func(t *testing.T) {
+		tracker := &stacklessCoroSelfFrameTracker{
+			rootDepth: 8, roundsRemaining: 2,
+		}
+		runStacklessCoroSelfFrames(t, tracker)
+		wantTotal := 2*tracker.rootDepth + 1
+		if tracker.total != wantTotal {
+			t.Fatalf("completed frames = %d, want %d",
+				tracker.total, wantTotal)
+		}
+		wantAction := uint8(runtime.StacklessCoroActionSwitch)
+		wantFused := true
+		if runtime.Raceenabled {
+			wantAction = runtime.StacklessCoroActionWait
+			wantFused = false
+		}
+		if tracker.firstAwaitAction != wantAction ||
+			tracker.firstAwaitFused != wantFused {
+			t.Fatalf("first await = (action %d, fused %t), want (%d, %t)",
+				tracker.firstAwaitAction, tracker.firstAwaitFused,
+				wantAction, wantFused)
+		}
+	})
+
+	t.Run("ordinary-caller", func(t *testing.T) {
+		tracker := &stacklessCoroSelfFrameTracker{rootDepth: 0}
+		stacklessCoroSelfFrameActive = tracker
+		defer func() { stacklessCoroSelfFrameActive = nil }()
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+					stacklessCoroSelfFrameResume)
+				if childPointer == nil {
+					childPointer = unsafe.Pointer(
+						new(runtime.StacklessCoroSelfFrameForTest))
+				}
+				*(*runtime.StacklessCoroSelfFrameForTest)(childPointer) =
+					runtime.StacklessCoroSelfFrameForTest{
+						Depth: 0, Value: &tracker.total,
+					}
+				runtime.AwaitStacklessCoroFrameForTest(ctx, childPointer,
+					stacklessCoroSelfFrameResume)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if tracker.total != 1 {
+			t.Fatalf("ordinary caller completed %d frames, want 1", tracker.total)
+		}
+	})
+
+	t.Run("cache-boundary-and-fairness", func(t *testing.T) {
+		depth := runtime.StacklessCoroTaskCacheSize +
+			runtime.StacklessCoroFrameChunkDirectCount +
+			2*runtime.StacklessCoroFrameChunkSize
+		tracker := &stacklessCoroSelfFrameTracker{
+			rootDepth:            depth,
+			spawnAwaitSibling:    true,
+			spawnCompleteSibling: true,
+		}
+		runStacklessCoroSelfFrames(t, tracker)
+		if tracker.total != depth+1 {
+			t.Fatalf("completed frames = %d, want %d", tracker.total, depth+1)
+		}
+		if tracker.awaitSiblingOrder == 0 ||
+			tracker.awaitSiblingOrder >= tracker.firstChildOrder {
+			t.Fatalf("await sibling order = %d, child order = %d, want sibling first",
+				tracker.awaitSiblingOrder, tracker.firstChildOrder)
+		}
+		if tracker.completeSiblingOrder == 0 ||
+			tracker.completeSiblingOrder >= tracker.completeParentOrder {
+			t.Fatalf("completion sibling order = %d, parent order = %d, want sibling first",
+				tracker.completeSiblingOrder, tracker.completeParentOrder)
+		}
+		if !runtime.Raceenabled &&
+			(!tracker.sawCacheOwner || !tracker.sawDirectFirst ||
+				!tracker.sawDirectLast || !tracker.sawChunkFirst ||
+				!tracker.sawChunkLast) {
+			t.Fatalf("allocation phases = cache:%t direct:%t/%t chunk:%t/%t, want all",
+				tracker.sawCacheOwner, tracker.sawDirectFirst,
+				tracker.sawDirectLast, tracker.sawChunkFirst,
+				tracker.sawChunkLast)
+		}
+	})
+
+	t.Run("timer-wait", func(t *testing.T) {
+		tracker := &stacklessCoroSelfFrameTracker{rootDepth: 8, sleepLeaf: true}
+		runStacklessCoroSelfFrames(t, tracker)
+		if tracker.total != tracker.rootDepth+1 {
+			t.Fatalf("completed frames = %d, want %d",
+				tracker.total, tracker.rootDepth+1)
+		}
+	})
+
+	t.Run("panic-unwind", func(t *testing.T) {
+		tracker := &stacklessCoroSelfFrameTracker{rootDepth: 16, panicLeaf: true}
+		defer func() {
+			stacklessCoroSelfFrameActive = nil
+			if value := recover(); value != "stackless coroutine fused-frame panic" {
+				t.Fatalf("recovered %v, want fused-frame panic", value)
+			}
+		}()
+		stacklessCoroSelfFrameActive = tracker
+		root := &runtime.StacklessCoroSelfFrameForTest{
+			Depth: tracker.rootDepth,
+			Value: &tracker.total,
+		}
+		runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+			stacklessCoroSelfFrameResume)
+		t.Fatal("fused-frame panic returned")
+	})
+}
+
 type stacklessCoroFrameCacheTestFrame struct {
 	value int
 	total *int

@@ -17,12 +17,27 @@ type stacklessCoroFrameChunkExportFrame struct {
 	tracker unsafe.Pointer
 }
 
+// StacklessCoroSelfFrameForTest matches the compiler-private fused-frame
+// prefix and leaves enough ordinary state for runtime transition tests.
+type StacklessCoroSelfFrameForTest struct {
+	Parent unsafe.Pointer
+	Owner  unsafe.Pointer
+	Marker uint8
+	State  uint8
+	Depth  int
+	Value  *int
+}
+
 const (
 	StacklessCoroWarmExecutorCount     = stacklessCoroWarmExecutorCount
 	StacklessCoroTaskCacheSize         = stacklessCoroTaskCacheSize
 	StacklessCoroTaskChunkSize         = stacklessCoroTaskChunkSize
 	StacklessCoroFrameChunkSize        = stacklessCoroFrameChunkSize
 	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
+	StacklessCoroFusedFrameDirectFirst = stacklessCoroFusedFrameDirectFirst
+	StacklessCoroFusedFrameDirectLast  = stacklessCoroFusedFrameDirectLast
+	StacklessCoroFusedFrameChunkFirst  = stacklessCoroFusedFrameChunkFirst
+	StacklessCoroFusedFrameChunkLast   = stacklessCoroFusedFrameChunkLast
 	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
 	StacklessCoroSelectCaseCacheSize   = stacklessCoroSelectCaseCacheSize
@@ -33,6 +48,7 @@ const (
 	StacklessCoroActionComplete = stacklessCoroActionComplete
 	StacklessCoroActionPanic    = stacklessCoroActionPanic
 	StacklessCoroActionGoexit   = stacklessCoroActionGoexit
+	StacklessCoroActionSwitch   = stacklessCoroActionSwitch
 	StacklessCoroPollErrClosing = pollErrClosing
 	StacklessCoroPollErrTimeout = pollErrTimeout
 )
@@ -109,6 +125,22 @@ func TakeStacklessCoroFrameChunkForTest(ctx unsafe.Pointer,
 	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroFrameChunkExportFrame]()
 	frame := coroTakeFrameChunk(ctx, resume, size, frameType)
 	return frame, chunk && frame != nil
+}
+
+func TakeStacklessCoroSelfFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
+	return coroTakeSelfFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroSelfFrameForTest{}), frameType)
+}
+
+func AwaitStacklessCoroSelfFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) uint8 {
+	return coroAwaitSelfFrame(ctx, frame, resume)
+}
+
+func CompleteStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) uint8 {
+	return coroCompleteSelfFrame(ctx)
 }
 
 func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,
@@ -285,11 +317,13 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 	firstParent := new(stacklessCoroTask)
 	secondParent := new(stacklessCoroTask)
 	first := &stacklessCoroTask{
-		resume: resume, parent: firstParent, cacheFrame: true, frameSize: 1,
+		resume: resume, parent: firstParent,
+		flags: stacklessCoroTaskCacheFrame, frameSize: 1,
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
 	second := &stacklessCoroTask{
-		resume: resume, parent: secondParent, cacheFrame: true, frameSize: 1,
+		resume: resume, parent: secondParent,
+		flags: stacklessCoroTaskCacheFrame, frameSize: 1,
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
 	first.next = second
@@ -304,10 +338,12 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 		recycled = s.freeTasks == nil && s.freePlainTaskCount == 0
 	}
 	valid := s.reservedTasks == second && second.next == nil &&
-		second.parent == secondParent && second.cacheFrame &&
+		second.parent == secondParent &&
+		second.hasFlag(stacklessCoroTaskCacheFrame) &&
 		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1 &&
 		recycled &&
-		first.resume == nil && first.context.frame == nil && !first.cacheFrame
+		first.resume == nil && first.context.frame == nil &&
+		!first.hasFlag(stacklessCoroTaskCacheFrame)
 	unlock(&s.lock)
 	return valid
 }
@@ -317,7 +353,7 @@ func StacklessCoroPreferPlainTaskForTest() bool {
 		return stacklessCoroActionComplete
 	})
 	cached := &stacklessCoroTask{
-		resume: resume, cacheFrame: true, frameSize: 1,
+		resume: resume, flags: stacklessCoroTaskCacheFrame, frameSize: 1,
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
 	plain := new(stacklessCoroTask)
@@ -380,10 +416,10 @@ func StacklessCoroOverflowTaskSelectionForTest() bool {
 	frameSize := uint16(unsafe.Sizeof(uintptr(0)))
 	newCachedTask := func() *stacklessCoroTask {
 		return &stacklessCoroTask{
-			resume:     resume,
-			context:    stacklessCoroContext{frame: unsafe.Pointer(new(uintptr))},
-			cacheFrame: true,
-			frameSize:  frameSize,
+			resume:    resume,
+			context:   stacklessCoroContext{frame: unsafe.Pointer(new(uintptr))},
+			flags:     stacklessCoroTaskCacheFrame,
+			frameSize: frameSize,
 		}
 	}
 	newOverflowTask := func() *stacklessCoroTask {
