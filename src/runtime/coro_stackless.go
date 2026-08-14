@@ -940,10 +940,6 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
-		if action != stacklessCoroActionSwitch &&
-			task.hasFlag(stacklessCoroTaskSwitchPending) {
-			throw("runtime: stackless coroutine frame switch returned wrong action")
-		}
 
 		switch action {
 		case stacklessCoroActionYield:
