@@ -1928,13 +1928,22 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
-	if s.tail == nil {
+	var runnable uint32
+	if stacklessCoroIsPullComparison(s) {
+		// A pull comparison root has one active structured leaf. An event
+		// publishes readiness for that leaf and rings the root doorbell; it
+		// does not enqueue the exact continuation. Child completion replaces
+		// the leaf with its parent before the next polling episode.
 		s.head = task
 	} else {
-		s.tail.next = task
+		if s.tail == nil {
+			s.head = task
+		} else {
+			s.tail.next = task
+		}
+		s.tail = task
+		runnable = s.runnableState.Add(1)
 	}
-	s.tail = task
-	runnable := s.runnableState.Add(1)
 	if raceenabled {
 		// Runtime mutex operations are invisible to the race detector.
 		// Merge both the previous resume episode and the producer that made
@@ -1946,16 +1955,19 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
+	pull := stacklessCoroIsPullComparison(s)
 	task := s.head
-	if task == nil {
+	if task == nil || pull && task.state != stacklessCoroTaskRunnable {
 		unlock(&s.lock)
 		return nil
 	}
-	s.head = task.next
-	if s.head == nil {
-		s.tail = nil
+	if !pull {
+		s.head = task.next
+		if s.head == nil {
+			s.tail = nil
+		}
+		s.runnableState.Add(-1)
 	}
-	s.runnableState.Add(-1)
 	task.next = nil
 	if task.state != stacklessCoroTaskRunnable || task.resuming ||
 		task.readyPending {
