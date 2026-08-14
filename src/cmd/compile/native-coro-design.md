@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-07-30
+Last updated: 2026-08-14
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -3336,15 +3336,64 @@ was directional for channel round trips and neutral for ready select and both
 blocking probes; the exact measurements and load qualification are in the
 architecture probe README.
 
+### 16.1 Local read readiness before native park
+
+CPU profiles of the remaining blocking file and TCP probes assigned most of
+their time to the native executor's condition wait and wake. In those probes,
+another logical task on the same stackless scheduler makes an older read
+ready. The reader nevertheless completed through the platform poller and the
+bridge G, so the locked-M executor parked immediately before the bridge made
+the logical task runnable. The read itself and the public library boundary
+were no longer the dominant costs.
+
+The native executor now performs a short readiness retry only after its
+logical ready queue becomes empty. It permanently excludes the task that just
+armed, preventing a genuinely external read from turning into an immediate
+busy poll. Under the existing operation-registry lock, one pass considers at
+most 64 registered operations, accepts only synchronous poll reads owned by
+the same scheduler, and claims the still-armed netpoll token with a
+compare-and-swap. A successful nonblocking retry either publishes completion
+or rearms after `EAGAIN`. At most four attempts are made, rotating the older
+waiter excluded by the preceding attempt and yielding briefly between
+attempts. A missed scan, a lost token race, or an unavailable descriptor falls
+back to the unchanged platform-netpoll path.
+
+This is a cold helper outside the ready-task dispatch loop. It adds no
+scheduler, task, native-context, or compiler ABI state, and does not alter the
+bounded operation cache. A truly external read still parks the locked M and
+uses the existing netpoll bridge and replacement-executor behavior. Builds
+without the experiment do not compile this path.
+
+The exact parent is `86706396a0` and the runtime candidate is `dd8f3f3422`.
+Twenty alternating 500 ms samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| ready file read | 348.7 ns -> 347.7 ns, neutral | 410.0 ns -> 418.6 ns, neutral |
+| ready TCP read | 313.9 ns -> 312.4 ns, neutral | 492.4 ns -> 487.4 ns, neutral |
+| blocking file and sibling release | 8.305 us -> 1.266 us (-84.76%) | 52.773 us -> 2.343 us (-95.56%) |
+| blocking TCP and sibling release | 15.092 us -> 5.508 us (-63.51%) | 59.358 us -> 4.062 us (-93.16%) |
+
+Every sample reports 0 B and 0 allocations for all four probes. The Linux
+environment identifies its translated CPU as VirtualApple, so its absolute
+timings are directional rather than native x86 measurements. The ready-path
+controls are statistically neutral on both platforms, showing that the cold
+retry does not measurably enlarge ordinary ready dispatch.
+
+The focused runtime profile covers `runTasks` at 97.9%, the bounded idle scan
+at 93.3%, the pre-park retry helper at 92.9%, and the netpoll token claim at
+100%. The exact candidate passes all stackless-coroutine runtime tests in
+normal, race, and `checkptr=2` modes on Darwin/arm64 and translated
+Linux/amd64, as well as the compiler/library suites, portable architecture
+probe, disabled-experiment control, and FreeBSD/amd64 and Windows/amd64
+cross-compilation gates.
+
 The remaining performance sequence is:
 
-1. Fuse generated factory frames and captured cells while retaining exact
-   compiler-generated GC maps, bounded cache retention, and the measured
-   recursion-boundary behavior.
-2. Reduce the remaining blocking-call scheduler handoff and public-root entry
+1. Reduce truly external blocking-call scheduler handoff and public-root entry
    transitions while retaining the lower-cost M replacement boundary and
-   sibling progress.
-3. Remove ready-select temporary storage.
+   sibling progress. The same-scheduler local-readiness subcase is complete.
+2. Remove ready-select temporary storage.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
 fixed-work scaling, and the live-task footprint as explicit regression gates.
