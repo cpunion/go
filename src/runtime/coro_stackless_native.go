@@ -37,6 +37,7 @@ type stacklessCoroNativeContext struct {
 	lockedG            guintptr
 	lockedInt          uint32
 	g0Accurate         bool
+	root               bool
 	sigmask            sigset
 	poolNext           *stacklessCoroNativeContext
 }
@@ -98,6 +99,7 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 
 	ctx.scheduler = s
 	ctx.caller = gp
+	ctx.root = root
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
 	msigrestore(ctx.sigmask)
@@ -109,6 +111,7 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
+	ctx.root = false
 	if root && scheduler.executorState.Load() == stacklessCoroExecutorStateOff &&
 		scheduler.freeTasks != nil {
 		scheduler.discardFreeOverflowTasks()
@@ -285,7 +288,11 @@ func coroNativeMain() {
 		throw("runtime: invalid stackless coroutine executor context")
 	}
 	msigrestore(ctx.sigmask)
-	ctx.scheduler.run(true)
+	if ctx.root {
+		ctx.scheduler.run(true)
+	} else {
+		ctx.scheduler.runTasks(true, false)
+	}
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
 }
