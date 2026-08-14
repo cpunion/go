@@ -730,7 +730,7 @@ func (s *stacklessCoroScheduler) run(native bool) {
 
 func (s *stacklessCoroScheduler) runLoop(native bool) {
 	for !s.rootComplete() {
-		s.runTasks(native)
+		s.runTasks(native, true)
 	}
 }
 
@@ -763,10 +763,11 @@ func (scope *stacklessCoroRunScope) leave() {
 	}
 }
 
-// runTasks drives the ready queue until the root completes or one resume
-// panics. A recovered panic returns to run, which starts another queue-driving
-// episode after this native activation has unwound.
-func (s *stacklessCoroScheduler) runTasks(native bool) {
+// runTasks drives the ready queue until the root completes, one resume panics,
+// or a non-parking episode exhausts ready work. A recovered panic returns to
+// run, which starts another queue-driving episode after this native activation
+// has unwound.
+func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	defer func() {
@@ -792,6 +793,9 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
 			}
 			if task == nil {
+				if !park {
+					return
+				}
 				if s.executorStop == nil {
 					<-s.wake
 				} else {
@@ -2233,9 +2237,20 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 		case <-s.executorStop:
 		}
 	}
-	if !s.rootComplete() {
+	for !s.rootComplete() {
+		// Run ready work on the fixed native stack, but park this ordinary G
+		// between episodes. Keeping an idle synthetic executor locked to its M
+		// would make every blocking-call handoff pay stoplockedm/startlockedm.
 		if coroRunOnNativeStack(s) == nil {
 			s.run(false)
+			break
+		}
+		if s.rootComplete() {
+			break
+		}
+		select {
+		case <-s.wake:
+		case <-s.executorStop:
 		}
 	}
 	s.executorDone <- struct{}{}

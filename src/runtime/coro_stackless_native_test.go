@@ -101,6 +101,14 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeReplacementDrain(t *testing.T) {
+	runs, native := runtime.StacklessCoroNativeReplacementDrainForTest()
+	if runs != 2 || !native {
+		t.Fatalf("replacement drain = (%d runs, native %t), want (2, true)",
+			runs, native)
+	}
+}
+
 func TestStacklessCoroNativeTaskReuse(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)

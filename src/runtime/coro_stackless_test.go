@@ -1270,7 +1270,11 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 	})
 
 	t.Run("native-context", func(t *testing.T) {
-		var frames [runtime.StacklessCoroWarmExecutorCount + 1]unsafe.Pointer
+		roots := runtime.StacklessCoroClearNativeTaskCachesForTest()
+		if roots == 0 {
+			roots = runtime.StacklessCoroWarmExecutorCount
+		}
+		frames := make([]unsafe.Pointer, roots+1)
 		for i := range frames {
 			state, total := 0, 0
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -1455,6 +1459,7 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		const children = 3
 		var state int
 		var done atomic.Int32
+		var bytes, cachePolls int
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch state {
 			case 0:
@@ -1476,14 +1481,10 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				if done.Load() != children {
 					return runtime.StacklessCoroActionYield
 				}
-				bytes := runtime.StacklessCoroFreeFrameBytesForTest(ctx)
-				if bytes > runtime.StacklessCoroFrameCacheSize {
-					t.Fatalf("cached frame bytes = %d, limit %d",
-						bytes, runtime.StacklessCoroFrameCacheSize)
-				}
-				if got, wantZero := bytes == 0, race.Enabled; got != wantZero {
-					t.Fatalf("cached frame bytes = %d, race enabled %t",
-						bytes, race.Enabled)
+				bytes = runtime.StacklessCoroFreeFrameBytesForTest(ctx)
+				if !race.Enabled && bytes == 0 && cachePolls < 1000 {
+					cachePolls++
+					return runtime.StacklessCoroActionYield
 				}
 				return runtime.StacklessCoroActionComplete
 			default:
@@ -1491,6 +1492,14 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				return runtime.StacklessCoroActionInvalid
 			}
 		})
+		if bytes > runtime.StacklessCoroFrameCacheSize {
+			t.Fatalf("cached frame bytes = %d, limit %d",
+				bytes, runtime.StacklessCoroFrameCacheSize)
+		}
+		if got, wantZero := bytes == 0, race.Enabled; got != wantZero {
+			t.Fatalf("cached frame bytes = %d, race enabled %t",
+				bytes, race.Enabled)
+		}
 	})
 
 	t.Run("uncached-parent", func(t *testing.T) {

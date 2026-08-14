@@ -38,6 +38,57 @@ func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 	return
 }
 
+func StacklessCoroClearNativeTaskCachesForTest() int {
+	available := stacklessCoroNativePool.available
+	count := len(available)
+	for range count {
+		ctx := <-available
+		ctx.freeTasks = nil
+		ctx.freePlainTaskCount = 0
+		ctx.freeFrameBytes = 0
+		ctx.cachedFrameTasks = 0
+		ctx.cachedFrameBytes = 0
+		available <- ctx
+	}
+	return count
+}
+
+var stacklessCoroNativeReplacementDrainTest struct {
+	runs   int
+	native bool
+}
+
+func stacklessCoroNativeReplacementDrainResume(unsafe.Pointer) uint8 {
+	state := &stacklessCoroNativeReplacementDrainTest
+	state.native = state.native && getg().stackIsFixed()
+	state.runs++
+	return stacklessCoroActionComplete
+}
+
+func StacklessCoroNativeReplacementDrainForTest() (runs int, native bool) {
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	s.root.state = stacklessCoroTaskWaiting
+	s.executorCount.Store(2)
+	s.executorState.Store(stacklessCoroExecutorStateRunning)
+
+	state := &stacklessCoroNativeReplacementDrainTest
+	state.runs = 0
+	state.native = true
+	for range 2 {
+		s.ready(&stacklessCoroTask{
+			resume: stacklessCoroNativeReplacementDrainResume,
+		}, false)
+		if coroRunOnNativeStack(s) == nil {
+			state.native = false
+			break
+		}
+	}
+	return state.runs, state.native
+}
+
 func stacklessCoroTaskListLen(task *stacklessCoroTask) int {
 	count := 0
 	for ; task != nil; task = task.next {
