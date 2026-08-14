@@ -1022,12 +1022,70 @@ initializer reports 88.9% only because its pre-existing fatal nil-resume branch
 cannot write coverage after process termination; a subprocess test verifies
 that branch's behavior.
 
-The next order of performance work is:
+#### Park idle replacement executors on ordinary goroutines
 
-1. reduce truly external blocking-call scheduler handoff while preserving the
-   lower-cost M replacement boundary and sibling progress;
-2. remove the remaining compiler-owned public-entry frame and result
-   allocations as an independent lowering change.
+An executor that replaced a thread blocked in direct C previously remained on
+its synthetic fixed native stack after draining the ready queue. Its locked M
+then parked through `stoplockedm` and resumed through `startlockedm`. A Darwin
+CPU profile attributed nearly all runnable-sibling handoff time to the
+resulting `pthread_cond_wait` and `pthread_cond_signal` calls.
 
-The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
-and live task footprint are regression gates for each of those changes.
+Revision `a0248ea149` keeps every logical resume and direct C call on a fixed
+native stack, but ends a replacement native activation when its ready queue is
+empty. The ordinary caller G waits for the next episode and reenters the fixed
+stack after wakeup. The public root activation remains persistent. This needs
+neither task capability classification nor source annotations, and the
+managed-stack fallback remains unchanged on unsupported and race targets.
+
+Revision `62a3add088` adds a deterministic two-episode native-drain test and
+hardens the frame-cache test exposed by the shorter handoff. A child publishes
+its terminal state before its executor recycles the typed frame, so cache
+inspection now yields until recycling is visible and performs test failures on
+the ordinary test goroutine rather than a synthetic executor.
+
+The exact target is `09590b5e0b`; its tree is identical to executable revision
+`1e50d7ebe1`. Three warm-up pairs followed by 20 alternating 500 ms Darwin
+samples at one P produced:
+
+| Probe | Target | Native-drain candidate | Change |
+| --- | ---: | ---: | ---: |
+| direct C steady call | 13.15 ns | 13.12 ns | neutral |
+| direct C blocking handoff | 2.283 us | 2.377 us | neutral |
+| ordinary cgo runnable handoff | 59.99 us | 60.02 us | neutral |
+| direct C runnable handoff | 26.54 us | 15.23 us | -42.60% |
+| direct C runnable progress | 7.944 us | 5.557 us | -30.04% |
+
+All Darwin samples report 0 B and 0 allocations. The direct runnable changes
+have `p<0.001`; the three controls are statistically neutral.
+
+Translated Linux/amd64 used identical fixed counts of 4,096 operations, two
+warm-up pairs, and ten alternating samples. Fixed counts avoid a Rosetta
+benchmark-calibration busy loop in ordinary cgo:
+
+| Probe | Target | Native-drain candidate | Change |
+| --- | ---: | ---: | ---: |
+| ordinary cgo runnable handoff | 211.1 us | 213.9 us | neutral (`p=0.052`) |
+| direct C runnable handoff | 133.85 us | 42.45 us | -68.29% |
+| direct C runnable progress | 30.63 us | 15.20 us | -50.38% |
+
+The Linux direct changes have `p<0.001`, and every sample reports zero
+allocations per operation. Absolute translated timings are directional; the
+independent result confirms that the native-stack implementation on both
+architectures avoids the persistent locked-M wait.
+
+Normal, race, and `checkptr=2` stackless runtime suites, the compiler coroutine
+suite, transparent direct-C tests, and the complete timer, file, and TCP probe
+audit pass on Darwin/arm64 and Linux/amd64. Full Darwin runtime and `nocoro`
+suites pass. The translated Linux runtime suite passes with three
+Rosetta-incompatible intentional crash or oversized-mmap tests excluded; the
+remaining tests and the separately constrained memory-limit tests pass.
+FreeBSD and Windows amd64 cross-compilation also pass. Native and race coverage
+profiles together execute every statement introduced in the scheduler and
+native-stack paths; focused native coverage is 96.0% for `runTasks`, 80.0% for
+`replacementExecutor`, and 90.0% for each native entry helper, with the race
+profile covering the managed fallback.
+
+The next independent performance change is to remove the remaining
+compiler-owned public-entry frame and result allocations. Its regression gates
+remain the direct-C path, multi-P fixed-work behavior, disabled-experiment
+control, and live task footprint.
