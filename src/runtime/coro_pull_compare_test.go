@@ -26,7 +26,7 @@ type stacklessCoroComparisonDriver struct {
 var stacklessCoroComparisonDrivers = [...]stacklessCoroComparisonDriver{
 	{
 		name: "Push",
-		run:  runtime.RunStacklessCoroFrameForTest,
+		run:  runtime.RunStacklessCoroPushComparisonFrameForTest,
 	},
 	{
 		name: "Pull",

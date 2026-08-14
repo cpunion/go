@@ -46,6 +46,26 @@ func RunStacklessCoroFrameForTest(frame unsafe.Pointer,
 	coroRunFrame(frame, resume)
 }
 
+// RunStacklessCoroPushComparisonFrameForTest bypasses public-root reuse so
+// the controlled push and pull drivers have the same root allocation and
+// lifetime. It is a measurement aid, not a supported execution mode.
+func RunStacklessCoroPushComparisonFrameForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
+	runStacklessCoroComparisonSchedulerForTest(
+		newStacklessCoroScheduler(frame, resume))
+}
+
+func runStacklessCoroComparisonSchedulerForTest(s *stacklessCoroScheduler) {
+	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
+		s = nativeScheduler
+	} else {
+		s.run(false)
+	}
+	s.stopReplacementExecutors()
+	s.releaseWake()
+	s.finish()
+}
+
 // RunStacklessCoroPullFrameForTest runs the same resume ABI, task
 // representation, typed frames, and operation sources as the push driver, but
 // completion only rings the root doorbell. The root then polls its current
@@ -57,15 +77,7 @@ func RunStacklessCoroPullFrameForTest(frame unsafe.Pointer,
 	s := newStacklessCoroScheduler(frame, resume)
 	s.tail = &stacklessCoroPullComparisonMarker
 	s.runnableState.Store(0)
-
-	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
-		s = nativeScheduler
-	} else {
-		s.run(false)
-	}
-	s.stopReplacementExecutors()
-	s.releaseWake()
-	s.finish()
+	runStacklessCoroComparisonSchedulerForTest(s)
 }
 
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {

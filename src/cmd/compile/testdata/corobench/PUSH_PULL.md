@@ -38,6 +38,8 @@ native Go stack does not grow with logical depth.
 All stackless variants use:
 
 - the same `stacklessCoroScheduler` root and native-stack executor;
+- the same unpooled root allocation and lifetime for the controlled `Push`
+  and `Pull` pair, so public-root cache policy is not a model difference;
 - the same resume action ABI and typed test frames;
 - the same runtime timer, public regular-file read, and socket netpoll
   sources;
