@@ -32,6 +32,22 @@ func recursiveYield(depth int) int {
 	return recursiveYield(depth-1) + 1
 }
 
+func mutualYieldA(depth int) int {
+	if depth <= 0 {
+		runtime.Gosched()
+		return 1
+	}
+	return mutualYieldB(depth-1) + 1
+}
+
+func mutualYieldB(depth int) int {
+	if depth <= 0 {
+		runtime.Gosched()
+		return 1
+	}
+	return mutualYieldA(depth-1) + 1
+}
+
 func finishDefer(result *int) {
 	*result = *result + 1
 }

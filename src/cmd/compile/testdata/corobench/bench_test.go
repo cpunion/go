@@ -35,6 +35,12 @@ func TestProbes(t *testing.T) {
 	if got := recursiveYield(4); got != 5 {
 		t.Errorf("recursiveYield(4) = %d, want 5", got)
 	}
+	if got := mutualYieldA(4); got != 5 {
+		t.Errorf("mutualYieldA(4) = %d, want 5", got)
+	}
+	if got := mutualYieldB(4); got != 5 {
+		t.Errorf("mutualYieldB(4) = %d, want 5", got)
+	}
 	if got := deferYield(); got != 2 {
 		t.Errorf("deferYield() = %d, want 2", got)
 	}
@@ -468,6 +474,24 @@ func BenchmarkRecursiveYield4096(b *testing.B) {
 	total := 0
 	for i := 0; i < b.N; i++ {
 		total += recursiveYield(4096)
+	}
+	intSink = total
+}
+
+func BenchmarkMutualYield64(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(64)
+	}
+	intSink = total
+}
+
+func BenchmarkMutualYield4096(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(4096)
 	}
 	intSink = total
 }

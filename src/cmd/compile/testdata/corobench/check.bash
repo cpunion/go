@@ -121,6 +121,8 @@ expected=(
 	yieldLoop
 	yieldEntry
 	recursiveYield
+	mutualYieldA
+	mutualYieldB
 	deferYield
 	recoverYield
 	taskWorker
