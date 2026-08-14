@@ -3391,13 +3391,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					args = ir.Nodes{ctx, child.frame, child.resume}
 				}
 				edge := edgeForCall(function, state.call)
-				selfAwait := candidate.selfAwait && !candidate.selfSpawn &&
+				selfAwait := child.frame != nil && candidate.selfAwait &&
+					!candidate.selfSpawn &&
 					edge.Callee == fn
 				if selfAwait {
-					if child.frame == nil {
-						return fmt.Errorf("%s: self await has no explicit frame",
-							ir.PkgFuncName(fn))
-					}
 					actionResult = typecheck.Call(state.call.Pos(),
 						typecheck.LookupRuntime("coroAwaitSelfFrame"),
 						args, false)
