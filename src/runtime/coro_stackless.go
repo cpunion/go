@@ -720,30 +720,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 		task = s.take()
 		if task == nil {
 			if native {
-				var previous *stacklessCoroTask
-				for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
-					claimed := stacklessCoroPollReadAtIdle(s, idlePollSkip, previous)
-					if claimed == nil && previous != nil {
-						// Every other waiter had a chance. Start another bounded pass
-						// while continuing to exclude the task that just armed.
-						previous = nil
-						claimed = stacklessCoroPollReadAtIdle(s, idlePollSkip, nil)
-					}
-					if claimed == nil {
-						break
-					}
-					// A successful retry may have made its waiter runnable. Take it
-					// before another bounded retry; if the read remains unavailable,
-					// the scheduler parks after the final attempt.
-					task = s.take()
-					if task != nil {
-						break
-					}
-					previous = claimed
-					if attempt+1 < stacklessCoroIdlePollAttempts {
-						procyield(30)
-					}
-				}
+				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
 			}
 			if task == nil {
 				if s.executorStop == nil {

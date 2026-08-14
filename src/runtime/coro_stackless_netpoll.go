@@ -145,6 +145,35 @@ func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 	return nil
 }
 
+//go:noinline
+func stacklessCoroPollReadBeforePark(s *stacklessCoroScheduler,
+	exclude *stacklessCoroTask) *stacklessCoroTask {
+	var previous *stacklessCoroTask
+	for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
+		claimed := stacklessCoroPollReadAtIdle(s, exclude, previous)
+		if claimed == nil && previous != nil {
+			// Every other waiter had a chance. Start another bounded pass
+			// while continuing to exclude the task that just armed.
+			previous = nil
+			claimed = stacklessCoroPollReadAtIdle(s, exclude, nil)
+		}
+		if claimed == nil {
+			return nil
+		}
+		// A successful retry may have made its waiter runnable. Take it
+		// before another bounded retry; if the read remains unavailable,
+		// the scheduler parks after the final attempt.
+		if task := s.take(); task != nil {
+			return task
+		}
+		previous = claimed
+		if attempt+1 < stacklessCoroIdlePollAttempts {
+			procyield(30)
+		}
+	}
+	return nil
+}
+
 func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
 	status := uintptr(pollErr)
 	if !op.ownsPollDesc {

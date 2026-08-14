@@ -10,3 +10,8 @@ func stacklessCoroPollReadAtIdle(*stacklessCoroScheduler,
 	*stacklessCoroTask, *stacklessCoroTask) *stacklessCoroTask {
 	return nil
 }
+
+func stacklessCoroPollReadBeforePark(*stacklessCoroScheduler,
+	*stacklessCoroTask) *stacklessCoroTask {
+	return nil
+}
