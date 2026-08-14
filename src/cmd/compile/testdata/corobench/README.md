@@ -1142,3 +1142,44 @@ FreeBSD and Windows amd64 plus Darwin amd64 and Linux arm64 cross-compilation
 passes. Compiler coverage is 93.3% overall and 100% for the changed explicit
 frame lowering; the new root-frame cache eligibility, lookup, release, and
 quiescent scheduler release paths each have 100% focused coverage.
+
+#### Hand off structured child completion directly
+
+Revision `de39ab3163`, based on the exact `3db190a434` merge, removes the
+ready-queue round trip between a normally completed structured child and its
+waiting parent. If the queue is empty and the parent is fully suspended, the
+current executor marks the parent running, recycles the child, and resumes the
+parent immediately. An already-runnable sibling retains queue order. A parent
+still returning `Wait` retains `readyPending`, and race builds retain the
+separate publication and acquisition boundary. Panic, `Goexit`, external
+readiness, and blocking-C replacement executors are not part of this fast
+path.
+
+The follow-up moved the direct resume branch into the `Complete` action itself,
+so unrelated queue iterations do not test a handoff variable. It adds no task
+or scheduler fields, changes no allocation count, and needs no compiler or
+source annotation. The 64-bit task and scheduler remain 48 and 192 bytes.
+
+On Darwin/arm64, twenty alternating fixed-layout 500 ms samples improved
+structured await by 1.45%, 4.93%, 9.02%, 9.33%, and 12.25% at depths 1, 8,
+64, 256, and 4096. The steady structured-await probe improved 13.61%.
+Twelve matched randomized linker layouts reproduced a depth-dependent effect
+from 2.22% to 12.41% and improved the steady probe 16.94%. Entry, yield,
+positive timer, ready and blocked file and socket I/O, and channel controls
+were neutral under randomized layouts. All byte and allocation counts were
+identical.
+
+Translated Linux/amd64 fixed layouts improved the less noisy depth-64,
+depth-256, depth-4096, and steady probes by 12.86%, 10.56%, 15.09%, and
+12.00%. Eight matched randomized layouts reproduced improvements through
+11.34% at depth 4096 and 8.94% for steady await; entry, yield, and every I/O
+control remained neutral. The translated timing is directional, while its
+unchanged allocation results independently agree with native Darwin.
+
+Normal, race, and `checkptr=2` stackless runtime suites, the compiler coroutine
+suite, and the architecture probe pass on both platforms. Full Darwin runtime
+suites pass with both `coro` and `nocoro`; the translated Linux suite passes
+with only its three known Rosetta-incompatible tests excluded. FreeBSD and
+Windows amd64 plus Darwin amd64 and Linux arm64 cross-compilation pass. The
+runtime coverage profile executes every new direct-handoff statement and each
+tested fallback; `runTasks` reports 96.2% and `complete` reports 84.8%.
