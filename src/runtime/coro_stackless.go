@@ -1785,9 +1785,6 @@ func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroSche
 		op.timerWait || op.waiterActive || op.next != nil || op.workNext != nil {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
-	if !op.selection.validCache() {
-		throw("runtime: invalid completed stackless coroutine select")
-	}
 	s := op.scheduler
 	task := op.task
 	op.stacklessCoroOperationState = stacklessCoroOperationState{}
