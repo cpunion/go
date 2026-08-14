@@ -23,6 +23,7 @@ const (
 	actionComplete
 	actionPanic
 	actionGoexit
+	actionSwitch
 )
 
 // Keep this in sync with runtime.stacklessCoroFrameChunkSize. The array length
@@ -3363,6 +3364,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			next := typedInt(pos, types.Types[types.TUINT32], int64(state.next))
 			body = append(body, ir.NewAssignStmt(pos, resumePC, next))
 			action := actionInvalid
+			var actionResult ir.Node
 			switch state.transition {
 			case SiteYield:
 				action = actionYield
@@ -3388,9 +3390,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					name = "coroAwaitFrame"
 					args = ir.Nodes{ctx, child.frame, child.resume}
 				}
-				body = append(body, typecheck.Call(state.call.Pos(),
-					typecheck.LookupRuntime(name), args, false))
-				action = actionWait
+				edge := edgeForCall(function, state.call)
+				selfAwait := child.frame != nil && candidate.selfAwait &&
+					!candidate.selfSpawn &&
+					edge.Callee == fn
+				if selfAwait {
+					actionResult = typecheck.Call(state.call.Pos(),
+						typecheck.LookupRuntime("coroAwaitSelfFrame"),
+						args, false)
+				} else {
+					body = append(body, typecheck.Call(state.call.Pos(),
+						typecheck.LookupRuntime(name), args, false))
+					action = actionWait
+				}
 			case SiteChannel:
 				if selection := state.selection; selection != nil {
 					casePointerType := types.NewPtr(
@@ -3583,9 +3595,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return fmt.Errorf("%s: state %d has no transition",
 					ir.PkgFuncName(fn), i)
 			}
-			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
-				typedInt(pos, types.Types[types.TUINT8], int64(action)),
-			}))
+			if actionResult == nil {
+				actionResult = typedInt(pos, types.Types[types.TUINT8],
+					int64(action))
+			}
+			body = append(body, ir.NewReturnStmt(pos,
+				[]ir.Node{actionResult}))
 		} else if state.thenState >= 0 {
 			thenPC := ir.NewAssignStmt(pos, resumePC,
 				typedInt(pos, types.Types[types.TUINT32], int64(state.thenState)))
@@ -3700,6 +3715,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	factory := candidate.factory
 	pos := fn.Pos()
 	closureVars := slices.Clone(resume.ClosureVars)
+	fusedSelf := candidate.selfAwait && !candidate.selfSpawn
 	fields := make([]*types.Field, len(closureVars))
 	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
 	outerFields := make(map[*ir.Name]*types.Field, len(closureVars))
@@ -3721,7 +3737,21 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		rootResultTargets[candidate.resultPtrs[i].Canonical()] =
 			resultValueFields[i]
 	}
-	frameType := types.NewStruct(fields)
+	frameFields := fields
+	var fusedParentField, fusedOwnerField, fusedMarkerField *types.Field
+	if fusedSelf {
+		fusedParentField = types.NewField(pos,
+			typecheck.Lookup(".coroParent"), types.Types[types.TUNSAFEPTR])
+		fusedOwnerField = types.NewField(pos,
+			typecheck.Lookup(".coroOwner"), types.Types[types.TUNSAFEPTR])
+		fusedMarkerField = types.NewField(pos,
+			typecheck.Lookup(".coroMarker"), types.Types[types.TUINT8])
+		frameFields = make([]*types.Field, 0, len(fields)+3)
+		frameFields = append(frameFields, fusedParentField, fusedOwnerField,
+			fusedMarkerField)
+		frameFields = append(frameFields, fields...)
+	}
+	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)
 	framePointerType := types.NewPtr(frameType)
 	frame := typecheck.TempAt(pos, resume, framePointerType)
@@ -3770,15 +3800,33 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		if ret, ok := node.(*ir.ReturnStmt); ok &&
 			len(ret.Results) == 1 &&
 			ir.IsConst(ret.Results[0], constant.Int) &&
-			ir.Int64Val(ret.Results[0]) == int64(actionComplete) &&
-			len(pointerClears)+len(resultPointerClears) != 0 {
-			cacheFrame := typecheck.Call(ret.Pos(),
-				typecheck.LookupRuntime("coroFrameNeedsClear"),
-				ir.Nodes{resume.Dcl[0]}, false)
-			clears := slices.Clone(resultPointerClears)
-			clears = append(clears, pointerClears...)
-			clear := ir.NewIfStmt(ret.Pos(), cacheFrame, clears, nil)
-			return ir.NewBlockStmt(ret.Pos(), ir.Nodes{clear, ret})
+			ir.Int64Val(ret.Results[0]) == int64(actionComplete) {
+			var completion ir.Nodes
+			if len(pointerClears)+len(resultPointerClears) != 0 {
+				cacheFrame := typecheck.Call(ret.Pos(),
+					typecheck.LookupRuntime("coroFrameNeedsClear"),
+					ir.Nodes{resume.Dcl[0]}, false)
+				clears := slices.Clone(resultPointerClears)
+				clears = append(clears, pointerClears...)
+				completion = append(completion,
+					ir.NewIfStmt(ret.Pos(), cacheFrame, clears, nil))
+			}
+			if fusedSelf {
+				parent := explicitFrameField(ret.Pos(), frame,
+					fusedParentField)
+				hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
+					ir.NewNilExpr(ret.Pos(), fusedParentField.Type))
+				action := typecheck.Call(ret.Pos(),
+					typecheck.LookupRuntime("coroCompleteSelfFrame"),
+					ir.Nodes{resume.Dcl[0]}, false)
+				completion = append(completion, ir.NewIfStmt(ret.Pos(),
+					hasParent, ir.Nodes{ir.NewReturnStmt(ret.Pos(),
+						[]ir.Node{action})}, nil))
+			}
+			if len(completion) != 0 {
+				completion = append(completion, ret)
+				return ir.NewBlockStmt(ret.Pos(), completion)
+			}
 		}
 		ir.EditChildren(node, clearCompletedFrame)
 		return node
@@ -3844,10 +3892,10 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// Await suspends the parent before starting its child. A recursive spawn
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
-	if candidate.selfAwait && !candidate.selfSpawn {
+	if fusedSelf {
 		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
 		takeFrame := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroTakeFrameChunk"), ir.Nodes{
+			typecheck.LookupRuntime("coroTakeSelfFrame"), ir.Nodes{
 				factoryCtx, factoryResume, frameSize(),
 				reflectdata.TypePtrAt(pos, frameChunkType),
 			}, false)
@@ -3872,6 +3920,18 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
 		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
 			typedNew(pos, frameType))}, nil))
+	if fusedSelf {
+		declarations = append(declarations,
+			ir.NewAssignStmt(pos,
+				explicitFrameField(pos, factoryFrame, fusedParentField),
+				ir.NewNilExpr(pos, fusedParentField.Type)),
+			ir.NewAssignStmt(pos,
+				explicitFrameField(pos, factoryFrame, fusedOwnerField),
+				ir.NewNilExpr(pos, fusedOwnerField.Type)),
+			ir.NewAssignStmt(pos,
+				explicitFrameField(pos, factoryFrame, fusedMarkerField),
+				typedInt(pos, types.Types[types.TUINT8], 0)))
+	}
 	for i, variable := range closureVars {
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
 		resultField := rootResultTargets[variable.Outer.Canonical()]

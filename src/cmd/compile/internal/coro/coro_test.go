@@ -6084,6 +6084,16 @@ func sum(n int) int {
 }
 
 //go:noinline
+func sumDefer(n int) (result int) {
+	defer func() { result++ }()
+	if n == 0 {
+		runtime.Gosched()
+		return 0
+	}
+	return sumDefer(n - 1)
+}
+
+//go:noinline
 func even(n int) bool {
 	if n == 0 {
 		runtime.Gosched()
@@ -6123,6 +6133,9 @@ func main() {
 	if got != want {
 		panic("bad recursive sum")
 	}
+	if got := sumDefer(depth); got != depth+1 {
+		panic("bad recursive defer sum")
+	}
 	gotEven := even(depth)
 	gotOdd := even(depth + 1)
 	if !gotEven || gotOdd {
@@ -6154,7 +6167,9 @@ func main() {
 		t.Fatalf("recursive factory build failed: %v\n%s", err, data)
 	}
 	buildOutput := string(data)
-	for _, name := range []string{"sum", "even", "odd", "(*counter).descend"} {
+	for _, name := range []string{
+		"sum", "sumDefer", "even", "odd", "(*counter).descend",
+	} {
 		found := false
 		for _, line := range strings.Split(buildOutput, "\n") {
 			if strings.Contains(line, "coro: func=main."+name+" ") &&
@@ -6170,7 +6185,7 @@ func main() {
 				name, buildOutput)
 		}
 	}
-	if want := "coro: phase=lower lowered=5 skipped=0"; !strings.Contains(buildOutput, want) {
+	if want := "coro: phase=lower lowered=6 skipped=0"; !strings.Contains(buildOutput, want) {
 		t.Errorf("build output does not contain %q\n%s", want, buildOutput)
 	}
 
@@ -6192,6 +6207,11 @@ func main() {
 			`main\.sum\.coro\.func[0-9]+$`,
 			"main.sum.coro",
 			"main.sum(SB)",
+		},
+		{
+			`main\.sumDefer\.coro\.func[0-9]+$`,
+			"main.sumDefer.coro",
+			"main.sumDefer(SB)",
 		},
 		{
 			`main\.even\.coro\.func[0-9]+$`,
@@ -6258,6 +6278,7 @@ func main() {
 	symbols := string(data)
 	for _, name := range []string{
 		"main.sum.coro",
+		"main.sumDefer.coro",
 		"main.even.coro",
 		"main.odd.coro",
 		"main.(*counter).descend.coro",
