@@ -894,9 +894,41 @@ changed by -0.87%. Under checkptr, the file probe similarly changed from
 105 B and three allocations to 1 B and one allocation, removing the same
 104 B and two target objects.
 
+#### Local readiness before native park
+
+The blocking file and TCP probes use one logical task to make an older read
+ready. At exact parent `86706396a0`, the reader still parks its locked native
+executor and completes through the platform poller and bridge G. CPU profiles
+therefore attribute most of the remaining time to condition wait and wake,
+even though the readiness source belongs to the same stackless scheduler.
+
+Revision `dd8f3f3422` adds a bounded cold-path retry before a native executor
+parks with an empty logical ready queue. It skips the task that just armed,
+scans no more than the 64-operation cache bound, claims only a still-armed
+same-scheduler poll read, and makes at most four rotating attempts. An
+unavailable read is rearmed, and every miss or race retains the ordinary
+netpoll behavior. No scheduler, task, native-context, operation, or compiler
+ABI layout changes.
+
+Twenty alternating 500 ms samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| ready file read | 348.7 ns -> 347.7 ns, neutral | 410.0 ns -> 418.6 ns, neutral |
+| ready TCP read | 313.9 ns -> 312.4 ns, neutral | 492.4 ns -> 487.4 ns, neutral |
+| blocking file and release | 8.305 us -> 1.266 us (-84.76%) | 52.773 us -> 2.343 us (-95.56%) |
+| blocking TCP and release | 15.092 us -> 5.508 us (-63.51%) | 59.358 us -> 4.062 us (-93.16%) |
+
+Every sample reports 0 B and 0 allocations. Ready-file and ready-TCP timing is
+statistically neutral on both platforms. The Linux/amd64 results were
+collected under VirtualApple translation and are directional. Normal, race,
+and `checkptr=2` runtime suites and the complete probe audit pass on both
+targets. Focused coverage is 97.9% for `runTasks`, 93.3% for the bounded scan,
+92.9% for the cold retry helper, and 100% for token claim.
+
 The next order of performance work is:
 
-1. reduce the remaining blocking-call scheduler handoff and root-entry
+1. reduce truly external blocking-call scheduler handoff and root-entry
    transitions while preserving the lower-cost M replacement boundary and
    sibling progress; and
 2. remove ready-`select` temporary storage.

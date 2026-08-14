@@ -4538,6 +4538,25 @@ func TestStacklessCoroPollArm(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroPollIdleRetry(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+
+	skipped, claimed, rearmed :=
+		runtime.StacklessCoroPollIdleRetryForTest(fds[0])
+	if !skipped || !claimed || !rearmed {
+		t.Fatalf("idle poll retry = (%t, %t, %t), want (true, true, true)",
+			skipped, claimed, rearmed)
+	}
+}
+
 func TestStacklessCoroOrdinaryNetpollStates(t *testing.T) {
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 	if err != nil {

@@ -42,6 +42,14 @@ const stacklessCoroFrameChunkDirectCount = 6
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
+// A short bounded retry window covers local pipe and loopback delivery without
+// turning a genuinely external read into polling.
+const stacklessCoroIdlePollAttempts = 4
+
+// Limit a cold-path registry scan to one scheduler's bounded operation cache.
+// Missing a read only preserves the ordinary netpoll wake path.
+const stacklessCoroIdlePollScanLimit = stacklessCoroOperationCacheSize
+
 // stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
 // created after the task cache saturated. It cannot be a cached frame size.
 const stacklessCoroUncachedFrameLineage = ^uint16(0)
@@ -695,6 +703,7 @@ func (scope *stacklessCoroRunScope) leave() {
 // episode after this native activation has unwound.
 func (s *stacklessCoroScheduler) runTasks(native bool) {
 	var task *stacklessCoroTask
+	var idlePollSkip *stacklessCoroTask
 	defer func() {
 		if task == nil || task.context.scheduler != s {
 			return
@@ -714,16 +723,21 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 	for !s.rootComplete() {
 		task = s.take()
 		if task == nil {
-			if s.executorStop == nil {
-				<-s.wake
-			} else {
-				select {
-				case <-s.wake:
-				case <-s.executorStop:
-					return
-				}
+			if native {
+				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
 			}
-			continue
+			if task == nil {
+				if s.executorStop == nil {
+					<-s.wake
+				} else {
+					select {
+					case <-s.wake:
+					case <-s.executorStop:
+						return
+					}
+				}
+				continue
+			}
 		}
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
@@ -731,6 +745,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 		switch action {
 		case stacklessCoroActionYield:
+			idlePollSkip = nil
 			foreignReturner := s.yield(task)
 			if !native || foreignReturner {
 				// Cooperate with the host scheduler when this target has no
@@ -740,11 +755,15 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 			}
 		case stacklessCoroActionWait:
 			s.waiting(task)
+			idlePollSkip = task
 		case stacklessCoroActionComplete:
+			idlePollSkip = nil
 			s.complete(task)
 		case stacklessCoroActionPanic:
+			idlePollSkip = nil
 			s.terminate(task)
 		case stacklessCoroActionGoexit:
+			idlePollSkip = nil
 			s.goexit(task)
 		default:
 			throw("runtime: invalid stackless coroutine action")
