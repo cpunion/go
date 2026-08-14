@@ -3388,12 +3388,70 @@ Linux/amd64, as well as the compiler/library suites, portable architecture
 probe, disabled-experiment control, and FreeBSD/amd64 and Windows/amd64
 cross-compilation gates.
 
+### 16.2 Bounded select storage reuse
+
+After operation and typed-frame reuse removed the surrounding allocations, a
+steady ready `select` still used 132 B and three allocations. An allocation
+profile and disassembly assign them to the select descriptor, its waiter
+slice, and lock-order backing storage. The temporary poll order remains on the
+native executor stack for the measured small select. Reusing the ordinary
+channel waiter alone cannot remove these objects because one select owns a
+waiter for every case and a separate lock order.
+
+The select descriptor is now an operation resource rather than part of the
+transient operation state that is zeroed after every completion. Starting a
+select validates and prepares that resource; completion clears every case,
+waiter, result pointer, and arbitration bit before the operation returns to
+its scheduler-local cache. A non-nil result pointer marks an active select, so
+reusing the same operation for an ordinary channel operation cannot mistake
+the inactive retained descriptor for select state. Tests exercise
+select-channel-select reuse and retention across a forced GC.
+
+Only backing arrays for at most 16 cases are retained. A larger select uses
+the same path for that operation but discards both arrays on completion, and a
+following small select can establish the bounded cache again. The operation
+cache itself remains limited to 64 entries, is not shared between public
+roots, and remains disabled under the race detector. On a 64-bit target the
+operation shrinks from 184 B to 176 B; after accounting for that reduction,
+the maximum logical storage added when all 64 cached operations have used a
+small select is 16 KiB. The 32-bit operation remains 104 B. Exact size,
+zero-allocation warm reuse, large-select discard, pointer clearing, and
+cross-kind reuse all have runtime tests.
+
+The exact parent is `7e6d48c590`, whose executable runtime revision is
+`dd8f3f3422`; the candidate is `c37ea928da`. Twenty alternating 500 ms samples
+at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| channel round trip control | 269.9 ns -> 268.2 ns, neutral | 477.8 ns -> 490.3 ns, neutral |
+| ready select | 292.9 ns -> 170.7 ns (-41.74%) | 518.5 ns -> 309.8 ns (-40.24%) |
+
+Ready select falls from 132 B and three allocations to zero on both targets;
+the channel control remains allocation-free. A separate exact-parent Darwin
+run covering positive timers, ready and locally blocking file and TCP reads,
+and channel round trips found every timing control statistically neutral and
+every allocation count unchanged. The translated Linux timing is directional,
+but its allocation result and neutral channel control match Darwin.
+
+Against the official Go merge-base in a separate paired Darwin run, ready
+select is 41.99 ns versus 156.70 ns and channel round trip is 165.5 ns versus
+238.9 ns. Both sides use zero allocations. This change therefore closes the
+ready-select allocation gap and reduces its parent-relative time without
+claiming to remove the remaining stackless scheduler overhead.
+
+The exact candidate passes every stackless-coroutine runtime test in normal,
+race, and `checkptr=2` modes on Darwin/arm64 and translated Linux/amd64. The
+compiler coroutine suite and architecture probe also pass on both targets,
+and the 32-bit size assertion passes under Linux/386. Focused coverage is 100%
+for select activity, cache validation, clearing, and publication, 94.1% for
+cache preparation, and 88.4% for the complete select start path.
+
 The remaining performance sequence is:
 
 1. Reduce truly external blocking-call scheduler handoff and public-root entry
    transitions while retaining the lower-cost M replacement boundary and
    sibling progress. The same-scheduler local-readiness subcase is complete.
-2. Remove ready-select temporary storage.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
 fixed-work scaling, and the live-task footprint as explicit regression gates.

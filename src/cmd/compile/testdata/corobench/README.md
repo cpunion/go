@@ -926,12 +926,57 @@ and `checkptr=2` runtime suites and the complete probe audit pass on both
 targets. Focused coverage is 97.9% for `runTasks`, 93.3% for the bounded scan,
 92.9% for the cold retry helper, and 100% for token claim.
 
+#### Bounded select storage reuse
+
+A steady ready `select` still used 132 B and three allocations after the
+surrounding operation, waiter, and typed-frame caches were warm. Profiles and
+disassembly identify a select descriptor, a waiter slice, and lock-order
+backing storage; the measured small select's poll order remains on the native
+executor stack.
+
+Revision `c37ea928da` retains a cleared descriptor with each scheduler-local
+cached operation. Backing arrays for at most 16 cases survive completion;
+larger arrays are discarded. Every channel, element, waiter, result, and
+arbitration field is cleared before reuse, and tests cover forced GC,
+large-select discard, and select-channel-select reuse. The 64-entry operation
+cache does not cross public roots and remains disabled under the race
+detector. On 64-bit targets the operation shrinks from 184 B to 176 B, making
+the maximum net logical retention 16 KiB if all 64 entries have used a small
+select. The 32-bit operation remains 104 B.
+
+The exact parent is `7e6d48c590`, with executable runtime revision
+`dd8f3f3422`, and the candidate is `c37ea928da`. Twenty alternating 500 ms
+samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| channel round trip control | 269.9 ns -> 268.2 ns, neutral | 477.8 ns -> 490.3 ns, neutral |
+| ready select | 292.9 ns -> 170.7 ns (-41.74%) | 518.5 ns -> 309.8 ns (-40.24%) |
+
+Ready select falls from 132 B and three allocations to zero on both targets;
+the channel control remains allocation-free. A seven-probe Darwin control run
+found positive timers and ready and locally blocking file and TCP reads
+statistically neutral with unchanged allocation counts. Translated Linux
+timing is directional, while its allocation result and channel control match
+Darwin.
+
+An additional paired Darwin comparison measured official Go at 41.99 ns for
+ready select and 165.5 ns for channel round trip, versus 156.70 ns and 238.9 ns
+for the stackless candidate. All four measurements use zero allocations. The
+allocation gap is closed, but the remaining scheduler time is a separate
+target.
+
+Normal, race, and `checkptr=2` stackless runtime suites and the architecture
+probe pass on both targets; the compiler coroutine suite also passes, and
+Linux/386 verifies the 104 B operation layout. Focused coverage is 100% for
+select activity, cache validation, clearing, and publication, 94.1% for
+preparation, and 88.4% for the complete select start path.
+
 The next order of performance work is:
 
 1. reduce truly external blocking-call scheduler handoff and root-entry
    transitions while preserving the lower-cost M replacement boundary and
-   sibling progress; and
-2. remove ready-`select` temporary storage.
+   sibling progress.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
 and live task footprint are regression gates for each of those changes.
