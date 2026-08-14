@@ -297,6 +297,55 @@ Linux arm64 cross-compilation pass. Focused coverage is 96.2% for `runTasks`
 and 84.8% for `complete`; every executable statement added for direct handoff
 and each queue fallback is covered.
 
+## Production structured frame-fusion follow-up, 2026-08-15
+
+Revision `d6a4bac3dc`, relative to exact parent `f338b13f94`, implements the
+next hybrid step without adopting the comparison driver's pull scheduler. A
+compiler-proven explicit-frame function that awaits itself and never spawns
+itself links child frames under one logical task. Each frame carries its
+parent, an optional cache-frame owner, and a direct/chunk allocation marker.
+After the reusable cache prefix, six direct typed frames and `[4]frame` chunks
+remove the separate task allocation from every saturated child.
+
+The current executor switches frames directly while the ready queue is empty.
+If another task is ready, the shared logical task yields behind it, preserving
+the production push scheduler's fairness. Race builds and the tagged pull
+comparison retain separate task identities. Nonmatching resumes and
+closure-frame factories also retain the ordinary task path; a 4,096-level
+recursive function with `defer` is an end-to-end compatibility regression.
+Panic unwinds the linked frames, while timer and external event delivery still
+use the push scheduler. No annotation, public pull API, or factory ABI change
+is introduced.
+
+The production result closes half of the allocation-count gap identified by
+`CompactPull` without importing its second driver. At depth 4,096, native
+Darwin/arm64 moved from 338,144 B and 1,930 allocations to 215,200 B and 965
+allocations. Twelve matched randomized layouts improved time from 429.2 us to
+248.3 us (-42.16%), while yield and public-entry controls were neutral. The
+fixed cache/chunk boundaries show why:
+
+| Depth | Parent bytes / allocs | Fused bytes / allocs |
+| ---: | ---: | ---: |
+| 262 | 720 / 12 | 384 / 6 |
+| 264 | 928 / 14 | 608 / 7 |
+| 267 | 1,120 / 15 | 832 / 8 |
+| 4096 | 338,144 / 1,930 | 215,200 / 965 |
+
+Translated Linux/amd64 reproduced the allocation counts and a directional
+35.45% depth-4096 improvement. Native Linux/arm64 passes the complete `coro`
+and `nocoro` runtime suites plus race and `checkptr=2`; Linux/amd64 passes the
+complete compiler suite and targeted runtime comparison, while Rosetta's
+unrelated address-space crash tests prevent using its full runtime run as a
+gate.
+
+This result narrows the case for a separately exposed pull model. Structured
+ownership and compact storage can be added beneath the existing push-based
+goroutine semantics, leaving independent roots, external readiness, and
+blocking-C M replacement on the push scheduler. A future heterogeneous-frame
+fusion step should first prove result, panic, and fairness ownership; a public
+pull API still requires independent cancellation, backpressure, and ecosystem
+evidence.
+
 ## Interpretation gates
 
 A pull implementation is worth pursuing only if the measurements separate

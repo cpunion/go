@@ -3570,6 +3570,110 @@ fixed-work scaling, and the live-task footprint as explicit regression gates.
 The portable benchmark remains an architecture probe; native exact-parent
 comparisons, rather than hosted CI timing thresholds, decide performance.
 
+### 16.5 Structured self-await frame fusion
+
+Revision `d6a4bac3dc`, relative to the exact `f338b13f94` merge containing
+structured completion handoff, implements the first task/frame fusion step.
+It is deliberately restricted to a compiler-proven, explicit-frame
+`FactoryABI3` function that awaits itself and never spawns itself. The existing
+explicit-frame eligibility gate already excludes defer ownership, closures,
+range-variable storage, and terminal cleanup. Mutual recursion, ordinary
+closure-frame factories, imported nonmatching resumes, and race or pull
+comparison builds retain the ordinary child-task path. A regression program
+with 4,096 recursive frames and a named result updated by `defer` verifies that
+the closure-frame fallback still compiles and runs.
+
+Every eligible generated frame starts with three compiler-private fields:
+
+1. a typed-GC-visible parent frame pointer;
+2. an owner pointer for a cache-owned frame holder; and
+3. a compact allocation marker.
+
+The aligned prefix occupies 24 bytes on 64-bit targets. Packing with the
+existing fields makes the benchmark's recursive frame grow from 40 to 56
+bytes, rather than adding a separate logical task to every active child. The
+task's former one-byte cache marker now holds internal flags, so the 64-bit
+task and scheduler remain 48 and 192 bytes. The factory ABI stays at version
+3 and the source needs no annotation.
+
+The first cache-sized prefix still uses scheduler-owned typed-frame holders,
+but those holders are storage owners rather than separately runnable logical
+tasks. Once the cache is saturated, one active task links six directly
+allocated typed frames followed by exact `[4]frame` chunks. Each child retains
+its cache owner directly in the header, avoiding a lineage scan. Completion
+clears pointer-bearing fields, restores the parent frame, and recycles only an
+owner that exists. An implicit native panic walks the same links back to the
+root and discards cache owners whose frames may retain pointers.
+
+The generated await and completion helpers return a private `Switch` action
+when no other task is runnable. The executor then enters the new current frame
+without publishing and consuming the same logical task. If a sibling is
+already queued, the helper returns `Yield`, preserving queue priority before
+the child or restored parent resumes. Race builds retain distinct task and
+synchronization identities. The controlled pull build and any nonmatching or
+non-explicit caller fall back to the existing frame-chunk and task protocol.
+External timer, file, network, channel, and blocking-C wakeups are unchanged.
+
+The exact `d6a4bac3dc` binaries used two warm-up pairs and eight alternating
+500 ms fixed-layout samples at one P on native Darwin/arm64:
+
+| Probe | Exact parent | Fused frames | Change |
+| --- | ---: | ---: | ---: |
+| logical yield control | 19.43 ns | 19.59 ns | neutral |
+| public entry control | 1.107 us | 1.162 us | neutral |
+| recursive yield, depth 64 | 4.794 us | 3.855 us | -19.59% |
+| recursive yield, depth 256 | 15.43 us | 11.47 us | -25.66% |
+| recursive yield, depth 262 | 17.47 us | 12.67 us | -27.46% |
+| recursive yield, depth 264 | 18.08 us | 12.85 us | -28.91% |
+| recursive yield, depth 267 | 18.54 us | 13.29 us | -28.30% |
+| recursive yield, depth 4096 | 430.7 us | 260.6 us | -39.49% |
+
+Twelve matched `-randlayout` seeds reproduced the result and separated it
+from code placement: depth 64, 256, and 4096 improved by 25.94%, 32.35%, and
+42.16%, while yield and entry remained neutral (`p=0.291` and `p=0.062`).
+The deterministic allocation transitions were identical on Darwin/arm64 and
+translated Linux/amd64:
+
+| Depth | Parent bytes / allocs | Fused bytes / allocs | Explanation |
+| ---: | ---: | ---: | --- |
+| 262 | 720 / 12 | 384 / 6 | six direct frames, no task allocations |
+| 264 | 928 / 14 | 608 / 7 | direct prefix plus the first four-frame chunk |
+| 267 | 1,120 / 15 | 832 / 8 | direct prefix plus two typed chunks |
+| 4096 | 338,144 / 1,930 | 215,200 / 965 | 36.36% fewer bytes and 50% fewer objects |
+
+Ten alternating translated Linux/amd64 samples improved depth 4096 from
+758.6 us to 489.7 us (-35.45%) and reproduced every allocation count. Its
+smaller timing rows moved with VirtualApple layout and scheduling noise, so
+they are directional rather than release thresholds.
+
+Tests cover cache reuse, the direct/chunk boundaries, repeated roots, queued
+sibling fairness on both await and completion, timer suspension, implicit
+panic unwind across every allocation phase, ordinary-caller compatibility,
+race fallback, and pull-comparison fallback. Full `coro` and `nocoro` runtime
+suites pass on Darwin/arm64 and native Linux/arm64. The complete compiler
+coroutine suite passes on Darwin/arm64 and Linux/amd64; normal, race, and
+`checkptr=2` focused runtime tests pass on Darwin and native Linux. The
+translated Linux/amd64 full runtime run is not used as a gate because Rosetta
+repeatedly traps in unrelated address-space crash tests; targeted runtime,
+compiler, and benchmark binaries pass there.
+Linux/386, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime test binaries
+also cross-compile with the experiment enabled.
+
+Compiler coverage is 93.4% overall, 100% for the changed explicit-frame
+lowering, and 93.0% for the containing lowering function. Combined normal,
+race, and pull runtime profiles execute every reachable line added by this
+checkpoint. The raw changed-line calculation is 86.09% because runtime
+`throw` bodies deliberately cannot return and flush an in-process coverage
+profile; all 47 unexecuted changed lines are those fail-closed invariant
+bodies. No coverage exclusion directive or test-only production branch is
+used.
+
+The next allocation step is heterogeneous structured-call fusion: prove when
+different explicit frame types can share one task without weakening panic,
+result, or fairness ownership. It should remain separate from the blocking-C
+handoff work, which must leave a blocking call on its original M even if the
+replacement transfer becomes cheaper.
+
 The likely compatibility order remains:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake

@@ -1183,3 +1183,65 @@ with only its three known Rosetta-incompatible tests excluded. FreeBSD and
 Windows amd64 plus Darwin amd64 and Linux arm64 cross-compilation pass. The
 runtime coverage profile executes every new direct-handoff statement and each
 tested fallback; `runTasks` reports 96.2% and `complete` reports 84.8%.
+
+#### Fuse structured self-await frames
+
+Revision `d6a4bac3dc`, based on the exact `f338b13f94` merge, lets one logical
+task own a compiler-proven explicit-frame self-await chain. Each generated
+frame carries its parent, an optional cache owner, and a compact direct/chunk
+marker. The cache prefix remains typed and reusable; after saturation, six
+direct frames and exact four-frame chunks replace the former frame-plus-task
+allocation pairs. The benchmark recursive frame grows from 40 to 56 bytes,
+while the task and scheduler remain 48 and 192 bytes.
+
+An empty ready queue returns a private frame-switch action so the executor can
+enter the child or restored parent immediately. A queued sibling retains
+priority through the ordinary yield path. Race and pull-comparison builds,
+nonmatching callers, closure-frame factories, and self-spawn candidates retain
+the old task path. Panic unwinds the parent links and discards cache owners.
+The compiler-private factory ABI remains version 3 and no source annotation is
+added.
+
+Two warm-up pairs followed by eight alternating 500 ms fixed-layout samples
+on native Darwin/arm64 produced:
+
+| Probe | Exact parent | Fused frames | Change |
+| --- | ---: | ---: | ---: |
+| logical yield control | 19.43 ns | 19.59 ns | neutral |
+| public entry control | 1.107 us | 1.162 us | neutral |
+| recursive yield, depth 64 | 4.794 us | 3.855 us | -19.59% |
+| recursive yield, depth 256 | 15.43 us | 11.47 us | -25.66% |
+| recursive yield, depth 262 | 17.47 us | 12.67 us | -27.46% |
+| recursive yield, depth 264 | 18.08 us | 12.85 us | -28.91% |
+| recursive yield, depth 267 | 18.54 us | 13.29 us | -28.30% |
+| recursive yield, depth 4096 | 430.7 us | 260.6 us | -39.49% |
+
+Twelve matched randomized layouts made both controls neutral and reproduced
+25.94%, 32.35%, and 42.16% improvements at depths 64, 256, and 4096. The
+allocation boundary probes are exact and identical on native Darwin and
+translated Linux:
+
+| Depth | Exact parent | Fused frames | Change |
+| ---: | ---: | ---: | ---: |
+| 262 | 720 B, 12 allocs | 384 B, 6 allocs | -46.67% bytes, -50% allocs |
+| 264 | 928 B, 14 allocs | 608 B, 7 allocs | -34.48% bytes, -50% allocs |
+| 267 | 1,120 B, 15 allocs | 832 B, 8 allocs | -25.71% bytes, -46.67% allocs |
+| 4096 | 338,144 B, 1,930 allocs | 215,200 B, 965 allocs | -36.36% bytes, -50% allocs |
+
+Ten alternating translated Linux/amd64 samples improved depth 4096 from
+758.6 us to 489.7 us (-35.45%) and reproduced the exact allocation result.
+Smaller timing rows were sensitive to VirtualApple translation and are not
+used as release thresholds.
+
+Full `coro` and `nocoro` runtime suites pass on native Darwin/arm64 and native
+Linux/arm64. The complete compiler coroutine suite passes on Darwin/arm64 and
+Linux/amd64. Normal, race, `checkptr=2`, pull fallback, architecture, and
+closure-frame recursive compatibility checks pass on their applicable native
+targets. Rosetta repeatedly traps in unrelated Linux/amd64 address-space crash
+tests, so only its targeted runtime, compiler, and benchmark results are used.
+Linux/386, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime test binaries
+cross-compile with the experiment enabled.
+Compiler coverage is 93.4% overall and 100% for the changed explicit-frame
+lowering. Normal, race, and pull runtime profiles cover every reachable added
+line; the remaining raw-profile gaps are fail-closed `throw` bodies, with no
+coverage exclusion or test-only production branch.
