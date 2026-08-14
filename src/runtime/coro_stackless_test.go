@@ -2188,6 +2188,18 @@ func TestStacklessCoroRootSchedulerPool(t *testing.T) {
 		t.Fatalf("root scheduler pool size after operation = %d, want %d",
 			got, want)
 	}
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+			return runtime.StacklessCoroActionYield
+		})
+		return runtime.StacklessCoroActionComplete
+	})
+	if got, want := runtime.StacklessCoroRootSchedulerPoolSizeForTest(),
+		runtime.StacklessCoroWarmExecutorCount-2; got != want {
+		t.Fatalf("root scheduler pool size after detached task = %d, want %d",
+			got, want)
+	}
 }
 
 func TestStacklessCoroEmbeddedRoot(t *testing.T) {

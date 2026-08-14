@@ -319,6 +319,12 @@ func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
 }
 
 func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
+	// An operation producer can still hold a completed root scheduler after
+	// removing its operation from the global registry. Do not inspect or reuse
+	// any other scheduler state in that case.
+	if s.operationStarted {
+		return
+	}
 	state := s.executorState.Load()
 	runnable := s.runnableState.Load()
 	quiescent := s.wake == nil && s.head == nil && s.tail == nil &&
@@ -330,13 +336,11 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
 			state == stacklessCoroExecutorStateStopping)
-	// An operation producer can still hold a completed root scheduler after
-	// removing its operation from the global registry. A remaining runnable
-	// task or frame reservation similarly belongs to the old root. Leave those
-	// schedulers on their existing allocation lifetime rather than making
-	// their addresses available to another public root. Pooling is optional,
-	// so any state not proven quiescent also keeps that lifetime.
-	if s.operationStarted || !quiescent {
+	// A remaining runnable task or frame reservation belongs to the old root.
+	// Leave those schedulers on their existing allocation lifetime rather than
+	// making their addresses available to another public root. Pooling is
+	// optional, so any state not proven quiescent also keeps that lifetime.
+	if !quiescent {
 		return
 	}
 	*s = stacklessCoroScheduler{}
