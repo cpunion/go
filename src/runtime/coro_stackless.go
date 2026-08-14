@@ -254,20 +254,35 @@ var stacklessCoroRootSchedulerPool struct {
 	available chan *stacklessCoroScheduler
 }
 
+// stacklessCoroRootFrame retains a compiler-generated typed allocation only
+// after its public root has become quiescent. The frame pointer keeps the
+// allocation's exact GC type alive while it is cached.
+type stacklessCoroRootFrame struct {
+	frame  unsafe.Pointer
+	resume *funcval
+	size   uint16
+}
+
+var stacklessCoroRootFramePool struct {
+	available chan stacklessCoroRootFrame
+}
+
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 	stacklessCoroRootSchedulerPool.available = make(chan *stacklessCoroScheduler, stacklessCoroWarmExecutorCount)
+	stacklessCoroRootFramePool.available = make(chan stacklessCoroRootFrame, stacklessCoroWarmExecutorCount)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
 // compiler emits calls to coroRun only for coroutine root adapters.
 func coroRun(resume stacklessCoroResume) {
-	coroRunFrame(nil, resume)
+	coroRunFrame(nil, resume, 0)
 }
 
-func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
-	s := acquireStacklessCoroRootScheduler(frame, resume)
+func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
+	frameSize uintptr) bool {
+	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 
 	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
 		s = nativeScheduler
@@ -276,29 +291,32 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
 	}
 	s.stopReplacementExecutors()
 	s.releaseWake()
-	finishStacklessCoroRootScheduler(s)
+	return finishStacklessCoroRootScheduler(s)
 }
 
 func newStacklessCoroScheduler(frame unsafe.Pointer,
 	resume stacklessCoroResume) *stacklessCoroScheduler {
 	return initializeStacklessCoroScheduler(
-		new(stacklessCoroScheduler), frame, resume)
+		new(stacklessCoroScheduler), frame, resume, 0)
 }
 
 func acquireStacklessCoroRootScheduler(frame unsafe.Pointer,
-	resume stacklessCoroResume) *stacklessCoroScheduler {
+	resume stacklessCoroResume, frameSize uintptr) *stacklessCoroScheduler {
 	if !raceenabled {
 		select {
 		case s := <-stacklessCoroRootSchedulerPool.available:
-			return initializeStacklessCoroScheduler(s, frame, resume)
+			return initializeStacklessCoroScheduler(s, frame, resume,
+				frameSize)
 		default:
 		}
 	}
-	return newStacklessCoroScheduler(frame, resume)
+	return initializeStacklessCoroScheduler(
+		new(stacklessCoroScheduler), frame, resume, frameSize)
 }
 
 func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
-	frame unsafe.Pointer, resume stacklessCoroResume) *stacklessCoroScheduler {
+	frame unsafe.Pointer, resume stacklessCoroResume,
+	frameSize uintptr) *stacklessCoroScheduler {
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
@@ -307,23 +325,31 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
 	s.root.context.frame = frame
+	if frame != nil && canCacheStacklessCoroRootFrame(resume, frameSize) {
+		s.root.cacheFrame = true
+		s.root.frameSize = uint16(frameSize)
+	}
 	s.ready(&s.root, false)
 	return s
 }
 
-func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
+func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
+	quiescent bool) {
 	if !raceenabled {
-		defer releaseStacklessCoroRootScheduler(s)
+		defer func() {
+			quiescent = releaseStacklessCoroRootScheduler(s)
+		}()
 	}
 	s.finish()
+	return
 }
 
-func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
+func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// An operation producer can still hold a completed root scheduler after
 	// removing its operation from the global registry. Do not inspect or reuse
 	// any other scheduler state in that case.
 	if s.operationStarted {
-		return
+		return false
 	}
 	state := s.executorState.Load()
 	runnable := s.runnableState.Load()
@@ -341,11 +367,63 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
 	// making their addresses available to another public root. Pooling is
 	// optional, so any state not proven quiescent also keeps that lifetime.
 	if !quiescent {
-		return
+		return false
 	}
 	*s = stacklessCoroScheduler{}
 	select {
 	case stacklessCoroRootSchedulerPool.available <- s:
+	default:
+	}
+	return true
+}
+
+func canCacheStacklessCoroRootFrame(resume stacklessCoroResume,
+	size uintptr) bool {
+	return !raceenabled && resume != nil && size != 0 &&
+		size <= stacklessCoroFrameCacheSize
+}
+
+// coroTakeRootFrame returns a quiescent typed frame with the same resume
+// identity and size. A miss leaves allocation to the generated factory.
+func coroTakeRootFrame(resume stacklessCoroResume,
+	size uintptr) unsafe.Pointer {
+	if !canCacheStacklessCoroRootFrame(resume, size) {
+		return nil
+	}
+	identity := stacklessCoroResumeIdentity(resume)
+	for count := cap(stacklessCoroRootFramePool.available); count > 0; count-- {
+		select {
+		case cached := <-stacklessCoroRootFramePool.available:
+			if cached.resume == identity && cached.size == uint16(size) {
+				return cached.frame
+			}
+			select {
+			case stacklessCoroRootFramePool.available <- cached:
+			default:
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// coroReleaseRootFrame publishes a frame only after coroRunFrame reported a
+// quiescent root, so no scheduler or operation can retain its previous
+// identity. The generated wrapper copies result values out before calling
+// this function.
+func coroReleaseRootFrame(frame unsafe.Pointer, resume stacklessCoroResume,
+	size uintptr) {
+	if frame == nil || !canCacheStacklessCoroRootFrame(resume, size) {
+		return
+	}
+	cached := stacklessCoroRootFrame{
+		frame:  frame,
+		resume: stacklessCoroResumeIdentity(resume),
+		size:   uint16(size),
+	}
+	select {
+	case stacklessCoroRootFramePool.available <- cached:
 	default:
 	}
 }

@@ -1089,3 +1089,56 @@ The next independent performance change is to remove the remaining
 compiler-owned public-entry frame and result allocations. Its regression gates
 remain the direct-C path, multi-P fixed-work behavior, disabled-experiment
 control, and live task footprint.
+
+#### Reuse compiler-owned public-root frames
+
+Revision `2a950f17c0` removes the remaining steady-state public-entry
+allocations without changing the internal explicit-frame factory ABI. A public
+factory first looks up one of at most four quiescent typed frames by exact
+resume identity and size. On a miss, under the race detector, or above the
+existing 32 KiB frame-cache limit, it retains the ordinary typed allocation.
+Internal await and spawn factories continue to use their scheduler-local frame
+reservations.
+
+Public result targets now refer to result values inside the typed frame. The
+wrapper copies those values only after the root scheduler has finished, clears
+pointer-bearing results, and publishes the frame only when scheduler release
+proves the old root quiescent. Generated completion still clears every other
+pointer field. Child factories distinguish their external result targets from
+the public root's self-target, so they retain the existing copy-before-reuse
+behavior without a runtime root query or a source annotation.
+
+The exact parent is the `a1bf0645ae` merge of the native-drain checkpoint.
+Three warm-up pairs followed by 20 alternating 500 ms fixed-layout samples at
+one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 986.7 ns -> 982.3 ns (-0.45%) | 1.022 us -> 1.019 us (-0.39%) |
+| allocation | 32 B, 2 allocs -> 0 B, 0 allocs | 32 B, 2 allocs -> 0 B, 0 allocs |
+
+The sub-percent entry-time movements are practically neutral; exact
+steady-state allocation removal is the result. Five fixed-layout controls had
+timing geomeans of
+-0.22% on Darwin and +0.34% on translated Linux, with every allocation count
+unchanged. The fixed Linux `YieldBatch` control moved +2.29%, but eight matched
+randomized linker layouts made it neutral (`p=0.382`). Channel round trips,
+ready file and TCP reads, and scalar direct-C calls otherwise remained neutral.
+The 64-task multi-P probe was also neutral on both targets.
+
+Five independent 10,000-parked-task samples retained the same steady live
+footprint: the stable samples report 340.1 live heap bytes and 3.252 live
+objects per task, zero measured live stack bytes, about 3.244 MiB allocated,
+and about 40,017 allocations. Disabled-experiment binaries contain no
+coroutine resume symbol; public entry, file-read, and scalar-C controls remain
+statistically neutral with identical zero-allocation counts.
+
+The architecture check now runs three fixed-count public-entry samples and
+requires each to report zero bytes and zero allocations. The compiler
+coroutine suite, normal, race, and `checkptr=2` stackless runtime suites, and
+the complete architecture audit pass on native Darwin/arm64 and translated
+Linux/amd64. Full Darwin runtime suites pass with both `coro` and `nocoro`, and
+FreeBSD and Windows amd64 plus Darwin amd64 and Linux arm64 cross-compilation
+passes. Compiler coverage is 93.3% overall and 100% for the changed explicit
+frame lowering; the new root-frame cache eligibility, lookup, release, and
+quiescent scheduler release paths each have 100% focused coverage.

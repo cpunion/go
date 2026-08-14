@@ -25,6 +25,7 @@ lowering_output="$output_dir/lowering.txt"
 symbols_output="$output_dir/coro.symbols"
 test_binary="$output_dir/coro.test"
 build_output="$output_dir/build.txt"
+allocation_output="$output_dir/public-entry-allocation.txt"
 read_output="$output_dir/read-lowering.txt"
 correctness_output="$output_dir/correctness.txt"
 public_coverage_output="$output_dir/public-read-coverage.txt"
@@ -190,6 +191,27 @@ for function in "${expected[@]}"; do
 		exit 1
 	fi
 done
+if ! "$test_binary" -test.run '^$' -test.bench '^BenchmarkYieldEntry$' \
+	-test.benchmem -test.benchtime=10000x -test.count=3 \
+	>"$allocation_output"; then
+	tail -n 100 "$allocation_output" >&2
+	exit 1
+fi
+if ! awk '
+	$1 ~ /^BenchmarkYieldEntry-/ {
+		samples++
+		for (i = 2; i <= NF; i++) {
+			if (($i == "B/op" || $i == "allocs/op") && $(i - 1) != 0) {
+				bad = 1
+			}
+		}
+	}
+	END { exit samples == 3 && !bad ? 0 : 1 }
+' "$allocation_output"; then
+	cat "$allocation_output" >&2
+	echo "public coroutine entry allocation is not zero" >&2
+	exit 1
+fi
 
 : >"$read_output"
 read_functions=(

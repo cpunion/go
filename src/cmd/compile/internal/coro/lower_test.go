@@ -286,16 +286,22 @@ func TestLowerMethodReceiver(t *testing.T) {
 	if allocations != 1 {
 		t.Fatalf("factory has %d allocations, want one typed frame", allocations)
 	}
-	takeFrames := 0
+	takeFrames, takeRootFrames := 0, 0
 	ir.VisitList(generatedFactory.Body, func(node ir.Node) {
 		call, ok := node.(*ir.CallExpr)
-		if ok && symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
-			"runtime.coroTakeFrame" {
+		if !ok {
+			return
+		}
+		switch symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) {
+		case "runtime.coroTakeFrame":
 			takeFrames++
+		case "runtime.coroTakeRootFrame":
+			takeRootFrames++
 		}
 	})
-	if takeFrames != 1 {
-		t.Fatalf("factory has %d frame-cache lookups, want one", takeFrames)
+	if takeFrames != 1 || takeRootFrames != 1 {
+		t.Fatalf("factory has %d child and %d root frame-cache lookups, want one each",
+			takeFrames, takeRootFrames)
 	}
 	cacheQueries, pointerClears := 0, 0
 	ir.VisitList(resume.Func.Body, func(node ir.Node) {
@@ -1973,11 +1979,14 @@ func TestLowerStateMachines(t *testing.T) {
 		repeatedDeferred, repeatedRead,
 	} {
 		wantStatements := 2
-		callIndex := 0
 		wantRuntime := "coroRun"
 		if explicitFrames[fn] {
-			wantStatements = 5
-			callIndex = 3
+			wantStatements = 7 + fn.Type().NumResults()
+			for _, result := range fn.Type().Results() {
+				if result.Type.HasPointers() {
+					wantStatements++
+				}
+			}
 			wantRuntime = "coroRunFrame"
 		}
 		if len(fn.Body) != wantStatements {
@@ -1985,17 +1994,21 @@ func TestLowerStateMachines(t *testing.T) {
 				len(fn.Body), wantStatements)
 			continue
 		}
-		call, ok := fn.Body[callIndex].(*ir.CallExpr)
-		if !ok {
-			t.Errorf("%s statement %d is %T, want call", fn.Sym().Name,
-				callIndex, fn.Body[callIndex])
-			continue
-		}
-		callee := ir.StaticCalleeName(call.Fun)
-		if callee == nil || callee.Sym().Pkg != ir.Pkgs.Runtime ||
-			callee.Sym().Name != wantRuntime {
-			t.Errorf("%s wrapper calls %v, want runtime.%s",
-				fn.Sym().Name, callee, wantRuntime)
+		var runtimeCalls int
+		ir.VisitList(fn.Body, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			callee := ir.StaticCalleeName(call.Fun)
+			if callee != nil && callee.Sym().Pkg == ir.Pkgs.Runtime &&
+				callee.Sym().Name == wantRuntime {
+				runtimeCalls++
+			}
+		})
+		if runtimeCalls != 1 {
+			t.Errorf("%s wrapper has %d runtime.%s calls, want one",
+				fn.Sym().Name, runtimeCalls, wantRuntime)
 		}
 		if fn.Inl != nil {
 			t.Errorf("%s retained stale inline body", fn.Sym().Name)
@@ -5403,13 +5416,14 @@ func TestLowerParametersAndResults(t *testing.T) {
 	yield.DeclareParams(true)
 
 	param := types.NewField(src.NoXPos, pkg.Lookup("value"), types.Types[types.TINT])
-	resultField := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	resultType := types.NewPtr(types.Types[types.TINT])
+	resultField := types.NewField(src.NoXPos, nil, resultType)
 	leaf := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("leaf"),
 		types.NewSignature(nil, []*types.Field{param}, []*types.Field{resultField}))
 	leaf.DeclareParams(true)
 	yieldCall := newLowerTestCall(yield)
-	returnValue, _ := param.Nname.(ir.Node)
-	ret := ir.NewReturnStmt(src.NoXPos, []ir.Node{returnValue})
+	ret := ir.NewReturnStmt(src.NoXPos,
+		[]ir.Node{ir.NewNilExpr(src.NoXPos, resultType)})
 	ret.SetTypecheck(1)
 	leaf.Body = []ir.Node{yieldCall, ret}
 
@@ -5417,9 +5431,9 @@ func TestLowerParametersAndResults(t *testing.T) {
 	leafCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, leaf.Nname,
 		[]ir.Node{ir.NewBasicLit(src.NoXPos, types.Types[types.TINT],
 			constant.MakeInt64(42))})
-	leafCall.SetType(types.Types[types.TINT])
+	leafCall.SetType(resultType)
 	leafCall.SetTypecheck(1)
-	output := ir.NewNameAt(src.NoXPos, pkg.Lookup("output"), types.Types[types.TINT])
+	output := ir.NewNameAt(src.NoXPos, pkg.Lookup("output"), resultType)
 	output.Class = ir.PEXTERN
 	assign := ir.NewAssignStmt(src.NoXPos, output, leafCall)
 	assign.SetTypecheck(1)
@@ -5454,6 +5468,37 @@ func TestLowerParametersAndResults(t *testing.T) {
 	}
 	if result.Lowered != 2 || result.Skipped != 0 {
 		t.Fatalf("Lower result = %+v, want 2 lowered and 0 skipped", result)
+	}
+	wantFactory := symbolName(leaf.Nname) + ".coro"
+	var publicFactoryCall *ir.CallExpr
+	runtimeCalls := make(map[string]int)
+	ir.VisitList(leaf.Body, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok {
+			return
+		}
+		name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
+		if name == wantFactory {
+			publicFactoryCall = call
+		}
+		if name == "runtime.coroRunFrame" ||
+			name == "runtime.coroReleaseRootFrame" {
+			runtimeCalls[name]++
+		}
+	})
+	if publicFactoryCall == nil || len(publicFactoryCall.Args) != 3 ||
+		!ir.IsNil(publicFactoryCall.Args[0]) ||
+		!ir.IsNil(publicFactoryCall.Args[2]) {
+		t.Fatalf("public factory call = %v, want nil context and result target",
+			publicFactoryCall)
+	}
+	for _, name := range []string{
+		"runtime.coroRunFrame", "runtime.coroReleaseRootFrame",
+	} {
+		if runtimeCalls[name] != 1 {
+			t.Errorf("public wrapper has %d %s calls, want one",
+				runtimeCalls[name], name)
+		}
 	}
 }
 
