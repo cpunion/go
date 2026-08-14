@@ -847,7 +847,6 @@ func (scope *stacklessCoroRunScope) leave() {
 // has unwound.
 func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 	var task *stacklessCoroTask
-	var handoff *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	defer func() {
 		if task == nil || task.context.scheduler != s {
@@ -866,11 +865,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 	}()
 
 	for !s.rootComplete() {
-		task = handoff
-		handoff = nil
-		if task == nil {
-			task = s.take()
-		}
+		task = s.take()
 		if task == nil {
 			if native {
 				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
@@ -891,6 +886,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 				continue
 			}
 		}
+	resume:
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
@@ -910,7 +906,10 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 			idlePollSkip = task
 		case stacklessCoroActionComplete:
 			idlePollSkip = nil
-			handoff = s.complete(task)
+			task = s.complete(task)
+			if task != nil && !s.rootComplete() {
+				goto resume
+			}
 		case stacklessCoroActionPanic:
 			idlePollSkip = nil
 			s.terminate(task)
