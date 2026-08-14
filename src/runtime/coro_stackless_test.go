@@ -2088,8 +2088,105 @@ func TestStacklessCoroWakePool(t *testing.T) {
 	}
 	if got := testing.AllocsPerRun(100, func() {
 		runtime.RunStacklessCoroForTest(resume)
-	}); got != 1 {
-		t.Fatalf("native root allocations = %v, want 1", got)
+	}); got != 0 {
+		t.Fatalf("native root allocations = %v, want 0", got)
+	}
+}
+
+func TestStacklessCoroRootSchedulerPool(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds retain per-root scheduler identities")
+	}
+	const roots = 2 * runtime.StacklessCoroWarmExecutorCount
+
+	oldProcs := runtime.GOMAXPROCS(runtime.StacklessCoroWarmExecutorCount)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	var ready atomic.Int32
+	var release atomic.Bool
+	schedulers := make([]unsafe.Pointer, roots)
+	done := make(chan struct{}, roots)
+	for i := range roots {
+		go func() {
+			state := 0
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					schedulers[i] = runtime.SchedulerStacklessCoroForTest(ctx)
+					state = 1
+					ready.Add(1)
+					return runtime.StacklessCoroActionYield
+				case 1:
+					if !release.Load() {
+						return runtime.StacklessCoroActionYield
+					}
+					return runtime.StacklessCoroActionComplete
+				default:
+					panic("unexpected root scheduler pool state")
+				}
+			})
+			done <- struct{}{}
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for ready.Load() != roots && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if ready.Load() != roots {
+		t.Fatalf("ready roots = %d, want %d", ready.Load(), roots)
+	}
+	for i, scheduler := range schedulers {
+		if scheduler == nil {
+			t.Fatalf("root %d has a nil scheduler", i)
+		}
+		for j := range i {
+			if scheduler == schedulers[j] {
+				t.Fatalf("roots %d and %d share a scheduler", i, j)
+			}
+		}
+	}
+	release.Store(true)
+	timeout := time.After(5 * time.Second)
+	for range roots {
+		select {
+		case <-done:
+		case <-timeout:
+			t.Fatal("scheduler-pool root did not stop")
+		}
+	}
+	if got := runtime.StacklessCoroRootSchedulerPoolSizeForTest(); got !=
+		runtime.StacklessCoroWarmExecutorCount {
+		t.Fatalf("root scheduler pool size = %d, want %d", got,
+			runtime.StacklessCoroWarmExecutorCount)
+	}
+
+	channel := make(chan int, 1)
+	channel <- 41
+	state := 0
+	value := 0
+	received := false
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.RecvIntStacklessCoroForTest(ctx, channel,
+				&value, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if value != 41 || !received {
+				t.Fatalf("root receive = (%d, %t), want (41, true)",
+					value, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected root receive state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	if got, want := runtime.StacklessCoroRootSchedulerPoolSizeForTest(),
+		runtime.StacklessCoroWarmExecutorCount-1; got != want {
+		t.Fatalf("root scheduler pool size after operation = %d, want %d",
+			got, want)
 	}
 }
 

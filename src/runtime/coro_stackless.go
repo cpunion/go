@@ -148,6 +148,7 @@ type stacklessCoroScheduler struct {
 	freeOperationCount      uint8
 	freeOverflowTaskCount   uint8
 	directOverflowTaskCount uint8
+	operationStarted        bool
 	root                    stacklessCoroTask
 	terminalValues          map[*stacklessCoroTask]any
 	wake                    chan struct{}
@@ -245,9 +246,18 @@ var stacklessCoroWakePool struct {
 	available chan chan struct{}
 }
 
+// Operation-free public roots may reuse a scheduler only after every
+// replacement executor has stopped and the root outcome has been transferred
+// to its caller. Race builds retain a distinct root synchronization identity
+// instead.
+var stacklessCoroRootSchedulerPool struct {
+	available chan *stacklessCoroScheduler
+}
+
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
+	stacklessCoroRootSchedulerPool.available = make(chan *stacklessCoroScheduler, stacklessCoroWarmExecutorCount)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -257,7 +267,7 @@ func coroRun(resume stacklessCoroResume) {
 }
 
 func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
-	s := newStacklessCoroScheduler(frame, resume)
+	s := acquireStacklessCoroRootScheduler(frame, resume)
 
 	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
 		s = nativeScheduler
@@ -266,23 +276,75 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume) {
 	}
 	s.stopReplacementExecutors()
 	s.releaseWake()
-	s.finish()
+	finishStacklessCoroRootScheduler(s)
 }
 
 func newStacklessCoroScheduler(frame unsafe.Pointer,
 	resume stacklessCoroResume) *stacklessCoroScheduler {
+	return initializeStacklessCoroScheduler(
+		new(stacklessCoroScheduler), frame, resume)
+}
+
+func acquireStacklessCoroRootScheduler(frame unsafe.Pointer,
+	resume stacklessCoroResume) *stacklessCoroScheduler {
+	if !raceenabled {
+		select {
+		case s := <-stacklessCoroRootSchedulerPool.available:
+			return initializeStacklessCoroScheduler(s, frame, resume)
+		default:
+		}
+	}
+	return newStacklessCoroScheduler(frame, resume)
+}
+
+func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
+	frame unsafe.Pointer, resume stacklessCoroResume) *stacklessCoroScheduler {
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
-	s := &stacklessCoroScheduler{
-		wake: acquireStacklessCoroWake(),
-	}
+	s.wake = acquireStacklessCoroWake()
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
 	s.root.context.frame = frame
 	s.ready(&s.root, false)
 	return s
+}
+
+func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
+	if !raceenabled {
+		defer releaseStacklessCoroRootScheduler(s)
+	}
+	s.finish()
+}
+
+func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
+	state := s.executorState.Load()
+	runnable := s.runnableState.Load()
+	if s.wake != nil || (s.head == nil) != (s.tail == nil) ||
+		(s.head == nil) != (runnable == 0) ||
+		s.root.state != stacklessCoroTaskComplete ||
+		s.root.resuming || s.root.readyPending ||
+		s.root.terminal != stacklessCoroTerminalNone || s.root.goexit ||
+		len(s.terminalValues) != 0 || s.blockingExecutors.Load() != 0 ||
+		s.foreignReturners.Load() != 0 ||
+		state != stacklessCoroExecutorStateOff &&
+			state != stacklessCoroExecutorStateStopping {
+		throw("runtime: invalid completed stackless coroutine root scheduler")
+	}
+	// An operation producer can still hold a completed root scheduler after
+	// removing its operation from the global registry. A remaining runnable
+	// task or frame reservation similarly belongs to the old root. Leave those
+	// schedulers on their existing allocation lifetime rather than making
+	// their addresses available to another public root.
+	if s.operationStarted || runnable != 0 || s.reservedTasks != nil {
+		return
+	}
+	*s = stacklessCoroScheduler{}
+	select {
+	case stacklessCoroRootSchedulerPool.available <- s:
+	default:
+	}
 }
 
 func acquireStacklessCoroWake() chan struct{} {
@@ -1744,6 +1806,7 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine operation outside resume")
 	}
+	s.operationStarted = true
 	op := s.freeOperations
 	if op == nil {
 		if s.freeOperationCount != 0 {
