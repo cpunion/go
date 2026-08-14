@@ -11,9 +11,9 @@ coroutine tree until it reaches the ready leaf or returns pending, like a
 Rust `Future` driven by a `Waker`.
 
 The pull-aware queue and comparison exports compile only with the
-`coropullcompare` build tag. A normal coroutine build uses the unchanged push
-queue implementation and contains no comparison marker, hook, or hot-path
-branch. The tag is private to this measurement driver.
+`coropullcompare` build tag. A normal coroutine build uses the production push
+scheduler and contains no comparison marker, hook, or build-tag-specific
+hot-path branch. The tag is private to this measurement driver.
 
 ## Models
 
@@ -242,6 +242,60 @@ single-owner structured handoff optimization where compiler proof permits,
 and investigate task/frame fusion for structured await chains. None of these
 requires source annotations or a separately exposed Rust-style pull API, and
 none changes the M-handoff requirement for a blocking C call.
+
+## Production structured handoff follow-up, 2026-08-15
+
+Revision `de39ab3163`, relative to the exact `3db190a434` merge base,
+implements the first hybrid step in the production push scheduler. When a
+normally completed structured child finds its suspended parent and no other
+task is already runnable, the same executor marks the parent running, recycles
+the child, and resumes the parent directly. It avoids publishing a queue entry
+that the same executor would immediately consume.
+
+The optimization is deliberately completion-local. It falls back to the
+ordinary ready queue when a sibling is already queued, the parent is still
+returning `Wait`, readiness is pending, the race detector is enabled, or the
+pull comparison driver is active. External readiness, panic, `Goexit`, root
+completion, and blocking-C M replacement are unchanged. No task or scheduler
+field was added: their 64-bit sizes remain 48 and 192 bytes, respectively.
+The change requires neither a compiler annotation nor a second coroutine
+mode.
+
+Twenty alternating fixed-layout 500 ms samples on native Darwin/arm64 showed
+the expected depth-dependent improvement:
+
+| Probe | Parent | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| await depth 1 | 1.137 us | 1.120 us | -1.45% |
+| await depth 8 | 1.776 us | 1.688 us | -4.93% |
+| await depth 64 | 6.320 us | 5.750 us | -9.02% |
+| await depth 256 | 21.78 us | 19.75 us | -9.33% |
+| await depth 4096 | 411.9 us | 361.5 us | -12.25% |
+| steady structured await | 45.76 ns | 39.54 ns | -13.61% |
+
+Twelve matched randomized linker layouts reproduced changes from -2.22% at
+depth 1 to -12.41% at depth 4096, with the steady await improving 16.94%.
+Entry, yield, timer, ready and blocked file I/O, ready and blocked socket I/O,
+and channel controls were neutral. The fixed-layout channel result moved
+1.57%, but became neutral (`p=0.147`) under randomized layouts. Every bytes/op
+and allocations/op result was identical between revisions.
+
+Translated Linux/amd64 validation was noisier but directionally agreed. The
+fixed-layout run improved depth 64 by 12.86%, depth 256 by 10.56%, depth 4096
+by 15.09%, and steady await by 12.00%; entry, yield, timer, file, socket, and
+channel controls were neutral. Eight matched randomized layouts reproduced
+5.40% at depth 8 through 11.34% at depth 4096, with steady await improving
+8.94%, and again changed no allocation result.
+
+Normal, race, and `checkptr=2` stackless runtime tests, the compiler coroutine
+suite, and the architecture probe pass on Darwin/arm64 and translated
+Linux/amd64. Full `coro` and `nocoro` runtime suites pass on Darwin. The
+translated Linux runtime suite passes with the same three known
+Rosetta-incompatible intentional-crash or oversized-mmap tests excluded;
+native CI remains unfiltered. FreeBSD and Windows amd64 plus Darwin amd64 and
+Linux arm64 cross-compilation pass. Focused coverage is 96.2% for `runTasks`
+and 84.8% for `complete`; every executable statement added for direct handoff
+and each queue fallback is covered.
 
 ## Interpretation gates
 

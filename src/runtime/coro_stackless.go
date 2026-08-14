@@ -886,6 +886,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 				continue
 			}
 		}
+	resume:
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
 		task.context.scheduler = nil
@@ -905,7 +906,10 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 			idlePollSkip = task
 		case stacklessCoroActionComplete:
 			idlePollSkip = nil
-			s.complete(task)
+			task = s.complete(task)
+			if task != nil && !s.rootComplete() {
+				goto resume
+			}
 		case stacklessCoroActionPanic:
 			idlePollSkip = nil
 			s.terminate(task)
@@ -1218,8 +1222,8 @@ func (s *stacklessCoroScheduler) cancelReservedFrameTasksLocked(
 	}
 }
 
-// coroAwait transfers execution to child. Completion makes the current task
-// runnable; it does not call the parent continuation.
+// coroAwait transfers execution to child. Completion schedules the current
+// task again; it does not call the parent continuation from the child resume.
 func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 	coroAwaitFrame(ctx, nil, child)
 }
@@ -2115,7 +2119,7 @@ func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
 	s.signal()
 }
 
-func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
+func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCoroTask {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -2143,16 +2147,31 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) {
 		} else {
 			s.signalAll()
 		}
-		return
+		return nil
 	}
 	if parent.state != stacklessCoroTaskWaiting ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine completed for non-waiting parent")
 	}
+	// A completed structured child can return its already-suspended parent to
+	// this executor without publishing and immediately consuming a queue
+	// entry. Preserve the queue path when another task is ready, while the
+	// parent is still returning Wait, or when a build needs a distinct
+	// synchronization or comparison policy.
+	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		!parent.resuming && !parent.readyPending && parent.next == nil &&
+		s.head == nil && s.tail == nil {
+		parent.state = stacklessCoroTaskRunning
+		parent.resuming = true
+		s.recycleTaskLocked(task)
+		unlock(&s.lock)
+		return parent
+	}
 	s.readyLocked(parent)
 	s.recycleTaskLocked(task)
 	unlock(&s.lock)
+	return nil
 }
 
 func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {

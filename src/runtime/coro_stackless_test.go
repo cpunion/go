@@ -118,6 +118,40 @@ func TestStacklessCoroAwait(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroCompletionHandoff(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		parentResuming bool
+		ready          bool
+	}{
+		{name: "empty"},
+		{name: "ready", ready: true},
+		{name: "parent-resuming", parentResuming: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			direct, pending, parentQueued, readyFirst :=
+				runtime.CheckCompletionHandoffStacklessCoroForTest(
+					test.parentResuming, test.ready)
+			wantDirect := !race.Enabled && !test.parentResuming && !test.ready
+			if direct != wantDirect {
+				t.Fatalf("direct handoff = %t, want %t", direct, wantDirect)
+			}
+			if pending != test.parentResuming {
+				t.Fatalf("pending readiness = %t, want %t", pending,
+					test.parentResuming)
+			}
+			wantQueued := !test.parentResuming && !wantDirect
+			if parentQueued != wantQueued {
+				t.Fatalf("parent queued = %t, want %t", parentQueued,
+					wantQueued)
+			}
+			if !readyFirst {
+				t.Fatal("direct handoff bypassed an already-runnable task")
+			}
+		})
+	}
+}
+
 func TestStacklessCoroPanic(t *testing.T) {
 	for _, value := range []any{"panic-value", nil} {
 		var recovered any

@@ -3512,13 +3512,58 @@ nil-resume branch cannot flush an in-process coverage profile; a subprocess
 test verifies that guard explicitly. Every executable line changed by this
 checkpoint is covered.
 
+### 16.4 Structured child-completion handoff
+
+The subsequent public-root frame cache removes the two compiler-owned entry
+allocations described in the preceding checkpoint. Revision `de39ab3163`,
+relative to the exact `3db190a434` merge containing that cache, then recovers
+the scheduling part of the same-representation pull result without adopting a
+second public scheduling model.
+
+A child that returns `Complete` already runs on an executor owned by its root.
+When its structured parent is waiting, has finished returning `Wait`, has no
+pending readiness, and the scheduler has no other ready task, ownership can
+move directly back to that parent under the scheduler lock. The child is
+recycled before unlocking and the executor invokes the parent resume function
+again. This removes ready-count publication, queue-pointer maintenance, and an
+immediate queue consumption at every eligible await level.
+
+This is a narrow proof, not a general ready-task shortcut. The normal queue is
+retained when another task is runnable so that a completing child cannot skip
+a sibling; an early completion keeps the parent's existing `readyPending`
+protocol. Race builds keep the explicit synchronization boundary, and the
+private pull comparison build keeps its controlled model. Panic, `Goexit`,
+root completion, external timer and I/O readiness, and blocking foreign-call
+M replacement are unchanged. The implementation adds no task or scheduler
+field, no call-site metadata, and no source annotation.
+
+Twenty alternating native Darwin/arm64 samples improved structured await from
+1.45% at depth 1 to 12.25% at depth 4096 and improved the steady await probe
+13.61%. Twelve matched randomized linker layouts reproduced 2.22% through
+12.41% across those depths and 16.94% for steady await. Entry, yield, timer,
+file, socket, and channel controls were neutral, and every allocation result
+was unchanged. Translated Linux/amd64 fixed and randomized layouts reproduced
+the deeper directional improvements with neutral controls and identical
+allocation results.
+
+Normal, race, and `checkptr=2` runtime tests cover the direct case, queued
+sibling fairness, early completion, and race fallback. The complete compiler
+coroutine suite and architecture probe pass on Darwin/arm64 and translated
+Linux/amd64, full `coro` and `nocoro` runtime suites pass on Darwin, and the
+portable cross-compilation matrix passes. Focused runtime coverage is 96.2%
+for `runTasks` and 84.8% for `complete`; every new direct-handoff statement is
+executed.
+
 The remaining performance sequence is:
 
-1. Reduce truly external blocking-call scheduler handoff while retaining the
-   lower-cost M replacement boundary and sibling progress. Same-scheduler
-   local readiness and the runtime-owned public-root scheduler allocation are
-   complete; compiler-owned public-entry frame and result allocations remain
-   an independent lowering task.
+1. Fuse task metadata with compiler-owned frames for provably structured await
+   chains. The direct handoff removes queue work, but the compact comparison
+   shows that one separate task object per child still dominates deep-tree
+   allocation and GC scan cost.
+2. Reduce truly external blocking-call scheduler handoff while retaining the
+   lower-cost M replacement boundary and sibling progress. A blocking C call
+   must remain on its original M; only the transfer and replacement cost are
+   candidates for reduction.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
 fixed-work scaling, and the live-task footprint as explicit regression gates.

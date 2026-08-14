@@ -1027,6 +1027,43 @@ func CheckEarlyReadyStacklessCoroForTest() bool {
 		task.resuming && !task.readyPending
 }
 
+func CheckCompletionHandoffStacklessCoroForTest(parentResuming,
+	ready bool) (direct, pending, parentQueued, readyFirst bool) {
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+	}
+	lockInit(&s.lock, lockRankLeafRank)
+	parent := &s.root
+	parent.state = stacklessCoroTaskWaiting
+	parent.resuming = parentResuming
+	child := &stacklessCoroTask{
+		parent:   parent,
+		state:    stacklessCoroTaskRunning,
+		resuming: true,
+	}
+	var readyTask *stacklessCoroTask
+	if ready {
+		readyTask = new(stacklessCoroTask)
+		lock(&s.lock)
+		s.readyLocked(readyTask)
+		unlock(&s.lock)
+	}
+	next := s.complete(child)
+	lock(&s.lock)
+	direct = next == parent && parent.state == stacklessCoroTaskRunning &&
+		parent.resuming
+	pending = parent.state == stacklessCoroTaskWaiting && parent.resuming &&
+		parent.readyPending
+	for task := s.head; task != nil; task = task.next {
+		if task == parent {
+			parentQueued = true
+		}
+	}
+	readyFirst = !ready || s.head == readyTask && readyTask.next == parent
+	unlock(&s.lock)
+	return
+}
+
 func CheckStacklessCoroOperationRegistryForTest() bool {
 	first := new(stacklessCoroOperation)
 	second := new(stacklessCoroOperation)
