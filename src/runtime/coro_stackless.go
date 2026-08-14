@@ -321,23 +321,22 @@ func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
 func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) {
 	state := s.executorState.Load()
 	runnable := s.runnableState.Load()
-	if s.wake != nil || (s.head == nil) != (s.tail == nil) ||
-		(s.head == nil) != (runnable == 0) ||
-		s.root.state != stacklessCoroTaskComplete ||
-		s.root.resuming || s.root.readyPending ||
-		s.root.terminal != stacklessCoroTerminalNone || s.root.goexit ||
-		len(s.terminalValues) != 0 || s.blockingExecutors.Load() != 0 ||
-		s.foreignReturners.Load() != 0 ||
-		state != stacklessCoroExecutorStateOff &&
-			state != stacklessCoroExecutorStateStopping {
-		throw("runtime: invalid completed stackless coroutine root scheduler")
-	}
+	quiescent := s.wake == nil && s.head == nil && s.tail == nil &&
+		s.reservedTasks == nil && runnable == 0 &&
+		s.root.state == stacklessCoroTaskComplete &&
+		!s.root.resuming && !s.root.readyPending &&
+		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
+		len(s.terminalValues) == 0 && s.blockingExecutors.Load() == 0 &&
+		s.foreignReturners.Load() == 0 &&
+		(state == stacklessCoroExecutorStateOff ||
+			state == stacklessCoroExecutorStateStopping)
 	// An operation producer can still hold a completed root scheduler after
 	// removing its operation from the global registry. A remaining runnable
 	// task or frame reservation similarly belongs to the old root. Leave those
 	// schedulers on their existing allocation lifetime rather than making
-	// their addresses available to another public root.
-	if s.operationStarted || runnable != 0 || s.reservedTasks != nil {
+	// their addresses available to another public root. Pooling is optional,
+	// so any state not proven quiescent also keeps that lifetime.
+	if s.operationStarted || !quiescent {
 		return
 	}
 	*s = stacklessCoroScheduler{}
