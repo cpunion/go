@@ -952,6 +952,15 @@ func StacklessCoroWakePoolSizeForTest() int {
 	return len(stacklessCoroWakePool.available)
 }
 
+func StacklessCoroRootSchedulerPoolSizeForTest() int {
+	return len(stacklessCoroRootSchedulerPool.available)
+}
+
+func SchedulerStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
+	context := (*stacklessCoroContext)(ctx)
+	return unsafe.Pointer(context.scheduler)
+}
+
 func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
 	return context.task() == &context.scheduler.root

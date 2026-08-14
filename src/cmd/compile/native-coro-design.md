@@ -3447,11 +3447,78 @@ and the 32-bit size assertion passes under Linux/386. Focused coverage is 100%
 for select activity, cache validation, clearing, and publication, 94.1% for
 cache preparation, and 88.4% for the complete select start path.
 
+### 16.3 Quiescent public-root scheduler reuse
+
+After operation, waiter, and frame reuse, one operation-free public coroutine
+entry still allocated its 192-byte scheduler. The result cell and typed root
+frame account for the other 32 bytes and two allocations. This checkpoint
+removes only the runtime-owned scheduler allocation; changing the two
+compiler-owned objects remains a separate compiler ABI task.
+
+A bounded global pool retains at most four public-root schedulers. Reuse is
+disabled under the race detector so that separate public roots retain distinct
+synchronization identities. Nested defer schedulers are also excluded. The
+public-root owner stops every replacement executor and releases the wake
+channel before transferring the root result. A deferred release then handles
+normal return, panic, and `Goexit` uniformly.
+
+Release is deliberately fail closed. A scheduler is zeroed and returned only
+when the root is complete, its queues and reservations are empty, no terminal
+value remains, no blocking or foreign executor can return, and the executor
+state is stopped. Starting any logical operation permanently marks that
+scheduler instance as ineligible because an asynchronous producer may still
+hold its address after registry removal. A detached ready tail similarly
+keeps the ordinary allocation lifetime. Pooling is optional, so a state that
+cannot prove all of these conditions is retained rather than treated as a
+runtime failure. The new marker occupies existing padding; the 64-bit
+scheduler remains 192 bytes.
+
+The exact executable parent is `c37ea928da`, and the final candidate is
+`903b2090f5`. Twenty alternating 500 ms fixed-layout samples at one P
+produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 1.204 us -> 1.119 us (-7.02%, `p=0.027`) | 920.0 ns -> 832.2 ns (-9.55%, `p<0.001`) |
+| allocation | 224 B, 3 allocs -> 32 B, 2 allocs | 224 B, 3 allocs -> 32 B, 2 allocs |
+
+The fixed layouts also moved unrelated steady paths. File, TCP, and scalar-C
+controls were 6.0--7.5% slower on Darwin, while `YieldBatch` was 14.38% slower
+under translated Linux. Twelve matched Darwin `-randlayout` seeds and eight
+matched Linux seeds separated those layout effects from the change:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 1.292 us -> 1.211 us, neutral (`p=0.054`) | 920.2 ns -> 835.0 ns (-9.26%) |
+| `YieldBatch` control | 20.63 ns -> 20.31 ns, neutral | 32.27 ns -> 32.46 ns, neutral |
+| timing geomean | -0.63% | -1.39% |
+
+Channel, positive-timer, ready-file, ready-TCP, scalar-C, and blocking-C
+controls were statistically neutral across the matched layouts on both
+platforms. Every fixed and randomized layout reproduced 32 bytes and two
+allocations instead of 224 bytes and three allocations. Linux identifies its
+CPU as VirtualApple, so its timing remains directional; the exact allocation
+reduction independently agrees with native Darwin.
+
+Tests hold eight roots active concurrently to prove distinct scheduler
+identities, enforce the four-entry bound, verify that an operation-owning root
+is not returned, and check zero warm-entry allocations. Normal, race, and
+`checkptr=2` runtime tests, the compiler and library suites, and the portable
+architecture probe pass on Darwin/arm64 and translated Linux/amd64. FreeBSD
+and Windows amd64 cross-compilation and the disabled-experiment gate also
+pass. The new acquire, finish, and release helpers have 100% focused statement
+coverage. The shared initializer reports 88.9% because its pre-existing fatal
+nil-resume branch cannot flush an in-process coverage profile; a subprocess
+test verifies that guard explicitly. Every executable line changed by this
+checkpoint is covered.
+
 The remaining performance sequence is:
 
-1. Reduce truly external blocking-call scheduler handoff and public-root entry
-   transitions while retaining the lower-cost M replacement boundary and
-   sibling progress. The same-scheduler local-readiness subcase is complete.
+1. Reduce truly external blocking-call scheduler handoff while retaining the
+   lower-cost M replacement boundary and sibling progress. Same-scheduler
+   local readiness and the runtime-owned public-root scheduler allocation are
+   complete; compiler-owned public-entry frame and result allocations remain
+   an independent lowering task.
 
 Each step keeps experiment-off behavior, the direct-C fast path, multi-P
 fixed-work scaling, and the live-task footprint as explicit regression gates.

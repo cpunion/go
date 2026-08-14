@@ -972,11 +972,58 @@ Linux/386 verifies the 104 B operation layout. Focused coverage is 100% for
 select activity, cache validation, clearing, and publication, 94.1% for
 preparation, and 88.4% for the complete select start path.
 
+#### Quiescent public-root scheduler reuse
+
+Revision `903b2090f5` retains at most four completed, operation-free public
+root schedulers. Release happens only after replacement executors have stopped
+and the root result has been transferred. Race builds and nested defer
+schedulers remain allocation-backed, and any started logical operation,
+detached ready task, reservation, terminal result, or returning executor makes
+release fail closed. The complete scheduler is zeroed before reuse, and a new
+operation marker fits existing padding so its 64-bit size remains 192 bytes.
+
+The exact executable parent is `c37ea928da`. Three warm-up pairs followed by
+20 alternating 500 ms fixed-layout samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 1.204 us -> 1.119 us (-7.02%, `p=0.027`) | 920.0 ns -> 832.2 ns (-9.55%, `p<0.001`) |
+| allocation | 224 B, 3 allocs -> 32 B, 2 allocs | 224 B, 3 allocs -> 32 B, 2 allocs |
+
+The fixed Darwin binary also made ready file, ready TCP, and scalar C calls
+6.50%, 7.47%, and 6.03% slower. The fixed translated-Linux binary made
+`YieldBatch` 14.38% slower. Those benchmarks do not execute scheduler release
+in their timed steady-state loops, so matched randomized layouts were used to
+test whether the movements came from text layout. Twelve Darwin seeds and
+eight Linux seeds produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 1.292 us -> 1.211 us, neutral (`p=0.054`) | 920.2 ns -> 835.0 ns (-9.26%, `p<0.001`) |
+| `YieldBatch` | 20.63 ns -> 20.31 ns, neutral | 32.27 ns -> 32.46 ns, neutral |
+| timing geomean | -0.63% | -1.39% |
+
+Channel round trips, positive timers, ready file and TCP reads, scalar C calls,
+and blocking-C handoff were statistically neutral across the matched layouts
+on both platforms. Every fixed and randomized sample reproduced 32 bytes and
+two allocations instead of 224 bytes and three allocations. The Linux host
+reports a VirtualApple CPU, so its absolute timings are directional; its exact
+allocation result independently matches Darwin.
+
+Normal, race, and `checkptr=2` runtime tests and the complete probe audit pass
+on both targets, as do the compiler and library suites. FreeBSD and Windows
+amd64 cross-compilation and `GOEXPERIMENT=nocoro` gates pass. Focused coverage
+is 100% for acquisition, finish, and fail-closed release. The shared
+initializer reports 88.9% only because its pre-existing fatal nil-resume branch
+cannot write coverage after process termination; a subprocess test verifies
+that branch's behavior.
+
 The next order of performance work is:
 
-1. reduce truly external blocking-call scheduler handoff and root-entry
-   transitions while preserving the lower-cost M replacement boundary and
-   sibling progress.
+1. reduce truly external blocking-call scheduler handoff while preserving the
+   lower-cost M replacement boundary and sibling progress;
+2. remove the remaining compiler-owned public-entry frame and result
+   allocations as an independent lowering change.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
 and live task footprint are regression gates for each of those changes.
