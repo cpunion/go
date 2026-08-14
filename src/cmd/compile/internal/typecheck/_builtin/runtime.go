@@ -199,8 +199,9 @@ func coroTakeRootFrame(func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
 func coroReleaseRootFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr)
 func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroAwaitFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
-func coroAwaitSelfFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
-func coroCompleteSelfFrame(unsafe.Pointer) uint8
+func coroRequestFusedFrame(unsafe.Pointer)
+func coroAwaitFusedFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
+func coroCompleteFusedFrame(unsafe.Pointer) uint8
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroSpawnFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroPanic(unsafe.Pointer, interface{})
@@ -354,4 +355,4 @@ func coroTerminalAction(unsafe.Pointer) uint8
 // stackless coroutine frame factory
 func coroTakeFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
 func coroTakeFrameChunk(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
-func coroTakeSelfFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
+func coroTakeFusedFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer

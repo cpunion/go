@@ -383,7 +383,7 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	ir.VisitList(factory.Body, func(node ir.Node) {
 		if call, ok := node.(*ir.CallExpr); ok &&
 			symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
-				"runtime.coroTakeSelfFrame" {
+				"runtime.coroTakeFusedFrame" {
 			takeFrames++
 			if len(call.Args) == 4 && call.Args[3].Type().IsPtr() {
 				chunkTypes++
@@ -429,12 +429,121 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		})
 	}
 	for _, name := range []string{
-		"runtime.coroTakeSelfFrame",
-		"runtime.coroAwaitSelfFrame",
-		"runtime.coroCompleteSelfFrame",
+		"runtime.coroRequestFusedFrame",
+		"runtime.coroTakeFusedFrame",
+		"runtime.coroAwaitFusedFrame",
+		"runtime.coroCompleteFusedFrame",
 	} {
 		if runtimeCalls[name] != 1 {
 			t.Errorf("lowered recursive function has %d %s calls, want one",
+				runtimeCalls[name], name)
+		}
+	}
+}
+
+func TestLowerHeterogeneousFrameFusion(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/heterogeneousframe",
+		"heterogeneousframe")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	yield := newLowerTestFunc(pkg, "yield")
+	leaf := newLowerTestFunc(pkg, "leaf")
+	yieldCall := newLowerTestCall(yield)
+	leaf.Body = ir.Nodes{yieldCall, newLowerTestReturn()}
+	leafFunction := &Function{
+		Func: leaf, Local: MaySuspend, Effect: MaySuspend,
+		Primary: CoroPrimary,
+		Sites:   []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+	}
+
+	caller := newLowerTestFunc(pkg, "caller")
+	leafCall := newLowerTestCall(leaf)
+	caller.Body = ir.Nodes{leafCall, newLowerTestReturn()}
+	callerFunction := &Function{
+		Func: caller, Local: MaySuspend, Effect: MaySuspend,
+		Primary: CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: leaf,
+			CalleeName: symbolName(leaf.Nname), Node: leafCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: leafCall}},
+	}
+
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		caller: callerFunction,
+		leaf:   leafFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 2 || result.Skipped != 0 ||
+		callerFunction.Factory != FactoryABI3 ||
+		leafFunction.Factory != FactoryABI3 {
+		t.Fatalf("Lower result = %+v, caller factory = %v, leaf factory = %v",
+			result, callerFunction.Factory, leafFunction.Factory)
+	}
+
+	var leafFactory *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.Sym() == resumeFactorySymbol(leaf) {
+			leafFactory = generated
+			break
+		}
+	}
+	if leafFactory == nil {
+		t.Fatal("missing heterogeneous leaf frame factory")
+	}
+	var frameType *types.Type
+	ir.VisitList(leafFactory.Body, func(node ir.Node) {
+		allocation, ok := node.(*ir.UnaryExpr)
+		if !ok || allocation.Op() != ir.ONEW ||
+			allocation.Type().Elem().Kind() != types.TSTRUCT {
+			return
+		}
+		frameType = allocation.Type().Elem()
+	})
+	if frameType == nil || frameType.NumFields() < 4 ||
+		!frameType.FieldType(0).IsUnsafePtr() ||
+		!frameType.FieldType(1).IsUnsafePtr() ||
+		frameType.FieldType(2) != types.Types[types.TUINT8] ||
+		!frameType.FieldType(3).IsUnsafePtr() ||
+		frameType.FieldOff(0) != 0 ||
+		frameType.FieldOff(1) != int64(types.PtrSize) ||
+		frameType.FieldOff(2) != int64(2*types.PtrSize) ||
+		frameType.FieldOff(3) != int64(3*types.PtrSize) {
+		t.Fatalf("heterogeneous frame header = %v, want parent, owner, marker, and resume prefix",
+			frameType)
+	}
+
+	runtimeCalls := make(map[string]int)
+	for _, generated := range typecheck.Target.Funcs {
+		ir.VisitList(generated.Body, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
+			runtimeCalls[name]++
+		})
+	}
+	for _, name := range []string{
+		"runtime.coroRequestFusedFrame",
+		"runtime.coroTakeFusedFrame",
+		"runtime.coroAwaitFusedFrame",
+		"runtime.coroCompleteFusedFrame",
+	} {
+		if runtimeCalls[name] != 1 {
+			t.Errorf("heterogeneous lowering has %d %s calls, want one",
 				runtimeCalls[name], name)
 		}
 	}

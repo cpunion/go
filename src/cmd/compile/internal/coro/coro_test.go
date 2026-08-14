@@ -6202,31 +6202,37 @@ func main() {
 		resume  string
 		factory string
 		public  string
+		fused   bool
 	}{
 		{
 			`main\.sum\.coro\.func[0-9]+$`,
 			"main.sum.coro",
 			"main.sum(SB)",
+			true,
 		},
 		{
 			`main\.sumDefer\.coro\.func[0-9]+$`,
 			"main.sumDefer.coro",
 			"main.sumDefer(SB)",
+			false,
 		},
 		{
 			`main\.even\.coro\.func[0-9]+$`,
 			"main.odd.coro",
 			"main.odd(SB)",
+			true,
 		},
 		{
 			`main\.odd\.coro\.func[0-9]+$`,
 			"main.even.coro",
 			"main.even(SB)",
+			true,
 		},
 		{
 			`main\.\(\*counter\)\.descend\.coro\.func[0-9]+$`,
 			"main.(*counter).descend.coro",
 			"main.(*counter).descend(SB)",
+			true,
 		},
 	} {
 		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
@@ -6245,6 +6251,18 @@ func main() {
 			if strings.Contains(disassembly, forbidden) {
 				t.Errorf("%s contains %q\n%s",
 					test.resume, forbidden, disassembly)
+			}
+		}
+		if test.fused {
+			for _, helper := range []string{
+				"runtime.coroRequestFusedFrame",
+				"runtime.coroAwaitFusedFrame",
+				"runtime.coroCompleteFusedFrame",
+			} {
+				if !strings.Contains(disassembly, helper) {
+					t.Errorf("%s does not call %s\n%s",
+						test.resume, helper, disassembly)
+				}
 			}
 		}
 	}

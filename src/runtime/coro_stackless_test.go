@@ -1107,7 +1107,7 @@ func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
 		if child.Owner != nil {
 			tracker.sawCacheOwner = true
 		}
-		switch child.Marker {
+		switch child.Marker & runtime.StacklessCoroFusedFrameAllocationMask {
 		case runtime.StacklessCoroFusedFrameDirectFirst:
 			tracker.sawDirectFirst = true
 		case runtime.StacklessCoroFusedFrameDirectLast:
@@ -1279,6 +1279,350 @@ func TestStacklessCoroSelfFrameFusion(t *testing.T) {
 			stacklessCoroSelfFrameResume)
 		t.Fatal("fused-frame panic returned")
 	})
+}
+
+type stacklessCoroFusedResumeTracker struct {
+	trace       []string
+	value       int
+	firstAction uint8
+	firstFused  bool
+	middle      *runtime.StacklessCoroFusedResumeFrameForTest
+	leaf        *runtime.StacklessCoroFusedResumeFrameForTest
+}
+
+var stacklessCoroFusedResumeActive *stacklessCoroFusedResumeTracker
+
+func stacklessCoroFusedResumeSibling(unsafe.Pointer) uint8 {
+	tracker := stacklessCoroFusedResumeActive
+	tracker.trace = append(tracker.trace, "sibling")
+	return runtime.StacklessCoroActionComplete
+}
+
+func completeStacklessCoroFusedResume(ctx unsafe.Pointer,
+	frame *runtime.StacklessCoroFusedResumeFrameForTest) uint8 {
+	frame.Value = nil
+	if frame.Parent != nil {
+		return runtime.CompleteStacklessCoroFusedResumeFrameForTest(ctx)
+	}
+	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroFusedResumeLeaf(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroFusedResumeActive
+	frame := (*runtime.StacklessCoroFusedResumeFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	tracker.trace = append(tracker.trace, "leaf")
+	*frame.Value += 1
+	return completeStacklessCoroFusedResume(ctx, frame)
+}
+
+func stacklessCoroFusedResumeMiddle(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroFusedResumeActive
+	frame := (*runtime.StacklessCoroFusedResumeFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		tracker.trace = append(tracker.trace, "middle")
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFusedResumeLeaf)
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Value: frame.Value,
+		}
+		tracker.leaf = child
+		frame.State = 1
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			childPointer, stacklessCoroFusedResumeLeaf)
+	case 1:
+		tracker.trace = append(tracker.trace, "middle-complete")
+		*frame.Value += 10
+		return completeStacklessCoroFusedResume(ctx, frame)
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func stacklessCoroFusedResumeRoot(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroFusedResumeActive
+	frame := (*runtime.StacklessCoroSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		runtime.SpawnStacklessCoroForTest(ctx,
+			stacklessCoroFusedResumeSibling)
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFusedResumeMiddle)
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Value: frame.Value,
+		}
+		tracker.middle = child
+		frame.State = 1
+		tracker.firstAction =
+			runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+				childPointer, stacklessCoroFusedResumeMiddle)
+		tracker.firstFused = child.Parent != nil
+		return tracker.firstAction
+	case 1:
+		tracker.trace = append(tracker.trace, "root-complete")
+		*frame.Value += 100
+		frame.Value = nil
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func TestStacklessCoroFusedResumeFrames(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+
+	tracker := new(stacklessCoroFusedResumeTracker)
+	stacklessCoroFusedResumeActive = tracker
+	defer func() { stacklessCoroFusedResumeActive = nil }()
+	root := &runtime.StacklessCoroSelfFrameForTest{Value: &tracker.value}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroFusedResumeRoot)
+
+	if tracker.value != 111 {
+		t.Fatalf("result = %d, want 111", tracker.value)
+	}
+	wantTrace := []string{
+		"sibling", "middle", "leaf", "middle-complete", "root-complete",
+	}
+	if len(tracker.trace) != len(wantTrace) {
+		t.Fatalf("trace = %v, want %v", tracker.trace, wantTrace)
+	}
+	for i, want := range wantTrace {
+		if tracker.trace[i] != want {
+			t.Fatalf("trace = %v, want %v", tracker.trace, wantTrace)
+		}
+	}
+	wantAction := uint8(runtime.StacklessCoroActionYield)
+	wantFused := true
+	if runtime.Raceenabled {
+		wantAction = runtime.StacklessCoroActionWait
+		wantFused = false
+	}
+	if tracker.firstAction != wantAction || tracker.firstFused != wantFused {
+		t.Fatalf("first await = (action %d, fused %t), want (%d, %t)",
+			tracker.firstAction, tracker.firstFused, wantAction, wantFused)
+	}
+	for name, frame := range map[string]*runtime.StacklessCoroFusedResumeFrameForTest{
+		"middle": tracker.middle,
+		"leaf":   tracker.leaf,
+	} {
+		if frame.Parent != nil || frame.Owner != nil || frame.Marker != 0 ||
+			frame.Resume != nil || frame.Value != nil {
+			t.Errorf("%s frame retained state: %+v", name, frame)
+		}
+	}
+}
+
+type stacklessCoroFusedFallbackTracker struct {
+	size           uintptr
+	validChunkType bool
+	firstAction    uint8
+	firstFused     bool
+}
+
+var stacklessCoroFusedFallbackActive *stacklessCoroFusedFallbackTracker
+
+func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroFusedFallbackActive
+	frame := (*runtime.StacklessCoroSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		childPointer := runtime.TakeStacklessCoroFusedFallbackFrameForTest(
+			ctx, stacklessCoroFusedFallbackResume, tracker.size,
+			tracker.validChunkType)
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(new(runtime.StacklessCoroSelfFrameForTest))
+		}
+		child := (*runtime.StacklessCoroSelfFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroSelfFrameForTest{State: 2}
+		frame.State = 1
+		tracker.firstAction = runtime.AwaitStacklessCoroSelfFrameForTest(
+			ctx, childPointer, stacklessCoroFusedFallbackResume)
+		tracker.firstFused = child.Parent != nil
+		return tracker.firstAction
+	case 1, 2:
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroFusedFallbackActive = nil }()
+
+	for _, test := range []struct {
+		name           string
+		size           uintptr
+		validChunkType bool
+	}{
+		{"oversized", runtime.StacklessCoroFrameCacheSize + 1, true},
+		{"invalid-chunk-type", unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{}), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracker := &stacklessCoroFusedFallbackTracker{
+				size: test.size, validChunkType: test.validChunkType,
+			}
+			stacklessCoroFusedFallbackActive = tracker
+			root := new(runtime.StacklessCoroSelfFrameForTest)
+			runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+				stacklessCoroFusedFallbackResume)
+			if tracker.firstAction != runtime.StacklessCoroActionWait ||
+				tracker.firstFused {
+				t.Fatalf("first await = (action %d, fused %t), want (%d, false)",
+					tracker.firstAction, tracker.firstFused,
+					runtime.StacklessCoroActionWait)
+			}
+		})
+	}
+}
+
+type stacklessCoroFusedResumeDeepTracker struct {
+	completed int
+	uncached  int
+	panicLeaf bool
+}
+
+var stacklessCoroFusedResumeDeepActive *stacklessCoroFusedResumeDeepTracker
+
+func stacklessCoroFusedResumeDeep(ctx unsafe.Pointer,
+	next func(unsafe.Pointer) uint8) uint8 {
+	if terminal := runtime.TerminalActionStacklessCoroForTest(ctx); terminal !=
+		runtime.StacklessCoroActionInvalid {
+		return terminal
+	}
+	tracker := stacklessCoroFusedResumeDeepActive
+	frame := (*runtime.StacklessCoroFusedResumeFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		if frame.Depth == 0 {
+			if tracker.panicLeaf {
+				panic("stackless coroutine heterogeneous fused-frame panic")
+			}
+			*frame.Value += 1
+			return completeStacklessCoroFusedResume(ctx, frame)
+		}
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			next)
+		if childPointer == nil {
+			tracker.uncached++
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Depth: frame.Depth - 1,
+			Value: frame.Value,
+		}
+		frame.State = 1
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			childPointer, next)
+	case 1:
+		*frame.Value += 1
+		return completeStacklessCoroFusedResume(ctx, frame)
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func stacklessCoroFusedResumeDeepA(ctx unsafe.Pointer) uint8 {
+	return stacklessCoroFusedResumeDeep(ctx, stacklessCoroFusedResumeDeepB)
+}
+
+func stacklessCoroFusedResumeDeepB(ctx unsafe.Pointer) uint8 {
+	return stacklessCoroFusedResumeDeep(ctx, stacklessCoroFusedResumeDeepA)
+}
+
+func stacklessCoroFusedResumeDeepRoot(ctx unsafe.Pointer) uint8 {
+	if terminal := runtime.TerminalActionStacklessCoroForTest(ctx); terminal !=
+		runtime.StacklessCoroActionInvalid {
+		return terminal
+	}
+	tracker := stacklessCoroFusedResumeDeepActive
+	frame := (*runtime.StacklessCoroSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFusedResumeDeepA)
+		if childPointer == nil {
+			tracker.uncached++
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Depth: frame.Depth,
+			Value: &tracker.completed,
+		}
+		frame.State = 1
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			childPointer, stacklessCoroFusedResumeDeepA)
+	case 1:
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func runStacklessCoroFusedResumeDeep(depth int,
+	tracker *stacklessCoroFusedResumeDeepTracker) {
+	stacklessCoroFusedResumeDeepActive = tracker
+	root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroFusedResumeDeepRoot)
+}
+
+func TestStacklessCoroFusedResumeDeep(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+
+	depth := runtime.StacklessCoroTaskCacheSize + 32
+	tracker := new(stacklessCoroFusedResumeDeepTracker)
+	runStacklessCoroFusedResumeDeep(depth, tracker)
+	if tracker.completed != depth+1 {
+		t.Fatalf("completed frames = %d, want %d",
+			tracker.completed, depth+1)
+	}
+	if tracker.uncached == 0 {
+		t.Fatal("deep heterogeneous fusion did not cross the frame cache")
+	}
+}
+
+func TestStacklessCoroFusedResumePanic(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+
+	tracker := &stacklessCoroFusedResumeDeepTracker{panicLeaf: true}
+	defer func() {
+		stacklessCoroFusedResumeDeepActive = nil
+		if value := recover(); value !=
+			"stackless coroutine heterogeneous fused-frame panic" {
+			t.Fatalf("recovered %v, want heterogeneous fused-frame panic",
+				value)
+		}
+	}()
+	runStacklessCoroFusedResumeDeep(runtime.StacklessCoroTaskCacheSize+32,
+		tracker)
+	t.Fatal("heterogeneous fused-frame panic returned")
 }
 
 type stacklessCoroFrameCacheTestFrame struct {

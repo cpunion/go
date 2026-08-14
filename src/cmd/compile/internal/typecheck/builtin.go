@@ -163,23 +163,24 @@ var runtimeDecls = [...]struct {
 	{"coroReleaseRootFrame", funcTag, 127},
 	{"coroAwait", funcTag, 128},
 	{"coroAwaitFrame", funcTag, 129},
-	{"coroAwaitSelfFrame", funcTag, 130},
-	{"coroCompleteSelfFrame", funcTag, 123},
+	{"coroRequestFusedFrame", funcTag, 130},
+	{"coroAwaitFusedFrame", funcTag, 131},
+	{"coroCompleteFusedFrame", funcTag, 123},
 	{"coroSpawn", funcTag, 128},
 	{"coroSpawnFrame", funcTag, 129},
-	{"coroPanic", funcTag, 131},
-	{"coroPanicPending", funcTag, 132},
-	{"coroFrameNeedsClear", funcTag, 132},
-	{"coroSleep", funcTag, 133},
-	{"coroChanSend", funcTag, 134},
-	{"coroChanRecv", funcTag, 136},
-	{"coroSelect", funcTag, 138},
-	{"coroFileRead", funcTag, 139},
-	{"coroSocketRead", funcTag, 139},
-	{"coroCallRead", funcTag, 140},
+	{"coroPanic", funcTag, 132},
+	{"coroPanicPending", funcTag, 133},
+	{"coroFrameNeedsClear", funcTag, 133},
+	{"coroSleep", funcTag, 134},
+	{"coroChanSend", funcTag, 135},
+	{"coroChanRecv", funcTag, 137},
+	{"coroSelect", funcTag, 139},
+	{"coroFileRead", funcTag, 140},
+	{"coroSocketRead", funcTag, 140},
+	{"coroCallRead", funcTag, 141},
 	{"coroEnterForeign", funcTag, 9},
 	{"coroExitForeign", funcTag, 9},
-	{"coroEnterBlocking", funcTag, 141},
+	{"coroEnterBlocking", funcTag, 130},
 	{"coroExitBlocking", funcTag, 9},
 	{"coroAsyncDouble", funcTag, 143},
 	{"makeslice", funcTag, 144},
@@ -281,16 +282,16 @@ var runtimeDecls = [...]struct {
 	{"asanregisterglobals", funcTag, 157},
 	{"KeepAlive", funcTag, 11},
 	{"coroDeferToken", funcTag, 185},
-	{"coroDeferCall", funcTag, 140},
+	{"coroDeferCall", funcTag, 141},
 	{"coroDeferRun", funcTag, 128},
-	{"coroDeferGoexit", funcTag, 141},
-	{"coroDeferPanic", funcTag, 131},
+	{"coroDeferGoexit", funcTag, 130},
+	{"coroDeferPanic", funcTag, 132},
 	{"coroDeferRecover", funcTag, 186},
-	{"coroGoexit", funcTag, 141},
+	{"coroGoexit", funcTag, 130},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 187},
 	{"coroTakeFrameChunk", funcTag, 188},
-	{"coroTakeSelfFrame", funcTag, 188},
+	{"coroTakeFusedFrame", funcTag, 188},
 }
 
 func runtimeTypes() []*types.Type {
@@ -425,18 +426,18 @@ func runtimeTypes() []*types.Type {
 	typs[127] = newSig(params(typs[7], typs[123], typs[5]), nil)
 	typs[128] = newSig(params(typs[7], typs[123]), nil)
 	typs[129] = newSig(params(typs[7], typs[7], typs[123]), nil)
-	typs[130] = newSig(params(typs[7], typs[7], typs[123]), params(typs[71]))
-	typs[131] = newSig(params(typs[7], typs[10]), nil)
-	typs[132] = newSig(params(typs[7]), params(typs[6]))
-	typs[133] = newSig(params(typs[7], typs[22]), params(typs[6]))
-	typs[134] = newSig(params(typs[7], typs[110], typs[3]), nil)
-	typs[135] = types.NewPtr(typs[6])
-	typs[136] = newSig(params(typs[7], typs[107], typs[3], typs[135]), nil)
-	typs[137] = types.NewPtr(typs[13])
-	typs[138] = newSig(params(typs[7], typs[1], typs[13], typs[13], typs[6], typs[137], typs[135]), nil)
-	typs[139] = newSig(params(typs[7], typs[13], typs[42], typs[137], typs[78]), nil)
-	typs[140] = newSig(params(typs[7], typs[9]), nil)
-	typs[141] = newSig(params(typs[7]), nil)
+	typs[130] = newSig(params(typs[7]), nil)
+	typs[131] = newSig(params(typs[7], typs[7], typs[123]), params(typs[71]))
+	typs[132] = newSig(params(typs[7], typs[10]), nil)
+	typs[133] = newSig(params(typs[7]), params(typs[6]))
+	typs[134] = newSig(params(typs[7], typs[22]), params(typs[6]))
+	typs[135] = newSig(params(typs[7], typs[110], typs[3]), nil)
+	typs[136] = types.NewPtr(typs[6])
+	typs[137] = newSig(params(typs[7], typs[107], typs[3], typs[136]), nil)
+	typs[138] = types.NewPtr(typs[13])
+	typs[139] = newSig(params(typs[7], typs[1], typs[13], typs[13], typs[6], typs[138], typs[136]), nil)
+	typs[140] = newSig(params(typs[7], typs[13], typs[42], typs[138], typs[78]), nil)
+	typs[141] = newSig(params(typs[7], typs[9]), nil)
 	typs[142] = types.NewPtr(typs[24])
 	typs[143] = newSig(params(typs[7], typs[13], typs[13], typs[24], typs[142], typs[78]), nil)
 	typs[144] = newSig(params(typs[1], typs[13], typs[13]), params(typs[7]))
