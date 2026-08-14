@@ -17,29 +17,74 @@ import (
 // every ordinary channel operation when the experiment is disabled. Waiter
 // matching and completion still use the common send and recv paths.
 
-// newStacklessCoroSudog allocates a waiter owned by its channel operation.
-// Unlike a parked goroutine, a logical task has no owner that can return the
-// waiter to a per-P cache after wakeup. The object becomes garbage after the
-// waker removes it from the channel queue.
+// newStacklessCoroSudog returns a waiter owned by op. A completed operation
+// retains one cleared waiter with the operation cache. The retained pointer
+// remains installed while the waiter is active so it is a stable GC root while
+// a native executor initializes and queues it. Extra select waiters are rooted
+// in slot before allocation can reach a GC safe point.
 //
 //go:nosplit
-func newStacklessCoroSudog() *sudog {
-	// Match acquireSudog's allocation rule. A caller may hold an hchan lock,
-	// so prevent new from starting a collection that needs a sudog itself.
+func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
+	if op == nil {
+		throw("runtime: nil stackless coroutine channel waiter owner")
+	}
+	if !op.waiterActive {
+		op.waiterActive = true
+		if sg := op.waiter; sg != nil {
+			if !validReleasedStacklessCoroSudog(sg) {
+				throw("runtime: invalid cached stackless coroutine channel waiter")
+			}
+			if slot != nil {
+				*slot = sg
+			}
+			return sg
+		}
+
+		// Match acquireSudog's allocation rule. A caller may hold an hchan
+		// lock, so prevent new from starting a collection that needs a sudog
+		// itself. Install both possible heap roots before releasing the M.
+		mp := acquirem()
+		sg := new(sudog)
+		op.waiter = sg
+		if slot != nil {
+			*slot = sg
+		}
+		releasem(mp)
+		return sg
+	}
+	if slot == nil {
+		throw("runtime: duplicate stackless coroutine channel waiter")
+	}
+
+	// A select may need more than the one waiter retained by its operation.
+	// Publish each additional waiter in the selection before releasing the M.
 	mp := acquirem()
 	sg := new(sudog)
+	*slot = sg
 	releasem(mp)
 	return sg
 }
 
 // releaseStacklessCoroSudog checks that the waiter no longer retains channel
-// state. Its storage is reclaimed by the garbage collector.
-func releaseStacklessCoroSudog(sg *sudog) {
-	if sg.g != nil || sg.elem.get() != nil || sg.coro.get() != nil ||
-		sg.next != nil || sg.prev != nil || sg.waitlink != nil ||
-		sg.c.get() != nil || sg.isSelect {
+// state. Each cached operation retains at most one waiter; extra select
+// waiters become garbage after their selection descriptor is cleared.
+func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
+	op := (*stacklessCoroOperation)(owner)
+	if op == nil || !validReleasedStacklessCoroSudog(sg) {
 		throw("runtime: invalid released stackless coroutine channel waiter")
 	}
+	if op.waiter == sg {
+		if !op.waiterActive {
+			throw("runtime: duplicate released stackless coroutine channel waiter")
+		}
+		op.waiterActive = false
+	}
+}
+
+func validReleasedStacklessCoroSudog(sg *sudog) bool {
+	return sg != nil && sg.g == nil && sg.elem.get() == nil &&
+		sg.coro.get() == nil && sg.next == nil && sg.prev == nil &&
+		sg.waitlink == nil && sg.c.get() == nil && !sg.isSelect
 }
 
 // chansendStackless starts op without parking the executor goroutine.
@@ -84,11 +129,10 @@ func chansendStackless(op *stacklessCoroOperation) {
 		return
 	}
 
-	sg := newStacklessCoroSudog()
+	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
 	sg.elem.set(op.element)
 	sg.waitlink = nil
-	sg.g = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)
@@ -150,11 +194,10 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 		return
 	}
 
-	sg := newStacklessCoroSudog()
+	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
 	sg.elem.set(op.element)
 	sg.waitlink = nil
-	sg.g = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)

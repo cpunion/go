@@ -1326,7 +1326,8 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	}
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
-		case SiteYield, SiteAwait, SiteChannel:
+		// These transitions keep their suspended state in the resume frame.
+		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll:
 		default:
 			return false
 		}

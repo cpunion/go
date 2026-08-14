@@ -492,13 +492,15 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 	if explicitFrameFactorySupported(nil) {
 		t.Fatal("nil candidate supports an explicit frame")
 	}
-	for _, kind := range []SiteKind{SiteYield, SiteAwait, SiteChannel} {
+	for _, kind := range []SiteKind{
+		SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll,
+	} {
 		if got := candidate(kind); !explicitFrameFactorySupported(got) {
 			t.Errorf("%s candidate does not support an explicit frame", kind)
 		}
 	}
 	for _, kind := range []SiteKind{
-		SiteSpawn, SiteTimer, SiteFile, SitePoll, SiteForeign,
+		SiteSpawn, SiteForeign,
 	} {
 		if got := candidate(kind); explicitFrameFactorySupported(got) {
 			t.Errorf("%s candidate supports an explicit frame", kind)
@@ -1961,6 +1963,8 @@ func TestLowerStateMachines(t *testing.T) {
 
 	explicitFrames := map[*ir.Func]bool{
 		child: true, parent: true, spawned: true,
+		sleeper: true, fileReader: true, socketReader: true,
+		ordinaryFileReader: true, structured: true,
 	}
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,

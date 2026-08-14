@@ -25,6 +25,7 @@ const (
 	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
 	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
+	StacklessCoroSelectCaseCacheSize   = stacklessCoroSelectCaseCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -202,6 +203,10 @@ func DeferRecoverStacklessCoroForTest(token unsafe.Pointer) any {
 
 func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
+}
+
+func StacklessCoroOperationSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroOperation{})
 }
 
 func StacklessCoroSchedulerSizeForTest() uintptr {
@@ -504,9 +509,68 @@ func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
 	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
 }
 
+type StacklessCoroChannelWaiterCacheForTest struct {
+	operation stacklessCoroOperation
+}
+
+func NewStacklessCoroChannelWaiterCacheForTest() *StacklessCoroChannelWaiterCacheForTest {
+	return new(StacklessCoroChannelWaiterCacheForTest)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) Cycle() {
+	var slot *sudog
+	sg := newStacklessCoroSudog(&cache.operation, &slot)
+	if sg != slot {
+		throw("runtime: lost stackless coroutine test waiter root")
+	}
+	releaseStacklessCoroSudog(unsafe.Pointer(&cache.operation), sg)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) CycleAcrossGC() {
+	newStacklessCoroSudog(&cache.operation, nil)
+	GC()
+	sg := cache.operation.waiter
+	if sg == nil {
+		throw("runtime: lost active stackless coroutine test waiter")
+	}
+	releaseStacklessCoroSudog(unsafe.Pointer(&cache.operation), sg)
+}
+
+func (cache *StacklessCoroChannelWaiterCacheForTest) Valid() bool {
+	return validReleasedStacklessCoroSudog(cache.operation.waiter)
+}
+
 type StacklessCoroSelectCasesForTest struct {
 	cases  []scase
 	nsends int
+}
+
+type StacklessCoroSelectStorageForTest struct {
+	selection stacklessCoroSelect
+	cases     [stacklessCoroSelectCaseCacheSize + 1]scase
+	chosen    int
+	received  bool
+}
+
+func NewStacklessCoroSelectStorageForTest() *StacklessCoroSelectStorageForTest {
+	return new(StacklessCoroSelectStorageForTest)
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Cycle(n int) {
+	if n < 0 || n > len(cache.cases) {
+		throw("runtime: invalid stackless coroutine select cache test size")
+	}
+	cache.selection.prepare(cache.cases[:n], n, n, 0,
+		&cache.chosen, &cache.received)
+	cache.selection.clear()
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Valid() bool {
+	return cache.selection.validCache()
+}
+
+func (cache *StacklessCoroSelectStorageForTest) Capacities() (locks, waiters int) {
+	return cap(cache.selection.lockOrder), cap(cache.selection.waiters)
 }
 
 func NewStacklessCoroSelectCasesForTest(channels []any,
@@ -656,20 +720,13 @@ func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, err
 	}
 	waiting, errno = netpollCoroReadArm(pd, op)
 	if waiting {
-		var token uintptr
-		for {
-			old := pd.rg.Load()
-			if old&netpollCoroTagMask != netpollCoroTag {
-				break
-			}
-			if pd.rg.CompareAndSwap(old, pdNil) {
-				delta--
-				token = old &^ netpollCoroTagMask
-				break
+		tokenMatches = netpollCoroReadClaim(pd, op)
+		if tokenMatches {
+			delta--
+			if netpollCoroReadClaim(pd, op) {
+				throw("runtime: claimed stackless coroutine poll token twice")
 			}
 		}
-		tokenMatches = token == uintptr(unsafe.Pointer(op))
-		netpollAdjustWaiters(delta)
 	}
 	if timeout {
 		lock(&pd.lock)
@@ -677,6 +734,51 @@ func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, err
 		pd.publishInfo()
 		unlock(&pd.lock)
 	}
+	poll_runtime_pollUnblock(pd)
+	poll_runtime_pollClose(pd)
+	return
+}
+
+func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) {
+	netpollGenericInit()
+	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
+	if openErr != 0 {
+		throw("runtime: failed to open coroutine idle-retry descriptor")
+	}
+
+	s := new(stacklessCoroScheduler)
+	task := new(stacklessCoroTask)
+	buffer := make([]byte, 1)
+	op := &stacklessCoroOperation{
+		stacklessCoroOperationState: stacklessCoroOperationState{
+			scheduler: s,
+			task:      task,
+			fd:        int32(fd),
+			buffer:    buffer,
+		},
+	}
+	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	id := registerStacklessCoroOperation(op)
+	waiting, waitErr := netpollCoroReadArm(pd, op)
+	if !waiting || waitErr != pollNoError {
+		throw("runtime: failed to arm coroutine idle-retry descriptor")
+	}
+
+	skipped = stacklessCoroPollReadAtIdle(s, task, nil) == nil
+	claimed = stacklessCoroPollReadAtIdle(s, nil, nil) == task
+	token := pd.rg.Load()
+	rearmed = token&netpollCoroTagMask == netpollCoroTag &&
+		token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op))
+	if !skipped || !claimed || !rearmed {
+		throw("runtime: failed coroutine idle poll retry")
+	}
+	if !netpollCoroReadClaim(pd, op) {
+		throw("runtime: lost rearmed coroutine idle-retry descriptor")
+	}
+	if takeStacklessCoroOperation(id) != op {
+		throw("runtime: lost coroutine idle-retry operation")
+	}
+	op.packet[stacklessCoroPollDescWord] = 0
 	poll_runtime_pollUnblock(pd)
 	poll_runtime_pollClose(pd)
 	return

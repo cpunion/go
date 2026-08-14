@@ -400,8 +400,8 @@ func (p *maybeTraceableChan) get() *hchan {
 // synchronization object, so there may be many sudogs for one object.
 //
 // sudogs are ordinarily allocated from a special pool. Use acquireSudog and
-// releaseSudog to allocate and free them. Stackless coroutine channel waiters
-// have operation-owned storage; see newStacklessCoroSudog.
+// releaseSudog to allocate and free them. Stackless coroutine channel
+// operations retain their own bounded waiter; see newStacklessCoroSudog.
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on

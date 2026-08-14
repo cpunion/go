@@ -25,11 +25,85 @@ type stacklessCoroSelect struct {
 	done      atomic.Uint32
 }
 
+// Retaining the common small-select storage with each cached operation keeps
+// steady ready selects allocation-free without allowing a rare large select
+// to enlarge the bounded operation cache indefinitely.
+const stacklessCoroSelectCaseCacheSize = 16
+
+func (selection *stacklessCoroSelect) active() bool {
+	return selection != nil && selection.chosen != nil
+}
+
+func (selection *stacklessCoroSelect) validCache() bool {
+	return selection == nil ||
+		(selection.cases == nil && len(selection.lockOrder) == 0 &&
+			cap(selection.lockOrder) <= stacklessCoroSelectCaseCacheSize &&
+			len(selection.waiters) == 0 &&
+			cap(selection.waiters) <= stacklessCoroSelectCaseCacheSize &&
+			selection.chosen == nil &&
+			selection.received == nil && selection.nsends == 0 &&
+			selection.done.Load() == 0)
+}
+
+func (selection *stacklessCoroSelect) prepare(cases []scase,
+	nlocks, ncases, nsends int, chosen *int, received *bool) {
+	if !selection.validCache() {
+		throw("runtime: active stackless coroutine select reuse")
+	}
+
+	if nlocks <= stacklessCoroSelectCaseCacheSize {
+		if cap(selection.lockOrder) < nlocks {
+			selection.lockOrder = make([]uint16, nlocks)
+		} else {
+			selection.lockOrder = selection.lockOrder[:nlocks]
+		}
+	} else {
+		selection.lockOrder = make([]uint16, nlocks)
+	}
+	if ncases <= stacklessCoroSelectCaseCacheSize {
+		if cap(selection.waiters) < ncases {
+			selection.waiters = make([]*sudog, ncases)
+		} else {
+			selection.waiters = selection.waiters[:ncases]
+			clear(selection.waiters)
+		}
+	} else {
+		selection.waiters = make([]*sudog, ncases)
+	}
+
+	selection.cases = cases
+	selection.chosen = chosen
+	selection.received = received
+	selection.nsends = nsends
+}
+
+func (selection *stacklessCoroSelect) clear() {
+	for i := range selection.cases {
+		selection.cases[i] = scase{}
+	}
+	selection.cases = nil
+	if cap(selection.lockOrder) > stacklessCoroSelectCaseCacheSize {
+		selection.lockOrder = nil
+	} else {
+		selection.lockOrder = selection.lockOrder[:0]
+	}
+	clear(selection.waiters)
+	if cap(selection.waiters) > stacklessCoroSelectCaseCacheSize {
+		selection.waiters = nil
+	} else {
+		selection.waiters = selection.waiters[:0]
+	}
+	selection.chosen = nil
+	selection.received = nil
+	selection.nsends = 0
+	selection.done.Store(0)
+}
+
 // stacklessCoroSelectTry arbitrates a waiter removed from a channel queue.
 // The winning producer finishes the operation after dropping channel locks.
 func stacklessCoroSelectTry(owner unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(owner)
-	if op == nil || op.selection == nil {
+	if op == nil || !op.selection.active() {
 		throw("runtime: invalid stackless coroutine select waiter")
 	}
 	return op.selection.done.CompareAndSwap(0, 1)
@@ -48,7 +122,6 @@ func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
 		cases = (*[1 << 16]scase)(unsafe.Pointer(cases0))[:ncases:ncases]
 	}
 	pollOrder := make([]uint16, 0, ncases)
-	lockOrder := make([]uint16, 0, ncases)
 	for i := range cases {
 		c := cases[i].c
 		if c == nil {
@@ -66,18 +139,16 @@ func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
 		pollOrder[len(pollOrder)-1] = pollOrder[j]
 		pollOrder[j] = uint16(i)
 	}
-	lockOrder = lockOrder[:len(pollOrder)]
-	sortStacklessCoroSelectLocks(cases, pollOrder, lockOrder)
-
 	op := stacklessCoroStartOperation(ctx, "select")
-	op.selection = &stacklessCoroSelect{
-		cases:     cases,
-		lockOrder: lockOrder,
-		waiters:   make([]*sudog, ncases),
-		chosen:    chosen,
-		received:  received,
-		nsends:    nsends,
+	selection := op.selection
+	if selection == nil {
+		selection = new(stacklessCoroSelect)
+		op.selection = selection
 	}
+	selection.prepare(cases, len(pollOrder), ncases,
+		nsends, chosen, received)
+	lockOrder := selection.lockOrder
+	sortStacklessCoroSelectLocks(cases, pollOrder, lockOrder)
 	op.id = registerStacklessCoroOperation(op)
 
 	sellock(cases, lockOrder)
@@ -130,15 +201,13 @@ func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
 		casi = int(casei)
 		cas = &cases[casi]
 		c = cas.c
-		sg = newStacklessCoroSudog()
+		sg = newStacklessCoroSudog(op, &selection.waiters[casi])
 		sg.releasetime = 0
 		sg.elem.set(cas.elem)
 		sg.waitlink = nil
-		sg.g = nil
 		sg.coro.set(unsafe.Pointer(op))
 		sg.isSelect = true
 		sg.c.set(c)
-		op.selection.waiters[casi] = sg
 		if casi < nsends {
 			c.sendq.enqueue(sg)
 		} else {
@@ -278,7 +347,7 @@ func sortStacklessCoroSelectLocks(cases []scase, pollOrder, lockOrder []uint16) 
 
 func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 	success bool) {
-	if op == nil || winner == nil || op.selection == nil ||
+	if op == nil || winner == nil || !op.selection.active() ||
 		op.selection.done.Load() != 1 ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid stackless coroutine select completion")
@@ -319,10 +388,14 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 		waiter.coro.clear()
 		waiter.c.set(nil)
 		waiter.waitlink = nil
-		releaseStacklessCoroSudog(waiter)
-		selection.waiters[i] = nil
 	}
 	selunlock(selection.cases, selection.lockOrder)
+	for _, casei := range selection.lockOrder {
+		i := int(casei)
+		waiter := selection.waiters[i]
+		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
+		selection.waiters[i] = nil
+	}
 
 	sendClosed := chosen < selection.nsends && !success
 	recvOK := chosen >= selection.nsends && success
@@ -331,7 +404,7 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 
 func completeStacklessCoroSelect(op *stacklessCoroOperation, chosen int,
 	recvOK, sendClosed bool) {
-	if op == nil || op.selection == nil ||
+	if op == nil || !op.selection.active() ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid immediate stackless coroutine select completion")
 	}
@@ -342,14 +415,7 @@ func publishStacklessCoroSelect(op *stacklessCoroOperation,
 	selection *stacklessCoroSelect, chosen int, recvOK, sendClosed bool) {
 	*selection.chosen = chosen
 	*selection.received = recvOK
-	for i := range selection.cases {
-		selection.cases[i] = scase{}
-	}
-	selection.cases = nil
-	selection.lockOrder = nil
-	selection.waiters = nil
-	selection.chosen = nil
-	selection.received = nil
+	selection.clear()
 	if sendClosed {
 		panicStacklessCoroOperation(op, plainError("send on closed channel"))
 		return

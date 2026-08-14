@@ -34,11 +34,12 @@ The I/O benchmarks intentionally use the ordinary public APIs. Regular files
 use the compensated-syscall boundary, while pollable pipes and TCP connections
 borrow their existing poll descriptors; none of these common paths creates a
 read closure or uses the worker pool. A concurrent read that cannot acquire the
-same descriptor's read lock is the bounded worker fallback. The blocking probes release each
-public read with a one-byte raw write syscall that cannot fill the empty pipe
-or socket buffer; this keeps the release path out of the unsupported public
-write lowering. A preceding `Sleep(0)` keeps the release worker on the
-automatically colored path without adding a positive-duration timer.
+same descriptor's read lock is the bounded worker fallback. The blocking
+probes release each public read with a one-byte raw write syscall that cannot
+fill the empty pipe or socket buffer; this keeps the release path out of the
+unsupported public write lowering. A preceding `Sleep(0)` keeps the release
+worker on the automatically colored path without adding a positive-duration
+timer.
 
 Every probe is interpreted as one of three capability states. A native fast
 path is a performance result. An adapter fallback is an end-to-end measurement
@@ -779,18 +780,207 @@ live stack was also statistically level. The different fixed-layout outliers
 and neutral layout controls provide no evidence of a systematic regression
 when the experiment is disabled.
 
-With positive-duration timer ownership addressed, the next order of
-performance work is:
+#### Public read library boundary
 
-1. connect ordinary file reads to the now-direct blocking-M runtime boundary
-   without exposing private library layouts to the compiler;
-2. replace the socket worker with a pointer-free netpoll readiness token and
-   completion on a safe G;
-3. reduce the fixed root-entry transition and typed frame allocation costs,
-   with the depth-boundary probes guarding the existing bounded-retention and
-   exact-GC-map rules; and
-4. remove ready-`select` temporary storage before changing channel waiter
-   lifetime.
+Revision `98a0445e59` connects ordinary `os.File.Read` and
+`net.TCPConn.Read` calls to library-owned start and finish methods. Its exact
+parent is `7b768d219c`, and official revision `9549c91031` is the merge base.
+The native Darwin/arm64 comparison used separate binaries built from the same
+probe sources, three warm-up rounds, and 12 Latin-square-ordered 500 ms
+samples at one P. The Apple M4 Max host had substantial unrelated load; the
+wide timing distributions are retained in the statistical comparison rather
+than treated as release thresholds.
+
+| Probe | Exact parent -> candidate | Official -> candidate | Parent allocation -> candidate |
+| --- | ---: | ---: | ---: |
+| ready file read | 90.758 us -> 3.035 us (-96.66%, `p<0.001`) | 1.985 us -> 3.035 us (`p=0.114`, neutral) | 64 B, 1 alloc -> 0 B, 0 allocs |
+| ready TCP read | 105.911 us -> 2.915 us (-97.25%, `p<0.001`) | 2.223 us -> 2.915 us (`p=0.291`, neutral) | 64 B, 1 alloc -> 0 B, 0 allocs |
+| blocking file read and sibling release | 162.4 us -> 195.2 us (`p=0.347`, neutral) | 12.05 us -> 195.17 us (+1,520%, `p<0.001`) | 596 B, 16 allocs -> 584 B, 16 allocs |
+| blocking TCP read and sibling release | 444.5 us -> 372.5 us (`p=0.713`, neutral) | 178.0 us -> 372.5 us (+109%, `p=0.024`) | 596 B, 16 allocs -> 584 B, 16 allocs |
+
+The ready paths therefore remove the worker closure and recover both
+zero-allocation behavior and timing statistically indistinguishable from the
+official implementation on this host. All blocking samples completed without
+a watchdog timeout, and neither blocking result regressed statistically from
+the exact parent. The remaining gap to official Go is the coroutine scheduler
+handoff and logical-operation cost around a genuinely blocking call, not this
+library boundary.
+
+#### Channel waiter cache reuse
+
+This checkpoint retains one cleared channel or select waiter on each cached
+stackless operation. Its exact parent is the merged public-read revision
+`0532f91256`. Completion clears all operation and queue references before
+reuse. Select completion performs that cleanup while its ordered channel locks
+are held, drops those locks, and then retains one waiter; additional select
+waiters become garbage with the selection descriptor. The ordinary per-P
+`sudog` cache remains reserved for goroutine-owned waiters. The retained
+pointer remains a GC root while active; additional select waiters are rooted
+in the selection descriptor before allocation can reach a safe point.
+
+Fixed-count, one-P runs of 10,000 operations give the following deterministic
+allocation result. The Linux file-byte difference is benchmark rounding: the
+object-count reduction agrees on both targets.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| channel round trip | 224 B, 2 allocs -> 0 B, 0 allocs | 224 B, 2 allocs -> 0 B, 0 allocs |
+| ready select | 132 B, 3 allocs -> 132 B, 3 allocs | 132 B, 3 allocs -> 132 B, 3 allocs |
+| blocking file and release | 584 B, 16 allocs -> 360 B, 14 allocs | 585 B, 16 allocs -> 361 B, 14 allocs |
+| blocking TCP and release | 584 B, 16 allocs -> 360 B, 14 allocs | 584 B, 16 allocs -> 360 B, 14 allocs |
+
+Twenty alternating 300 ms Darwin/arm64 samples were also collected on the
+loaded Apple M4 Max host. Channel round-trip medians were 1,606.5 ns for the
+parent and 1,346 ns for the candidate; the candidate won 15 of 20 pairs, with
+a paired median change of -16.96% and an exploratory sign-test `p=0.041`.
+Ready select and both blocking probes split their pairs 10 to 10. Their timing
+is therefore treated as neutral. The stable allocation counts, rather than
+these host-sensitive timings, are the checkpoint's performance result.
+
+A 10,000-operation allocation profile attributes all remaining blocking-file
+objects to the generated child factories: eight objects per read task and six
+per release task. No channel waiter remains in the allocation root. That makes
+compiler frame and captured-cell fusion the next independent allocation
+target.
+
+#### Explicit frames for timer and I/O transitions
+
+Revision `f50e5d25e6` admits timer, file, and poll transition sites to the
+existing explicit typed-frame factory. The change uses the existing factory
+ABI and runtime frame cache; functions with spawn or foreign transitions,
+source closures, channel ranges, defer, or terminal behavior still use the
+conservative closure-backed path.
+
+The exact parent is `d259cdcf7f`, the final revision merged by pull request 73.
+Fixed-count, one-P runs of 10,000 lowered operations produced identical object
+counts on native Darwin/arm64 and translated Linux/amd64:
+
+| Probe | Parent | Explicit I/O frame |
+| --- | ---: | ---: |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file read | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and release | 360 B, 14 allocs | 104 B, 2 allocs |
+| blocking TCP and release | 360 B, 14 allocs | 104 B, 2 allocs |
+
+An allocation-rate-one profile assigns one remaining object to
+`waitForEpoch.coro` and one to `blockingFileRelease.coro` per round. The read
+task itself is now allocation-free. Timing from the loaded Darwin host and
+translated Linux is retained only as diagnostic data; the exact twelve-object
+reduction is the performance result.
+
+#### Preserve distinct cached frame identities
+
+Revision `d103ba4e1d` prevents a new frame identity from consuming a completed
+typed-frame task while the bounded cache still has room. The allocator first
+reuses an ordinary free task; if none exists, it adds a cache-owned task rather
+than discarding another resume identity. Behavior at the existing 256-task or
+32 KiB limit is unchanged, as are the scheduler and task layouts. Race builds
+still disable identity reuse.
+
+The exact parent is `cf30715f3e`. Fixed-count, one-P runs of 10,000 lowered
+operations matched on native Darwin/arm64 and translated Linux/amd64:
+
+| Probe | Parent | Preserved identities |
+| --- | ---: | ---: |
+| channel round trip | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready select | 132 B, 3 allocs | 132 B, 3 allocs |
+| positive timer | 0 B, 0 allocs | 0 B, 0 allocs |
+| ready file or TCP read | 0 B, 0 allocs | 0 B, 0 allocs |
+| blocking file and release | 104 B, 2 allocs | 0 B, 0 allocs |
+| blocking TCP and release | 104 B, 2 allocs | 0 B, 0 allocs |
+
+A rate-one profile shows only cold calibration and setup objects; no factory
+allocation scales with the 10,000 operations. Ten alternating 300 ms Darwin
+pairs found file timing neutral at 8.626 us versus 8.739 us (`p=0.739`) and
+TCP timing neutral at 15.80 us versus 15.33 us (`p=0.280`). The timing geomean
+changed by -0.87%. Under checkptr, the file probe similarly changed from
+105 B and three allocations to 1 B and one allocation, removing the same
+104 B and two target objects.
+
+#### Local readiness before native park
+
+The blocking file and TCP probes use one logical task to make an older read
+ready. At exact parent `86706396a0`, the reader still parks its locked native
+executor and completes through the platform poller and bridge G. CPU profiles
+therefore attribute most of the remaining time to condition wait and wake,
+even though the readiness source belongs to the same stackless scheduler.
+
+Revision `dd8f3f3422` adds a bounded cold-path retry before a native executor
+parks with an empty logical ready queue. It skips the task that just armed,
+scans no more than the 64-operation cache bound, claims only a still-armed
+same-scheduler poll read, and makes at most four rotating attempts. An
+unavailable read is rearmed, and every miss or race retains the ordinary
+netpoll behavior. No scheduler, task, native-context, operation, or compiler
+ABI layout changes.
+
+Twenty alternating 500 ms samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| ready file read | 348.7 ns -> 347.7 ns, neutral | 410.0 ns -> 418.6 ns, neutral |
+| ready TCP read | 313.9 ns -> 312.4 ns, neutral | 492.4 ns -> 487.4 ns, neutral |
+| blocking file and release | 8.305 us -> 1.266 us (-84.76%) | 52.773 us -> 2.343 us (-95.56%) |
+| blocking TCP and release | 15.092 us -> 5.508 us (-63.51%) | 59.358 us -> 4.062 us (-93.16%) |
+
+Every sample reports 0 B and 0 allocations. Ready-file and ready-TCP timing is
+statistically neutral on both platforms. The Linux/amd64 results were
+collected under VirtualApple translation and are directional. Normal, race,
+and `checkptr=2` runtime suites and the complete probe audit pass on both
+targets. Focused coverage is 97.9% for `runTasks`, 93.3% for the bounded scan,
+92.9% for the cold retry helper, and 100% for token claim.
+
+#### Bounded select storage reuse
+
+A steady ready `select` still used 132 B and three allocations after the
+surrounding operation, waiter, and typed-frame caches were warm. Profiles and
+disassembly identify a select descriptor, a waiter slice, and lock-order
+backing storage; the measured small select's poll order remains on the native
+executor stack.
+
+Revision `c37ea928da` retains a cleared descriptor with each scheduler-local
+cached operation. Backing arrays for at most 16 cases survive completion;
+larger arrays are discarded. Every channel, element, waiter, result, and
+arbitration field is cleared before reuse, and tests cover forced GC,
+large-select discard, and select-channel-select reuse. The 64-entry operation
+cache does not cross public roots and remains disabled under the race
+detector. On 64-bit targets the operation shrinks from 184 B to 176 B, making
+the maximum net logical retention 16 KiB if all 64 entries have used a small
+select. The 32-bit operation remains 104 B.
+
+The exact parent is `7e6d48c590`, with executable runtime revision
+`dd8f3f3422`, and the candidate is `c37ea928da`. Twenty alternating 500 ms
+samples at one P produced:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| channel round trip control | 269.9 ns -> 268.2 ns, neutral | 477.8 ns -> 490.3 ns, neutral |
+| ready select | 292.9 ns -> 170.7 ns (-41.74%) | 518.5 ns -> 309.8 ns (-40.24%) |
+
+Ready select falls from 132 B and three allocations to zero on both targets;
+the channel control remains allocation-free. A seven-probe Darwin control run
+found positive timers and ready and locally blocking file and TCP reads
+statistically neutral with unchanged allocation counts. Translated Linux
+timing is directional, while its allocation result and channel control match
+Darwin.
+
+An additional paired Darwin comparison measured official Go at 41.99 ns for
+ready select and 165.5 ns for channel round trip, versus 156.70 ns and 238.9 ns
+for the stackless candidate. All four measurements use zero allocations. The
+allocation gap is closed, but the remaining scheduler time is a separate
+target.
+
+Normal, race, and `checkptr=2` stackless runtime suites and the architecture
+probe pass on both targets; the compiler coroutine suite also passes, and
+Linux/386 verifies the 104 B operation layout. Focused coverage is 100% for
+select activity, cache validation, clearing, and publication, 94.1% for
+preparation, and 88.4% for the complete select start path.
+
+The next order of performance work is:
+
+1. reduce truly external blocking-call scheduler handoff and root-entry
+   transitions while preserving the lower-cost M replacement boundary and
+   sibling progress.
 
 The direct-C path, multi-P fixed-work behavior, disabled-experiment control,
 and live task footprint are regression gates for each of those changes.

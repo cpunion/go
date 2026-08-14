@@ -42,6 +42,14 @@ const stacklessCoroFrameChunkDirectCount = 6
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
+// A short bounded retry window covers local pipe and loopback delivery without
+// turning a genuinely external read into polling.
+const stacklessCoroIdlePollAttempts = 4
+
+// Limit a cold-path registry scan to one scheduler's bounded operation cache.
+// Missing a read only preserves the ordinary netpoll wake path.
+const stacklessCoroIdlePollScanLimit = stacklessCoroOperationCacheSize
+
 // stacklessCoroUncachedFrameLineage marks an explicit-frame task that was
 // created after the task cache saturated. It cannot be a cached frame size.
 const stacklessCoroUncachedFrameLineage = ^uint16(0)
@@ -169,26 +177,38 @@ func (s *stacklessCoroScheduler) isPullComparison() bool {
 	return s.tail == &stacklessCoroPullComparisonMarker
 }
 
-// A stacklessCoroOperation is owned by its source until that source publishes
-// a terminal fact. Registered sources carry only id. Timers use a stable
-// owner and generation so a late callback cannot complete a reused operation.
+// A stacklessCoroOperation retains reusable resources after clearing the state
+// owned by a completed source. Keeping those resources outside state avoids a
+// transient unrooted pointer while a native executor clears the operation.
 type stacklessCoroOperation struct {
+	stacklessCoroOperationState
+	timer     *stacklessCoroTimer
+	waiter    *sudog
+	selection *stacklessCoroSelect
+}
+
+// A stacklessCoroOperationState is owned by its source until that source
+// publishes a terminal fact. Registered sources carry only id. Timers use a
+// stable owner and generation so a late callback cannot complete a reused
+// operation.
+type stacklessCoroOperationState struct {
 	id        uint64
 	scheduler *stacklessCoroScheduler
 	task      *stacklessCoroTask
-	timer     *stacklessCoroTimer
 	channel   *hchan
 	element   unsafe.Pointer
 	received  *bool
 	send      bool
 	timerWait bool
-	selection *stacklessCoroSelect
-	fd        int32
-	buffer    []byte
-	call      func()
-	n         *int
-	errno     *uintptr
-	valueOut  *uint64
+	// waiterActive keeps the retained waiter rooted by waiter while it is
+	// also linked from a channel queue.
+	waiterActive bool
+	fd           int32
+	buffer       []byte
+	call         func()
+	n            *int
+	errno        *uintptr
+	valueOut     *uint64
 	// packet holds an asynchronous C reply or, for a socket read, the
 	// pointer-free poll descriptor and completion link. The operation
 	// registry remains the GC root for a linked socket operation.
@@ -349,6 +369,20 @@ func (s *stacklessCoroScheduler) newTaskAfterCacheMissLocked(
 		isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	task := s.allocateTaskLocked(uncachedLineage)
 	return initializeStacklessCoroTask(task, frame, resume, parent)
+}
+
+// newFrameReservationTaskLocked preserves completed typed frames while the
+// bounded frame cache still has room for another resume identity.
+func (s *stacklessCoroScheduler) newFrameReservationTaskLocked(
+	resume stacklessCoroResume, parent *stacklessCoroTask,
+	size uintptr) *stacklessCoroTask {
+	cacheHasRoom := s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
+		uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize
+	if cacheHasRoom && s.freePlainTaskCount == 0 {
+		return initializeStacklessCoroTask(new(stacklessCoroTask), nil,
+			resume, parent)
+	}
+	return s.newTaskLocked(nil, resume, parent)
 }
 
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
@@ -679,6 +713,7 @@ func (scope *stacklessCoroRunScope) leave() {
 // episode after this native activation has unwound.
 func (s *stacklessCoroScheduler) runTasks(native bool) {
 	var task *stacklessCoroTask
+	var idlePollSkip *stacklessCoroTask
 	defer func() {
 		if task == nil || task.context.scheduler != s {
 			return
@@ -698,16 +733,21 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 	for !s.rootComplete() {
 		task = s.take()
 		if task == nil {
-			if s.executorStop == nil {
-				<-s.wake
-			} else {
-				select {
-				case <-s.wake:
-				case <-s.executorStop:
-					return
-				}
+			if native {
+				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
 			}
-			continue
+			if task == nil {
+				if s.executorStop == nil {
+					<-s.wake
+				} else {
+					select {
+					case <-s.wake:
+					case <-s.executorStop:
+						return
+					}
+				}
+				continue
+			}
 		}
 		task.context.scheduler = s
 		action := task.resume(unsafe.Pointer(&task.context))
@@ -715,6 +755,7 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 
 		switch action {
 		case stacklessCoroActionYield:
+			idlePollSkip = nil
 			foreignReturner := s.yield(task)
 			if !native || foreignReturner {
 				// Cooperate with the host scheduler when this target has no
@@ -724,11 +765,15 @@ func (s *stacklessCoroScheduler) runTasks(native bool) {
 			}
 		case stacklessCoroActionWait:
 			s.waiting(task)
+			idlePollSkip = task
 		case stacklessCoroActionComplete:
+			idlePollSkip = nil
 			s.complete(task)
 		case stacklessCoroActionPanic:
+			idlePollSkip = nil
 			s.terminate(task)
 		case stacklessCoroActionGoexit:
+			idlePollSkip = nil
 			s.goexit(task)
 		default:
 			throw("runtime: invalid stackless coroutine action")
@@ -808,7 +853,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
-		task = s.newTaskLocked(nil, child, parent)
+		task = s.newFrameReservationTaskLocked(child, parent, size)
 		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 			task.cacheFrame = true
@@ -878,7 +923,7 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
-		task = s.newTaskLocked(nil, child, parent)
+		task = s.newFrameReservationTaskLocked(child, parent, size)
 		if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 			task.cacheFrame = true
@@ -1449,7 +1494,7 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
 	op := (*stacklessCoroOperation)(owner)
-	if op != nil && op.selection != nil {
+	if op != nil && op.selection.active() {
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
@@ -1459,7 +1504,7 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 	if waiter != nil {
 		waiter.coro.clear()
 		waiter.c.set(nil)
-		releaseStacklessCoroSudog(waiter)
+		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
 	}
 	if op.timerWait {
 		unblockTimerChan(op.channel)
@@ -1747,14 +1792,12 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
 	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
 		(op.timer != nil && op.timer.active.Load() != 0) ||
-		op.timerWait || op.next != nil || op.workNext != nil {
+		op.timerWait || op.waiterActive || op.next != nil || op.workNext != nil {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	s := op.scheduler
 	task := op.task
-	t := op.timer
-	*op = stacklessCoroOperation{}
-	op.timer = t
+	op.stacklessCoroOperationState = stacklessCoroOperationState{}
 	return s, task
 }
 
