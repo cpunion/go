@@ -3473,21 +3473,32 @@ cannot prove all of these conditions is retained rather than treated as a
 runtime failure. The new marker occupies existing padding; the 64-bit
 scheduler remains 192 bytes.
 
-The exact executable parent is `c37ea928da`, and the runtime candidate is
-`b2c3584ec4`. Twenty alternating 500 ms samples at one P produced:
+The exact executable parent is `c37ea928da`, and the final candidate is
+`903b2090f5`. Twenty alternating 500 ms fixed-layout samples at one P
+produced:
 
 | Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
 | --- | ---: | ---: |
-| public yield entry | 1.422 us -> 1.383 us, neutral | 1.044 us -> 933.8 ns (-10.56%) |
+| public yield entry | 1.204 us -> 1.119 us (-7.02%, `p=0.027`) | 920.0 ns -> 832.2 ns (-9.55%, `p<0.001`) |
 | allocation | 224 B, 3 allocs -> 32 B, 2 allocs | 224 B, 3 allocs -> 32 B, 2 allocs |
 
+The fixed layouts also moved unrelated steady paths. File, TCP, and scalar-C
+controls were 6.0--7.5% slower on Darwin, while `YieldBatch` was 14.38% slower
+under translated Linux. Twelve matched Darwin `-randlayout` seeds and eight
+matched Linux seeds separated those layout effects from the change:
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| public yield entry | 1.292 us -> 1.211 us, neutral (`p=0.054`) | 920.2 ns -> 835.0 ns (-9.26%) |
+| `YieldBatch` control | 20.63 ns -> 20.31 ns, neutral | 32.27 ns -> 32.46 ns, neutral |
+| timing geomean | -0.63% | -1.39% |
+
 Channel, positive-timer, ready-file, ready-TCP, scalar-C, and blocking-C
-controls were statistically neutral on both platforms. `YieldBatch`, which
-enters one public root for the whole benchmark process and amortizes entry
-over all iterations, moved by -9.26% on Darwin and +11.64% under translated
-Linux. The opposite directions and unchanged dispatch body do not establish a
-systematic effect. Linux identifies its CPU as VirtualApple, so its timings
-remain directional; the exact allocation reduction agrees on both targets.
+controls were statistically neutral across the matched layouts on both
+platforms. Every fixed and randomized layout reproduced 32 bytes and two
+allocations instead of 224 bytes and three allocations. Linux identifies its
+CPU as VirtualApple, so its timing remains directional; the exact allocation
+reduction independently agrees with native Darwin.
 
 Tests hold eight roots active concurrently to prove distinct scheduler
 identities, enforce the four-entry bound, verify that an operation-owning root
