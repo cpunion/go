@@ -178,8 +178,9 @@ type stacklessCoroScheduler struct {
 // transient unrooted pointer while a native executor clears the operation.
 type stacklessCoroOperation struct {
 	stacklessCoroOperationState
-	timer  *stacklessCoroTimer
-	waiter *sudog
+	timer     *stacklessCoroTimer
+	waiter    *sudog
+	selection *stacklessCoroSelect
 }
 
 // A stacklessCoroOperationState is owned by its source until that source
@@ -198,7 +199,6 @@ type stacklessCoroOperationState struct {
 	// waiterActive keeps the retained waiter rooted by waiter while it is
 	// also linked from a channel queue.
 	waiterActive bool
-	selection    *stacklessCoroSelect
 	fd           int32
 	buffer       []byte
 	call         func()
@@ -1484,7 +1484,7 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
 	op := (*stacklessCoroOperation)(owner)
-	if op != nil && op.selection != nil {
+	if op != nil && op.selection.active() {
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}

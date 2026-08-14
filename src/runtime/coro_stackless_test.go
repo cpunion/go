@@ -947,6 +947,17 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroOperationSize(t *testing.T) {
+	ptrSize := unsafe.Sizeof(uintptr(0))
+	want := 22 * ptrSize
+	if ptrSize == 4 {
+		want = 26 * ptrSize
+	}
+	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
+		t.Fatalf("stackless coroutine operation size = %d, want %d", got, want)
+	}
+}
+
 func TestStacklessCoroSchedulerSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := uintptr(192)
@@ -2263,6 +2274,86 @@ func TestStacklessCoroChannelWaiterCache(t *testing.T) {
 	}
 	cache.Cycle()
 	cache.CycleAcrossGC()
+}
+
+func TestStacklessCoroSelectStorageCache(t *testing.T) {
+	cache := runtime.NewStacklessCoroSelectStorageForTest()
+	cache.Cycle(2)
+	if got := testing.AllocsPerRun(100, func() { cache.Cycle(2) }); got != 0 {
+		t.Fatalf("cached select storage allocations = %v, want 0", got)
+	}
+	if locks, waiters := cache.Capacities(); locks != 2 || waiters != 2 {
+		t.Fatalf("cached select capacities = (%d, %d), want (2, 2)",
+			locks, waiters)
+	}
+	runtime.GC()
+	if !cache.Valid() {
+		t.Fatal("cached select storage was not retained across GC")
+	}
+
+	cache.Cycle(runtime.StacklessCoroSelectCaseCacheSize + 1)
+	if locks, waiters := cache.Capacities(); locks != 0 || waiters != 0 {
+		t.Fatalf("large select capacities = (%d, %d), want (0, 0)",
+			locks, waiters)
+	}
+	if got := testing.AllocsPerRun(100, func() { cache.Cycle(2) }); got != 0 {
+		t.Fatalf("recached select storage allocations = %v, want 0", got)
+	}
+}
+
+func TestStacklessCoroSelectOperationReuse(t *testing.T) {
+	ready := make(chan int, 1)
+	ready <- 41
+	channel := make(chan int, 1)
+	value := -1
+	sendValue := 43
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{ready}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+	state := 0
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 0 || !received || value != 41 {
+				t.Fatalf("first select = (%d, %t, %d), want (0, true, 41)",
+					chosen, received, value)
+			}
+			state = 2
+			runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue)
+			return runtime.StacklessCoroActionWait
+		case 2:
+			if got := <-channel; got != sendValue {
+				t.Fatalf("reused channel value = %d, want %d", got, sendValue)
+			}
+			ready <- 47
+			value = -1
+			chosen = -1
+			received = false
+			cases = runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{ready}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+			state = 3
+			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 3:
+			if chosen != 0 || !received || value != 47 {
+				t.Fatalf("reused select = (%d, %t, %d), want (0, true, 47)",
+					chosen, received, value)
+			}
+			state = 4
+			return runtime.StacklessCoroActionComplete
+		default:
+			t.Fatalf("unexpected state %d", state)
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
 }
 
 func TestStacklessCoroSelect(t *testing.T) {
