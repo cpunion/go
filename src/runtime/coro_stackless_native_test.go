@@ -465,6 +465,24 @@ func TestStacklessCoroNativeTrace(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNilResume(t *testing.T) {
+	const helper = "GO_RUNTIME_CORO_NIL_RESUME"
+	if os.Getenv(helper) == "1" {
+		runtime.RunStacklessCoroForTest(nil)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroNilResume$")
+	cmd.Env = append(os.Environ(), helper+"=1", "GOTRACEBACK=single")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("nil resume function unexpectedly succeeded")
+	}
+	if !strings.Contains(string(out), "nil stackless coroutine resume function") {
+		t.Fatalf("nil resume function failed with the wrong error:\n%s", out)
+	}
+}
+
 func TestStacklessCoroNativeFixedStackOverflow(t *testing.T) {
 	const helper = "GO_RUNTIME_CORO_FIXED_STACK_OVERFLOW"
 	if os.Getenv(helper) == "1" {
