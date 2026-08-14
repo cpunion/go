@@ -10,6 +10,11 @@ rings a root task's doorbell. The executor then polls the structured
 coroutine tree until it reaches the ready leaf or returns pending, like a
 Rust `Future` driven by a `Waker`.
 
+The pull-aware queue and comparison exports compile only with the
+`coropullcompare` build tag. A normal coroutine build uses the unchanged push
+queue implementation and contains no comparison marker, hook, or hot-path
+branch. The tag is private to this measurement driver.
+
 ## Models
 
 The probes distinguish two independent design choices: how readiness is
