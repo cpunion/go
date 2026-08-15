@@ -70,6 +70,20 @@ func TestAnalyzeAndFreeze(t *testing.T) {
 	importedCaller := newFunction("importedCaller")
 	importedCaller.Body = ir.Nodes{call(imported)}
 
+	timePkg := types.NewPkg("time", "time")
+	sleep := newSiteTestFunc(timePkg, "Sleep", pos())
+	// A compiler-owned operation recipe takes precedence over an ordinary
+	// imported summary for the declaration.
+	SetSummary(sleep, NoSuspend)
+	timer := newFunction("timer")
+	timer.Body = ir.Nodes{call(sleep)}
+	timerDeferred := newFunction("timerDeferred")
+	timerDeferredCall := call(sleep)
+	timerDeferred.Body = ir.Nodes{ir.NewGoDeferStmt(pos(), ir.ODEFER, timerDeferredCall)}
+	timerLaunched := newFunction("timerLaunched")
+	timerLaunchedCall := call(sleep)
+	timerLaunched.Body = ir.Nodes{ir.NewGoDeferStmt(pos(), ir.OGO, timerLaunchedCall)}
+
 	interfaceCaller := newFunction("interfaceCaller")
 	interfaceCaller.Body = ir.Nodes{ir.NewCallExpr(pos(), ir.OCALLINTER, functionValue, nil)}
 
@@ -80,19 +94,20 @@ func TestAnalyzeAndFreeze(t *testing.T) {
 
 	functions := []*ir.Func{
 		leaf, receive, channelRange, selecting, direct, deferred, launched,
-		dynamic, launchedDynamic, importedCaller, interfaceCaller, cycleA, cycleB,
+		dynamic, launchedDynamic, importedCaller, timer, timerDeferred,
+		timerLaunched, interfaceCaller, cycleA, cycleB,
 	}
 	analysis := Analyze(functions)
 
 	for _, fn := range []*ir.Func{
 		leaf, receive, channelRange, selecting, direct, deferred, dynamic,
-		importedCaller, interfaceCaller, cycleA, cycleB,
+		importedCaller, timer, timerDeferred, interfaceCaller, cycleA, cycleB,
 	} {
 		if got := analysis.funcs[fn].effect; got != MaySuspend {
 			t.Errorf("%s effect = %v, want %v", ir.PkgFuncName(fn), got, MaySuspend)
 		}
 	}
-	for _, fn := range []*ir.Func{launched, launchedDynamic} {
+	for _, fn := range []*ir.Func{launched, launchedDynamic, timerLaunched} {
 		if got := analysis.funcs[fn].effect; got != NoSuspend {
 			t.Errorf("%s effect = %v, want %v", ir.PkgFuncName(fn), got, NoSuspend)
 		}
@@ -128,6 +143,9 @@ func TestAnalyzeAndFreeze(t *testing.T) {
 	checkSite(dynamic, SiteDispatch, OperationNone)
 	checkSite(launchedDynamic, SiteSpawn, OperationNone)
 	checkSite(importedCaller, SiteAwait, OperationNone)
+	checkSite(timer, SitePark, OperationTimer)
+	checkSite(timerDeferred, SitePark, OperationTimer)
+	checkSite(timerLaunched, SiteSpawn, OperationNone)
 	checkSite(interfaceCaller, SiteDispatch, OperationNone)
 
 	analysis.PublishSummaries()
@@ -200,6 +218,7 @@ func TestAnalysisValueStrings(t *testing.T) {
 		{channelReceive.String(), "channel-receive"},
 		{channelSelect.String(), "channel-select"},
 		{channelRange.String(), "channel-range"},
+		{timerWait.String(), "timer-wait"},
 		{unknownCall.String(), "unknown-call"},
 		{suspendReason(255).String(), "suspendReason(255)"},
 	} {
