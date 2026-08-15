@@ -615,7 +615,8 @@ func (ctxt *Link) loadlib() {
 		}
 	}
 
-	// Process cgo directives (has to be done before host object loading).
+	// Process native-object directives before host object loading.
+	ctxt.loadcorodirectives()
 	ctxt.loadcgodirectives()
 
 	// Conditionally load host objects, or setup for external linking.
@@ -770,6 +771,13 @@ func loadWindowsHostArchives(ctxt *Link) {
 		import:
 		libmsvcrt.a libm.a
 	*/
+}
+
+func (ctxt *Link) loadcorodirectives() {
+	for _, data := range ctxt.corodata {
+		setCoroAttr(ctxt, data)
+	}
+	ctxt.corodata = nil
 }
 
 // loadcgodirectives reads the previously discovered cgo directives, creating

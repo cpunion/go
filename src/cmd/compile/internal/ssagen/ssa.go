@@ -296,7 +296,7 @@ func (s *state) emitOpenDeferInfo() {
 
 // buildssa builds an SSA function for fn.
 // worker indicates which of the backend workers is doing the processing.
-func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWriter) {
+func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWriter, bool) {
 	name := ir.FuncName(fn)
 
 	abiSelf := abiForFunc(fn, ssaConfig.ABI0, ssaConfig.ABI1)
@@ -597,7 +597,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWrite
 	s.insertPhis()
 
 	// Main call to ssa package to compile function.
-	if buildcfg.Experiment.Coro && (base.Debug.Coro > 2 || base.Debug.CoroBasic != "") {
+	if buildcfg.Experiment.Coro && (base.Debug.Coro > 2 || base.Debug.CoroBasic != "" || base.Debug.CoroObject != "") {
 		handled := ssa.CompileWithLoweringHook(s.f, htmlWriter, func(f *ssa.Func) bool {
 			if base.Debug.Coro > 2 {
 				coro.DumpPreLowerSSA(os.Stderr, f)
@@ -612,10 +612,24 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWrite
 						f.NameABI(), base.Debug.CoroBasic)
 				}
 			}
+			if base.Debug.CoroObject != "" {
+				matched, err := coro.WriteBasicObject(base.Debug.CoroObject, f)
+				if err != nil {
+					s.Fatalf("basic LLVM coroutine object: %v", err)
+				}
+				if matched {
+					fmt.Fprintf(os.Stderr, "coro: phase=pre-lower-ssa func=%s action=emit-native-object\n", f.NameABI())
+					return true
+				}
+			}
 			return false
 		})
 		if handled {
-			s.Fatalf("side-artifact coroutine backend unexpectedly handled %s", s.f.Name)
+			htmlWriter.Close()
+			return s.f, nil, true
+		}
+		if base.Debug.CoroObject != "" && coro.BasicObjectCandidate(fn) {
+			s.Fatalf("basic LLVM coroutine object candidate %s was not handled", s.f.Name)
 		}
 	} else {
 		ssa.Compile(s.f, htmlWriter)
@@ -645,7 +659,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) (*ssa.Func, *ssa.HTMLWrite
 		}
 	}
 
-	return s.f, htmlWriter
+	return s.f, htmlWriter, false
 }
 
 func (s *state) storeParameterRegsToStack(abi *abi.ABIConfig, paramAssignment *abi.ABIParamAssignment, n *ir.Name, addr *ssa.Value, pointersOnly bool) {

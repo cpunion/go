@@ -6,6 +6,7 @@ package gc
 
 import (
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/noder"
 	"cmd/compile/internal/objw"
@@ -16,6 +17,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/archive"
 	"cmd/internal/bio"
+	"cmd/internal/coroobj"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"encoding/json"
@@ -69,6 +71,11 @@ func dumpobj1(outfile string, mode int) {
 		start := startArchiveEntry(bout)
 		dumpLinkerObj(bout)
 		finishArchiveEntry(bout, start, "_go_.o")
+		for _, object := range coro.NativeObjects() {
+			start := startArchiveEntry(bout)
+			bout.Write(object.Data)
+			finishArchiveEntry(bout, start, object.Name)
+		}
 	}
 
 	if err := bout.Close(); err != nil {
@@ -85,6 +92,9 @@ func printObjHeader(bout *bio.Writer) {
 	}
 	if types.LocalPkg.Name == "main" {
 		fmt.Fprintf(bout, "main\n")
+	}
+	if _, ok := coro.ObjectManifest(); ok {
+		fmt.Fprintf(bout, "%s\n", coroobj.Header)
 	}
 	fmt.Fprintf(bout, "\n") // header ends with blank line
 }
@@ -133,12 +143,22 @@ func dumpdata() {
 func dumpLinkerObj(bout *bio.Writer) {
 	printObjHeader(bout)
 
-	if len(typecheck.Target.CgoPragmas) != 0 {
+	manifest, hasCoroObjects := coro.ObjectManifest()
+	if len(typecheck.Target.CgoPragmas) != 0 || hasCoroObjects {
 		// write empty export section; must be before cgo section
 		fmt.Fprintf(bout, "\n$$\n\n$$\n\n")
+	}
+	if len(typecheck.Target.CgoPragmas) != 0 {
 		fmt.Fprintf(bout, "\n$$  // cgo\n")
 		if err := json.NewEncoder(bout).Encode(typecheck.Target.CgoPragmas); err != nil {
 			base.Fatalf("serializing pragcgobuf: %v", err)
+		}
+		fmt.Fprintf(bout, "\n$$\n\n")
+	}
+	if hasCoroObjects {
+		fmt.Fprintf(bout, "\n$$  // %s\n", coroobj.Section)
+		if err := coroobj.Encode(bout, manifest); err != nil {
+			base.Fatalf("serializing coroutine object manifest: %v", err)
 		}
 		fmt.Fprintf(bout, "\n$$\n\n")
 	}

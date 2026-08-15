@@ -41,6 +41,7 @@ var bootstrapDirs = []string{
 	"cmd/internal/archive",
 	"cmd/internal/bio",
 	"cmd/internal/codesign",
+	"cmd/internal/coroobj",
 	"cmd/internal/dwarf",
 	"cmd/internal/edit",
 	"cmd/internal/gcprog",

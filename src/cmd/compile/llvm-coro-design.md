@@ -1,7 +1,8 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
-状态：架构设计稿；已完成 Phase 0、pre-lower handoff 与受限可执行 LLVM coroutine
-basic example，尚未接入 Go object/linker 的正式 LLVM backend
+状态：架构设计稿；已完成 Phase 0、pre-lower handoff、受限可执行 LLVM coroutine
+basic example，以及单函数 Go object/archive/external-link ownership 纵切；scheduler、
+structured await、timer 和 I/O 尚未接入
 
 更新时间：2026-08-15
 
@@ -9,7 +10,7 @@ basic example，尚未接入 Go object/linker 的正式 LLVM backend
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 integration topic/worktree：`dev.coro-sync-20260815`
+当前 implementation topic/worktree：`dev.coro-object-link-20260815`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -188,6 +189,69 @@ merged source 在 native Darwin/arm64 上通过以下门禁：
 object/archive/link ownership 和 reentry scheduler 仍是下一个必需纵切。仓库分支策略
 现在明确为：`main` 镜像 upstream，topic PR 以 `dev.coro` 为目标，只有经过 review 的
 upstream-merge topic 才更新这条长期分支。
+
+### 1.4 受限 Go object/archive/link ownership 纵切
+
+`dev.coro-object-link-20260815` 在 upstream merge topic `7b8b1f264e` 之上实现了第一个
+不再保留 Go native primary 的 LLVM object/link 例子。它有意只接受以下函数：
+
+```go
+//go:noinline
+func leaf() int64 {
+    yieldOnce()
+    return 42
+}
+```
+
+函数必须无参数、只返回一个常量 `int64`，并且 generic SSA 中只有一个
+`yieldOnce` marker call 和一个 `Ret` block。零参数限制避免在这个物理链路验证中把
+Go ABIInternal 输入寄存器与 host C ABI 混在一起；当前两个 ABI 的单个 scalar 返回值
+在 Darwin/arm64 与 Linux/amd64 上可以直接衔接。完整 coroutine ABI 仍由第 10 节定义，
+不能从这个巧合外推。
+
+纵切的 ownership 流程是：
+
+```text
+prepareFunc 识别受限 candidate，不建立 native text body
+  -> pre-lower generic SSA recognizer 最终 fail-closed 校验
+  -> LLVM coroutine module -> clang native object
+  -> compiler archive: __.PKGDEF + _go_.o + co<48-bit digest>.o
+  -> _go_.o private coro manifest 映射 Go symbol/ABI 到 host symbol
+  -> cmd/pack 展开 compiler archive，并原名保留 native object member
+  -> linker 校验 manifest version/target/duplicate symbol
+  -> Go symbol 标为 SHOSTOBJ，自动选择 external link
+```
+
+成员名的摘要包含 Go symbol 和 ABI，使用 48 bit，并恰好适配 Go archive 的 16-byte
+short-name 限制。manifest 位于新包 `cmd/internal/coroobj`，由 compiler 与 linker
+共享；它限制输入大小、拒绝未知 JSON 字段、重复 Go/host symbol、控制字符、错误 ABI
+和错误 target。显式 `-linkmode=internal` 会以稳定原因拒绝，而不是等到 host object
+relocation 才失败。
+
+Darwin/arm64 上的端到端测试已经证明：编译器输出 `action=emit-native-object`，archive
+中同时存在 Go object、空 marker assembly object 和 coroutine native object，`go tool
+nm` 能看到 host definition，最终 executable 输出 `coro-object-ok`。测试还覆盖
+`cmd/pack` 的 compiler-archive 展开、experiment gate、unsupported SSA、重复 artifact、
+manifest 编解码和 linker `SHOSTOBJ` 映射。新增 manifest package 的 statement coverage
+为 94.0%；`basic_object.go` 除操作系统临时目录/空 object 等故障注入分支外均有直接
+测试。
+
+这个纵切仍有四个刻意保留的边界：
+
+- `-d=coroobject=<clang>` 是 debug PoC selector；compiler 内调用 clang，cache identity
+  只包含路径而不包含工具内容，不能作为正式 backend driver。
+- LLVM wrapper 在函数内部立即 resume 一次；尚无 scheduler reentry、parent await、
+  external wakeup 或并发 goroutine。
+- object 使用 `malloc/free`，host external-link 启动路径由测试显式导入
+  `runtime/cgo`；这不代表直接 C/no-cgo boundary 已完成。
+- marker 仍按私有符号名识别，尚未替换成 typed `YieldOnce`、SiteID 和版本化 callable
+  fact。
+- 当前 module contract 已在 LLVM 19.1.7 验证，并兼容 LLVM 19–21 的 `i1
+  llvm.coro.end`；LLVM 22 把该 intrinsic 改为 `void`，需要 versioned intrinsic ABI
+  renderer。当前不能把 LLVM 22 verifier 失败误报为 object/link ownership 失败。
+
+因此该结果只把风险从“Go compiler 能否把 LLVM object 交给 archive/linker”降为已
+验证；它没有提前完成第 19 节的 scheduler/runtime 验收。
 
 ## 2. 结论
 
@@ -853,6 +917,40 @@ resume/destroy。二者不是替换一个函数调用就能兼容。
 - 逐步复用与 native stack 无关的纯 Go runtime/stdlib 代码。
 - 把“运行未经修改的官方 runtime”列为独立长期研究，不作为自动染色原型的验收条件。
 
+### 12.1 Push 与 pull-based 调度对比
+
+原生 Go backend 的独立测量原型把两个维度分开：readiness 如何投递，以及 structured
+call tree 如何表示。`Push` 把完成事件精确排入 logical task；同表示的 `Pull` 只唤醒
+root，再从 root poll 到 ready leaf；两者使用完全相同的 task 和 typed frame。
+`CompactPull` 另把 child task 融入 parent-linked frame，因此不是单纯的 pull 调度
+结果。
+
+同表示 `Push`/`Pull` 的结论不稳定。2026-08-14 的 native Darwin/arm64 聚焦结果曾让
+pull 在 await depth 1–4096 快 1.06%–7.72%，但 merge 到最新 Go 开发检查点后的
+2026-08-15 结果反转：
+
+| Await depth | `Push` | 同表示 `Pull` | Pull 变化 |
+| ---: | ---: | ---: | ---: |
+| 64 | 7.001 us | 7.873 us | +12.46% |
+| 256 | 24.03 us | 28.70 us | +19.44% |
+| 4,096 | 441.9 us | 510.1 us | +15.43% |
+
+两个模型在每个深度的 bytes/allocs 完全相同；entry、yield、timer、ready/blocking file、
+ready/blocking socket 和 direct C 也没有稳定差异。这说明“root wake-and-poll”本身尚未
+给出足够稳定的收益，不能据此增加第二套默认公开执行模型。
+
+`CompactPull` 的大幅改善来自表示变化。在同一 post-sync run 的 depth 4,096，它把
+441.9 us 降到 92.19 us（-79.14%），315,616 B/7,938 allocs 降到
+131,312 B/4,098 allocs（-58.40%/-48.37%），GC-scanned heap 从 395,072 B 降到
+198,488 B（-49.76%）。生产 push 原型随后把这个结论实现为 compiler-proven
+structured handoff/frame fusion，而不引入 pull mode：异构互递归 depth 4,096 从
+404.6 us 降到 298.6 us（-26.21%），allocation count 降 20.07%。
+
+因此当前设计选择是 hybrid push：独立 goroutine root、external event、timer/I/O 和
+blocking-C M handoff 继续使用 push；编译器证明 single-owner structured child 时直接
+handoff 并融合 frame。Pull 继续作为测量模型，或未来显式 stream/backpressure API 的
+候选；它不改变阻塞 C 调用必须把原 M 留在阻塞点、另给 ready work 提供 M 的要求。
+
 ## 13. 代码结构建议
 
 在 Go compiler fork 中建议按职责分割：
@@ -1395,9 +1493,9 @@ recover、Goexit 和 cancel 竞态。
 
 ## 18. 建议的第一步
 
-Phase 0 已完成；第 1.2 节的 basic example 也已把单函数 scalar SSA 送入 LLVM 并
-实际运行。下一步仍不应扩大到 channel、panic、GC 或标准库，而应先把以下三个
-Phase 0 决定补齐成稳定 Program/SitePlan：
+Phase 0 已完成；第 1.2 节的 standalone basic example 和第 1.4 节的受限
+object/archive/link ownership 纵切也已实际运行。下一步仍不应扩大到 channel、panic、
+GC 或标准库，而应先把以下三个 Phase 0 决定补齐成稳定 Program/SitePlan：
 
 1. Unified IR 是否保留了当前 `llvm-coro` 分支分析所需的全部语义。
 2. 两阶段染色是否能与官方内联、wrapper、逃逸顺序稳定共存。
@@ -1418,9 +1516,9 @@ SummaryDigest
 ```
 
 当它与 `llvm-coro` 现有规则在 direct/defer/go、递归、动态调用和抢占 corpus 上一致
-后，再把已通过的 standalone basic emitter 提升为 Phase 1 的 backend ownership、
-object/link 和三包 direct-call vertical slice。这样仍能把自动染色、包边界、LLVM
-lowering 和 runtime 生命周期分层验证。
+后，再把已通过的单函数 backend ownership 扩成 typed Yield、reentry scheduler 和
+三包 direct-call structured await。这样仍能把自动染色、包边界、LLVM lowering 和
+runtime 生命周期分层验证。
 
 ## 19. 最小可行性验证范围
 
@@ -1438,10 +1536,12 @@ go/no-go 验证。
 | 单函数 scalar SSA 生成 standalone LLVM coroutine | 已验证 |
 | initial/final suspend、resume、done、result、destroy | 已在 LLVM 19.1.7 执行验证 |
 | typed `YieldOnce`/SiteID、三包 coroutine primary/await | 未实现 |
-| Go object、linker ownership、reentry scheduler/runtime | 未实现 |
+| 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
+| reentry scheduler/runtime、三包 structured await | 未实现 |
 
-因此 basic example 已窄化回答第 19.1 节的第 4、5 个问题，但不能替代第 19.4 节的
-完整验收；尤其不能把 standalone `main` driver 当成 Go linker/runtime 已接通。
+因此 basic example 与 object/link 纵切已经回答第 19.1 节的第 4、5 个物理路径问题，
+但不能替代第 19.4 节的完整验收；尤其不能把同步 LLVM wrapper 当成 reentry
+scheduler/runtime 已接通。
 
 ### 19.1 必须回答的问题
 

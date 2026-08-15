@@ -27,6 +27,7 @@ type DebugFlags struct {
 	Converthash           string `help:"hash value for use in debugging changes to platform-dependent float-to-[u]int conversion" concurrent:"ok"`
 	Coro                  int    `help:"print experimental coroutine analysis (1 final, 2 provisional and final, 3 pre-lower SSA)" concurrent:"ok"`
 	CoroBasic             string `help:"write a standalone LLVM module for the restricted coroutine example" concurrent:"ok"`
+	CoroObject            string `help:"compile the restricted coroutine object/link example with the specified clang" concurrent:"ok"`
 	Defer                 int    `help:"print information about defer compilation"`
 	DisableNil            int    `help:"disable nil checks" concurrent:"ok"`
 	DumpInlFuncProps      string `help:"dump function properties from inl heuristics to specified file"`

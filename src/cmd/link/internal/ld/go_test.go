@@ -5,6 +5,9 @@
 package ld
 
 import (
+	"bytes"
+	"cmd/internal/coroobj"
+	"cmd/internal/obj"
 	"internal/testenv"
 	"os"
 	"path/filepath"
@@ -13,7 +16,50 @@ import (
 	"testing"
 
 	"cmd/internal/objabi"
+	"cmd/link/internal/loader"
+	"cmd/link/internal/sym"
+	"internal/buildcfg"
 )
+
+func TestCoroObjectManifest(t *testing.T) {
+	manifest := &coroobj.Manifest{
+		Version: coroobj.Version,
+		GOOS:    buildcfg.GOOS,
+		GOARCH:  buildcfg.GOARCH,
+		Symbols: []coroobj.Symbol{{
+			GoName:   "example.com/p.leaf",
+			GoABI:    int(obj.ABIInternal),
+			HostName: "go_coro_leaf",
+		}},
+	}
+	var data bytes.Buffer
+	if err := coroobj.Encode(&data, manifest); err != nil {
+		t.Fatal(err)
+	}
+	ctxt := &Link{}
+	loadcoro(ctxt, "p.a", data.String())
+	if len(ctxt.corodata) != 1 || ctxt.corodata[0].file != "p.a" {
+		t.Fatalf("coroutine object data = %#v", ctxt.corodata)
+	}
+
+	reporter := loader.ErrorReporter{}
+	ctxt.loader = loader.NewLoader(0, &reporter)
+	ctxt.loadcorodirectives()
+	if ctxt.corodata != nil {
+		t.Fatalf("processed coroutine object data = %#v, want nil", ctxt.corodata)
+	}
+	version := sym.ABIToVersion(obj.ABIInternal)
+	s := ctxt.loader.Lookup("example.com/p.leaf", version)
+	if s == 0 {
+		t.Fatal("coroutine Go symbol was not created")
+	}
+	if got, want := ctxt.loader.SymType(s), sym.SHOSTOBJ; got != want {
+		t.Fatalf("coroutine Go symbol type = %s, want %s", got, want)
+	}
+	if got, want := ctxt.loader.SymExtname(s), "go_coro_leaf"; got != want {
+		t.Fatalf("coroutine Go symbol external name = %q, want %q", got, want)
+	}
+}
 
 func TestDedupLibraries(t *testing.T) {
 	ctxt := &Link{}

@@ -87,6 +87,25 @@ jobs:
           "$LLVM_OPT" --version
           ./bin/go test -count=1 -run '^TestBasicLLVM' -v cmd/compile/internal/coro
 
+      - name: Run Go object and external-link coroutine example
+        shell: bash
+        env:
+          GOEXPERIMENT: coro
+        run: |
+          find_tool() {
+            for tool in "$@"; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                command -v "$tool"
+                return
+              fi
+            done
+            return 1
+          }
+          LLVM_CLANG="$(find_tool clang clang-20 clang-19 clang-18)"
+          export LLVM_CLANG
+          "$LLVM_CLANG" --version
+          ./bin/go test -count=1 -run '^TestBasicObjectLink$' -v cmd/compile/internal/coro
+
       - name: Test coroutine compiler
         env:
           GOEXPERIMENT: coro
