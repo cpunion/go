@@ -1485,6 +1485,7 @@ func buildop(ctxt *obj.Link) {
 
 		case ASYSCALL:
 			opset(ADBAR, r0)
+			opset(AIBAR, r0)
 			opset(ABREAK, r0)
 
 		case ACMPEQF:
@@ -1507,6 +1508,12 @@ func buildop(ctxt *obj.Link) {
 		case AMOVF:
 			opset(AMOVD, r0)
 
+		case AVSHUFB:
+			opset(AVBITSELV, r0)
+
+		case AXVSHUFB:
+			opset(AXVBITSELV, r0)
+
 		case AMOVW,
 			AMOVV,
 			ARFE,
@@ -1514,8 +1521,6 @@ func buildop(ctxt *obj.Link) {
 			AJMP,
 			AVMOVQ,
 			AXVMOVQ,
-			AVSHUFB,
-			AXVSHUFB,
 			AWORD,
 			APRELD,
 			APRELDX,
@@ -1636,6 +1641,7 @@ func buildop(ctxt *obj.Link) {
 			opset(AVEXTRINSH, r0)
 			opset(AVEXTRINSW, r0)
 			opset(AVEXTRINSV, r0)
+			opset(AVBITSELB, r0)
 
 		// xvandi.b xd, xj, ui8
 		case AXVANDB:
@@ -1653,6 +1659,7 @@ func buildop(ctxt *obj.Link) {
 			opset(AXVEXTRINSH, r0)
 			opset(AXVEXTRINSW, r0)
 			opset(AXVEXTRINSV, r0)
+			opset(AXVBITSELB, r0)
 
 		// vadd.b vd, vj, vk
 		case AVADDB:
