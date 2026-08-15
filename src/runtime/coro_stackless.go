@@ -482,6 +482,19 @@ func coroReleaseRootFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	}
 	select {
 	case stacklessCoroRootFramePool.available <- cached:
+		return
+	default:
+	}
+	// A full pool can otherwise retain an old set of resume identities
+	// forever. Every entry is quiescent, so discard one before publishing
+	// the newly active identity. Concurrent users may take or replace the
+	// same slot; cache loss in that race is harmless.
+	select {
+	case <-stacklessCoroRootFramePool.available:
+	default:
+	}
+	select {
+	case stacklessCoroRootFramePool.available <- cached:
 	default:
 	}
 }

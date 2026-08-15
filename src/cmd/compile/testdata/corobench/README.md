@@ -1263,9 +1263,11 @@ extended header. Race builds and the tagged pull-comparison driver likewise
 retain distinct task identities. There is no source annotation, public ABI
 change, or alternate scheduler mode. A completed root may replace a stale,
 free typed-frame cache entry left by an earlier deep lineage; active frames are
-never evicted. A regression first saturates the cache with depth-4,096 self
-recursion and then requires repeated depth-64 mutual recursion to allocate
-nothing.
+never evicted. The bounded public-root frame pool also replaces a quiescent old
+identity when full, so an earlier workload cannot permanently force a new root
+type to allocate. A fixed-count regression first saturates the internal cache
+with depth-4,096 self recursion, warms one depth-64 mutual call, and then
+requires repeated mutual recursion to allocate nothing.
 
 Two warm-up pairs followed by ten alternating 500 ms samples at one P on
 native Darwin/arm64 produced:

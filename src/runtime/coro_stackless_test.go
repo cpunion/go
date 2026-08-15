@@ -2988,6 +2988,24 @@ func TestStacklessCoroRootFrameCache(t *testing.T) {
 		stacklessCoroRootFrameCacheResume, size); got != nil {
 		t.Fatalf("empty root frame cache returned %p", got)
 	}
+
+	staleFrames := make([]stacklessCoroRootFrameCacheTestFrame,
+		runtime.StacklessCoroWarmExecutorCount)
+	for i := range staleFrames {
+		runtime.ReleaseRootStacklessCoroFrameForTest(
+			unsafe.Pointer(&staleFrames[i]),
+			stacklessCoroRootFrameCacheOtherResume, size)
+	}
+	replacement := new(stacklessCoroRootFrameCacheTestFrame)
+	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(replacement),
+		stacklessCoroRootFrameCacheResume, size)
+	if got := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheResume, size); got !=
+		unsafe.Pointer(replacement) {
+		t.Fatalf("replacement root frame = %p, want %p", got, replacement)
+	}
+	runtime.ClearStacklessCoroRootFramePoolForTest()
+
 	runtime.ReleaseRootStacklessCoroFrameForTest(nil,
 		stacklessCoroRootFrameCacheResume, size)
 	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(frame), nil, size)

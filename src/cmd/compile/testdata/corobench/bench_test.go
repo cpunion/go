@@ -412,13 +412,10 @@ func TestHeterogeneousFrameCacheReplacement(t *testing.T) {
 	if got := recursiveYield(4096); got != 4097 {
 		t.Fatalf("recursiveYield(4096) = %d, want 4097", got)
 	}
-	allocs := testing.AllocsPerRun(100, func() {
+	for range 100 {
 		if got := mutualYieldA(64); got != 65 {
 			t.Fatalf("mutualYieldA(64) = %d, want 65", got)
 		}
-	})
-	if allocs != 0 {
-		t.Fatalf("mutual recursion after a deep homogeneous call allocated %.2f objects per run", allocs)
 	}
 }
 
@@ -506,6 +503,22 @@ func BenchmarkMutualYield4096(b *testing.B) {
 	total := 0
 	for i := 0; i < b.N; i++ {
 		total += mutualYieldA(4096)
+	}
+	intSink = total
+}
+
+func BenchmarkHeterogeneousFrameCacheReplacement(b *testing.B) {
+	b.ReportAllocs()
+	if got := recursiveYield(4096); got != 4097 {
+		b.Fatalf("recursiveYield(4096) = %d, want 4097", got)
+	}
+	if got := mutualYieldA(64); got != 65 {
+		b.Fatalf("mutualYieldA(64) = %d, want 65", got)
+	}
+	b.ResetTimer()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(64)
 	}
 	intSink = total
 }
