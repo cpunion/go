@@ -776,6 +776,29 @@ func TestStacklessCoroSelfFramePullFallback(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroFusedResumePullFallback(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	tracker := new(stacklessCoroFusedResumeDeepTracker)
+	stacklessCoroFusedResumeDeepActive = tracker
+	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+	const depth = 32
+	root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
+	runtime.RunStacklessCoroPullFrameForTest(unsafe.Pointer(root),
+		stacklessCoroFusedResumeDeepRoot)
+	if tracker.completed != depth+1 {
+		t.Fatalf("completed frames = %d, want %d",
+			tracker.completed, depth+1)
+	}
+	if tracker.firstAction != runtime.StacklessCoroActionWait ||
+		tracker.firstFused {
+		t.Fatalf("first await = (action %d, fused %t), want (%d, false)",
+			tracker.firstAction, tracker.firstFused,
+			runtime.StacklessCoroActionWait)
+	}
+}
+
 func stacklessCoroComparisonCompleteResume(unsafe.Pointer) uint8 {
 	return runtime.StacklessCoroActionComplete
 }

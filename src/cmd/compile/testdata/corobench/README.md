@@ -1245,3 +1245,42 @@ Compiler coverage is 93.4% overall and 100% for the changed explicit-frame
 lowering. Normal, race, and pull runtime profiles cover every reachable added
 line; the remaining raw-profile gaps are fail-closed `throw` bodies, with no
 coverage exclusion or test-only production branch.
+
+#### Fuse local heterogeneous structured frames
+
+Revision `c450d8f21f`, measured against exact benchmark parent `cd8f6d8a51`,
+extends frame fusion from self recursion to local structured awaits between
+different explicit-frame functions. The compiler proves both ends use its
+private version-3 factory layout. A heterogeneous child adds its resume entry
+to the common parent, owner, and allocation-marker header, so the current
+logical task can enter the child and restore its parent without allocating a
+second task. Pure self recursion retains its smaller header and original
+specialized runtime path.
+
+The optimization is automatic and local to one compilation unit. Cross-package
+factories retain the ordinary task path until export data describes the
+extended header. Race builds and the tagged pull-comparison driver likewise
+retain distinct task identities. There is no source annotation, public ABI
+change, or alternate scheduler mode. A completed root may replace a stale,
+free typed-frame cache entry left by an earlier deep lineage; active frames are
+never evicted. A regression first saturates the cache with depth-4,096 self
+recursion and then requires repeated depth-64 mutual recursion to allocate
+nothing.
+
+Two warm-up pairs followed by ten alternating 500 ms samples at one P on
+native Darwin/arm64 produced:
+
+| Probe | Exact parent | Heterogeneous fusion | Change |
+| --- | ---: | ---: | ---: |
+| recursive self yield, depth 64 | 3.307 us | 3.321 us | neutral |
+| recursive self yield, depth 4,096 | 231.3 us | 229.4 us | neutral |
+| mutual yield, depth 64 | 4.489 us | 3.737 us | -16.75% |
+| mutual yield, depth 4,096 | 404.6 us | 298.6 us | -26.21% |
+| mutual depth-4,096 allocation | 360.0 KiB, 4,804 allocs | 300.0 KiB, 3,840 allocs | -16.68% bytes, -20.07% allocs |
+
+The mixed six-probe run moved the logical-yield control by 2.56%. A separate
+15-pair control made both logical yield (`p=0.690`) and public entry
+(`p=0.878`) neutral, while all control allocation counts remained zero. The
+result therefore extends the compact structured-frame benefit beneath the
+production push scheduler without regressing its established homogeneous
+fast path.

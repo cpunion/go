@@ -1494,9 +1494,11 @@ func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
 }
 
 type stacklessCoroFusedResumeDeepTracker struct {
-	completed int
-	uncached  int
-	panicLeaf bool
+	completed   int
+	uncached    int
+	panicLeaf   bool
+	firstAction uint8
+	firstFused  bool
 }
 
 var stacklessCoroFusedResumeDeepActive *stacklessCoroFusedResumeDeepTracker
@@ -1573,8 +1575,10 @@ func stacklessCoroFusedResumeDeepRoot(ctx unsafe.Pointer) uint8 {
 			Value: &tracker.completed,
 		}
 		frame.State = 1
-		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
-			childPointer, stacklessCoroFusedResumeDeepA)
+		tracker.firstAction = runtime.AwaitStacklessCoroFusedResumeFrameForTest(
+			ctx, childPointer, stacklessCoroFusedResumeDeepA)
+		tracker.firstFused = child.Parent != nil
+		return tracker.firstAction
 	case 1:
 		return runtime.StacklessCoroActionComplete
 	default:
