@@ -240,8 +240,9 @@ manifest 编解码和 linker `SHOSTOBJ` 映射。新增 manifest package 的 sta
 
 - `-d=coroobject=<clang>` 是 debug PoC selector；compiler 内调用 clang，cache identity
   只包含路径而不包含工具内容，不能作为正式 backend driver。
-- LLVM wrapper 在函数内部立即 resume 一次；尚无 scheduler reentry、parent await、
-  external wakeup 或并发 goroutine。
+- 本纵切最初使用函数内同步 wrapper；后续第 1.5 节已把同一受限 object 例子替换为
+  显式 scheduler/operation reentry，但仍没有真实 timer/I/O event source、parent await
+  或并发 worker。
 - object 使用 `malloc/free`，host external-link 启动路径由测试显式导入
   `runtime/cgo`；这不代表直接 C/no-cgo boundary 已完成。
 - marker 仍按私有符号名识别，尚未替换成 typed `YieldOnce`、SiteID 和版本化 callable
@@ -252,6 +253,26 @@ manifest 编解码和 linker `SHOSTOBJ` 映射。新增 manifest package 的 sta
 
 因此该结果只把风险从“Go compiler 能否把 LLVM object 交给 archive/linker”降为已
 验证；它没有提前完成第 19 节的 scheduler/runtime 验收。
+
+### 1.5 Push scheduler 与 operation reentry 纵切
+
+`dev.coro-scheduler-operation-20260815` 叠加在 object/link topic 上，把同步 resume
+wrapper 替换为最小的 push FIFO 和显式 operation 生命周期。生成的 LLVM module 创建
+两个 logical task；每个 task 都依次发生 initial suspend、`Yield`、`Park` 和完成，
+scheduler 记录并校验 resume 顺序必须是 `0,1,0,1,0,1`。
+
+operation 使用 `(task, generation, phase)` 标识，phase 单向经过
+`Idle -> Armed -> Parked/Ready -> Consumed`。task 0 在 arm 后、提交 park 前完成，验证
+early completion 不丢 wakeup；task 1 在 ready queue 变空后完成，验证 late publisher
+只唤醒精确 waiter。重复入队、错误 task/generation、非法 phase 和非 runnable task 都
+fail closed。两个 task 都只在 scheduler 中 resume/destroy，coroutine body 只提交
+action，不递归驱动 scheduler。
+
+Darwin/arm64 上使用 LLVM 19.1.7 的真实 compile/archive/external-link executable 已
+通过，并返回原 Go 函数期望值。这个结果证明了单线程下 push queue、early/late
+completion 与 LLVM coroutine reentry 的物理闭环；它尚未证明跨线程发布、内存序、
+timer/netpoll/file adapter、M handoff 或完整 runtime 公平性。下一纵切应保持相同
+operation contract，只把手工 late publisher 替换为 timer event source。
 
 ## 2. 结论
 
@@ -1537,11 +1558,12 @@ go/no-go 验证。
 | initial/final suspend、resume、done、result、destroy | 已在 LLVM 19.1.7 执行验证 |
 | typed `YieldOnce`/SiteID、三包 coroutine primary/await | 未实现 |
 | 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
-| reentry scheduler/runtime、三包 structured await | 未实现 |
+| 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
+| 真实 event source、跨线程 scheduler/runtime、三包 structured await | 未实现 |
 
-因此 basic example 与 object/link 纵切已经回答第 19.1 节的第 4、5 个物理路径问题，
-但不能替代第 19.4 节的完整验收；尤其不能把同步 LLVM wrapper 当成 reentry
-scheduler/runtime 已接通。
+因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
+第 4、5 个物理路径问题，并验证了最小单线程 scheduler 所有权；但不能替代第 19.4
+节的完整验收，也不能把手工 publisher 当成 timer/netpoll runtime 已接通。
 
 ### 19.1 必须回答的问题
 
