@@ -266,10 +266,10 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		analysis := coro.Analyze(typecheck.Target.Funcs)
 		if base.Debug.Coro > 1 {
 			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
-			plan.Dump(os.Stderr)
+			analysis.Dump(os.Stderr)
 		}
 	}
 
@@ -301,12 +301,18 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
-		plan := coro.Analyze(typecheck.Target.Funcs)
+		analysis := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := analysis.Freeze()
+		if err != nil {
+			base.Fatalf("freezing coroutine plan: %v", err)
+		}
 		if base.Debug.Coro != 0 {
 			fmt.Fprintln(os.Stderr, "coro: phase=final")
+			analysis.Dump(os.Stderr)
 			plan.Dump(os.Stderr)
 		}
-		plan.PublishSummaries()
+		analysis.PublishSummaries()
+		coro.SetCurrentPlan(plan)
 	}
 
 	deadlocals.Funcs(typecheck.Target.Funcs)

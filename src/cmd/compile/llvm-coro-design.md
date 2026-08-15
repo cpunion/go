@@ -3,7 +3,8 @@
 状态：架构设计稿；已完成 Phase 0、pre-lower handoff、受限可执行 LLVM coroutine
 basic example、单函数 Go object/archive/external-link ownership、push scheduler、native
 timer event、blocking file executor handoff，以及 connected stream socket 纵切；typed
-structured await、runtime timer/file/net adapter 和普通标准库 lowering 尚未接入
+site plan 已接入；structured await lowering、runtime timer/file/net adapter 和普通
+标准库 lowering 尚未接入
 
 更新时间：2026-08-15
 
@@ -11,7 +12,7 @@ structured await、runtime timer/file/net adapter 和普通标准库 lowering �
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 implementation topic/worktree：`dev.coro-sync-20260815b`
+当前 implementation topic/worktree：`dev.coro-site-plan-20260815`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -377,6 +378,24 @@ connected-socket 物理纵切的 `dev.coro`。本次继续采用 merge 而不是
 coroutine bootstrap、convergence/staleness 和同一完整 suite 也通过。该 topic 不修改
 coroutine 分析、ABI、renderer 或 runtime 行为；它只建立下一批真实标准库 lowering
 工作的共同官方基线。
+
+### 1.10 冻结 site plan
+
+`dev.coro-site-plan-20260815` 在第 1.9 节的同步点之上，把可变 effect analysis 与后端
+输入分开。provisional 阶段仍只计算 effect；final 阶段在 wrapper 生成后把结果冻结成
+package `Plan`，并在 escape analysis 和并发 backend worker 启动前安装。计划使用
+link symbol、definition ABI 和 wrapper role 组成 `FuncID`，使用高层 IR 的确定性遍历
+序号组成 `SiteID`。
+
+第一版 `SitePlan` 只包含四个控制 family：`Await`、`Park`、`Spawn` 和 `Dispatch`。
+channel send/receive/select/range 是 typed `OperationKind`，后端不需要根据裸 SSA call
+symbol 重新决定操作语义。普通调用只有在 callee 最终会挂起时才保留 `Await` site；
+未知动态调用使用 `Dispatch`；`go` 调用使用 `Spawn`。
+
+本阶段只冻结语义，没有把任何新 operation 交给 LLVM emitter 或 runtime service。
+正常程序仍由 Go native backend 执行；后续 topic 必须按完整静态声明身份加入 typed
+operation recipe，再把 `SiteID` 传到 pre-lower SSA consumer。现有私有 object recipe
+保留为物理链路回归测试，不能作为标准库 lowering 的实现。
 
 ## 2. 结论
 
