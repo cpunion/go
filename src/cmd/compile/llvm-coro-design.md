@@ -11,7 +11,7 @@ structured await、runtime timer/file/net adapter 和普通标准库 lowering �
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 implementation topic/worktree：`dev.coro-socket-operation-20260815`
+当前 implementation topic/worktree：`dev.coro-sync-20260815b`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -362,6 +362,21 @@ runtime netpoll，并用 loopback TCP、deadline 和关闭竞态验证一次完�
 完整 compiler suite；Darwin 上的 timer/file/socket archive/link/executable 路径各连续
 通过五次，Linux/amd64 上各连续通过三次。新增及修改 renderer 的 changed Go functions
 均为 100% statement coverage。
+
+### 1.9 2026-08-15 后续 upstream merge checkpoint
+
+Integration commit `0e1700e82c` 把 Go 开发版 `372c766cdd` merge 到包含 timer、file 和
+connected-socket 物理纵切的 `dev.coro`。本次继续采用 merge 而不是重放 coroutine
+提交；9 个官方提交没有产生内容冲突。`cpunion/go:main` 已快进到同一个官方 revision，
+仍不携带 coroutine patch。
+
+官方变化主要位于 escape analysis walk、`walk` 的 makeslicecopy 优化、`cmd/go` 加载
+队列和 tool listing，以及 SIMD 生成器。merge 后 native Darwin/arm64 的默认与
+`GOEXPERIMENT=coro` 三阶段 bootstrap、convergence/staleness 检查，以及完整
+`cmd/compile/... internal/pkgbits internal/buildcfg` suite 均通过；Linux/arm64 的
+coroutine bootstrap、convergence/staleness 和同一完整 suite 也通过。该 topic 不修改
+coroutine 分析、ABI、renderer 或 runtime 行为；它只建立下一批真实标准库 lowering
+工作的共同官方基线。
 
 ## 2. 结论
 
