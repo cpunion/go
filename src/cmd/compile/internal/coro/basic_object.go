@@ -139,6 +139,10 @@ func sortedObjectArtifacts() []objectArtifact {
 }
 
 func basicObjectLLVMModule(f *ssa.Func) (goName, hostName string, module []byte, matched bool, err error) {
+	return basicObjectLLVMModuleForTarget(f, buildcfg.GOOS, buildcfg.GOARCH)
+}
+
+func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, hostName string, module []byte, matched bool, err error) {
 	var markerCalls []*ssa.Value
 	calls := 0
 	for _, b := range f.Blocks {
@@ -190,7 +194,10 @@ func basicObjectLLVMModule(f *ssa.Func) (goName, hostName string, module []byte,
 	goName = f.OwnAux.Fn.Name
 	digest := sha256.Sum256([]byte(fmt.Sprintf("%s<%d>", goName, f.ABISelf.Which())))
 	hostName = fmt.Sprintf("go_coro_%x", digest[:8])
-	module = renderBasicObjectLLVM(hostName, value.AuxInt)
+	module, err = renderBasicObjectLLVMForTarget(hostName, value.AuxInt, goos, goarch)
+	if err != nil {
+		return "", "", nil, true, err
+	}
 	return goName, hostName, module, true, nil
 }
 

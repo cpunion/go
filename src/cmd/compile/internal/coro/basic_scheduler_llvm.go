@@ -5,32 +5,56 @@
 package coro
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
 
-// renderBasicObjectLLVM emits the scheduler/operation vertical slice used by
-// the restricted object-link example. Two logical tasks share one FIFO. Each
-// task yields once, parks on a generation-checked manual operation, and then
-// completes. One operation completes before the park is committed and the
-// other completes after the ready queue becomes empty.
-func renderBasicObjectLLVM(hostName string, value int64) []byte {
+// renderBasicObjectLLVMForTarget emits the scheduler/operation vertical slice
+// used by the restricted object-link example. Two logical tasks share one FIFO.
+// Each task yields once and parks on a generation-checked operation. The first
+// operation completes before the park is committed. The second is completed
+// by a native timer thread while the first task continues to make progress.
+func renderBasicObjectLLVMForTarget(hostName string, value int64, goos, goarch string) ([]byte, error) {
+	pthreadType, err := pthreadHandleType(goos, goarch)
+	if err != nil {
+		return nil, err
+	}
 	replacer := strings.NewReplacer(
 		"{{HOST}}", hostName,
 		"{{VALUE0}}", strconv.FormatInt(value, 10),
 		"{{VALUE1}}", strconv.FormatInt(value+1, 10),
+		"{{PTHREAD_T}}", pthreadType,
 	)
-	return []byte(replacer.Replace(basicSchedulerLLVM))
+	return []byte(replacer.Replace(basicSchedulerLLVM)), nil
+}
+
+func pthreadHandleType(goos, goarch string) (string, error) {
+	if goarch != "amd64" && goarch != "arm64" {
+		return "", fmt.Errorf("coroutine timer object does not support %s/%s", goos, goarch)
+	}
+	switch goos {
+	case "darwin":
+		return "ptr", nil
+	case "linux":
+		return "i64", nil
+	default:
+		return "", fmt.Errorf("coroutine timer object does not support %s/%s", goos, goarch)
+	}
 }
 
 const basicSchedulerLLVM = `; Generated from the restricted Go coroutine scheduler/operation example.
 
 %queue = type { ptr, ptr }
 %operation = type { ptr, i64, i8 }
-%task = type { ptr, ptr, ptr, ptr, ptr, i64, i64, i32, i8, i8, i1, i1 }
+%timer = type { i8, i64, i32 }
+%task = type { ptr, ptr, ptr, ptr, ptr, i64, i64, i32, i8, i8, i1, i1, ptr }
 
 declare noalias ptr @malloc(i64)
 declare void @free(ptr)
+declare i32 @pthread_create(ptr, ptr, ptr, ptr)
+declare i32 @pthread_join({{PTHREAD_T}}, ptr)
+declare i32 @nanosleep(ptr, ptr)
 
 declare token @llvm.coro.id(i32, ptr, ptr, ptr)
 declare i64 @llvm.coro.size.i64()
@@ -236,6 +260,30 @@ reject:
   ret i1 false
 }
 
+define internal ptr @timer.thread(ptr %timer) {
+entry:
+  %request = alloca [2 x i64], align 8
+  %seconds.ptr = getelementptr inbounds [2 x i64], ptr %request, i32 0, i32 0
+  store i64 0, ptr %seconds.ptr, align 8
+  %nanoseconds.ptr = getelementptr inbounds [2 x i64], ptr %request, i32 0, i32 1
+  store i64 1000000, ptr %nanoseconds.ptr, align 8
+  br label %wait.progress
+
+wait.progress:
+  %progress.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 1
+  %progress = load atomic i64, ptr %progress.ptr acquire, align 8
+  %enough = icmp uge i64 %progress, 8
+  br i1 %enough, label %sleep, label %wait.progress
+
+sleep:
+  %status = call i32 @nanosleep(ptr %request, ptr null)
+  %status.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 2
+  store atomic i32 %status, ptr %status.ptr release, align 4
+  %ready.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 0
+  store atomic i8 1, ptr %ready.ptr release, align 1
+  ret ptr null
+}
+
 define internal ptr @{{HOST}}.body(ptr %task) presplitcoroutine {
 entry:
   %id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)
@@ -291,7 +339,35 @@ park:
 
 after.park:
   %consumed = call i1 @operation.consume(ptr %operation, ptr %task, i64 %generation)
-  br i1 %consumed, label %complete, label %consume.failed
+  br i1 %consumed, label %select.progress, label %consume.failed
+
+select.progress:
+  %task.id.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 7
+  %task.id = load i32, ptr %task.id.ptr, align 4
+  %is.progress.task = icmp eq i32 %task.id, 0
+  br i1 %is.progress.task, label %progress.check, label %complete
+
+progress.check:
+  %timer.ptr.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 12
+  %timer = load ptr, ptr %timer.ptr.ptr, align 8
+  %timer.ready.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 0
+  %timer.ready.value = load atomic i8, ptr %timer.ready.ptr acquire, align 1
+  %timer.ready = icmp ne i8 %timer.ready.value, 0
+  br i1 %timer.ready, label %complete, label %progress
+
+progress:
+  %timer.progress.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 1
+  %old.progress = atomicrmw add ptr %timer.progress.ptr, i64 1 monotonic, align 8
+  store i8 1, ptr %action.ptr, align 1
+  %progress.save = call token @llvm.coro.save(ptr %hdl)
+  %progress.kind = call i8 @llvm.coro.suspend(token %progress.save, i1 false)
+  switch i8 %progress.kind, label %suspend [
+    i8 0, label %after.progress
+    i8 1, label %cleanup
+  ]
+
+after.progress:
+  br label %progress.check
 
 complete:
   %result.ptr.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 4
@@ -340,7 +416,7 @@ suspend:
   ret ptr %hdl
 }
 
-define internal i1 @task.init(ptr %queue, ptr %task, ptr %operation, ptr %result, i32 %id, i64 %value, i1 %early) {
+define internal i1 @task.init(ptr %queue, ptr %task, ptr %operation, ptr %timer, ptr %result, i32 %id, i64 %value, i1 %early) {
 entry:
   store %task zeroinitializer, ptr %task, align 8
   store %operation zeroinitializer, ptr %operation, align 8
@@ -361,6 +437,8 @@ entry:
   store i32 %id, ptr %id.ptr, align 4
   %early.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 11
   store i1 %early, ptr %early.ptr, align 1
+  %timer.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 12
+  store ptr %timer, ptr %timer.ptr, align 8
   %hdl = call ptr @{{HOST}}.body(ptr %task)
   %nonnull = icmp ne ptr %hdl, null
   %handle.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 0
@@ -389,25 +467,50 @@ entry:
   %task1 = alloca %task, align 8
   %operation0 = alloca %operation, align 8
   %operation1 = alloca %operation, align 8
+  %timer = alloca %timer, align 8
+  %thread = alloca {{PTHREAD_T}}, align 8
   %result0 = alloca i64, align 8
   %result1 = alloca i64, align 8
-  %order = alloca [6 x i32], align 4
+  %order = alloca [4 x i32], align 4
   %resume.count = alloca i32, align 4
   %complete.count = alloca i32, align 4
   %late.published = alloca i1, align 1
+  %thread.started = alloca i1, align 1
+  %thread.joined = alloca i1, align 1
   store %queue zeroinitializer, ptr %queue, align 8
-  store [6 x i32] zeroinitializer, ptr %order, align 4
+  store %timer zeroinitializer, ptr %timer, align 8
+  store [4 x i32] zeroinitializer, ptr %order, align 4
   store i32 0, ptr %resume.count, align 4
   store i32 0, ptr %complete.count, align 4
   store i1 false, ptr %late.published, align 1
-  %init0 = call i1 @task.init(ptr %queue, ptr %task0, ptr %operation0, ptr %result0, i32 0, i64 {{VALUE0}}, i1 true)
+  store i1 false, ptr %thread.started, align 1
+  store i1 false, ptr %thread.joined, align 1
+  %init0 = call i1 @task.init(ptr %queue, ptr %task0, ptr %operation0, ptr %timer, ptr %result0, i32 0, i64 {{VALUE0}}, i1 true)
   br i1 %init0, label %init.second, label %fail
 
 init.second:
-  %init1 = call i1 @task.init(ptr %queue, ptr %task1, ptr %operation1, ptr %result1, i32 1, i64 {{VALUE1}}, i1 false)
+  %init1 = call i1 @task.init(ptr %queue, ptr %task1, ptr %operation1, ptr %timer, ptr %result1, i32 1, i64 {{VALUE1}}, i1 false)
   br i1 %init1, label %loop, label %fail
 
 loop:
+  %started = load i1, ptr %thread.started, align 1
+  br i1 %started, label %poll.timer, label %pop
+
+poll.timer:
+  %poll.ready.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 0
+  %poll.ready.value = load atomic i8, ptr %poll.ready.ptr acquire, align 1
+  %poll.ready = icmp ne i8 %poll.ready.value, 0
+  %already.published = load i1, ptr %late.published, align 1
+  %not.published = xor i1 %already.published, true
+  %publish.now = and i1 %poll.ready, %not.published
+  br i1 %publish.now, label %publish.timer, label %pop
+
+publish.timer:
+  %timer.published = call i1 @operation.publish(ptr %queue, ptr %operation1, i64 2)
+  store i1 true, ptr %late.published, align 1
+  br i1 %timer.published, label %pop, label %fail
+
+pop:
   %task = call ptr @queue.pop(ptr %queue)
   %empty = icmp eq ptr %task, null
   br i1 %empty, label %idle, label %run
@@ -415,16 +518,7 @@ loop:
 idle:
   %completed.idle = load i32, ptr %complete.count, align 4
   %all.complete = icmp eq i32 %completed.idle, 2
-  br i1 %all.complete, label %verify, label %publish.late
-
-publish.late:
-  %was.published = load i1, ptr %late.published, align 1
-  br i1 %was.published, label %fail, label %publish.once
-
-publish.once:
-  %published = call i1 @operation.publish(ptr %queue, ptr %operation1, i64 2)
-  store i1 true, ptr %late.published, align 1
-  br i1 %published, label %loop, label %fail
+  br i1 %all.complete, label %join.timer, label %fail
 
 run:
   %state.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 8
@@ -441,14 +535,17 @@ record:
 
 log:
   %count = load i32, ptr %resume.count, align 4
-  %within.log = icmp ult i32 %count, 6
-  br i1 %within.log, label %resume, label %fail
+  %within.log = icmp ult i32 %count, 4
+  br i1 %within.log, label %log.first, label %resume
+
+log.first:
+  %log.id.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 7
+  %log.id = load i32, ptr %log.id.ptr, align 4
+  %order.slot = getelementptr inbounds [4 x i32], ptr %order, i32 0, i32 %count
+  store i32 %log.id, ptr %order.slot, align 4
+  br label %resume
 
 resume:
-  %id.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 7
-  %task.id = load i32, ptr %id.ptr, align 4
-  %order.slot = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 %count
-  store i32 %task.id, ptr %order.slot, align 4
   %action.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 9
   store i8 0, ptr %action.ptr, align 1
   call void @llvm.coro.resume(ptr %hdl)
@@ -488,11 +585,41 @@ park:
   %generation.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 6
   %generation = load i64, ptr %generation.ptr, align 8
   %parked = call i1 @operation.park(ptr %queue, ptr %operation, ptr %task, i64 %generation)
-  br i1 %parked, label %loop, label %fail
+  br i1 %parked, label %maybe.start.timer, label %fail
+
+maybe.start.timer:
+  %park.id.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 7
+  %park.id = load i32, ptr %park.id.ptr, align 4
+  %is.timer.task = icmp eq i32 %park.id, 1
+  br i1 %is.timer.task, label %start.timer, label %loop
+
+start.timer:
+  %was.started = load i1, ptr %thread.started, align 1
+  br i1 %was.started, label %fail, label %create.timer
+
+create.timer:
+  %create.status = call i32 @pthread_create(ptr %thread, ptr null, ptr @timer.thread, ptr %timer)
+  %created = icmp eq i32 %create.status, 0
+  br i1 %created, label %timer.started, label %fail
+
+timer.started:
+  store i1 true, ptr %thread.started, align 1
+  br label %loop
+
+join.timer:
+  %thread.is.started = load i1, ptr %thread.started, align 1
+  br i1 %thread.is.started, label %join.started, label %fail
+
+join.started:
+  %thread.value = load {{PTHREAD_T}}, ptr %thread, align 8
+  %join.status = call i32 @pthread_join({{PTHREAD_T}} %thread.value, ptr null)
+  store i1 true, ptr %thread.joined, align 1
+  %joined = icmp eq i32 %join.status, 0
+  br i1 %joined, label %verify, label %fail
 
 verify:
   %resumes = load i32, ptr %resume.count, align 4
-  %six.resumes = icmp eq i32 %resumes, 6
+  %enough.resumes = icmp uge i32 %resumes, 14
   %result0.value = load i64, ptr %result0, align 8
   %result0.ok = icmp eq i64 %result0.value, {{VALUE0}}
   %result1.value = load i64, ptr %result1, align 8
@@ -504,51 +631,70 @@ verify:
   %operation1.phase = load i8, ptr %operation1.phase.ptr, align 1
   %operation1.done = icmp eq i8 %operation1.phase, 4
   %late.done = load i1, ptr %late.published, align 1
+  %timer.ready.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 0
+  %timer.ready.value = load atomic i8, ptr %timer.ready.ptr acquire, align 1
+  %timer.ready = icmp ne i8 %timer.ready.value, 0
+  %timer.progress.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 1
+  %timer.progress = load atomic i64, ptr %timer.progress.ptr acquire, align 8
+  %timer.progressed = icmp uge i64 %timer.progress, 8
+  %timer.status.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 2
+  %timer.status = load atomic i32, ptr %timer.status.ptr acquire, align 4
+  %timer.slept = icmp eq i32 %timer.status, 0
   %head.ptr = getelementptr inbounds %queue, ptr %queue, i32 0, i32 0
   %head = load ptr, ptr %head.ptr, align 8
   %head.empty = icmp eq ptr %head, null
   %tail.ptr = getelementptr inbounds %queue, ptr %queue, i32 0, i32 1
   %tail = load ptr, ptr %tail.ptr, align 8
   %tail.empty = icmp eq ptr %tail, null
-  %base0 = and i1 %six.resumes, %result0.ok
+  %base0 = and i1 %enough.resumes, %result0.ok
   %base1 = and i1 %base0, %result1.ok
   %base2 = and i1 %base1, %operation0.done
   %base3 = and i1 %base2, %operation1.done
   %base4 = and i1 %base3, %late.done
-  %base5 = and i1 %base4, %head.empty
-  %base6 = and i1 %base5, %tail.empty
-  br i1 %base6, label %verify.order, label %fail
+  %base5 = and i1 %base4, %timer.ready
+  %base6 = and i1 %base5, %timer.progressed
+  %base7 = and i1 %base6, %timer.slept
+  %base8 = and i1 %base7, %head.empty
+  %base9 = and i1 %base8, %tail.empty
+  br i1 %base9, label %verify.order, label %fail
 
 verify.order:
-  %order0.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 0
+  %order0.ptr = getelementptr inbounds [4 x i32], ptr %order, i32 0, i32 0
   %order0 = load i32, ptr %order0.ptr, align 4
   %order0.ok = icmp eq i32 %order0, 0
-  %order1.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 1
+  %order1.ptr = getelementptr inbounds [4 x i32], ptr %order, i32 0, i32 1
   %order1 = load i32, ptr %order1.ptr, align 4
   %order1.ok = icmp eq i32 %order1, 1
-  %order2.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 2
+  %order2.ptr = getelementptr inbounds [4 x i32], ptr %order, i32 0, i32 2
   %order2 = load i32, ptr %order2.ptr, align 4
   %order2.ok = icmp eq i32 %order2, 0
-  %order3.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 3
+  %order3.ptr = getelementptr inbounds [4 x i32], ptr %order, i32 0, i32 3
   %order3 = load i32, ptr %order3.ptr, align 4
   %order3.ok = icmp eq i32 %order3, 1
-  %order4.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 4
-  %order4 = load i32, ptr %order4.ptr, align 4
-  %order4.ok = icmp eq i32 %order4, 0
-  %order5.ptr = getelementptr inbounds [6 x i32], ptr %order, i32 0, i32 5
-  %order5 = load i32, ptr %order5.ptr, align 4
-  %order5.ok = icmp eq i32 %order5, 1
   %order.check1 = and i1 %order0.ok, %order1.ok
   %order.check2 = and i1 %order.check1, %order2.ok
   %order.check3 = and i1 %order.check2, %order3.ok
-  %order.check4 = and i1 %order.check3, %order4.ok
-  %order.check5 = and i1 %order.check4, %order5.ok
-  br i1 %order.check5, label %success, label %fail
+  br i1 %order.check3, label %success, label %fail
 
 success:
   ret i64 {{VALUE0}}
 
 fail:
+  %fail.started = load i1, ptr %thread.started, align 1
+  %fail.joined = load i1, ptr %thread.joined, align 1
+  %fail.not.joined = xor i1 %fail.joined, true
+  %fail.needs.join = and i1 %fail.started, %fail.not.joined
+  br i1 %fail.needs.join, label %fail.join, label %fail.return
+
+fail.join:
+  %fail.progress.ptr = getelementptr inbounds %timer, ptr %timer, i32 0, i32 1
+  store atomic i64 8, ptr %fail.progress.ptr release, align 8
+  %fail.thread.value = load {{PTHREAD_T}}, ptr %thread, align 8
+  %fail.join.status = call i32 @pthread_join({{PTHREAD_T}} %fail.thread.value, ptr null)
+  store i1 true, ptr %thread.joined, align 1
+  br label %fail.return
+
+fail.return:
   ret i64 -1
 }
 
