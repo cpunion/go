@@ -121,6 +121,8 @@ expected=(
 	yieldLoop
 	yieldEntry
 	recursiveYield
+	mutualYieldA
+	mutualYieldB
 	deferYield
 	recoverYield
 	taskWorker
@@ -191,14 +193,15 @@ for function in "${expected[@]}"; do
 		exit 1
 	fi
 done
-if ! "$test_binary" -test.run '^$' -test.bench '^BenchmarkYieldEntry$' \
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^(BenchmarkYieldEntry|BenchmarkHeterogeneousFrameCacheReplacement)$' \
 	-test.benchmem -test.benchtime=10000x -test.count=3 \
 	>"$allocation_output"; then
 	tail -n 100 "$allocation_output" >&2
 	exit 1
 fi
 if ! awk '
-	$1 ~ /^BenchmarkYieldEntry-/ {
+	$1 ~ /^Benchmark(YieldEntry|HeterogeneousFrameCacheReplacement)-/ {
 		samples++
 		for (i = 2; i <= NF; i++) {
 			if (($i == "B/op" || $i == "allocs/op") && $(i - 1) != 0) {
@@ -206,10 +209,10 @@ if ! awk '
 			}
 		}
 	}
-	END { exit samples == 3 && !bad ? 0 : 1 }
+	END { exit samples == 6 && !bad ? 0 : 1 }
 ' "$allocation_output"; then
 	cat "$allocation_output" >&2
-	echo "public coroutine entry allocation is not zero" >&2
+	echo "steady coroutine frame allocation is not zero" >&2
 	exit 1
 fi
 

@@ -56,6 +56,11 @@ type lowerCandidate struct {
 	resultPtrs    []*ir.Name
 	factory       *ir.Func
 	factoryABI    FactoryABI
+	fusedAwaits   map[*ir.CallExpr]bool
+	fusedRequests map[*ir.CallExpr]bool
+	fusedFrame    bool
+	fusedResume   bool
+	fusedSelf     bool
 	selfAwait     bool
 	selfSpawn     bool
 }
@@ -297,6 +302,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 			candidate.resultPtrs = append(candidate.resultPtrs, pointer)
 		}
 	}
+	markFusedFrameCandidates(candidates)
 	for _, function := range functions {
 		candidate := candidates[function.Func]
 		if candidate == nil {
@@ -1340,6 +1346,46 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 		}
 	})
 	return supported
+}
+
+// markFusedFrameCandidates identifies local structured awaits whose explicit
+// frames can share one logical task. Cross-package factories retain the
+// ordinary task path until their export ABI describes the extended frame
+// header required when the resume entry changes.
+func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
+	for _, candidate := range candidates {
+		if candidate.factoryABI != FactoryABI3 {
+			continue
+		}
+		for call, transition := range candidate.transitions {
+			if transition != SiteAwait {
+				continue
+			}
+			edge := edgeForCall(candidate.function, call)
+			child := candidates[edge.Callee]
+			if child == nil || child.factoryABI != FactoryABI3 {
+				continue
+			}
+			self := edge.Callee == candidate.function.Func
+			if self && candidate.selfSpawn {
+				continue
+			}
+			if candidate.fusedAwaits == nil {
+				candidate.fusedAwaits = make(map[*ir.CallExpr]bool)
+			}
+			candidate.fusedAwaits[call] = true
+			child.fusedFrame = true
+			if self {
+				child.fusedSelf = true
+			} else {
+				if candidate.fusedRequests == nil {
+					candidate.fusedRequests = make(map[*ir.CallExpr]bool)
+				}
+				candidate.fusedRequests[call] = true
+				child.fusedResume = true
+			}
+		}
+	}
 }
 
 func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
@@ -2865,12 +2911,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			stacklessResumeType())
 		assignment := ir.NewAssignListStmt(call.Pos(), ir.OAS2,
 			ir.Nodes{frame, childResume}, ir.Nodes{factoryCall})
+		setup := ir.Nodes{
+			ir.NewDecl(call.Pos(), ir.ODCL, frame),
+			ir.NewDecl(call.Pos(), ir.ODCL, childResume),
+		}
+		if candidate.fusedRequests[call] {
+			setup = append(setup, typecheck.Call(call.Pos(),
+				typecheck.LookupRuntime("coroRequestFusedFrame"),
+				ir.Nodes{ctx}, false))
+		}
+		setup = append(setup, assignment)
 		return lowerFactoryCall{
-			setup: ir.Nodes{
-				ir.NewDecl(call.Pos(), ir.ODCL, frame),
-				ir.NewDecl(call.Pos(), ir.ODCL, childResume),
-				assignment,
-			},
+			setup: setup,
 			frame: frame, resume: childResume,
 		}, nil
 	}
@@ -3390,13 +3442,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					name = "coroAwaitFrame"
 					args = ir.Nodes{ctx, child.frame, child.resume}
 				}
-				edge := edgeForCall(function, state.call)
-				selfAwait := child.frame != nil && candidate.selfAwait &&
-					!candidate.selfSpawn &&
-					edge.Callee == fn
-				if selfAwait {
+				fusedAwait := child.frame != nil &&
+					candidate.fusedAwaits[state.call]
+				if fusedAwait {
+					helper := "coroAwaitFusedFrame"
+					edge := edgeForCall(function, state.call)
+					if edge.Callee == fn && candidate.fusedSelf &&
+						!candidate.fusedResume {
+						helper = "coroAwaitSelfFrame"
+					}
 					actionResult = typecheck.Call(state.call.Pos(),
-						typecheck.LookupRuntime("coroAwaitSelfFrame"),
+						typecheck.LookupRuntime(helper),
 						args, false)
 				} else {
 					body = append(body, typecheck.Call(state.call.Pos(),
@@ -3715,7 +3771,8 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	factory := candidate.factory
 	pos := fn.Pos()
 	closureVars := slices.Clone(resume.ClosureVars)
-	fusedSelf := candidate.selfAwait && !candidate.selfSpawn
+	fusedFrame := candidate.fusedFrame
+	selfOnly := candidate.fusedSelf && !candidate.fusedResume
 	fields := make([]*types.Field, len(closureVars))
 	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
 	outerFields := make(map[*ir.Name]*types.Field, len(closureVars))
@@ -3738,17 +3795,24 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			resultValueFields[i]
 	}
 	frameFields := fields
-	var fusedParentField, fusedOwnerField, fusedMarkerField *types.Field
-	if fusedSelf {
+	var fusedParentField, fusedOwnerField, fusedMarkerField,
+		fusedResumeField *types.Field
+	if fusedFrame {
 		fusedParentField = types.NewField(pos,
 			typecheck.Lookup(".coroParent"), types.Types[types.TUNSAFEPTR])
 		fusedOwnerField = types.NewField(pos,
 			typecheck.Lookup(".coroOwner"), types.Types[types.TUNSAFEPTR])
 		fusedMarkerField = types.NewField(pos,
 			typecheck.Lookup(".coroMarker"), types.Types[types.TUINT8])
-		frameFields = make([]*types.Field, 0, len(fields)+3)
+		frameFields = make([]*types.Field, 0, len(fields)+4)
 		frameFields = append(frameFields, fusedParentField, fusedOwnerField,
 			fusedMarkerField)
+		if candidate.fusedResume {
+			fusedResumeField = types.NewField(pos,
+				typecheck.Lookup(".coroResume"),
+				types.Types[types.TUNSAFEPTR])
+			frameFields = append(frameFields, fusedResumeField)
+		}
 		frameFields = append(frameFields, fields...)
 	}
 	frameType := types.NewStruct(frameFields)
@@ -3811,13 +3875,17 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				completion = append(completion,
 					ir.NewIfStmt(ret.Pos(), cacheFrame, clears, nil))
 			}
-			if fusedSelf {
+			if fusedFrame {
 				parent := explicitFrameField(ret.Pos(), frame,
 					fusedParentField)
 				hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
 					ir.NewNilExpr(ret.Pos(), fusedParentField.Type))
+				completionHelper := "coroCompleteFusedFrame"
+				if selfOnly {
+					completionHelper = "coroCompleteSelfFrame"
+				}
 				action := typecheck.Call(ret.Pos(),
-					typecheck.LookupRuntime("coroCompleteSelfFrame"),
+					typecheck.LookupRuntime(completionHelper),
 					ir.Nodes{resume.Dcl[0]}, false)
 				completion = append(completion, ir.NewIfStmt(ret.Pos(),
 					hasParent, ir.Nodes{ir.NewReturnStmt(ret.Pos(),
@@ -3892,13 +3960,21 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// Await suspends the parent before starting its child. A recursive spawn
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
-	if fusedSelf {
+	if fusedFrame {
 		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
+		takeHelper := "coroTakeFusedFrame"
+		takeArgs := ir.Nodes{
+			factoryCtx, factoryResume, frameSize(),
+			reflectdata.TypePtrAt(pos, frameChunkType),
+		}
+		if selfOnly {
+			takeHelper = "coroTakeSelfFrame"
+		} else {
+			takeArgs = append(takeArgs,
+				ir.NewBool(pos, candidate.fusedSelf))
+		}
 		takeFrame := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroTakeSelfFrame"), ir.Nodes{
-				factoryCtx, factoryResume, frameSize(),
-				reflectdata.TypePtrAt(pos, frameChunkType),
-			}, false)
+			typecheck.LookupRuntime(takeHelper), takeArgs, false)
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))
 	} else {
@@ -3920,7 +3996,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
 		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
 			typedNew(pos, frameType))}, nil))
-	if fusedSelf {
+	if fusedFrame {
 		declarations = append(declarations,
 			ir.NewAssignStmt(pos,
 				explicitFrameField(pos, factoryFrame, fusedParentField),
@@ -3931,6 +4007,11 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.NewAssignStmt(pos,
 				explicitFrameField(pos, factoryFrame, fusedMarkerField),
 				typedInt(pos, types.Types[types.TUINT8], 0)))
+		if fusedResumeField != nil {
+			declarations = append(declarations, ir.NewAssignStmt(pos,
+				explicitFrameField(pos, factoryFrame, fusedResumeField),
+				ir.NewNilExpr(pos, fusedResumeField.Type)))
+		}
 	}
 	for i, variable := range closureVars {
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])

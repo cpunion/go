@@ -341,10 +341,77 @@ gate.
 This result narrows the case for a separately exposed pull model. Structured
 ownership and compact storage can be added beneath the existing push-based
 goroutine semantics, leaving independent roots, external readiness, and
-blocking-C M replacement on the push scheduler. A future heterogeneous-frame
-fusion step should first prove result, panic, and fairness ownership; a public
-pull API still requires independent cancellation, backpressure, and ecosystem
-evidence.
+blocking-C M replacement on the push scheduler. The subsequent heterogeneous
+frame-fusion step extends this ownership proof to calls between different
+local explicit-frame functions. A public pull API still requires independent
+cancellation, backpressure, and ecosystem evidence.
+
+## Post-sync controlled comparison, 2026-08-15
+
+Revision `af63291afc` merged Go development revision `41a1646f6d` before this
+measurement. The native Darwin/arm64 run used an Apple M4 Max, two warm-up
+pairs, eight alternating 500 ms samples, and four independent footprint
+processes. Startup load averages were 7.92, 10.37, and 12.35, so timing is a
+directional checkpoint rather than a release threshold.
+
+The same-representation pair allocated exactly the same bytes and objects at
+every depth. Entry, yield, depths 1 and 8, timer, ready and blocked file I/O,
+ready and blocked socket I/O, and direct C controls were statistically
+neutral. Deeper same-representation pull was slower in this run:
+
+| Await depth | `Push` | same-representation `Pull` | Change |
+| ---: | ---: | ---: | ---: |
+| 64 | 7.001 us | 7.873 us | +12.46% |
+| 256 | 24.03 us | 28.70 us | +19.44% |
+| 4,096 | 441.9 us | 510.1 us | +15.43% |
+
+At depth 4,096 both allocated 315,616 bytes in 7,938 allocations, parked
+470,728 heap bytes in 8,253 objects, and exposed the same heap and stack scan
+sizes. Together with the earlier native run, which modestly favored pull on
+the same await probes, this reversal shows that root polling alone has not
+produced a stable advantage. It is sensitive to implementation revision,
+layout, and host conditions and does not justify a second public execution
+model.
+
+`CompactPull` again produced large, deterministic gains by changing frame
+representation rather than readiness delivery:
+
+| Probe | `Push` | `CompactPull` | Change |
+| --- | ---: | ---: | ---: |
+| await depth 8 | 2.064 us | 1.615 us | -21.76% |
+| await depth 64 | 7.001 us | 2.772 us | -60.40% |
+| await depth 256 | 24.03 us | 6.720 us | -72.04% |
+| await depth 4,096 | 441.9 us | 92.19 us | -79.14% |
+| depth-4,096 allocation | 315,616 B, 7,938 allocs | 131,312 B, 4,098 allocs | -58.40% bytes, -48.37% allocs |
+| depth-4,096 parked heap | 470,728 B, 8,253 objects | 274,136 B, 4,157 objects | -41.76% bytes, -49.63% objects |
+
+GC-scanned heap at depth 4,096 also fell from 395,072 to 198,488 bytes
+(-49.76%). The data continues to attribute the important gain to compact
+structured ownership, not to pull polling.
+
+## Production heterogeneous-frame follow-up, 2026-08-15
+
+Revision `c450d8f21f`, relative to exact benchmark parent `cd8f6d8a51`, keeps
+the production push scheduler and fuses local structured calls between
+different explicit-frame functions. Independent roots and external events
+still queue work; a compiler-proven child instead shares its parent's logical
+task and records only the resume identity needed to switch frame types. Pure
+self recursion retains the specialized homogeneous path. Cross-package calls,
+race builds, and the tagged pull driver retain ordinary tasks, with no source
+annotation or factory ABI change.
+
+Ten alternating 500 ms native Darwin/arm64 samples improved mutual recursion
+at depth 64 from 4.489 us to 3.737 us (-16.75%) and at depth 4,096 from
+404.6 us to 298.6 us (-26.21%). The deep case fell from 360.0 KiB and 4,804
+allocations to 300.0 KiB and 3,840 allocations (-16.68% and -20.07%). Self
+recursion remained neutral at depths 64 and 4,096. A separate 15-pair control
+made logical yield and public entry neutral.
+
+This is the production interpretation of the `CompactPull` result: retain
+push-based goroutine scheduling and external wakeups, but compact
+compiler-proven structured subtrees inside a root. Pull remains useful as a
+measurement model and may suit a future explicit stream or backpressure API;
+it is not currently a better default scheduler.
 
 ## Interpretation gates
 

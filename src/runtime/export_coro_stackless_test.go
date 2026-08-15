@@ -28,19 +28,32 @@ type StacklessCoroSelfFrameForTest struct {
 	Value  *int
 }
 
+// StacklessCoroFusedResumeFrameForTest matches the extended compiler-private
+// prefix used when a fused structured await changes resume entry.
+type StacklessCoroFusedResumeFrameForTest struct {
+	Parent unsafe.Pointer
+	Owner  unsafe.Pointer
+	Marker uint8
+	Resume unsafe.Pointer
+	State  uint8
+	Depth  int
+	Value  *int
+}
+
 const (
-	StacklessCoroWarmExecutorCount     = stacklessCoroWarmExecutorCount
-	StacklessCoroTaskCacheSize         = stacklessCoroTaskCacheSize
-	StacklessCoroTaskChunkSize         = stacklessCoroTaskChunkSize
-	StacklessCoroFrameChunkSize        = stacklessCoroFrameChunkSize
-	StacklessCoroFrameChunkDirectCount = stacklessCoroFrameChunkDirectCount
-	StacklessCoroFusedFrameDirectFirst = stacklessCoroFusedFrameDirectFirst
-	StacklessCoroFusedFrameDirectLast  = stacklessCoroFusedFrameDirectLast
-	StacklessCoroFusedFrameChunkFirst  = stacklessCoroFusedFrameChunkFirst
-	StacklessCoroFusedFrameChunkLast   = stacklessCoroFusedFrameChunkLast
-	StacklessCoroFrameCacheSize        = stacklessCoroFrameCacheSize
-	StacklessCoroOperationCacheSize    = stacklessCoroOperationCacheSize
-	StacklessCoroSelectCaseCacheSize   = stacklessCoroSelectCaseCacheSize
+	StacklessCoroWarmExecutorCount        = stacklessCoroWarmExecutorCount
+	StacklessCoroTaskCacheSize            = stacklessCoroTaskCacheSize
+	StacklessCoroTaskChunkSize            = stacklessCoroTaskChunkSize
+	StacklessCoroFrameChunkSize           = stacklessCoroFrameChunkSize
+	StacklessCoroFrameChunkDirectCount    = stacklessCoroFrameChunkDirectCount
+	StacklessCoroFusedFrameDirectFirst    = stacklessCoroFusedFrameDirectFirst
+	StacklessCoroFusedFrameDirectLast     = stacklessCoroFusedFrameDirectLast
+	StacklessCoroFusedFrameChunkFirst     = stacklessCoroFusedFrameChunkFirst
+	StacklessCoroFusedFrameChunkLast      = stacklessCoroFusedFrameChunkLast
+	StacklessCoroFusedFrameAllocationMask = stacklessCoroFusedFrameAllocationMask
+	StacklessCoroFrameCacheSize           = stacklessCoroFrameCacheSize
+	StacklessCoroOperationCacheSize       = stacklessCoroOperationCacheSize
+	StacklessCoroSelectCaseCacheSize      = stacklessCoroSelectCaseCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
 	StacklessCoroActionYield    = stacklessCoroActionYield
@@ -78,11 +91,17 @@ func ReleaseRootStacklessCoroFrameForTest(frame unsafe.Pointer,
 }
 
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
+	RunStacklessCoroFrameInlineForTest(nil, resume)
+}
+
+func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
+	s.root.context.frame = frame
 	s.ready(&s.root, false)
 	s.run(false)
 	s.finish()
@@ -141,6 +160,33 @@ func AwaitStacklessCoroSelfFrameForTest(ctx, frame unsafe.Pointer,
 
 func CompleteStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) uint8 {
 	return coroCompleteSelfFrame(ctx)
+}
+
+func TakeStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroFusedResumeFrameForTest]()
+	coroRequestFusedFrame(ctx)
+	return coroTakeFusedFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType, false)
+}
+
+func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr,
+	validChunkType bool) unsafe.Pointer {
+	chunkType := abi.TypeFor[uintptr]()
+	if validChunkType {
+		chunkType = abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
+	}
+	return coroTakeSelfFrame(ctx, resume, size, chunkType)
+}
+
+func AwaitStacklessCoroFusedResumeFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) uint8 {
+	return coroAwaitFusedFrame(ctx, frame, resume)
+}
+
+func CompleteStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer) uint8 {
+	return coroCompleteFusedFrame(ctx)
 }
 
 func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,

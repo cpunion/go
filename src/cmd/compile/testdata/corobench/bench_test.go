@@ -35,6 +35,12 @@ func TestProbes(t *testing.T) {
 	if got := recursiveYield(4); got != 5 {
 		t.Errorf("recursiveYield(4) = %d, want 5", got)
 	}
+	if got := mutualYieldA(4); got != 5 {
+		t.Errorf("mutualYieldA(4) = %d, want 5", got)
+	}
+	if got := mutualYieldB(4); got != 5 {
+		t.Errorf("mutualYieldB(4) = %d, want 5", got)
+	}
 	if got := deferYield(); got != 2 {
 		t.Errorf("deferYield() = %d, want 2", got)
 	}
@@ -402,6 +408,17 @@ func TestProbeEdges(t *testing.T) {
 	cleanup()
 }
 
+func TestHeterogeneousFrameCacheReplacement(t *testing.T) {
+	if got := recursiveYield(4096); got != 4097 {
+		t.Fatalf("recursiveYield(4096) = %d, want 4097", got)
+	}
+	for range 100 {
+		if got := mutualYieldA(64); got != 65 {
+			t.Fatalf("mutualYieldA(64) = %d, want 65", got)
+		}
+	}
+}
+
 func BenchmarkYieldBatch(b *testing.B) {
 	b.ReportAllocs()
 	if got := yieldLoop(b.N); got != b.N {
@@ -468,6 +485,40 @@ func BenchmarkRecursiveYield4096(b *testing.B) {
 	total := 0
 	for i := 0; i < b.N; i++ {
 		total += recursiveYield(4096)
+	}
+	intSink = total
+}
+
+func BenchmarkMutualYield64(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(64)
+	}
+	intSink = total
+}
+
+func BenchmarkMutualYield4096(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(4096)
+	}
+	intSink = total
+}
+
+func BenchmarkHeterogeneousFrameCacheReplacement(b *testing.B) {
+	b.ReportAllocs()
+	if got := recursiveYield(4096); got != 4097 {
+		b.Fatalf("recursiveYield(4096) = %d, want 4097", got)
+	}
+	if got := mutualYieldA(64); got != 65 {
+		b.Fatalf("mutualYieldA(64) = %d, want 65", got)
+	}
+	b.ResetTimer()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += mutualYieldA(64)
 	}
 	intSink = total
 }
