@@ -16,33 +16,46 @@ import (
 // operation completes before the park is committed. The second is completed
 // by a native timer thread while the first task continues to make progress.
 func renderBasicObjectLLVMForTarget(hostName string, value int64, goos, goarch string) ([]byte, error) {
-	pthreadType, err := pthreadHandleType(goos, goarch)
+	target, err := basicObjectTargetFor(goos, goarch)
 	if err != nil {
 		return nil, err
-	}
-	wrapperAttributes := ""
-	goABIReturn := ""
-	if goarch == "amd64" {
-		// Go ABIInternal and the System V ABI do not make the same stack
-		// alignment promise at a call boundary. XMM15 is also a zero
-		// register in Go ABIInternal, while the System V ABI may clobber it.
-		wrapperAttributes = " alignstack(16)"
-		goABIReturn = "  call void asm sideeffect \"xorps %xmm15, %xmm15\", \"~{xmm15},~{dirflag},~{fpsr},~{flags}\"()\n"
 	}
 	replacer := strings.NewReplacer(
 		"{{HOST}}", hostName,
 		"{{VALUE0}}", strconv.FormatInt(value, 10),
 		"{{VALUE1}}", strconv.FormatInt(value+1, 10),
-		"{{PTHREAD_T}}", pthreadType,
-		"{{WRAPPER_ATTRIBUTES}}", wrapperAttributes,
-		"{{GO_ABI_RETURN}}", goABIReturn,
+		"{{PTHREAD_T}}", target.pthreadType,
+		"{{WRAPPER_ATTRIBUTES}}", target.wrapperAttributes,
+		"{{GO_ABI_RETURN}}", target.goABIReturn,
 	)
 	return []byte(replacer.Replace(basicSchedulerLLVM)), nil
 }
 
+type basicObjectTarget struct {
+	pthreadType       string
+	wrapperAttributes string
+	goABIReturn       string
+}
+
+func basicObjectTargetFor(goos, goarch string) (basicObjectTarget, error) {
+	pthreadType, err := pthreadHandleType(goos, goarch)
+	if err != nil {
+		return basicObjectTarget{}, err
+	}
+	target := basicObjectTarget{pthreadType: pthreadType}
+	if goarch == "amd64" {
+		// Go ABIInternal and the System V ABI do not make the same stack
+		// alignment promise at a call boundary. XMM15 is also a zero
+		// register in Go ABIInternal, while the System V ABI may clobber it.
+		target.wrapperAttributes = " alignstack(16)"
+		target.goABIReturn = "  call void asm sideeffect \"xorps %xmm15, %xmm15\", \"~{xmm15},~{dirflag},~{fpsr},~{flags}\"()\n"
+	}
+	return target, nil
+}
+
 func pthreadHandleType(goos, goarch string) (string, error) {
 	if goarch != "amd64" && goarch != "arm64" {
-		return "", fmt.Errorf("coroutine timer object does not support %s/%s", goos, goarch)
+		return "", fmt.Errorf("coroutine object does not support %s/%s", goos, goarch)
 	}
 	switch goos {
 	case "darwin":
@@ -50,22 +63,20 @@ func pthreadHandleType(goos, goarch string) (string, error) {
 	case "linux":
 		return "i64", nil
 	default:
-		return "", fmt.Errorf("coroutine timer object does not support %s/%s", goos, goarch)
+		return "", fmt.Errorf("coroutine object does not support %s/%s", goos, goarch)
 	}
 }
 
-const basicSchedulerLLVM = `; Generated from the restricted Go coroutine scheduler/operation example.
+const basicSchedulerCoreLLVM = `; Generated from a restricted Go coroutine scheduler/operation example.
 
 %queue = type { ptr, ptr }
 %operation = type { ptr, i64, i8 }
-%timer = type { i8, i64, i32 }
 %task = type { ptr, ptr, ptr, ptr, ptr, i64, i64, i32, i8, i8, i1, i1, ptr }
 
 declare noalias ptr @malloc(i64)
 declare void @free(ptr)
 declare i32 @pthread_create(ptr, ptr, ptr, ptr)
 declare i32 @pthread_join({{PTHREAD_T}}, ptr)
-declare i32 @nanosleep(ptr, ptr)
 
 declare token @llvm.coro.id(i32, ptr, ptr, ptr)
 declare i64 @llvm.coro.size.i64()
@@ -270,6 +281,14 @@ consume:
 reject:
   ret i1 false
 }
+
+`
+
+const basicSchedulerLLVM = basicSchedulerCoreLLVM + `
+
+%timer = type { i8, i64, i32 }
+
+declare i32 @nanosleep(ptr, ptr)
 
 define internal ptr @timer.thread(ptr %timer) {
 entry:

@@ -261,6 +261,15 @@ func TestBasicLLVMExecution(t *testing.T) {
 }
 
 func TestBasicObjectLink(t *testing.T) {
+	testBasicObjectLink(t, "yieldOnce", "coro-object-ok")
+}
+
+func TestBasicFileObjectLink(t *testing.T) {
+	testBasicObjectLink(t, "blockingReadOnce", "coro-file-object-ok")
+}
+
+func testBasicObjectLink(t *testing.T, marker, output string) {
+	t.Helper()
 	testenv.MustHaveGoBuild(t)
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("external object/link test is supported on Darwin and Linux")
@@ -271,15 +280,15 @@ func TestBasicObjectLink(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/coroobject\n\ngo 1.28\n"), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	program := `package main
+	program := fmt.Sprintf(`package main
 
 import _ "runtime/cgo"
 
-func yieldOnce()
+func %[1]s()
 
 //go:noinline
 func leaf() int64 {
-	yieldOnce()
+	%[1]s()
 	return 42
 }
 
@@ -287,14 +296,14 @@ func main() {
 	if got := leaf(); got != 42 {
 		panic(got)
 	}
-	println("coro-object-ok")
+	println(%[2]q)
 }
-`
+`, marker, output)
 	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(program), 0o666); err != nil {
 		t.Fatal(err)
 	}
 	// An assembly file tells cmd/go that declarations without Go bodies are
-	// permitted. The coroutine backend removes the yieldOnce call, so the file
+	// permitted. The coroutine backend removes the marker call, so the file
 	// does not need to define a symbol.
 	if err := os.WriteFile(filepath.Join(tmp, "marker.s"), []byte("// Coroutine suspension marker.\n"), 0o666); err != nil {
 		t.Fatal(err)
@@ -307,7 +316,7 @@ func main() {
 		"GOWORK=off",
 		"CC="+clang,
 	)
-	exe := filepath.Join(tmp, "coro-object")
+	exe := filepath.Join(tmp, marker)
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
 		"-gcflags="+gcflags,
@@ -324,9 +333,10 @@ func main() {
 	}
 
 	cmd = testenv.Command(t, exe)
+	cmd.Env = append(cmd.Environ(), "GOMAXPROCS=1")
 	if data, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("object/link executable failed: %v\n%s", err, data)
-	} else if got, want := strings.TrimSpace(string(data)), "coro-object-ok"; got != want {
+	} else if got, want := strings.TrimSpace(string(data)), output; got != want {
 		t.Fatalf("object/link executable output = %q, want %q", got, want)
 	}
 
