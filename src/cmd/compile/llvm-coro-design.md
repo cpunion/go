@@ -1,8 +1,9 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
 状态：架构设计稿；已完成 Phase 0、pre-lower handoff、受限可执行 LLVM coroutine
-basic example，以及单函数 Go object/archive/external-link ownership 纵切；scheduler、
-structured await、timer 和 I/O 尚未接入
+basic example、单函数 Go object/archive/external-link ownership、push scheduler、native
+timer event，以及 blocking file executor handoff 纵切；typed structured await、runtime
+timer/file/net adapter 和普通标准库 lowering 尚未接入
 
 更新时间：2026-08-15
 
@@ -10,7 +11,7 @@ structured await、timer 和 I/O 尚未接入
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 implementation topic/worktree：`dev.coro-object-link-20260815`
+当前 implementation topic/worktree：`dev.coro-file-operation-20260815`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -331,6 +332,12 @@ P、G、GC 或 Go stack 的任意代码；当前 no-argument recipe 也没有连
 runtime adapter 把 P 或 stackless scheduler ownership 交给可复用 replacement M，避免
 退化为每次调用创建 worker 的模型。该物理纵切只验证 handoff 的控制流、queue
 single-owner 约束和 direct native call ABI。
+
+该 slice 已在 native Darwin/arm64 和 Linux/arm64 上通过 coroutine toolchain build 与
+完整 `cmd/compile/... internal/pkgbits internal/buildcfg` 测试；Linux/amd64 的 timer 和
+blocking-file archive/link/executable 用例各连续通过三次。GitHub Ubuntu runner 负责
+native Linux/amd64 完整 suite 的最终门禁。新增 recipe 选择和 renderer 的 changed Go
+functions 均被测试覆盖。
 
 ## 2. 结论
 
@@ -1618,7 +1625,7 @@ go/no-go 验证。
 | 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
 | native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
-| blocking file read、replacement executor、queue ownership handoff | 已在 Darwin/arm64 受限验证 |
+| blocking file read、replacement executor、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
 | `time.Sleep` lowering、timer service、net event、普通 file lowering、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
