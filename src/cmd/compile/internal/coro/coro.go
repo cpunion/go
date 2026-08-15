@@ -96,6 +96,7 @@ const (
 	channelReceive
 	channelSelect
 	channelRange
+	timerWait
 	unknownCall
 )
 
@@ -109,6 +110,8 @@ func (r suspendReason) String() string {
 		return "channel-select"
 	case channelRange:
 		return "channel-range"
+	case timerWait:
+		return "timer-wait"
 	case unknownCall:
 		return "unknown-call"
 	default:
@@ -125,6 +128,7 @@ type callEdge struct {
 	calleeName string
 	imported   Effect
 	unknown    bool
+	operation  OperationKind
 }
 
 // funcInfo is the coroutine analysis result for one function.
@@ -268,14 +272,24 @@ func (a *Analysis) scan(info *funcInfo) {
 			edge.calleeName = "<interface>"
 			edge.unknown = true
 		}
+		recipe, hasOperation := lookupOperation(edge.calleeName)
+		if hasOperation {
+			edge.imported = recipe.effect
+			edge.unknown = false
+			edge.operation = recipe.kind
+		}
 		callIndex := len(info.calls)
 		info.calls = append(info.calls, edge)
-		info.sites = append(info.sites, siteCandidate{
-			kind:      callCandidate,
-			ordinal:   uint32(len(info.sites)),
-			pos:       call.Pos(),
-			callIndex: callIndex,
-		})
+		if hasOperation && kind != goCall {
+			addOperation(recipe.reason, call)
+		} else {
+			info.sites = append(info.sites, siteCandidate{
+				kind:      callCandidate,
+				ordinal:   uint32(len(info.sites)),
+				pos:       call.Pos(),
+				callIndex: callIndex,
+			})
+		}
 		if edge.unknown && kind != goCall {
 			recordReason(unknownCall)
 		}
@@ -295,6 +309,9 @@ func (a *Analysis) callsSuspending(info *funcInfo) bool {
 }
 
 func (a *Analysis) callMaySuspend(call callEdge) bool {
+	if call.operation != OperationNone {
+		return true
+	}
 	if call.unknown {
 		return true
 	}
@@ -357,6 +374,9 @@ func (a *Analysis) Dump(w io.Writer) {
 }
 
 func (a *Analysis) callEffect(call callEdge) Effect {
+	if call.operation != OperationNone {
+		return MaySuspend
+	}
 	if callee := a.funcs[call.callee]; callee != nil {
 		return callee.effect
 	}

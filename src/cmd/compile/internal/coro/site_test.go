@@ -68,6 +68,7 @@ func TestFreezeSitePlans(t *testing.T) {
 			{kind: callCandidate, ordinal: 6, pos: pos(37), callIndex: 2},
 			{kind: callCandidate, ordinal: 7, pos: pos(38), callIndex: 3},
 			{kind: callCandidate, ordinal: 8, pos: pos(39), callIndex: 4},
+			{kind: operationCandidate, ordinal: 9, pos: pos(40), reason: timerWait},
 		},
 	}
 	analysis := &Analysis{funcs: map[*ir.Func]*funcInfo{
@@ -105,6 +106,7 @@ func TestFreezeSitePlans(t *testing.T) {
 		{6, SiteDispatch, OperationNone, ""},
 		{7, SiteSpawn, OperationNone, "example.com/p.suspending,1"},
 		{8, SiteAwait, OperationNone, "example.com/imported.suspending"},
+		{9, SitePark, OperationTimer, ""},
 	}
 	if len(fp.Sites) != len(want) {
 		t.Fatalf("caller has %d sites, want %d", len(fp.Sites), len(want))
@@ -206,11 +208,26 @@ func TestPlanValueStrings(t *testing.T) {
 		{OperationChannelReceive.String(), "channel-receive"},
 		{OperationChannelSelect.String(), "channel-select"},
 		{OperationChannelRange.String(), "channel-range"},
+		{OperationTimer.String(), "timer"},
 		{OperationKind(255).String(), "OperationKind(255)"},
 	} {
 		if test.got != test.want {
 			t.Errorf("String() = %q, want %q", test.got, test.want)
 		}
+	}
+}
+
+func TestLookupOperation(t *testing.T) {
+	recipe, ok := lookupOperation("time.Sleep")
+	if !ok {
+		t.Fatal("time.Sleep has no operation recipe")
+	}
+	if recipe.kind != OperationTimer || recipe.effect != MaySuspend ||
+		recipe.reason != timerWait {
+		t.Fatalf("time.Sleep recipe = %+v", recipe)
+	}
+	if _, ok := lookupOperation("example.com/p.Sleep"); ok {
+		t.Fatal("unrelated Sleep declaration has an operation recipe")
 	}
 }
 

@@ -71,6 +71,7 @@ const (
 	OperationChannelReceive
 	OperationChannelSelect
 	OperationChannelRange
+	OperationTimer
 )
 
 func (kind OperationKind) String() string {
@@ -85,6 +86,8 @@ func (kind OperationKind) String() string {
 		return "channel-select"
 	case OperationChannelRange:
 		return "channel-range"
+	case OperationTimer:
+		return "timer"
 	default:
 		return fmt.Sprintf("OperationKind(%d)", kind)
 	}
@@ -257,6 +260,8 @@ func operationForReason(reason suspendReason) OperationKind {
 		return OperationChannelSelect
 	case channelRange:
 		return OperationChannelRange
+	case timerWait:
+		return OperationTimer
 	default:
 		panic("suspend reason has no coroutine operation recipe")
 	}

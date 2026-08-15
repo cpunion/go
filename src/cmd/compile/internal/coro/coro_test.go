@@ -122,6 +122,65 @@ func TestAnalysis(t *testing.T) {
 	}
 }
 
+func TestTimeSleepPlan(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/corosleep\n\ngo 1.28\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	const program = `package main
+
+import "time"
+
+//go:noinline
+func sleep() {
+	time.Sleep(time.Nanosecond)
+}
+
+func main() {
+	sleep()
+	println("coro-sleep-plan-ok")
+}
+`
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmp, "corosleep")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags=example.com/corosleep=-l -d=coro=1",
+		".")
+	cmd.Dir = tmp
+	cmd.Env = append(cmd.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+	)
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build failed: %v\n%s", err, data)
+	}
+	for _, want := range []string{
+		"coro: func=main.sleep effect=may-suspend local=may-suspend recursive=false reasons=timer-wait",
+		"kind=park operation=timer",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("compiler output does not contain %q\n%s", want, data)
+		}
+	}
+
+	cmd = testenv.Command(t, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("executable failed: %v\n%s", err, data)
+	}
+	if got, want := strings.TrimSpace(string(data)), "coro-sleep-plan-ok"; got != want {
+		t.Fatalf("executable output = %q, want %q", got, want)
+	}
+}
+
 func TestExperimentGate(t *testing.T) {
 	out, err := compile(t, "nocoro", 1)
 	if err == nil {
