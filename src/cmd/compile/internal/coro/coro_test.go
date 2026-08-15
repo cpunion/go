@@ -6204,6 +6204,7 @@ func main() {
 		public  string
 		fused   bool
 		request bool
+		self    bool
 	}{
 		{
 			`main\.sum\.coro\.func[0-9]+$`,
@@ -6211,11 +6212,13 @@ func main() {
 			"main.sum(SB)",
 			true,
 			false,
+			true,
 		},
 		{
 			`main\.sumDefer\.coro\.func[0-9]+$`,
 			"main.sumDefer.coro",
 			"main.sumDefer(SB)",
+			false,
 			false,
 			false,
 		},
@@ -6225,6 +6228,7 @@ func main() {
 			"main.odd(SB)",
 			true,
 			true,
+			false,
 		},
 		{
 			`main\.odd\.coro\.func[0-9]+$`,
@@ -6232,6 +6236,7 @@ func main() {
 			"main.even(SB)",
 			true,
 			true,
+			false,
 		},
 		{
 			`main\.\(\*counter\)\.descend\.coro\.func[0-9]+$`,
@@ -6239,6 +6244,7 @@ func main() {
 			"main.(*counter).descend(SB)",
 			true,
 			false,
+			true,
 		},
 	} {
 		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
@@ -6260,9 +6266,15 @@ func main() {
 			}
 		}
 		if test.fused {
+			awaitHelper := "runtime.coroAwaitFusedFrame"
+			completeHelper := "runtime.coroCompleteFusedFrame"
+			if test.self {
+				awaitHelper = "runtime.coroAwaitSelfFrame"
+				completeHelper = "runtime.coroCompleteSelfFrame"
+			}
 			for _, helper := range []string{
-				"runtime.coroAwaitFusedFrame",
-				"runtime.coroCompleteFusedFrame",
+				awaitHelper,
+				completeHelper,
 			} {
 				if !strings.Contains(disassembly, helper) {
 					t.Errorf("%s does not call %s\n%s",

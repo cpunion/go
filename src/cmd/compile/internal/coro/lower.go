@@ -3445,8 +3445,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				fusedAwait := child.frame != nil &&
 					candidate.fusedAwaits[state.call]
 				if fusedAwait {
+					helper := "coroAwaitFusedFrame"
+					edge := edgeForCall(function, state.call)
+					if edge.Callee == fn && candidate.fusedSelf &&
+						!candidate.fusedResume {
+						helper = "coroAwaitSelfFrame"
+					}
 					actionResult = typecheck.Call(state.call.Pos(),
-						typecheck.LookupRuntime("coroAwaitFusedFrame"),
+						typecheck.LookupRuntime(helper),
 						args, false)
 				} else {
 					body = append(body, typecheck.Call(state.call.Pos(),
@@ -3766,6 +3772,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	pos := fn.Pos()
 	closureVars := slices.Clone(resume.ClosureVars)
 	fusedFrame := candidate.fusedFrame
+	selfOnly := candidate.fusedSelf && !candidate.fusedResume
 	fields := make([]*types.Field, len(closureVars))
 	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
 	outerFields := make(map[*ir.Name]*types.Field, len(closureVars))
@@ -3873,8 +3880,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 					fusedParentField)
 				hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
 					ir.NewNilExpr(ret.Pos(), fusedParentField.Type))
+				completionHelper := "coroCompleteFusedFrame"
+				if selfOnly {
+					completionHelper = "coroCompleteSelfFrame"
+				}
 				action := typecheck.Call(ret.Pos(),
-					typecheck.LookupRuntime("coroCompleteFusedFrame"),
+					typecheck.LookupRuntime(completionHelper),
 					ir.Nodes{resume.Dcl[0]}, false)
 				completion = append(completion, ir.NewIfStmt(ret.Pos(),
 					hasParent, ir.Nodes{ir.NewReturnStmt(ret.Pos(),
@@ -3951,12 +3962,19 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// must not hand out the same adjacent array element.
 	if fusedFrame {
 		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
+		takeHelper := "coroTakeFusedFrame"
+		takeArgs := ir.Nodes{
+			factoryCtx, factoryResume, frameSize(),
+			reflectdata.TypePtrAt(pos, frameChunkType),
+		}
+		if selfOnly {
+			takeHelper = "coroTakeSelfFrame"
+		} else {
+			takeArgs = append(takeArgs,
+				ir.NewBool(pos, candidate.fusedSelf))
+		}
 		takeFrame := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroTakeFusedFrame"), ir.Nodes{
-				factoryCtx, factoryResume, frameSize(),
-				reflectdata.TypePtrAt(pos, frameChunkType),
-				ir.NewBool(pos, candidate.fusedSelf),
-			}, false)
+			typecheck.LookupRuntime(takeHelper), takeArgs, false)
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))
 	} else {

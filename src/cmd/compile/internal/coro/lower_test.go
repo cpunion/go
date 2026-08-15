@@ -383,10 +383,9 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	ir.VisitList(factory.Body, func(node ir.Node) {
 		if call, ok := node.(*ir.CallExpr); ok &&
 			symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
-				"runtime.coroTakeFusedFrame" {
+				"runtime.coroTakeSelfFrame" {
 			takeFrames++
-			if len(call.Args) == 5 && call.Args[3].Type().IsPtr() &&
-				call.Args[4].Op() == ir.OLITERAL {
+			if len(call.Args) == 4 && call.Args[3].Type().IsPtr() {
 				chunkTypes++
 			}
 		}
@@ -434,9 +433,9 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 			runtimeCalls["runtime.coroRequestFusedFrame"])
 	}
 	for _, name := range []string{
-		"runtime.coroTakeFusedFrame",
-		"runtime.coroAwaitFusedFrame",
-		"runtime.coroCompleteFusedFrame",
+		"runtime.coroTakeSelfFrame",
+		"runtime.coroAwaitSelfFrame",
+		"runtime.coroCompleteSelfFrame",
 	} {
 		if runtimeCalls[name] != 1 {
 			t.Errorf("lowered recursive function has %d %s calls, want one",

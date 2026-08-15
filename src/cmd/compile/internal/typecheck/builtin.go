@@ -163,8 +163,10 @@ var runtimeDecls = [...]struct {
 	{"coroReleaseRootFrame", funcTag, 127},
 	{"coroAwait", funcTag, 128},
 	{"coroAwaitFrame", funcTag, 129},
-	{"coroRequestFusedFrame", funcTag, 130},
-	{"coroAwaitFusedFrame", funcTag, 131},
+	{"coroAwaitSelfFrame", funcTag, 130},
+	{"coroCompleteSelfFrame", funcTag, 123},
+	{"coroRequestFusedFrame", funcTag, 131},
+	{"coroAwaitFusedFrame", funcTag, 130},
 	{"coroCompleteFusedFrame", funcTag, 123},
 	{"coroSpawn", funcTag, 128},
 	{"coroSpawnFrame", funcTag, 129},
@@ -180,7 +182,7 @@ var runtimeDecls = [...]struct {
 	{"coroCallRead", funcTag, 141},
 	{"coroEnterForeign", funcTag, 9},
 	{"coroExitForeign", funcTag, 9},
-	{"coroEnterBlocking", funcTag, 130},
+	{"coroEnterBlocking", funcTag, 131},
 	{"coroExitBlocking", funcTag, 9},
 	{"coroAsyncDouble", funcTag, 143},
 	{"makeslice", funcTag, 144},
@@ -284,13 +286,14 @@ var runtimeDecls = [...]struct {
 	{"coroDeferToken", funcTag, 185},
 	{"coroDeferCall", funcTag, 141},
 	{"coroDeferRun", funcTag, 128},
-	{"coroDeferGoexit", funcTag, 130},
+	{"coroDeferGoexit", funcTag, 131},
 	{"coroDeferPanic", funcTag, 132},
 	{"coroDeferRecover", funcTag, 186},
-	{"coroGoexit", funcTag, 130},
+	{"coroGoexit", funcTag, 131},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 187},
 	{"coroTakeFrameChunk", funcTag, 188},
+	{"coroTakeSelfFrame", funcTag, 188},
 	{"coroTakeFusedFrame", funcTag, 189},
 }
 
@@ -426,8 +429,8 @@ func runtimeTypes() []*types.Type {
 	typs[127] = newSig(params(typs[7], typs[123], typs[5]), nil)
 	typs[128] = newSig(params(typs[7], typs[123]), nil)
 	typs[129] = newSig(params(typs[7], typs[7], typs[123]), nil)
-	typs[130] = newSig(params(typs[7]), nil)
-	typs[131] = newSig(params(typs[7], typs[7], typs[123]), params(typs[71]))
+	typs[130] = newSig(params(typs[7], typs[7], typs[123]), params(typs[71]))
+	typs[131] = newSig(params(typs[7]), nil)
 	typs[132] = newSig(params(typs[7], typs[10]), nil)
 	typs[133] = newSig(params(typs[7]), params(typs[6]))
 	typs[134] = newSig(params(typs[7], typs[22]), params(typs[6]))
