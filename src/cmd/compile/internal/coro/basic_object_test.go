@@ -73,12 +73,43 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 	for _, want := range []string{
 		"presplitcoroutine",
 		"call i8 @llvm.coro.suspend",
-		"store i64 42",
+		"define internal i1 @queue.push",
+		"define internal i1 @operation.publish",
+		"define internal i64 @scheduler.run",
+		"i8 1, label %yield",
+		"i8 2, label %park",
+		"i64 42, i1 true",
+		"i64 43, i1 false",
 		"define i64 @" + hostName + "()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("module does not contain %q", want)
 		}
+	}
+	if strings.Contains(text, "{{") {
+		t.Fatal("module contains an unreplaced template marker")
+	}
+}
+
+func TestRenderBasicObjectLLVMForTarget(t *testing.T) {
+	amd64 := string(renderBasicObjectLLVMForTarget("host", 42, "amd64"))
+	for _, want := range []string{
+		"define i64 @host() alignstack(16)",
+		"xorps %xmm15, %xmm15",
+	} {
+		if !strings.Contains(amd64, want) {
+			t.Errorf("amd64 module does not contain %q", want)
+		}
+	}
+
+	arm64 := string(renderBasicObjectLLVMForTarget("host", 42, "arm64"))
+	for _, unwanted := range []string{"alignstack(16)", "%xmm15"} {
+		if strings.Contains(arm64, unwanted) {
+			t.Errorf("arm64 module unexpectedly contains %q", unwanted)
+		}
+	}
+	if strings.Contains(arm64, "{{") {
+		t.Fatal("arm64 module contains an unreplaced template marker")
 	}
 }
 
