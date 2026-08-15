@@ -298,9 +298,9 @@ progress。最终 executable 同时校验 progress、timer syscall、thread join
 其中的状态。
 
 Darwin 的 `pthread_t` 是 pointer，Linux 64-bit 是 integer，因此 renderer 显式按
-`GOOS/GOARCH` 选择 ABI，并对其他 target fail closed。该 slice 已在 Darwin/arm64 和
-Linux/arm64 的 LLVM 19.1.7 上重复通过 compile、CoroSplit、archive、external link 和
-executable 测试。
+`GOOS/GOARCH` 选择 ABI，并对其他 target fail closed。该 slice 已在 Darwin/arm64 的
+LLVM 19.1.7 和 Linux/amd64 的 LLVM 18 上通过
+compile、CoroSplit、archive、external link 和 executable 测试。
 
 这证明了“timer 阻塞留在 event thread，stackless scheduler 继续推进 ready task”的
 最小物理路径，但还不是生产 `time.Sleep`：当前每个例子只有一个 thread、scheduler 在
@@ -1593,7 +1593,7 @@ go/no-go 验证。
 | typed `YieldOnce`/SiteID、三包 coroutine primary/await | 未实现 |
 | 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
-| native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/arm64 受限验证 |
+| native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
 | `time.Sleep` lowering、timer service、net/file event、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
