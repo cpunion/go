@@ -91,6 +91,28 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 	}
 }
 
+func TestRenderBasicObjectLLVMForTarget(t *testing.T) {
+	amd64 := string(renderBasicObjectLLVMForTarget("host", 42, "amd64"))
+	for _, want := range []string{
+		"define i64 @host() alignstack(16)",
+		"xorps %xmm15, %xmm15",
+	} {
+		if !strings.Contains(amd64, want) {
+			t.Errorf("amd64 module does not contain %q", want)
+		}
+	}
+
+	arm64 := string(renderBasicObjectLLVMForTarget("host", 42, "arm64"))
+	for _, unwanted := range []string{"alignstack(16)", "%xmm15"} {
+		if strings.Contains(arm64, unwanted) {
+			t.Errorf("arm64 module unexpectedly contains %q", unwanted)
+		}
+	}
+	if strings.Contains(arm64, "{{") {
+		t.Fatal("arm64 module contains an unreplaced template marker")
+	}
+}
+
 func TestBasicObjectLLVMModuleRejectsUnsupportedSSA(t *testing.T) {
 	tests := []struct {
 		name string

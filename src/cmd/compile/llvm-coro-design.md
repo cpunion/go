@@ -209,6 +209,13 @@ Go ABIInternal 输入寄存器与 host C ABI 混在一起；当前两个 ABI 的
 在 Darwin/arm64 与 Linux/amd64 上可以直接衔接。完整 coroutine ABI 仍由第 10 节定义，
 不能从这个巧合外推。
 
+“返回值可以衔接”不表示函数入口可以直接共用 host ABI。Linux/amd64 的端到端测试
+曾在 LLVM 生成的第一个 `movaps` 上失败：Go ABIInternal 调用点没有提供该 System V
+函数假定的栈对齐，并且 System V 也不保证保留 Go ABIInternal 用作零寄存器的 XMM15。
+受限 wrapper 因此使用 LLVM `alignstack(16)` 自行重对齐，并在所有返回边清零 XMM15。
+这是当前无参数 PoC 的最小 ABI bridge；参数、栈增长、async preemption、GC stack map
+和阻塞调用的 M handoff 仍必须由第 10、11、12 节的正式 adapter 解决。
+
 纵切的 ownership 流程是：
 
 ```text

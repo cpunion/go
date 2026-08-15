@@ -5,6 +5,7 @@
 package coro
 
 import (
+	"internal/buildcfg"
 	"strconv"
 	"strings"
 )
@@ -15,10 +16,25 @@ import (
 // completes. One operation completes before the park is committed and the
 // other completes after the ready queue becomes empty.
 func renderBasicObjectLLVM(hostName string, value int64) []byte {
+	return renderBasicObjectLLVMForTarget(hostName, value, buildcfg.GOARCH)
+}
+
+func renderBasicObjectLLVMForTarget(hostName string, value int64, goarch string) []byte {
+	wrapperAttributes := ""
+	goABIReturn := ""
+	if goarch == "amd64" {
+		// Go ABIInternal and the System V ABI do not make the same stack
+		// alignment promise at a call boundary. XMM15 is also a zero
+		// register in Go ABIInternal, while the System V ABI may clobber it.
+		wrapperAttributes = " alignstack(16)"
+		goABIReturn = "  call void asm sideeffect \"xorps %xmm15, %xmm15\", \"~{xmm15},~{dirflag},~{fpsr},~{flags}\"()\n"
+	}
 	replacer := strings.NewReplacer(
 		"{{HOST}}", hostName,
 		"{{VALUE0}}", strconv.FormatInt(value, 10),
 		"{{VALUE1}}", strconv.FormatInt(value+1, 10),
+		"{{WRAPPER_ATTRIBUTES}}", wrapperAttributes,
+		"{{GO_ABI_RETURN}}", goABIReturn,
 	)
 	return []byte(replacer.Replace(basicSchedulerLLVM))
 }
@@ -552,9 +568,9 @@ fail:
   ret i64 -1
 }
 
-define i64 @{{HOST}}() {
+define i64 @{{HOST}}(){{WRAPPER_ATTRIBUTES}} {
 entry:
   %result = call i64 @scheduler.run()
-  ret i64 %result
+{{GO_ABI_RETURN}}  ret i64 %result
 }
 `
