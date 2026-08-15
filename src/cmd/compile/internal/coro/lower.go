@@ -57,8 +57,10 @@ type lowerCandidate struct {
 	factory       *ir.Func
 	factoryABI    FactoryABI
 	fusedAwaits   map[*ir.CallExpr]bool
+	fusedRequests map[*ir.CallExpr]bool
 	fusedFrame    bool
 	fusedResume   bool
+	fusedSelf     bool
 	selfAwait     bool
 	selfSpawn     bool
 }
@@ -1364,12 +1366,22 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 			if child == nil || child.factoryABI != FactoryABI3 {
 				continue
 			}
+			self := edge.Callee == candidate.function.Func
+			if self && candidate.selfSpawn {
+				continue
+			}
 			if candidate.fusedAwaits == nil {
 				candidate.fusedAwaits = make(map[*ir.CallExpr]bool)
 			}
 			candidate.fusedAwaits[call] = true
 			child.fusedFrame = true
-			if edge.Callee != candidate.function.Func {
+			if self {
+				child.fusedSelf = true
+			} else {
+				if candidate.fusedRequests == nil {
+					candidate.fusedRequests = make(map[*ir.CallExpr]bool)
+				}
+				candidate.fusedRequests[call] = true
 				child.fusedResume = true
 			}
 		}
@@ -2903,7 +2915,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			ir.NewDecl(call.Pos(), ir.ODCL, frame),
 			ir.NewDecl(call.Pos(), ir.ODCL, childResume),
 		}
-		if candidate.fusedAwaits[call] {
+		if candidate.fusedRequests[call] {
 			setup = append(setup, typecheck.Call(call.Pos(),
 				typecheck.LookupRuntime("coroRequestFusedFrame"),
 				ir.Nodes{ctx}, false))
@@ -3943,6 +3955,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			typecheck.LookupRuntime("coroTakeFusedFrame"), ir.Nodes{
 				factoryCtx, factoryResume, frameSize(),
 				reflectdata.TypePtrAt(pos, frameChunkType),
+				ir.NewBool(pos, candidate.fusedSelf),
 			}, false)
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))

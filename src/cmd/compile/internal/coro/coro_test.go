@@ -6203,17 +6203,20 @@ func main() {
 		factory string
 		public  string
 		fused   bool
+		request bool
 	}{
 		{
 			`main\.sum\.coro\.func[0-9]+$`,
 			"main.sum.coro",
 			"main.sum(SB)",
 			true,
+			false,
 		},
 		{
 			`main\.sumDefer\.coro\.func[0-9]+$`,
 			"main.sumDefer.coro",
 			"main.sumDefer(SB)",
+			false,
 			false,
 		},
 		{
@@ -6221,11 +6224,13 @@ func main() {
 			"main.odd.coro",
 			"main.odd(SB)",
 			true,
+			true,
 		},
 		{
 			`main\.odd\.coro\.func[0-9]+$`,
 			"main.even.coro",
 			"main.even(SB)",
+			true,
 			true,
 		},
 		{
@@ -6233,6 +6238,7 @@ func main() {
 			"main.(*counter).descend.coro",
 			"main.(*counter).descend(SB)",
 			true,
+			false,
 		},
 	} {
 		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
@@ -6255,7 +6261,6 @@ func main() {
 		}
 		if test.fused {
 			for _, helper := range []string{
-				"runtime.coroRequestFusedFrame",
 				"runtime.coroAwaitFusedFrame",
 				"runtime.coroCompleteFusedFrame",
 			} {
@@ -6264,6 +6269,12 @@ func main() {
 						test.resume, helper, disassembly)
 				}
 			}
+		}
+		hasRequest := strings.Contains(disassembly,
+			"runtime.coroRequestFusedFrame")
+		if hasRequest != test.request {
+			t.Errorf("%s fused-frame request = %t, want %t\n%s",
+				test.resume, hasRequest, test.request, disassembly)
 		}
 	}
 

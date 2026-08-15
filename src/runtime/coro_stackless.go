@@ -1219,7 +1219,7 @@ func coroRequestFusedFrame(ctx unsafe.Pointer) {
 // cache-owned frame holder is reserved. Homogeneous recursion additionally
 // uses the direct prefix and typed four-frame chunks after the cache fills.
 func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
-	size uintptr, chunkType *_type) unsafe.Pointer {
+	size uintptr, chunkType *_type, self bool) unsafe.Pointer {
 	if ctx == nil || raceenabled {
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
@@ -1230,6 +1230,9 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 
 	s := context.scheduler
+	sameResume := parent.resume != nil &&
+		stacklessCoroResumeIdentity(parent.resume) ==
+			stacklessCoroResumeIdentity(child)
 	lock(&s.lock)
 	if stacklessCoroIsPullComparison(s) {
 		unlock(&s.lock)
@@ -1243,11 +1246,15 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine fused-frame reservation outside resume")
 	}
-	if !parent.hasFlag(stacklessCoroTaskFusedRequested) {
+	requested := parent.hasFlag(stacklessCoroTaskFusedRequested)
+	self = self && sameResume
+	if !self && !requested {
 		unlock(&s.lock)
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
-	parent.setFlag(stacklessCoroTaskFusedRequested, false)
+	if requested {
+		parent.setFlag(stacklessCoroTaskFusedRequested, false)
+	}
 	if context.frame == nil {
 		unlock(&s.lock)
 		throw("runtime: missing stackless coroutine fused frame")
@@ -1257,9 +1264,6 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
-	sameResume := parent.resume != nil &&
-		stacklessCoroResumeIdentity(parent.resume) ==
-			stacklessCoroResumeIdentity(child)
 	if sameResume &&
 		(size > stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize ||
 			!validStacklessCoroFrameChunkType(chunkType, size)) {
@@ -1277,6 +1281,12 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
+	if task == nil && !sameResume {
+		for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
+			uintptr(s.cachedFrameBytes)+size > stacklessCoroFrameCacheSize) &&
+			s.discardFreeCachedFrameTaskLocked() {
+		}
+	}
 	if task == nil && s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 		uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 		task = s.newFrameReservationTaskLocked(child, parent, size)
@@ -1597,6 +1607,38 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 		return task
 	}
 	return nil
+}
+
+// discardFreeCachedFrameTaskLocked makes room for a new typed frame identity.
+// Native contexts retain a bounded cache across roots; without replacement, a
+// deep call of one type could permanently force later heterogeneous frames to
+// allocate. Active frames stay untouched.
+func (s *stacklessCoroScheduler) discardFreeCachedFrameTaskLocked() bool {
+	var previous *stacklessCoroTask
+	for task := s.freeTasks; task != nil; task = task.next {
+		if !task.hasFlag(stacklessCoroTaskCacheFrame) {
+			previous = task
+			continue
+		}
+		if task.state != stacklessCoroTaskNew || task.parent != nil ||
+			task.context.scheduler != nil || task.context.frame == nil ||
+			task.frameSize == 0 || s.freeFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine free cached frame")
+		}
+		if previous == nil {
+			s.freeTasks = task.next
+		} else {
+			previous.next = task.next
+		}
+		task.next = nil
+		s.freeFrameBytes -= task.frameSize
+		s.discardCachedFrameTaskLocked(task)
+		task.next = s.freeTasks
+		s.freeTasks = task
+		s.freePlainTaskCount++
+		return true
+	}
+	return false
 }
 
 func (s *stacklessCoroScheduler) takeReservedFrameTaskLocked(

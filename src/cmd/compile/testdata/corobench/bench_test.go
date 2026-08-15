@@ -408,6 +408,20 @@ func TestProbeEdges(t *testing.T) {
 	cleanup()
 }
 
+func TestHeterogeneousFrameCacheReplacement(t *testing.T) {
+	if got := recursiveYield(4096); got != 4097 {
+		t.Fatalf("recursiveYield(4096) = %d, want 4097", got)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		if got := mutualYieldA(64); got != 65 {
+			t.Fatalf("mutualYieldA(64) = %d, want 65", got)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("mutual recursion after a deep homogeneous call allocated %.2f objects per run", allocs)
+	}
+}
+
 func BenchmarkYieldBatch(b *testing.B) {
 	b.ReportAllocs()
 	if got := yieldLoop(b.N); got != b.N {

@@ -147,7 +147,7 @@ func TakeStacklessCoroSelfFrameForTest(ctx unsafe.Pointer,
 		coroRequestFusedFrame(ctx)
 	}
 	return coroTakeFusedFrame(ctx, resume,
-		unsafe.Sizeof(StacklessCoroSelfFrameForTest{}), frameType)
+		unsafe.Sizeof(StacklessCoroSelfFrameForTest{}), frameType, true)
 }
 
 func AwaitStacklessCoroSelfFrameForTest(ctx, frame unsafe.Pointer,
@@ -164,7 +164,7 @@ func TakeStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer,
 	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroFusedResumeFrameForTest]()
 	coroRequestFusedFrame(ctx)
 	return coroTakeFusedFrame(ctx, resume,
-		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType)
+		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType, false)
 }
 
 func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
@@ -174,8 +174,7 @@ func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
 	if validChunkType {
 		chunkType = abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
 	}
-	coroRequestFusedFrame(ctx)
-	return coroTakeFusedFrame(ctx, resume, size, chunkType)
+	return coroTakeFusedFrame(ctx, resume, size, chunkType, true)
 }
 
 func AwaitStacklessCoroFusedResumeFrameForTest(ctx, frame unsafe.Pointer,
