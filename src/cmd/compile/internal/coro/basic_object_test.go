@@ -75,6 +75,10 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 		"call i8 @llvm.coro.suspend",
 		"define internal i1 @queue.push",
 		"define internal i1 @operation.publish",
+		"define internal ptr @timer.thread",
+		"call i32 @pthread_create",
+		"call i32 @nanosleep",
+		"atomicrmw add",
 		"define internal i64 @scheduler.run",
 		"i8 1, label %yield",
 		"i8 2, label %park",
@@ -91,25 +95,68 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 	}
 }
 
-func TestRenderBasicObjectLLVMForTarget(t *testing.T) {
-	amd64 := string(renderBasicObjectLLVMForTarget("host", 42, "amd64"))
-	for _, want := range []string{
-		"define i64 @host() alignstack(16)",
-		"xorps %xmm15, %xmm15",
-	} {
-		if !strings.Contains(amd64, want) {
-			t.Errorf("amd64 module does not contain %q", want)
-		}
+func TestBasicObjectLLVMTarget(t *testing.T) {
+	tests := []struct {
+		name      string
+		goos      string
+		goarch    string
+		wants     []string
+		unwanted  []string
+		wantError string
+	}{
+		{
+			name:     "darwin arm64",
+			goos:     "darwin",
+			goarch:   "arm64",
+			wants:    []string{"@pthread_join(ptr"},
+			unwanted: []string{"alignstack(16)", "%xmm15"},
+		},
+		{
+			name:   "linux amd64",
+			goos:   "linux",
+			goarch: "amd64",
+			wants: []string{
+				"@pthread_join(i64",
+				"define i64 @host() alignstack(16)",
+				"xorps %xmm15, %xmm15",
+			},
+		},
+		{name: "unsupported system", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
+		{name: "unsupported architecture", goos: "linux", goarch: "386", wantError: "linux/386"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			module, err := renderBasicObjectLLVMForTarget("host", 42, test.goos, test.goarch)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(module)
+			for _, want := range test.wants {
+				if !strings.Contains(text, want) {
+					t.Errorf("module does not contain %q", want)
+				}
+			}
+			for _, unwanted := range test.unwanted {
+				if strings.Contains(text, unwanted) {
+					t.Errorf("module unexpectedly contains %q", unwanted)
+				}
+			}
+			if strings.Contains(text, "{{") {
+				t.Fatal("module contains an unreplaced template marker")
+			}
+		})
 	}
 
-	arm64 := string(renderBasicObjectLLVMForTarget("host", 42, "arm64"))
-	for _, unwanted := range []string{"alignstack(16)", "%xmm15"} {
-		if strings.Contains(arm64, unwanted) {
-			t.Errorf("arm64 module unexpectedly contains %q", unwanted)
-		}
-	}
-	if strings.Contains(arm64, "{{") {
-		t.Fatal("arm64 module contains an unreplaced template marker")
+	x := newBasicObjectFixture()
+	_, _, module, matched, err := basicObjectLLVMModuleForTarget(x.f, "freebsd", "amd64")
+	if !matched || module != nil || err == nil || !strings.Contains(err.Error(), "freebsd/amd64") {
+		t.Fatalf("unsupported target matched=%t module=%v err=%v", matched, module, err)
 	}
 }
 

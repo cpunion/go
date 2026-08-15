@@ -281,6 +281,33 @@ completion 与 LLVM coroutine reentry 的物理闭环；它尚未证明跨线程
 timer/netpoll/file adapter、M handoff 或完整 runtime 公平性。下一纵切应保持相同
 operation contract，只把手工 late publisher 替换为 timer event source。
 
+### 1.6 非阻塞 timer event source 纵切
+
+`dev.coro-timer-operation-20260815` 保留第 1.5 节的 queue/operation contract，并把
+task 1 的手工 late completion 替换为真实 POSIX timer thread。task 1 提交 park 后，
+scheduler 才创建 timer thread；timer thread 等待另一个 stackless task 至少推进 8 次，
+随后执行 1 ms `nanosleep`，记录系统调用结果，并以 release store 发布 ready。scheduler
+每次 dispatch 边界用 acquire load 观察 ready，之后仍由 scheduler 自己调用
+`operation.publish`。timer thread 从不直接修改 ready queue、task state 或 operation
+phase。
+
+task 0 仍覆盖 early completion，consume 后在 timer ready 前反复 `Yield` 并递增 atomic
+progress。最终 executable 同时校验 progress、timer syscall、thread join、两个 operation
+的 `Consumed` phase、FIFO 前四次 resume 顺序、空队列和两个 Go 返回值。正常路径和失败
+清理路径都会 join 已创建的 thread，避免 scheduler frame 退出后仍有 event source 引用
+其中的状态。
+
+Darwin 的 `pthread_t` 是 pointer，Linux 64-bit 是 integer，因此 renderer 显式按
+`GOOS/GOARCH` 选择 ABI，并对其他 target fail closed。该 slice 已在 Darwin/arm64 的
+LLVM 19.1.7 和 Linux/amd64 的 LLVM 18 上通过
+compile、CoroSplit、archive、external link 和 executable 测试。
+
+这证明了“timer 阻塞留在 event thread，stackless scheduler 继续推进 ready task”的
+最小物理路径，但还不是生产 `time.Sleep`：当前每个例子只有一个 thread、scheduler 在
+dispatch 边界 polling、没有 deadline heap/parking primitive、没有 `time.Sleep` 自动
+染色或 runtime timer API adapter。下一步应把同一 release/acquire publication contract
+接到可 park 的 timer service，再让普通 Go `time.Sleep` call site 进入该 operation。
+
 ## 2. 结论
 
 方案可行，推荐复用或 fork Go 官方编译器的 parser、types2、Unified IR、内联、
@@ -1566,7 +1593,8 @@ go/no-go 验证。
 | typed `YieldOnce`/SiteID、三包 coroutine primary/await | 未实现 |
 | 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
-| 真实 event source、跨线程 scheduler/runtime、三包 structured await | 未实现 |
+| native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
+| `time.Sleep` lowering、timer service、net/file event、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
 第 4、5 个物理路径问题，并验证了最小单线程 scheduler 所有权；但不能替代第 19.4
