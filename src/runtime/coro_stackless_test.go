@@ -1611,6 +1611,111 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	}
 }
 
+type stacklessCoroFusedCacheReplacementTracker struct {
+	first  stacklessCoroFusedResumeDeepTracker
+	second stacklessCoroFusedResumeDeepTracker
+}
+
+var stacklessCoroFusedCacheReplacementActive *stacklessCoroFusedCacheReplacementTracker
+
+func stacklessCoroFusedCacheReplacementRoot(ctx unsafe.Pointer) uint8 {
+	frame := (*runtime.StacklessCoroSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		if frame.Depth == 0 {
+			return runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+		}
+		childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+			stacklessCoroFusedCacheReplacementRoot)
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(new(runtime.StacklessCoroSelfFrameForTest))
+		}
+		child := (*runtime.StacklessCoroSelfFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroSelfFrameForTest{Depth: frame.Depth - 1}
+		frame.State = 1
+		return runtime.AwaitStacklessCoroSelfFrameForTest(ctx, childPointer,
+			stacklessCoroFusedCacheReplacementRoot)
+	case 1:
+		if frame.Parent != nil {
+			return runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+		}
+		tracker := stacklessCoroFusedCacheReplacementActive
+		stacklessCoroFusedResumeDeepActive = &tracker.first
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFusedResumeDeepA)
+		if childPointer == nil {
+			tracker.first.uncached++
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Depth: 64, Value: &tracker.first.completed,
+		}
+		frame.State = 2
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			childPointer, stacklessCoroFusedResumeDeepA)
+	case 2:
+		tracker := stacklessCoroFusedCacheReplacementActive
+		stacklessCoroFusedResumeDeepActive = &tracker.second
+		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFusedResumeDeepA)
+		if childPointer == nil {
+			tracker.second.uncached++
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroFusedResumeFrameForTest))
+		}
+		child := (*runtime.StacklessCoroFusedResumeFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroFusedResumeFrameForTest{
+			Depth: 64, Value: &tracker.second.completed,
+		}
+		frame.State = 3
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			childPointer, stacklessCoroFusedResumeDeepA)
+	case 3:
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func TestStacklessCoroFusedFrameCacheReplacement(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds do not reuse frame addresses")
+	}
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() {
+		stacklessCoroFusedCacheReplacementActive = nil
+		stacklessCoroFusedResumeDeepActive = nil
+	}()
+
+	tracker := new(stacklessCoroFusedCacheReplacementTracker)
+	stacklessCoroFusedCacheReplacementActive = tracker
+	root := &runtime.StacklessCoroSelfFrameForTest{
+		Depth: runtime.StacklessCoroTaskCacheSize + 32,
+	}
+	runtime.RunStacklessCoroFrameInlineForTest(unsafe.Pointer(root),
+		stacklessCoroFusedCacheReplacementRoot)
+	for name, run := range map[string]*stacklessCoroFusedResumeDeepTracker{
+		"first":  &tracker.first,
+		"second": &tracker.second,
+	} {
+		if run.completed != 65 {
+			t.Fatalf("%s mutual recursion completed %d frames, want 65",
+				name, run.completed)
+		}
+	}
+	if tracker.first.uncached == 0 {
+		t.Fatal("first mutual recursion did not replace homogeneous cache entries")
+	}
+	if tracker.second.uncached != 0 {
+		t.Fatalf("second mutual recursion had %d cache misses, want zero",
+			tracker.second.uncached)
+	}
+}
+
 func TestStacklessCoroFusedResumePanic(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)

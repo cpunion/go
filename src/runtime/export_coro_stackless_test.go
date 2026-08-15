@@ -91,11 +91,17 @@ func ReleaseRootStacklessCoroFrameForTest(frame unsafe.Pointer,
 }
 
 func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
+	RunStacklessCoroFrameInlineForTest(nil, resume)
+}
+
+func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
+	s.root.context.frame = frame
 	s.ready(&s.root, false)
 	s.run(false)
 	s.finish()
