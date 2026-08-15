@@ -75,6 +75,10 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 		"call i8 @llvm.coro.suspend",
 		"define internal i1 @queue.push",
 		"define internal i1 @operation.publish",
+		"define internal ptr @timer.thread",
+		"call i32 @pthread_create",
+		"call i32 @nanosleep",
+		"atomicrmw add",
 		"define internal i64 @scheduler.run",
 		"i8 1, label %yield",
 		"i8 2, label %park",
@@ -88,6 +92,44 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 	}
 	if strings.Contains(text, "{{") {
 		t.Fatal("module contains an unreplaced template marker")
+	}
+}
+
+func TestBasicObjectLLVMTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		goos   string
+		goarch string
+		want   string
+		bad    bool
+	}{
+		{"darwin arm64", "darwin", "arm64", "@pthread_join(ptr", false},
+		{"linux amd64", "linux", "amd64", "@pthread_join(i64", false},
+		{"unsupported system", "freebsd", "amd64", "freebsd/amd64", true},
+		{"unsupported architecture", "linux", "386", "linux/386", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			module, err := renderBasicObjectLLVMForTarget("host", 42, test.goos, test.goarch)
+			if test.bad {
+				if err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("error = %v, want error containing %q", err, test.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(module), test.want) {
+				t.Fatalf("module does not contain %q", test.want)
+			}
+		})
+	}
+
+	x := newBasicObjectFixture()
+	_, _, module, matched, err := basicObjectLLVMModuleForTarget(x.f, "freebsd", "amd64")
+	if !matched || module != nil || err == nil || !strings.Contains(err.Error(), "freebsd/amd64") {
+		t.Fatalf("unsupported target matched=%t module=%v err=%v", matched, module, err)
 	}
 }
 
