@@ -18,12 +18,10 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/ssa"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
-	"sync"
 )
 
 // Effect describes whether a function may suspend its caller.
@@ -55,8 +53,6 @@ const SummaryVersion uint64 = 1
 // compilation state and do not require synchronization.
 var summaries = make(map[*ir.Func]Effect)
 
-var dumpMu sync.Mutex
-
 // SetSummary records a function effect read from Unified IR export data.
 func SetSummary(fn *ir.Func, effect Effect) {
 	if fn != nil {
@@ -70,118 +66,105 @@ func Summary(fn *ir.Func) (Effect, bool) {
 	return effect, ok
 }
 
-// DumpPreLowerSSA reports the SSA shape presented at the target lowering
-// boundary. The report-only PoC always continues into the native backend.
-func DumpPreLowerSSA(w io.Writer, f *ssa.Func) {
-	values := 0
-	for _, block := range f.Blocks {
-		values += len(block.Values)
-	}
-
-	// Backend compilation is parallel, so keep each diagnostic line intact.
-	dumpMu.Lock()
-	defer dumpMu.Unlock()
-	fmt.Fprintf(w, "coro: phase=pre-lower-ssa func=%s blocks=%d values=%d action=continue-native\n",
-		f.NameABI(), len(f.Blocks), values)
-}
-
-// EdgeKind describes how a call is executed.
-type EdgeKind uint8
+// callKind describes how a call is executed.
+type callKind uint8
 
 const (
-	DirectCall EdgeKind = iota
-	DeferCall
-	GoCall
+	directCall callKind = iota
+	deferCall
+	goCall
 )
 
-func (k EdgeKind) String() string {
+func (k callKind) String() string {
 	switch k {
-	case DirectCall:
+	case directCall:
 		return "direct"
-	case DeferCall:
+	case deferCall:
 		return "defer"
-	case GoCall:
+	case goCall:
 		return "go"
 	default:
-		return fmt.Sprintf("EdgeKind(%d)", k)
+		return fmt.Sprintf("callKind(%d)", k)
 	}
 }
 
-// Seed is a reason a function is locally considered suspending.
-type Seed uint8
+// suspendReason describes why a function may suspend locally.
+type suspendReason uint8
 
 const (
-	ChannelSend Seed = iota
-	ChannelReceive
-	ChannelSelect
-	ChannelRange
-	UnknownCall
+	channelSend suspendReason = iota
+	channelReceive
+	channelSelect
+	channelRange
+	unknownCall
 )
 
-func (s Seed) String() string {
-	switch s {
-	case ChannelSend:
+func (r suspendReason) String() string {
+	switch r {
+	case channelSend:
 		return "channel-send"
-	case ChannelReceive:
+	case channelReceive:
 		return "channel-receive"
-	case ChannelSelect:
+	case channelSelect:
 		return "channel-select"
-	case ChannelRange:
+	case channelRange:
 		return "channel-range"
-	case UnknownCall:
+	case unknownCall:
 		return "unknown-call"
 	default:
-		return fmt.Sprintf("Seed(%d)", s)
+		return fmt.Sprintf("suspendReason(%d)", r)
 	}
 }
 
-// Edge is a call from one function to another. Callee is nil for a dynamic
-// call. Unknown is true when the callee has no effect summary in this package.
-type Edge struct {
-	Kind       EdgeKind
-	Callee     *ir.Func
-	CalleeName string
-	Imported   Effect
-	Unknown    bool
+// callEdge describes a call from one function to another. callee is nil for a
+// dynamic call. unknown is true when the callee has no effect summary in this
+// package.
+type callEdge struct {
+	kind       callKind
+	callee     *ir.Func
+	calleeName string
+	imported   Effect
+	unknown    bool
 }
 
-// Function is the coroutine analysis result for one function.
-type Function struct {
-	Func      *ir.Func
-	Local     Effect
-	Effect    Effect
-	Recursive bool
-	Seeds     []Seed
-	Edges     []Edge
+// funcInfo is the coroutine analysis result for one function.
+type funcInfo struct {
+	fn        *ir.Func
+	local     Effect
+	effect    Effect
+	recursive bool
+	reasons   []suspendReason
+	calls     []callEdge
+	sites     []siteCandidate
 }
 
-// Plan is the result of analyzing one package.
-type Plan struct {
-	Functions map[*ir.Func]*Function
+// Analysis contains coroutine effect information for one package.
+type Analysis struct {
+	funcs map[*ir.Func]*funcInfo
 }
 
 // PublishSummaries makes this package's final effects available to the
 // Unified IR export writer.
-func (p *Plan) PublishSummaries() {
-	for fn, function := range p.Functions {
-		SetSummary(fn, function.Effect)
+func (a *Analysis) PublishSummaries() {
+	for fn, info := range a.funcs {
+		SetSummary(fn, info.effect)
 	}
 }
 
 // Analyze computes coroutine effects for funcs.
-func Analyze(funcs []*ir.Func) *Plan {
-	p := &Plan{Functions: make(map[*ir.Func]*Function, len(funcs))}
+func Analyze(funcs []*ir.Func) *Analysis {
+	a := &Analysis{funcs: make(map[*ir.Func]*funcInfo, len(funcs))}
 	for _, fn := range funcs {
-		p.Functions[fn] = &Function{Func: fn}
+		a.funcs[fn] = &funcInfo{fn: fn}
 	}
-	for _, function := range p.Functions {
-		p.scan(function)
+	for _, info := range a.funcs {
+		a.scan(info)
 	}
 
 	ir.VisitFuncsBottomUp(funcs, func(funcs []*ir.Func, recursive bool) {
 		for _, fn := range funcs {
-			if function := p.Functions[fn]; function != nil {
-				function.Recursive = recursive
+			if info := a.funcs[fn]; info != nil {
+				info.recursive = recursive
 			}
 		}
 
@@ -190,56 +173,65 @@ func Analyze(funcs []*ir.Func) *Plan {
 		for changed := true; changed; {
 			changed = false
 			for _, fn := range funcs {
-				function := p.Functions[fn]
-				if function == nil || function.Effect == MaySuspend {
+				info := a.funcs[fn]
+				if info == nil || info.effect == MaySuspend {
 					continue
 				}
-				if function.Local == MaySuspend || p.callsSuspending(function) {
-					function.Effect = MaySuspend
+				if info.local == MaySuspend || a.callsSuspending(info) {
+					info.effect = MaySuspend
 					changed = true
 				}
 			}
 		}
 	})
 
-	return p
+	return a
 }
 
-func (p *Plan) scan(function *Function) {
-	goDefer := make(map[*ir.CallExpr]EdgeKind)
-	ir.Visit(function.Func, func(n ir.Node) {
+func (a *Analysis) scan(info *funcInfo) {
+	callKinds := make(map[*ir.CallExpr]callKind)
+	ir.Visit(info.fn, func(n ir.Node) {
 		if n, ok := n.(*ir.GoDeferStmt); ok {
 			if call, ok := n.Call.(*ir.CallExpr); ok {
 				if n.Op() == ir.OGO {
-					goDefer[call] = GoCall
+					callKinds[call] = goCall
 				} else {
-					goDefer[call] = DeferCall
+					callKinds[call] = deferCall
 				}
 			}
 		}
 	})
 
-	addSeed := func(seed Seed) {
-		function.Local = MaySuspend
-		if !slices.Contains(function.Seeds, seed) {
-			function.Seeds = append(function.Seeds, seed)
+	recordReason := func(reason suspendReason) {
+		info.local = MaySuspend
+		if !slices.Contains(info.reasons, reason) {
+			info.reasons = append(info.reasons, reason)
 		}
 	}
+	addOperation := func(reason suspendReason, node ir.Node) {
+		recordReason(reason)
+		info.sites = append(info.sites, siteCandidate{
+			kind:    operationCandidate,
+			ordinal: uint32(len(info.sites)),
+			pos:     node.Pos(),
+			reason:  reason,
+		})
+	}
 
-	ir.Visit(function.Func, func(n ir.Node) {
+	ir.Visit(info.fn, func(n ir.Node) {
 		switch n.Op() {
 		case ir.OSEND:
-			addSeed(ChannelSend)
+			addOperation(channelSend, n)
 		case ir.ORECV:
-			addSeed(ChannelReceive)
+			addOperation(channelReceive, n)
 		case ir.OSELECT:
 			// This is intentionally conservative for the PoC: a select with
 			// a default case does not block, but treating it as a seed is safe.
-			addSeed(ChannelSelect)
+			addOperation(channelSelect, n)
 		case ir.ORANGE:
 			n := n.(*ir.RangeStmt)
 			if n.X != nil && n.X.Type() != nil && n.X.Type().IsChan() {
-				addSeed(ChannelRange)
+				addOperation(channelRange, n)
 			}
 		}
 
@@ -253,56 +245,63 @@ func (p *Plan) scan(function *Function) {
 			return
 		}
 
-		kind := DirectCall
-		if goDeferKind, ok := goDefer[call]; ok {
-			kind = goDeferKind
+		kind := directCall
+		if k, ok := callKinds[call]; ok {
+			kind = k
 		}
 
-		edge := Edge{Kind: kind}
+		edge := callEdge{kind: kind}
 		if call.Op() == ir.OCALLFUNC {
 			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
-				edge.Callee = name.Func
-				edge.CalleeName = symbolName(name)
-				if _, local := p.Functions[edge.Callee]; !local {
+				edge.callee = name.Func
+				edge.calleeName = symbolName(name)
+				if _, local := a.funcs[edge.callee]; !local {
 					var known bool
-					edge.Imported, known = Summary(edge.Callee)
-					edge.Unknown = !known
+					edge.imported, known = Summary(edge.callee)
+					edge.unknown = !known
 				}
 			} else {
-				edge.CalleeName = "<dynamic>"
-				edge.Unknown = true
+				edge.calleeName = "<dynamic>"
+				edge.unknown = true
 			}
 		} else {
-			edge.CalleeName = "<interface>"
-			edge.Unknown = true
+			edge.calleeName = "<interface>"
+			edge.unknown = true
 		}
-		function.Edges = append(function.Edges, edge)
-		if edge.Unknown && kind != GoCall {
-			addSeed(UnknownCall)
+		callIndex := len(info.calls)
+		info.calls = append(info.calls, edge)
+		info.sites = append(info.sites, siteCandidate{
+			kind:      callCandidate,
+			ordinal:   uint32(len(info.sites)),
+			pos:       call.Pos(),
+			callIndex: callIndex,
+		})
+		if edge.unknown && kind != goCall {
+			recordReason(unknownCall)
 		}
 	})
 }
 
-func (p *Plan) callsSuspending(function *Function) bool {
-	for _, edge := range function.Edges {
-		if edge.Kind == GoCall {
+func (a *Analysis) callsSuspending(info *funcInfo) bool {
+	for _, call := range info.calls {
+		if call.kind == goCall {
 			continue
 		}
-		if p.edgeMaySuspend(edge) {
+		if a.callMaySuspend(call) {
 			return true
 		}
 	}
 	return false
 }
 
-func (p *Plan) edgeMaySuspend(edge Edge) bool {
-	if edge.Unknown {
+func (a *Analysis) callMaySuspend(call callEdge) bool {
+	if call.unknown {
 		return true
 	}
-	if callee := p.Functions[edge.Callee]; callee != nil {
-		return callee.Effect == MaySuspend
+	if callee := a.funcs[call.callee]; callee != nil {
+		return callee.effect == MaySuspend
 	}
-	return edge.Imported == MaySuspend
+	return call.imported == MaySuspend
 }
 
 func symbolName(name *ir.Name) string {
@@ -316,50 +315,50 @@ func symbolName(name *ir.Name) string {
 	return sym.Pkg.Path + "." + sym.Name
 }
 
-// Dump writes a deterministic, human-readable representation of p.
-func (p *Plan) Dump(w io.Writer) {
-	functions := make([]*Function, 0, len(p.Functions))
-	for _, function := range p.Functions {
-		functions = append(functions, function)
+// Dump writes a deterministic, human-readable representation of a.
+func (a *Analysis) Dump(w io.Writer) {
+	funcs := make([]*funcInfo, 0, len(a.funcs))
+	for _, info := range a.funcs {
+		funcs = append(funcs, info)
 	}
-	slices.SortFunc(functions, func(a, b *Function) int {
-		return strings.Compare(ir.PkgFuncName(a.Func), ir.PkgFuncName(b.Func))
+	slices.SortFunc(funcs, func(a, b *funcInfo) int {
+		return strings.Compare(ir.PkgFuncName(a.fn), ir.PkgFuncName(b.fn))
 	})
 
-	for _, function := range functions {
-		seeds := make([]string, len(function.Seeds))
-		for i, seed := range function.Seeds {
-			seeds[i] = seed.String()
+	for _, info := range funcs {
+		reasons := make([]string, len(info.reasons))
+		for i, reason := range info.reasons {
+			reasons[i] = reason.String()
 		}
-		slices.Sort(seeds)
-		if len(seeds) == 0 {
-			seeds = append(seeds, "-")
+		slices.Sort(reasons)
+		if len(reasons) == 0 {
+			reasons = append(reasons, "-")
 		}
-		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t seeds=%s\n",
-			ir.PkgFuncName(function.Func), function.Effect, function.Local,
-			function.Recursive, strings.Join(seeds, ","))
+		fmt.Fprintf(w, "coro: func=%s effect=%s local=%s recursive=%t reasons=%s\n",
+			ir.PkgFuncName(info.fn), info.effect, info.local,
+			info.recursive, strings.Join(reasons, ","))
 
-		edges := slices.Clone(function.Edges)
-		slices.SortFunc(edges, func(a, b Edge) int {
-			if n := strings.Compare(a.Kind.String(), b.Kind.String()); n != 0 {
+		calls := slices.Clone(info.calls)
+		slices.SortFunc(calls, func(a, b callEdge) int {
+			if n := strings.Compare(a.kind.String(), b.kind.String()); n != 0 {
 				return n
 			}
-			return strings.Compare(a.CalleeName, b.CalleeName)
+			return strings.Compare(a.calleeName, b.calleeName)
 		})
-		for _, edge := range edges {
+		for _, call := range calls {
 			effect := "unknown"
-			if !edge.Unknown {
-				effect = p.edgeEffect(edge).String()
+			if !call.unknown {
+				effect = a.callEffect(call).String()
 			}
 			fmt.Fprintf(w, "coro: edge=%s caller=%s callee=%s unknown=%t effect=%s\n",
-				edge.Kind, ir.PkgFuncName(function.Func), edge.CalleeName, edge.Unknown, effect)
+				call.kind, ir.PkgFuncName(info.fn), call.calleeName, call.unknown, effect)
 		}
 	}
 }
 
-func (p *Plan) edgeEffect(edge Edge) Effect {
-	if callee := p.Functions[edge.Callee]; callee != nil {
-		return callee.Effect
+func (a *Analysis) callEffect(call callEdge) Effect {
+	if callee := a.funcs[call.callee]; callee != nil {
+		return callee.effect
 	}
-	return edge.Imported
+	return call.imported
 }

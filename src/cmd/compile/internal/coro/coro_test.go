@@ -100,17 +100,17 @@ func TestAnalysis(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"coro: func=p.leaf effect=may-suspend local=may-suspend recursive=false seeds=channel-send",
-		"coro: func=p.receive effect=may-suspend local=may-suspend recursive=false seeds=channel-receive",
-		"coro: func=p.direct effect=may-suspend local=nosuspend recursive=false seeds=-",
-		"coro: func=p.deferred effect=may-suspend local=nosuspend recursive=false seeds=-",
-		"coro: func=p.launched effect=nosuspend local=nosuspend recursive=false seeds=-",
-		"coro: func=p.cycleA effect=may-suspend local=nosuspend recursive=true seeds=-",
-		"coro: func=p.cycleB effect=may-suspend local=may-suspend recursive=true seeds=channel-receive",
-		"coro: func=p.channelRange effect=may-suspend local=may-suspend recursive=false seeds=channel-range",
-		"coro: func=p.selecting effect=may-suspend local=may-suspend recursive=false seeds=channel-receive,channel-select",
-		"coro: func=p.dynamic effect=may-suspend local=may-suspend recursive=false seeds=unknown-call",
-		"coro: func=p.launchedDynamic effect=nosuspend local=nosuspend recursive=false seeds=-",
+		"coro: func=p.leaf effect=may-suspend local=may-suspend recursive=false reasons=channel-send",
+		"coro: func=p.receive effect=may-suspend local=may-suspend recursive=false reasons=channel-receive",
+		"coro: func=p.direct effect=may-suspend local=nosuspend recursive=false reasons=-",
+		"coro: func=p.deferred effect=may-suspend local=nosuspend recursive=false reasons=-",
+		"coro: func=p.launched effect=nosuspend local=nosuspend recursive=false reasons=-",
+		"coro: func=p.cycleA effect=may-suspend local=nosuspend recursive=true reasons=-",
+		"coro: func=p.cycleB effect=may-suspend local=may-suspend recursive=true reasons=channel-receive",
+		"coro: func=p.channelRange effect=may-suspend local=may-suspend recursive=false reasons=channel-range",
+		"coro: func=p.selecting effect=may-suspend local=may-suspend recursive=false reasons=channel-receive,channel-select",
+		"coro: func=p.dynamic effect=may-suspend local=may-suspend recursive=false reasons=unknown-call",
+		"coro: func=p.launchedDynamic effect=nosuspend local=nosuspend recursive=false reasons=-",
 		"coro: edge=direct caller=p.direct callee=p.leaf unknown=false",
 		"coro: edge=defer caller=p.deferred callee=p.leaf unknown=false",
 		"coro: edge=go caller=p.launched callee=p.leaf unknown=false",
@@ -510,7 +510,7 @@ func caller(ch chan int) {
 		"coro: phase=provisional",
 		"coro: func=p.caller effect=may-suspend local=nosuspend",
 		"coro: phase=final",
-		"coro: func=p.caller effect=may-suspend local=may-suspend recursive=false seeds=channel-send",
+		"coro: func=p.caller effect=may-suspend local=may-suspend recursive=false reasons=channel-send",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
