@@ -15,7 +15,7 @@ func TestCompileWithLoweringHook(t *testing.T) {
 	t.Run("handled", func(t *testing.T) {
 		f := makeLoweringHookTestFunc(c)
 		calls := 0
-		handled := CompileWithLoweringHook(f, func(got *Func) bool {
+		handled := CompileWithLoweringHook(f, nil, func(got *Func) bool {
 			calls++
 			if got != f {
 				t.Fatalf("hook received %p, want %p", got, f)
@@ -48,7 +48,7 @@ func TestCompileWithLoweringHook(t *testing.T) {
 	t.Run("continue native", func(t *testing.T) {
 		f := makeLoweringHookTestFunc(c)
 		calls := 0
-		handled := CompileWithLoweringHook(f, func(got *Func) bool {
+		handled := CompileWithLoweringHook(f, nil, func(got *Func) bool {
 			calls++
 			if got.scheduled {
 				t.Error("function is already scheduled at lowering boundary")

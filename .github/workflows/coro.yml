@@ -3,13 +3,11 @@ name: Coroutine compiler
 on:
   pull_request:
     branches:
-      - main
+      - dev.coro
   push:
     branches:
-      - main
+      - dev.coro
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * 0"
 
 permissions:
   contents: read

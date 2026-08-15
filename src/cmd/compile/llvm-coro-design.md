@@ -3,11 +3,14 @@
 状态：架构设计稿；已完成 Phase 0、pre-lower handoff 与受限可执行 LLVM coroutine
 basic example，尚未接入 Go object/linker 的正式 LLVM backend
 
-更新时间：2026-07-26
+更新时间：2026-08-15
 
-目标开发线：`cpunion/go:main`（持续 merge Go 官方 `master`）
+官方镜像线：`cpunion/go:main`（保持与 Go 官方 `master` 一致）
 
-当前 topic/worktree：`dev.coro`（向 `cpunion/go:main` 提交）
+长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
+
+当前 integration topic/worktree：`dev.coro-sync-20260815`
+（向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
 
@@ -33,7 +36,8 @@ structured await、抢占和动态函数值处理，编译流水线应如何组�
 - [LLVM Coroutine Runtime 总体设计](https://github.com/cpunion/llgo/blob/llvm-coro/doc/llvm-coro-runtime-design.md)
 
 本文把“源码已经确认的事实”和“建议采用的设计”分开描述。Go `master` 会继续变化；
-`cpunion/go:main` 通过 merge 跟进，以上 commit 是首次实现和复核的固定起点。
+`cpunion/go:dev.coro` 通过 merge 跟进，以上 commit 是首次实现和复核的固定起点；
+`cpunion/go:main` 不携带 coroutine patch。
 
 ### 1.1 当前 Phase 0 PoC
 
@@ -162,6 +166,28 @@ clang -O1 /tmp/basic.split.ll -o /tmp/basic-coro
   生成 object。
 - driver 直接调用 resume/destroy，不代表 scheduler、Go runtime、跨包 coroutine
   ABI 或 linker ownership 已经完成。
+
+### 1.3 2026-08-15 upstream merge checkpoint
+
+Integration commit `44875ea4a4` 在不重放 coroutine 提交的前提下，把 Go 开发版
+`41a1646f6d` merge 进 `dev.coro`。这 172 个提交只产生两个内容冲突，均来自官方 SSA
+入口新增的 `*ssa.HTMLWriter` 参数。解决方案保留官方 `Compile(f, htmlWriter)` API，
+并把同一个 writer 传入可选的 pre-lower hook；没有用旧 compiler 文件覆盖新版本。
+
+merged source 在 native Darwin/arm64 上通过以下门禁：
+
+| 验证 | 结果 |
+| --- | --- |
+| 默认 `make.bash` | 通过 |
+| 默认 `go test cmd/compile/... internal/pkgbits internal/buildcfg` | 通过 |
+| `GOEXPERIMENT=coro make.bash` | 通过 |
+| 实验模式完整 compiler、pkgbits 和 buildcfg 测试 | 通过 |
+| LLVM 19 pre/post-CoroSplit verify 和可执行 basic example | 通过 |
+
+可执行例子仍是 standalone side artifact。本次 merge 不改变第 19 节的完成度：Go
+object/archive/link ownership 和 reentry scheduler 仍是下一个必需纵切。仓库分支策略
+现在明确为：`main` 镜像 upstream，topic PR 以 `dev.coro` 为目标，只有经过 review 的
+upstream-merge topic 才更新这条长期分支。
 
 ## 2. 结论
 
@@ -981,10 +1007,10 @@ Go 官方并不是“master 上依次打 release tag”的单线模型。根据
 - Go 官方支持最近两个主版本，直到两个更新主版本已经发布。
 
 因此 coroutine 主开发线最接近官方的 `dev.*` 模型，而不是 release branch 模型。
-本 fork 使用 `cpunion/go:main` 作为这条长期集成线；`dev.coro`、`upgrade/go-master`
-等只作为可审查的 topic branch，通过 PR 合入 `main`。若未来 Go 官方接受其中的通用
-机制，可以按可独立审查的模块逐步贡献。下文的 `coro-main` 即指
-`cpunion/go:main`。
+本 fork 保持 `cpunion/go:main` 与 Go 官方 `master` 一致，使用
+`cpunion/go:dev.coro` 作为长期 coroutine 集成线；`upgrade/go-master` 和功能分支只
+作为可审查的 topic branch，通过 PR 合入 `dev.coro`。若未来 Go 官方接受其中的通用
+机制，可以按可独立审查的模块逐步贡献。下文直接使用 `dev.coro` 指这条长期开发线。
 
 截至 2026-07-26 的本地 refs 直接证明了这项分叉：
 
@@ -996,7 +1022,7 @@ Go 官方并不是“master 上依次打 release tag”的单线模型。根据
 - `go1.26.0`、`go1.26.5` 等 tag 同样只位于 `release-branch.go1.26` 的历史上。
 
 因此必须修正一个策略：**不能把 release branch 或 release tag merge 进持续跟踪
-master 的 `coro-main`**。这会把 release-only backport 和可能已经以不同 commit
+master 的 `dev.coro`**。这会把 release-only backport 和可能已经以不同 commit
 存在于 master 的修复重新引入开发线，造成重复历史和冲突。
 
 推荐镜像 Go 官方的分支拓扑：
@@ -1006,13 +1032,13 @@ go/master          A------B------C-----------D  (next Go development)
                            \
 go/release.go1.N            R1---R2[tag rc]---R3[tag go1.N.0]---R4
 
-coro-main          A'--M(B)--Coro-------------M(D)---Coro
+dev.coro           A'--M(B)--Coro-------------M(D)---Coro
                             \
 coro-release.go1.N           CR---M(R2)---------M(R3)------------M(R4)
 ```
 
-- `coro-main` 只 merge `go/master`，是 coroutine 新功能和未来上游贡献的开发线。
-- Go 官方创建 `release-branch.go1.N` 时，从仍对应该版本的绿色 `coro-main` 历史点
+- `dev.coro` 只 merge `go/master`，是 coroutine 新功能和未来上游贡献的开发线。
+- Go 官方创建 `release-branch.go1.N` 时，从仍对应该版本的绿色 `dev.coro` 历史点
   创建 `coro-release.go1.N`。
 - `coro-release.go1.N` 只 merge 对应的官方 release branch，不再 merge
   `go/master`，也不接受新的 coroutine 功能。
@@ -1022,19 +1048,19 @@ coro-release.go1.N           CR---M(R2)---------M(R3)------------M(R4)
 - 已共享的 coro 分支不 rebase；整个 coroutine patch stack不会在每个 Go 版本重放。
 
 如果官方切 release branch 时没有及时建立 coro release branch，并且
-`coro-main` 已经包含下一版本代码，应从历史上最后一个对应 release 的绿色 coro
-commit 切分支。不能把 release tag 直接 merge 回最新 `coro-main` 来“还原”版本。
+`dev.coro` 已经包含下一版本代码，应从历史上最后一个对应 release 的绿色 coro
+commit 切分支。不能把 release tag 直接 merge 回最新 `dev.coro` 来“还原”版本。
 
 开发线的日常升级仍使用临时 integration branch：
 
 ```text
-从绿色 coro-main 创建 upgrade/go-master
+从绿色 dev.coro 创建 upgrade/go-master
   -> git merge golang/go/master 的选定 commit
   -> 解决文本冲突
   -> 提交明确的 phase/API 适配
   -> 对比 phase-order 与 ABI manifest
   -> 运行 analysis、LLVM、runtime、stdlib 全矩阵
-  -> merge upgrade branch 回绿色 coro-main
+  -> merge upgrade branch 回绿色 dev.coro
 ```
 
 这样保留官方 ancestry，`git log --first-parent` 能分别看到 Go 升级和 LLGo 功能，
@@ -1044,15 +1070,15 @@ commit 切分支。不能把 release tag 直接 merge 回最新 `coro-main` 来�
 稳定分支维护无法完全消除 backport，这是 Go 官方分叉模型本身决定的。正确的限制是：
 
 - 不重放完整 coroutine patch stack；
-- 新功能只进 `coro-main`；
+- 新功能只进 `dev.coro`；
 - 同时影响稳定版的 LLGo bugfix 以单个 commit 为单位 backport；
-- 不把整个 `coro-release.go1.N` merge 回 `coro-main`，否则会带回 upstream 的
+- 不把整个 `coro-release.go1.N` merge 回 `dev.coro`，否则会带回 upstream 的
   release-only commits；
 - 安全修复同时跟随官方 master 和仍受支持的 release branch。
 
-若项目只交付开发版，可以只维护 `coro-main`，把官方 RC/tag 用作外部兼容测试基线。
-若交付一个稳定版本，最低需要 `coro-main + 一个 coro-release`。若承诺与 Go 官方
-相同的“两代主版本”支持政策，就必须接受 `coro-main + 两个 coro-release` 的维护
+若项目只交付开发版，可以只维护 `dev.coro`，把官方 RC/tag 用作外部兼容测试基线。
+若交付一个稳定版本，最低需要 `dev.coro + 一个 coro-release`。若承诺与 Go 官方
+相同的“两代主版本”支持政策，就必须接受 `dev.coro + 两个 coro-release` 的维护
 成本；一条分支无法同时精确表示三个已经分叉的提交图。
 
 ### 13.3 模块边界与最小官方 patch surface
@@ -1193,7 +1219,7 @@ compiler 的主要收益不是“少写一个 parser”，而是删除 `cl` 中�
 | `internal/build` 集成 | 10%–30% | 50%–70% | 改接 `go build` toolchain/archive 流程 |
 | runtime/stdlib patch | 50%–75% | 70%–90% | 取决于是否保持现有 LLGo runtime ABI |
 
-下表以只维护 `coro-main`、复用当前 runtime、由熟悉 Go
+下表以只维护 `dev.coro`、复用当前 runtime、由熟悉 Go
 compiler/LLVM/runtime 的工程师实施，并从第一天保持上述模块和上游边界为前提：
 
 | 累计目标 | 范围 | 预计工程量 |
@@ -1220,7 +1246,7 @@ summary、escape/frame 集成以及可上游模块边界的成本。收益主要
 
 稳定发布策略会增加独立维护量：
 
-- 只维护 `coro-main`：没有 release backport 成本，适合早期实验。
+- 只维护 `dev.coro`：没有 release backport 成本，适合早期实验。
 - 增加一个当前 `coro-release`：预计增加约 10%–20% 的持续维护和认证工作。
 - 与 Go 官方一样维护两个稳定主版本：预计增加约 20%–35% 的持续维护和认证工作。
 
