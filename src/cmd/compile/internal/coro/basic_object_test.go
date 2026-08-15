@@ -178,8 +178,15 @@ func TestSocketObjectLLVMModule(t *testing.T) {
 	}
 }
 
-func TestFileObjectLLVMTarget(t *testing.T) {
-	for _, test := range []struct {
+func TestBlockingObjectLLVMTarget(t *testing.T) {
+	renderers := []struct {
+		name   string
+		render func(string, int64, string, string) ([]byte, error)
+	}{
+		{name: "file", render: renderFileObjectLLVMForTarget},
+		{name: "socket", render: renderSocketObjectLLVMForTarget},
+	}
+	targets := []struct {
 		name      string
 		goos      string
 		goarch    string
@@ -189,88 +196,55 @@ func TestFileObjectLLVMTarget(t *testing.T) {
 		{name: "darwin arm64", goos: "darwin", goarch: "arm64", want: "declare ptr @pthread_self()"},
 		{name: "linux amd64", goos: "linux", goarch: "amd64", want: "declare i64 @pthread_self()"},
 		{name: "unsupported", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			module, err := renderFileObjectLLVMForTarget("host", 42, test.goos, test.goarch)
-			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) {
-					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(module), test.want) {
-				t.Fatalf("module does not contain %q", test.want)
+	}
+	for _, renderer := range renderers {
+		t.Run(renderer.name, func(t *testing.T) {
+			for _, target := range targets {
+				t.Run(target.name, func(t *testing.T) {
+					module, err := renderer.render("host", 42, target.goos, target.goarch)
+					if target.wantError != "" {
+						if err == nil || !strings.Contains(err.Error(), target.wantError) {
+							t.Fatalf("error = %v, want error containing %q", err, target.wantError)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !strings.Contains(string(module), target.want) {
+						t.Fatalf("module does not contain %q", target.want)
+					}
+				})
 			}
 		})
 	}
 }
 
-func TestSocketObjectLLVMTarget(t *testing.T) {
+func TestBlockingObjectLLVMCompile(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("test requires clang")
+	}
 	for _, test := range []struct {
-		name      string
-		goos      string
-		goarch    string
-		want      string
-		wantError string
+		name   string
+		render func(string, int64, string, string) ([]byte, error)
 	}{
-		{name: "darwin arm64", goos: "darwin", goarch: "arm64", want: "declare ptr @pthread_self()"},
-		{name: "linux amd64", goos: "linux", goarch: "amd64", want: "declare i64 @pthread_self()"},
-		{name: "unsupported", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
+		{name: "file", render: renderFileObjectLLVMForTarget},
+		{name: "socket", render: renderSocketObjectLLVMForTarget},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			module, err := renderSocketObjectLLVMForTarget("host", 42, test.goos, test.goarch)
-			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) {
-					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
-				}
-				return
-			}
+			module, err := test.render("host", 42, runtime.GOOS, runtime.GOARCH)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(module), test.want) {
-				t.Fatalf("module does not contain %q", test.want)
+			object, err := compileLLVMObject(clang, module)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(object) == 0 {
+				t.Fatal("clang produced an empty blocking object")
 			}
 		})
-	}
-}
-
-func TestFileObjectLLVMCompile(t *testing.T) {
-	clang, err := exec.LookPath("clang")
-	if err != nil {
-		t.Skip("test requires clang")
-	}
-	module, err := renderFileObjectLLVMForTarget("host", 42, runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object, err := compileLLVMObject(clang, module)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(object) == 0 {
-		t.Fatal("clang produced an empty file object")
-	}
-}
-
-func TestSocketObjectLLVMCompile(t *testing.T) {
-	clang, err := exec.LookPath("clang")
-	if err != nil {
-		t.Skip("test requires clang")
-	}
-	module, err := renderSocketObjectLLVMForTarget("host", 42, runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object, err := compileLLVMObject(clang, module)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(object) == 0 {
-		t.Fatal("clang produced an empty socket object")
 	}
 }
 
