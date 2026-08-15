@@ -32,6 +32,7 @@ package ld
 
 import (
 	"bufio"
+	"cmd/internal/coroobj"
 	"cmd/internal/objabi"
 	"cmd/link/internal/loader"
 	"cmd/link/internal/sym"
@@ -108,8 +109,9 @@ type Link struct {
 	compUnits []*sym.CompilationUnit // DWARF compilation units
 	runtimeCU *sym.CompilationUnit   // One of the runtime CUs, the last one seen.
 
-	loader  *loader.Loader
-	cgodata []cgodata // cgo directives to load, three strings are args for loadcgo
+	loader   *loader.Loader
+	cgodata  []cgodata // cgo directives to load, three strings are args for loadcgo
+	corodata []corodata
 
 	datap  []loader.Sym
 	dynexp []loader.Sym
@@ -128,6 +130,11 @@ type cgodata struct {
 	file       string
 	pkg        string
 	directives [][]string
+}
+
+type corodata struct {
+	file     string
+	manifest *coroobj.Manifest
 }
 
 func (ctxt *Link) Logf(format string, args ...any) {

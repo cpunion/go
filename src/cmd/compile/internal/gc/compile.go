@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/liveness"
 	"cmd/compile/internal/objw"
@@ -22,6 +23,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/walk"
 	"cmd/internal/obj"
+	"internal/buildcfg"
 )
 
 // "Portable" code generation.
@@ -102,7 +104,8 @@ func prepareFunc(fn *ir.Func) {
 	// Set up the function's LSym early to avoid data races with the assemblers.
 	// Do this before walk, as walk needs the LSym to set attributes/relocations
 	// (e.g. in MarkTypeUsedInInterface).
-	ir.InitLSym(fn, true)
+	coroObject := buildcfg.Experiment.Coro && base.Debug.CoroObject != "" && coro.BasicObjectCandidate(fn)
+	ir.InitLSym(fn, !coroObject)
 
 	// If this function is a compiler-generated outlined global map
 	// initializer function, register its LSym for later processing.
@@ -127,7 +130,9 @@ func prepareFunc(fn *ir.Func) {
 	}
 	ir.CurFunc = nil // enforce no further uses of CurFunc
 
-	base.Ctxt.DwTextCount++
+	if !coroObject {
+		base.Ctxt.DwTextCount++
+	}
 }
 
 // compileFunctions compiles all functions in compilequeue.

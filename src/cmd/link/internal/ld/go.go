@@ -8,6 +8,7 @@ package ld
 
 import (
 	"cmd/internal/bio"
+	"cmd/internal/coroobj"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
@@ -16,6 +17,7 @@ import (
 	"debug/elf"
 	"encoding/json"
 	"fmt"
+	"internal/buildcfg"
 	"io"
 	"os"
 	"sort"
@@ -48,11 +50,15 @@ func ldpkg(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, filename s
 	data := string(bdata)
 
 	// process header lines
+	coroHeaders := 0
 	for data != "" {
 		var line string
 		line, data, _ = strings.Cut(data, "\n")
 		if line == "main" {
 			lib.Main = true
+		}
+		if line == coroobj.Header {
+			coroHeaders++
 		}
 		if line == "" {
 			break
@@ -81,6 +87,77 @@ func ldpkg(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, filename s
 		}
 		p1 += p0
 		loadcgo(ctxt, filename, objabi.PathToPrefix(lib.Pkg), data[p0:p1])
+	}
+
+	// Look for the coroutine native-object manifest.
+	sectionHeader := "\n$$  // " + coroobj.Section
+	coroManifests := strings.Count(data, sectionHeader)
+	p0 = strings.Index(data, sectionHeader)
+	hasCoroManifest := coroManifests != 0
+	if hasCoroManifest {
+		i := strings.IndexByte(data[p0+1:], '\n')
+		if i < 0 {
+			fmt.Fprintf(os.Stderr, "%s: found $$ // %s but no newline in %s\n", os.Args[0], coroobj.Section, filename)
+			nerrors++
+			return
+		}
+		p0 += 1 + i
+
+		p1 = strings.Index(data[p0:], "\n$$")
+		if p1 < 0 {
+			p1 = strings.Index(data[p0:], "\n!\n")
+		}
+		if p1 < 0 {
+			fmt.Fprintf(os.Stderr, "%s: cannot find end of // %s section in %s\n", os.Args[0], coroobj.Section, filename)
+			nerrors++
+			return
+		}
+		p1 += p0
+		loadcoro(ctxt, filename, data[p0:p1])
+	}
+	if coroHeaders != 0 || hasCoroManifest {
+		if coroHeaders != 1 || coroManifests != 1 {
+			fmt.Fprintf(os.Stderr, "%s: %s: coroutine object header count is %d, manifest count is %d\n", os.Args[0], filename, coroHeaders, coroManifests)
+			nerrors++
+		}
+	}
+}
+
+func loadcoro(ctxt *Link, file, data string) {
+	manifest, err := coroobj.Decode(strings.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %s: failed decoding coroutine object manifest: %v\n", os.Args[0], file, err)
+		nerrors++
+		return
+	}
+	if manifest.GOOS != buildcfg.GOOS || manifest.GOARCH != buildcfg.GOARCH {
+		fmt.Fprintf(os.Stderr, "%s: %s: coroutine object target is %s/%s, want %s/%s\n", os.Args[0], file, manifest.GOOS, manifest.GOARCH, buildcfg.GOOS, buildcfg.GOARCH)
+		nerrors++
+		return
+	}
+	ctxt.corodata = append(ctxt.corodata, corodata{file: file, manifest: manifest})
+}
+
+func setCoroAttr(ctxt *Link, data corodata) {
+	l := ctxt.loader
+	for _, definition := range data.manifest.Symbols {
+		abi := obj.ABI(definition.GoABI)
+		s := l.LookupOrCreateSym(definition.GoName, sym.ABIToVersion(abi))
+		kind := l.SymType(s)
+		if kind != 0 && kind != sym.SXREF && kind != sym.SHOSTOBJ {
+			fmt.Fprintf(os.Stderr, "%s: %s: coroutine symbol %s<%d> already has type %s\n", os.Args[0], data.file, definition.GoName, definition.GoABI, kind)
+			nerrors++
+			continue
+		}
+		if old := l.SymExtname(s); old != definition.GoName && old != definition.HostName {
+			fmt.Fprintf(os.Stderr, "%s: %s: coroutine symbol %s<%d> maps to both %s and %s\n", os.Args[0], data.file, definition.GoName, definition.GoABI, old, definition.HostName)
+			nerrors++
+			continue
+		}
+		su := l.MakeSymbolUpdater(s)
+		su.SetType(sym.SHOSTOBJ)
+		su.SetSize(0)
+		l.SetSymExtname(s, definition.HostName)
 	}
 }
 

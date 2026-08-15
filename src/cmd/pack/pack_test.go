@@ -333,6 +333,32 @@ func TestCreateWithCompilerObj(t *testing.T) {
 		t.Errorf("packed file with different size: want %d, got %d", want, got)
 	}
 
+	// Compiler-generated archives may contain native objects in addition to
+	// __.PKGDEF and _go_.o. Keep those objects as separate archive members.
+	const nativeContents = "native object\n"
+	if err := os.WriteFile(filepath.Join(dir, "native.o"), []byte(nativeContents), 0666); err != nil {
+		t.Fatal(err)
+	}
+	run(packPath(t), "r", "p.a", "native.o")
+	run(packPath(t), "c", "packed-native.a", "p.a")
+	if got, want := run(packPath(t), "t", "packed-native.a"), "__.PKGDEF\np.a\nnative.o\n"; got != want {
+		t.Fatalf("packed archive entries = %q, want %q", got, want)
+	}
+	if got := run(packPath(t), "p", "packed-native.a", "native.o"); got != nativeContents {
+		t.Fatalf("packed native object = %q, want %q", got, nativeContents)
+	}
+	fi, err = os.Stat(filepath.Join(dir, "p.a"))
+	if err != nil {
+		t.Fatalf("stat p.a with native object failed: %v", err)
+	}
+	fi2, err = os.Stat(filepath.Join(dir, "packed-native.a"))
+	if err != nil {
+		t.Fatalf("stat packed-native.a failed: %v", err)
+	}
+	if want, got := fi.Size(), fi2.Size(); want != got {
+		t.Errorf("packed file with native object has different size: want %d, got %d", want, got)
+	}
+
 	// Test -linkobj flag as well.
 	run(goBin, "tool", "compile", "-p=p", "-linkobj", "p2.a", "-o", "p.x", "p.go")
 	run(packPath(t), "c", "packed2.a", "p2.a")

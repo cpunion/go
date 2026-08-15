@@ -260,6 +260,127 @@ func TestBasicLLVMExecution(t *testing.T) {
 	}
 }
 
+func TestBasicObjectLink(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("external object/link test is supported on Darwin and Linux")
+	}
+	clang := llvmTool(t, "LLVM_CLANG", "clang", "clang-20", "clang-19", "clang-18")
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/coroobject\n\ngo 1.28\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	program := `package main
+
+import _ "runtime/cgo"
+
+func yieldOnce()
+
+//go:noinline
+func leaf() int64 {
+	yieldOnce()
+	return 42
+}
+
+func main() {
+	if got := leaf(); got != 42 {
+		panic(got)
+	}
+	println("coro-object-ok")
+}
+`
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(program), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// An assembly file tells cmd/go that declarations without Go bodies are
+	// permitted. The coroutine backend removes the yieldOnce call, so the file
+	// does not need to define a symbol.
+	if err := os.WriteFile(filepath.Join(tmp, "marker.s"), []byte("// Coroutine suspension marker.\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	gcflags := "example.com/coroobject=-l -d=coroobject=" + clang
+	env := append(os.Environ(),
+		"GOEXPERIMENT=coro",
+		"GOCACHE="+filepath.Join(tmp, "gocache"),
+		"GOWORK=off",
+		"CC="+clang,
+	)
+	exe := filepath.Join(tmp, "coro-object")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", exe,
+		"-gcflags="+gcflags,
+		"-ldflags=-extld="+clang,
+		".")
+	cmd.Dir = tmp
+	cmd.Env = env
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("object/link build failed: %v\n%s", err, data)
+	}
+	if want := "action=emit-native-object"; !strings.Contains(string(data), want) {
+		t.Fatalf("compiler output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, exe)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("object/link executable failed: %v\n%s", err, data)
+	} else if got, want := strings.TrimSpace(string(data)), "coro-object-ok"; got != want {
+		t.Fatalf("object/link executable output = %q, want %q", got, want)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "list",
+		"-export", "-f={{.Export}}", "-gcflags="+gcflags, ".")
+	cmd.Dir = tmp
+	cmd.Env = env
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	data, err = cmd.Output()
+	if err != nil {
+		t.Fatalf("listing package archive failed: %v\n%s", err, stderr.String())
+	}
+	archive := strings.TrimSpace(string(data))
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "pack", "t", archive)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("listing archive members failed: %v\n%s", err, data)
+	}
+	var nativeObjects int
+	for _, name := range strings.Fields(string(data)) {
+		if strings.HasPrefix(name, "co") && strings.HasSuffix(name, ".o") && len(name) == 16 {
+			nativeObjects++
+		}
+	}
+	if nativeObjects != 1 {
+		t.Fatalf("archive contains %d coroutine native objects, want 1\n%s", nativeObjects, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", archive)
+	data, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading package symbols failed: %v\n%s", err, data)
+	}
+	if want := "go_coro_"; !strings.Contains(string(data), want) {
+		t.Fatalf("package symbols do not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "build",
+		"-o", filepath.Join(tmp, "internal-link"),
+		"-gcflags="+gcflags,
+		"-ldflags=-linkmode=internal",
+		".")
+	cmd.Dir = tmp
+	cmd.Env = env
+	data, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("internal link unexpectedly succeeded\n%s", data)
+	}
+	if want := "a package contains LLVM coroutine objects"; !strings.Contains(string(data), want) {
+		t.Fatalf("internal-link error does not contain %q\n%s", want, data)
+	}
+}
+
 func TestBasicLLVMRejectsUnsupportedShape(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
@@ -323,6 +444,19 @@ func TestBasicLLVMExperimentGate(t *testing.T) {
 		t.Fatalf("compile unexpectedly succeeded\n%s", data)
 	}
 	if want := "-d=corobasic requires GOEXPERIMENT=coro"; !strings.Contains(string(data), want) {
+		t.Fatalf("compiler output does not contain %q\n%s", want, data)
+	}
+
+	cmd = testenv.Command(t, testenv.GoToolPath(t),
+		"tool", "compile",
+		"-d=coroobject=clang",
+		"-o", filepath.Join(tmp, "p.o"), src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=nocoro")
+	data, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("object compile unexpectedly succeeded\n%s", data)
+	}
+	if want := "-d=coroobject requires GOEXPERIMENT=coro"; !strings.Contains(string(data), want) {
 		t.Fatalf("compiler output does not contain %q\n%s", want, data)
 	}
 }
