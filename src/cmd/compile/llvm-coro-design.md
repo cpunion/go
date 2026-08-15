@@ -373,7 +373,8 @@ connected-socket 物理纵切的 `dev.coro`。本次继续采用 merge 而不是
 官方变化主要位于 escape analysis walk、`walk` 的 makeslicecopy 优化、`cmd/go` 加载
 队列和 tool listing，以及 SIMD 生成器。merge 后 native Darwin/arm64 的默认与
 `GOEXPERIMENT=coro` 三阶段 bootstrap、convergence/staleness 检查，以及完整
-`cmd/compile/... internal/pkgbits internal/buildcfg` suite 均通过。该 topic 不修改
+`cmd/compile/... internal/pkgbits internal/buildcfg` suite 均通过；Linux/arm64 的
+coroutine bootstrap、convergence/staleness 和同一完整 suite 也通过。该 topic 不修改
 coroutine 分析、ABI、renderer 或 runtime 行为；它只建立下一批真实标准库 lowering
 工作的共同官方基线。
 
