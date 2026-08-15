@@ -97,31 +97,58 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 
 func TestBasicObjectLLVMTarget(t *testing.T) {
 	tests := []struct {
-		name   string
-		goos   string
-		goarch string
-		want   string
-		bad    bool
+		name      string
+		goos      string
+		goarch    string
+		wants     []string
+		unwanted  []string
+		wantError string
 	}{
-		{"darwin arm64", "darwin", "arm64", "@pthread_join(ptr", false},
-		{"linux amd64", "linux", "amd64", "@pthread_join(i64", false},
-		{"unsupported system", "freebsd", "amd64", "freebsd/amd64", true},
-		{"unsupported architecture", "linux", "386", "linux/386", true},
+		{
+			name:     "darwin arm64",
+			goos:     "darwin",
+			goarch:   "arm64",
+			wants:    []string{"@pthread_join(ptr"},
+			unwanted: []string{"alignstack(16)", "%xmm15"},
+		},
+		{
+			name:   "linux amd64",
+			goos:   "linux",
+			goarch: "amd64",
+			wants: []string{
+				"@pthread_join(i64",
+				"define i64 @host() alignstack(16)",
+				"xorps %xmm15, %xmm15",
+			},
+		},
+		{name: "unsupported system", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
+		{name: "unsupported architecture", goos: "linux", goarch: "386", wantError: "linux/386"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			module, err := renderBasicObjectLLVMForTarget("host", 42, test.goos, test.goarch)
-			if test.bad {
-				if err == nil || !strings.Contains(err.Error(), test.want) {
-					t.Fatalf("error = %v, want error containing %q", err, test.want)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(module), test.want) {
-				t.Fatalf("module does not contain %q", test.want)
+			text := string(module)
+			for _, want := range test.wants {
+				if !strings.Contains(text, want) {
+					t.Errorf("module does not contain %q", want)
+				}
+			}
+			for _, unwanted := range test.unwanted {
+				if strings.Contains(text, unwanted) {
+					t.Errorf("module unexpectedly contains %q", unwanted)
+				}
+			}
+			if strings.Contains(text, "{{") {
+				t.Fatal("module contains an unreplaced template marker")
 			}
 		})
 	}
