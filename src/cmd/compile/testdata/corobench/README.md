@@ -1286,3 +1286,63 @@ The mixed six-probe run moved the logical-yield control by 2.56%. A separate
 result therefore extends the compact structured-frame benefit beneath the
 production push scheduler without regressing its established homogeneous
 fast path.
+
+#### Exact-upstream performance checkpoint
+
+Revision `ba32b8ecb3` was also compared with an unmodified toolchain built at
+the exact merged Go development revision, `41a1646f6d`. This is a comparison
+of the complete coroutine experiment, not an attribution to heterogeneous
+frame fusion alone. The focused native Darwin/arm64 run used an Apple M4 Max,
+disabled inlining, one P, two warm-up pairs, and 12 alternating 500 ms
+samples. Host load remained elevated, but the focused rerun greatly narrowed
+the earlier full-suite distributions and reproduced every architectural
+difference below.
+
+| Probe | Official Go | Coroutine experiment | Change |
+| --- | ---: | ---: | ---: |
+| logical yield batch | 48.86 ns | 18.89 ns | -61.33% |
+| public task entry | 47.21 ns | 1.060 us | +2,145.29% |
+| recursive yield, depth 4,096 | 18.68 us | 244.12 us | +1,206.69% |
+| mutual yield, depth 4,096 | 18.19 us | 322.75 us | +1,673.91% |
+| park 100 tasks | 14.58 us | 29.09 us | +99.57% |
+| sleep for one nanosecond | 124.6 ns | 5.766 us | +4,525.35% |
+| ready file read | 313.2 ns | 372.4 ns | +18.88% |
+| ready TCP read | 270.1 ns | 322.0 ns | +19.24% |
+| scalar C call | 17.72 ns | 13.89 ns | -21.59% |
+| blocking C handoff | 60.95 us | 15.93 us | -73.86% |
+| eight concurrent blocking C calls | 525.0 us | 164.1 us | -68.75% |
+
+The blocking-C progress metric improved from 59.14 us to 5.900 us per
+observed scheduler step (-90.02%), and the eight-call entry cost improved
+from 58.07 us to 6.008 us per call (-89.65%). The current group-of-eight
+path allocates 321 bytes in 24 allocations while the official cgo path
+allocates nothing. Blocking file and TCP round trips were directionally
+faster in both the full and focused runs, but the coroutine distributions
+remained too wide to use those two rows as release thresholds. Ready file and
+TCP paths allocate nothing in either toolchain.
+
+Deep stackless calls still pay for explicit heap frames that the official
+growable stack avoids. At depth 4,096, homogeneous recursion used 210.2 KiB
+in 965 allocations and mutual recursion used 300.0 KiB in 3,840 allocations;
+the official benchmark allocated nothing. Conversely, four independent
+10,000-task footprint processes found a smaller parked representation:
+
+| Parked-task metric | Official Go | Coroutine experiment | Change |
+| --- | ---: | ---: | ---: |
+| allocated bytes | 5.942 MiB | 3.248 MiB | -45.34% |
+| allocation count | 20.02k | 40.04k | +100.00% |
+| live heap bytes per task | 623.1 | 340.6 | -45.34% |
+| live objects per task | 2.002 | 3.253 | +62.49% |
+| live stack bytes per task | 2,048.0 | 6.554 | -99.68% |
+| create and park 10,000 tasks | 6.648 ms | 164.484 ms | +2,374.19% |
+
+The full eight-pair run also kept fixed-work multi-P scaling close to
+official Go: 535.4 versus 539.6 us at one P, 290.8 versus 294.3 us at two P,
+and 165.6 versus 168.6 us at four P. The remaining priorities are therefore
+entry and parking construction cost, timer wakeup, ready-I/O overhead, and
+further compact-frame allocation reduction. Transparent C calls and blocking
+M replacement already show the intended performance advantage. The
+push-versus-pull measurements in `PUSH_PULL.md` separately show that compact
+structured ownership, rather than pull polling itself, is the productive way
+to reduce the deep-frame and GC costs while retaining push-based goroutine
+semantics.
