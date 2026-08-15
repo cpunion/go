@@ -462,11 +462,19 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 	yield := newLowerTestFunc(pkg, "yield")
 	leaf := newLowerTestFunc(pkg, "leaf")
 	yieldCall := newLowerTestCall(yield)
-	leaf.Body = ir.Nodes{yieldCall, newLowerTestReturn()}
+	leafCallSelf := newLowerTestCall(leaf)
+	leaf.Body = ir.Nodes{yieldCall, leafCallSelf, newLowerTestReturn()}
 	leafFunction := &Function{
 		Func: leaf, Local: MaySuspend, Effect: MaySuspend,
 		Primary: CoroPrimary,
-		Sites:   []Site{{ID: 1, Kind: SiteYield, Node: yieldCall}},
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: leaf,
+			CalleeName: symbolName(leaf.Nname), Node: leafCallSelf,
+		}},
+		Sites: []Site{
+			{ID: 1, Kind: SiteYield, Node: yieldCall},
+			{ID: 2, Kind: SiteAwait, Node: leafCallSelf},
+		},
 	}
 
 	caller := newLowerTestFunc(pkg, "caller")
@@ -539,15 +547,15 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 			runtimeCalls[name]++
 		})
 	}
-	for _, name := range []string{
-		"runtime.coroRequestFusedFrame",
-		"runtime.coroTakeFusedFrame",
-		"runtime.coroAwaitFusedFrame",
-		"runtime.coroCompleteFusedFrame",
+	for name, want := range map[string]int{
+		"runtime.coroRequestFusedFrame":  1,
+		"runtime.coroTakeFusedFrame":     1,
+		"runtime.coroAwaitFusedFrame":    2,
+		"runtime.coroCompleteFusedFrame": 1,
 	} {
-		if runtimeCalls[name] != 1 {
-			t.Errorf("heterogeneous lowering has %d %s calls, want one",
-				runtimeCalls[name], name)
+		if runtimeCalls[name] != want {
+			t.Errorf("heterogeneous lowering has %d %s calls, want %d",
+				runtimeCalls[name], name, want)
 		}
 	}
 }
