@@ -2,8 +2,8 @@
 
 状态：架构设计稿；已完成 Phase 0、pre-lower handoff、受限可执行 LLVM coroutine
 basic example、单函数 Go object/archive/external-link ownership、push scheduler、native
-timer event，以及 blocking file executor handoff 纵切；typed structured await、runtime
-timer/file/net adapter 和普通标准库 lowering 尚未接入
+timer event、blocking file executor handoff，以及 connected stream socket 纵切；typed
+structured await、runtime timer/file/net adapter 和普通标准库 lowering 尚未接入
 
 更新时间：2026-08-15
 
@@ -11,7 +11,7 @@ timer/file/net adapter 和普通标准库 lowering 尚未接入
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 implementation topic/worktree：`dev.coro-file-operation-20260815`
+当前 implementation topic/worktree：`dev.coro-socket-operation-20260815`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -338,6 +338,30 @@ single-owner 约束和 direct native call ABI。
 blocking-file archive/link/executable 用例各连续通过三次。GitHub Ubuntu runner 负责
 native Linux/amd64 完整 suite 的最终门禁。新增 recipe 选择和 renderer 的 changed Go
 functions 均被测试覆盖。
+
+### 1.8 Connected stream socket 与 executor handoff 纵切
+
+`dev.coro-socket-operation-20260815` 复用第 1.7 节的 blocking-FD scheduler 和所有权
+协议，但用 `socketpair(AF_UNIX, SOCK_STREAM)` 建立 connected stream socket，并把直接
+`read`/`write` 换成 libc `recv`/`send`。调用线程在空 socket 上阻塞 `recv`；replacement
+pthread 独占 push queue，至少推进 sibling stackless task 8 次后由 sibling `send` 一个
+字节释放调用线程。最终检查仍要求线程身份不同、精确单字节 I/O、operation consumed、
+ownership 归还、replacement join 和空 queue。
+
+file 和 socket recipe 共用同一份 scheduler IR 模板，只把 FD 初始化和 I/O call 作为
+受限 recipe 参数，避免复制 queue、operation 和 M-handoff 状态机。`AF_UNIX` 与
+`SOCK_STREAM` 在当前支持的 Darwin/Linux target 上均为 1；其他 target 仍由统一 target
+gate fail closed。
+
+这个 slice 验证阻塞 socket call 不占住唯一 stackless executor，但不是 TCP 或 production
+netpoll。它没有 listener/connect/accept、nonblocking retry、deadline/cancel、poll token、
+DNS 或 `net.Conn.Read` lowering。下一阶段必须把同一 operation publication contract 接到
+runtime netpoll，并用 loopback TCP、deadline 和关闭竞态验证一次完成与取消语义。
+
+该 slice 已在 native Darwin/arm64 和 Linux/arm64 上通过 coroutine toolchain build 与
+完整 compiler suite；Darwin 上的 timer/file/socket archive/link/executable 路径各连续
+通过五次，Linux/amd64 上各连续通过三次。新增及修改 renderer 的 changed Go functions
+均为 100% statement coverage。
 
 ## 2. 结论
 
@@ -1626,7 +1650,8 @@ go/no-go 验证。
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
 | native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
 | blocking file read、replacement executor、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
-| `time.Sleep` lowering、timer service、net event、普通 file lowering、三包 structured await | 未实现 |
+| connected stream socket、blocking recv/send、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
+| `time.Sleep` lowering、timer service、TCP/netpoll、普通 file lowering、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
 第 4、5 个物理路径问题，并验证了最小单线程 scheduler 所有权；但不能替代第 19.4

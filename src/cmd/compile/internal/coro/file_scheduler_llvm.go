@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+type blockingObjectLLVMRecipe struct {
+	namespace    string
+	declarations string
+	initialize   string
+	read         string
+	write        string
+}
+
 // renderFileObjectLLVMForTarget emits the blocking-file vertical slice used
 // by the restricted object-link example. The calling thread remains in read
 // while a replacement native thread owns the scheduler queue and advances a
@@ -16,6 +24,20 @@ import (
 // relinquishes queue ownership, and exits before the calling thread resumes
 // scheduler mutation.
 func renderFileObjectLLVMForTarget(hostName string, value int64, goos, goarch string) ([]byte, error) {
+	return renderBlockingObjectLLVMForTarget(hostName, value, goos, goarch, blockingObjectLLVMRecipe{
+		namespace: "file",
+		declarations: `declare i32 @pipe(ptr)
+declare i64 @read(i32, ptr, i64)
+declare i64 @write(i32, ptr, i64)`,
+		initialize: `  %pipe.status = call i32 @pipe(ptr %fds.ptr)
+  %pipe.ok = icmp eq i32 %pipe.status, 0
+  br i1 %pipe.ok, label %initialize.io, label %fail.free`,
+		read:  "call i64 @read(i32 %read.fd, ptr %read.byte.ptr, i64 1)",
+		write: "call i64 @write(i32 %write.fd, ptr %write.byte.ptr, i64 1)",
+	})
+}
+
+func renderBlockingObjectLLVMForTarget(hostName string, value int64, goos, goarch string, recipe blockingObjectLLVMRecipe) ([]byte, error) {
 	target, err := basicObjectTargetFor(goos, goarch)
 	if err != nil {
 		return nil, err
@@ -24,6 +46,11 @@ func renderFileObjectLLVMForTarget(hostName string, value int64, goos, goarch st
 		"{{HOST}}", hostName,
 		"{{VALUE0}}", strconv.FormatInt(value, 10),
 		"{{VALUE1}}", strconv.FormatInt(value+1, 10),
+		"{{IO_NAMESPACE}}", recipe.namespace,
+		"{{IO_DECLARATIONS}}", recipe.declarations,
+		"{{IO_INITIALIZE}}", recipe.initialize,
+		"{{IO_READ}}", recipe.read,
+		"{{IO_WRITE}}", recipe.write,
 		"{{PTHREAD_T}}", target.pthreadType,
 		"{{WRAPPER_ATTRIBUTES}}", target.wrapperAttributes,
 		"{{GO_ABI_RETURN}}", target.goABIReturn,
@@ -52,12 +79,10 @@ const fileSchedulerLLVM = basicSchedulerCoreLLVM + `
 
 declare {{PTHREAD_T}} @pthread_self()
 declare i32 @pthread_equal({{PTHREAD_T}}, {{PTHREAD_T}})
-declare i32 @pipe(ptr)
-declare i64 @read(i32, ptr, i64)
-declare i64 @write(i32, ptr, i64)
+{{IO_DECLARATIONS}}
 declare i32 @close(i32)
 
-define internal i1 @file.fail(ptr %file) {
+define internal i1 @{{IO_NAMESPACE}}.fail(ptr %file) {
 entry:
   %failed.ptr = getelementptr inbounds %file, ptr %file, i32 0, i32 7
   store atomic i8 1, ptr %failed.ptr release, align 1
@@ -112,14 +137,14 @@ write.byte:
   %write.fd.ptr = getelementptr inbounds [2 x i32], ptr %fds.ptr, i32 0, i32 1
   %write.fd = load i32, ptr %write.fd.ptr, align 4
   %write.byte.ptr = getelementptr inbounds %file, ptr %file, i32 0, i32 15
-  %write.count = call i64 @write(i32 %write.fd, ptr %write.byte.ptr, i64 1)
+  %write.count = {{IO_WRITE}}
   %write.count.ptr = getelementptr inbounds %file, ptr %file, i32 0, i32 10
   store atomic i64 %write.count, ptr %write.count.ptr release, align 8
   %write.ok = icmp eq i64 %write.count, 1
   br i1 %write.ok, label %write.complete, label %write.failed
 
 write.failed:
-  %failure = call i1 @file.fail(ptr %file)
+  %failure = call i1 @{{IO_NAMESPACE}}.fail(ptr %file)
   br label %progress.yield
 
 write.complete:
@@ -150,7 +175,7 @@ blocker.start:
 
 create.replacement:
   %thread.ptr = getelementptr inbounds %file, ptr %blocker.file, i32 0, i32 12
-  %create.status = call i32 @pthread_create(ptr %thread.ptr, ptr null, ptr @file.replacement.thread, ptr %blocker.state)
+  %create.status = call i32 @pthread_create(ptr %thread.ptr, ptr null, ptr @{{IO_NAMESPACE}}.replacement.thread, ptr %blocker.state)
   %created = icmp eq i32 %create.status, 0
   br i1 %created, label %wait.replacement, label %create.failed
 
@@ -177,7 +202,7 @@ handoff:
   %read.fd.ptr = getelementptr inbounds [2 x i32], ptr %blocker.fds.ptr, i32 0, i32 0
   %read.fd = load i32, ptr %read.fd.ptr, align 4
   %read.byte.ptr = getelementptr inbounds %file, ptr %blocker.file, i32 0, i32 16
-  %read.count = call i64 @read(i32 %read.fd, ptr %read.byte.ptr, i64 1)
+  %read.count = {{IO_READ}}
   %read.count.ptr = getelementptr inbounds %file, ptr %blocker.file, i32 0, i32 9
   store atomic i64 %read.count, ptr %read.count.ptr release, align 8
   br label %wait.replacement.done
@@ -244,7 +269,7 @@ after.park:
   br i1 %consumed, label %complete, label %consume.failed
 
 arm.failed:
-  %arm.failure = call i1 @file.fail(ptr %blocker.file)
+  %arm.failure = call i1 @{{IO_NAMESPACE}}.fail(ptr %blocker.file)
   %arm.read.done.ptr = getelementptr inbounds %file, ptr %blocker.file, i32 0, i32 5
   store atomic i8 1, ptr %arm.read.done.ptr release, align 1
   %arm.result.ptr.ptr = getelementptr inbounds %task, ptr %task, i32 0, i32 4
@@ -300,7 +325,7 @@ suspend:
   ret ptr %hdl
 }
 
-define internal i1 @file.task.init(ptr %state, ptr %task, ptr %operation, ptr %result, i32 %id, i64 %value) {
+define internal i1 @{{IO_NAMESPACE}}.task.init(ptr %state, ptr %task, ptr %operation, ptr %result, i32 %id, i64 %value) {
 entry:
   store %task zeroinitializer, ptr %task, align 8
   store %operation zeroinitializer, ptr %operation, align 8
@@ -443,7 +468,7 @@ reject:
   ret i1 false
 }
 
-define internal ptr @file.replacement.thread(ptr %scheduler) {
+define internal ptr @{{IO_NAMESPACE}}.replacement.thread(ptr %scheduler) {
 entry:
   %file = getelementptr inbounds %scheduler, ptr %scheduler, i32 0, i32 9
   %self = call {{PTHREAD_T}} @pthread_self()
@@ -471,7 +496,7 @@ drive:
   br i1 %ran, label %finish, label %fail
 
 fail:
-  %failed = call i1 @file.fail(ptr %file)
+  %failed = call i1 @{{IO_NAMESPACE}}.fail(ptr %file)
   br label %finish
 
 finish:
@@ -492,11 +517,9 @@ initialize:
   store %scheduler zeroinitializer, ptr %state, align 8
   %file = getelementptr inbounds %scheduler, ptr %state, i32 0, i32 9
   %fds.ptr = getelementptr inbounds %file, ptr %file, i32 0, i32 0
-  %pipe.status = call i32 @pipe(ptr %fds.ptr)
-  %pipe.ok = icmp eq i32 %pipe.status, 0
-  br i1 %pipe.ok, label %initialize.file, label %fail.free
+{{IO_INITIALIZE}}
 
-initialize.file:
+initialize.io:
   %write.byte.ptr = getelementptr inbounds %file, ptr %file, i32 0, i32 15
   store i8 70, ptr %write.byte.ptr, align 1
   %original = call {{PTHREAD_T}} @pthread_self()
@@ -509,11 +532,11 @@ initialize.file:
   %operation1 = getelementptr inbounds %scheduler, ptr %state, i32 0, i32 4
   %result0 = getelementptr inbounds %scheduler, ptr %state, i32 0, i32 5
   %result1 = getelementptr inbounds %scheduler, ptr %state, i32 0, i32 6
-  %init1 = call i1 @file.task.init(ptr %state, ptr %task1, ptr %operation1, ptr %result1, i32 1, i64 {{VALUE1}})
+  %init1 = call i1 @{{IO_NAMESPACE}}.task.init(ptr %state, ptr %task1, ptr %operation1, ptr %result1, i32 1, i64 {{VALUE1}})
   br i1 %init1, label %init.progress, label %fail.close
 
 init.progress:
-  %init0 = call i1 @file.task.init(ptr %state, ptr %task0, ptr %operation0, ptr %result0, i32 0, i64 {{VALUE0}})
+  %init0 = call i1 @{{IO_NAMESPACE}}.task.init(ptr %state, ptr %task0, ptr %operation0, ptr %result0, i32 0, i64 {{VALUE0}})
   br i1 %init0, label %loop, label %fail.close
 
 loop:
