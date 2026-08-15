@@ -33,14 +33,33 @@ type objectArtifact struct {
 	symbol coroobj.Symbol
 }
 
+type basicObjectRecipe uint8
+
+const (
+	basicObjectRecipeNone basicObjectRecipe = iota
+	basicObjectRecipeTimer
+	basicObjectRecipeFile
+)
+
+func basicObjectRecipeForName(name string) basicObjectRecipe {
+	switch {
+	case strings.HasSuffix(name, ".yieldOnce"):
+		return basicObjectRecipeTimer
+	case strings.HasSuffix(name, ".blockingReadOnce"):
+		return basicObjectRecipeFile
+	default:
+		return basicObjectRecipeNone
+	}
+}
+
 var objectArtifacts struct {
 	sync.Mutex
 	list []objectArtifact
 }
 
-// BasicObjectCandidate reports whether fn contains the private suspension
-// marker used by the object/link vertical slice. The final SSA recognizer
-// still validates the complete function shape before taking ownership.
+// BasicObjectCandidate reports whether fn contains a private suspension
+// marker used by an object/link vertical slice. The final SSA recognizer still
+// validates the complete function shape before taking ownership.
 func BasicObjectCandidate(fn *ir.Func) bool {
 	markers := 0
 	ir.Visit(fn, func(n ir.Node) {
@@ -49,7 +68,7 @@ func BasicObjectCandidate(fn *ir.Func) bool {
 			return
 		}
 		name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
-		if strings.HasSuffix(symbolName(name), ".yieldOnce") {
+		if basicObjectRecipeForName(symbolName(name)) != basicObjectRecipeNone {
 			markers++
 		}
 	})
@@ -144,14 +163,22 @@ func basicObjectLLVMModule(f *ssa.Func) (goName, hostName string, module []byte,
 
 func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, hostName string, module []byte, matched bool, err error) {
 	var markerCalls []*ssa.Value
+	recipe := basicObjectRecipeNone
 	calls := 0
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			if v.Op.IsCall() {
 				calls++
 			}
-			if v.Op == ssa.OpStaticCall && strings.HasSuffix(callName(v), ".yieldOnce") {
+			if v.Op == ssa.OpStaticCall {
+				candidate := basicObjectRecipeForName(callName(v))
+				if candidate == basicObjectRecipeNone {
+					continue
+				}
 				markerCalls = append(markerCalls, v)
+				if recipe == basicObjectRecipeNone {
+					recipe = candidate
+				}
 			}
 		}
 	}
@@ -159,7 +186,7 @@ func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, h
 		return "", "", nil, false, nil
 	}
 	if len(markerCalls) != 1 {
-		return "", "", nil, true, fmt.Errorf("found %d yieldOnce calls, want exactly 1", len(markerCalls))
+		return "", "", nil, true, fmt.Errorf("found %d coroutine marker calls, want exactly 1", len(markerCalls))
 	}
 	if calls != 1 {
 		return "", "", nil, true, fmt.Errorf("function has %d calls, want exactly 1", calls)
@@ -181,11 +208,11 @@ func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, h
 	}
 	call := markerCalls[0]
 	if len(call.Args) != 1 {
-		return "", "", nil, true, fmt.Errorf("yieldOnce call has %d arguments, want only memory", len(call.Args))
+		return "", "", nil, true, fmt.Errorf("coroutine marker call has %d arguments, want only memory", len(call.Args))
 	}
 	memory := result.Args[1]
 	if memory.Op != ssa.OpSelectN || memory.AuxInt != 0 || len(memory.Args) != 1 || memory.Args[0] != call {
-		return "", "", nil, true, fmt.Errorf("return memory is not yieldOnce result memory")
+		return "", "", nil, true, fmt.Errorf("return memory is not coroutine marker result memory")
 	}
 	if f.OwnAux == nil || f.OwnAux.Fn == nil || f.OwnAux.Fn.Name == "" {
 		return "", "", nil, true, fmt.Errorf("function has no linker symbol")
@@ -194,7 +221,11 @@ func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, h
 	goName = f.OwnAux.Fn.Name
 	digest := sha256.Sum256([]byte(fmt.Sprintf("%s<%d>", goName, f.ABISelf.Which())))
 	hostName = fmt.Sprintf("go_coro_%x", digest[:8])
-	module, err = renderBasicObjectLLVMForTarget(hostName, value.AuxInt, goos, goarch)
+	render := renderBasicObjectLLVMForTarget
+	if recipe == basicObjectRecipeFile {
+		render = renderFileObjectLLVMForTarget
+	}
+	module, err = render(hostName, value.AuxInt, goos, goarch)
 	if err != nil {
 		return "", "", nil, true, err
 	}

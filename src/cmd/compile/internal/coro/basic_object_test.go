@@ -14,6 +14,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/src"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -27,12 +28,16 @@ type basicObjectFixture struct {
 }
 
 func newBasicObjectFixture() *basicObjectFixture {
+	return newBasicObjectFixtureForMarker("basic.yieldOnce")
+}
+
+func newBasicObjectFixtureForMarker(marker string) *basicObjectFixture {
 	memory := &ssa.Value{ID: 1, Op: ssa.OpInitMem, Type: types.TypeMem}
 	call := &ssa.Value{
 		ID:   2,
 		Op:   ssa.OpStaticCall,
 		Type: types.TypeMem,
-		Aux:  &ssa.AuxCall{Fn: &obj.LSym{Name: "basic.yieldOnce"}},
+		Aux:  &ssa.AuxCall{Fn: &obj.LSym{Name: marker}},
 		Args: []*ssa.Value{memory},
 	}
 	callMemory := &ssa.Value{ID: 3, Op: ssa.OpSelectN, Type: types.TypeMem, Args: []*ssa.Value{call}}
@@ -92,6 +97,93 @@ func TestBasicObjectLLVMModule(t *testing.T) {
 	}
 	if strings.Contains(text, "{{") {
 		t.Fatal("module contains an unreplaced template marker")
+	}
+}
+
+func TestFileObjectLLVMModule(t *testing.T) {
+	x := newBasicObjectFixtureForMarker("basic.blockingReadOnce")
+	goName, hostName, module, matched, err := basicObjectLLVMModule(x.f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("valid file object recipe did not match")
+	}
+	if goName != "example.com/p.leaf" {
+		t.Fatalf("Go symbol = %q, want example.com/p.leaf", goName)
+	}
+	text := string(module)
+	for _, want := range []string{
+		"presplitcoroutine",
+		"define internal i1 @operation.publish",
+		"define internal ptr @file.replacement.thread",
+		"define internal i1 @scheduler.replacement.run",
+		"call i32 @pipe",
+		"call i64 @read",
+		"call i64 @write",
+		"call i32 @pthread_equal",
+		"atomicrmw add",
+		"define i64 @" + hostName + "()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("module does not contain %q", want)
+		}
+	}
+	for _, unwanted := range []string{"@timer.thread", "@nanosleep"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("file module unexpectedly contains %q", unwanted)
+		}
+	}
+	if strings.Contains(text, "{{") {
+		t.Fatal("module contains an unreplaced template marker")
+	}
+}
+
+func TestFileObjectLLVMTarget(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		goos      string
+		goarch    string
+		want      string
+		wantError string
+	}{
+		{name: "darwin arm64", goos: "darwin", goarch: "arm64", want: "declare ptr @pthread_self()"},
+		{name: "linux amd64", goos: "linux", goarch: "amd64", want: "declare i64 @pthread_self()"},
+		{name: "unsupported", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			module, err := renderFileObjectLLVMForTarget("host", 42, test.goos, test.goarch)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(module), test.want) {
+				t.Fatalf("module does not contain %q", test.want)
+			}
+		})
+	}
+}
+
+func TestFileObjectLLVMCompile(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("test requires clang")
+	}
+	module, err := renderFileObjectLLVMForTarget("host", 42, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := compileLLVMObject(clang, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(object) == 0 {
+		t.Fatal("clang produced an empty file object")
 	}
 }
 
@@ -171,7 +263,7 @@ func TestBasicObjectLLVMModuleRejectsUnsupportedSSA(t *testing.T) {
 			call := *x.call
 			call.ID = 6
 			x.block.Values = append(x.block.Values, &call)
-		}, "found 2 yieldOnce calls"},
+		}, "found 2 coroutine marker calls"},
 		{"other call", func(x *basicObjectFixture) {
 			call := *x.call
 			call.ID = 6
@@ -185,7 +277,7 @@ func TestBasicObjectLLVMModuleRejectsUnsupportedSSA(t *testing.T) {
 		{"wrong return control", func(x *basicObjectFixture) { x.result.Op = ssa.OpConst64 }, "want MakeResult"},
 		{"wrong return", func(x *basicObjectFixture) { x.value.Op = ssa.OpConst32 }, "want Const64"},
 		{"wrong call arguments", func(x *basicObjectFixture) { x.call.Args = append(x.call.Args, x.value) }, "want only memory"},
-		{"wrong memory", func(x *basicObjectFixture) { x.result.Args[1] = x.call.Args[0] }, "not yieldOnce result memory"},
+		{"wrong memory", func(x *basicObjectFixture) { x.result.Args[1] = x.call.Args[0] }, "not coroutine marker result memory"},
 		{"missing symbol", func(x *basicObjectFixture) { x.f.OwnAux = nil }, "no linker symbol"},
 		{"empty symbol", func(x *basicObjectFixture) { x.f.OwnAux.Fn.Name = "" }, "no linker symbol"},
 	}
@@ -209,15 +301,17 @@ func TestBasicObjectLLVMModuleRejectsUnsupportedSSA(t *testing.T) {
 
 func TestBasicObjectCandidate(t *testing.T) {
 	pkg := types.NewPkg("example.com/p", "p")
-	name := ir.NewNameAt(src.NoXPos, pkg.Lookup("yieldOnce"), nil)
+	for _, marker := range []string{"yieldOnce", "blockingReadOnce"} {
+		name := ir.NewNameAt(src.NoXPos, pkg.Lookup(marker), nil)
+		name.Class = ir.PFUNC
+		fn := &ir.Func{Body: ir.Nodes{ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, name, nil)}}
+		if !BasicObjectCandidate(fn) {
+			t.Errorf("%s call was not recognized", marker)
+		}
+	}
+	name := ir.NewNameAt(src.NoXPos, pkg.Lookup("other"), nil)
 	name.Class = ir.PFUNC
 	fn := &ir.Func{Body: ir.Nodes{ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, name, nil)}}
-	if !BasicObjectCandidate(fn) {
-		t.Fatal("yieldOnce call was not recognized")
-	}
-	name = ir.NewNameAt(src.NoXPos, pkg.Lookup("other"), nil)
-	name.Class = ir.PFUNC
-	fn.Body = ir.Nodes{ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, name, nil)}
 	if BasicObjectCandidate(fn) {
 		t.Fatal("ordinary call was recognized as an object candidate")
 	}

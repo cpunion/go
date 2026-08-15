@@ -1,8 +1,9 @@
 # 基于 Go 官方编译器的 LLVM Coroutine 自动染色设计
 
 状态：架构设计稿；已完成 Phase 0、pre-lower handoff、受限可执行 LLVM coroutine
-basic example，以及单函数 Go object/archive/external-link ownership 纵切；scheduler、
-structured await、timer 和 I/O 尚未接入
+basic example、单函数 Go object/archive/external-link ownership、push scheduler、native
+timer event，以及 blocking file executor handoff 纵切；typed structured await、runtime
+timer/file/net adapter 和普通标准库 lowering 尚未接入
 
 更新时间：2026-08-15
 
@@ -10,7 +11,7 @@ structured await、timer 和 I/O 尚未接入
 
 长期开发线：`cpunion/go:dev.coro`（只 merge `cpunion/go:main`）
 
-当前 implementation topic/worktree：`dev.coro-object-link-20260815`
+当前 implementation topic/worktree：`dev.coro-file-operation-20260815`
 （向 `cpunion/go:dev.coro` 提交）
 
 ## 1. 调研基线
@@ -307,6 +308,36 @@ compile、CoroSplit、archive、external link 和 executable 测试。
 dispatch 边界 polling、没有 deadline heap/parking primitive、没有 `time.Sleep` 自动
 染色或 runtime timer API adapter。下一步应把同一 release/acquire publication contract
 接到可 park 的 timer service，再让普通 Go `time.Sleep` call site 进入该 operation。
+
+### 1.7 阻塞 file read 与 executor handoff 纵切
+
+`dev.coro-file-operation-20260815` 增加第二个私有 object recipe，不改变 timer recipe。
+它创建空 POSIX pipe，让调用线程直接执行阻塞 `read`；在进入 `read` 前，只把 push queue
+的所有权以 release store 交给一个 replacement pthread。replacement 用 acquire load
+取得所有权后，反复 resume 同一个 sibling stackless task。sibling 至少推进 8 次后直接
+`write` 一个字节，唤醒原调用线程。replacement 退出并被 join 后，原线程才把 owner
+切回并继续 scheduler mutation，因此两个 executor 不会并发修改 queue、task state 或
+operation phase。
+
+scheduler、tasks、operation 和 file handoff 状态放在同一 native heap object；跨线程
+字段只通过原子 publication 共享。最终 executable 校验两个 pthread 身份不同、精确的
+单字节 read/write、progress、join、queue 空状态、两个返回值，以及阻塞 task 的
+early-completion operation 最终进入 `Consumed`。LLVM module 直接调用 libc
+`read`/`write`，不经过 cgo trampoline；测试中的空 assembly marker 只用于触发这个受限
+recipe，不是用户源码注解或长期自动染色接口。
+
+这仍不是生产 Go M handoff。replacement pthread 没有注册成 runtime M，不能执行依赖
+P、G、GC 或 Go stack 的任意代码；当前 no-argument recipe 也没有连接 `os.File.Read`。
+生产路径应保留阻塞调用所在的原 M，通过与 `reentersyscallblock`/`exitsyscall` 等价的
+runtime adapter 把 P 或 stackless scheduler ownership 交给可复用 replacement M，避免
+退化为每次调用创建 worker 的模型。该物理纵切只验证 handoff 的控制流、queue
+single-owner 约束和 direct native call ABI。
+
+该 slice 已在 native Darwin/arm64 和 Linux/arm64 上通过 coroutine toolchain build 与
+完整 `cmd/compile/... internal/pkgbits internal/buildcfg` 测试；Linux/amd64 的 timer 和
+blocking-file archive/link/executable 用例各连续通过三次。GitHub Ubuntu runner 负责
+native Linux/amd64 完整 suite 的最终门禁。新增 recipe 选择和 renderer 的 changed Go
+functions 均被测试覆盖。
 
 ## 2. 结论
 
@@ -1594,7 +1625,8 @@ go/no-go 验证。
 | 单函数 Go object/archive/linker ownership | 已在 Darwin/arm64 受限验证 |
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
 | native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
-| `time.Sleep` lowering、timer service、net/file event、三包 structured await | 未实现 |
+| blocking file read、replacement executor、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
+| `time.Sleep` lowering、timer service、net event、普通 file lowering、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
 第 4、5 个物理路径问题，并验证了最小单线程 scheduler 所有权；但不能替代第 19.4
