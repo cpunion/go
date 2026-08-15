@@ -359,8 +359,9 @@ DNS 或 `net.Conn.Read` lowering。下一阶段必须把同一 operation publica
 runtime netpoll，并用 loopback TCP、deadline 和关闭竞态验证一次完成与取消语义。
 
 该 slice 已在 native Darwin/arm64 和 Linux/arm64 上通过 coroutine toolchain build 与
-完整 compiler suite；Darwin 上的 timer/file/socket archive/link/executable 路径另各连续
-通过五次。新增及修改 renderer 的 changed Go functions 均为 100% statement coverage。
+完整 compiler suite；Darwin 上的 timer/file/socket archive/link/executable 路径各连续
+通过五次，Linux/amd64 上各连续通过三次。新增及修改 renderer 的 changed Go functions
+均为 100% statement coverage。
 
 ## 2. 结论
 
@@ -1649,7 +1650,7 @@ go/no-go 验证。
 | 单线程 push FIFO、early/late operation reentry | 已在 Darwin/arm64 受限验证 |
 | native timer event、跨线程 publication、ready task progress | 已在 Darwin/arm64 与 Linux/amd64 受限验证 |
 | blocking file read、replacement executor、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
-| connected stream socket、blocking recv/send、queue ownership handoff | 已在 Darwin/arm64 与 Linux/arm64 受限验证 |
+| connected stream socket、blocking recv/send、queue ownership handoff | 已在 Darwin/arm64、Linux/arm64 和 Linux/amd64 聚焦用例受限验证 |
 | `time.Sleep` lowering、timer service、TCP/netpoll、普通 file lowering、三包 structured await | 未实现 |
 
 因此 basic example、object/link 和手工 operation reentry 纵切已经回答第 19.1 节的
