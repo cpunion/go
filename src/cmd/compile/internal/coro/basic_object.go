@@ -39,6 +39,7 @@ const (
 	basicObjectRecipeNone basicObjectRecipe = iota
 	basicObjectRecipeTimer
 	basicObjectRecipeFile
+	basicObjectRecipeSocket
 )
 
 func basicObjectRecipeForName(name string) basicObjectRecipe {
@@ -47,6 +48,8 @@ func basicObjectRecipeForName(name string) basicObjectRecipe {
 		return basicObjectRecipeTimer
 	case strings.HasSuffix(name, ".blockingReadOnce"):
 		return basicObjectRecipeFile
+	case strings.HasSuffix(name, ".blockingSocketReadOnce"):
+		return basicObjectRecipeSocket
 	default:
 		return basicObjectRecipeNone
 	}
@@ -222,8 +225,11 @@ func basicObjectLLVMModuleForTarget(f *ssa.Func, goos, goarch string) (goName, h
 	digest := sha256.Sum256([]byte(fmt.Sprintf("%s<%d>", goName, f.ABISelf.Which())))
 	hostName = fmt.Sprintf("go_coro_%x", digest[:8])
 	render := renderBasicObjectLLVMForTarget
-	if recipe == basicObjectRecipeFile {
+	switch recipe {
+	case basicObjectRecipeFile:
 		render = renderFileObjectLLVMForTarget
+	case basicObjectRecipeSocket:
+		render = renderSocketObjectLLVMForTarget
 	}
 	module, err = render(hostName, value.AuxInt, goos, goarch)
 	if err != nil {

@@ -139,6 +139,45 @@ func TestFileObjectLLVMModule(t *testing.T) {
 	}
 }
 
+func TestSocketObjectLLVMModule(t *testing.T) {
+	x := newBasicObjectFixtureForMarker("basic.blockingSocketReadOnce")
+	goName, hostName, module, matched, err := basicObjectLLVMModule(x.f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("valid socket object recipe did not match")
+	}
+	if goName != "example.com/p.leaf" {
+		t.Fatalf("Go symbol = %q, want example.com/p.leaf", goName)
+	}
+	text := string(module)
+	for _, want := range []string{
+		"presplitcoroutine",
+		"define internal i1 @operation.publish",
+		"define internal ptr @socket.replacement.thread",
+		"define internal i1 @scheduler.replacement.run",
+		"call i32 @socketpair",
+		"call i64 @recv",
+		"call i64 @send",
+		"call i32 @pthread_equal",
+		"atomicrmw add",
+		"define i64 @" + hostName + "()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("module does not contain %q", want)
+		}
+	}
+	for _, unwanted := range []string{"@timer.thread", "@nanosleep", "@pipe", "@read", "@write"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("socket module unexpectedly contains %q", unwanted)
+		}
+	}
+	if strings.Contains(text, "{{") {
+		t.Fatal("module contains an unreplaced template marker")
+	}
+}
+
 func TestFileObjectLLVMTarget(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -153,6 +192,36 @@ func TestFileObjectLLVMTarget(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			module, err := renderFileObjectLLVMForTarget("host", 42, test.goos, test.goarch)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(module), test.want) {
+				t.Fatalf("module does not contain %q", test.want)
+			}
+		})
+	}
+}
+
+func TestSocketObjectLLVMTarget(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		goos      string
+		goarch    string
+		want      string
+		wantError string
+	}{
+		{name: "darwin arm64", goos: "darwin", goarch: "arm64", want: "declare ptr @pthread_self()"},
+		{name: "linux amd64", goos: "linux", goarch: "amd64", want: "declare i64 @pthread_self()"},
+		{name: "unsupported", goos: "freebsd", goarch: "amd64", wantError: "freebsd/amd64"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			module, err := renderSocketObjectLLVMForTarget("host", 42, test.goos, test.goarch)
 			if test.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantError) {
 					t.Fatalf("error = %v, want error containing %q", err, test.wantError)
@@ -184,6 +253,24 @@ func TestFileObjectLLVMCompile(t *testing.T) {
 	}
 	if len(object) == 0 {
 		t.Fatal("clang produced an empty file object")
+	}
+}
+
+func TestSocketObjectLLVMCompile(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("test requires clang")
+	}
+	module, err := renderSocketObjectLLVMForTarget("host", 42, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := compileLLVMObject(clang, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(object) == 0 {
+		t.Fatal("clang produced an empty socket object")
 	}
 }
 
@@ -301,7 +388,7 @@ func TestBasicObjectLLVMModuleRejectsUnsupportedSSA(t *testing.T) {
 
 func TestBasicObjectCandidate(t *testing.T) {
 	pkg := types.NewPkg("example.com/p", "p")
-	for _, marker := range []string{"yieldOnce", "blockingReadOnce"} {
+	for _, marker := range []string{"yieldOnce", "blockingReadOnce", "blockingSocketReadOnce"} {
 		name := ir.NewNameAt(src.NoXPos, pkg.Lookup(marker), nil)
 		name.Class = ir.PFUNC
 		fn := &ir.Func{Body: ir.Nodes{ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, name, nil)}}

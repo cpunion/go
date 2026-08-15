@@ -268,6 +268,10 @@ func TestBasicFileObjectLink(t *testing.T) {
 	testBasicObjectLink(t, "blockingReadOnce", "coro-file-object-ok")
 }
 
+func TestBasicSocketObjectLink(t *testing.T) {
+	testBasicObjectLink(t, "blockingSocketReadOnce", "coro-socket-object-ok")
+}
+
 func testBasicObjectLink(t *testing.T, marker, output string) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
