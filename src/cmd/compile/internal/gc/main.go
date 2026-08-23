@@ -23,9 +23,10 @@ import (
 	"cmd/compile/internal/pgoir"
 	"cmd/compile/internal/pkginit"
 	"cmd/compile/internal/reflectdata"
+	"cmd/compile/internal/rewriteresults"
 	"cmd/compile/internal/rttype"
 	"cmd/compile/internal/slice"
-	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/ssacompile"
 	"cmd/compile/internal/ssagen"
 	"cmd/compile/internal/staticinit"
 	"cmd/compile/internal/typecheck"
@@ -83,7 +84,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// See bugs 31188 and 21945 (CLs 170638, 98075, 72371).
 	base.Ctxt.UseBASEntries = base.Ctxt.Headtype != objabi.Hdarwin
 
-	base.DebugSSA = ssa.PhaseOption
+	base.DebugSSA = ssacompile.PhaseOption
 	base.ParseFlags()
 	if base.Debug.Coro != 0 && !buildcfg.Experiment.Coro {
 		base.Fatalf("-d=coro requires GOEXPERIMENT=coro")
@@ -233,7 +234,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	dwarfgen.RecordPackageName()
 
 	// Prepare for backend processing.
-	ssagen.InitConfig()
+	ssagen.InitConfig(ssacompile.NewConfig(ssagen.Arch.SoftFloat))
 
 	// Apply coverage fixups, if applicable.
 	coverage.Fixup()
@@ -345,6 +346,8 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// because large values may contain pointers, it must happen early.
 	base.Timer.Start("fe", "escapes")
 	escape.Funcs(typecheck.Target.Funcs)
+
+	rewriteresults.Funcs(typecheck.Target.Funcs)
 
 	slice.Funcs(typecheck.Target.Funcs)
 

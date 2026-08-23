@@ -1694,16 +1694,12 @@ func FindVendor(path string) (index int, ok bool) {
 type TargetDir int
 
 const (
-	ToTool    TargetDir = iota // to GOROOT/pkg/tool (default for cmd/*)
-	ToBin                      // to bin dir inside package root (default for non-cmd/*)
-	StalePath                  // an old import path; fail to build
+	ToTool TargetDir = iota // to GOROOT/pkg/tool (default for cmd/*)
+	ToBin                   // to bin dir inside package root (default for non-cmd/*)
 )
 
 // InstallTargetDir reports the target directory for installing the command p.
 func InstallTargetDir(p *Package) TargetDir {
-	if strings.HasPrefix(p.ImportPath, "code.google.com/p/go.tools/cmd/") {
-		return StalePath
-	}
 	if p.Goroot && strings.HasPrefix(p.ImportPath, "cmd/") && p.Name == "main" {
 		switch p.ImportPath {
 		case "cmd/go", "cmd/gofmt":
@@ -1842,15 +1838,6 @@ func (p *Package) load(ld *modload.Loader, ctx context.Context, opts PackageOpts
 	}
 
 	if useBindir {
-		// Report an error when the old code.google.com/p/go.tools paths are used.
-		if InstallTargetDir(p) == StalePath {
-			// TODO(matloob): remove this branch, and StalePath itself. code.google.com/p/go is so
-			// old, even this code checking for it is stale now!
-			newPath := strings.Replace(p.ImportPath, "code.google.com/p/go.", "golang.org/x/", 1)
-			e := ImportErrorf(p.ImportPath, "the %v command has moved; use %v instead.", p.ImportPath, newPath)
-			setError(e)
-			return
-		}
 		elem := p.DefaultExecName() + cfg.ExeSuffix
 		full := filepath.Join(cfg.BuildContext.GOOS+"_"+cfg.BuildContext.GOARCH, elem)
 		if cfg.BuildContext.GOOS != runtime.GOOS || cfg.BuildContext.GOARCH != runtime.GOARCH {
@@ -3267,6 +3254,8 @@ func setToolFlags(ld *modload.Loader, pkgs ...*Package) {
 	}
 }
 
+var errFileNotFound = errors.New("file not found")
+
 // GoFilesPackage creates a package for building a collection of Go files
 // (typically named on the command line). The target is named p.a for
 // package p or named after the first Go file for package main.
@@ -3300,6 +3289,11 @@ func GoFilesPackage(ld *modload.Loader, ctx context.Context, opts PackageOpts, g
 	for _, file := range gofiles {
 		fi, err := fsys.Stat(file)
 		if err != nil {
+			if os.IsNotExist(err) {
+				// Canonicalize OS-specific errors to errFileNotFound so that error
+				// messages will be easier for users to search for.
+				err = &fs.PathError{Op: "stat", Path: file, Err: errFileNotFound}
+			}
 			base.Fatalf("%s", err)
 		}
 		if fi.IsDir() {

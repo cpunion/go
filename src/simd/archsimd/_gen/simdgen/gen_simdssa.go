@@ -22,6 +22,7 @@ import (
 	"cmd/compile/internal/ssagen"
 	"cmd/internal/obj"
 	"cmd/internal/obj/{{.ObjArch}}"
+	"cmd/compile/internal/ssa/ssaop"
 )
 
 func ssaGenSIMDValue(s *ssagen.State, v *ssa.Value) bool {
@@ -77,7 +78,7 @@ func getArrangementFromOp(archInfo ArchInfo, caseStr string) string {
 
 // writeSIMDSSA generates the ssa to prog lowering codes and writes it to simdssa.go
 // within the specified directory.
-func writeSIMDSSA(ops []Operation) *bytes.Buffer {
+func writeSIMDSSA(buffer *bytes.Buffer, ops []Operation) {
 	archInfo := CurrentArch()
 	var ZeroingMask []string
 	regInfoKeys := archInfo.RegInfoKeys
@@ -181,7 +182,7 @@ func writeSIMDSSA(ops []Operation) *bytes.Buffer {
 			continue
 		}
 		seen[asm] = struct{}{}
-		caseStr := fmt.Sprintf("ssa.Op%s%s", archInfo.ArchUpper, asm)
+		caseStr := fmt.Sprintf("ssaop.Op%s%s", archInfo.ArchUpper, asm)
 		isZeroMasking := false
 		if shapeIn == OneKmaskIn || shapeIn == OneKmaskImmIn {
 			if gOp.Zeroing == nil || *gOp.Zeroing {
@@ -200,7 +201,7 @@ func writeSIMDSSA(ops []Operation) *bytes.Buffer {
 			kind := op.hiHalfKind()
 			if kind != "" {
 				asm2 := hiHalfOpName(*gOp.HiHalfAsm, gOp)
-				caseStr2 := fmt.Sprintf("ssa.Op%s%s", archInfo.ArchUpper, asm2)
+				caseStr2 := fmt.Sprintf("ssaop.Op%s%s", archInfo.ArchUpper, asm2)
 				if _, ok2 := seen[asm2]; !ok2 {
 					seen[asm2] = struct{}{}
 					if err := classifyHiHalfOp(op, kind, caseStr2, immOpArg, immType); err != nil {
@@ -232,8 +233,6 @@ func writeSIMDSSA(ops []Operation) *bytes.Buffer {
 		}
 		panic(fmt.Errorf("unsupported register constraint for prog, please update gen_simdssa.go and amd64/ssa.go: %+v\nAll keys: %v\n, cases: %v\n", allUnseen, allKeys, allUnseenCaseStr))
 	}
-
-	buffer := new(bytes.Buffer)
 
 	headerData := tplSSAHeader{
 		Arch:            archInfo.Arch,
@@ -294,6 +293,4 @@ func writeSIMDSSA(ops []Operation) *bytes.Buffer {
 	if err := ssaTemplates.ExecuteTemplate(buffer, "ending", headerData); err != nil {
 		panic(fmt.Errorf("failed to execute ending template: %w", err))
 	}
-
-	return buffer
 }
