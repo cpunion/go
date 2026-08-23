@@ -59,6 +59,11 @@ type Flags struct {
 	PreemptibleLoops  bool
 	StaticLockRanking bool
 	BoringCrypto      bool
+	// Coro enables the experimental coroutine analysis and backend hooks.
+	//
+	// The default compiler and runtime paths must remain unchanged when Coro
+	// is disabled.
+	Coro bool
 
 	// Regabi is split into several sub-experiments that can be
 	// enabled individually. Not all combinations work.

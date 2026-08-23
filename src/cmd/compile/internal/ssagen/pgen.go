@@ -301,7 +301,10 @@ const maxStackSize = 1 << 30
 // and flushes that plist to machine code.
 // worker indicates which of the backend workers is doing the processing.
 func Compile(fn *ir.Func, worker int, profile *pgoir.Profile) {
-	f, htmlWriter := buildssa(fn, worker, inline.IsPgoHotFunc(fn, profile) || inline.HasPgoHotInline(fn))
+	f, htmlWriter, handled := buildssa(fn, worker, inline.IsPgoHotFunc(fn, profile) || inline.HasPgoHotInline(fn))
+	if handled {
+		return
+	}
 	// Note: check arg size to fix issue 25507.
 	if f.Frontend().(*ssafn).stksize >= maxStackSize || f.OwnAux.ArgWidth() >= maxStackSize {
 		largeStackFramesMu.Lock()

@@ -222,10 +222,14 @@ func (ar *Archive) addFiles() {
 		}
 
 		for _, e := range aro.Entries {
-			if e.Type != archive.EntryGoObj || e.Name != "_go_.o" {
-				continue
+			switch e.Type {
+			case archive.EntryPkgDef:
+				// addPkgdef copied this entry before addFiles.
+			case archive.EntryGoObj:
+				ar.a.AddEntry(archive.EntryGoObj, filepath.Base(file), 0, 0, 0, 0644, e.Size, io.NewSectionReader(f, e.Offset, e.Size))
+			case archive.EntryNativeObj:
+				ar.a.AddEntry(archive.EntryNativeObj, e.Name, 0, 0, 0, e.Mode, e.Size, io.NewSectionReader(f, e.Offset, e.Size))
 			}
-			ar.a.AddEntry(archive.EntryGoObj, filepath.Base(file), 0, 0, 0, 0644, e.Size, io.NewSectionReader(f, e.Offset, e.Size))
 		}
 	close:
 		f.Close()
@@ -329,25 +333,27 @@ func (ar *Archive) extractContents1(e *archive.Entry, out io.Writer) {
 }
 
 // isGoCompilerObjFile reports whether file is an object file created
-// by the Go compiler, which is an archive file with exactly one entry
-// of __.PKGDEF, or _go_.o, or both entries.
+// by the Go compiler. Such an archive contains __.PKGDEF, _go_.o, or both,
+// and may also contain native object files.
 func isGoCompilerObjFile(a *archive.Archive) bool {
-	switch len(a.Entries) {
-	case 1:
-		return (a.Entries[0].Type == archive.EntryGoObj && a.Entries[0].Name == "_go_.o") ||
-			(a.Entries[0].Type == archive.EntryPkgDef && a.Entries[0].Name == "__.PKGDEF")
-	case 2:
-		var foundPkgDef, foundGo bool
-		for _, e := range a.Entries {
-			if e.Type == archive.EntryPkgDef && e.Name == "__.PKGDEF" {
-				foundPkgDef = true
+	var foundPkgDef, foundGo bool
+	for _, e := range a.Entries {
+		switch e.Type {
+		case archive.EntryPkgDef:
+			if foundPkgDef || e.Name != "__.PKGDEF" {
+				return false
 			}
-			if e.Type == archive.EntryGoObj && e.Name == "_go_.o" {
-				foundGo = true
+			foundPkgDef = true
+		case archive.EntryGoObj:
+			if foundGo || e.Name != "_go_.o" {
+				return false
 			}
+			foundGo = true
+		case archive.EntryNativeObj:
+			// Native objects are emitted by compiler backends.
+		default:
+			return false
 		}
-		return foundPkgDef && foundGo
-	default:
-		return false
 	}
+	return foundPkgDef || foundGo
 }

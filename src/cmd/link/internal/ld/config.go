@@ -167,6 +167,10 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 		return true, "some input objects have an unrecognized file format"
 	}
 
+	if len(ctxt.corodata) != 0 {
+		return true, "a package contains LLVM coroutine objects"
+	}
+
 	if len(dynimportfail) > 0 {
 		// This error means that we were unable to generate
 		// the _cgo_import.go file for some packages.

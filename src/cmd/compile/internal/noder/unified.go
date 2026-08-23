@@ -7,6 +7,7 @@ package noder
 import (
 	"cmp"
 	"fmt"
+	"internal/buildcfg"
 	"internal/pkgbits"
 	"internal/types/errors"
 	"io"
@@ -25,8 +26,14 @@ import (
 )
 
 // uirVersion is the unified IR version to use for encoding/decoding.
-// Use V4 for generic methods.
-const uirVersion = pkgbits.V4
+// The default compiler keeps emitting the upstream V4 format. The coroutine
+// experiment uses V5 for its compiler-private function summary.
+func uirVersion() pkgbits.Version {
+	if buildcfg.Experiment.Coro {
+		return pkgbits.V5
+	}
+	return pkgbits.V4
+}
 
 // localPkgReader holds the package reader used for reading the local
 // package. It exists so the unified IR linker can refer back to it
@@ -410,6 +417,9 @@ func freePackage(pkg *types2.Package) {
 func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 	{
 		r := pr.newReader(pkgbits.SectionMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
+		if !localStub && buildcfg.Experiment.Coro && !r.Version().Has(pkgbits.CoroFuncSummary) {
+			base.Fatalf("package %q lacks coroutine summaries; rebuild it with GOEXPERIMENT=coro", importpkg.Path)
+		}
 
 		pkg := r.pkg()
 		// This error can happen if "go tool compile" is called with wrong "-p" flag, see issue #54542.
@@ -468,7 +478,7 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 // Unified IR export data file for the current compilation unit.
 func writeUnifiedExport(out io.Writer) {
 	l := linker{
-		pw: pkgbits.NewPkgEncoder(uirVersion, base.Debug.SyncFrames),
+		pw: pkgbits.NewPkgEncoder(uirVersion(), base.Debug.SyncFrames),
 
 		pkgs:   make(map[string]index),
 		decls:  make(map[*types.Sym]index),
@@ -493,7 +503,7 @@ func writeUnifiedExport(out io.Writer) {
 		// TODO: It seems that we should be able to use r.Version() for NewPkgEncoder
 		// instead of passing uirVersion, but NewPkgEncoder is created before r.
 		// If that is correct, we should make that happen.
-		assert(r.Version() == uirVersion)
+		assert(r.Version() == uirVersion())
 
 		if r.Version().Has(pkgbits.HasInit) {
 			r.Bool()

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/bloop"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/coverage"
 	"cmd/compile/internal/deadlocals"
 	"cmd/compile/internal/dwarfgen"
@@ -84,6 +85,15 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	base.DebugSSA = ssa.PhaseOption
 	base.ParseFlags()
+	if base.Debug.Coro != 0 && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=coro requires GOEXPERIMENT=coro")
+	}
+	if base.Debug.CoroBasic != "" && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=corobasic requires GOEXPERIMENT=coro")
+	}
+	if base.Debug.CoroObject != "" && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=coroobject requires GOEXPERIMENT=coro")
+	}
 
 	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
 		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap
@@ -254,6 +264,15 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Apply bloop markings.
 	bloop.Walk(typecheck.Target)
 
+	if buildcfg.Experiment.Coro {
+		base.Timer.Start("fe", "coro-provisional")
+		analysis := coro.Analyze(typecheck.Target.Funcs)
+		if base.Debug.Coro > 1 {
+			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
+			analysis.Dump(os.Stderr)
+		}
+	}
+
 	// Interleaved devirtualization and inlining.
 	base.Timer.Start("fe", "devirtualize-and-inline")
 	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
@@ -279,6 +298,22 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Generate ABI wrappers. Must happen before escape analysis
 	// and doesn't benefit from dead-coding or inlining.
 	symABIs.GenABIWrappers()
+
+	if buildcfg.Experiment.Coro {
+		base.Timer.Start("fe", "coro")
+		analysis := coro.Analyze(typecheck.Target.Funcs)
+		plan, err := analysis.Freeze()
+		if err != nil {
+			base.Fatalf("freezing coroutine plan: %v", err)
+		}
+		if base.Debug.Coro != 0 {
+			fmt.Fprintln(os.Stderr, "coro: phase=final")
+			analysis.Dump(os.Stderr)
+			plan.Dump(os.Stderr)
+		}
+		analysis.PublishSummaries()
+		coro.SetCurrentPlan(plan)
+	}
 
 	deadlocals.Funcs(typecheck.Target.Funcs)
 

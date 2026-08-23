@@ -101,7 +101,7 @@ type pkgWriter struct {
 // package.
 func newPkgWriter(m posMap, pkg *types2.Package, info *types2.Info, otherInfo map[*syntax.FuncLit]bool) *pkgWriter {
 	return &pkgWriter{
-		PkgEncoder: pkgbits.NewPkgEncoder(uirVersion, base.Debug.SyncFrames),
+		PkgEncoder: pkgbits.NewPkgEncoder(uirVersion(), base.Debug.SyncFrames),
 
 		m:                     m,
 		curpkg:                pkg,
@@ -1210,6 +1210,9 @@ func (w *writer) funcExt(obj *types2.Func) {
 
 	w.Bool(false) // stub extension
 	w.Reloc(pkgbits.SectionBody, body)
+	if w.Version().Has(pkgbits.CoroFuncSummary) {
+		w.Uint64(0) // no coroutine summary in the stub
+	}
 	w.Sync(pkgbits.SyncEOF)
 }
 
