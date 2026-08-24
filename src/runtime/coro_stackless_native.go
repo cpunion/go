@@ -9,6 +9,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -51,15 +52,14 @@ type stacklessCoroNativeDriver struct {
 var stacklessCoroNativePool struct {
 	lock  mutex
 	count int
-	// available preserves the common lock-free reuse path. Contexts beyond
-	// the warm capacity remain reusable through overflow.
-	available chan *stacklessCoroNativeContext
-	overflow  *stacklessCoroNativeContext
+	// slots preserve the common lock-free reuse path. Contexts beyond the
+	// warm capacity remain reusable through overflow.
+	slots    [stacklessCoroWarmExecutorCount]atomic.Pointer[stacklessCoroNativeContext]
+	overflow *stacklessCoroNativeContext
 }
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
-	stacklessCoroNativePool.available = make(chan *stacklessCoroNativeContext, stacklessCoroWarmExecutorCount)
 }
 
 // run drives one episode on a fixed portion of the current operating system
@@ -167,10 +167,12 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 }
 
 func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
-	select {
-	case ctx := <-stacklessCoroNativePool.available:
-		return ctx
-	default:
+	for i := range stacklessCoroNativePool.slots {
+		slot := &stacklessCoroNativePool.slots[i]
+		ctx := slot.Load()
+		if ctx != nil && slot.CompareAndSwap(ctx, nil) {
+			return ctx
+		}
 	}
 	lock(&stacklessCoroNativePool.lock)
 	if ctx := stacklessCoroNativePool.overflow; ctx != nil {
@@ -185,10 +187,10 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
-	select {
-	case stacklessCoroNativePool.available <- ctx:
-		return
-	default:
+	for i := range stacklessCoroNativePool.slots {
+		if stacklessCoroNativePool.slots[i].CompareAndSwap(nil, ctx) {
+			return
+		}
 	}
 	// Only the bounded warm pool retains task caches. The overflow list may
 	// grow with peak root concurrency and must not retain one cache per peak.

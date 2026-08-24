@@ -32,11 +32,22 @@ func StacklessCoroNativePoolForTest() (count int) {
 }
 
 func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
-	available := stacklessCoroNativePool.available
-	for range len(available) {
-		ctx := <-available
-		warm += stacklessCoroTaskListLen(ctx.freeTasks)
-		available <- ctx
+	for i := range stacklessCoroNativePool.slots {
+		slot := &stacklessCoroNativePool.slots[i]
+		for {
+			ctx := slot.Load()
+			if ctx == nil {
+				break
+			}
+			if !slot.CompareAndSwap(ctx, nil) {
+				continue
+			}
+			warm += stacklessCoroTaskListLen(ctx.freeTasks)
+			if !slot.CompareAndSwap(nil, ctx) {
+				releaseStacklessCoroNativeContext(ctx)
+			}
+			break
+		}
 	}
 	lock(&stacklessCoroNativePool.lock)
 	for ctx := stacklessCoroNativePool.overflow; ctx != nil; ctx = ctx.poolNext {
@@ -47,16 +58,28 @@ func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 }
 
 func StacklessCoroClearNativeTaskCachesForTest() int {
-	available := stacklessCoroNativePool.available
-	count := len(available)
-	for range count {
-		ctx := <-available
-		ctx.freeTasks = nil
-		ctx.freePlainTaskCount = 0
-		ctx.freeFrameBytes = 0
-		ctx.cachedFrameTasks = 0
-		ctx.cachedFrameBytes = 0
-		available <- ctx
+	count := 0
+	for i := range stacklessCoroNativePool.slots {
+		slot := &stacklessCoroNativePool.slots[i]
+		for {
+			ctx := slot.Load()
+			if ctx == nil {
+				break
+			}
+			if !slot.CompareAndSwap(ctx, nil) {
+				continue
+			}
+			ctx.freeTasks = nil
+			ctx.freePlainTaskCount = 0
+			ctx.freeFrameBytes = 0
+			ctx.cachedFrameTasks = 0
+			ctx.cachedFrameBytes = 0
+			if !slot.CompareAndSwap(nil, ctx) {
+				releaseStacklessCoroNativeContext(ctx)
+			}
+			count++
+			break
+		}
 	}
 	return count
 }
