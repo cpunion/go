@@ -564,6 +564,11 @@ func acquireStacklessCoroWake() chan struct{} {
 }
 
 func drainStacklessCoroWake(wake chan struct{}) {
+	// Callers detach wake or establish scheduler quiescence before draining,
+	// so the length snapshot can skip the common empty-channel receive.
+	if len(wake) == 0 {
+		return
+	}
 	for {
 		select {
 		case <-wake:
