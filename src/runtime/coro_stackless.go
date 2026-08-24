@@ -424,13 +424,22 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
-	s.root.resume = resume
-	s.root.context.frame = frame
+	root := &s.root
+	root.resume = resume
+	root.context.frame = frame
 	if frame != nil && canCacheStacklessCoroRootFrame(resume, frameSize) {
-		s.root.setFlag(stacklessCoroTaskCacheFrame, true)
-		s.root.frameSize = uint16(frameSize)
+		root.setFlag(stacklessCoroTaskCacheFrame, true)
+		root.frameSize = uint16(frameSize)
 	}
-	s.ready(&s.root, false)
+	// The scheduler remains private until initialization returns, so install
+	// its initial runnable root without taking the queue lock.
+	root.state = stacklessCoroTaskRunnable
+	s.head = root
+	s.tail = root
+	s.runnableState.Store(1)
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(root))
+	}
 	return s
 }
 
