@@ -53,6 +53,16 @@ var stacklessCoroNativePool struct {
 	overflow  *stacklessCoroNativeContext
 }
 
+// coroSaveAndBlockSignals records the current signal mask and blocks signals
+// in one operation. The native G and g0 transition must not be interrupted
+// while they temporarily disagree with the thread state.
+//
+//go:nosplit
+//go:nowritebarrierrec
+func coroSaveAndBlockSignals(mask *sigset) {
+	sigprocmask(_SIG_SETMASK, &sigset_all, mask)
+}
+
 // coroNativeGogo installs newG0 and resumes buf in one assembly sequence. No
 // Go safe point may observe the old current G with the new m.g0.
 func coroNativeGogo(buf *gobuf, newG0 *g)
@@ -277,8 +287,7 @@ func coroNativeStart(caller *g) {
 	// completed. Between changing m.g0 and gogo, the current G would otherwise
 	// be neither m.g0 nor m.curg, so a concurrent GC transition could fail in
 	// systemstack.
-	sigsave(&ctx.sigmask)
-	sigblock(false)
+	coroSaveAndBlockSignals(&ctx.sigmask)
 	mp.g0StackAccurate = true
 	coroNativeGogo(&executor.sched, schedulerG)
 }
@@ -357,8 +366,7 @@ func coroNativeFinish(executor *g) {
 
 	// Keep schedulerG installed as m.g0 while teardown calls runtime helpers.
 	// Change m.g0 only for the final non-returning switch to caller.
-	sigsave(&ctx.sigmask)
-	sigblock(false)
+	coroSaveAndBlockSignals(&ctx.sigmask)
 	mp.g0StackAccurate = g0Accurate
 	schedulerG.m = nil
 	coroNativeGogo(&caller.sched, nativeG0)
