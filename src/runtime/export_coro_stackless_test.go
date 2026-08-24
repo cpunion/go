@@ -1050,7 +1050,13 @@ func StacklessCoroWakePoolSizeForTest() int {
 }
 
 func StacklessCoroRootSchedulerPoolSizeForTest() int {
-	return len(stacklessCoroRootSchedulerPool.available)
+	count := 0
+	for i := range stacklessCoroRootSchedulerCache.slots {
+		if stacklessCoroRootSchedulerCache.slots[i].Load() != nil {
+			count++
+		}
+	}
+	return count
 }
 
 func StacklessCoroRootFramePoolSizeForTest() int {

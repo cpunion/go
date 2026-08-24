@@ -306,10 +306,11 @@ var stacklessCoroWakePool struct {
 
 // Operation-free public roots may reuse a scheduler and its wake channel only
 // after every replacement executor has stopped and the root outcome has been
-// transferred to its caller. Race builds retain a distinct root
-// synchronization identity instead.
-var stacklessCoroRootSchedulerPool struct {
-	available chan *stacklessCoroScheduler
+// transferred to its caller. Fixed atomic slots keep cache lookup independent
+// of channel scheduling. Race builds retain a distinct root synchronization
+// identity instead.
+var stacklessCoroRootSchedulerCache struct {
+	slots [stacklessCoroWarmExecutorCount]atomic.Pointer[stacklessCoroScheduler]
 }
 
 // stacklessCoroRootFrame retains a compiler-generated typed allocation only
@@ -328,7 +329,6 @@ var stacklessCoroRootFramePool struct {
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
-	stacklessCoroRootSchedulerPool.available = make(chan *stacklessCoroScheduler, stacklessCoroWarmExecutorCount)
 	stacklessCoroRootFramePool.available = make(chan stacklessCoroRootFrame, stacklessCoroWarmExecutorCount)
 }
 
@@ -375,11 +375,13 @@ func newStacklessCoroScheduler(frame unsafe.Pointer,
 func acquireStacklessCoroRootScheduler(frame unsafe.Pointer,
 	resume stacklessCoroResume, frameSize uintptr) *stacklessCoroScheduler {
 	if !raceenabled {
-		select {
-		case s := <-stacklessCoroRootSchedulerPool.available:
-			return initializeStacklessCoroScheduler(s, frame, resume,
-				frameSize)
-		default:
+		for i := range stacklessCoroRootSchedulerCache.slots {
+			slot := &stacklessCoroRootSchedulerCache.slots[i]
+			s := slot.Load()
+			if s != nil && slot.CompareAndSwap(s, nil) {
+				return initializeStacklessCoroScheduler(s, frame, resume,
+					frameSize)
+			}
 		}
 	}
 	s := new(stacklessCoroScheduler)
@@ -456,14 +458,15 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	drainStacklessCoroWake(wake)
 	*s = stacklessCoroScheduler{}
 	s.wake = wake
-	select {
-	case stacklessCoroRootSchedulerPool.available <- s:
-	default:
-		// Root wake channels belong to the scheduler cache as one unit. Do
-		// not increase the separate nested-scheduler wake pool after a root
-		// cache miss or a concurrency spike.
-		s.discardWake()
+	for i := range stacklessCoroRootSchedulerCache.slots {
+		if stacklessCoroRootSchedulerCache.slots[i].CompareAndSwap(nil, s) {
+			return true
+		}
 	}
+	// Root wake channels belong to the scheduler cache as one unit. Do not
+	// increase the separate nested-scheduler wake pool after a root cache miss
+	// or a concurrency spike.
+	s.discardWake()
 	return true
 }
 
