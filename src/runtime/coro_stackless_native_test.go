@@ -298,6 +298,48 @@ func TestStacklessCoroNativeBlockingReuseDuringGC(t *testing.T) {
 	<-gcDone
 }
 
+func TestStacklessCoroNativeTransitionSignals(t *testing.T) {
+	const (
+		signals = 256
+		minRuns = 10_000
+	)
+
+	oldProcs := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(oldProcs)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	target := runtime.StacklessCoroNativeSignalTargetForTest()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		for range signals {
+			runtime.SignalStacklessCoroNativeForTest(target)
+			// Avoid saturating one M with pending signals. In particular,
+			// Darwin can livelock when signals arrive faster than the target
+			// thread can make progress.
+			runtime.Gosched()
+		}
+		close(done)
+	}()
+	<-started
+
+	runs := 0
+	signalsDone := false
+	for !signalsDone || runs < minRuns {
+		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+			return runtime.StacklessCoroActionComplete
+		})
+		runs++
+		select {
+		case <-done:
+			signalsDone = true
+		default:
+		}
+	}
+}
+
 func TestStacklessCoroNativeBlockingReturnProgress(t *testing.T) {
 	testStacklessCoroNativeBlockingProgress(t, 3)
 }
