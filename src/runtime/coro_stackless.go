@@ -93,6 +93,11 @@ const (
 	stacklessCoroExecutorStateStopping
 )
 
+const (
+	stacklessCoroLifetimeOperationStarted uint8 = 1 << iota
+	stacklessCoroLifetimeRootComplete
+)
+
 type stacklessCoroTaskState uint8
 
 const (
@@ -206,10 +211,12 @@ type stacklessCoroScheduler struct {
 	freeOperationCount      uint8
 	freeOverflowTaskCount   uint8
 	directOverflowTaskCount uint8
-	operationStarted        bool
-	root                    stacklessCoroTask
-	terminalValues          map[*stacklessCoroTask]any
-	wake                    chan struct{}
+	// lifetime publishes monotonic facts for one initialized scheduler
+	// lifetime. Root completion is published only after its outcome is ready.
+	lifetime       atomic.Uint8
+	root           stacklessCoroTask
+	terminalValues map[*stacklessCoroTask]any
+	wake           chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
@@ -444,7 +451,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// An operation producer can still hold a completed root scheduler after
 	// removing its operation from the global registry. Detach its wake channel,
 	// but do not inspect or reuse the remaining scheduler state in that case.
-	if s.operationStarted {
+	if s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 {
 		s.discardWake()
 		return false
 	}
@@ -1087,10 +1094,7 @@ func (s *stacklessCoroScheduler) waitForWork() bool {
 }
 
 func (s *stacklessCoroScheduler) rootComplete() bool {
-	lock(&s.lock)
-	complete := s.root.state == stacklessCoroTaskComplete
-	unlock(&s.lock)
-	return complete
+	return s.lifetime.Load()&stacklessCoroLifetimeRootComplete != 0
 }
 
 // coroFrame returns the typed-frame pointer carried by a resume packet.
@@ -2673,7 +2677,7 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine operation outside resume")
 	}
-	s.operationStarted = true
+	s.lifetime.Or(stacklessCoroLifetimeOperationStarted)
 	op := s.freeOperations
 	if op == nil {
 		if s.freeOperationCount != 0 {
@@ -2923,7 +2927,9 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	parent := task.parent
 	task.parent = nil
 	if parent == nil {
-		if task != &s.root {
+		if task == &s.root {
+			s.lifetime.Or(stacklessCoroLifetimeRootComplete)
+		} else {
 			s.recycleTaskLocked(task)
 		}
 		unlock(&s.lock)
@@ -2989,6 +2995,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 			unlock(&s.lock)
 			panic(value)
 		}
+		s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 		unlock(&s.lock)
 		s.stopExecutorRuns()
 		return
@@ -3031,6 +3038,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	task.parent = nil
 	if parent == nil {
 		if task == &s.root {
+			s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 			unlock(&s.lock)
 			s.stopExecutorRuns()
 			return
