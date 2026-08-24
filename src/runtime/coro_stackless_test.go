@@ -2809,7 +2809,7 @@ func TestStacklessCoroRootWakeReuse(t *testing.T) {
 					}
 					return runtime.StacklessCoroActionComplete
 				default:
-					panic("unexpected wake-pool state")
+					panic("unexpected root wake state")
 				}
 			})
 			done <- struct{}{}
@@ -2835,7 +2835,7 @@ func TestStacklessCoroRootWakeReuse(t *testing.T) {
 		select {
 		case <-done:
 		case <-timeout:
-			t.Fatal("wake-pool root did not stop")
+			t.Fatal("root wake test did not stop")
 		}
 	}
 	if got := runtime.StacklessCoroWakePoolSizeForTest(); got != wakePoolSize {

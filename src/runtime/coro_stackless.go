@@ -297,17 +297,17 @@ var stacklessCoroOperations struct {
 	head *stacklessCoroOperation
 }
 
-// The bounded wake pool retains channels only after every executor for their
-// previous scheduler has stopped. Race builds keep a distinct synchronization
-// identity for each scheduler instead.
+// The bounded wake pool retains channels for nested schedulers only after
+// every executor for their previous scheduler has stopped. Race builds keep a
+// distinct synchronization identity for each scheduler instead.
 var stacklessCoroWakePool struct {
 	available chan chan struct{}
 }
 
-// Operation-free public roots may reuse a scheduler only after every
-// replacement executor has stopped and the root outcome has been transferred
-// to its caller. Race builds retain a distinct root synchronization identity
-// instead.
+// Operation-free public roots may reuse a scheduler and its wake channel only
+// after every replacement executor has stopped and the root outcome has been
+// transferred to its caller. Race builds retain a distinct root
+// synchronization identity instead.
 var stacklessCoroRootSchedulerPool struct {
 	available chan *stacklessCoroScheduler
 }
@@ -427,8 +427,8 @@ func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
 
 func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// An operation producer can still hold a completed root scheduler after
-	// removing its operation from the global registry. Do not inspect or reuse
-	// any other scheduler state in that case.
+	// removing its operation from the global registry. Detach its wake channel,
+	// but do not inspect or reuse the remaining scheduler state in that case.
 	if s.operationStarted {
 		s.discardWake()
 		return false
