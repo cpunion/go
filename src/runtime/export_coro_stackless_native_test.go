@@ -16,6 +16,14 @@ func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uint
 	return gp.stackIsFixed(), sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi
 }
 
+func StacklessCoroNativeSignalTargetForTest() *M {
+	return getg().m
+}
+
+func SignalStacklessCoroNativeForTest(target *M) {
+	signalM(target, _SIGPROF)
+}
+
 func StacklessCoroNativePoolForTest() (count int) {
 	lock(&stacklessCoroNativePool.lock)
 	count = stacklessCoroNativePool.count

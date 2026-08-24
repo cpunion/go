@@ -37,7 +37,6 @@ type stacklessCoroNativeContext struct {
 	lockedG            guintptr
 	lockedInt          uint32
 	g0Accurate         bool
-	sigmask            sigset
 	poolNext           *stacklessCoroNativeContext
 }
 
@@ -57,20 +56,6 @@ var stacklessCoroNativePool struct {
 	available chan *stacklessCoroNativeContext
 	overflow  *stacklessCoroNativeContext
 }
-
-// coroSaveAndBlockSignals records the current signal mask and blocks signals
-// in one operation. The native G and g0 transition must not be interrupted
-// while they temporarily disagree with the thread state.
-//
-//go:nosplit
-//go:nowritebarrierrec
-func coroSaveAndBlockSignals(mask *sigset) {
-	sigprocmask(_SIG_SETMASK, &sigset_all, mask)
-}
-
-// coroNativeGogo installs newG0 and resumes buf in one assembly sequence. No
-// Go safe point may observe the old current G with the new m.g0.
-func coroNativeGogo(buf *gobuf, newG0 *g)
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
@@ -119,7 +104,17 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler) *stacklessCor
 	ctx.caller = gp
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
-	msigrestore(ctx.sigmask)
+	mp := gp.m
+	if mp == nil || mp.curg != gp || mp.g0 != ctx.schedulerG || ctx.schedulerG.m != mp || ctx.nativeG0 == nil {
+		throw("runtime: invalid stackless coroutine native return")
+	}
+	mp.g0 = ctx.nativeG0
+	mp.g0StackAccurate = ctx.g0Accurate
+	ctx.schedulerG.m = nil
+	ctx.nativeG0 = nil
+	ctx.lockedG = 0
+	ctx.lockedInt = 0
+	ctx.g0Accurate = false
 
 	if gp.param != unsafe.Pointer(ctx) {
 		throw("runtime: lost stackless coroutine native context")
@@ -313,21 +308,19 @@ func coroNativeStart(caller *g) {
 	}
 
 	// Keep nativeG0 installed as m.g0 until every runtime call above has
-	// completed. Between changing m.g0 and gogo, the current G would otherwise
-	// be neither m.g0 nor m.curg, so a concurrent GC transition could fail in
-	// systemstack.
-	coroSaveAndBlockSignals(&ctx.sigmask)
-	mp.g0StackAccurate = true
-	coroNativeGogo(&executor.sched, schedulerG)
+	// completed. gogo performs the signal-safe G and stack transition; the
+	// executor replaces m.g0 only after it is running on its target stack.
+	gogo(&executor.sched)
 }
 
 func coroNativeMain() {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
-	if ctx == nil || ctx.executor != gp {
+	if ctx == nil || ctx.executor != gp || gp.m.g0 != ctx.nativeG0 || ctx.schedulerG.m != gp.m {
 		throw("runtime: invalid stackless coroutine executor context")
 	}
-	msigrestore(ctx.sigmask)
+	gp.m.g0 = ctx.schedulerG
+	gp.m.g0StackAccurate = true
 	ctx.scheduler.runTasks(true, false)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
@@ -382,19 +375,9 @@ func coroNativeFinish(executor *g) {
 		traceRelease(trace)
 	}
 
-	nativeG0 := ctx.nativeG0
-	g0Accurate := ctx.g0Accurate
-	ctx.nativeG0 = nil
-	ctx.lockedG = 0
-	ctx.lockedInt = 0
-	ctx.g0Accurate = false
-
-	// Keep schedulerG installed as m.g0 while teardown calls runtime helpers.
-	// Change m.g0 only for the final non-returning switch to caller.
-	coroSaveAndBlockSignals(&ctx.sigmask)
-	mp.g0StackAccurate = g0Accurate
-	schedulerG.m = nil
-	coroNativeGogo(&caller.sched, nativeG0)
+	// Keep schedulerG installed as m.g0 through gogo's signal-safe G and stack
+	// transition. The caller restores nativeG0 after it is running again.
+	gogo(&caller.sched)
 }
 
 //go:nosplit
