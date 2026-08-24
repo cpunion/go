@@ -3074,6 +3074,30 @@ func TestStacklessCoroRootFrameCache(t *testing.T) {
 		t.Fatalf("root frame cache returned %p, want %p", got, frame)
 	}
 
+	retainedTotal := 7
+	retainedNeedsClear := true
+	retained := &stacklessCoroRootFrameCacheTestFrame{
+		value: 9, total: &retainedTotal, needsClear: &retainedNeedsClear,
+	}
+	retainedAddress := uintptr(unsafe.Pointer(retained))
+	runtime.ReleaseRootStacklessCoroFrameForTest(unsafe.Pointer(retained),
+		stacklessCoroRootFrameCacheResume, size)
+	retained = nil
+	runtime.GC()
+	retainedPointer := runtime.TakeRootStacklessCoroFrameForTest(
+		stacklessCoroRootFrameCacheResume, size)
+	if uintptr(retainedPointer) != retainedAddress {
+		t.Fatalf("retained root frame = %p, want %#x", retainedPointer,
+			retainedAddress)
+	}
+	retainedFrame := (*stacklessCoroRootFrameCacheTestFrame)(retainedPointer)
+	if retainedFrame.value != 9 || retainedFrame.total == nil ||
+		*retainedFrame.total != 7 || retainedFrame.needsClear == nil ||
+		!*retainedFrame.needsClear {
+		t.Fatalf("retained root frame was not preserved: %+v", retainedFrame)
+	}
+	runtime.KeepAlive(retainedFrame)
+
 	const roots = runtime.StacklessCoroWarmExecutorCount + 1
 	frames := make([]stacklessCoroRootFrameCacheTestFrame, roots)
 	for i := range frames {
@@ -3106,6 +3130,65 @@ func TestStacklessCoroRootFrameCache(t *testing.T) {
 	if got := runtime.TakeRootStacklessCoroFrameForTest(
 		stacklessCoroRootFrameCacheResume, size); got != nil {
 		t.Fatalf("empty root frame cache returned %p", got)
+	}
+
+	const concurrentRoots = 8 * runtime.StacklessCoroWarmExecutorCount
+	concurrentFrames := make([]stacklessCoroRootFrameCacheTestFrame,
+		concurrentRoots)
+	knownFrames := make(map[unsafe.Pointer]bool, concurrentRoots)
+	releaseStart := make(chan struct{})
+	releaseDone := make(chan struct{}, concurrentRoots)
+	for i := range concurrentFrames {
+		frame := unsafe.Pointer(&concurrentFrames[i])
+		knownFrames[frame] = true
+		go func(frame unsafe.Pointer) {
+			<-releaseStart
+			runtime.ReleaseRootStacklessCoroFrameForTest(frame,
+				stacklessCoroRootFrameCacheResume, size)
+			releaseDone <- struct{}{}
+		}(frame)
+	}
+	close(releaseStart)
+	for range concurrentRoots {
+		<-releaseDone
+	}
+	cachedFrames := runtime.StacklessCoroRootFramePoolSizeForTest()
+	if cachedFrames == 0 || cachedFrames >
+		runtime.StacklessCoroWarmExecutorCount {
+		t.Fatalf("concurrent root frame cache size = %d", cachedFrames)
+	}
+	takenFrames := make([]unsafe.Pointer, concurrentRoots)
+	takeStart := make(chan struct{})
+	takeDone := make(chan struct{}, concurrentRoots)
+	for i := range takenFrames {
+		go func(i int) {
+			<-takeStart
+			takenFrames[i] = runtime.TakeRootStacklessCoroFrameForTest(
+				stacklessCoroRootFrameCacheResume, size)
+			takeDone <- struct{}{}
+		}(i)
+	}
+	close(takeStart)
+	for range concurrentRoots {
+		<-takeDone
+	}
+	seen = make(map[unsafe.Pointer]bool, cachedFrames)
+	for _, frame := range takenFrames {
+		if frame == nil {
+			continue
+		}
+		if !knownFrames[frame] || seen[frame] {
+			t.Fatalf("concurrent root frame cache returned invalid frame %p",
+				frame)
+		}
+		seen[frame] = true
+	}
+	if len(seen) != cachedFrames {
+		t.Fatalf("concurrent root frame cache returned %d frames, want %d",
+			len(seen), cachedFrames)
+	}
+	if got := runtime.StacklessCoroRootFramePoolSizeForTest(); got != 0 {
+		t.Fatalf("concurrent root frame cache retained %d frames", got)
 	}
 
 	staleFrames := make([]stacklessCoroRootFrameCacheTestFrame,
