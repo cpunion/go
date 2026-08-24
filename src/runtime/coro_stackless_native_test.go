@@ -136,11 +136,9 @@ func TestStacklessCoroNativeTaskReuse(t *testing.T) {
 		return tasks
 	}
 
-	// Sequential acquisitions rotate through the lock-free warm pool. Prime
-	// every slot before checking that a later root receives the task cache.
-	for range 2 * runtime.StacklessCoroWarmExecutorCount {
-		run()
-	}
+	// A released context returns to its claimed atomic slot. Prime that slot
+	// before checking that a later root receives the task cache.
+	run()
 	if tasks := run(); tasks == 0 {
 		t.Fatal("native root task cache is empty after reuse")
 	}
