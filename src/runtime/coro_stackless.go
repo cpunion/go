@@ -343,7 +343,6 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 	s = runStacklessCoroRoot(s)
 	s.stopReplacementExecutors()
-	s.releaseWake()
 	return finishStacklessCoroRootScheduler(s)
 }
 
@@ -383,8 +382,13 @@ func acquireStacklessCoroRootScheduler(frame unsafe.Pointer,
 		default:
 		}
 	}
+	s := new(stacklessCoroScheduler)
+	// A root scheduler retains its wake channel when both become quiescent.
+	// Allocate a distinct channel for a cold root instead of borrowing from
+	// the pool used by short-lived nested schedulers.
+	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
 	return initializeStacklessCoroScheduler(
-		new(stacklessCoroScheduler), frame, resume, frameSize)
+		s, frame, resume, frameSize)
 }
 
 func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
@@ -393,7 +397,9 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 	if resume == nil {
 		throw("runtime: nil stackless coroutine resume function")
 	}
-	s.wake = acquireStacklessCoroWake()
+	if s.wake == nil {
+		s.wake = acquireStacklessCoroWake()
+	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = resume
@@ -408,11 +414,13 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 
 func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
 	quiescent bool) {
-	if !raceenabled {
-		defer func() {
+	defer func() {
+		if raceenabled {
+			s.discardWake()
+		} else {
 			quiescent = releaseStacklessCoroRootScheduler(s)
-		}()
-	}
+		}
+	}()
 	s.finish()
 	return
 }
@@ -422,11 +430,12 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// removing its operation from the global registry. Do not inspect or reuse
 	// any other scheduler state in that case.
 	if s.operationStarted {
+		s.discardWake()
 		return false
 	}
 	state := s.executorState.Load()
 	runnable := s.runnableState.Load()
-	quiescent := s.wake == nil && s.head == nil && s.tail == nil &&
+	quiescent := s.wake != nil && s.head == nil && s.tail == nil &&
 		s.reservedTasks == nil && runnable == 0 &&
 		s.root.state == stacklessCoroTaskComplete &&
 		!s.root.resuming && !s.root.readyPending &&
@@ -440,12 +449,20 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// making their addresses available to another public root. Pooling is
 	// optional, so any state not proven quiescent also keeps that lifetime.
 	if !quiescent {
+		s.discardWake()
 		return false
 	}
+	wake := s.wake
+	drainStacklessCoroWake(wake)
 	*s = stacklessCoroScheduler{}
+	s.wake = wake
 	select {
 	case stacklessCoroRootSchedulerPool.available <- s:
 	default:
+		// Root wake channels belong to the scheduler cache as one unit. Do
+		// not increase the separate nested-scheduler wake pool after a root
+		// cache miss or a concurrency spike.
+		s.discardWake()
 	}
 	return true
 }
@@ -525,21 +542,31 @@ func acquireStacklessCoroWake() chan struct{} {
 	return make(chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
+func drainStacklessCoroWake(wake chan struct{}) {
+	for {
+		select {
+		case <-wake:
+			continue
+		default:
+			return
+		}
+	}
+}
+
+func (s *stacklessCoroScheduler) discardWake() {
+	wake := s.wake
+	s.wake = nil
+	drainStacklessCoroWake(wake)
+}
+
 func (s *stacklessCoroScheduler) releaseWake() {
 	wake := s.wake
 	s.wake = nil
 	if !raceenabled {
-		for {
-			select {
-			case <-wake:
-				continue
-			default:
-				select {
-				case stacklessCoroWakePool.available <- wake:
-				default:
-				}
-				return
-			}
+		drainStacklessCoroWake(wake)
+		select {
+		case stacklessCoroWakePool.available <- wake:
+		default:
 		}
 	}
 }

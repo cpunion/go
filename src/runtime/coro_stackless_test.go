@@ -2776,7 +2776,7 @@ func TestStacklessCoroLazyExecutorChannels(t *testing.T) {
 	})
 }
 
-func TestStacklessCoroWakePool(t *testing.T) {
+func TestStacklessCoroRootWakeReuse(t *testing.T) {
 	if race.Enabled {
 		t.Skip("race builds retain per-scheduler wake identities")
 	}
@@ -2787,7 +2787,9 @@ func TestStacklessCoroWakePool(t *testing.T) {
 
 	var ready atomic.Int32
 	var release atomic.Bool
+	schedulers := make([]unsafe.Pointer, roots)
 	wakes := make([]chan struct{}, roots)
+	wakePoolSize := runtime.StacklessCoroWakePoolSizeForTest()
 	done := make(chan struct{}, roots)
 	for i := range roots {
 		go func() {
@@ -2795,6 +2797,7 @@ func TestStacklessCoroWakePool(t *testing.T) {
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 				switch state {
 				case 0:
+					schedulers[i] = runtime.SchedulerStacklessCoroForTest(ctx)
 					wakes[i] = runtime.WakeStacklessCoroForTest(ctx)
 					runtime.SignalStacklessCoroForTest(ctx)
 					state = 1
@@ -2835,17 +2838,28 @@ func TestStacklessCoroWakePool(t *testing.T) {
 			t.Fatal("wake-pool root did not stop")
 		}
 	}
-	if got := runtime.StacklessCoroWakePoolSizeForTest(); got !=
-		runtime.StacklessCoroWarmExecutorCount {
-		t.Fatalf("wake pool size = %d, want %d", got,
-			runtime.StacklessCoroWarmExecutorCount)
+	if got := runtime.StacklessCoroWakePoolSizeForTest(); got != wakePoolSize {
+		t.Fatalf("nested wake pool size = %d, want unchanged %d", got,
+			wakePoolSize)
+	}
+	wakeByScheduler := make(map[unsafe.Pointer]chan struct{}, roots)
+	for i, scheduler := range schedulers {
+		wakeByScheduler[scheduler] = wakes[i]
 	}
 	for i := range runtime.StacklessCoroWarmExecutorCount {
 		buffered := -1
+		var scheduler unsafe.Pointer
+		var wake chan struct{}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			buffered = len(runtime.WakeStacklessCoroForTest(ctx))
+			scheduler = runtime.SchedulerStacklessCoroForTest(ctx)
+			wake = runtime.WakeStacklessCoroForTest(ctx)
+			buffered = len(wake)
 			return runtime.StacklessCoroActionComplete
 		})
+		if want := wakeByScheduler[scheduler]; wake != want {
+			t.Fatalf("reused scheduler %d wake = %p, want %p", i, wake,
+				want)
+		}
 		if buffered != 0 {
 			t.Fatalf("reused wake channel %d has %d notifications", i,
 				buffered)
