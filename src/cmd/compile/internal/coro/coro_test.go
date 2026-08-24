@@ -7,6 +7,7 @@ package coro_test
 import (
 	"context"
 	"fmt"
+	"internal/platform"
 	"internal/testenv"
 	"os"
 	"path/filepath"
@@ -3281,11 +3282,9 @@ coro_add_u64:
 func TestDirectSystemABI(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	testenv.MustHaveCGO(t)
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		t.Skip("direct System ABI fixture is only implemented on Darwin and Linux")
-	}
-	if runtime.GOARCH != "arm64" && runtime.GOARCH != "amd64" {
-		t.Skip("direct System ABI fixture is only implemented on arm64 and amd64")
+	if !platform.CoroDirectSupported(runtime.GOOS, runtime.GOARCH) {
+		t.Skipf("direct System ABI fixture is not implemented on %s/%s",
+			runtime.GOOS, runtime.GOARCH)
 	}
 
 	tmp := t.TempDir()

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"go/token"
 	"internal/lazyregexp"
+	"internal/platform"
 	"io"
 	"io/fs"
 	"log"
@@ -3388,8 +3389,7 @@ func cgoDirectAssembly(p *load.Package) bool {
 		!cfg.Experiment.Coro || !p.UsesCgo() {
 		return false
 	}
-	return cfg.Goos == "darwin" && cfg.Goarch == "arm64" ||
-		cfg.Goos == "linux" && cfg.Goarch == "amd64"
+	return platform.CoroDirectSupported(cfg.Goos, cfg.Goarch)
 }
 
 func (b *Builder) processCgoOutputs(a *Action, runCgoProvider *runCgoProvider, cgoExe, objdir string) (outGo, outObj []string, err error) {
