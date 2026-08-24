@@ -322,14 +322,27 @@ type stacklessCoroRootFrame struct {
 	size   uint16
 }
 
-var stacklessCoroRootFramePool struct {
-	available chan stacklessCoroRootFrame
+const (
+	stacklessCoroRootFrameSlotEmpty uint32 = iota
+	stacklessCoroRootFrameSlotBusy
+	stacklessCoroRootFrameSlotReady
+)
+
+// stacklessCoroRootFrameSlot keeps cached in GC-visible pointer fields. State
+// is the mutator publication barrier; a producer or consumer owns cached only
+// while state is busy.
+type stacklessCoroRootFrameSlot struct {
+	state  atomic.Uint32
+	cached stacklessCoroRootFrame
+}
+
+var stacklessCoroRootFrameCache struct {
+	slots [stacklessCoroWarmExecutorCount]stacklessCoroRootFrameSlot
 }
 
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
-	stacklessCoroRootFramePool.available = make(chan stacklessCoroRootFrame, stacklessCoroWarmExecutorCount)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -484,19 +497,20 @@ func coroTakeRootFrame(resume stacklessCoroResume,
 		return nil
 	}
 	identity := stacklessCoroResumeIdentity(resume)
-	for count := cap(stacklessCoroRootFramePool.available); count > 0; count-- {
-		select {
-		case cached := <-stacklessCoroRootFramePool.available:
-			if cached.resume == identity && cached.size == uint16(size) {
-				return cached.frame
-			}
-			select {
-			case stacklessCoroRootFramePool.available <- cached:
-			default:
-			}
-		default:
-			return nil
+	for i := range stacklessCoroRootFrameCache.slots {
+		slot := &stacklessCoroRootFrameCache.slots[i]
+		if !slot.state.CompareAndSwap(stacklessCoroRootFrameSlotReady,
+			stacklessCoroRootFrameSlotBusy) {
+			continue
 		}
+		cached := slot.cached
+		if cached.resume == identity && cached.size == uint16(size) {
+			frame := cached.frame
+			slot.cached = stacklessCoroRootFrame{}
+			slot.state.Store(stacklessCoroRootFrameSlotEmpty)
+			return frame
+		}
+		slot.state.Store(stacklessCoroRootFrameSlotReady)
 	}
 	return nil
 }
@@ -515,22 +529,26 @@ func coroReleaseRootFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 		resume: stacklessCoroResumeIdentity(resume),
 		size:   uint16(size),
 	}
-	select {
-	case stacklessCoroRootFramePool.available <- cached:
-		return
-	default:
+	for i := range stacklessCoroRootFrameCache.slots {
+		slot := &stacklessCoroRootFrameCache.slots[i]
+		if slot.state.CompareAndSwap(stacklessCoroRootFrameSlotEmpty,
+			stacklessCoroRootFrameSlotBusy) {
+			slot.cached = cached
+			slot.state.Store(stacklessCoroRootFrameSlotReady)
+			return
+		}
 	}
-	// A full pool can otherwise retain an old set of resume identities
-	// forever. Every entry is quiescent, so discard one before publishing
-	// the newly active identity. Concurrent users may take or replace the
-	// same slot; cache loss in that race is harmless.
-	select {
-	case <-stacklessCoroRootFramePool.available:
-	default:
-	}
-	select {
-	case stacklessCoroRootFramePool.available <- cached:
-	default:
+	// A full cache can otherwise retain an old set of resume identities
+	// forever. Every ready entry is quiescent, so replace one with the newly
+	// active identity. Cache loss when all slots are busy is harmless.
+	for i := range stacklessCoroRootFrameCache.slots {
+		slot := &stacklessCoroRootFrameCache.slots[i]
+		if slot.state.CompareAndSwap(stacklessCoroRootFrameSlotReady,
+			stacklessCoroRootFrameSlotBusy) {
+			slot.cached = cached
+			slot.state.Store(stacklessCoroRootFrameSlotReady)
+			return
+		}
 	}
 }
 

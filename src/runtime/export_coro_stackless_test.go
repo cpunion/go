@@ -1060,19 +1060,28 @@ func StacklessCoroRootSchedulerPoolSizeForTest() int {
 }
 
 func StacklessCoroRootFramePoolSizeForTest() int {
-	return len(stacklessCoroRootFramePool.available)
+	count := 0
+	for i := range stacklessCoroRootFrameCache.slots {
+		if stacklessCoroRootFrameCache.slots[i].state.Load() ==
+			stacklessCoroRootFrameSlotReady {
+			count++
+		}
+	}
+	return count
 }
 
 func ClearStacklessCoroRootFramePoolForTest() int {
 	count := 0
-	for {
-		select {
-		case <-stacklessCoroRootFramePool.available:
+	for i := range stacklessCoroRootFrameCache.slots {
+		slot := &stacklessCoroRootFrameCache.slots[i]
+		if slot.state.CompareAndSwap(stacklessCoroRootFrameSlotReady,
+			stacklessCoroRootFrameSlotBusy) {
+			slot.cached = stacklessCoroRootFrame{}
+			slot.state.Store(stacklessCoroRootFrameSlotEmpty)
 			count++
-		default:
-			return count
 		}
 	}
+	return count
 }
 
 func SchedulerStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
