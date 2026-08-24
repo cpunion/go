@@ -37,11 +37,16 @@ type stacklessCoroNativeContext struct {
 	lockedG            guintptr
 	lockedInt          uint32
 	g0Accurate         bool
-	// root keeps the public driver active across an empty ready queue.
-	// Replacement activations drain ready work and park on their caller G.
-	root     bool
-	sigmask  sigset
-	poolNext *stacklessCoroNativeContext
+	sigmask            sigset
+	poolNext           *stacklessCoroNativeContext
+}
+
+// stacklessCoroNativeDriver owns one native context across the fixed-stack
+// episodes of a public root. Replacement executors use a driver for one
+// episode and park on their ordinary G between activations.
+type stacklessCoroNativeDriver struct {
+	context *stacklessCoroNativeContext
+	root    bool
 }
 
 var stacklessCoroNativePool struct {
@@ -72,46 +77,46 @@ func init() {
 	stacklessCoroNativePool.available = make(chan *stacklessCoroNativeContext, stacklessCoroWarmExecutorCount)
 }
 
-// coroRunOnNativeStack runs s on a fixed portion of the current operating
-// system thread stack. It returns s reloaded from the heap context after a
-// successful stack switch; callers must not reuse their pre-switch local.
-// The race runtime has its own stack and goroutine bookkeeping, so race builds
-// retain the managed-stack driver for now.
-func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
+// run drives one episode on a fixed portion of the current operating system
+// thread stack. It returns s reloaded from the heap context after a successful
+// stack switch; callers must not reuse their pre-switch local. The race
+// runtime has its own stack and goroutine bookkeeping, so race builds retain
+// the managed-stack driver for now.
+func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	if raceenabled {
 		return nil
 	}
-	// A newly created root is the only scheduler that is both off and has
-	// one executor. Replacement executors are prepared before they start.
-	root := s.executorState.Load() == stacklessCoroExecutorStateOff &&
-		s.executorCount.Load() == 1
+	if d.context == nil {
+		// A newly created root is the only scheduler that is both off and has
+		// one executor. Replacement executors are prepared before they start.
+		d.root = s.executorState.Load() == stacklessCoroExecutorStateOff &&
+			s.executorCount.Load() == 1
+		d.context = acquireStacklessCoroNativeContext()
+		if d.root && d.context.freeTasks != nil {
+			s.freeTasks = d.context.freeTasks
+			s.freePlainTaskCount = d.context.freePlainTaskCount
+			s.freeFrameBytes = d.context.freeFrameBytes
+			s.cachedFrameTasks = d.context.cachedFrameTasks
+			s.cachedFrameBytes = d.context.cachedFrameBytes
+			d.context.freeTasks = nil
+			d.context.freePlainTaskCount = 0
+			d.context.freeFrameBytes = 0
+			d.context.cachedFrameTasks = 0
+			d.context.cachedFrameBytes = 0
+		}
+	}
 
-	ctx := acquireStacklessCoroNativeContext()
+	ctx := d.context
 	gp := getg()
 	if gp != gp.m.curg || gp == gp.m.g0 || gp == gp.m.gsignal {
-		releaseStacklessCoroNativeContext(ctx)
 		return nil
 	}
 	if gp.param != nil {
-		releaseStacklessCoroNativeContext(ctx)
 		throw("runtime: stackless coroutine caller has pending parameter")
-	}
-	if root && ctx.freeTasks != nil {
-		s.freeTasks = ctx.freeTasks
-		s.freePlainTaskCount = ctx.freePlainTaskCount
-		s.freeFrameBytes = ctx.freeFrameBytes
-		s.cachedFrameTasks = ctx.cachedFrameTasks
-		s.cachedFrameBytes = ctx.cachedFrameBytes
-		ctx.freeTasks = nil
-		ctx.freePlainTaskCount = 0
-		ctx.freeFrameBytes = 0
-		ctx.cachedFrameTasks = 0
-		ctx.cachedFrameBytes = 0
 	}
 
 	ctx.scheduler = s
 	ctx.caller = gp
-	ctx.root = root
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
 	msigrestore(ctx.sigmask)
@@ -123,22 +128,46 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
-	ctx.root = false
-	if root && scheduler.executorState.Load() == stacklessCoroExecutorStateOff &&
-		scheduler.freeTasks != nil {
-		scheduler.discardFreeOverflowTasks()
-		ctx.freeTasks = scheduler.freeTasks
-		ctx.freePlainTaskCount = scheduler.freePlainTaskCount
-		ctx.freeFrameBytes = scheduler.freeFrameBytes
-		ctx.cachedFrameTasks = scheduler.cachedFrameTasks
-		ctx.cachedFrameBytes = scheduler.cachedFrameBytes
-		scheduler.freeTasks = nil
-		scheduler.freePlainTaskCount = 0
-		scheduler.freeFrameBytes = 0
-		scheduler.cachedFrameTasks = 0
-		scheduler.cachedFrameBytes = 0
+	return scheduler
+}
+
+// close releases the native context. A completed public root returns its
+// bounded task cache to that context only after its final episode.
+func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplete bool) {
+	ctx := d.context
+	if ctx == nil {
+		return
+	}
+	if d.root && rootComplete &&
+		s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.freeTasks != nil {
+		s.discardFreeOverflowTasks()
+		ctx.freeTasks = s.freeTasks
+		ctx.freePlainTaskCount = s.freePlainTaskCount
+		ctx.freeFrameBytes = s.freeFrameBytes
+		ctx.cachedFrameTasks = s.cachedFrameTasks
+		ctx.cachedFrameBytes = s.cachedFrameBytes
+		s.freeTasks = nil
+		s.freePlainTaskCount = 0
+		s.freeFrameBytes = 0
+		s.cachedFrameTasks = 0
+		s.cachedFrameBytes = 0
 	}
 	releaseStacklessCoroNativeContext(ctx)
+	d.context = nil
+	d.root = false
+}
+
+// coroRunOnNativeStack drives one replacement episode with a short-lived
+// driver. Public roots keep their driver across idle episodes instead.
+func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
+	var native stacklessCoroNativeDriver
+	scheduler := native.run(s)
+	if scheduler != nil {
+		native.close(scheduler, false)
+	} else {
+		native.close(s, false)
+	}
 	return scheduler
 }
 
@@ -299,11 +328,7 @@ func coroNativeMain() {
 		throw("runtime: invalid stackless coroutine executor context")
 	}
 	msigrestore(ctx.sigmask)
-	if ctx.root {
-		ctx.scheduler.run(true)
-	} else {
-		ctx.scheduler.runTasks(true, false)
-	}
+	ctx.scheduler.runTasks(true, false)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
 }

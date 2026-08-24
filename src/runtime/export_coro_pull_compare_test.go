@@ -18,11 +18,7 @@ func RunStacklessCoroPushComparisonFrameForTest(frame unsafe.Pointer,
 }
 
 func runStacklessCoroComparisonSchedulerForTest(s *stacklessCoroScheduler) {
-	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
-		s = nativeScheduler
-	} else {
-		s.run(false)
-	}
+	s = runStacklessCoroRoot(s)
 	s.stopReplacementExecutors()
 	s.releaseWake()
 	s.finish()

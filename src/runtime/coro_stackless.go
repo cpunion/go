@@ -341,15 +341,30 @@ func coroRun(resume stacklessCoroResume) {
 func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	frameSize uintptr) bool {
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
-
-	if nativeScheduler := coroRunOnNativeStack(s); nativeScheduler != nil {
-		s = nativeScheduler
-	} else {
-		s.run(false)
-	}
+	s = runStacklessCoroRoot(s)
 	s.stopReplacementExecutors()
 	s.releaseWake()
 	return finishStacklessCoroRootScheduler(s)
+}
+
+// runStacklessCoroRoot drives native fixed-stack episodes from an ordinary G.
+// Keeping the ordinary G parked between episodes lets its M run unrelated
+// work while the root waits for a timer or asynchronous operation.
+func runStacklessCoroRoot(s *stacklessCoroScheduler) *stacklessCoroScheduler {
+	var native stacklessCoroNativeDriver
+	for {
+		nativeScheduler := native.run(s)
+		if nativeScheduler == nil {
+			native.close(s, false)
+			s.run(false)
+			return s
+		}
+		s = nativeScheduler
+		if s.rootComplete() || !s.waitForWork() {
+			native.close(s, true)
+			return s
+		}
+	}
 }
 
 func newStacklessCoroScheduler(frame unsafe.Pointer,
@@ -952,14 +967,8 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 				if !park {
 					return
 				}
-				if s.executorStop == nil {
-					<-s.wake
-				} else {
-					select {
-					case <-s.wake:
-					case <-s.executorStop:
-						return
-					}
+				if !s.waitForWork() {
+					return
 				}
 				continue
 			}
@@ -1006,6 +1015,21 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 		default:
 			throw("runtime: invalid stackless coroutine action")
 		}
+	}
+}
+
+// waitForWork parks the current ordinary G until work is ready. It reports
+// false when root completion stopped the replacement executors instead.
+func (s *stacklessCoroScheduler) waitForWork() bool {
+	if s.executorStop == nil {
+		<-s.wake
+		return true
+	}
+	select {
+	case <-s.wake:
+		return true
+	case <-s.executorStop:
+		return false
 	}
 }
 

@@ -6,6 +6,14 @@
 
 package runtime
 
+type stacklessCoroNativeDriver struct{}
+
+func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler) *stacklessCoroScheduler {
+	return nil
+}
+
+func (*stacklessCoroNativeDriver) close(*stacklessCoroScheduler, bool) {}
+
 func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
 	return nil
 }
