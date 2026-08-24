@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"internal/buildcfg"
+	"internal/platform"
 )
 
 const cgoDirectVersion = "v1"
@@ -112,8 +113,7 @@ func cgoDirectSupported() bool {
 	if !buildcfg.Experiment.Coro {
 		return false
 	}
-	return buildcfg.GOOS == "darwin" && buildcfg.GOARCH == "arm64" ||
-		buildcfg.GOOS == "linux" && buildcfg.GOARCH == "amd64"
+	return platform.CoroDirectSupported(buildcfg.GOOS, buildcfg.GOARCH)
 }
 
 func validCgoDirectSymbol(name string) bool {

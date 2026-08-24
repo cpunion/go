@@ -11,12 +11,6 @@ package coro
 
 import "syscall"
 
-// DirectAdd calls the MVP scalar System ABI fixture.
-func DirectAdd(a, b uint64) uint64
-
-// DirectBlock calls the MVP blocking System ABI fixture.
-func DirectBlock(gate *uint32)
-
 // AsyncDouble asks the MVP foreign fixture to publish twice value through a
 // descriptor. The compiler turns the call into a suspending operation.
 func AsyncDouble(readFD, writeFD int, value uint64, result *uint64, errno *uintptr) {

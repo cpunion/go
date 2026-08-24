@@ -268,6 +268,16 @@ func CgoSupported(goos, goarch string) bool {
 	return distInfo[OSArch{goos, goarch}].CgoSupported
 }
 
+// CoroDirectSupported reports whether goos/goarch supports direct System ABI
+// calls for the coroutine experiment.
+func CoroDirectSupported(goos, goarch string) bool {
+	switch goos + "/" + goarch {
+	case "darwin/arm64", "linux/amd64":
+		return true
+	}
+	return false
+}
+
 // FirstClass reports whether goos/goarch is considered a “first class” port.
 // (See https://go.dev/wiki/PortingPolicy#first-class-ports.)
 func FirstClass(goos, goarch string) bool {
