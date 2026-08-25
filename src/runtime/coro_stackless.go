@@ -371,14 +371,20 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 // work while the root waits for a timer or asynchronous operation.
 func runStacklessCoroRoot(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	var native stacklessCoroNativeDriver
+	initial := true
 	for {
-		nativeScheduler := native.run(s)
+		nativeScheduler := native.run(s, initial)
 		if nativeScheduler == nil {
 			native.close(s, false)
-			s.run(false)
+			if initial {
+				s.runInitial()
+			} else {
+				s.run(false)
+			}
 			return s
 		}
 		s = nativeScheduler
+		initial = false
 		if s.rootComplete() || !s.waitForWork() {
 			native.close(s, true)
 			return s
@@ -968,9 +974,17 @@ func (s *stacklessCoroScheduler) run(native bool) {
 	s.runLoop(false)
 }
 
+// runInitial drives a scheduler that has not yet been published to a producer.
+func (s *stacklessCoroScheduler) runInitial() {
+	scope := enterStacklessCoroRunScope()
+	defer scope.leave()
+	s.runTasks(false, true, true)
+	s.runLoop(false)
+}
+
 func (s *stacklessCoroScheduler) runLoop(native bool) {
 	for !s.rootComplete() {
-		s.runTasks(native, true)
+		s.runTasks(native, true, false)
 	}
 }
 
@@ -1006,8 +1020,8 @@ func (scope *stacklessCoroRunScope) leave() {
 // runTasks drives the ready queue until the root completes, one resume panics,
 // or a non-parking episode exhausts ready work. A recovered panic returns to
 // run, which starts another queue-driving episode after this native activation
-// has unwound.
-func (s *stacklessCoroScheduler) runTasks(native, park bool) {
+// has unwound. initial is valid only while the scheduler remains private.
+func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	defer func() {
@@ -1026,65 +1040,75 @@ func (s *stacklessCoroScheduler) runTasks(native, park bool) {
 		s.readyAfterPanic(task)
 	}()
 
-	for !s.rootComplete() {
-		task = s.take()
-		if task == nil {
-			if native {
-				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
-			}
-			if task == nil {
-				if !park {
-					return
-				}
-				if !s.waitForWork() {
-					return
-				}
-				continue
-			}
-		}
-	resume:
-		task.context.scheduler = s
-		action := task.resume(unsafe.Pointer(&task.context))
-		task.context.scheduler = nil
+	// Select the private root before entering the ordinary queue loop. Keeping
+	// this branch out of that loop avoids adding work to every later yield.
+	if initial {
+		task = s.takeInitialRoot()
+		goto resume
+	}
 
-		switch action {
-		case stacklessCoroActionYield:
-			idlePollSkip = nil
-			foreignReturner := s.yield(task)
-			if !native || foreignReturner {
-				// Cooperate with the host scheduler when this target has no
-				// native executor implementation or a foreign-call executor
-				// needs a P to return from syscall state.
-				Gosched()
+next:
+	if s.rootComplete() {
+		return
+	}
+	task = s.take()
+	if task == nil {
+		if native {
+			task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
+		}
+		if task == nil {
+			if !park {
+				return
 			}
-		case stacklessCoroActionWait:
-			s.waiting(task)
-			idlePollSkip = task
-		case stacklessCoroActionComplete:
-			idlePollSkip = nil
-			task = s.complete(task)
-			if task != nil && !s.rootComplete() {
-				goto resume
+			if !s.waitForWork() {
+				return
 			}
-		case stacklessCoroActionPanic:
-			idlePollSkip = nil
-			s.terminate(task)
-		case stacklessCoroActionGoexit:
-			idlePollSkip = nil
-			s.goexit(task)
-		case stacklessCoroActionSwitch:
-			idlePollSkip = nil
-			if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
-				task.state != stacklessCoroTaskRunning || !task.resuming ||
-				task.readyPending {
-				throw("runtime: invalid stackless coroutine frame switch")
-			}
-			task.setFlag(stacklessCoroTaskSwitchPending, false)
-			goto resume
-		default:
-			throw("runtime: invalid stackless coroutine action")
+			goto next
 		}
 	}
+resume:
+	task.context.scheduler = s
+	action := task.resume(unsafe.Pointer(&task.context))
+	task.context.scheduler = nil
+
+	switch action {
+	case stacklessCoroActionYield:
+		idlePollSkip = nil
+		foreignReturner := s.yield(task)
+		if !native || foreignReturner {
+			// Cooperate with the host scheduler when this target has no
+			// native executor implementation or a foreign-call executor
+			// needs a P to return from syscall state.
+			Gosched()
+		}
+	case stacklessCoroActionWait:
+		s.waiting(task)
+		idlePollSkip = task
+	case stacklessCoroActionComplete:
+		idlePollSkip = nil
+		task = s.complete(task)
+		if task != nil && !s.rootComplete() {
+			goto resume
+		}
+	case stacklessCoroActionPanic:
+		idlePollSkip = nil
+		s.terminate(task)
+	case stacklessCoroActionGoexit:
+		idlePollSkip = nil
+		s.goexit(task)
+	case stacklessCoroActionSwitch:
+		idlePollSkip = nil
+		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
+			task.state != stacklessCoroTaskRunning || !task.resuming ||
+			task.readyPending {
+			throw("runtime: invalid stackless coroutine frame switch")
+		}
+		task.setFlag(stacklessCoroTaskSwitchPending, false)
+		goto resume
+	default:
+		throw("runtime: invalid stackless coroutine action")
+	}
+	goto next
 }
 
 // waitForWork parks the current ordinary G until work is ready. It reports
@@ -2214,7 +2238,7 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 	defer scope.leave()
 
 	s := newStacklessCoroScheduler(frame, resume)
-	s.run(false)
+	s.runInitial()
 	s.releaseWake()
 	if raceenabled {
 		raceacquire(unsafe.Pointer(&s.root))
@@ -2854,6 +2878,31 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	task.state = stacklessCoroTaskRunning
 	task.resuming = true
 	unlock(&s.lock)
+	if raceenabled {
+		raceacquire(unsafe.Pointer(task))
+	}
+	return task
+}
+
+// takeInitialRoot consumes the queue entry installed while the scheduler was
+// private. The caller must retain exclusive ownership until this transition
+// completes; later episodes and replacement executors use take.
+func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
+	pull := stacklessCoroIsPullComparison(s)
+	task := &s.root
+	runnable := s.runnableState.Load()
+	if s.head != task || (!pull && s.tail != task) || task.next != nil ||
+		task.state != stacklessCoroTaskRunnable || task.resuming ||
+		task.readyPending || (pull && runnable != 0) || (!pull && runnable != 1) {
+		throw("runtime: invalid initial stackless coroutine root")
+	}
+	if !pull {
+		s.head = nil
+		s.tail = nil
+		s.runnableState.Store(0)
+	}
+	task.state = stacklessCoroTaskRunning
+	task.resuming = true
 	if raceenabled {
 		raceacquire(unsafe.Pointer(task))
 	}

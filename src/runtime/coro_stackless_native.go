@@ -38,6 +38,7 @@ type stacklessCoroNativeContext struct {
 	lockedG            guintptr
 	lockedInt          uint32
 	g0Accurate         bool
+	initialRoot        bool
 	poolNext           *stacklessCoroNativeContext
 }
 
@@ -67,7 +68,8 @@ func init() {
 // stack switch; callers must not reuse their pre-switch local. The race
 // runtime has its own stack and goroutine bookkeeping, so race builds retain
 // the managed-stack driver for now.
-func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler) *stacklessCoroScheduler {
+func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
+	initial bool) *stacklessCoroScheduler {
 	if raceenabled {
 		return nil
 	}
@@ -102,6 +104,7 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler) *stacklessCor
 
 	ctx.scheduler = s
 	ctx.caller = gp
+	ctx.initialRoot = initial
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
 	mp := gp.m
@@ -157,7 +160,7 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 // driver. Public roots keep their driver across idle episodes instead.
 func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	var native stacklessCoroNativeDriver
-	scheduler := native.run(s)
+	scheduler := native.run(s, false)
 	if scheduler != nil {
 		native.close(scheduler, false)
 	} else {
@@ -323,7 +326,9 @@ func coroNativeMain() {
 	}
 	gp.m.g0 = ctx.schedulerG
 	gp.m.g0StackAccurate = true
-	ctx.scheduler.runTasks(true, false)
+	initial := ctx.initialRoot
+	ctx.initialRoot = false
+	ctx.scheduler.runTasks(true, false, initial)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
 }

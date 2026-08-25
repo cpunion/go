@@ -8,7 +8,7 @@ package runtime
 
 type stacklessCoroNativeDriver struct{}
 
-func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler) *stacklessCoroScheduler {
+func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool) *stacklessCoroScheduler {
 	return nil
 }
 
