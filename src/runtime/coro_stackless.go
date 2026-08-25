@@ -1040,70 +1040,75 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 		s.readyAfterPanic(task)
 	}()
 
-	for !s.rootComplete() {
-		if initial {
-			task = s.takeInitialRoot()
-			initial = false
-		} else {
-			task = s.take()
+	// Select the private root before entering the ordinary queue loop. Keeping
+	// this branch out of that loop avoids adding work to every later yield.
+	if initial {
+		task = s.takeInitialRoot()
+		goto resume
+	}
+
+next:
+	if s.rootComplete() {
+		return
+	}
+	task = s.take()
+	if task == nil {
+		if native {
+			task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
 		}
 		if task == nil {
-			if native {
-				task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
+			if !park {
+				return
 			}
-			if task == nil {
-				if !park {
-					return
-				}
-				if !s.waitForWork() {
-					return
-				}
-				continue
+			if !s.waitForWork() {
+				return
 			}
-		}
-	resume:
-		task.context.scheduler = s
-		action := task.resume(unsafe.Pointer(&task.context))
-		task.context.scheduler = nil
-
-		switch action {
-		case stacklessCoroActionYield:
-			idlePollSkip = nil
-			foreignReturner := s.yield(task)
-			if !native || foreignReturner {
-				// Cooperate with the host scheduler when this target has no
-				// native executor implementation or a foreign-call executor
-				// needs a P to return from syscall state.
-				Gosched()
-			}
-		case stacklessCoroActionWait:
-			s.waiting(task)
-			idlePollSkip = task
-		case stacklessCoroActionComplete:
-			idlePollSkip = nil
-			task = s.complete(task)
-			if task != nil && !s.rootComplete() {
-				goto resume
-			}
-		case stacklessCoroActionPanic:
-			idlePollSkip = nil
-			s.terminate(task)
-		case stacklessCoroActionGoexit:
-			idlePollSkip = nil
-			s.goexit(task)
-		case stacklessCoroActionSwitch:
-			idlePollSkip = nil
-			if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
-				task.state != stacklessCoroTaskRunning || !task.resuming ||
-				task.readyPending {
-				throw("runtime: invalid stackless coroutine frame switch")
-			}
-			task.setFlag(stacklessCoroTaskSwitchPending, false)
-			goto resume
-		default:
-			throw("runtime: invalid stackless coroutine action")
+			goto next
 		}
 	}
+resume:
+	task.context.scheduler = s
+	action := task.resume(unsafe.Pointer(&task.context))
+	task.context.scheduler = nil
+
+	switch action {
+	case stacklessCoroActionYield:
+		idlePollSkip = nil
+		foreignReturner := s.yield(task)
+		if !native || foreignReturner {
+			// Cooperate with the host scheduler when this target has no
+			// native executor implementation or a foreign-call executor
+			// needs a P to return from syscall state.
+			Gosched()
+		}
+	case stacklessCoroActionWait:
+		s.waiting(task)
+		idlePollSkip = task
+	case stacklessCoroActionComplete:
+		idlePollSkip = nil
+		task = s.complete(task)
+		if task != nil && !s.rootComplete() {
+			goto resume
+		}
+	case stacklessCoroActionPanic:
+		idlePollSkip = nil
+		s.terminate(task)
+	case stacklessCoroActionGoexit:
+		idlePollSkip = nil
+		s.goexit(task)
+	case stacklessCoroActionSwitch:
+		idlePollSkip = nil
+		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
+			task.state != stacklessCoroTaskRunning || !task.resuming ||
+			task.readyPending {
+			throw("runtime: invalid stackless coroutine frame switch")
+		}
+		task.setFlag(stacklessCoroTaskSwitchPending, false)
+		goto resume
+	default:
+		throw("runtime: invalid stackless coroutine action")
+	}
+	goto next
 }
 
 // waitForWork parks the current ordinary G until work is ready. It reports
