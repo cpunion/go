@@ -289,14 +289,21 @@ func coroNativeStart(caller *g) {
 
 	executor.trace.reset()
 	trace := traceAcquire()
+	tracing := trace.ok()
+	canCASCaller := !tracing && caller.bubble == nil && !goroutineProfile.active
 	gcController.addScannableStack(mp.p.ptr(), int64(executor.stack.hi-executor.stack.lo))
 	casgstatus(executor, _Gdead, _Grunnable)
-	if trace.ok() {
+	if tracing {
 		trace.GoCreate(executor, executor.startpc, false)
 		trace.GoPark(traceBlockGeneric, 0)
 	}
 	caller.waitreason = waitReasonCoroutine
-	casgstatus(caller, _Grunning, _Gwaiting)
+	if !canCASCaller ||
+		!caller.atomicstatus.CompareAndSwap(_Grunning, _Gwaiting) {
+		// Preserve the ordinary transition when a concurrent stack scan owns
+		// the status or a runtime observer needs the full path.
+		casgstatus(caller, _Grunning, _Gwaiting)
+	}
 	caller.m = nil
 
 	mp.curg = executor
@@ -307,7 +314,7 @@ func coroNativeStart(caller *g) {
 	mp.lockedg.set(executor)
 	executor.lockedm.set(mp)
 	casgstatus(executor, _Grunnable, _Grunning)
-	if trace.ok() {
+	if tracing {
 		trace.GoStart()
 		traceRelease(trace)
 	}
@@ -351,7 +358,9 @@ func coroNativeFinish(executor *g) {
 	}
 
 	trace := traceAcquire()
-	if trace.ok() {
+	tracing := trace.ok()
+	canCASCaller := !tracing && caller.bubble == nil && !goroutineProfile.active
+	if tracing {
 		trace.GoEnd()
 	}
 	casgstatus(executor, _Grunning, _Gdead)
@@ -372,12 +381,17 @@ func coroNativeFinish(executor *g) {
 	mp.lockedInt = ctx.lockedInt
 	caller.m = mp
 
-	casgstatus(caller, _Gwaiting, _Grunnable)
-	if trace.ok() {
-		trace.GoUnpark(caller, 0)
+	if !canCASCaller ||
+		!caller.atomicstatus.CompareAndSwap(_Gwaiting, _Grunning) {
+		// Preserve the ordinary runnable transition when a concurrent stack
+		// scan owns the status or a runtime observer needs the full path.
+		casgstatus(caller, _Gwaiting, _Grunnable)
+		if tracing {
+			trace.GoUnpark(caller, 0)
+		}
+		casgstatus(caller, _Grunnable, _Grunning)
 	}
-	casgstatus(caller, _Grunnable, _Grunning)
-	if trace.ok() {
+	if tracing {
 		trace.GoStart()
 		traceRelease(trace)
 	}
