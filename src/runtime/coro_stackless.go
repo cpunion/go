@@ -1074,7 +1074,10 @@ resume:
 	switch action {
 	case stacklessCoroActionYield:
 		idlePollSkip = nil
-		foreignReturner := s.yield(task)
+		resumeDirectly, foreignReturner := s.yield(task, native)
+		if resumeDirectly {
+			goto resume
+		}
 		if !native || foreignReturner {
 			// Cooperate with the host scheduler when this target has no
 			// native executor implementation or a foreign-call executor
@@ -2909,7 +2912,7 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 	return task
 }
 
-func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) bool {
+func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (resumeDirectly, foreignReturner bool) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -2917,10 +2920,17 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask) bool {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine yield")
 	}
+	if native && !raceenabled && !stacklessCoroIsPullComparison(s) && !s.rootComplete() &&
+		s.head == nil && s.tail == nil && s.runnableState.Load() == 0 {
+		// With no competing work, a queue round trip would select this task
+		// again. Keep its running ownership on the current native executor.
+		unlock(&s.lock)
+		return true, false
+	}
 	task.resuming = false
 	runnable := s.readyLocked(task)
 	unlock(&s.lock)
-	return runnable&stacklessCoroForeignReturnerBit != 0
+	return false, runnable&stacklessCoroForeignReturnerBit != 0
 }
 
 func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
