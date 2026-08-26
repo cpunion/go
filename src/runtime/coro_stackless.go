@@ -1074,6 +1074,9 @@ resume:
 	switch action {
 	case stacklessCoroActionYield:
 		idlePollSkip = nil
+		if initial && native && s.canYieldInitialRootDirectly(task) {
+			goto resume
+		}
 		resumeDirectly, foreignReturner := s.yield(task, native)
 		if resumeDirectly {
 			goto resume
@@ -2914,6 +2917,27 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 		raceacquire(unsafe.Pointer(task))
 	}
 	return task
+}
+
+// canYieldInitialRootDirectly reports whether a root has remained private
+// since its initial selection. Such a root can retain its running ownership
+// across a yield without serializing with an observer that does not exist.
+func (s *stacklessCoroScheduler) canYieldInitialRootDirectly(
+	task *stacklessCoroTask) bool {
+	// These facts are monotonic for one initialized scheduler lifetime and are
+	// published before an operation producer or replacement executor can
+	// observe the scheduler.
+	if raceenabled || stacklessCoroIsPullComparison(s) || task != &s.root ||
+		s.lifetime.Load() != 0 ||
+		s.executorState.Load() != stacklessCoroExecutorStateOff ||
+		s.head != nil || s.tail != nil || s.runnableState.Load() != 0 ||
+		task.parent != nil || task.next != nil ||
+		task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
+		task.terminal != stacklessCoroTerminalNone || task.goexit {
+		return false
+	}
+	return true
 }
 
 func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (resumeDirectly, foreignReturner bool) {
