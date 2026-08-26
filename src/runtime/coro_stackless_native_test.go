@@ -513,6 +513,24 @@ func TestStacklessCoroNativeTrace(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeStatusTracking(t *testing.T) {
+	old := *runtime.CasGStatusAlwaysTrack
+	defer func() { *runtime.CasGStatusAlwaysTrack = old }()
+
+	run := func() {
+		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+			return runtime.StacklessCoroActionComplete
+		})
+	}
+	*runtime.CasGStatusAlwaysTrack = true
+	run()
+	// The tracked transition leaves the reused executor with pending scheduler
+	// latency state. Its next entry must finish that state before returning to
+	// the direct status path.
+	*runtime.CasGStatusAlwaysTrack = false
+	run()
+}
+
 func TestStacklessCoroNilResume(t *testing.T) {
 	const helper = "GO_RUNTIME_CORO_NIL_RESUME"
 	if os.Getenv(helper) == "1" {

@@ -291,8 +291,15 @@ func coroNativeStart(caller *g) {
 	trace := traceAcquire()
 	tracing := trace.ok()
 	canCASCaller := !tracing && caller.bubble == nil && !goroutineProfile.active
+	canCASExecutor := !tracing && executor.bubble == nil &&
+		!goroutineProfile.active && !casgstatusAlwaysTrack && !executor.tracking
 	gcController.addScannableStack(mp.p.ptr(), int64(executor.stack.hi-executor.stack.lo))
-	casgstatus(executor, _Gdead, _Grunnable)
+	if !canCASExecutor ||
+		!executor.atomicstatus.CompareAndSwap(_Gdead, _Grunnable) {
+		// Preserve scheduler latency tracking and wait for a concurrent stack
+		// scan when the executor is observable through the ordinary G path.
+		casgstatus(executor, _Gdead, _Grunnable)
+	}
 	if tracing {
 		trace.GoCreate(executor, executor.startpc, false)
 		trace.GoPark(traceBlockGeneric, 0)
@@ -313,7 +320,10 @@ func coroNativeStart(caller *g) {
 	}
 	mp.lockedg.set(executor)
 	executor.lockedm.set(mp)
-	casgstatus(executor, _Grunnable, _Grunning)
+	if !canCASExecutor ||
+		!executor.atomicstatus.CompareAndSwap(_Grunnable, _Grunning) {
+		casgstatus(executor, _Grunnable, _Grunning)
+	}
 	if tracing {
 		trace.GoStart()
 		traceRelease(trace)
@@ -360,10 +370,15 @@ func coroNativeFinish(executor *g) {
 	trace := traceAcquire()
 	tracing := trace.ok()
 	canCASCaller := !tracing && caller.bubble == nil && !goroutineProfile.active
+	canCASExecutor := !tracing && executor.bubble == nil &&
+		!goroutineProfile.active && !casgstatusAlwaysTrack && !executor.tracking
 	if tracing {
 		trace.GoEnd()
 	}
-	casgstatus(executor, _Grunning, _Gdead)
+	if !canCASExecutor ||
+		!executor.atomicstatus.CompareAndSwap(_Grunning, _Gdead) {
+		casgstatus(executor, _Grunning, _Gdead)
+	}
 	gcController.addScannableStack(mp.p.ptr(), -int64(executor.stack.hi-executor.stack.lo))
 	resetStacklessCoroExecutor(executor)
 
