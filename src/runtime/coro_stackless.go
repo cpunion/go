@@ -1089,6 +1089,9 @@ resume:
 		idlePollSkip = task
 	case stacklessCoroActionComplete:
 		idlePollSkip = nil
+		if initial && s.completeInitialRoot(task) {
+			return
+		}
 		task = s.complete(task)
 		if task != nil && !s.rootComplete() {
 			goto resume
@@ -1111,6 +1114,7 @@ resume:
 	default:
 		throw("runtime: invalid stackless coroutine action")
 	}
+	initial = false
 	goto next
 }
 
@@ -2970,6 +2974,36 @@ func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
 	s.readyLocked(task)
 	unlock(&s.lock)
 	s.signal()
+}
+
+// completeInitialRoot completes a root that has remained private since its
+// initial selection. Once a producer or replacement executor can observe the
+// scheduler, completion retains the ordinary locked path.
+func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bool {
+	// These facts are monotonic for one initialized scheduler lifetime and are
+	// published before an operation producer or replacement executor can
+	// observe the scheduler.
+	if raceenabled || stacklessCoroIsPullComparison(s) || task != &s.root ||
+		s.lifetime.Load() != 0 ||
+		s.executorState.Load() != stacklessCoroExecutorStateOff ||
+		task.parent != nil || task.next != nil ||
+		task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending ||
+		task.hasFlag(stacklessCoroTaskFusedFrames) ||
+		task.hasFlag(stacklessCoroTaskFusedRequested) ||
+		task.hasFlag(stacklessCoroTaskFusedPending) ||
+		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.terminal != stacklessCoroTerminalNone || task.goexit {
+		return false
+	}
+	task.resuming = false
+	task.state = stacklessCoroTaskComplete
+	if !task.hasFlag(stacklessCoroTaskCacheFrame) {
+		clearStacklessCoroTaskFrame(task)
+	}
+	// Publish completion only after the root outcome and frame state are final.
+	s.lifetime.Store(stacklessCoroLifetimeRootComplete)
+	return true
 }
 
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCoroTask {
