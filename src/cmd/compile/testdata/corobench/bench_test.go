@@ -165,8 +165,9 @@ func TestProbes(t *testing.T) {
 	}
 
 	old := runtime.GOMAXPROCS(1)
-	if got := cBlockingHandoffs(1); got == 0 {
-		t.Error("cBlockingHandoffs(1) did not measure progress")
+	cBlockingHandoffs(1)
+	if got := atomic.LoadUint64(&handoffGate); got != 1 {
+		t.Errorf("cBlockingHandoffs(1) gate = %d, want 1", got)
 	}
 	if elapsed, timeouts := cBlockingGroup(1, 3, 250*time.Millisecond); elapsed == 0 || timeouts != 0 {
 		t.Errorf("cBlockingGroup(1, 3) = (%d, %d), want elapsed and no timeout",
