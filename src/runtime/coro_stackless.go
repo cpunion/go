@@ -213,10 +213,13 @@ type stacklessCoroScheduler struct {
 	directOverflowTaskCount uint8
 	// lifetime publishes monotonic facts for one initialized scheduler
 	// lifetime. Root completion is published only after its outcome is ready.
-	lifetime       atomic.Uint8
-	root           stacklessCoroTask
-	terminalValues map[*stacklessCoroTask]any
-	wake           chan struct{}
+	lifetime atomic.Uint8
+	// initialRootPrivate is cleared once by the initial driver, under the
+	// scheduler lock, before an operation or non-root runnable is published.
+	initialRootPrivate bool
+	root               stacklessCoroTask
+	terminalValues     map[*stacklessCoroTask]any
+	wake               chan struct{}
 	// executorWake admits the initial warm replacements. executorGrow asks
 	// the manager for capacity beyond that warm set, and executorStop
 	// broadcasts root completion to every admitted or waiting replacement.
@@ -439,6 +442,7 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 	}
 	// The scheduler remains private until initialization returns, so install
 	// its initial runnable root without taking the queue lock.
+	s.initialRootPrivate = true
 	root.state = stacklessCoroTaskRunnable
 	s.head = root
 	s.tail = root
@@ -2720,6 +2724,9 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine operation outside resume")
 	}
+	if s.initialRootPrivate {
+		s.initialRootPrivate = false
+	}
 	s.lifetime.Or(stacklessCoroLifetimeOperationStarted)
 	op := s.freeOperations
 	if op == nil {
@@ -2837,6 +2844,9 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	if task.readyPending {
 		throw("runtime: stackless coroutine has pending ready transition")
 	}
+	if task != &s.root && s.initialRootPrivate {
+		s.initialRootPrivate = false
+	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
 	var runnable uint32
@@ -2924,13 +2934,8 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 // across a yield without serializing with an observer that does not exist.
 func (s *stacklessCoroScheduler) canYieldInitialRootDirectly(
 	task *stacklessCoroTask) bool {
-	// These facts are monotonic for one initialized scheduler lifetime and are
-	// published before an operation producer or replacement executor can
-	// observe the scheduler.
 	if raceenabled || stacklessCoroIsPullComparison(s) || task != &s.root ||
-		s.lifetime.Load() != 0 ||
-		s.executorState.Load() != stacklessCoroExecutorStateOff ||
-		s.head != nil || s.tail != nil || s.runnableState.Load() != 0 ||
+		!s.initialRootPrivate ||
 		task.parent != nil || task.next != nil ||
 		task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
