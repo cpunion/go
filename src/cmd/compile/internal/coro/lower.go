@@ -3166,7 +3166,29 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	}
 
+	// Dispatch once on entry, then use direct branches between states. Persist
+	// the next state only before handing control to the scheduler or terminal
+	// machinery; ordinary state edges do not need a frame write.
+	labels := make([]*types.Sym, len(states))
 	cases := make([]*ir.CaseClause, len(states))
+	for i := range states {
+		// Lower is also called directly by tests, where ir.CurFunc is unset, so
+		// allocate labels from resume instead of using typecheck.AutoLabel.
+		labels[i] = resume.Sym().Pkg.LookupNum(".coro", int(resume.Label))
+		resume.Label++
+		label := typedInt(pos, types.Types[types.TUINT32], int64(i))
+		cases[i] = ir.NewCaseStmt(pos, []ir.Node{label}, ir.Nodes{
+			ir.NewBranchStmt(pos, ir.OGOTO, labels[i]),
+		})
+	}
+	assignResumePC := func(state int) ir.Node {
+		return ir.NewAssignStmt(pos, resumePC,
+			typedInt(pos, types.Types[types.TUINT32], int64(state)))
+	}
+	gotoState := func(state int) ir.Node {
+		return ir.NewBranchStmt(pos, ir.OGOTO, labels[state])
+	}
+	var stateBodies ir.Nodes
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
 		for _, stmt := range state.body {
@@ -3290,10 +3312,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body,
 				typecheck.Call(pos, typecheck.LookupRuntime("coroPanic"),
 					ir.Nodes{ctx, edit(state.panicValue)}, false),
-				ir.NewAssignStmt(pos, resumePC,
-					typedInt(pos, types.Types[types.TUINT32],
-						int64(state.next))),
-				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
+				assignResumePC(state.next),
+				gotoState(state.next),
 			)
 		} else if state.terminal != actionInvalid {
 			if state.next < 0 {
@@ -3301,10 +3321,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					ir.PkgFuncName(fn), i)
 			}
 			body = append(body,
-				ir.NewAssignStmt(pos, resumePC,
-					typedInt(pos, types.Types[types.TUINT32],
-						int64(state.next))),
-				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
+				assignResumePC(state.next),
+				gotoState(state.next),
 			)
 		} else if state.cleanup {
 			if candidate.dynamicDefers {
@@ -3405,16 +3423,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					edit(name), ir.NewZero(read.call.Pos(), name.Type())))
 			}
 			body = append(body,
-				ir.NewAssignStmt(pos, resumePC,
-					typedInt(pos, types.Types[types.TUINT32], int64(state.next))),
-				ir.NewBranchStmt(pos, ir.OCONTINUE, nil))
+				assignResumePC(state.next),
+				gotoState(state.next))
 		} else if state.transition != SiteInvalid {
 			if state.next < 0 {
 				return fmt.Errorf("%s: state %d transition has no continuation",
 					ir.PkgFuncName(fn), i)
 			}
-			next := typedInt(pos, types.Types[types.TUINT32], int64(state.next))
-			body = append(body, ir.NewAssignStmt(pos, resumePC, next))
+			body = append(body, assignResumePC(state.next))
 			action := actionInvalid
 			var actionResult ir.Node
 			switch state.transition {
@@ -3425,7 +3441,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					typecheck.Call(state.call.Pos(),
 						typecheck.LookupRuntime("coroGoexit"),
 						ir.Nodes{ctx}, false),
-					ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil),
+					gotoState(state.next),
 				)
 			case SiteAwait:
 				for _, init := range state.call.Init() {
@@ -3570,7 +3586,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 								int64(actionWait)),
 						}),
 					}, nil),
-					ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil),
+					gotoState(state.next),
 				)
 			case SiteFile, SitePoll:
 				if ordinaryReadOperation(state.call) {
@@ -3604,7 +3620,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 									types.Types[types.TUINT8], int64(actionWait)),
 							}),
 						}, nil),
-						ir.NewBranchStmt(state.call.Pos(), ir.OCONTINUE, nil))
+						gotoState(state.next))
 					action = actionWait
 					break
 				}
@@ -3658,8 +3674,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, ir.NewReturnStmt(pos,
 				[]ir.Node{actionResult}))
 		} else if state.thenState >= 0 {
-			thenPC := ir.NewAssignStmt(pos, resumePC,
-				typedInt(pos, types.Types[types.TUINT32], int64(state.thenState)))
+			thenPC := gotoState(state.thenState)
 			if state.condition == nil {
 				body = append(body, thenPC)
 			} else {
@@ -3667,24 +3682,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					return fmt.Errorf("%s: state %d branch has no false continuation",
 						ir.PkgFuncName(fn), i)
 				}
-				elsePC := ir.NewAssignStmt(pos, resumePC,
-					typedInt(pos, types.Types[types.TUINT32], int64(state.elseState)))
+				elsePC := gotoState(state.elseState)
 				body = append(body, ir.NewIfStmt(pos, edit(state.condition),
 					ir.Nodes{thenPC}, ir.Nodes{elsePC}))
 			}
-			body = append(body, ir.NewBranchStmt(pos, ir.OCONTINUE, nil))
 		} else if state.next >= 0 {
-			body = append(body,
-				ir.NewAssignStmt(pos, resumePC,
-					typedInt(pos, types.Types[types.TUINT32], int64(state.next))),
-				ir.NewBranchStmt(pos, ir.OCONTINUE, nil),
-			)
+			body = append(body, gotoState(state.next))
 		} else {
 			return fmt.Errorf("%s: state %d has no terminator",
 				ir.PkgFuncName(fn), i)
 		}
-		label := typedInt(pos, types.Types[types.TUINT32], int64(i))
-		cases[i] = ir.NewCaseStmt(pos, []ir.Node{label}, body)
+		stateBodies = append(stateBodies, ir.NewLabelStmt(pos, labels[i]))
+		stateBodies = append(stateBodies, body...)
 	}
 	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
 	resume.Body = ir.Nodes{}
@@ -3705,12 +3714,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}, nil))
 	}
 	resume.Body = append(resume.Body,
-		ir.NewForStmt(pos, nil, nil, nil, []ir.Node{
-			dispatch,
-			ir.NewReturnStmt(pos, []ir.Node{
-				typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)),
-			}),
-		}, false))
+		dispatch,
+		ir.NewReturnStmt(pos, []ir.Node{
+			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)),
+		}))
+	resume.Body = append(resume.Body, stateBodies...)
 
 	finishLowering(candidate, resume, declarations)
 	return nil
