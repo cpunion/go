@@ -1036,6 +1036,7 @@ func (scope *stacklessCoroRunScope) leave() {
 func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
+	var directInitialRoot bool
 	defer func() {
 		if task == nil || task.context.scheduler != s {
 			return
@@ -1054,8 +1055,13 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 
 	// Select the private root before entering the ordinary queue loop. Keeping
 	// this branch out of that loop avoids adding work to every later yield.
+	// takeInitialRoot validates the root before its first resume. A native
+	// driver can retain that ownership while the root remains private; every
+	// non-yield action is validated by its handler below.
 	if initial {
 		task = s.takeInitialRoot()
+		directInitialRoot = native && !raceenabled &&
+			!stacklessCoroIsPullComparison(s)
 		goto resume
 	}
 
@@ -1086,8 +1092,11 @@ resume:
 	switch action {
 	case stacklessCoroActionYield:
 		idlePollSkip = nil
-		if initial && native && s.canYieldInitialRootDirectly(task) {
-			goto resume
+		if directInitialRoot {
+			if s.initialRootPrivate {
+				goto resume
+			}
+			directInitialRoot = false
 		}
 		resumeDirectly, foreignReturner := s.yield(task, native)
 		if resumeDirectly {
@@ -1130,6 +1139,7 @@ resume:
 		throw("runtime: invalid stackless coroutine action")
 	}
 	initial = false
+	directInitialRoot = false
 	goto next
 }
 
@@ -2935,22 +2945,6 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 		raceacquire(unsafe.Pointer(task))
 	}
 	return task
-}
-
-// canYieldInitialRootDirectly reports whether a root has remained private
-// since its initial selection. Such a root can retain its running ownership
-// across a yield without serializing with an observer that does not exist.
-func (s *stacklessCoroScheduler) canYieldInitialRootDirectly(
-	task *stacklessCoroTask) bool {
-	if raceenabled || stacklessCoroIsPullComparison(s) || task != &s.root ||
-		!s.initialRootPrivate ||
-		task.parent != nil || task.next != nil ||
-		task.state != stacklessCoroTaskRunning || !task.resuming ||
-		task.readyPending ||
-		task.terminal != stacklessCoroTerminalNone || task.goexit {
-		return false
-	}
-	return true
 }
 
 func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (resumeDirectly, foreignReturner bool) {
