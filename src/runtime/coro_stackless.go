@@ -1086,18 +1086,21 @@ next:
 	}
 resume:
 	task.context.scheduler = s
+	// Retain the active context across private yields. Detaching it on every
+	// iteration would repeat two pointer write barriers while no other executor
+	// can observe or resume this task.
+resumeActive:
 	action := task.resume(unsafe.Pointer(&task.context))
+	if directInitialRoot && action == stacklessCoroActionYield &&
+		s.initialRootPrivate {
+		goto resumeActive
+	}
 	task.context.scheduler = nil
 
 	switch action {
 	case stacklessCoroActionYield:
 		idlePollSkip = nil
-		if directInitialRoot {
-			if s.initialRootPrivate {
-				goto resume
-			}
-			directInitialRoot = false
-		}
+		directInitialRoot = false
 		resumeDirectly, foreignReturner := s.yield(task, native)
 		if resumeDirectly {
 			goto resume
