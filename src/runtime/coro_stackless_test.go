@@ -1567,6 +1567,15 @@ func TestStacklessCoroFusedResumeFrames(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroPlainParentFusedAwait(t *testing.T) {
+	if race.Enabled {
+		t.Skip("the race detector retains separate coroutine tasks")
+	}
+	if !runtime.CheckStacklessCoroPlainParentFusedAwaitForTest() {
+		t.Fatal("fused await did not preserve a plain parent frame")
+	}
+}
+
 type stacklessCoroFusedFallbackTracker struct {
 	size           uintptr
 	validChunkType bool
