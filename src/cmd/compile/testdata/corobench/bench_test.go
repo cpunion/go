@@ -65,6 +65,9 @@ func TestProbes(t *testing.T) {
 	if got := readySelects(4); got != 6 {
 		t.Errorf("readySelects(4) = %d, want 6", got)
 	}
+	if got := blockedSelects(4); got != 10 {
+		t.Errorf("blockedSelects(4) = %d, want 10", got)
+	}
 	if got := sleepLoop(2, 0); got != 2 {
 		t.Errorf("sleepLoop(2, 0) = %d, want 2", got)
 	}
@@ -623,6 +626,11 @@ func BenchmarkChannelRoundTrip(b *testing.B) {
 func BenchmarkReadySelect(b *testing.B) {
 	b.ReportAllocs()
 	intSink = readySelects(b.N)
+}
+
+func BenchmarkBlockedSelect(b *testing.B) {
+	b.ReportAllocs()
+	intSink = blockedSelects(b.N)
 }
 
 func BenchmarkSleepZero(b *testing.B) {

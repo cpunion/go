@@ -6249,7 +6249,7 @@ func TestLowerChannelSelect(t *testing.T) {
 			result, function.Factory)
 	}
 
-	var selects, nativeSelects, nativeChannels int
+	var selects, conditionalSelects, nativeSelects, nativeChannels int
 	for _, generated := range typecheck.Target.Funcs {
 		ir.Visit(generated, func(node ir.Node) {
 			switch node.Op() {
@@ -6257,6 +6257,17 @@ func TestLowerChannelSelect(t *testing.T) {
 				nativeSelects++
 			case ir.OSEND, ir.ORECV:
 				nativeChannels++
+			case ir.OIF:
+				stmt := node.(*ir.IfStmt)
+				call, ok := stmt.Cond.(*ir.CallExpr)
+				if !ok {
+					break
+				}
+				name := ir.StaticCalleeName(call.Fun)
+				if name != nil && name.Sym() != nil &&
+					name.Sym().Name == "coroSelect" {
+					conditionalSelects++
+				}
 			}
 			call, ok := node.(*ir.CallExpr)
 			if !ok {
@@ -6275,6 +6286,10 @@ func TestLowerChannelSelect(t *testing.T) {
 	}
 	if selects != 1 {
 		t.Fatalf("generated IR has %d coroutine selects, want 1", selects)
+	}
+	if conditionalSelects != 1 {
+		t.Fatalf("generated IR has %d conditional coroutine selects, want 1",
+			conditionalSelects)
 	}
 	if nativeSelects != 0 || nativeChannels != 0 {
 		t.Fatalf("generated IR retains %d selects and %d channel operations",

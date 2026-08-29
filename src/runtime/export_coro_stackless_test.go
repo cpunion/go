@@ -740,15 +740,32 @@ func NewStacklessCoroSelectCasesForTest(channels []any,
 	return &StacklessCoroSelectCasesForTest{cases: cases, nsends: nsends}
 }
 
-func SelectStacklessCoroForTest(ctx unsafe.Pointer,
+func StartStacklessCoroSelectForTest(ctx unsafe.Pointer,
 	cases *StacklessCoroSelectCasesForTest, block bool, chosen *int,
 	received *bool) {
 	var first *scase
 	if len(cases.cases) != 0 {
 		first = &cases.cases[0]
 	}
-	coroSelect(ctx, first, cases.nsends, len(cases.cases)-cases.nsends,
+	startStacklessCoroSelect(ctx, first, cases.nsends,
+		len(cases.cases)-cases.nsends, block, chosen, received)
+}
+
+func SelectStacklessCoroForTest(ctx unsafe.Pointer,
+	cases *StacklessCoroSelectCasesForTest, block bool, chosen *int,
+	received *bool) bool {
+	var first *scase
+	if len(cases.cases) != 0 {
+		first = &cases.cases[0]
+	}
+	return coroSelect(ctx, first, cases.nsends,
+		len(cases.cases)-cases.nsends,
 		block, chosen, received)
+}
+
+func StacklessCoroSelectMayBeReadyForTest(
+	cases *StacklessCoroSelectCasesForTest) bool {
+	return stacklessCoroSelectMayBeReady(cases.cases, cases.nsends)
 }
 
 func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {

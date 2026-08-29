@@ -1531,3 +1531,69 @@ deadline, timer-arm, scheduling, and native deferral helpers and 92.3% for the
 native wait path. It executes 57 of 63 added executable lines (90.48%); the
 remaining six lines are fail-closed invariant or unreachable bounded-cache
 fallback bodies rather than omitted functional branches.
+
+#### Complete ready selects synchronously
+
+Revision `14199affe6`, based on exact parent `7934c61ced`, lets a stackless
+coroutine continue in its current resume call when a select is already ready.
+The runtime first uses the existing lock-free channel readiness hints. It then
+calls the ordinary `selectgo` arbitration with `block=false`, writes the
+selected index and receive result into the coroutine frame, clears the case
+descriptors so they cannot retain frame pointers, and tells compiler-generated
+code whether it must return the wait action. A genuinely blocked select keeps
+the original retained-operation path.
+
+The direct path is limited to non-race, non-pull-comparison selects with at
+most 16 cases, which keeps the complete arbitration order on the native stack.
+Large selects, race instrumentation, pull comparison, and special cases that
+cannot be ruled ready by the hint retain the previous protocol. Synctest
+bubble channels conservatively enter `selectgo`, where the existing bubble
+checks remain authoritative. Closed-send panics still pass through the
+existing native-panic machinery. No runtime object layout, source annotation,
+or public compiler interface changes.
+
+The exact parent and candidate used identical compiler and linker source,
+disabled inlining, one P, one warm-up, alternating execution, and matched
+randomized linker layouts. Native Darwin/arm64 used eight independent layouts
+at 300 ms per probe. Linux/amd64 used six independent layouts under Rosetta,
+so its timings are directional while its functional and allocation results
+remain useful.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| ready select | 114.400 ns -> 80.805 ns (-29.37%) | 188.250 ns -> 133.250 ns (-29.22%) |
+| blocked select | 133.400 ns -> 139.800 ns (+4.80%) | 237.100 ns -> 247.700 ns (+4.47%) |
+| channel round trip | 212.900 ns -> 210.150 ns (-1.29%) | 364.650 ns -> 366.850 ns (+0.60%) |
+| sleep for one nanosecond | 139.650 ns -> 139.150 ns (-0.36%) | 189.750 ns -> 188.400 ns (-0.71%) |
+
+Ready select improved in every matched layout on both platforms. All timing
+and allocation probes retained their parent zero-allocation results. The
+blocked-select row intentionally measures an immediate wake, making the
+roughly 6--11 ns lock-free readiness check visible; real external blocking
+latency dominates that fixed cost. The hint reduced the earlier full
+double-scan implementation's approximately 15% blocked-select regression to
+less than 5%. Amortized yield was within 1.76% on native Darwin. Its translated
+Linux result was address-layout noisy and is not attributed to this change.
+
+A prior separate 12-sample native Darwin run measured unmodified Go at exact
+upstream revision `da7c67f595` at 42.38 ns per ready select. This is directional
+whole-experiment context rather than a matched attribution: the candidate is
+about 1.91 times official Go, down from about 2.70 times in its exact parent.
+
+Regression tests cover buffered and closed sends and receives, queued peers,
+default selection, direct closed-send panic, genuinely blocked and large
+select fallback, descriptor clearing, race and pull fallback, and the
+readiness hint. Normal, race, pull, pull-plus-race, and `checkptr=2` stackless
+runtime tests, the complete coroutine compiler suite, `go vet runtime`, and
+the benchmark audit pass on native Darwin/arm64 and translated Linux/amd64 as
+applicable. Full `coro` and `nocoro` suites pass on Darwin. Linux/386,
+Linux/arm64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests also
+cross-compile with the experiment enabled. The translated full Linux runtime
+reaches only the existing Rosetta failure in `TestCheckFDs`; native Linux CI
+remains the complete runtime gate.
+
+Combined normal, race, and pull profiles report 100% coverage for `coroSelect`,
+92.3% for the lock-free readiness helper, 93.3% for direct arbitration, and
+100% for retained-select initiation. The remaining gaps are conservative
+synctest and fail-closed invariant branches or pre-existing retained-operation
+competition paths rather than omitted direct-path behavior.

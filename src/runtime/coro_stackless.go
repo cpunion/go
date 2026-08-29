@@ -2495,10 +2495,16 @@ func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, re
 	startStacklessCoroChannel(ctx, channel, element, received, false)
 }
 
-// coroSelect starts a channel select for a stackless logical goroutine.
+// coroSelect starts a channel select for a stackless logical goroutine and
+// reports whether the task must wait for it.
 func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool,
-	chosen *int, received *bool) {
-	startStacklessCoroSelect(ctx, cases, nsends, nrecvs, block, chosen, received)
+	chosen *int, received *bool) bool {
+	selection := stacklessCoroSelectCases(cases, nsends, nrecvs, chosen, received)
+	if tryStacklessCoroSelect(ctx, selection, nsends, block, chosen, received) {
+		return false
+	}
+	startStacklessCoroSelectCases(ctx, selection, nsends, block, chosen, received)
+	return true
 }
 
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,

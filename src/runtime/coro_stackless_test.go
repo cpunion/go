@@ -3427,6 +3427,347 @@ func TestStacklessCoroSelectStorageCache(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSelectReadyHint(t *testing.T) {
+	channel := make(chan int, 1)
+	channel <- 1
+	value := 2
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{channel, nil},
+		[]unsafe.Pointer{unsafe.Pointer(&value), nil}, 1)
+	if runtime.StacklessCoroSelectMayBeReadyForTest(cases) {
+		t.Fatal("full send and disabled receive reported ready")
+	}
+}
+
+func TestStacklessCoroSelectFastPath(t *testing.T) {
+	if race.Enabled {
+		t.Skip("the race detector retains logical select operations")
+	}
+
+	t.Run("BufferedReceive", func(t *testing.T) {
+		channel := make(chan int, 1)
+		channel <- 41
+		value := -1
+		chosen := -2
+		received := false
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+		baselineOperations := runtime.StacklessCoroOperationCountForTest()
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("ready receive select waited")
+			}
+			if chosen != 0 || !received || value != 41 {
+				t.Fatalf("ready receive select = (%d, %t, %d), want (0, true, 41)",
+					chosen, received, value)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+			t.Fatalf("operation count = %d, want %d",
+				operations, baselineOperations)
+		}
+	})
+
+	t.Run("BufferedSend", func(t *testing.T) {
+		channel := make(chan int, 1)
+		value := 43
+		chosen := -2
+		received := true
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 1)
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("ready send select waited")
+			}
+			if chosen != 0 || received {
+				t.Fatalf("ready send select = (%d, %t), want (0, false)",
+					chosen, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		if got := <-channel; got != value {
+			t.Fatalf("ready send value = %d, want %d", got, value)
+		}
+	})
+
+	t.Run("Default", func(t *testing.T) {
+		channel := make(chan int)
+		value := -1
+		chosen := -2
+		received := true
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SelectStacklessCoroForTest(ctx, cases, false,
+				&chosen, &received) {
+				t.Fatal("default select waited")
+			}
+			if chosen != -1 || received {
+				t.Fatalf("default select = (%d, %t), want (-1, false)",
+					chosen, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	})
+
+	t.Run("ClosedReceive", func(t *testing.T) {
+		channel := make(chan int)
+		close(channel)
+		value := -1
+		chosen := -2
+		received := true
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("closed receive select waited")
+			}
+			if chosen != 0 || received || value != 0 {
+				t.Fatalf("closed receive select = (%d, %t, %d), want (0, false, 0)",
+					chosen, received, value)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	})
+
+	t.Run("ReadyPeer", func(t *testing.T) {
+		channel := make(chan int)
+		peerDone := make(chan struct{})
+		go func() {
+			channel <- 45
+			close(peerDone)
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			send, _, logical :=
+				runtime.StacklessCoroChannelWaitersForTest(channel)
+			if send == 1 && logical == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("ordinary select peer was not queued")
+			}
+			runtime.Gosched()
+		}
+
+		value := -1
+		chosen := -2
+		received := false
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("ready peer select waited")
+			}
+			if chosen != 0 || !received || value != 45 {
+				t.Fatalf("ready peer select = (%d, %t, %d), want (0, true, 45)",
+					chosen, received, value)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		<-peerDone
+	})
+}
+
+func TestStacklessCoroSelectFastPathFallback(t *testing.T) {
+	t.Run("Blocked", func(t *testing.T) {
+		channel := make(chan int)
+		value := -1
+		chosen := -2
+		received := false
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				_, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if recv == 1 && logical == 1 {
+					channel <- 47
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Error("blocked select waiter was not queued")
+					close(channel)
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+
+		state := 0
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				if !runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received) {
+					t.Fatal("blocked select completed synchronously")
+				}
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if chosen != 0 || !received || value != 47 {
+					t.Fatalf("blocked select = (%d, %t, %d), want (0, true, 47)",
+						chosen, received, value)
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		<-peerDone
+	})
+
+	t.Run("LargeReady", func(t *testing.T) {
+		const caseCount = runtime.StacklessCoroSelectCaseCacheSize + 1
+		channel := make(chan int, 1)
+		channel <- 53
+		channels := make([]any, caseCount)
+		elements := make([]unsafe.Pointer, caseCount)
+		value := -1
+		channels[caseCount-1] = channel
+		elements[caseCount-1] = unsafe.Pointer(&value)
+		chosen := -2
+		received := false
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			channels, elements, 0)
+		state := 0
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				if !runtime.SelectStacklessCoroForTest(ctx, cases, true,
+					&chosen, &received) {
+					t.Fatal("large ready select bypassed retained operation")
+				}
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if chosen != caseCount-1 || !received || value != 53 {
+					t.Fatalf("large ready select = (%d, %t, %d), want (%d, true, 53)",
+						chosen, received, value, caseCount-1)
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	})
+
+	t.Run("EmptyDefault", func(t *testing.T) {
+		chosen := -2
+		received := true
+		cases := runtime.NewStacklessCoroSelectCasesForTest(nil, nil, 0)
+		state := 0
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				if !runtime.SelectStacklessCoroForTest(ctx, cases, false,
+					&chosen, &received) {
+					t.Fatal("empty default bypassed retained operation")
+				}
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if chosen != -1 || received {
+					t.Fatalf("empty default = (%d, %t), want (-1, false)",
+						chosen, received)
+				}
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	})
+}
+
+func TestStacklessCoroSelectRaceFallback(t *testing.T) {
+	if !race.Enabled {
+		t.Skip("requires the race detector")
+	}
+	channel := make(chan int, 1)
+	channel <- 57
+	value := -1
+	chosen := -2
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+	state := 0
+
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			if !runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("race select bypassed retained operation")
+			}
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 0 || !received || value != 57 {
+				t.Fatalf("race select = (%d, %t, %d), want (0, true, 57)",
+					chosen, received, value)
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroSelectFastPathPanic(t *testing.T) {
+	if race.Enabled {
+		t.Skip("the race detector retains logical select operations")
+	}
+	channel := make(chan int)
+	close(channel)
+	value := 59
+	chosen := -2
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 1)
+	var recovered any
+
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				return action
+			}
+			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				&chosen, &received) {
+				t.Fatal("closed send select returned")
+			}
+			t.Fatal("closed send select completed")
+			return runtime.StacklessCoroActionInvalid
+		})
+	}()
+	err, ok := recovered.(error)
+	if !ok || err.Error() != "send on closed channel" {
+		t.Fatalf("recovered select panic = %v, want send on closed channel",
+			recovered)
+	}
+}
+
 func TestStacklessCoroSelectOperationReuse(t *testing.T) {
 	ready := make(chan int, 1)
 	ready <- 41
@@ -3443,7 +3784,7 @@ func TestStacklessCoroSelectOperationReuse(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3465,7 +3806,7 @@ func TestStacklessCoroSelectOperationReuse(t *testing.T) {
 			cases = runtime.NewStacklessCoroSelectCasesForTest(
 				[]any{ready}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
 			state = 3
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 3:
@@ -3502,7 +3843,7 @@ func TestStacklessCoroSelect(t *testing.T) {
 			cases = runtime.NewStacklessCoroSelectCasesForTest(
 				[]any{send}, []unsafe.Pointer{unsafe.Pointer(&sendValue)}, 1)
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3520,7 +3861,7 @@ func TestStacklessCoroSelect(t *testing.T) {
 					unsafe.Pointer(&receivedValue),
 				}, 1)
 			state = 2
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 2:
@@ -3533,7 +3874,7 @@ func TestStacklessCoroSelect(t *testing.T) {
 			chosen = -2
 			received = true
 			state = 3
-			runtime.SelectStacklessCoroForTest(ctx, cases, false,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, false,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 3:
@@ -3549,7 +3890,7 @@ func TestStacklessCoroSelect(t *testing.T) {
 			chosen = -2
 			received = true
 			state = 4
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 4:
@@ -3609,7 +3950,7 @@ func TestStacklessCoroSelectBlocked(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3669,7 +4010,7 @@ func TestStacklessCoroSelectReadyPeers(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 					&chosen, &received)
 				return runtime.StacklessCoroActionWait
 			case 1:
@@ -3718,7 +4059,7 @@ func TestStacklessCoroSelectReadyPeers(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 					&chosen, &received)
 				return runtime.StacklessCoroActionWait
 			case 1:
@@ -3774,7 +4115,7 @@ func TestStacklessCoroSelectBlockedSend(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3815,7 +4156,7 @@ func TestStacklessCoroSelectTimer(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3875,7 +4216,7 @@ func TestStacklessCoroSelectClose(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3941,7 +4282,7 @@ func TestStacklessCoroSelectBlockedSendPanic(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 					&chosen, &received)
 				return runtime.StacklessCoroActionWait
 			default:
@@ -3979,7 +4320,7 @@ func TestStacklessCoroSelectPanic(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SelectStacklessCoroForTest(ctx, cases, true,
+				runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 					&chosen, &received)
 				return runtime.StacklessCoroActionWait
 			default:
