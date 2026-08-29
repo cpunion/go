@@ -4885,6 +4885,50 @@ func TestStacklessCoroSleepProgress(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSleepSiblingProgress(t *testing.T) {
+	const delay = 5 * time.Millisecond
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	childDone := false
+	child := func(unsafe.Pointer) uint8 {
+		childDone = true
+		return runtime.StacklessCoroActionComplete
+	}
+	state := 0
+	sleepStarted := false
+	siblingObserved := false
+	invalidState := -1
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			runtime.SpawnStacklessCoroForTest(ctx, child)
+			sleepStarted = runtime.SleepStacklessCoroForTest(ctx, int64(delay))
+			if !sleepStarted {
+				return runtime.StacklessCoroActionComplete
+			}
+			return runtime.StacklessCoroActionWait
+		case 1:
+			siblingObserved = childDone
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			invalidState = state
+			return runtime.StacklessCoroActionComplete
+		}
+	})
+	if !sleepStarted {
+		t.Fatal("positive sleep did not wait")
+	}
+	if invalidState >= 0 {
+		t.Fatalf("unexpected state %d", invalidState)
+	}
+	if !siblingObserved {
+		t.Fatal("sibling did not run while root slept")
+	}
+}
+
 func TestStacklessCoroSleepCancel(t *testing.T) {
 	const maxDuration = int64(^uint64(0) >> 1)
 	var state, round int
