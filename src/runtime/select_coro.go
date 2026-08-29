@@ -109,18 +109,84 @@ func stacklessCoroSelectTry(owner unsafe.Pointer) bool {
 	return op.selection.done.CompareAndSwap(0, 1)
 }
 
-func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
-	nsends, nrecvs int, block bool, chosen *int, received *bool) {
+func stacklessCoroSelectCases(cases0 *scase, nsends, nrecvs int,
+	chosen *int, received *bool) []scase {
 	ncases := nsends + nrecvs
 	if nsends < 0 || nrecvs < 0 || ncases < 0 || ncases > 1<<16 ||
 		(ncases != 0 && cases0 == nil) || chosen == nil || received == nil {
 		throw("runtime: invalid stackless coroutine select")
 	}
 
-	var cases []scase
-	if ncases != 0 {
-		cases = (*[1 << 16]scase)(unsafe.Pointer(cases0))[:ncases:ncases]
+	if ncases == 0 {
+		return nil
 	}
+	return (*[1 << 16]scase)(unsafe.Pointer(cases0))[:ncases:ncases]
+}
+
+// stacklessCoroSelectMayBeReady is a hint that avoids a redundant locked poll
+// before a select that is visibly blocked. Both the direct and retained paths
+// arbitrate under channel locks, so a stale result only changes which one is
+// attempted first.
+func stacklessCoroSelectMayBeReady(cases []scase, nsends int) bool {
+	for i := range cases {
+		c := cases[i].c
+		if c == nil {
+			continue
+		}
+		if c.bubble != nil {
+			return true
+		}
+		if i < nsends {
+			if c.closed != 0 || !full(c) {
+				return true
+			}
+			continue
+		}
+		if !empty(c) || atomic.Load(&c.closed) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// tryStacklessCoroSelect completes a small nonblocking select directly on the
+// current executor. It reports whether it selected a case or the default.
+func tryStacklessCoroSelect(ctx unsafe.Pointer, cases []scase, nsends int,
+	block bool, chosen *int, received *bool) bool {
+	if raceenabled || len(cases) == 0 ||
+		len(cases) > stacklessCoroSelectCaseCacheSize {
+		return false
+	}
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil ||
+		stacklessCoroIsPullComparison(context.scheduler) {
+		return false
+	}
+	if block && !stacklessCoroSelectMayBeReady(cases, nsends) {
+		return false
+	}
+
+	var order [2 * stacklessCoroSelectCaseCacheSize]uint16
+	casi, recvOK := selectgo(&cases[0], &order[0], nil, nsends,
+		len(cases)-nsends, false)
+	if casi < 0 && block {
+		return false
+	}
+	clear(cases)
+	*chosen = casi
+	*received = recvOK
+	return true
+}
+
+func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
+	nsends, nrecvs int, block bool, chosen *int, received *bool) {
+	cases := stacklessCoroSelectCases(cases0, nsends, nrecvs, chosen, received)
+	startStacklessCoroSelectCases(ctx, cases, nsends, block, chosen, received)
+}
+
+func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
+	nsends int, block bool, chosen *int, received *bool) {
+	ncases := len(cases)
 	pollOrder := make([]uint16, 0, ncases)
 	for i := range cases {
 		c := cases[i].c

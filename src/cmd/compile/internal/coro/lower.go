@@ -3495,7 +3495,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						}
 						nsends++
 					}
-					body = append(body, typecheck.Call(
+					wait := typecheck.Call(
 						state.statement.Pos(),
 						typecheck.LookupRuntime("coroSelect"),
 						ir.Nodes{
@@ -3511,8 +3511,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 									selection.defaultCase == nil)),
 							typecheck.NodAddr(edit(selection.chosen)),
 							typecheck.NodAddr(edit(selection.received)),
-						}, false))
-					action = actionWait
+						}, false)
+					body = append(body,
+						ir.NewIfStmt(state.statement.Pos(), wait, ir.Nodes{
+							ir.NewReturnStmt(state.statement.Pos(), []ir.Node{
+								typedInt(state.statement.Pos(),
+									types.Types[types.TUINT8],
+									int64(actionWait)),
+							}),
+						}, nil),
+						gotoState(state.next),
+					)
 					break
 				}
 				channel := state.channel

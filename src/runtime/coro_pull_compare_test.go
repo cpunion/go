@@ -39,6 +39,15 @@ type stacklessCoroComparisonYieldFrame struct {
 	completed int
 }
 
+type stacklessCoroComparisonSelectFrame struct {
+	channel  chan int
+	state    uint8
+	value    int
+	chosen   int
+	received bool
+	waited   bool
+}
+
 func stacklessCoroComparisonYieldResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroComparisonYieldFrame)(
 		runtime.FrameStacklessCoroForTest(ctx))
@@ -48,6 +57,25 @@ func stacklessCoroComparisonYieldResume(ctx unsafe.Pointer) uint8 {
 	frame.remaining--
 	frame.completed++
 	return runtime.StacklessCoroActionYield
+}
+
+func stacklessCoroComparisonSelectResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroComparisonSelectFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.state {
+	case 0:
+		frame.state = 1
+		cases := runtime.NewStacklessCoroSelectCasesForTest(
+			[]any{frame.channel},
+			[]unsafe.Pointer{unsafe.Pointer(&frame.value)}, 0)
+		frame.waited = runtime.SelectStacklessCoroForTest(ctx, cases, true,
+			&frame.chosen, &frame.received)
+		return runtime.StacklessCoroActionWait
+	case 1:
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
 }
 
 type stacklessCoroComparisonAwaitFrame struct {
@@ -628,6 +656,25 @@ func startStacklessCoroComparisonSocketWriter(fd, iterations int,
 		done <- err
 	}()
 	return done
+}
+
+func TestStacklessCoroSelectPullFallback(t *testing.T) {
+	channel := make(chan int, 1)
+	channel <- 39
+	frame := &stacklessCoroComparisonSelectFrame{
+		channel: channel,
+		value:   -1,
+		chosen:  -2,
+	}
+	runtime.RunStacklessCoroPullFrameForTest(unsafe.Pointer(frame),
+		stacklessCoroComparisonSelectResume)
+	if !frame.waited {
+		t.Fatal("pull select bypassed retained operation")
+	}
+	if frame.chosen != 0 || !frame.received || frame.value != 39 {
+		t.Fatalf("pull select = (%d, %t, %d), want (0, true, 39)",
+			frame.chosen, frame.received, frame.value)
+	}
 }
 
 func TestStacklessCoroPushPullComparison(t *testing.T) {
