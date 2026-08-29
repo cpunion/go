@@ -125,14 +125,14 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 	exclude, previous *stacklessCoroTask) *stacklessCoroTask {
 	lock(&stacklessCoroOperations.lock)
+	registry := stacklessCoroOperations.registry
 	scanned := 0
-	start := int(stacklessCoroOperations.scan)
-	for offset := range len(stacklessCoroOperations.buckets) {
-		index := (start + offset) % len(stacklessCoroOperations.buckets)
-		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+	start := int(registry.scan)
+	for offset := range len(registry.buckets) {
+		index := (start + offset) % len(registry.buckets)
+		for op := registry.buckets[index]; op != nil; op = op.next {
 			if scanned == stacklessCoroIdlePollScanLimit {
-				stacklessCoroOperations.scan = uint16((index + 1) %
-					len(stacklessCoroOperations.buckets))
+				registry.scan = uint16((index + 1) % len(registry.buckets))
 				unlock(&stacklessCoroOperations.lock)
 				return nil
 			}
@@ -148,15 +148,13 @@ func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 				continue
 			}
 			task := op.task
-			stacklessCoroOperations.scan = uint16((index + 1) %
-				len(stacklessCoroOperations.buckets))
+			registry.scan = uint16((index + 1) % len(registry.buckets))
 			unlock(&stacklessCoroOperations.lock)
 			stacklessCoroSocketReadAttempt(op)
 			return task
 		}
 	}
-	stacklessCoroOperations.scan = uint16((start + 1) %
-		len(stacklessCoroOperations.buckets))
+	registry.scan = uint16((start + 1) % len(registry.buckets))
 	unlock(&stacklessCoroOperations.lock)
 	return nil
 }

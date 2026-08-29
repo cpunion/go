@@ -62,8 +62,8 @@ const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
 	stacklessCoroOperationCacheSize
 
 // Sixteen buckets distribute 64 consecutive operation IDs over four links per
-// chain while retaining 128 bytes of GC-visible global roots on 64-bit targets.
-// Larger concurrent sets remain correct through per-bucket chains.
+// chain while retaining 128 bytes of pointer slots on 64-bit targets. Larger
+// concurrent sets remain correct through per-bucket chains.
 const stacklessCoroOperationRegistryBucketCount = 16
 
 // A fused structured-await chain uses the same direct prefix as ordinary
@@ -336,11 +336,17 @@ type stacklessCoroTimerToken struct {
 	sequence uintptr
 }
 
-var stacklessCoroOperations struct {
-	lock    mutex
-	next    uint64
+// The pointerful buckets live in one runtime-init allocation, leaving a single
+// pointer in the static runtime root set.
+type stacklessCoroOperationRegistry struct {
 	scan    uint16
 	buckets [stacklessCoroOperationRegistryBucketCount]*stacklessCoroOperation
+}
+
+var stacklessCoroOperations struct {
+	lock     mutex
+	next     uint64
+	registry *stacklessCoroOperationRegistry
 }
 
 // stacklessCoroSharedOperations retains completed operations that exceeded a
@@ -397,6 +403,7 @@ var stacklessCoroRootFrameCache struct {
 
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
+	stacklessCoroOperations.registry = new(stacklessCoroOperationRegistry)
 	lockInit(&stacklessCoroSharedOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
@@ -3701,6 +3708,7 @@ func findStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 // stacklessCoroOperationBucket returns the registry chain for id. Callers
 // access the returned link only while holding stacklessCoroOperations.lock.
 func stacklessCoroOperationBucket(id uint64) **stacklessCoroOperation {
-	index := id % uint64(len(stacklessCoroOperations.buckets))
-	return &stacklessCoroOperations.buckets[index]
+	registry := stacklessCoroOperations.registry
+	index := id % uint64(len(registry.buckets))
+	return &registry.buckets[index]
 }

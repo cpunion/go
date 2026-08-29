@@ -991,8 +991,9 @@ func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {
 func StacklessCoroOperationCountForTest() int {
 	lock(&stacklessCoroOperations.lock)
 	count := 0
-	for index := range stacklessCoroOperations.buckets {
-		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+	registry := stacklessCoroOperations.registry
+	for index := range registry.buckets {
+		for op := registry.buckets[index]; op != nil; op = op.next {
 			count++
 		}
 	}
@@ -1003,8 +1004,9 @@ func StacklessCoroOperationCountForTest() int {
 func StacklessCoroPollWaitCountForTest() int {
 	lock(&stacklessCoroOperations.lock)
 	count := 0
-	for index := range stacklessCoroOperations.buckets {
-		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+	registry := stacklessCoroOperations.registry
+	for index := range registry.buckets {
+		for op := registry.buckets[index]; op != nil; op = op.next {
 			if op.async || op.packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
@@ -1165,8 +1167,9 @@ func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	}
 	lock(&stacklessCoroOperations.lock)
 	var found *stacklessCoroOperation
-	for index := range stacklessCoroOperations.buckets {
-		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+	registry := stacklessCoroOperations.registry
+	for index := range registry.buckets {
+		for op := registry.buckets[index]; op != nil; op = op.next {
 			if op.scheduler == context.scheduler && op.task == context.task() {
 				if found != nil {
 					unlock(&stacklessCoroOperations.lock)
@@ -1562,14 +1565,15 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 	}
 	bucket := int(ids[0] % stacklessCoroOperationRegistryBucketCount)
 	lock(&stacklessCoroOperations.lock)
-	oldScan := stacklessCoroOperations.scan
-	stacklessCoroOperations.scan = uint16(bucket)
+	registry := stacklessCoroOperations.registry
+	oldScan := registry.scan
+	registry.scan = uint16(bucket)
 	unlock(&stacklessCoroOperations.lock)
 	valid := stacklessCoroPollReadAtIdle(s, nil, nil) == nil
 	lock(&stacklessCoroOperations.lock)
-	valid = valid && int(stacklessCoroOperations.scan) ==
+	valid = valid && int(registry.scan) ==
 		(bucket+1)%stacklessCoroOperationRegistryBucketCount
-	stacklessCoroOperations.scan = oldScan
+	registry.scan = oldScan
 	unlock(&stacklessCoroOperations.lock)
 	for i := range operations {
 		if takeStacklessCoroOperation(ids[i]) != operations[i] {
