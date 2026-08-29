@@ -63,8 +63,10 @@ const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
 
 // A fused structured-await chain uses the same direct prefix as ordinary
 // recursive frame chunks. The low four bits describe allocation. The next two
-// cache typed-chunk validation and its four-element class; the top two retain
-// suspended-frame state when resumes are heterogeneous.
+// cache typed-chunk validation and its four-element class; runtime-created
+// child frames inherit both, so later self-frame transitions need not repeat
+// the validation. The top two bits retain suspended-frame state when resumes
+// are heterogeneous.
 const (
 	stacklessCoroFusedFrameDirectFirst uint8 = 1
 	stacklessCoroFusedFrameDirectLast        = stacklessCoroFusedFrameDirectFirst + stacklessCoroFrameChunkDirectCount - 1
@@ -1567,7 +1569,7 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		unlock(&s.lock)
 		throw("runtime: invalid initialized stackless coroutine self frame")
 	}
-	if !validStacklessCoroSelfFrameMarker(parentHeader.marker) {
+	if parentHeader.marker&stacklessCoroFusedFrameChunkValidated == 0 {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine parent self-frame marker")
 	}
@@ -1631,7 +1633,8 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	}
 	frame := context.frame
 	header := (*stacklessCoroFusedFrameHeader)(frame)
-	if header.parent == nil || !validStacklessCoroSelfFrameMarker(header.marker) {
+	if header.parent == nil ||
+		header.marker&stacklessCoroFusedFrameChunkValidated == 0 {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completed self frame")
 	}
