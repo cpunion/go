@@ -1128,7 +1128,12 @@ resumeActive:
 			Gosched()
 		}
 	case stacklessCoroActionWait:
-		s.waiting(task)
+		if s.waiting(task, native) {
+			idlePollSkip = nil
+			initial = false
+			directInitialRoot = false
+			goto resume
+		}
 		idlePollSkip = task
 	case stacklessCoroActionComplete:
 		idlePollSkip = nil
@@ -2890,13 +2895,16 @@ func cacheStacklessCoroSharedOperation(op *stacklessCoroOperation) {
 func completeStacklessCoroOperation(op *stacklessCoroOperation) {
 	s, task := clearStacklessCoroOperation(op)
 	lock(&s.lock)
+	completedDuringResume := task.resuming
 	s.readyLocked(task)
 	cachedLocally := s.recycleOperationLocked(op)
 	unlock(&s.lock)
 	if !cachedLocally {
 		cacheStacklessCoroSharedOperation(op)
 	}
-	s.signal()
+	if !completedDuringResume {
+		s.signal()
+	}
 }
 
 func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
@@ -2913,13 +2921,16 @@ func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
 		s.terminalValues = make(map[*stacklessCoroTask]any)
 	}
 	s.terminalValues[task] = value
+	completedDuringResume := task.resuming
 	s.readyLocked(task)
 	cachedLocally := s.recycleOperationLocked(op)
 	unlock(&s.lock)
 	if !cachedLocally {
 		cacheStacklessCoroSharedOperation(op)
 	}
-	s.signal()
+	if !completedDuringResume {
+		s.signal()
+	}
 }
 
 func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
@@ -3050,15 +3061,27 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (re
 	return false, runnable&stacklessCoroForeignReturnerBit != 0
 }
 
-func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
+func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
+	native bool) (resumeDirectly bool) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskWaiting || !task.resuming {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine wait without operation")
 	}
-	task.resuming = false
 	ready := task.readyPending
 	task.readyPending = false
+	if ready && native && !raceenabled &&
+		!stacklessCoroIsPullComparison(s) && !s.rootComplete() &&
+		s.head == nil && s.tail == nil && s.runnableState.Load() == 0 {
+		// The producer completed while the initiating resume call was still
+		// active. With no competing logical work, retain task ownership on
+		// this native executor instead of publishing and taking it again.
+		// Race and pull-comparison builds retain their separate handoff.
+		task.state = stacklessCoroTaskRunning
+		unlock(&s.lock)
+		return true
+	}
+	task.resuming = false
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -3069,6 +3092,7 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask) {
 	if ready {
 		s.signal()
 	}
+	return false
 }
 
 func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {

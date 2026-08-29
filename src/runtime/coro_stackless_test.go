@@ -5202,9 +5202,26 @@ func TestStacklessCoroOperationRegistry(t *testing.T) {
 }
 
 func TestStacklessCoroEarlyReady(t *testing.T) {
-	if !runtime.CheckEarlyReadyStacklessCoroForTest() {
-		t.Fatal("operation completion was published before resume returned")
-	}
+	t.Run("direct", func(t *testing.T) {
+		if !runtime.CheckEarlyReadyStacklessCoroForTest() {
+			t.Fatal("early operation completion did not use the valid handoff")
+		}
+	})
+	t.Run("managed fallback", func(t *testing.T) {
+		if !runtime.CheckEarlyReadyManagedFallbackStacklessCoroForTest() {
+			t.Fatal("managed early completion bypassed the ready queue")
+		}
+	})
+	t.Run("ready ordering", func(t *testing.T) {
+		if !runtime.CheckEarlyReadyOrderingStacklessCoroForTest() {
+			t.Fatal("early completion bypassed a queued task")
+		}
+	})
+	t.Run("delayed signal", func(t *testing.T) {
+		if !runtime.CheckDelayedReadySignalStacklessCoroForTest() {
+			t.Fatal("delayed completion did not signal its waiting executor")
+		}
+	})
 }
 
 func TestStacklessCoroCallRead(t *testing.T) {
