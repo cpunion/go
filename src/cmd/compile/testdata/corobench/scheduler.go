@@ -287,6 +287,17 @@ func channelRoundTrips(iterations int) int {
 	return sum
 }
 
+func readyChannelPairs(iterations int) int {
+	channel := make(chan int, 1)
+	sum := 0
+	for i := 0; i < iterations; i++ {
+		channel <- i
+		value := <-channel
+		sum += value
+	}
+	return sum
+}
+
 func readySelects(iterations int) int {
 	left := make(chan int, 1)
 	right := make(chan int, 1)

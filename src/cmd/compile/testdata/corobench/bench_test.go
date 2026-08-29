@@ -623,6 +623,11 @@ func BenchmarkChannelRoundTrip(b *testing.B) {
 	intSink = channelRoundTrips(b.N)
 }
 
+func BenchmarkReadyChannelPair(b *testing.B) {
+	b.ReportAllocs()
+	intSink = readyChannelPairs(b.N)
+}
+
 func BenchmarkReadySelect(b *testing.B) {
 	b.ReportAllocs()
 	intSink = readySelects(b.N)

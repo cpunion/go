@@ -77,7 +77,7 @@ export GO111MODULE=off
 	-test.count=1 -test.v >"$coro_capability" \
 	2>"$coro_capability_error"
 
-benchmarks='^Benchmark(YieldBatch|YieldEntry|RecursiveYield64|RecursiveYield4096|MutualYield64|MutualYield4096|DeferYield|RecoverYield|TaskSequence|TaskBurst100|TaskPark100|ChannelRoundTrip|ReadySelect|BlockedSelect|SleepZero|SleepNanosecond|FileRead|TCPRead|FileBlockingProgress|TCPBlockingProgress|CScalar|CAggregate|CErrno|CLibm|CBlockingHandoff|CBlockingGroup3|CBlockingGroup8)$'
+benchmarks='^Benchmark(YieldBatch|YieldEntry|RecursiveYield64|RecursiveYield4096|MutualYield64|MutualYield4096|DeferYield|RecoverYield|TaskSequence|TaskBurst100|TaskPark100|ChannelRoundTrip|ReadyChannelPair|ReadySelect|BlockedSelect|SleepZero|SleepNanosecond|FileRead|TCPRead|FileBlockingProgress|TCPBlockingProgress|CScalar|CAggregate|CErrno|CLibm|CBlockingHandoff|CBlockingGroup3|CBlockingGroup8)$'
 samples=${SAMPLES:-10}
 benchtime=${BENCHTIME:-500ms}
 

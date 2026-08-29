@@ -137,6 +137,7 @@ expected=(
 	parallelYieldWork
 	channelWorker
 	channelRoundTrips
+	readyChannelPairs
 	readySelects
 	sleepLoop
 	fileReads
