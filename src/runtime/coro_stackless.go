@@ -61,6 +61,11 @@ const stacklessCoroOperationCacheSize = 64
 const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
 	stacklessCoroOperationCacheSize
 
+// Sixteen buckets distribute 64 consecutive operation IDs over four links per
+// chain while retaining 128 bytes of GC-visible global roots on 64-bit targets.
+// Larger concurrent sets remain correct through per-bucket chains.
+const stacklessCoroOperationRegistryBucketCount = 16
+
 // A fused structured-await chain uses the same direct prefix as ordinary
 // recursive frame chunks. The low four bits describe allocation. The next two
 // cache typed-chunk validation and its four-element class; runtime-created
@@ -332,9 +337,10 @@ type stacklessCoroTimerToken struct {
 }
 
 var stacklessCoroOperations struct {
-	lock mutex
-	next uint64
-	head *stacklessCoroOperation
+	lock    mutex
+	next    uint64
+	scan    uint16
+	buckets [stacklessCoroOperationRegistryBucketCount]*stacklessCoroOperation
 }
 
 // stacklessCoroSharedOperations retains completed operations that exceeded a
@@ -3646,15 +3652,16 @@ func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
 		stacklessCoroOperations.next++
 	}
 	op.id = stacklessCoroOperations.next
-	op.next = stacklessCoroOperations.head
-	stacklessCoroOperations.head = op
+	link := stacklessCoroOperationBucket(op.id)
+	op.next = *link
+	*link = op
 	unlock(&stacklessCoroOperations.lock)
 	return op.id
 }
 
 func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 	lock(&stacklessCoroOperations.lock)
-	link := &stacklessCoroOperations.head
+	link := stacklessCoroOperationBucket(id)
 	for *link != nil && (*link).id != id {
 		link = &(*link).next
 	}
@@ -3681,7 +3688,7 @@ func stacklessCoroTimerReady(arg any, sequence uintptr, _ int64) {
 
 func findStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 	lock(&stacklessCoroOperations.lock)
-	for op := stacklessCoroOperations.head; op != nil; op = op.next {
+	for op := *stacklessCoroOperationBucket(id); op != nil; op = op.next {
 		if op.id == id {
 			unlock(&stacklessCoroOperations.lock)
 			return op
@@ -3689,4 +3696,11 @@ func findStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 	}
 	unlock(&stacklessCoroOperations.lock)
 	return nil
+}
+
+// stacklessCoroOperationBucket returns the registry chain for id. Callers
+// access the returned link only while holding stacklessCoroOperations.lock.
+func stacklessCoroOperationBucket(id uint64) **stacklessCoroOperation {
+	index := id % uint64(len(stacklessCoroOperations.buckets))
+	return &stacklessCoroOperations.buckets[index]
 }

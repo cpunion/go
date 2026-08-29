@@ -991,8 +991,10 @@ func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {
 func StacklessCoroOperationCountForTest() int {
 	lock(&stacklessCoroOperations.lock)
 	count := 0
-	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		count++
+	for index := range stacklessCoroOperations.buckets {
+		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+			count++
+		}
 	}
 	unlock(&stacklessCoroOperations.lock)
 	return count
@@ -1001,15 +1003,17 @@ func StacklessCoroOperationCountForTest() int {
 func StacklessCoroPollWaitCountForTest() int {
 	lock(&stacklessCoroOperations.lock)
 	count := 0
-	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		if op.async || op.packet[stacklessCoroPollDescWord] == 0 {
-			continue
-		}
-		pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
-		token := pd.rg.Load()
-		if token&netpollCoroTagMask == netpollCoroTag &&
-			token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op)) {
-			count++
+	for index := range stacklessCoroOperations.buckets {
+		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+			if op.async || op.packet[stacklessCoroPollDescWord] == 0 {
+				continue
+			}
+			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
+			token := pd.rg.Load()
+			if token&netpollCoroTagMask == netpollCoroTag &&
+				token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op)) {
+				count++
+			}
 		}
 	}
 	unlock(&stacklessCoroOperations.lock)
@@ -1161,13 +1165,15 @@ func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	}
 	lock(&stacklessCoroOperations.lock)
 	var found *stacklessCoroOperation
-	for op := stacklessCoroOperations.head; op != nil; op = op.next {
-		if op.scheduler == context.scheduler && op.task == context.task() {
-			if found != nil {
-				unlock(&stacklessCoroOperations.lock)
-				throw("runtime: multiple stackless coroutine operations for one task")
+	for index := range stacklessCoroOperations.buckets {
+		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+			if op.scheduler == context.scheduler && op.task == context.task() {
+				if found != nil {
+					unlock(&stacklessCoroOperations.lock)
+					throw("runtime: multiple stackless coroutine operations for one task")
+				}
+				found = op
 			}
-			found = op
 		}
 	}
 	unlock(&stacklessCoroOperations.lock)
@@ -1506,23 +1512,71 @@ func CheckStacklessCoroOperationRegistryForTest() bool {
 	first := new(stacklessCoroOperation)
 	second := new(stacklessCoroOperation)
 	firstID := registerStacklessCoroOperation(first)
+	// Leave exactly one bucket rotation between consecutive registrations so
+	// the test covers a real collision.
+	lock(&stacklessCoroOperations.lock)
+	for range stacklessCoroOperationRegistryBucketCount - 1 {
+		stacklessCoroOperations.next++
+		if stacklessCoroOperations.next == 0 {
+			stacklessCoroOperations.next++
+		}
+	}
+	unlock(&stacklessCoroOperations.lock)
 	secondID := registerStacklessCoroOperation(second)
-	if firstID == 0 || secondID == 0 || firstID == secondID {
-		return false
+	valid := firstID != 0 && secondID != 0 && firstID != secondID &&
+		firstID%stacklessCoroOperationRegistryBucketCount ==
+			secondID%stacklessCoroOperationRegistryBucketCount &&
+		findStacklessCoroOperation(firstID) == first &&
+		findStacklessCoroOperation(secondID) == second &&
+		takeStacklessCoroOperation(firstID) == first &&
+		findStacklessCoroOperation(firstID) == nil &&
+		takeStacklessCoroOperation(firstID) == nil
+	if takeStacklessCoroOperation(secondID) != second {
+		valid = false
 	}
-	if findStacklessCoroOperation(firstID) != first {
-		return false
+	return valid
+}
+
+func CheckStacklessCoroOperationRegistryScanForTest() bool {
+	s := new(stacklessCoroScheduler)
+	operations := make([]*stacklessCoroOperation,
+		stacklessCoroIdlePollScanLimit+1)
+	ids := make([]uint64, len(operations))
+	for i := range operations {
+		if i != 0 {
+			lock(&stacklessCoroOperations.lock)
+			for range stacklessCoroOperationRegistryBucketCount - 1 {
+				stacklessCoroOperations.next++
+				if stacklessCoroOperations.next == 0 {
+					stacklessCoroOperations.next++
+				}
+			}
+			unlock(&stacklessCoroOperations.lock)
+		}
+		op := new(stacklessCoroOperation)
+		op.scheduler = s
+		op.task = new(stacklessCoroTask)
+		op.async = true
+		operations[i] = op
+		ids[i] = registerStacklessCoroOperation(op)
 	}
-	if takeStacklessCoroOperation(firstID) != first {
-		return false
+	bucket := int(ids[0] % stacklessCoroOperationRegistryBucketCount)
+	lock(&stacklessCoroOperations.lock)
+	oldScan := stacklessCoroOperations.scan
+	stacklessCoroOperations.scan = uint16(bucket)
+	unlock(&stacklessCoroOperations.lock)
+	valid := stacklessCoroPollReadAtIdle(s, nil, nil) == nil
+	lock(&stacklessCoroOperations.lock)
+	valid = valid && int(stacklessCoroOperations.scan) ==
+		(bucket+1)%stacklessCoroOperationRegistryBucketCount
+	stacklessCoroOperations.scan = oldScan
+	unlock(&stacklessCoroOperations.lock)
+	for i := range operations {
+		if takeStacklessCoroOperation(ids[i]) != operations[i] {
+			valid = false
+		}
 	}
-	if findStacklessCoroOperation(firstID) != nil {
-		return false
-	}
-	if takeStacklessCoroOperation(firstID) != nil {
-		return false
-	}
-	return takeStacklessCoroOperation(secondID) == second
+	return valid
 }
 
 func AsyncReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, result *uint64, errno *uintptr) uint64 {

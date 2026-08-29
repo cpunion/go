@@ -126,24 +126,37 @@ func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 	exclude, previous *stacklessCoroTask) *stacklessCoroTask {
 	lock(&stacklessCoroOperations.lock)
 	scanned := 0
-	for op := stacklessCoroOperations.head; op != nil &&
-		scanned < stacklessCoroIdlePollScanLimit; op = op.next {
-		scanned++
-		if op.scheduler != s || op.task == exclude ||
-			op.task == previous || op.async ||
-			op.packet[stacklessCoroPollDescWord] == 0 {
-			continue
+	start := int(stacklessCoroOperations.scan)
+	for offset := range len(stacklessCoroOperations.buckets) {
+		index := (start + offset) % len(stacklessCoroOperations.buckets)
+		for op := stacklessCoroOperations.buckets[index]; op != nil; op = op.next {
+			if scanned == stacklessCoroIdlePollScanLimit {
+				stacklessCoroOperations.scan = uint16((index + 1) %
+					len(stacklessCoroOperations.buckets))
+				unlock(&stacklessCoroOperations.lock)
+				return nil
+			}
+			scanned++
+			if op.scheduler != s || op.task == exclude ||
+				op.task == previous || op.async ||
+				op.packet[stacklessCoroPollDescWord] == 0 {
+				continue
+			}
+			pd := (*pollDesc)(unsafe.Pointer(
+				uintptr(op.packet[stacklessCoroPollDescWord])))
+			if !netpollCoroReadClaim(pd, op) {
+				continue
+			}
+			task := op.task
+			stacklessCoroOperations.scan = uint16((index + 1) %
+				len(stacklessCoroOperations.buckets))
+			unlock(&stacklessCoroOperations.lock)
+			stacklessCoroSocketReadAttempt(op)
+			return task
 		}
-		pd := (*pollDesc)(unsafe.Pointer(
-			uintptr(op.packet[stacklessCoroPollDescWord])))
-		if !netpollCoroReadClaim(pd, op) {
-			continue
-		}
-		task := op.task
-		unlock(&stacklessCoroOperations.lock)
-		stacklessCoroSocketReadAttempt(op)
-		return task
 	}
+	stacklessCoroOperations.scan = uint16((start + 1) %
+		len(stacklessCoroOperations.buckets))
 	unlock(&stacklessCoroOperations.lock)
 	return nil
 }
