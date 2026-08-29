@@ -3674,6 +3674,59 @@ result, or fairness ownership. It should remain separate from the blocking-C
 handoff work, which must leave a blocking call on its original M even if the
 replacement transfer becomes cheaper.
 
+### 16.6 Early operation-completion handoff
+
+An operation may complete before the resume call that started it returns
+`Wait`. The existing protocol records that race as `readyPending`: the
+producer leaves the task in `Waiting`, the active executor consumes `Wait`,
+publishes the same task to the ready queue, signals a wake token, and then
+takes the task again. The publication is necessary when another logical task
+is ready, but it is redundant when the current native executor still owns the
+only runnable continuation.
+
+Revision `d27a9580e1`, based on exact parent `2cef2cc392`, extends the same
+ownership rule used by direct yield and structured child completion. After an
+early operation completion, the active native executor retains the task in
+`Running` state and resumes it directly only when the scheduler has no queued
+or counted runnable work and the root has not completed. Managed executors,
+race builds, and the controlled pull-comparison build retain the ordinary
+queue handoff. A queued sibling also forces that handoff, preserving FIFO
+priority rather than letting a synchronously completed operation bypass
+logical work.
+
+The producer suppresses its wake token only while the initiating resume call
+is still active. If that call later returns `Wait` and direct ownership is not
+valid, the executor publishes the pending transition and emits the wake
+itself. A completion after the executor has consumed `Wait` follows the old
+producer-signals path. Both transitions are serialized by the scheduler
+mutex, so there is neither a stale token after a direct resume nor a lost
+wake before a queued resume. Panic completion uses the same protocol and
+retains the existing terminal value ownership.
+
+This is a runtime scheduling optimization, not a new operation ABI. It adds
+no task or scheduler field, compiler metadata, source annotation, or lowering
+case. Ready select benefits most because its operation commonly completes
+inside the initiating resume. Ready file and TCP reads also use the path.
+Channel round trips normally retain a runnable peer, and a positive timer
+normally fires after `Wait`, so their queue and signaling behavior remains
+unchanged.
+
+Twelve matched linker layouts on native Darwin/arm64 improved ready select by
+17.95% and ready file reads by 2.74%; ready TCP reads improved directionally
+by 3.48%. Sixteen matched layouts under translated Linux/amd64 improved the
+same probes by 16.19%, 7.53%, and 7.88%. Channel, positive-timer, task, yield,
+and direct and blocking C controls were statistically neutral, and all
+allocation results were unchanged. The detailed exact-parent methodology and
+distributions are recorded in `testdata/corobench/README.md`.
+
+Tests cover direct ownership, managed and race fallback, queued-sibling
+ordering, delayed producer signaling, normal and panic completion, pull
+comparison, and concurrent channel, select, file, and socket operation. Full
+`coro` and `nocoro` runtime suites pass on Darwin/arm64. Focused normal, race,
+and `checkptr=2` runtime tests, the complete compiler coroutine suite, and the
+architecture probe pass on Darwin/arm64 and translated Linux/amd64. Combined
+normal, race, and pull coverage executes every new production statement.
+
 The likely compatibility order remains:
 
 1. add mutexes, semaphores, and runtime notes through the same park/wake

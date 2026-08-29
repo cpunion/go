@@ -1171,7 +1171,8 @@ func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
 	return context.task() == &context.scheduler.root
 }
 
-func CheckEarlyReadyStacklessCoroForTest() bool {
+func newEarlyReadyStacklessCoroForTest() (*stacklessCoroScheduler,
+	*stacklessCoroTask, *stacklessCoroOperation) {
 	s := &stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
@@ -1182,23 +1183,68 @@ func CheckEarlyReadyStacklessCoroForTest() bool {
 	}
 	task := &s.root
 	task.context.scheduler = s
+	op := stacklessCoroStartOperation(
+		unsafe.Pointer(&task.context), "early ready test")
+	op.id = 1
+	task.context.scheduler = nil
+	return s, task, op
+}
 
-	stacklessCoroStartOperation(unsafe.Pointer(&task.context), "early ready test")
-	s.ready(task, true)
+func CheckEarlyReadyStacklessCoroForTest() bool {
+	s, task, op := newEarlyReadyStacklessCoroForTest()
+	completeStacklessCoroOperation(op)
 
 	lock(&s.lock)
 	deferred := s.head == nil &&
 		task.state == stacklessCoroTaskWaiting &&
 		task.resuming && task.readyPending
 	unlock(&s.lock)
-	if !deferred {
+	if !deferred || len(s.wake) != 0 {
 		return false
 	}
 
-	s.waiting(task)
-	return s.take() == task &&
-		task.state == stacklessCoroTaskRunning &&
+	direct := s.waiting(task, true)
+	if raceenabled {
+		return !direct && len(s.wake) == 1 && s.take() == task &&
+			task.state == stacklessCoroTaskRunning && task.resuming &&
+			!task.readyPending && s.freeOperationCount == 0
+	}
+	return direct && len(s.wake) == 0 && s.head == nil && s.tail == nil &&
+		task.state == stacklessCoroTaskRunning && task.resuming &&
+		!task.readyPending && s.freeOperations == op &&
+		s.freeOperationCount == 1
+}
+
+func CheckEarlyReadyManagedFallbackStacklessCoroForTest() bool {
+	s, task, op := newEarlyReadyStacklessCoroForTest()
+	completeStacklessCoroOperation(op)
+	return !s.waiting(task, false) && len(s.wake) == 1 &&
+		s.take() == task && task.state == stacklessCoroTaskRunning &&
 		task.resuming && !task.readyPending
+}
+
+func CheckEarlyReadyOrderingStacklessCoroForTest() bool {
+	s, task, op := newEarlyReadyStacklessCoroForTest()
+	other := new(stacklessCoroTask)
+	lock(&s.lock)
+	s.readyLocked(other)
+	unlock(&s.lock)
+	completeStacklessCoroOperation(op)
+	if s.waiting(task, true) || len(s.wake) != 1 {
+		return false
+	}
+	return s.take() == other && s.take() == task && s.head == nil &&
+		s.tail == nil && s.runnableState.Load() == 0
+}
+
+func CheckDelayedReadySignalStacklessCoroForTest() bool {
+	s, task, op := newEarlyReadyStacklessCoroForTest()
+	if s.waiting(task, true) || len(s.wake) != 0 {
+		return false
+	}
+	completeStacklessCoroOperation(op)
+	return len(s.wake) == 1 && s.take() == task &&
+		task.state == stacklessCoroTaskRunning && task.resuming
 }
 
 func CheckCompletionHandoffStacklessCoroForTest(parentResuming,
