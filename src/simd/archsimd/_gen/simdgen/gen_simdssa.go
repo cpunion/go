@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"simd/archsimd/_gen/simdgen/types"
 	"sort"
 	"strings"
 	"text/template"
@@ -25,7 +26,7 @@ import (
 	"cmd/compile/internal/ssa/ssaop"
 )
 
-func ssaGenSIMDValue(s *ssagen.State, v *ssa.Value) bool {
+func ssaGenSIMD{{.FuncInfix}}Value(s *ssagen.State, v *ssa.Value) bool {
 	var p *obj.Prog
 	switch v.Op {{"{"}}{{end}}
 {{define "case"}}
@@ -63,11 +64,26 @@ type tplSSAHeader struct {
 	Arch            string
 	ObjArch         string
 	GeneratedHeader string
+	// FuncInfix disambiguates the generated ssaGenSIMD<FuncInfix>Value function
+	// name when a target shares another's backend package.
+	// Empty for the primary target.
+	FuncInfix string
 }
 
 // getArrangementFromOp extracts the arrangement constant from an SSA op name for ARM64.
 // For example, "ssa.OpARM64VFADD4S" returns "arm64.ARNG_4S".
 func getArrangementFromOp(archInfo ArchInfo, caseStr string) string {
+	if archInfo.isSVE() {
+		// SVE machine op names end in a single element-size letter (ZADD -> ZADDB,
+		// ZSQADD -> ZSQADDD). Match the suffix, not any occurrence: "ZSQADDD"
+		// contains "S" (from SQADD) but its arrangement is the trailing "D".
+		for _, a := range archInfo.Arrangements {
+			if strings.HasSuffix(caseStr, a) {
+				return archInfo.Arch + ".ARNG_" + a
+			}
+		}
+		return ""
+	}
 	for _, a := range archInfo.Arrangements {
 		if strings.Contains(caseStr, a) {
 			return archInfo.Arch + ".ARNG_" + a
@@ -148,7 +164,7 @@ func writeSIMDSSA(buffer *bytes.Buffer, ops []Operation) {
 			if shapeOut != OneVregOutAtIn {
 				// We have to copy the slice here because the sort will be visible from other
 				// aliases when no reslicing is happening.
-				newIn := make([]Operand, len(op.In), len(op.In)+1)
+				newIn := make([]types.Operand, len(op.In), len(op.In)+1)
 				copy(newIn, op.In)
 				op.In = newIn
 				op.In = append(op.In, op.Out[0])
@@ -238,6 +254,7 @@ func writeSIMDSSA(buffer *bytes.Buffer, ops []Operation) {
 		Arch:            archInfo.Arch,
 		ObjArch:         archInfo.ObjArch,
 		GeneratedHeader: archInfo.GeneratedHeader,
+		FuncInfix:       archInfo.ssaGenFuncInfix(),
 	}
 	if err := ssaTemplates.ExecuteTemplate(buffer, "header", headerData); err != nil {
 		panic(fmt.Errorf("failed to execute header template: %w", err))

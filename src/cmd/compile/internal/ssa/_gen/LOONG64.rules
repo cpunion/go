@@ -261,14 +261,14 @@
 (SignExt32to64 ...) => (MOVWreg ...)
 
 // float <=> int conversion
-(Cvt32to32F ...) => (MOVWF ...)
-(Cvt32to64F ...) => (MOVWD ...)
-(Cvt64to32F ...) => (MOVVF ...)
-(Cvt64to64F ...) => (MOVVD ...)
-(Cvt32Fto32 ...) => (TRUNCFW ...)
-(Cvt64Fto32 ...) => (TRUNCDW ...)
-(Cvt32Fto64 ...) => (TRUNCFV ...)
-(Cvt64Fto64 ...) => (TRUNCDV ...)
+(Cvt32to32F <t> x) => (MOVWF (MOVWgpfp <t> x))
+(Cvt32to64F <t> x) => (MOVWD (MOVWgpfp <t> x))
+(Cvt64to32F <t> x) => (MOVVF (MOVVgpfp <t> x))
+(Cvt64to64F <t> x) => (MOVVD (MOVVgpfp <t> x))
+(Cvt32Fto32 <t> x) => (MOVWfpgp (TRUNCFW <t> x))
+(Cvt64Fto32 <t> x) => (MOVWfpgp (TRUNCDW <t> x))
+(Cvt32Fto64 <t> x) => (MOVVfpgp (TRUNCFV <t> x))
+(Cvt64Fto64 <t> x) => (MOVVfpgp (TRUNCDV <t> x))
 (Cvt32Fto64F ...) => (MOVFD ...)
 (Cvt64Fto32F ...) => (MOVDF ...)
 
@@ -559,53 +559,6 @@
 	&& ssa.Is32Bit(int64(off1)+int64(off2)) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink) =>
 	(MOV(B|H|W|V|F|D)store [off1+int32(off2)] {ssa.MergeSym(sym1,sym2)} ptr val mem)
 
-// don't extend after proper load
-(MOVBreg x:(MOVBload _ _)) => (MOVVreg x)
-(MOVBUreg x:(MOVBUload _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVBload _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVBUload _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVHload _ _)) => (MOVVreg x)
-(MOVHUreg x:(MOVBUload _ _)) => (MOVVreg x)
-(MOVHUreg x:(MOVHUload _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVBload _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVBUload _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVHload _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVHUload _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVWload _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVBUload _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVHUload _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVWUload _ _)) => (MOVVreg x)
-(MOVBreg x:(MOVBloadidx _ _ _)) => (MOVVreg x)
-(MOVBUreg x:(MOVBUloadidx _ _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVBloadidx _ _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVBUloadidx _ _ _)) => (MOVVreg x)
-(MOVHreg x:(MOVHloadidx _ _ _)) => (MOVVreg x)
-(MOVHUreg x:(MOVBUloadidx _ _ _)) => (MOVVreg x)
-(MOVHUreg x:(MOVHUloadidx _ _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVBloadidx _ _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVBUloadidx _ _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVHloadidx _ _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVHUloadidx _ _ _)) => (MOVVreg x)
-(MOVWreg x:(MOVWloadidx _ _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVBUloadidx _ _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVHUloadidx _ _ _)) => (MOVVreg x)
-(MOVWUreg x:(MOVWUloadidx _ _ _)) => (MOVVreg x)
-
-// fold double extensions
-(MOVBreg x:(MOVBreg _)) => (MOVVreg x)
-(MOVBUreg x:(MOVBUreg _)) => (MOVVreg x)
-(MOVHreg x:(MOVBreg _)) => (MOVVreg x)
-(MOVHreg x:(MOVBUreg _)) => (MOVVreg x)
-(MOVHreg x:(MOVHreg _)) => (MOVVreg x)
-(MOVHUreg x:(MOVBUreg _)) => (MOVVreg x)
-(MOVHUreg x:(MOVHUreg _)) => (MOVVreg x)
-(MOVWreg x:(MOVBreg _)) => (MOVVreg x)
-(MOVWreg x:(MOVBUreg _)) => (MOVVreg x)
-(MOVWreg x:(MOVHreg _)) => (MOVVreg x)
-(MOVWreg x:(MOVWreg _)) => (MOVVreg x)
-(MOVWUreg x:(MOVBUreg _)) => (MOVVreg x)
-(MOVWUreg x:(MOVHUreg _)) => (MOVVreg x)
-(MOVWUreg x:(MOVWUreg _)) => (MOVVreg x)
 
 // don't extend before store
 (MOVBstore [off] {sym} ptr (MOVBreg x) mem) => (MOVBstore [off] {sym} ptr x mem)
@@ -684,14 +637,6 @@
 (MOVFstoreidx (MOVVconst [c]) idx val mem) && ssa.Is32Bit(c) => (MOVFstore [int32(c)] idx val mem)
 (MOVDstoreidx ptr (MOVVconst [c]) val mem) && ssa.Is32Bit(c) => (MOVDstore [int32(c)] ptr val mem)
 (MOVDstoreidx (MOVVconst [c]) idx val mem) && ssa.Is32Bit(c) => (MOVDstore [int32(c)] idx val mem)
-
-// if a register move has only 1 use, just use the same register without emitting instruction
-// MOVVnop doesn't emit instruction, only for ensuring the type.
-(MOVVreg x) && x.Uses == 1 => (MOVVnop x)
-
-// TODO: we should be able to get rid of MOVVnop all together.
-// But for now, this is enough to get rid of lots of them.
-(MOVVnop (MOVVconst [c])) => (MOVVconst [c])
 
 // fold constant into arithmetic ops
 (ADDV x (MOVVconst <t> [c])) && ssa.Is32Bit(c) && !t.IsPtr() => (ADDVconst [c] x)
@@ -867,6 +812,11 @@
 (MOVBUreg x:(ANDconst [c] y)) && c >= 0 && int64(uint8(c)) == c => x
 (MOVHUreg x:(ANDconst [c] y)) && c >= 0 && int64(uint16(c)) == c => x
 (MOVWUreg x:(ANDconst [c] y)) && c >= 0 && int64(uint32(c)) == c => x
+
+// Don't bother extending if we're not using the higher bits.
+(MOV(B|BU)reg x) && v.Type.Size() <= 1 => x
+(MOV(H|HU)reg x) && v.Type.Size() <= 2 => x
+(MOV(W|WU)reg x) && v.Type.Size() <= 4 => x
 
 // Prefetch instructions (hint specified using aux field)
 // For PRELD{,X} A value of hint indicates:

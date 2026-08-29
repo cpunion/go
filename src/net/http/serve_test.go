@@ -1545,6 +1545,13 @@ func testSetsRemoteAddr(t *testing.T, mode testMode) {
 	// Relying on it here isn't particularly principled,
 	// but we don't have a good way to get the address out at the moment.
 	want := "192.0.2.1"
+	if mode == http3Mode {
+		// HTTP/3 does not yet use a TEST-NET-1 address. This is also not
+		// particularly principled, but just do this for now instead of
+		// half-heartedly trying to match minute internal details, and causing
+		// larger churns such as updating test TLS certs to include 192.0.2.1.
+		want = "127.0.0.1"
+	}
 	if !strings.HasPrefix(ip, want+":") && !strings.HasPrefix(ip, "[::1]:") {
 		t.Fatalf("got RemoteAddr %q, want %q", ip, want)
 	}
@@ -8138,9 +8145,6 @@ func TestServerConnectionReuse(t *testing.T) {
 }
 
 func TestServerRequestBodyLength(t *testing.T) {
-	joinCRLF := func(s ...string) string {
-		return strings.Join(s, "\r\n")
-	}
 	for _, test := range []struct {
 		name              string
 		message           string
@@ -8475,6 +8479,50 @@ func TestServerRequestBodyCloseAfterPartialRead(t *testing.T) {
 		}
 		if err := <-closeErr; err != nil {
 			t.Errorf("Request.Body.Close() = %v, want nil", err)
+		}
+	})
+}
+
+// A read error that is not io.EOF means the connection is gone in both
+// directions. A handler blocked writing a response must not stay blocked:
+// on some systems the poller stops reporting the socket as writable once a
+// read has consumed the socket's pending error, so the write would never
+// complete. See go.dev/issue/78438.
+func TestServerAbortsWriteOnConnReadError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		handler := newTestHandler(t)
+		st := newHTTP1ServerTest(t, handler.ServeHTTP)
+		defer handler.Close() // return from handlers before server shutdown
+		conn := st.dial()
+		conn.writeMessage(
+			"GET / HTTP/1.1",
+			"Host: example.tld",
+			"",
+		)
+		call := handler.nextCall()
+
+		// Nothing reads the response, so the handler blocks writing it.
+		conn.conn.SetReadBufferSize(0)
+		var writeErr error
+		writing := true
+		go func() {
+			call.do(func(w ResponseWriter, req *Request) {
+				_, writeErr = w.Write(make([]byte, 1<<20))
+			})
+			writing = false
+		}()
+		synctest.Wait()
+		if !writing {
+			t.Fatalf("handler finished writing response (should have blocked)")
+		}
+
+		conn.conn.Peer().SetReadError(errors.New("connection reset"))
+		synctest.Wait()
+		if writing {
+			t.Fatalf("handler still blocked writing response after connection read error")
+		}
+		if writeErr == nil {
+			t.Errorf("handler wrote response successfully, want error")
 		}
 	})
 }

@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"simd/archsimd/_gen/sgutil"
+	"simd/archsimd/_gen/simdgen/types"
 )
 
 type tplRuleData struct {
@@ -192,6 +193,27 @@ func expandFormatSpecifiers(s string, elemBits int) string {
 	return s
 }
 
+// sveImplicitPredRule returns the lowering rule for an SVE op whose governing
+// predicate is implicit-all-true: the unpredicated generic op lowers straight to
+// the predicated machine op with a synthesized all-true predicate.
+//
+// The all-true predicate is PWHILELT<letter>(0, lanes) with lanes =
+// maxVectorBits/elemBits, the lane count at the maximum supported vector length.
+// Since PWHILELT saturates
+// (lane i is set while i < hi), this predicate is all-true at any smaller VL too,
+// so it stands in for the not-yet-available PTRUE.
+//
+// For example, GreaterInt8s lowers to:
+//
+//	(GreaterInt8s x y) => (ZCMPGTB x y (Select0 <types.TypeMask> (PWHILELTB (MOVDconst [0]) (MOVDconst [32]))))
+func sveImplicitPredRule(gOp Operation, asm, args string) string {
+	elemBits := *gOp.Out[0].ElemBits
+	letter := sveArrangementLetter(gOp)
+	lanes := types.MaxVectorBits / elemBits
+	return fmt.Sprintf("(%s %s) => (%s %s (Select0 <types.TypeMask> (PWHILELT%s (MOVDconst [0]) (MOVDconst [%d]))))\n",
+		gOp.GenericName(), args, asm, args, letter, lanes)
+}
+
 // writeSIMDRules generates the lowering and rewrite rules for ssa and writes it to simdAMD64.rules
 // within the specified directory.
 func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
@@ -208,10 +230,14 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 	memOpSeen := make(map[string]bool)
 	ruleDone := make(map[string]struct{})
 
+	var sveRules []string // SVE implicit-all-true predicated ops, emitted separately.
+
 	for _, opr := range ops {
 		opInShape, opOutShape, maskType, immType, gOp, _ := opr.shape()
 		asm := machineOpName(maskType, gOp)
-		vregInCnt := len(gOp.In)
+		// An implicit-all-true governing predicate is a machine-op input only, so
+		// it is not one of the data-vector args of the (unpredicated) generic op.
+		vregInCnt := len(gOp.In) - opr.implicitPredCount()
 		if maskType == OneMask {
 			vregInCnt--
 		}
@@ -241,6 +267,16 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 		} else if immType == ConstVarImm {
 			data.Args = fmt.Sprintf("[a] %s", data.Args)
 			data.ArgsOut = fmt.Sprintf("[a+%s] %s", *opr.In[0].Const, data.ArgsOut)
+		}
+
+		// SVE ops with an implicit-all-true governing predicate expose an
+		// unpredicated Go API: lower the generic op straight to the predicated
+		// machine op, synthesizing an all-true predicate. This bypasses the AVX
+		// mask-conversion machinery below (SVE predicates are represented as-is).
+		if opr.implicitPredCount() > 0 {
+			sveRules = append(sveRules, sveImplicitPredRule(gOp, asm, data.Args))
+			asmCheck[asm] = true
+			continue
 		}
 
 		goType := func(op Operation) string {
@@ -394,7 +430,7 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 					immArg = "[c] "
 					immArgCombineOff = " [ssa.MakeValAndOff(int32(uint8(c)),off)] "
 				}
-				memOpData.ArgsLoadAddr = immArg + origArgs + fmt.Sprintf("l:(VMOVDQUload%d {sym} [off] ptr mem)", *lastVreg.Bits)
+				memOpData.ArgsLoadAddr = immArg + origArgs + fmt.Sprintf("l:(VMOVDQUload%d {sym} [off] ptr mem)", lastVreg.Bits.N())
 				// Remove the last vreg from the arg and change it to "ptr".
 				memOpData.ArgsAddr = "{sym}" + immArgCombineOff + origArgs + "ptr"
 				if maskType == OneMask {
@@ -422,8 +458,8 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 		if gOp.hasMaskedMerging(maskType, opOutShape) {
 			// TODO: handle customized operand order and special lower.
 			maskElem := gOp.In[len(gOp.In)-1]
-			if maskElem.Bits == nil {
-				panic("mask has no bits")
+			if maskElem.Bits.Scalable {
+				panic("scalable mask not supported in masked merging")
 			}
 			if maskElem.ElemBits == nil {
 				panic("mask has no elemBits")
@@ -431,13 +467,13 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 			if maskElem.Lanes == nil {
 				panic("mask has no lanes")
 			}
-			switch *maskElem.Bits {
+			switch maskElem.Bits.N() {
 			case 128, 256:
 				// VPBLENDVB cases.
 				noMaskName := machineOpName(NoMask, gOp)
 				ruleExisting, ok := maskedMergeOpts[noMaskName]
 				rule := fmt.Sprintf("(VPBLENDVB%d dst (%s %s) mask) && v.Block.CPUfeatures.HasFeature(ssa.CPUavx512) => (%sMerging dst %s (VPMOVVec%dx%dToM <types.TypeMask> mask))\n",
-					*maskElem.Bits, noMaskName, data.Args, data.Asm, data.Args, *maskElem.ElemBits, *maskElem.Lanes)
+					maskElem.Bits.N(), noMaskName, data.Args, data.Asm, data.Args, *maskElem.ElemBits, *maskElem.Lanes)
 				if ok && ruleExisting != rule {
 					panic(fmt.Sprintf("multiple masked merge rules for one op:\n%s\n%s\n", ruleExisting, rule))
 				} else {
@@ -448,7 +484,7 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 				noMaskName := machineOpName(NoMask, gOp)
 				ruleExisting, ok := maskedMergeOpts[noMaskName]
 				rule := fmt.Sprintf("(VPBLENDM%sMasked%d dst (%s %s) mask) => (%sMerging dst %s mask)\n",
-					s2n[*maskElem.ElemBits], *maskElem.Bits, noMaskName, data.Args, data.Asm, data.Args)
+					s2n[*maskElem.ElemBits], maskElem.Bits.N(), noMaskName, data.Args, data.Asm, data.Args)
 				if ok && ruleExisting != rule {
 					panic(fmt.Sprintf("multiple masked merge rules for one op:\n%s\n%s\n", ruleExisting, rule))
 				} else {
@@ -486,6 +522,11 @@ func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
 		if err := tpl.Execute(buffer, data); err != nil {
 			panic(fmt.Errorf("failed to execute template %s for %s: %w", data.TplName, data.GoOp+data.GoType, err))
 		}
+	}
+
+	slices.Sort(sveRules)
+	for _, rule := range sveRules {
+		buffer.WriteString(rule)
 	}
 
 	seen := make(map[string]bool)
