@@ -14,6 +14,10 @@ func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool) *stacklessC
 
 func (*stacklessCoroNativeDriver) close(*stacklessCoroScheduler, bool) {}
 
+func (*stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
+	return s.waitForWork()
+}
+
 func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
 	return nil
 }
@@ -21,4 +25,9 @@ func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
 //go:nosplit
 func stacklessCoroNativeSchedulerFor(*g) *stacklessCoroScheduler {
 	return nil
+}
+
+func stacklessCoroDeferSleep(*stacklessCoroScheduler,
+	*stacklessCoroOperation) bool {
+	return false
 }

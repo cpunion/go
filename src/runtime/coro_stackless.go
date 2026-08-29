@@ -96,6 +96,7 @@ const (
 		(stacklessCoroFrameChunkSize - 1)
 )
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
+const stacklessCoroDeferredSleepOperationID = ^uint64(0)
 
 const (
 	stacklessCoroExecutorStateOff uint32 = iota
@@ -285,9 +286,9 @@ type stacklessCoroOperationState struct {
 	n            *int
 	errno        *uintptr
 	valueOut     *uint64
-	// packet holds an asynchronous C reply or, for a socket read, the
-	// pointer-free poll descriptor and completion link. The operation
-	// registry remains the GC root for a linked socket operation.
+	// packet holds a deferred-sleep deadline, an asynchronous C reply, or a
+	// socket read's pointer-free poll descriptor and completion link. The
+	// operation registry remains the GC root for a linked socket operation.
 	packet [2]uint64
 	async  bool
 	// ownsPollDesc distinguishes the explicit raw-descriptor adapter from a
@@ -409,7 +410,7 @@ func runStacklessCoroRoot(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 		}
 		s = nativeScheduler
 		initial = false
-		if s.rootComplete() || !s.waitForWork() {
+		if s.rootComplete() || !native.waitForWork(s) {
 			native.close(s, true)
 			return s
 		}
@@ -2468,8 +2469,19 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 	if ns <= 0 {
 		return false
 	}
-	startStacklessCoroTimer(ctx, ns)
+	startStacklessCoroSleep(ctx, ns)
 	return true
+}
+
+func startStacklessCoroSleep(ctx unsafe.Pointer, ns int64) {
+	op := stacklessCoroStartOperation(ctx, "sleep")
+	s := op.scheduler
+	when := stacklessCoroTimerWhen(ns)
+	op.id = stacklessCoroDeferredSleepOperationID
+	op.packet[0] = uint64(when)
+	if stacklessCoroIsPullComparison(s) || !stacklessCoroDeferSleep(s, op) {
+		armStacklessCoroTimerAt(op, when)
+	}
 }
 
 // coroChanSend starts a channel send for a stackless logical goroutine.
@@ -2535,10 +2547,15 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) stacklessCoroTimerToken {
 	op := stacklessCoroStartOperation(ctx, "sleep")
-	t, sequence := op.nextTimer()
-	op.id = uint64(sequence)
-	t.active.Store(sequence)
+	return armStacklessCoroTimer(op, ns)
+}
 
+func armStacklessCoroTimer(op *stacklessCoroOperation, ns int64) stacklessCoroTimerToken {
+	t, sequence := op.nextTimer()
+	return scheduleStacklessCoroTimer(op, t, sequence, stacklessCoroTimerWhen(ns))
+}
+
+func stacklessCoroTimerWhen(ns int64) int64 {
 	when := nanotime()
 	if ns > 0 {
 		when += ns
@@ -2546,6 +2563,18 @@ func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) stacklessCoroTimerTok
 			when = maxWhen
 		}
 	}
+	return when
+}
+
+func armStacklessCoroTimerAt(op *stacklessCoroOperation, when int64) stacklessCoroTimerToken {
+	t, sequence := op.nextTimer()
+	return scheduleStacklessCoroTimer(op, t, sequence, when)
+}
+
+func scheduleStacklessCoroTimer(op *stacklessCoroOperation,
+	t *stacklessCoroTimer, sequence uintptr, when int64) stacklessCoroTimerToken {
+	op.id = uint64(sequence)
+	t.active.Store(sequence)
 	t.timer.modify(when, 0, stacklessCoroTimerReady, t, sequence)
 	return stacklessCoroTimerToken{timer: t, sequence: sequence}
 }

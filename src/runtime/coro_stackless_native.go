@@ -40,6 +40,9 @@ type stacklessCoroNativeContext struct {
 	g0Accurate         bool
 	initialRoot        bool
 	poolNext           *stacklessCoroNativeContext
+	// deferredSleep is owned by the driver between adjacent fixed-stack
+	// episodes. Keeping it here avoids growing the shared logical scheduler.
+	deferredSleep *stacklessCoroOperation
 }
 
 // stacklessCoroNativeDriver owns one native context across the fixed-stack
@@ -129,6 +132,37 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	return scheduler
 }
 
+func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
+	ctx := d.context
+	op := ctx.deferredSleep
+	if op == nil {
+		return s.waitForWork()
+	}
+	when := int64(op.packet[0])
+	ctx.deferredSleep = nil
+
+	if when > nanotime() {
+		armStacklessCoroTimerAt(op, when)
+		return s.waitForWork()
+	}
+	// A positive sleep remains a scheduling point after the fixed-stack
+	// teardown has already consumed its deadline.
+	Gosched()
+
+	scheduler, task := clearStacklessCoroOperation(op)
+	if scheduler != s {
+		throw("runtime: deferred sleep changed scheduler")
+	}
+	lock(&s.lock)
+	s.readyLocked(task)
+	cachedLocally := s.recycleOperationLocked(op)
+	unlock(&s.lock)
+	if !cachedLocally {
+		cacheStacklessCoroSharedOperation(op)
+	}
+	return true
+}
+
 // close releases the native context. A completed public root returns its
 // bounded task cache to that context only after its final episode.
 func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplete bool) {
@@ -190,6 +224,9 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
+	if ctx.deferredSleep != nil {
+		throw("runtime: releasing native context with deferred sleep")
+	}
 	for i := range stacklessCoroNativePool.slots {
 		if stacklessCoroNativePool.slots[i].CompareAndSwap(nil, ctx) {
 			return
@@ -435,6 +472,24 @@ func stacklessCoroNativeSchedulerFor(gp *g) *stacklessCoroScheduler {
 		throw("runtime: stackless coroutine blocking call has no scheduler")
 	}
 	return ctx.scheduler
+}
+
+func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
+	op *stacklessCoroOperation) bool {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.executor != gp || ctx.scheduler != s ||
+		ctx.deferredSleep != nil {
+		return false
+	}
+	lock(&s.lock)
+	deferSleep := s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.head == nil && s.tail == nil && s.runnableState.Load() == 0
+	if deferSleep {
+		ctx.deferredSleep = op
+	}
+	unlock(&s.lock)
+	return deferSleep
 }
 
 // resetStacklessCoroExecutor clears state that execute and gdestroy normally

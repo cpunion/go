@@ -639,6 +639,13 @@ func BenchmarkSleepNanosecond(b *testing.B) {
 	}
 }
 
+func BenchmarkSleepMicrosecond(b *testing.B) {
+	b.ReportAllocs()
+	if got := sleepLoop(b.N, time.Microsecond); got != b.N {
+		b.Fatalf("sleepLoop(%d, 1us) = %d", b.N, got)
+	}
+}
+
 func BenchmarkFileRead(b *testing.B) {
 	file, err := os.Open("/dev/zero")
 	if err != nil {

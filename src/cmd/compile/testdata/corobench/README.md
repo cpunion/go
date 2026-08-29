@@ -1463,3 +1463,71 @@ Combined normal, race, and pull profiles report 97.3% coverage for
 completion, and 89.5% for the wait transition. Every executable production
 statement added by this checkpoint is covered; the remaining function-level
 gaps are pre-existing fail-closed invariant throws.
+
+#### Defer short positive sleep timers
+
+Revision `ddf031c260`, based on exact parent `d5c809ceec`, avoids a timer
+callback and wake-channel round trip when a positive sleep expires while the
+native driver dismantles its fixed-stack episode. The optimization applies
+only when the current native executor owns the scheduler and no replacement
+executor or runnable logical sibling competes with it. The operation retains
+the original absolute deadline. A deadline still in the future arms the
+existing runtime timer; an elapsed deadline readies the task directly after a
+host `Gosched`, so even a one-nanosecond sleep remains a scheduling point.
+
+Spawned work, managed executors, race mode, pull comparison, and platforms
+without the native fixed-stack driver retain the ordinary timer path. No
+compiler ABI, lowering, source annotation, timer-owner protocol, or shared
+scheduler layout changes. The 64-bit scheduler remains 192 bytes, while the
+private native context adds one operation pointer. This checkpoint also adds
+`BenchmarkSleepMicrosecond` so both the elapsed-during-teardown and
+still-future deadline behaviors remain visible.
+
+The exact parent and candidate used the same compiler and linker source and
+flags, disabled inlining, one P, and the same source probes. Six independent
+matched `-randlayout` seeds each ran one warm-up and two alternating 200 ms
+samples, for 12 pairs. Native Darwin/arm64 used an Apple M4 Max. Linux/amd64
+ran under Rosetta, so its timing is directional while its functional and
+allocation results remain useful.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| sleep for one nanosecond | 218.50 ns -> 139.65 ns (-36.59%) | 317.00 ns -> 186.45 ns (-39.98%) |
+| sleep for one microsecond | 3.840 us -> 4.209 us (+3.26%, neutral) | 892.156 us -> 497.440 us (-46.76%) |
+
+Every one-nanosecond pair improved on both platforms (`p=0.000488`). Every
+Linux microsecond pair also improved; the Darwin microsecond distribution was
+neutral (`p=0.388`). Channel round trip, ready select, ready file and TCP read,
+task sequence, public entry, and amortized yield had no statistically
+significant regression on either platform. All probes retained zero
+allocations per operation. The translated Linux amortized-yield percentage
+was layout-noisy, but its pooled medians were effectively equal at 3.800 and
+3.798 ns and its sign test was neutral (`p=0.388`).
+
+A separate 12-pair native Darwin comparison used unmodified Go at exact
+upstream revision `da7c67f595`. This measures the complete coroutine
+experiment rather than attributing every difference to this change:
+
+| Probe | Official Go | Coroutine experiment | Change |
+| --- | ---: | ---: | ---: |
+| sleep for one nanosecond | 117.30 ns | 142.75 ns | +21.27% |
+| sleep for one microsecond | 3.619 us | 4.189 us | +12.33%, neutral (`p=0.146`) |
+
+The one-nanosecond path has moved from about 1.86 times official Go in the
+exact parent to about 1.22 times official Go. Its remaining cost is the
+fixed-stack episode boundary and host fairness point, not a redundant timer
+wake.
+
+Normal, race, pull, pull-plus-race, and `checkptr=2` stackless runtime tests,
+the complete coroutine compiler suite, `go vet runtime`, the architecture
+probe audit, and the Linux/386 runtime cross-test pass on native Darwin/arm64
+and translated Linux/amd64 as applicable. Full `coro` and `nocoro` runtime
+suites pass on Darwin. The translated full Linux runtime reaches unrelated
+Rosetta address-space crash tests, so native Linux CI remains the complete
+runtime gate.
+
+The focused profile reports 100% coverage for the sleep start, absolute
+deadline, timer-arm, scheduling, and native deferral helpers and 92.3% for the
+native wait path. It executes 57 of 63 added executable lines (90.48%); the
+remaining six lines are fail-closed invariant or unreachable bounded-cache
+fallback bodies rather than omitted functional branches.

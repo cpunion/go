@@ -31,6 +31,10 @@ func StacklessCoroNativePoolForTest() (count int) {
 	return
 }
 
+func StacklessCoroDeferSleepOutsideExecutorForTest() bool {
+	return stacklessCoroDeferSleep(nil, nil)
+}
+
 func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 	for i := range stacklessCoroNativePool.slots {
 		slot := &stacklessCoroNativePool.slots[i]

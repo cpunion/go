@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-08-14
+Last updated: 2026-08-29
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -3726,6 +3726,74 @@ comparison, and concurrent channel, select, file, and socket operation. Full
 and `checkptr=2` runtime tests, the complete compiler coroutine suite, and the
 architecture probe pass on Darwin/arm64 and translated Linux/amd64. Combined
 normal, race, and pull coverage executes every new production statement.
+
+### 16.7 Deferred native sleep timers
+
+A short positive sleep can expire while the native driver is dismantling its
+fixed-stack episode. The previous path armed a runtime timer before returning
+from that stack. Even when the deadline had passed by the time the ordinary G
+regained control, the timer callback still published the task, signaled the
+wake channel, and made the driver consume that wake before starting the next
+episode.
+
+Revision `ddf031c260`, based on exact parent `d5c809ceec`, defers that timer
+arming only when the current fixed-stack executor owns the scheduler, no
+replacement executor is active, and no sibling is queued or counted runnable.
+The logical operation records an absolute deadline, not a relative delay. Once
+the ordinary G regains control, the driver arms the existing runtime timer at
+that original deadline if it is still in the future. If teardown has already
+consumed the deadline, the driver clears and recycles the operation and readies
+the task directly, without a timer callback or wake-channel round trip.
+
+The direct path still calls `Gosched` before making an elapsed positive sleep
+runnable. Thus `Sleep(1ns)` remains a host scheduling point even though its
+timer is omitted. A spawned or otherwise runnable sibling, a managed or
+replacement executor, race mode, the pull-comparison build, and targets without
+the native driver retain the previous timer path. The scheduler remains 192
+bytes on 64-bit targets; only the private native context grows by one pointer
+to retain the operation between adjacent fixed-stack episodes.
+
+The change does not add compiler metadata, a lowering case, an operation
+registry protocol, a source annotation, or an ABI revision. The timer owner
+and generation protocol is unchanged whenever a timer is armed. Computing the
+absolute deadline in one helper also preserves the previous overflow rule for
+both deferred and ordinary timer starts.
+
+Six matched linker layouts and two alternating 200 ms rounds per layout at one
+P produced the following exact-parent comparison. Darwin/arm64 ran natively;
+Linux/amd64 ran under Rosetta and is directional rather than a native x86
+performance result.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| sleep for one nanosecond | 218.50 ns -> 139.65 ns (-36.59%) | 317.00 ns -> 186.45 ns (-39.98%) |
+| sleep for one microsecond | 3.840 us -> 4.209 us, neutral | 892.156 us -> 497.440 us (-46.76%) |
+
+All 12 one-nanosecond pairs improved on both platforms (`p=0.000488`). The
+Darwin microsecond result was statistically neutral (`p=0.388`); all other
+channel, select, file, TCP, task, entry, and yield controls had no significant
+regression. Every target and control retained zero allocations per operation.
+
+An independent native Darwin comparison against unmodified Go at the exact
+upstream revision `da7c67f595` measures the complete coroutine experiment, not
+only this checkpoint. `Sleep(1ns)` is now 142.75 ns versus 117.30 ns for Go, a
+21.27% remaining gap; `Sleep(1us)` is 4.189 us versus 3.619 us, with a neutral
+paired distribution (`p=0.146`). The short-sleep wakeup is therefore much
+closer to the official runtime without claiming parity.
+
+Tests require a runnable host goroutine to make progress during repeated
+one-nanosecond sleeps and require a logical sibling to retain priority through
+the timer fallback. Timer cancellation, owner reuse, early readiness, race,
+pull comparison, `checkptr=2`, the complete coroutine compiler suite, the
+portable architecture probe, `go vet runtime`, and the disabled experiment all
+pass. Full `coro` and `nocoro` runtime suites pass on Darwin. Focused Linux
+suites and Linux/386 cross-testing pass under translation; unrelated Rosetta
+address-space crash tests keep native Linux CI as the full-runtime gate.
+
+The targeted profile covers every sleep and timer helper and the native
+deferral selector at 100%, and covers the native driver's wait path at 92.3%.
+It executes 57 of 63 added executable lines (90.48%); the six remaining lines
+are three fail-closed invariant or unreachable bounded-cache fallback bodies.
 
 The likely compatibility order remains:
 
