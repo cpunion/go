@@ -254,9 +254,13 @@ func parallelYieldWork(rounds, tasks, work int) uint64 {
 }
 
 var (
-	channelPing       chan int
-	channelPong       chan int
-	channelIterations int
+	channelPing             chan int
+	channelPong             chan int
+	channelIterations       int
+	blockedSelectReady      chan int
+	blockedSelectIterations int
+	blockedSelectTrigger    uint64
+	blockedSelectDone       uint32
 )
 
 func channelWorker() {
@@ -299,6 +303,41 @@ func readySelects(iterations int) int {
 		case value := <-right:
 			sum += value
 		}
+	}
+	return sum
+}
+
+func blockedSelectWorker() {
+	for i := 0; i < blockedSelectIterations; i++ {
+		for atomic.LoadUint64(&blockedSelectTrigger) < uint64(i+1) {
+			runtime.Gosched()
+		}
+		blockedSelectReady <- i + 1
+	}
+	atomic.StoreUint32(&blockedSelectDone, 1)
+}
+
+func blockedSelects(iterations int) int {
+	if iterations <= 0 {
+		return 0
+	}
+	blockedSelectReady = make(chan int)
+	blockedSelectIterations = iterations
+	atomic.StoreUint64(&blockedSelectTrigger, 0)
+	atomic.StoreUint32(&blockedSelectDone, 0)
+	go blockedSelectWorker()
+	var disabled <-chan int
+	sum := 0
+	for i := 0; i < iterations; i++ {
+		atomic.StoreUint64(&blockedSelectTrigger, uint64(i+1))
+		select {
+		case value := <-blockedSelectReady:
+			sum += value
+		case <-disabled:
+		}
+	}
+	for atomic.LoadUint32(&blockedSelectDone) == 0 {
+		runtime.Gosched()
 	}
 	return sum
 }
