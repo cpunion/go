@@ -1869,8 +1869,12 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 	owner := s.takeReservedFrameTaskLocked(parent, frame, child)
 	sameResume := stacklessCoroResumeIdentity(parent.resume) ==
 		stacklessCoroResumeIdentity(child)
+	parentFused := parent.hasFlag(stacklessCoroTaskFusedFrames)
 	marker := uint8(0)
-	if !validStacklessCoroFusedFrameMarker(parentHeader.marker) {
+	// A plain root caller has no fused-frame header. Self recursion and an
+	// existing fused chain are the two cases that prove the prefix is present.
+	if (sameResume || parentFused) &&
+		!validStacklessCoroFusedFrameMarker(parentHeader.marker) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine parent fused-frame marker")
 	}
@@ -1904,7 +1908,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 	} else {
 		marker = stacklessCoroFusedFrameDirectFirst
 	}
-	if parent.hasFlag(stacklessCoroTaskFusedFrames) {
+	if parentFused {
 		marker |= stacklessCoroFusedFrameParent
 	}
 	if !sameResume {

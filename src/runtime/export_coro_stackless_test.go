@@ -25,6 +25,14 @@ type stacklessCoroOversizedFrameChunkExportFrame struct {
 	data [stacklessCoroFrameChunkByteLimit/stacklessCoroLargeFrameChunkSize + 1]byte
 }
 
+type stacklessCoroPlainParentFrame struct {
+	first  uintptr
+	second uintptr
+	marker uint8
+}
+
+var stacklessCoroPlainParentForTest stacklessCoroPlainParentFrame
+
 // StacklessCoroSelfFrameForTest matches the compiler-private fused-frame
 // prefix and leaves enough ordinary state for runtime transition tests.
 type StacklessCoroSelfFrameForTest struct {
@@ -243,6 +251,51 @@ func AwaitStacklessCoroFusedResumeFrameForTest(ctx, frame unsafe.Pointer,
 
 func CompleteStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer) uint8 {
 	return coroCompleteFusedFrame(ctx)
+}
+
+func CheckStacklessCoroPlainParentFusedAwaitForTest() bool {
+	parentResume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionInvalid
+	})
+	childResume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankLeafRank)
+	parent := &s.root
+	parent.resume = parentResume
+	parent.state = stacklessCoroTaskRunning
+	parent.resuming = true
+	parent.setFlag(stacklessCoroTaskFusedPending, true)
+	// A root caller need not carry a fused-frame header. These values make an
+	// accidental header interpretation fail marker validation deterministically.
+	plain := &stacklessCoroPlainParentForTest
+	*plain = stacklessCoroPlainParentFrame{
+		first: 1, second: 1<<20 - 1, marker: ^uint8(0),
+	}
+	parent.context.frame = unsafe.Pointer(plain)
+	parent.context.scheduler = s
+
+	frame := new(stacklessCoroFusedResumeFrameHeader)
+	owner := initializeStacklessCoroTask(new(stacklessCoroTask),
+		unsafe.Pointer(frame), childResume, parent)
+	owner.setFlag(stacklessCoroTaskCacheFrame, true)
+	owner.frameSize = uint16(unsafe.Sizeof(*frame))
+	s.reservedTasks = owner
+
+	action := coroAwaitFusedFrame(unsafe.Pointer(&parent.context),
+		unsafe.Pointer(frame), childResume)
+	return action == stacklessCoroActionSwitch &&
+		parent.context.frame == unsafe.Pointer(frame) &&
+		stacklessCoroResumeIdentity(parent.resume) ==
+			stacklessCoroResumeIdentity(childResume) &&
+		parent.hasFlag(stacklessCoroTaskFusedFrames) &&
+		!parent.hasFlag(stacklessCoroTaskFusedPending) &&
+		parent.hasFlag(stacklessCoroTaskSwitchPending) &&
+		s.reservedTasks == nil &&
+		frame.parent == unsafe.Pointer(plain) && frame.owner == owner &&
+		frame.marker == stacklessCoroFusedFrameResume &&
+		frame.resume == stacklessCoroResumeIdentity(parentResume)
 }
 
 func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,
