@@ -62,6 +62,9 @@ func TestProbes(t *testing.T) {
 	if got := channelRoundTrips(4); got != 10 {
 		t.Errorf("channelRoundTrips(4) = %d, want 10", got)
 	}
+	if got := readyChannelPairs(4); got != 6 {
+		t.Errorf("readyChannelPairs(4) = %d, want 6", got)
+	}
 	if got := readySelects(4); got != 6 {
 		t.Errorf("readySelects(4) = %d, want 6", got)
 	}
