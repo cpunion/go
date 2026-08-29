@@ -210,8 +210,8 @@ func coroPanic(unsafe.Pointer, interface{})
 func coroPanicPending(unsafe.Pointer) bool
 func coroFrameNeedsClear(unsafe.Pointer) bool
 func coroSleep(unsafe.Pointer, int64) bool
-func coroChanSend(unsafe.Pointer, chan<- any, *any)
-func coroChanRecv(unsafe.Pointer, <-chan any, *any, *bool)
+func coroChanSend(unsafe.Pointer, chan<- any, *any) bool
+func coroChanRecv(unsafe.Pointer, <-chan any, *any, *bool) bool
 func coroSelect(unsafe.Pointer, *byte, int, int, bool, *int, *bool) bool
 func coroFileRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)

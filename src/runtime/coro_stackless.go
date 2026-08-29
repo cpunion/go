@@ -2484,15 +2484,25 @@ func startStacklessCoroSleep(ctx unsafe.Pointer, ns int64) {
 	}
 }
 
-// coroChanSend starts a channel send for a stackless logical goroutine.
-func coroChanSend(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer) {
+// coroChanSend starts a channel send for a stackless logical goroutine and
+// reports whether the task must wait for it.
+func coroChanSend(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer) bool {
+	if tryStacklessCoroChanSend(ctx, channel, element) {
+		return false
+	}
 	startStacklessCoroChannel(ctx, channel, element, nil, true)
+	return true
 }
 
 // coroChanRecv starts a channel receive for a stackless logical goroutine.
-// received is optional and records the comma-ok result.
-func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool) {
+// received is optional and records the comma-ok result. The return value
+// reports whether the task must wait for the receive.
+func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool) bool {
+	if tryStacklessCoroChanRecv(ctx, channel, element, received) {
+		return false
+	}
 	startStacklessCoroChannel(ctx, channel, element, received, false)
+	return true
 }
 
 // coroSelect starts a channel select for a stackless logical goroutine and

@@ -6058,12 +6058,26 @@ func TestLowerChannelOperations(t *testing.T) {
 			result, function.Factory)
 	}
 
-	var sends, receives, nativeChannels int
+	var sends, receives, conditionalChannels, nativeChannels int
 	for _, generated := range typecheck.Target.Funcs {
 		ir.Visit(generated, func(node ir.Node) {
 			switch node.Op() {
 			case ir.OSEND, ir.ORECV:
 				nativeChannels++
+			case ir.OIF:
+				stmt := node.(*ir.IfStmt)
+				call, ok := stmt.Cond.(*ir.CallExpr)
+				if !ok {
+					break
+				}
+				name := ir.StaticCalleeName(call.Fun)
+				if name == nil || name.Sym() == nil {
+					break
+				}
+				switch name.Sym().Name {
+				case "coroChanSend", "coroChanRecv":
+					conditionalChannels++
+				}
 			}
 			call, ok := node.(*ir.CallExpr)
 			if !ok {
@@ -6084,6 +6098,10 @@ func TestLowerChannelOperations(t *testing.T) {
 	if sends != 1 || receives != 4 {
 		t.Fatalf("generated channel helpers = (%d send, %d receive), want (1, 4)",
 			sends, receives)
+	}
+	if conditionalChannels != 5 {
+		t.Fatalf("generated IR has %d conditional channel helpers, want 5",
+			conditionalChannels)
 	}
 	if nativeChannels != 0 {
 		t.Fatalf("generated IR retains %d native channel operations",

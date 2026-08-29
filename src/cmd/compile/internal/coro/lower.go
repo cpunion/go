@@ -3539,6 +3539,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				body = append(body, ir.NewAssignStmt(channel.node.Pos(),
 					channelValue, edit(operationChannel)))
+				var wait ir.Node
 				if channel.sendValue != nil {
 					value := typecheck.TempAt(channel.node.Pos(), factory,
 						elementType)
@@ -3547,11 +3548,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					value = capture(value)
 					body = append(body, ir.NewAssignStmt(channel.node.Pos(),
 						value, edit(channel.sendValue)))
-					body = append(body, typecheck.Call(channel.node.Pos(),
+					wait = typecheck.Call(channel.node.Pos(),
 						typecheck.LookupRuntime("coroChanSend",
 							elementType, elementType),
 						ir.Nodes{ctx, channelValue,
-							typecheck.NodAddr(value)}, false))
+							typecheck.NodAddr(value)}, false)
 				} else {
 					resultPointer := ir.Node(typecheck.NodNil())
 					if channel.recvValue != nil &&
@@ -3567,13 +3568,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						}
 						okPointer = typecheck.NodAddr(edit(target))
 					}
-					body = append(body, typecheck.Call(channel.node.Pos(),
+					wait = typecheck.Call(channel.node.Pos(),
 						typecheck.LookupRuntime("coroChanRecv",
 							elementType, elementType),
 						ir.Nodes{ctx, channelValue, resultPointer,
-							okPointer}, false))
+							okPointer}, false)
 				}
-				action = actionWait
+				body = append(body,
+					ir.NewIfStmt(channel.node.Pos(), wait, ir.Nodes{
+						ir.NewReturnStmt(channel.node.Pos(), []ir.Node{
+							typedInt(channel.node.Pos(),
+								types.Types[types.TUINT8],
+								int64(actionWait)),
+						}),
+					}, nil),
+					gotoState(state.next),
+				)
+				break
 			case SiteTimer:
 				if len(state.call.Args) != 1 {
 					return fmt.Errorf("%s: timer operation has %d arguments",

@@ -2957,7 +2957,7 @@ func TestStacklessCoroRootSchedulerPool(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.RecvIntStacklessCoroForTest(ctx, channel,
+			runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
 				&value, &received)
 			return runtime.StacklessCoroActionWait
 		case 1:
@@ -3352,11 +3352,11 @@ func TestStacklessCoroChannel(t *testing.T) {
 		switch state {
 		case 0:
 			state = 1
-			runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue)
+			runtime.StartStacklessCoroSendIntForTest(ctx, channel, &sendValue)
 			return runtime.StacklessCoroActionWait
 		case 1:
 			state = 2
-			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+			runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 				&received)
 			return runtime.StacklessCoroActionWait
 		case 2:
@@ -3368,7 +3368,7 @@ func TestStacklessCoroChannel(t *testing.T) {
 			value = -1
 			received = true
 			state = 3
-			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+			runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 				&received)
 			return runtime.StacklessCoroActionWait
 		case 3:
@@ -3377,7 +3377,7 @@ func TestStacklessCoroChannel(t *testing.T) {
 					value, received)
 			}
 			state = 4
-			runtime.RecvIntStacklessCoroForTest(ctx, discard, nil, nil)
+			runtime.StartStacklessCoroRecvIntForTest(ctx, discard, nil, nil)
 			return runtime.StacklessCoroActionWait
 		case 4:
 			state = 5
@@ -3387,6 +3387,363 @@ func TestStacklessCoroChannel(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+}
+
+func waitStacklessCoroChannelWaiters(t *testing.T, channel any,
+	wantSend, wantRecv, wantLogical int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		send, recv, logical :=
+			runtime.StacklessCoroChannelWaitersForTest(channel)
+		if send == wantSend && recv == wantRecv && logical == wantLogical {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("channel waiters = (%d, %d, %d), want (%d, %d, %d)",
+				send, recv, logical, wantSend, wantRecv, wantLogical)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestStacklessCoroChannelFastPath(t *testing.T) {
+	if race.Enabled {
+		t.Skip("the race detector retains logical channel operations")
+	}
+
+	t.Run("BufferedPair", func(t *testing.T) {
+		channel := make(chan int, 1)
+		sendValue := 41
+		value := -1
+		received := false
+		baselineOperations := runtime.StacklessCoroOperationCountForTest()
+
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue) {
+				t.Fatal("ready buffered send waited")
+			}
+			if runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received) {
+				t.Fatal("ready buffered receive waited")
+			}
+			if value != sendValue || !received {
+				t.Fatalf("buffered receive = (%d, %t), want (%d, true)",
+					value, received, sendValue)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+			t.Fatalf("operation count = %d, want %d",
+				operations, baselineOperations)
+		}
+	})
+
+	t.Run("ClosedReceive", func(t *testing.T) {
+		channel := make(chan int)
+		close(channel)
+		value := -1
+		received := true
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received) {
+				t.Fatal("closed receive waited")
+			}
+			if value != 0 || received {
+				t.Fatalf("closed receive = (%d, %t), want (0, false)",
+					value, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	})
+
+	t.Run("TimerReceive", func(t *testing.T) {
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		var value time.Time
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.RecvStacklessCoroForTest(ctx, timer.C,
+				unsafe.Pointer(&value), &received) {
+				t.Fatal("expired timer receive waited")
+			}
+			if value.IsZero() || !received {
+				t.Fatalf("timer receive = (%v, %t), want nonzero, true",
+					value, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	})
+
+	t.Run("OrdinaryPeers", func(t *testing.T) {
+		receiveChannel := make(chan int)
+		senderDone := make(chan struct{})
+		go func() {
+			receiveChannel <- 43
+			close(senderDone)
+		}()
+		waitStacklessCoroChannelWaiters(t, receiveChannel, 1, 0, 0)
+		value := -1
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.RecvIntStacklessCoroForTest(ctx, receiveChannel,
+				&value, &received) {
+				t.Fatal("queued ordinary sender receive waited")
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		<-senderDone
+		if value != 43 || !received {
+			t.Fatalf("ordinary sender receive = (%d, %t), want (43, true)",
+				value, received)
+		}
+
+		sendChannel := make(chan int)
+		receiverDone := make(chan int, 1)
+		go func() {
+			receiverDone <- <-sendChannel
+		}()
+		waitStacklessCoroChannelWaiters(t, sendChannel, 0, 1, 0)
+		sendValue := 47
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SendIntStacklessCoroForTest(ctx, sendChannel,
+				&sendValue) {
+				t.Fatal("queued ordinary receiver send waited")
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		if got := <-receiverDone; got != sendValue {
+			t.Fatalf("ordinary receiver value = %d, want %d", got, sendValue)
+		}
+	})
+
+	t.Run("StacklessReceiver", func(t *testing.T) {
+		channel := make(chan int)
+		type result struct {
+			value    int
+			received bool
+		}
+		receiverDone := make(chan result, 1)
+		go func() {
+			state := 0
+			value := -1
+			received := false
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
+						&value, &received)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					receiverDone <- result{value: value, received: received}
+					return runtime.StacklessCoroActionComplete
+				default:
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+		}()
+		waitStacklessCoroChannelWaiters(t, channel, 0, 1, 1)
+		sendValue := 53
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue) {
+				t.Fatal("queued stackless receiver send waited")
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		got := <-receiverDone
+		if got.value != sendValue || !got.received {
+			t.Fatalf("stackless receive = (%d, %t), want (%d, true)",
+				got.value, got.received, sendValue)
+		}
+	})
+
+	t.Run("StacklessSender", func(t *testing.T) {
+		channel := make(chan int)
+		senderDone := make(chan struct{}, 1)
+		go func() {
+			state := 0
+			value := 59
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					senderDone <- struct{}{}
+					return runtime.StacklessCoroActionComplete
+				default:
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+		}()
+		waitStacklessCoroChannelWaiters(t, channel, 1, 0, 1)
+		value := -1
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received) {
+				t.Fatal("queued stackless sender receive waited")
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+		<-senderDone
+		if value != 59 || !received {
+			t.Fatalf("stackless sender receive = (%d, %t), want (59, true)",
+				value, received)
+		}
+	})
+}
+
+func TestStacklessCoroChannelFastPathFallback(t *testing.T) {
+	t.Run("BlockedReceive", func(t *testing.T) {
+		channel := make(chan int)
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				_, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if recv == 1 && logical == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Error("blocked receive waiter was not queued")
+					break
+				}
+				runtime.Gosched()
+			}
+			channel <- 61
+		}()
+
+		state := 0
+		value := -1
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				if !runtime.RecvIntStacklessCoroForTest(ctx, channel,
+					&value, &received) {
+					t.Fatal("blocked receive completed synchronously")
+				}
+				return runtime.StacklessCoroActionWait
+			case 1:
+				if value != 61 || !received {
+					t.Fatalf("blocked receive = (%d, %t), want (61, true)",
+						value, received)
+				}
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		<-peerDone
+	})
+
+	t.Run("BlockedSend", func(t *testing.T) {
+		channel := make(chan int)
+		peerValue := make(chan int, 1)
+		go func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				send, _, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if send == 1 && logical == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Error("blocked send waiter was not queued")
+					break
+				}
+				runtime.Gosched()
+			}
+			peerValue <- <-channel
+		}()
+
+		state := 0
+		value := 67
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				if !runtime.SendIntStacklessCoroForTest(ctx, channel, &value) {
+					t.Fatal("blocked send completed synchronously")
+				}
+				return runtime.StacklessCoroActionWait
+			case 1:
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		if got := <-peerValue; got != value {
+			t.Fatalf("blocked send value = %d, want %d", got, value)
+		}
+	})
+}
+
+func TestStacklessCoroChannelRaceFallback(t *testing.T) {
+	if !race.Enabled {
+		t.Skip("requires the race detector")
+	}
+	channel := make(chan int, 1)
+	channel <- 71
+	state := 0
+	value := -1
+	received := false
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			state = 1
+			if !runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				&received) {
+				t.Fatal("race receive bypassed retained operation")
+			}
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if value != 71 || !received {
+				t.Fatalf("race receive = (%d, %t), want (71, true)",
+					value, received)
+			}
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+}
+
+func TestStacklessCoroChannelFastPathPanic(t *testing.T) {
+	if race.Enabled {
+		t.Skip("the race detector retains logical channel operations")
+	}
+	channel := make(chan int)
+	close(channel)
+	value := 73
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if action := runtime.TerminalActionStacklessCoroForTest(ctx); action !=
+				runtime.StacklessCoroActionInvalid {
+				return action
+			}
+			if runtime.SendIntStacklessCoroForTest(ctx, channel, &value) {
+				t.Fatal("closed send returned")
+			}
+			t.Fatal("closed send completed")
+			return runtime.StacklessCoroActionInvalid
+		})
+	}()
+	err, ok := recovered.(error)
+	if !ok || err.Error() != "send on closed channel" {
+		t.Fatalf("recovered channel panic = %v, want send on closed channel",
+			recovered)
+	}
 }
 
 func TestStacklessCoroChannelWaiterCache(t *testing.T) {
@@ -3793,7 +4150,7 @@ func TestStacklessCoroSelectOperationReuse(t *testing.T) {
 					chosen, received, value)
 			}
 			state = 2
-			runtime.SendIntStacklessCoroForTest(ctx, channel, &sendValue)
+			runtime.StartStacklessCoroSendIntForTest(ctx, channel, &sendValue)
 			return runtime.StacklessCoroActionWait
 		case 2:
 			if got := <-channel; got != sendValue {
@@ -4353,7 +4710,7 @@ func TestStacklessCoroChannelPanic(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 				return runtime.StacklessCoroActionWait
 			default:
 				t.Fatalf("unexpected state %d", state)
@@ -4397,7 +4754,7 @@ func TestStacklessCoroChannelProgress(t *testing.T) {
 						switch sender.state {
 						case 0:
 							sender.state = 1
-							runtime.SendIntStacklessCoroForTest(childCtx,
+							runtime.StartStacklessCoroSendIntForTest(childCtx,
 								channel, &sender.value)
 							return runtime.StacklessCoroActionWait
 						case 1:
@@ -4447,7 +4804,7 @@ func TestStacklessCoroChannelProgress(t *testing.T) {
 			value = 0
 			received = false
 			waiting = true
-			runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+			runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 				&received)
 			return runtime.StacklessCoroActionWait
 
@@ -4506,7 +4863,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 				return runtime.StacklessCoroActionWait
 			case 1:
 				state = 2
@@ -4544,7 +4901,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 					&received)
 				return runtime.StacklessCoroActionWait
 			case 1:
@@ -4578,7 +4935,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 					&received)
 				sendWaiters, recvWaiters, logicalWaiters :=
 					runtime.StacklessCoroChannelWaitersForTest(channel)
@@ -4618,7 +4975,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 				sendWaiters, recvWaiters, logicalWaiters :=
 					runtime.StacklessCoroChannelWaitersForTest(channel)
 				if sendWaiters != 1 || recvWaiters != 0 ||
@@ -4656,7 +5013,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 				sendWaiters, recvWaiters, logicalWaiters :=
 					runtime.StacklessCoroChannelWaitersForTest(channel)
 				if sendWaiters != 1 || recvWaiters != 0 ||
@@ -4695,7 +5052,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 					&received)
 				sendWaiters, recvWaiters, logicalWaiters :=
 					runtime.StacklessCoroChannelWaitersForTest(channel)
@@ -4738,7 +5095,7 @@ func TestStacklessCoroChannelInterop(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.SendStacklessCoroForTest(ctx, channel,
+				runtime.StartStacklessCoroSendForTest(ctx, channel,
 					unsafe.Pointer(&value))
 				send, recv, logical :=
 					runtime.StacklessCoroChannelWaitersForTest(channel)
@@ -4785,7 +5142,7 @@ func TestStacklessCoroChannelSynchronization(t *testing.T) {
 		case 0:
 			state = 1
 			shared = 63
-			runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+			runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 			return runtime.StacklessCoroActionWait
 		case 1:
 			state = 2
@@ -4817,7 +5174,7 @@ func TestStacklessCoroChannelCloseWaiter(t *testing.T) {
 			switch state {
 			case 0:
 				state = 1
-				runtime.RecvIntStacklessCoroForTest(ctx, channel, &value,
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value,
 					&received)
 				queued.Store(true)
 				return runtime.StacklessCoroActionWait
@@ -4860,7 +5217,7 @@ func TestStacklessCoroChannelCloseWaiter(t *testing.T) {
 				switch state {
 				case 0:
 					state = 1
-					runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+					runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 					queued.Store(true)
 					return runtime.StacklessCoroActionWait
 				default:
@@ -4926,7 +5283,7 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 					switch state {
 					case 0:
 						state = 1
-						runtime.RecvIntStacklessCoroForTest(ctx, channel,
+						runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
 							&value, &received)
 						queued.Add(1)
 						return runtime.StacklessCoroActionWait
@@ -4972,7 +5329,7 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 						switch state {
 						case 0:
 							state = 1
-							runtime.SendIntStacklessCoroForTest(ctx, channel,
+							runtime.StartStacklessCoroSendIntForTest(ctx, channel,
 								&value)
 							queued.Add(1)
 							return runtime.StacklessCoroActionWait
@@ -5007,7 +5364,7 @@ func TestStacklessCoroChannelFIFO(t *testing.T) {
 			switch states[index] {
 			case 0:
 				states[index] = 1
-				runtime.SendIntStacklessCoroForTest(ctx, channel,
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel,
 					&values[index])
 				return runtime.StacklessCoroActionWait
 			case 1:
@@ -5133,7 +5490,7 @@ func TestStacklessCoroTimerChannel(t *testing.T) {
 		received = false
 		pending = true
 		runtime.SpawnStacklessCoroForTest(ctx, resetTimer)
-		runtime.RecvStacklessCoroForTest(ctx, timer.C,
+		runtime.StartStacklessCoroRecvForTest(ctx, timer.C,
 			unsafe.Pointer(&value), &received)
 		return runtime.StacklessCoroActionWait
 	})
@@ -5433,7 +5790,7 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				return runtime.StacklessCoroActionWait
 			case 1:
 				cacheCount(t, ctx)
-				runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 				tokens[1] = runtime.StacklessCoroOperationTokenForTest(ctx)
 				runtime.ReadySleepStacklessCoroForTest(timer)
 				close(startReceiver)
