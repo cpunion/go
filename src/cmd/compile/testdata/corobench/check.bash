@@ -26,6 +26,7 @@ symbols_output="$output_dir/coro.symbols"
 test_binary="$output_dir/coro.test"
 build_output="$output_dir/build.txt"
 allocation_output="$output_dir/public-entry-allocation.txt"
+recursive_allocation_output="$output_dir/recursive-frame-allocation.txt"
 read_output="$output_dir/read-lowering.txt"
 correctness_output="$output_dir/correctness.txt"
 public_coverage_output="$output_dir/public-read-coverage.txt"
@@ -121,6 +122,7 @@ expected=(
 	yieldLoop
 	yieldEntry
 	recursiveYield
+	recursiveLargeFrame
 	mutualYieldA
 	mutualYieldB
 	deferYield
@@ -214,6 +216,57 @@ if ! awk '
 ' "$allocation_output"; then
 	cat "$allocation_output" >&2
 	echo "steady coroutine frame allocation is not zero" >&2
+	exit 1
+fi
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^(BenchmarkRecursiveYield64|BenchmarkRecursiveYield4096)$' \
+	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
+	>"$recursive_allocation_output"; then
+	tail -n 100 "$recursive_allocation_output" >&2
+	exit 1
+fi
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^BenchmarkRecursiveLargeFrame512$' \
+	-test.benchmem -test.benchtime=10x -test.count=3 -test.cpu=1 \
+	>>"$recursive_allocation_output"; then
+	tail -n 100 "$recursive_allocation_output" >&2
+	exit 1
+fi
+if ! awk '
+	$1 ~ /^BenchmarkRecursiveYield64(-[0-9]+)?$/ {
+		shallow++
+		for (i = 2; i <= NF; i++) {
+			if (($i == "B/op" || $i == "allocs/op") && $(i - 1) != 0) {
+				bad = 1
+			}
+		}
+	}
+	$1 ~ /^BenchmarkRecursiveYield4096(-[0-9]+)?$/ {
+		deep++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "B/op" && $(i - 1) > 216000) {
+				bad = 1
+			}
+			if ($i == "allocs/op" && $(i - 1) > 500) {
+				bad = 1
+			}
+		}
+	}
+	$1 ~ /^BenchmarkRecursiveLargeFrame512(-[0-9]+)?$/ {
+		large++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "B/op" && $(i - 1) > 2850000) {
+				bad = 1
+			}
+			if ($i == "allocs/op" && $(i - 1) > 140) {
+				bad = 1
+			}
+		}
+	}
+	END { exit shallow == 3 && deep == 3 && large == 3 && !bad ? 0 : 1 }
+' "$recursive_allocation_output"; then
+	cat "$recursive_allocation_output" >&2
+	echo "recursive coroutine frame allocation exceeds its bound" >&2
 	exit 1
 fi
 

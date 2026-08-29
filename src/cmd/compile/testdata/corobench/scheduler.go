@@ -32,6 +32,24 @@ func recursiveYield(depth int) int {
 	return recursiveYield(depth-1) + 1
 }
 
+const recursiveLargeFrameBytes = 5 << 10
+
+//go:noinline
+func recursiveLargeFrameValue(frame *[recursiveLargeFrameBytes]byte) int {
+	return int(frame[0] & 1)
+}
+
+func recursiveLargeFrame(depth int) int {
+	var frame [recursiveLargeFrameBytes]byte
+	frame[0] = byte(depth)
+	if depth <= 0 {
+		runtime.Gosched()
+		return 1 + recursiveLargeFrameValue(&frame)
+	}
+	return recursiveLargeFrame(depth-1) + 1 +
+		recursiveLargeFrameValue(&frame)
+}
+
 func mutualYieldA(depth int) int {
 	if depth <= 0 {
 		runtime.Gosched()

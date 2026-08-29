@@ -1155,6 +1155,146 @@ func runStacklessCoroSelfFrames(t *testing.T, tracker *stacklessCoroSelfFrameTra
 		stacklessCoroSelfFrameResume)
 }
 
+type stacklessCoroLargeSelfFrameTracker struct {
+	total         int
+	fused         bool
+	panicLeaf     bool
+	sawShortChunk bool
+	sawChunkFirst bool
+	sawChunkLast  bool
+}
+
+var stacklessCoroLargeSelfFrameActive *stacklessCoroLargeSelfFrameTracker
+
+func completeStacklessCoroLargeSelfFrame(ctx unsafe.Pointer,
+	frame *runtime.StacklessCoroLargeSelfFrameForTest,
+	tracker *stacklessCoroLargeSelfFrameTracker) uint8 {
+	tracker.total++
+	if frame.Parent != nil {
+		if runtime.FrameNeedsClearStacklessCoroForTest(ctx) {
+			frame.Value = nil
+		}
+		if tracker.fused {
+			return runtime.CompleteStacklessCoroLargeFusedFrameForTest(ctx)
+		}
+		return runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+	}
+	return runtime.StacklessCoroActionComplete
+}
+
+func stacklessCoroLargeSelfFrameResume(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroLargeSelfFrameActive
+	if terminal := runtime.TerminalActionStacklessCoroForTest(ctx); terminal !=
+		runtime.StacklessCoroActionInvalid {
+		return terminal
+	}
+	frame := (*runtime.StacklessCoroLargeSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.State {
+	case 0:
+		if frame.Depth == 0 {
+			if tracker.panicLeaf {
+				panic("stackless coroutine large-frame panic")
+			}
+			return completeStacklessCoroLargeSelfFrame(ctx, frame, tracker)
+		}
+		var childPointer unsafe.Pointer
+		if tracker.fused {
+			childPointer = runtime.TakeStacklessCoroLargeFusedFrameForTest(ctx,
+				stacklessCoroLargeSelfFrameResume)
+		} else {
+			childPointer = runtime.TakeStacklessCoroLargeSelfFrameForTest(ctx,
+				stacklessCoroLargeSelfFrameResume)
+		}
+		if childPointer == nil {
+			childPointer = unsafe.Pointer(
+				new(runtime.StacklessCoroLargeSelfFrameForTest))
+		}
+		child := (*runtime.StacklessCoroLargeSelfFrameForTest)(childPointer)
+		*child = runtime.StacklessCoroLargeSelfFrameForTest{
+			Depth: frame.Depth - 1,
+			Value: frame.Value,
+		}
+		frame.State = 1
+		var action uint8
+		if tracker.fused {
+			action = runtime.AwaitStacklessCoroLargeFusedFrameForTest(ctx,
+				childPointer, stacklessCoroLargeSelfFrameResume)
+		} else {
+			action = runtime.AwaitStacklessCoroSelfFrameForTest(ctx,
+				childPointer, stacklessCoroLargeSelfFrameResume)
+		}
+		marker := child.Marker
+		tracker.sawShortChunk = tracker.sawShortChunk ||
+			marker&runtime.StacklessCoroFusedFrameShortChunk != 0
+		switch marker & runtime.StacklessCoroFusedFrameAllocationMask {
+		case runtime.StacklessCoroFusedFrameChunkFirst:
+			tracker.sawChunkFirst = true
+		case runtime.StacklessCoroFusedFrameChunkFirst +
+			runtime.StacklessCoroLargeFrameChunkSize - 1:
+			tracker.sawChunkLast = true
+		}
+		return action
+	case 1:
+		return completeStacklessCoroLargeSelfFrame(ctx, frame, tracker)
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func runStacklessCoroLargeSelfFrames(depth int,
+	tracker *stacklessCoroLargeSelfFrameTracker) {
+	stacklessCoroLargeSelfFrameActive = tracker
+	root := &runtime.StacklessCoroLargeSelfFrameForTest{
+		Depth: depth,
+		Value: &tracker.total,
+	}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroLargeSelfFrameResume)
+}
+
+func TestStacklessCoroLargeSelfFrameFusion(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+
+	frameSize := int(unsafe.Sizeof(runtime.StacklessCoroLargeSelfFrameForTest{}))
+	depth := runtime.StacklessCoroFrameCacheSize/frameSize +
+		runtime.StacklessCoroFrameChunkDirectCount +
+		2*runtime.StacklessCoroLargeFrameChunkSize
+	defer func() { stacklessCoroLargeSelfFrameActive = nil }()
+	for _, test := range []struct {
+		name  string
+		fused bool
+	}{
+		{name: "self"},
+		{name: "general", fused: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracker := &stacklessCoroLargeSelfFrameTracker{fused: test.fused}
+			runStacklessCoroLargeSelfFrames(depth, tracker)
+			if tracker.total != depth+1 {
+				t.Fatalf("completed large frames = %d, want %d",
+					tracker.total, depth+1)
+			}
+			if !race.Enabled && (!tracker.sawShortChunk ||
+				!tracker.sawChunkFirst || !tracker.sawChunkLast) {
+				t.Fatalf("large frame markers = %+v, want short complete chunks", tracker)
+			}
+		})
+	}
+
+	t.Run("panic-unwind", func(t *testing.T) {
+		tracker := &stacklessCoroLargeSelfFrameTracker{panicLeaf: true}
+		defer func() {
+			if value := recover(); value != "stackless coroutine large-frame panic" {
+				t.Fatalf("recovered %v, want large-frame panic", value)
+			}
+		}()
+		runStacklessCoroLargeSelfFrames(depth, tracker)
+		t.Fatal("large-frame panic returned")
+	})
+}
+
 func TestStacklessCoroSelfFrameFusion(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
@@ -2367,6 +2507,12 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		if !valid || missing || wrongKind || wrongLength || wrongElementSize {
 			t.Fatalf("frame-chunk types = (%t, %t, %t, %t, %t), want (true, false, false, false, false)",
 				valid, missing, wrongKind, wrongLength, wrongElementSize)
+		}
+		if !runtime.ValidStacklessCoroAdaptiveFrameChunksForTest() {
+			t.Fatal("adaptive frame-chunk validation failed")
+		}
+		if !runtime.StacklessCoroAdaptiveFrameChunkMarkersForTest() {
+			t.Fatal("adaptive frame-chunk marker transition failed")
 		}
 		const depth = runtime.StacklessCoroTaskCacheSize +
 			runtime.StacklessCoroFrameChunkDirectCount +

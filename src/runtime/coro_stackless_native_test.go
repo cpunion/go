@@ -549,6 +549,78 @@ func TestStacklessCoroNilResume(t *testing.T) {
 	}
 }
 
+var stacklessCoroFrameChunkInvariantMode string
+
+func stacklessCoroFrameChunkInvariantResume(ctx unsafe.Pointer) uint8 {
+	frame := (*runtime.StacklessCoroLargeSelfFrameForTest)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch stacklessCoroFrameChunkInvariantMode {
+	case "self-take":
+		frame.Marker = runtime.StacklessCoroFusedFrameShortChunk
+		runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+	case "self-await":
+		child := runtime.TakeStacklessCoroLargeSelfFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+		if child == nil {
+			child = unsafe.Pointer(new(runtime.StacklessCoroLargeSelfFrameForTest))
+		}
+		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask + 1
+		return runtime.AwaitStacklessCoroSelfFrameForTest(ctx, child,
+			stacklessCoroFrameChunkInvariantResume)
+	case "fused-take":
+		frame.Marker = runtime.StacklessCoroFusedFrameShortChunk |
+			runtime.StacklessCoroFusedFrameChunkFirst
+		runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+	case "fused-await":
+		child := runtime.TakeStacklessCoroLargeFusedFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+		if child == nil {
+			child = unsafe.Pointer(new(runtime.StacklessCoroLargeSelfFrameForTest))
+		}
+		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask + 1
+		return runtime.AwaitStacklessCoroLargeFusedFrameForTest(ctx, child,
+			stacklessCoroFrameChunkInvariantResume)
+	}
+	return runtime.StacklessCoroActionInvalid
+}
+
+func TestStacklessCoroFrameChunkInvariants(t *testing.T) {
+	const helper = "GO_RUNTIME_CORO_FRAME_CHUNK_INVARIANT"
+	if mode := os.Getenv(helper); mode != "" {
+		stacklessCoroFrameChunkInvariantMode = mode
+		root := new(runtime.StacklessCoroLargeSelfFrameForTest)
+		runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+			stacklessCoroFrameChunkInvariantResume)
+		return
+	}
+
+	for _, test := range []struct {
+		mode, want string
+	}{
+		{mode: "self-take", want: "mismatched stackless coroutine self-frame chunk"},
+		{mode: "self-await", want: "invalid stackless coroutine parent self-frame marker"},
+		{mode: "fused-take", want: "mismatched stackless coroutine fused-frame chunk"},
+		{mode: "fused-await", want: "invalid stackless coroutine parent fused-frame marker"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0],
+				"-test.run=^TestStacklessCoroFrameChunkInvariants$", "-test.count=1")
+			cmd.Env = append(os.Environ(), helper+"="+test.mode,
+				"GOTRACEBACK=single")
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("%s invariant unexpectedly succeeded", test.mode)
+			}
+			if !strings.Contains(string(out), test.want) {
+				t.Fatalf("%s invariant failed with the wrong error:\n%s",
+					test.mode, out)
+			}
+		})
+	}
+}
+
 func TestStacklessCoroNativeFixedStackOverflow(t *testing.T) {
 	const helper = "GO_RUNTIME_CORO_FIXED_STACK_OVERFLOW"
 	if os.Getenv(helper) == "1" {

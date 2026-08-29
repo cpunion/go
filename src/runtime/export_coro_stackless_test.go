@@ -17,6 +17,14 @@ type stacklessCoroFrameChunkExportFrame struct {
 	tracker unsafe.Pointer
 }
 
+type stacklessCoroLargeFrameChunkExportFrame struct {
+	data [stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize + 1]byte
+}
+
+type stacklessCoroOversizedFrameChunkExportFrame struct {
+	data [stacklessCoroFrameChunkByteLimit/stacklessCoroLargeFrameChunkSize + 1]byte
+}
+
 // StacklessCoroSelfFrameForTest matches the compiler-private fused-frame
 // prefix and leaves enough ordinary state for runtime transition tests.
 type StacklessCoroSelfFrameForTest struct {
@@ -26,6 +34,18 @@ type StacklessCoroSelfFrameForTest struct {
 	State  uint8
 	Depth  int
 	Value  *int
+}
+
+// StacklessCoroLargeSelfFrameForTest exercises the four-element chunk selected
+// when eight frames would exceed the runtime's typed-allocation bound.
+type StacklessCoroLargeSelfFrameForTest struct {
+	Parent unsafe.Pointer
+	Owner  unsafe.Pointer
+	Marker uint8
+	State  uint8
+	Depth  int
+	Value  *int
+	Data   [stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize + 1]byte
 }
 
 // StacklessCoroFusedResumeFrameForTest matches the extended compiler-private
@@ -45,12 +65,14 @@ const (
 	StacklessCoroTaskCacheSize            = stacklessCoroTaskCacheSize
 	StacklessCoroTaskChunkSize            = stacklessCoroTaskChunkSize
 	StacklessCoroFrameChunkSize           = stacklessCoroFrameChunkSize
+	StacklessCoroLargeFrameChunkSize      = stacklessCoroLargeFrameChunkSize
 	StacklessCoroFrameChunkDirectCount    = stacklessCoroFrameChunkDirectCount
 	StacklessCoroFusedFrameDirectFirst    = stacklessCoroFusedFrameDirectFirst
 	StacklessCoroFusedFrameDirectLast     = stacklessCoroFusedFrameDirectLast
 	StacklessCoroFusedFrameChunkFirst     = stacklessCoroFusedFrameChunkFirst
 	StacklessCoroFusedFrameChunkLast      = stacklessCoroFusedFrameChunkLast
 	StacklessCoroFusedFrameAllocationMask = stacklessCoroFusedFrameAllocationMask
+	StacklessCoroFusedFrameShortChunk     = stacklessCoroFusedFrameShortChunk
 	StacklessCoroFrameCacheSize           = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize       = stacklessCoroOperationCacheSize
 	StacklessCoroSharedOperationCacheSize = stacklessCoroSharedOperationCacheSize
@@ -154,13 +176,36 @@ func TakeStacklessCoroSelfFrameForTest(ctx unsafe.Pointer,
 		unsafe.Sizeof(StacklessCoroSelfFrameForTest{}), frameType)
 }
 
+func TakeStacklessCoroLargeSelfFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]StacklessCoroLargeSelfFrameForTest]()
+	return coroTakeSelfFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroLargeSelfFrameForTest{}), frameType)
+}
+
+func TakeStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]StacklessCoroLargeSelfFrameForTest]()
+	return coroTakeFusedFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroLargeSelfFrameForTest{}), frameType, true)
+}
+
 func AwaitStacklessCoroSelfFrameForTest(ctx, frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) uint8 {
 	return coroAwaitSelfFrame(ctx, frame, resume)
 }
 
+func AwaitStacklessCoroLargeFusedFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) uint8 {
+	return coroAwaitFusedFrame(ctx, frame, resume)
+}
+
 func CompleteStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) uint8 {
 	return coroCompleteSelfFrame(ctx)
+}
+
+func CompleteStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer) uint8 {
+	return coroCompleteFusedFrame(ctx)
 }
 
 func TakeStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer,
@@ -202,6 +247,74 @@ func ValidStacklessCoroFrameChunkTypesForTest() (valid, missing,
 		validStacklessCoroFrameChunkType(integer, size),
 		validStacklessCoroFrameChunkType(shortChunk, size),
 		validStacklessCoroFrameChunkType(byteChunk, size)
+}
+
+func ValidStacklessCoroAdaptiveFrameChunksForTest() bool {
+	smallSize := unsafe.Sizeof(stacklessCoroFrameChunkExportFrame{})
+	largeSize := unsafe.Sizeof(stacklessCoroLargeFrameChunkExportFrame{})
+	smallLast := uintptr(stacklessCoroFrameChunkByteLimit /
+		stacklessCoroFrameChunkSize)
+	largeChunk := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]stacklessCoroLargeFrameChunkExportFrame]()
+	oversizedChunk := abi.TypeFor[[stacklessCoroFrameChunkSize]stacklessCoroLargeFrameChunkExportFrame]()
+	tooLargeSize := unsafe.Sizeof(stacklessCoroOversizedFrameChunkExportFrame{})
+	tooLargeChunk := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]stacklessCoroOversizedFrameChunkExportFrame]()
+	shortLast := uint8(stacklessCoroFusedFrameChunkFirst +
+		stacklessCoroLargeFrameChunkSize - 1)
+	return stacklessCoroFrameChunkLength(smallSize) ==
+		stacklessCoroFrameChunkSize &&
+		stacklessCoroFrameChunkLength(largeSize) ==
+			stacklessCoroLargeFrameChunkSize &&
+		stacklessCoroFrameChunkLength(smallLast) ==
+			stacklessCoroFrameChunkSize &&
+		stacklessCoroFrameChunkLength(smallLast+1) ==
+			stacklessCoroLargeFrameChunkSize &&
+		validStacklessCoroFrameChunkType(largeChunk, largeSize) &&
+		stacklessCoroFrameChunkEligible(largeChunk, largeSize) &&
+		!stacklessCoroFrameChunkEligible(tooLargeChunk, tooLargeSize) &&
+		!validStacklessCoroFrameChunkType(oversizedChunk, largeSize) &&
+		validStacklessCoroFusedFrameMarker(
+			stacklessCoroFusedFrameShortChunk|shortLast) &&
+		!validStacklessCoroFusedFrameMarker(
+			stacklessCoroFusedFrameShortChunk|shortLast+1) &&
+		validStacklessCoroSelfFrameMarker(
+			stacklessCoroFusedFrameShortChunk|shortLast)
+}
+
+func StacklessCoroAdaptiveFrameChunkMarkersForTest() bool {
+	largeSize := unsafe.Sizeof(stacklessCoroLargeFrameChunkExportFrame{})
+	directFirst, directLast, first, last :=
+		stacklessCoroFrameChunkBounds(largeSize)
+	if directFirst != stacklessCoroShortFrameChunkDirectFirst ||
+		directLast != stacklessCoroShortFrameChunkDirectLast ||
+		first != stacklessCoroShortFrameChunkFirst ||
+		last != stacklessCoroShortFrameChunkLast ||
+		isStacklessCoroFrameChunkElement(directLast) ||
+		!isStacklessCoroFrameChunkElement(first) ||
+		!isStacklessCoroFrameChunkElement(last) {
+		return false
+	}
+	resume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
+		return stacklessCoroActionComplete
+	})
+	for _, test := range [...]struct {
+		marker uint16
+		want   uint16
+	}{
+		{marker: directFirst, want: directFirst - 1},
+		{marker: directLast, want: first},
+		{marker: first, want: first - 1},
+		{marker: last, want: first},
+	} {
+		parent := &stacklessCoroTask{resume: resume, frameSize: test.marker}
+		task := &stacklessCoroTask{resume: resume}
+		s := new(stacklessCoroScheduler)
+		s.markUncachedFrameLineageLocked(task, parent,
+			unsafe.Pointer(new(byte)))
+		if task.frameSize != test.want {
+			return false
+		}
+	}
+	return true
 }
 
 func PanicStacklessCoroForTest(ctx unsafe.Pointer, value any) {
