@@ -1346,3 +1346,54 @@ push-versus-pull measurements in `PUSH_PULL.md` separately show that compact
 structured ownership, rather than pull polling itself, is the productive way
 to reduce the deep-frame and GC costs while retaining push-based goroutine
 semantics.
+
+#### Share overflow operation storage
+
+Revision `7b524fc862`, based on exact parent `8a329a4522`, retains the first
+64 completed operations in each logical scheduler and shares the remaining
+192 entries of the bounded 256-task working set process-wide. The local fast
+path and the task, operation, and scheduler layouts on 64-bit targets are
+unchanged. A shared leaf-rank mutex is reached only after releasing the
+scheduler lock and only on a local-cache miss or overflow. Race builds
+continue to give every channel operation a distinct synchronization address
+and therefore bypass both caches.
+
+The previous 64-entry bound made a steady burst of 100 parked tasks allocate
+36 operations and 36 channel waiters in addition to the release channel: 73
+allocations and about 10.5 KiB per iteration. The shared pool retains those
+overflow objects for later schedulers without multiplying a 256-entry cache
+by the number of schedulers. A direct 15-pair comparison with the alternative
+256-entry scheduler-local cache was neutral (-0.83% paired median, `p=1.0`)
+and reported one allocation for both implementations.
+
+The parent and candidate binaries below used identical compiler and linker
+executables, the same source probes, disabled inlining, one P, the same
+randomized linker-layout seed, and 15 alternating 200 ms samples.
+Darwin/arm64 ran natively on an Apple M4 Max. Linux/amd64 ran under Rosetta
+translation, so its timing is directional while its allocation counts are
+exact.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 parent -> candidate |
+| --- | ---: | ---: |
+| park and wake 100 tasks | 26.344 us -> 18.762 us (-28.66%) | 61.731 us -> 42.943 us (-25.85%) |
+| allocation | 10,482 B, 73 allocs -> 113 B, 1 alloc | 10,484 B, 73 allocs -> 116 B, 1 alloc |
+
+All 15 pairs improved on both platforms (`p=0.000061`). Eleven fixed-layout
+controls covering entry, yield, sequential and burst spawning, channel,
+select, timer, file, TCP, and direct and blocking C calls had no statistically
+significant regression. Every control retained its previous zero-allocation
+result.
+
+Regression tests cover empty, populated, and full shared caches; the exact
+257-operation bound; cross-scheduler and cross-operation-kind reuse; normal
+completion and panic; and race-mode non-reuse. Normal, race, and `checkptr=2`
+stackless runtime tests and the complete timer, file, TCP, lowering, symbol,
+allocation, and public-read coverage audit pass on native Darwin/arm64 and
+translated Linux/amd64. The complete coroutine compiler suite also passes on
+both. The translated full Linux runtime reaches only the existing Rosetta
+failure in `TestCheckFDs`; native Linux CI remains the complete runtime gate.
+
+Combined normal and race profiles execute 49 of 53 added runtime statements
+(92.45%). The four unexecuted statements are the two fail-closed cache
+invariant `throw` bodies; their validator, every state transition, both cache
+directions, overflow disposal, panic path, and race path are covered.
