@@ -53,6 +53,7 @@ const (
 	StacklessCoroFusedFrameAllocationMask = stacklessCoroFusedFrameAllocationMask
 	StacklessCoroFrameCacheSize           = stacklessCoroFrameCacheSize
 	StacklessCoroOperationCacheSize       = stacklessCoroOperationCacheSize
+	StacklessCoroSharedOperationCacheSize = stacklessCoroSharedOperationCacheSize
 	StacklessCoroSelectCaseCacheSize      = stacklessCoroSelectCaseCacheSize
 
 	StacklessCoroActionInvalid  = stacklessCoroActionInvalid
@@ -542,6 +543,80 @@ func StacklessCoroFreeOperationCountForTest(ctx unsafe.Pointer) int {
 	count := int(s.freeOperationCount)
 	unlock(&s.lock)
 	return count
+}
+
+func StacklessCoroSharedOperationCountForTest() int {
+	lock(&stacklessCoroSharedOperations.lock)
+	count := int(stacklessCoroSharedOperations.count)
+	unlock(&stacklessCoroSharedOperations.lock)
+	return count
+}
+
+func DrainStacklessCoroSharedOperationsForTest() int {
+	lock(&stacklessCoroSharedOperations.lock)
+	count := 0
+	for op := stacklessCoroSharedOperations.head; op != nil; {
+		next := op.next
+		op.next = nil
+		op = next
+		count++
+	}
+	if count != int(stacklessCoroSharedOperations.count) {
+		unlock(&stacklessCoroSharedOperations.lock)
+		throw("runtime: invalid shared stackless coroutine operation cache drain")
+	}
+	stacklessCoroSharedOperations.head = nil
+	stacklessCoroSharedOperations.count = 0
+	unlock(&stacklessCoroSharedOperations.lock)
+	return count
+}
+
+func CheckStacklessCoroSharedOperationCacheForTest() bool {
+	op := new(stacklessCoroOperation)
+	return validStacklessCoroSharedOperationCache(nil, 0) &&
+		!validStacklessCoroSharedOperationCache(nil, 1) &&
+		!validStacklessCoroSharedOperationCache(op, 0) &&
+		validStacklessCoroSharedOperationCache(
+			op, uint8(stacklessCoroSharedOperationCacheSize)) &&
+		!validStacklessCoroSharedOperationCache(
+			op, uint8(stacklessCoroSharedOperationCacheSize+1))
+}
+
+func CheckStacklessCoroSharedOperationPanicForTest() bool {
+	if raceenabled {
+		return true
+	}
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankLeafRank)
+	operations := new([stacklessCoroOperationCacheSize]stacklessCoroOperation)
+	for i := range operations {
+		op := &operations[i]
+		op.next = s.freeOperations
+		s.freeOperations = op
+		s.freeOperationCount++
+	}
+	task := &stacklessCoroTask{state: stacklessCoroTaskWaiting}
+	op := &stacklessCoroOperation{
+		stacklessCoroOperationState: stacklessCoroOperationState{
+			id:        1,
+			scheduler: s,
+			task:      task,
+		},
+	}
+	value := plainError("shared operation panic")
+	panicStacklessCoroOperation(op, value)
+
+	lock(&s.lock)
+	localValid := s.freeOperationCount == stacklessCoroOperationCacheSize &&
+		task.state == stacklessCoroTaskRunnable &&
+		task.terminal == stacklessCoroTerminalPanic &&
+		s.terminalValues[task] == value
+	unlock(&s.lock)
+	lock(&stacklessCoroSharedOperations.lock)
+	sharedValid := stacklessCoroSharedOperations.head == op &&
+		stacklessCoroSharedOperations.count == 1
+	unlock(&stacklessCoroSharedOperations.lock)
+	return localValid && sharedValid
 }
 
 func SpawnStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {

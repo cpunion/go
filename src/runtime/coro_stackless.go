@@ -48,6 +48,12 @@ const stacklessCoroFrameChunkDirectCount = 6
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
+// Share operation storage above a scheduler's local bound. Together the two
+// caches cover the bounded task cache without retaining the larger operation
+// resources separately in every scheduler.
+const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
+	stacklessCoroOperationCacheSize
+
 // A fused structured-await chain uses the same direct prefix as ordinary
 // recursive frame chunks. The low bits describe allocation; the high bits
 // retain the suspended frame state needed when resumes are heterogeneous.
@@ -312,6 +318,15 @@ var stacklessCoroOperations struct {
 	head *stacklessCoroOperation
 }
 
+// stacklessCoroSharedOperations retains completed operations that exceeded a
+// scheduler's local cache. The process-wide bound keeps this overflow shared
+// by concurrent schedulers.
+var stacklessCoroSharedOperations struct {
+	lock  mutex
+	head  *stacklessCoroOperation
+	count uint8
+}
+
 // The bounded wake pool retains channels for nested schedulers only after
 // every executor for their previous scheduler has stopped. Race builds keep a
 // distinct synchronization identity for each scheduler instead.
@@ -357,6 +372,7 @@ var stacklessCoroRootFrameCache struct {
 
 func init() {
 	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroSharedOperations.lock, lockRankLeafRank)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
@@ -2768,7 +2784,10 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 	task.state = stacklessCoroTaskWaiting
 	unlock(&s.lock)
 	if op == nil {
-		op = new(stacklessCoroOperation)
+		op = takeStacklessCoroSharedOperation()
+		if op == nil {
+			op = new(stacklessCoroOperation)
+		}
 	}
 	op.scheduler = s
 	op.task = task
@@ -2796,30 +2815,87 @@ func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroSche
 	return s, task
 }
 
-// recycleOperationLocked retains a completed operation for this scheduler.
-// The operation address is a race-detector synchronization identity for
-// channel operations, so race builds must not reuse it for another operation.
-func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperation) {
+// recycleOperationLocked retains a completed operation for this scheduler and
+// reports whether it fit. The operation address is a race-detector
+// synchronization identity for channel operations, so race builds must not
+// reuse it for another operation.
+func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperation) bool {
 	if raceenabled {
-		return
+		return false
 	}
 	if s.freeOperationCount > stacklessCoroOperationCacheSize {
 		throw("runtime: invalid stackless coroutine operation cache size")
 	}
 	if s.freeOperationCount == stacklessCoroOperationCacheSize {
-		return
+		return false
 	}
 	op.next = s.freeOperations
 	s.freeOperations = op
 	s.freeOperationCount++
+	return true
+}
+
+// takeStacklessCoroSharedOperation removes one operation from the overflow
+// shared by scheduler-local caches.
+func takeStacklessCoroSharedOperation() *stacklessCoroOperation {
+	if raceenabled {
+		return nil
+	}
+	lock(&stacklessCoroSharedOperations.lock)
+	if !validStacklessCoroSharedOperationCache(
+		stacklessCoroSharedOperations.head,
+		stacklessCoroSharedOperations.count) {
+		throw("runtime: invalid shared stackless coroutine operation cache")
+	}
+	op := stacklessCoroSharedOperations.head
+	if op != nil {
+		stacklessCoroSharedOperations.head = op.next
+		stacklessCoroSharedOperations.count--
+		op.next = nil
+	}
+	unlock(&stacklessCoroSharedOperations.lock)
+	return op
+}
+
+// validStacklessCoroSharedOperationCache checks the facts represented by the
+// shared cache's head and bounded byte count.
+func validStacklessCoroSharedOperationCache(head *stacklessCoroOperation,
+	count uint8) bool {
+	return (head == nil) == (count == 0) &&
+		int(count) <= stacklessCoroSharedOperationCacheSize
+}
+
+// cacheStacklessCoroSharedOperation retains an operation that did not fit in
+// its scheduler's local cache.
+func cacheStacklessCoroSharedOperation(op *stacklessCoroOperation) {
+	if raceenabled {
+		return
+	}
+	lock(&stacklessCoroSharedOperations.lock)
+	if !validStacklessCoroSharedOperationCache(
+		stacklessCoroSharedOperations.head,
+		stacklessCoroSharedOperations.count) {
+		throw("runtime: invalid shared stackless coroutine operation cache")
+	}
+	if int(stacklessCoroSharedOperations.count) == stacklessCoroSharedOperationCacheSize {
+		unlock(&stacklessCoroSharedOperations.lock)
+		return
+	}
+	op.next = stacklessCoroSharedOperations.head
+	stacklessCoroSharedOperations.head = op
+	stacklessCoroSharedOperations.count++
+	unlock(&stacklessCoroSharedOperations.lock)
 }
 
 func completeStacklessCoroOperation(op *stacklessCoroOperation) {
 	s, task := clearStacklessCoroOperation(op)
 	lock(&s.lock)
 	s.readyLocked(task)
-	s.recycleOperationLocked(op)
+	cachedLocally := s.recycleOperationLocked(op)
 	unlock(&s.lock)
+	if !cachedLocally {
+		cacheStacklessCoroSharedOperation(op)
+	}
 	s.signal()
 }
 
@@ -2838,8 +2914,11 @@ func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
 	}
 	s.terminalValues[task] = value
 	s.readyLocked(task)
-	s.recycleOperationLocked(op)
+	cachedLocally := s.recycleOperationLocked(op)
 	unlock(&s.lock)
+	if !cachedLocally {
+		cacheStacklessCoroSharedOperation(op)
+	}
 	s.signal()
 }
 
