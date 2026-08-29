@@ -48,6 +48,16 @@ type stacklessCoroComparisonSelectFrame struct {
 	waited   bool
 }
 
+type stacklessCoroComparisonChannelFrame struct {
+	channel    chan int
+	state      uint8
+	sendValue  int
+	value      int
+	received   bool
+	sendWaited bool
+	recvWaited bool
+}
+
 func stacklessCoroComparisonYieldResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroComparisonYieldFrame)(
 		runtime.FrameStacklessCoroForTest(ctx))
@@ -72,6 +82,27 @@ func stacklessCoroComparisonSelectResume(ctx unsafe.Pointer) uint8 {
 			&frame.chosen, &frame.received)
 		return runtime.StacklessCoroActionWait
 	case 1:
+		return runtime.StacklessCoroActionComplete
+	default:
+		return runtime.StacklessCoroActionInvalid
+	}
+}
+
+func stacklessCoroComparisonChannelResume(ctx unsafe.Pointer) uint8 {
+	frame := (*stacklessCoroComparisonChannelFrame)(
+		runtime.FrameStacklessCoroForTest(ctx))
+	switch frame.state {
+	case 0:
+		frame.state = 1
+		frame.sendWaited = runtime.SendIntStacklessCoroForTest(ctx,
+			frame.channel, &frame.sendValue)
+		return runtime.StacklessCoroActionWait
+	case 1:
+		frame.state = 2
+		frame.recvWaited = runtime.RecvIntStacklessCoroForTest(ctx,
+			frame.channel, &frame.value, &frame.received)
+		return runtime.StacklessCoroActionWait
+	case 2:
 		return runtime.StacklessCoroActionComplete
 	default:
 		return runtime.StacklessCoroActionInvalid
@@ -184,7 +215,7 @@ func stacklessCoroCompactPullFootprintResume(ctx unsafe.Pointer) uint8 {
 		case 0:
 			if frame.depth == 0 {
 				frame.state = 1
-				runtime.RecvIntStacklessCoroForTest(ctx, frame.gate,
+				runtime.StartStacklessCoroRecvIntForTest(ctx, frame.gate,
 					&frame.value, &frame.recv)
 				frame.parked.Store(true)
 				return runtime.StacklessCoroActionWait
@@ -278,7 +309,7 @@ func stacklessCoroComparisonFootprintResume(ctx unsafe.Pointer) uint8 {
 	case 0:
 		if frame.depth == 0 {
 			frame.state = 1
-			runtime.RecvIntStacklessCoroForTest(ctx, frame.gate,
+			runtime.StartStacklessCoroRecvIntForTest(ctx, frame.gate,
 				&frame.value, &frame.recv)
 			frame.parked.Store(true)
 			return runtime.StacklessCoroActionWait
@@ -674,6 +705,24 @@ func TestStacklessCoroSelectPullFallback(t *testing.T) {
 	if frame.chosen != 0 || !frame.received || frame.value != 39 {
 		t.Fatalf("pull select = (%d, %t, %d), want (0, true, 39)",
 			frame.chosen, frame.received, frame.value)
+	}
+}
+
+func TestStacklessCoroChannelPullFallback(t *testing.T) {
+	frame := &stacklessCoroComparisonChannelFrame{
+		channel:   make(chan int, 1),
+		sendValue: 41,
+		value:     -1,
+	}
+	runtime.RunStacklessCoroPullFrameForTest(unsafe.Pointer(frame),
+		stacklessCoroComparisonChannelResume)
+	if !frame.sendWaited || !frame.recvWaited {
+		t.Fatalf("pull channel waits = (%t, %t), want (true, true)",
+			frame.sendWaited, frame.recvWaited)
+	}
+	if frame.value != frame.sendValue || !frame.received {
+		t.Fatalf("pull channel receive = (%d, %t), want (%d, true)",
+			frame.value, frame.received, frame.sendValue)
 	}
 }
 

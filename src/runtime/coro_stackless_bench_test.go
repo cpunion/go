@@ -159,7 +159,7 @@ func BenchmarkStacklessCoroChannel(b *testing.B) {
 			return runtime.StacklessCoroActionComplete
 		}
 		receiverPending = true
-		runtime.RecvIntStacklessCoroForTest(ctx, channel, &receiverValue,
+		runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &receiverValue,
 			&receiverOK)
 		return runtime.StacklessCoroActionWait
 	}
@@ -187,7 +187,7 @@ func BenchmarkStacklessCoroChannel(b *testing.B) {
 				return runtime.StacklessCoroActionComplete
 			}
 			sendPending = true
-			runtime.SendIntStacklessCoroForTest(ctx, channel, &value)
+			runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
 			return runtime.StacklessCoroActionWait
 		default:
 			return runtime.StacklessCoroActionInvalid

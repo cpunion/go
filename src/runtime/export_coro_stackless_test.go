@@ -640,25 +640,49 @@ func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
 	return coroSleep(ctx, ns)
 }
 
-func SendIntStacklessCoroForTest(ctx unsafe.Pointer, channel chan<- int, value *int) {
-	coroChanSend(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+func StartStacklessCoroSendIntForTest(ctx unsafe.Pointer, channel chan<- int, value *int) {
+	startStacklessCoroChannel(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+		unsafe.Pointer(value), nil, true)
+}
+
+func StartStacklessCoroSendForTest(ctx unsafe.Pointer, channel any,
+	value unsafe.Pointer) {
+	startStacklessCoroChannel(ctx, (*hchan)(efaceOf(&channel).data),
+		value, nil, true)
+}
+
+func StartStacklessCoroRecvIntForTest(ctx unsafe.Pointer, channel <-chan int,
+	value *int, received *bool) {
+	startStacklessCoroChannel(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+		unsafe.Pointer(value), received, false)
+}
+
+func StartStacklessCoroRecvForTest(ctx unsafe.Pointer, channel any,
+	value unsafe.Pointer, received *bool) {
+	startStacklessCoroChannel(ctx, (*hchan)(efaceOf(&channel).data),
+		value, received, false)
+}
+
+func SendIntStacklessCoroForTest(ctx unsafe.Pointer, channel chan<- int,
+	value *int) bool {
+	return coroChanSend(ctx, *(**hchan)(unsafe.Pointer(&channel)),
 		unsafe.Pointer(value))
 }
 
 func SendStacklessCoroForTest(ctx unsafe.Pointer, channel any,
-	value unsafe.Pointer) {
-	coroChanSend(ctx, (*hchan)(efaceOf(&channel).data), value)
+	value unsafe.Pointer) bool {
+	return coroChanSend(ctx, (*hchan)(efaceOf(&channel).data), value)
 }
 
 func RecvIntStacklessCoroForTest(ctx unsafe.Pointer, channel <-chan int,
-	value *int, received *bool) {
-	coroChanRecv(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+	value *int, received *bool) bool {
+	return coroChanRecv(ctx, *(**hchan)(unsafe.Pointer(&channel)),
 		unsafe.Pointer(value), received)
 }
 
 func RecvStacklessCoroForTest(ctx unsafe.Pointer, channel any,
-	value unsafe.Pointer, received *bool) {
-	coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
+	value unsafe.Pointer, received *bool) bool {
+	return coroChanRecv(ctx, (*hchan)(efaceOf(&channel).data), value, received)
 }
 
 type StacklessCoroChannelWaiterCacheForTest struct {

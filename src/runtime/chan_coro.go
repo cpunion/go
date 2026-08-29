@@ -87,6 +87,41 @@ func validReleasedStacklessCoroSudog(sg *sudog) bool {
 		sg.waitlink == nil && sg.c.get() == nil && !sg.isSelect
 }
 
+// tryStacklessCoroChanSend completes a ready send on the current executor.
+func tryStacklessCoroChanSend(ctx unsafe.Pointer, channel *hchan,
+	element unsafe.Pointer) bool {
+	if raceenabled {
+		return false
+	}
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil ||
+		stacklessCoroIsPullComparison(context.scheduler) {
+		return false
+	}
+	return chansend(channel, element, false, sys.GetCallerPC())
+}
+
+// tryStacklessCoroChanRecv completes a ready receive on the current executor.
+func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
+	element unsafe.Pointer, received *bool) bool {
+	if raceenabled {
+		return false
+	}
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil ||
+		stacklessCoroIsPullComparison(context.scheduler) {
+		return false
+	}
+	selected, success := chanrecv(channel, element, false)
+	if !selected {
+		return false
+	}
+	if received != nil {
+		*received = success
+	}
+	return true
+}
+
 // chansendStackless starts op without parking the executor goroutine.
 func chansendStackless(op *stacklessCoroOperation) {
 	c := op.channel
