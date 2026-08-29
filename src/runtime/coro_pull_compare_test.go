@@ -872,6 +872,32 @@ func TestStacklessCoroSelfFramePullFallback(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroLargeSelfFramePullFallback(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	frameSize := int(unsafe.Sizeof(runtime.StacklessCoroLargeSelfFrameForTest{}))
+	depth := runtime.StacklessCoroFrameCacheSize/frameSize +
+		runtime.StacklessCoroFrameChunkDirectCount +
+		2*runtime.StacklessCoroLargeFrameChunkSize
+	tracker := new(stacklessCoroLargeSelfFrameTracker)
+	stacklessCoroLargeSelfFrameActive = tracker
+	defer func() { stacklessCoroLargeSelfFrameActive = nil }()
+	root := &runtime.StacklessCoroLargeSelfFrameForTest{
+		Depth: depth,
+		Value: &tracker.total,
+	}
+	runtime.RunStacklessCoroPullFrameForTest(unsafe.Pointer(root),
+		stacklessCoroLargeSelfFrameResume)
+	if tracker.total != depth+1 {
+		t.Fatalf("completed large frames = %d, want %d",
+			tracker.total, depth+1)
+	}
+	if tracker.sawShortChunk || tracker.sawChunkFirst || tracker.sawChunkLast {
+		t.Fatalf("pull fallback fused large frames: %+v", tracker)
+	}
+}
+
 func TestStacklessCoroFusedResumePullFallback(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)

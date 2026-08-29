@@ -34,7 +34,14 @@ const stacklessCoroTaskCacheSize = 256
 // exact 112-byte size class on 32-bit targets. Both remain below the per-object
 // malloc-header threshold.
 const stacklessCoroTaskChunkSize = 4
-const stacklessCoroFrameChunkSize = 4
+
+// Small frames use eight-element chunks to reduce deep-recursion allocation
+// frequency. Larger frames retain four-element chunks so each typed allocation
+// remains within the small-object bound after its malloc header. Both sizes fit
+// after the six direct markers in the four-bit fused-frame allocation field.
+const stacklessCoroFrameChunkSize = 8
+const stacklessCoroLargeFrameChunkSize = 4
+const stacklessCoroFrameChunkByteLimit = maxSmallSize - mallocHeaderSize
 
 const (
 	stacklessCoroDirectOverflowTaskCountMask uint8 = 1<<4 - 1
@@ -55,8 +62,11 @@ const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
 	stacklessCoroOperationCacheSize
 
 // A fused structured-await chain uses the same direct prefix as ordinary
-// recursive frame chunks. The low bits describe allocation; the high bits
-// retain the suspended frame state needed when resumes are heterogeneous.
+// recursive frame chunks. The low four bits describe allocation. The next two
+// cache typed-chunk validation and its four-element class; runtime-created
+// child frames inherit both, so later self-frame transitions need not repeat
+// the validation. The top two bits retain suspended-frame state when resumes
+// are heterogeneous.
 const (
 	stacklessCoroFusedFrameDirectFirst uint8 = 1
 	stacklessCoroFusedFrameDirectLast        = stacklessCoroFusedFrameDirectFirst + stacklessCoroFrameChunkDirectCount - 1
@@ -64,6 +74,8 @@ const (
 	stacklessCoroFusedFrameChunkLast         = stacklessCoroFusedFrameChunkFirst +
 		stacklessCoroFrameChunkSize - 1
 	stacklessCoroFusedFrameAllocationMask uint8 = 1<<4 - 1
+	stacklessCoroFusedFrameChunkValidated uint8 = 1 << 4
+	stacklessCoroFusedFrameShortChunk     uint8 = 1 << 5
 	stacklessCoroFusedFrameParent         uint8 = 1 << 6
 	stacklessCoroFusedFrameResume         uint8 = 1 << 7
 )
@@ -94,6 +106,12 @@ const (
 	stacklessCoroFrameChunkFirst = stacklessCoroFrameChunkDirectLast - 1
 	stacklessCoroFrameChunkLast  = stacklessCoroFrameChunkFirst -
 		(stacklessCoroFrameChunkSize - 1)
+	stacklessCoroShortFrameChunkDirectFirst = stacklessCoroFrameChunkLast - 1
+	stacklessCoroShortFrameChunkDirectLast  = stacklessCoroShortFrameChunkDirectFirst -
+		stacklessCoroFrameChunkDirectCount
+	stacklessCoroShortFrameChunkFirst = stacklessCoroShortFrameChunkDirectLast - 1
+	stacklessCoroShortFrameChunkLast  = stacklessCoroShortFrameChunkFirst -
+		(stacklessCoroLargeFrameChunkSize - 1)
 )
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 const stacklessCoroDeferredSleepOperationID = ^uint64(0)
@@ -1200,15 +1218,46 @@ func coroFrame(ctx unsafe.Pointer) unsafe.Pointer {
 	return context.frame
 }
 
+func stacklessCoroFrameChunkLength(size uintptr) uintptr {
+	if size <= stacklessCoroFrameChunkByteLimit/stacklessCoroFrameChunkSize {
+		return stacklessCoroFrameChunkSize
+	}
+	return stacklessCoroLargeFrameChunkSize
+}
+
+func stacklessCoroFrameChunkBounds(size uintptr) (directFirst, directLast,
+	first, last uint16) {
+	if stacklessCoroFrameChunkLength(size) == stacklessCoroLargeFrameChunkSize {
+		return stacklessCoroShortFrameChunkDirectFirst,
+			stacklessCoroShortFrameChunkDirectLast,
+			stacklessCoroShortFrameChunkFirst,
+			stacklessCoroShortFrameChunkLast
+	}
+	return stacklessCoroFrameChunkDirectFirst,
+		stacklessCoroFrameChunkDirectLast,
+		stacklessCoroFrameChunkFirst,
+		stacklessCoroFrameChunkLast
+}
+
+func stacklessCoroFusedFrameChunkLastFor(marker uint8) uint8 {
+	if marker&stacklessCoroFusedFrameShortChunk != 0 {
+		return stacklessCoroFusedFrameChunkFirst +
+			stacklessCoroLargeFrameChunkSize - 1
+	}
+	return stacklessCoroFusedFrameChunkLast
+}
+
 func isStacklessCoroUncachedFrameLineage(marker uint16) bool {
 	return marker == stacklessCoroUncachedFrameLineage ||
 		marker <= stacklessCoroFrameChunkDirectFirst &&
-			marker >= stacklessCoroFrameChunkLast
+			marker >= stacklessCoroShortFrameChunkLast
 }
 
 func isStacklessCoroFrameChunkElement(marker uint16) bool {
-	return marker <= stacklessCoroFrameChunkFirst &&
-		marker >= stacklessCoroFrameChunkLast
+	return (marker <= stacklessCoroFrameChunkFirst &&
+		marker >= stacklessCoroFrameChunkLast) ||
+		(marker <= stacklessCoroShortFrameChunkFirst &&
+			marker >= stacklessCoroShortFrameChunkLast)
 }
 
 // coroFrameNeedsClear reports whether another runtime-owned reference can
@@ -1275,7 +1324,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 }
 
 // coroTakeFrameChunk extends coroTakeFrame for compiler-proven structured
-// self recursion. chunkType describes the generated [4]frame allocation, so
+// self recursion. chunkType describes the generated typed frame array, so
 // newobject preserves its exact GC pointer map.
 func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, chunkType *_type) unsafe.Pointer {
@@ -1291,21 +1340,18 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 	// A marked explicit-frame task carries a saturated lineage without a
 	// shared-state query.
 	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
-		chunkEligible := size != 0 &&
-			size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
-			validStacklessCoroFrameChunkType(chunkType, size) &&
+		chunkEligible := validStacklessCoroFrameChunkType(chunkType, size) &&
 			parent.resume != nil &&
 			stacklessCoroResumeIdentity(parent.resume) ==
 				stacklessCoroResumeIdentity(child)
 		if !chunkEligible {
 			return nil
 		}
+		_, directLast, first, last := stacklessCoroFrameChunkBounds(size)
 		switch marker := parent.frameSize; {
-		case marker == stacklessCoroFrameChunkDirectLast ||
-			marker == stacklessCoroFrameChunkLast:
+		case marker == directLast || marker == last:
 			return newobject(chunkType)
-		case marker <= stacklessCoroFrameChunkFirst &&
-			marker > stacklessCoroFrameChunkLast:
+		case marker <= first && marker > last:
 			if parent.context.frame == nil {
 				throw("runtime: missing stackless coroutine frame chunk")
 			}
@@ -1333,10 +1379,8 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
 			s.freeFrameBytes == 0 {
 			task.frameSize = stacklessCoroUncachedFrameLineage
-			if size != 0 &&
-				size <= stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize &&
-				validStacklessCoroFrameChunkType(chunkType, size) {
-				task.frameSize = stacklessCoroFrameChunkDirectFirst
+			if validStacklessCoroFrameChunkType(chunkType, size) {
+				task.frameSize, _, _, _ = stacklessCoroFrameChunkBounds(size)
 			}
 		}
 	} else {
@@ -1350,25 +1394,45 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 }
 
 func validStacklessCoroFrameChunkType(chunkType *_type, size uintptr) bool {
-	if chunkType == nil || chunkType.Kind() != abi.Array {
-		return false
+	_, valid := stacklessCoroFrameChunkClass(chunkType, size)
+	return valid
+}
+
+func stacklessCoroFrameChunkClass(chunkType *_type, size uintptr) (uint8, bool) {
+	if size == 0 ||
+		size > stacklessCoroFrameChunkByteLimit/stacklessCoroLargeFrameChunkSize ||
+		chunkType == nil || chunkType.Kind() != abi.Array {
+		return 0, false
+	}
+	chunkLength := uintptr(stacklessCoroFrameChunkSize)
+	chunkFlag := uint8(0)
+	if size > stacklessCoroFrameChunkByteLimit/stacklessCoroFrameChunkSize {
+		chunkLength = stacklessCoroLargeFrameChunkSize
+		chunkFlag = stacklessCoroFusedFrameShortChunk
 	}
 	array := (*arraytype)(unsafe.Pointer(chunkType))
-	return array.Len == stacklessCoroFrameChunkSize &&
+	return chunkFlag, uintptr(array.Len) == chunkLength &&
 		array.Elem != nil && array.Elem.Size_ == size &&
-		chunkType.Size_ == size*stacklessCoroFrameChunkSize
+		chunkType.Size_ == size*chunkLength
 }
 
 func validStacklessCoroFusedFrameMarker(marker uint8) bool {
 	allowed := stacklessCoroFusedFrameAllocationMask |
+		stacklessCoroFusedFrameChunkValidated |
+		stacklessCoroFusedFrameShortChunk |
 		stacklessCoroFusedFrameParent | stacklessCoroFusedFrameResume
 	return marker&^allowed == 0 &&
 		marker&stacklessCoroFusedFrameAllocationMask <=
-			stacklessCoroFusedFrameChunkLast
+			stacklessCoroFusedFrameChunkLastFor(marker)
 }
 
 func validStacklessCoroSelfFrameMarker(marker uint8) bool {
-	return marker <= stacklessCoroFusedFrameChunkLast
+	allowed := stacklessCoroFusedFrameAllocationMask |
+		stacklessCoroFusedFrameChunkValidated |
+		stacklessCoroFusedFrameShortChunk
+	return marker&^allowed == 0 &&
+		marker&stacklessCoroFusedFrameAllocationMask <=
+			stacklessCoroFusedFrameChunkLastFor(marker)
 }
 
 // coroTakeSelfFrame keeps the homogeneous recursive fast path separate from
@@ -1377,8 +1441,7 @@ func validStacklessCoroSelfFrameMarker(marker uint8) bool {
 func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, chunkType *_type) unsafe.Pointer {
 	if ctx == nil || raceenabled || size < unsafe.Sizeof(stacklessCoroFusedFrameHeader{}) ||
-		size > stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize ||
-		!validStacklessCoroFrameChunkType(chunkType, size) {
+		size > stacklessCoroFrameChunkByteLimit/stacklessCoroLargeFrameChunkSize {
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
 	context := (*stacklessCoroContext)(ctx)
@@ -1410,9 +1473,26 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		throw("runtime: stackless coroutine self-frame reservation outside resume")
 	}
 	header := (*stacklessCoroFusedFrameHeader)(context.frame)
-	if !validStacklessCoroSelfFrameMarker(header.marker) {
-		unlock(&s.lock)
-		throw("runtime: invalid stackless coroutine self-frame marker")
+	if header.marker&stacklessCoroFusedFrameChunkValidated == 0 {
+		if !validStacklessCoroSelfFrameMarker(header.marker) {
+			unlock(&s.lock)
+			throw("runtime: invalid stackless coroutine self-frame marker")
+		}
+		marker := header.marker
+		chunkFlag, chunkEligible := stacklessCoroFrameChunkClass(chunkType, size)
+		if !chunkEligible {
+			unlock(&s.lock)
+			return coroTakeFrameChunk(ctx, child, size, chunkType)
+		}
+		if marker&stacklessCoroFusedFrameShortChunk != chunkFlag {
+			if marker != 0 {
+				unlock(&s.lock)
+				throw("runtime: mismatched stackless coroutine self-frame chunk")
+			}
+			marker = chunkFlag
+		}
+		marker |= stacklessCoroFusedFrameChunkValidated
+		header.marker = marker
 	}
 
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
@@ -1434,7 +1514,8 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return frame
 	}
-	marker := header.marker
+	marker := header.marker & stacklessCoroFusedFrameAllocationMask
+	chunkLast := stacklessCoroFusedFrameChunkLastFor(header.marker)
 	frame := context.frame
 	unlock(&s.lock)
 
@@ -1442,10 +1523,10 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	case marker == 0 || marker < stacklessCoroFusedFrameDirectLast:
 		return nil
 	case marker == stacklessCoroFusedFrameDirectLast ||
-		marker == stacklessCoroFusedFrameChunkLast:
+		marker == chunkLast:
 		return newobject(chunkType)
 	case marker >= stacklessCoroFusedFrameChunkFirst &&
-		marker < stacklessCoroFusedFrameChunkLast:
+		marker < chunkLast:
 		return add(frame, size)
 	default:
 		throw("runtime: invalid stackless coroutine self-frame allocation")
@@ -1488,23 +1569,32 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		unlock(&s.lock)
 		throw("runtime: invalid initialized stackless coroutine self frame")
 	}
+	if parentHeader.marker&stacklessCoroFusedFrameChunkValidated == 0 {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine parent self-frame marker")
+	}
+	chunkFlag := parentHeader.marker & (stacklessCoroFusedFrameChunkValidated |
+		stacklessCoroFusedFrameShortChunk)
+	childHeader.marker = chunkFlag
 	owner := s.takeReservedFrameTaskLocked(parent, frame, child)
 	if owner != nil {
 		owner.parent = nil
 		childHeader.owner = owner
 	} else {
-		switch marker := parentHeader.marker; {
+		marker := parentHeader.marker & stacklessCoroFusedFrameAllocationMask
+		chunkLast := stacklessCoroFusedFrameChunkLastFor(parentHeader.marker)
+		switch {
 		case marker == 0:
-			childHeader.marker = stacklessCoroFusedFrameDirectFirst
+			childHeader.marker |= stacklessCoroFusedFrameDirectFirst
 		case marker >= stacklessCoroFusedFrameDirectFirst &&
 			marker < stacklessCoroFusedFrameDirectLast:
-			childHeader.marker = marker + 1
+			childHeader.marker |= marker + 1
 		case marker == stacklessCoroFusedFrameDirectLast ||
-			marker == stacklessCoroFusedFrameChunkLast:
-			childHeader.marker = stacklessCoroFusedFrameChunkFirst
+			marker == chunkLast:
+			childHeader.marker |= stacklessCoroFusedFrameChunkFirst
 		case marker >= stacklessCoroFusedFrameChunkFirst &&
-			marker < stacklessCoroFusedFrameChunkLast:
-			childHeader.marker = marker + 1
+			marker < chunkLast:
+			childHeader.marker |= marker + 1
 		default:
 			unlock(&s.lock)
 			throw("runtime: invalid stackless coroutine self-frame transition")
@@ -1543,12 +1633,14 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	}
 	frame := context.frame
 	header := (*stacklessCoroFusedFrameHeader)(frame)
-	if header.parent == nil || !validStacklessCoroSelfFrameMarker(header.marker) {
+	if header.parent == nil ||
+		header.marker&stacklessCoroFusedFrameChunkValidated == 0 {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completed self frame")
 	}
+	allocation := header.marker & stacklessCoroFusedFrameAllocationMask
 	owner := header.owner
-	if header.marker == 0 {
+	if allocation == 0 {
 		if !validStacklessCoroFusedFrameOwner(owner, frame) {
 			unlock(&s.lock)
 			throw("runtime: invalid stackless coroutine self-frame owner")
@@ -1611,7 +1703,7 @@ func coroRequestFusedFrame(ctx unsafe.Pointer) {
 // coroTakeFusedFrame extends typed-frame reuse for a compiler-proven
 // structured await. A fused child shares the active logical task, so only a
 // cache-owned frame holder is reserved. Homogeneous recursion additionally
-// uses the direct prefix and typed four-frame chunks after the cache fills.
+// uses the direct prefix and typed frame chunks after the cache fills.
 func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, chunkType *_type, self bool) unsafe.Pointer {
 	if ctx == nil || raceenabled {
@@ -1658,20 +1750,35 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
-	if sameResume &&
-		(size > stacklessCoroFrameCacheSize/stacklessCoroFrameChunkSize ||
-			!validStacklessCoroFrameChunkType(chunkType, size)) {
-		unlock(&s.lock)
-		return coroTakeFrameChunk(ctx, child, size, chunkType)
-	}
 	var marker uint8
+	chunkLast := uint8(stacklessCoroFusedFrameChunkLast)
 	if sameResume {
 		header := (*stacklessCoroFusedFrameHeader)(context.frame)
-		if !validStacklessCoroFusedFrameMarker(header.marker) {
-			unlock(&s.lock)
-			throw("runtime: invalid stackless coroutine fused-frame marker")
+		frameMarker := header.marker
+		if frameMarker&stacklessCoroFusedFrameChunkValidated == 0 {
+			if !validStacklessCoroFusedFrameMarker(frameMarker) {
+				unlock(&s.lock)
+				throw("runtime: invalid stackless coroutine fused-frame marker")
+			}
+			chunkFlag, chunkEligible := stacklessCoroFrameChunkClass(chunkType, size)
+			if !chunkEligible {
+				unlock(&s.lock)
+				return coroTakeFrameChunk(ctx, child, size, chunkType)
+			}
+			if frameMarker&stacklessCoroFusedFrameShortChunk != chunkFlag {
+				if frameMarker&stacklessCoroFusedFrameAllocationMask >=
+					stacklessCoroFusedFrameChunkFirst {
+					unlock(&s.lock)
+					throw("runtime: mismatched stackless coroutine fused-frame chunk")
+				}
+				frameMarker = frameMarker&^stacklessCoroFusedFrameShortChunk |
+					chunkFlag
+			}
+			frameMarker |= stacklessCoroFusedFrameChunkValidated
+			header.marker = frameMarker
 		}
 		marker = header.marker & stacklessCoroFusedFrameAllocationMask
+		chunkLast = stacklessCoroFusedFrameChunkLastFor(header.marker)
 	}
 
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
@@ -1709,10 +1816,10 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	case marker == 0 || marker < stacklessCoroFusedFrameDirectLast:
 		return nil
 	case marker == stacklessCoroFusedFrameDirectLast ||
-		marker == stacklessCoroFusedFrameChunkLast:
+		marker == chunkLast:
 		return newobject(chunkType)
 	case marker >= stacklessCoroFusedFrameChunkFirst &&
-		marker < stacklessCoroFusedFrameChunkLast:
+		marker < chunkLast:
 		return add(frame, size)
 	default:
 		throw("runtime: invalid stackless coroutine fused-frame allocation")
@@ -1763,24 +1870,33 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 	sameResume := stacklessCoroResumeIdentity(parent.resume) ==
 		stacklessCoroResumeIdentity(child)
 	marker := uint8(0)
+	if !validStacklessCoroFusedFrameMarker(parentHeader.marker) {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine parent fused-frame marker")
+	}
+	if sameResume {
+		marker = parentHeader.marker & (stacklessCoroFusedFrameChunkValidated |
+			stacklessCoroFusedFrameShortChunk)
+	}
 	if owner != nil {
 		owner.parent = nil
 		childHeader.owner = owner
 	} else if sameResume {
 		parentMarker := parentHeader.marker &
 			stacklessCoroFusedFrameAllocationMask
+		chunkLast := stacklessCoroFusedFrameChunkLastFor(parentHeader.marker)
 		switch {
 		case parentMarker == 0:
-			marker = stacklessCoroFusedFrameDirectFirst
+			marker |= stacklessCoroFusedFrameDirectFirst
 		case parentMarker >= stacklessCoroFusedFrameDirectFirst &&
 			parentMarker < stacklessCoroFusedFrameDirectLast:
-			marker = parentMarker + 1
+			marker |= parentMarker + 1
 		case parentMarker == stacklessCoroFusedFrameDirectLast ||
-			parentMarker == stacklessCoroFusedFrameChunkLast:
-			marker = stacklessCoroFusedFrameChunkFirst
+			parentMarker == chunkLast:
+			marker |= stacklessCoroFusedFrameChunkFirst
 		case parentMarker >= stacklessCoroFusedFrameChunkFirst &&
-			parentMarker < stacklessCoroFusedFrameChunkLast:
-			marker = parentMarker + 1
+			parentMarker < chunkLast:
+			marker |= parentMarker + 1
 		default:
 			unlock(&s.lock)
 			throw("runtime: invalid stackless coroutine fused-frame transition")
@@ -1969,6 +2085,20 @@ func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 		marker >= stacklessCoroFrameChunkLast:
 		if marker == stacklessCoroFrameChunkLast {
 			task.frameSize = stacklessCoroFrameChunkFirst
+		} else {
+			task.frameSize = marker - 1
+		}
+	case marker <= stacklessCoroShortFrameChunkDirectFirst &&
+		marker >= stacklessCoroShortFrameChunkDirectLast:
+		if marker == stacklessCoroShortFrameChunkDirectLast {
+			task.frameSize = stacklessCoroShortFrameChunkFirst
+		} else {
+			task.frameSize = marker - 1
+		}
+	case marker <= stacklessCoroShortFrameChunkFirst &&
+		marker >= stacklessCoroShortFrameChunkLast:
+		if marker == stacklessCoroShortFrameChunkLast {
+			task.frameSize = stacklessCoroShortFrameChunkFirst
 		} else {
 			task.frameSize = marker - 1
 		}

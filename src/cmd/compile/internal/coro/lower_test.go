@@ -328,6 +328,24 @@ func TestLowerMethodReceiver(t *testing.T) {
 	}
 }
 
+func TestExplicitFrameChunkLength(t *testing.T) {
+	for _, test := range []struct {
+		size, want int64
+	}{
+		{size: explicitFrameChunkByteLimit / explicitFrameChunkSize,
+			want: explicitFrameChunkSize},
+		{size: explicitFrameChunkByteLimit/explicitFrameChunkSize + 1,
+			want: explicitLargeFrameChunkSize},
+		{size: explicitFrameChunkByteLimit / explicitLargeFrameChunkSize,
+			want: explicitLargeFrameChunkSize},
+	} {
+		if got := explicitFrameChunkLength(test.size); got != test.want {
+			t.Errorf("explicitFrameChunkLength(%d) = %d, want %d",
+				test.size, got, test.want)
+		}
+	}
+}
+
 func TestLowerRecursiveFrameChunk(t *testing.T) {
 	prepareLowerTest(t)
 

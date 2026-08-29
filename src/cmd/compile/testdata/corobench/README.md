@@ -1679,3 +1679,77 @@ runtime still traps in Rosetta address-space crash tests and is not a reliable
 gate. Linux/386, Linux/arm64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64
 runtime tests cross-compile with the experiment enabled; native Linux CI
 remains the complete runtime gate.
+
+#### Adapt recursive frame chunk sizes
+
+Revision `d4f127bcd5`, based on exact parent `e350225e50`, uses eight-element
+typed chunks for small recursive frames while retaining four-element chunks
+for larger frames. The compiler and runtime derive the boundary from the
+allocator's real small-object payload limit,
+`gc.MaxSmallSize-gc.MallocHeaderSize`, rather than duplicating a numeric
+constant. Frames through 4095 bytes use `[8]frame`, frames from 4096 through
+8190 bytes use `[4]frame`, and larger frames retain the existing per-frame
+fallback.
+
+The two chunk classes use disjoint task-local marker ranges after the shared
+six-frame direct prefix. Fused-frame markers use two previously spare bits for
+the four-element class and for successful typed-chunk validation. The
+validation bit is inherited only by runtime-created child transitions, which
+lets repeated self recursion trust the established type and class without
+repeating the cold check. The allocation field remains four bits, existing
+runtime object sizes and factory ABIs do not change, and the lowering adds no
+source annotation or public interface.
+
+A global eight-element prototype was rejected because it made 5 KiB frames
+ineligible for chunking. At depth 512, the existing four-element implementation
+used 2,752,256 bytes and 131 allocations per operation; the global-eight
+prototype used 2,732,544 bytes but 762 allocations, or 5.82 times as many.
+The adaptive implementation preserves the former 5 KiB result exactly while
+halving the allocation frequency for small deep recursion:
+
+| Probe | Exact parent | Adaptive candidate |
+| --- | ---: | ---: |
+| recursive depth 64 | 0 B, 0 allocs | 0 B, 0 allocs |
+| recursive depth 4096 | 215,200 B, 965 allocs | 215,424 B, 486 allocs |
+| 5 KiB frame, depth 512 | 2,752,256 B, 131 allocs | 2,752,256 B, 131 allocs |
+
+The deep-recursion allocation count falls by 49.64% for a 224-byte increase
+in retained allocation. The benchmark gate fixes all three probes: depth 64
+must remain allocation-free, depth 4096 must stay below 216,000 bytes and 500
+allocations, and the 5 KiB probe must stay below 2,850,000 bytes and 140
+allocations.
+
+The exact parent and candidate used identical benchmark source, disabled
+inlining, one P, and matched linker randomization. Twelve independent layouts
+each ran a 100 ms warm-up followed by two 750 ms samples in parent, candidate,
+candidate, parent order. A predeclared control rejected a layout if unchanged
+`YieldEntry` moved by more than 7.5%; all 12 layouts passed.
+
+| Probe | Parent median | Candidate median | Paired median change |
+| --- | ---: | ---: | ---: |
+| unchanged public entry | 76.685 ns | 76.788 ns | -0.62% |
+| recursive depth 64 | 2.328 us | 2.326 us | +0.41% |
+| recursive depth 4096 | 222.599 us | 205.473 us | -6.32% |
+
+The public-entry control and shallow recursion are neutral by a two-sided sign
+test (`p=0.774` for both). Deep recursion improved in 11 of 12 matched layouts
+(`p=0.00635`). This removes the shallow regression observed before validation
+was cached while retaining the deep-recursion allocation and latency gains.
+
+The full experiment-on normal and race runtime suites pass on native
+Darwin/arm64. Pull, pull-plus-race, and `checkptr=2` stackless runtime tests,
+the complete coroutine compiler suite, `go vet runtime`, experiment-off
+compilation, and the complete benchmark audit pass on native Darwin/arm64 and
+translated Linux/amd64 as applicable. The translated full Linux runtime still
+reaches the existing Rosetta `TestCheckFDs` address-space failure. Linux/386,
+Linux/arm64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests
+cross-compile at the final revision; native Linux CI remains the full runtime
+gate.
+
+The current focused profiles cover the compiler's new selection helper and
+its lowering caller at 100%, as well as runtime chunk length, bounds, class,
+type, and marker helpers at 100%. Across changed compiler and runtime blocks,
+115 of 127 statements execute (90.55%). The only missing statements are the
+`unlock` and `throw` bodies of six fail-closed marker invariants; four invariant
+classes also have fatal subprocess tests, whose counters cannot be returned
+after `throw` terminates the process.
