@@ -12,6 +12,7 @@ import (
 	"cmd/internal/src"
 	"fmt"
 	"go/constant"
+	"internal/runtime/gc"
 	"slices"
 	"strings"
 )
@@ -26,9 +27,19 @@ const (
 	actionSwitch
 )
 
-// Keep this in sync with runtime.stacklessCoroFrameChunkSize. The array length
-// is part of compiler-generated typed storage rather than the factory ABI.
-const explicitFrameChunkSize = 4
+// Keep these in sync with runtime's stackless coroutine frame chunk sizes. The
+// array length is part of compiler-generated typed storage rather than the
+// factory ABI.
+const explicitFrameChunkSize = 8
+const explicitLargeFrameChunkSize = 4
+const explicitFrameChunkByteLimit = gc.MaxSmallSize - gc.MallocHeaderSize
+
+func explicitFrameChunkLength(frameSize int64) int64 {
+	if frameSize <= explicitFrameChunkByteLimit/explicitFrameChunkSize {
+		return explicitFrameChunkSize
+	}
+	return explicitLargeFrameChunkSize
+}
 
 // LowerResult summarizes one package lowering pass.
 type LowerResult struct {
@@ -3989,7 +4000,8 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
 	if fusedFrame {
-		frameChunkType := types.NewArray(frameType, explicitFrameChunkSize)
+		frameChunkType := types.NewArray(frameType,
+			explicitFrameChunkLength(frameType.Size()))
 		takeHelper := "coroTakeFusedFrame"
 		takeArgs := ir.Nodes{
 			factoryCtx, factoryResume, frameSize(),
