@@ -19,7 +19,8 @@ implementations differ most:
   frames replace native stack growth;
 - sequential, burst, and parked task creation;
 - live heap and stack footprint with 10,000 simultaneously parked tasks;
-- unbuffered channel round trips and ready `select`;
+- ready buffered send/receive pairs, unbuffered channel round trips, and ready
+  `select`;
 - zero and one-nanosecond sleeps;
 - ready one-byte reads through `os.File.Read` and `net.TCPConn.Read`;
 - blocking pipe and loopback TCP reads released by a runnable logical sibling;
@@ -1597,3 +1598,84 @@ Combined normal, race, and pull profiles report 100% coverage for `coroSelect`,
 100% for retained-select initiation. The remaining gaps are conservative
 synctest and fail-closed invariant branches or pre-existing retained-operation
 competition paths rather than omitted direct-path behavior.
+
+#### Complete ready channel operations synchronously
+
+Revision `bd2ae512bc`, based on exact parent `8f884de403`, lets a stackless
+coroutine continue in its current resume call when a send or receive is already
+ready. The compiler now treats both runtime helpers as conditional operations:
+it returns the wait action only when the helper reports that the retained
+operation protocol was started, and otherwise jumps directly to the next
+state.
+
+The runtime direct path calls the ordinary `chansend` and `chanrecv` machinery
+with `block=false`. This reuses the standard channel lock, buffering, timer
+channel, closed-channel, and waiter-matching semantics instead of duplicating
+them. A send or receive that cannot complete immediately still enters the
+existing retained stackless operation path. Race builds retain that path so
+their logical operation identity and instrumentation remain unchanged, and the
+pull-comparison build retains it so push and pull measurements continue to
+compare the same operation boundary.
+
+The direct path handles buffered channels, closed receives, expired timer
+channels, and queued ordinary or stackless peers. A closed send still panics
+through the ordinary runtime path and is translated by the existing native
+panic machinery. Nil channels and genuinely blocked operations fall back. No
+runtime object layout, source annotation, public compiler interface, scheduler
+protocol, or non-Go backend changes.
+
+This checkpoint adds a fixed `BenchmarkReadyChannelPair` probe: every
+iteration sends to and receives from the same capacity-one channel. Its result
+is checked by `TestProbes`, and the lowering audit requires the helper to be a
+coroutine primary without fallback. The exact parent and candidate used the
+same probe source, disabled inlining, one P, one warm-up, alternating execution,
+and matched randomized linker layouts. Native Darwin/arm64 used eight layouts
+at 300 ms per probe. Linux/amd64 used six layouts under Rosetta, so its timings
+are directional while its functional and allocation results remain useful.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| ready buffered send and receive pair | 79.975 ns -> 19.165 ns (-76.16%) | 137.500 ns -> 32.800 ns (-76.24%) |
+| unbuffered channel round trip | 213.500 ns -> 131.100 ns (-38.86%) | 379.550 ns -> 248.800 ns (-35.19%) |
+| ready select, including its ready input send | 81.940 ns -> 52.480 ns (-35.15%) | 136.500 ns -> 82.100 ns (-39.87%) |
+| immediately released blocked select | 143.750 ns -> 117.700 ns (-16.86%) | 257.350 ns -> 216.500 ns (-16.26%) |
+
+The ready pair and channel round trip improved in every matched layout on both
+platforms. Linux ready and blocked select also improved in every layout;
+Darwin improved in seven of eight. The select probes benefit because their
+producer sends are now eligible for the channel fast path; their select
+arbitration remains the preceding checkpoint's implementation. File read, TCP
+read, one-nanosecond sleep, and amortized-yield controls had neutral paired
+medians, within about 1.2% on Darwin and 0.7% on translated Linux. Every probe
+retained zero bytes and zero allocations per iteration.
+
+An independent eight-layout native Darwin comparison compiled the same minimal
+ready-channel source with unmodified Go at exact upstream merge-base
+`da7c67f595` and with the coroutine candidate. Official Go measured 16.60 ns
+per pair and the candidate measured 19.29 ns, a remaining 16.98%
+whole-experiment difference; both allocated zero bytes. The exact checkpoint
+parent was about 4.82 times official Go, while the candidate is about 1.16
+times official Go. This comparison provides end-to-end context rather than
+attributing unrelated experiment differences to this change.
+
+A ten-second candidate CPU profile moved the target's cost back to the ordinary
+`chansend`, `chanrecv`, channel lock, and value-copy paths. The previous
+operation registration, recycling, completion, and scheduler-wake functions no
+longer appear among its sampled hotspots.
+
+Regression tests cover buffered send and receive, closed receive, expired timer
+receive, queued ordinary and stackless senders and receivers, direct closed-send
+panic, operation-count stability, genuinely blocked send and receive fallback,
+race and pull fallback, and all five compiler-generated channel helper calls.
+Combined normal, race, and pull profiles report 100% statement coverage for
+both direct helpers and both conditional runtime wrappers.
+
+Full experiment-off and experiment-on compiler/runtime matrices pass on native
+Darwin/arm64. On translated Linux/amd64, the isolated complete coroutine
+compiler package passes, as do normal, race, pull, pull-plus-race, and
+`checkptr=2` stackless runtime tests, `go vet runtime`, and the complete
+lowering, symbol, allocation, and public-read audit. The translated full
+runtime still traps in Rosetta address-space crash tests and is not a reliable
+gate. Linux/386, Linux/arm64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64
+runtime tests cross-compile with the experiment enabled; native Linux CI
+remains the complete runtime gate.
