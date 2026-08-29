@@ -4303,10 +4303,12 @@ func (s *state) minMax(n *ir.CallExpr) *ssa.Value {
 		if typ.IsFloat() {
 			hasIntrinsic := false
 			switch Arch.LinkArch.Family {
-			case sys.AMD64, sys.ARM64, sys.Loong64, sys.RISCV64, sys.S390X:
+			case sys.AMD64, sys.ARM64, sys.Loong64, sys.RISCV64:
 				hasIntrinsic = true
 			case sys.PPC64:
 				hasIntrinsic = buildcfg.GOPPC64 >= 9
+			case sys.S390X:
+				// FIXME: add check once GOS390X exists
 			}
 
 			if hasIntrinsic {
@@ -6663,6 +6665,20 @@ func (s *state) dottype1(pos src.XPos, src, dst *types.Type, iface, source, targ
 // temp allocates a temp of type t at position pos
 func (s *state) temp(pos src.XPos, t *types.Type) (*ir.Name, *ssa.Value) {
 	tmp := typecheck.TempAt(pos, s.curfn, t)
+	if ssa.CanSSA(t) {
+		// The whole point of this temporary is that we are about to take
+		// its address (see the s.addr call below), so it must live on the
+		// stack. typecheck.TempAt does not mark it addrtaken, and for an
+		// SSA-able type that makes s.addr take its s.canSSA early-return
+		// path and hand back &runtime.zerobase instead of the temporary's
+		// stack slot, after which the caller writes the object into
+		// runtime.zerobase.
+		//
+		// A type that is not SSA-able already gets a real stack slot, and
+		// marking it here would only cost it its stack-slot merging
+		// candidacy (see ssa.IsMergeCandidate below), so leave it alone.
+		tmp.SetAddrtaken(true)
+	}
 	if t.HasPointers() || (ssa.IsMergeCandidate(tmp) && t != deferstruct()) {
 		s.vars[memVar] = s.newValue1A(ssaop.OpVarDef, types.TypeMem, tmp, s.mem())
 	}

@@ -134,10 +134,6 @@ func run[T TBRun[T]](t T, f func(t T, mode testMode), opts ...any) {
 		setParallel(t)
 	}
 	for _, mode := range modes {
-		// TODO(nsh): re-enable the tests once tree re-opens.
-		if mode == http3Mode {
-			continue
-		}
 		t.Run(string(mode), func(t T) {
 			panicking := false
 			defer func() {
@@ -276,6 +272,24 @@ func newClientServerTest(t testing.TB, mode testMode, h Handler, opts ...any) *c
 		} else {
 			pconn := newLocalPacketConn(t)
 			cst.ts.Listener = http3ServeConn{conn: pconn}
+			// Bind the client to the same address as the server, rather than
+			// letting it use the default of the ":0" wildcard address.
+			//
+			// On Darwin, a wildcard bind creates a dual-stack IPv6 socket, and
+			// closing a UDP socket does not immediately free its port. A client
+			// which is coincidentally assigned a port that is still in use on
+			// IPv4 but free on IPv6 still binds successfully, but silently
+			// cannot receive packets sent to its IPv4 address. Since the server
+			// here listens on a loopback address, that leaves the client unable
+			// to receive the server's handshake packets.
+			// See go.dev/issue/78737 and go.dev/issue/81162.
+			host, _, err := net.SplitHostPort(pconn.LocalAddr().String())
+			if err != nil {
+				t.Fatalf("parsing server address %v: %v", pconn.LocalAddr(), err)
+			}
+			http3TransportOpts.ListenPacket = func(network, addr string) (net.PacketConn, error) {
+				return net.ListenPacket(network, net.JoinHostPort(host, "0"))
+			}
 		}
 	default:
 		cst.ts = httptest.NewUnstartedServer(h)
@@ -344,7 +358,9 @@ func newClientServerTest(t testing.TB, mode testMode, h Handler, opts ...any) *c
 
 	// Fakenet httptest servers always set the URL scheme to "http".
 	// Override it in https tests.
-	if fakeNet {
+	// Exclude HTTP3, which manages its own PacketNet URL, and lacks the
+	// ability to intercept "example.com".
+	if fakeNet && mode != http3Mode {
 		cst.ts.URL = mode.Scheme() + "://example.com"
 	}
 

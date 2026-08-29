@@ -5,7 +5,9 @@
 package sve
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"strings"
 
 	"simd/archsimd/_gen/unify"
@@ -66,6 +68,22 @@ func (op *Operand) emit() *unify.Value {
 		// instructions support only one; this records which.
 		db.Add("predication", unify.NewValue(unify.NewStringExact(op.Predication)))
 	}
+	if op.role == "mask" {
+		// role "mask" is precisely the governing predicate: the operand named <Pg>
+		// (buildOperandList assigns the role; every instruction has at most one). It
+		// is implicit-all-true — dropped from the unpredicated Go API and
+		// synthesized as an all-true predicate at lowering, so predicated-only
+		// instructions (e.g. ZCMPGT) expose an unpredicated API. Flagging it here,
+		// not in the user's go_*.yaml, keeps the YAML unpredicated.
+		//
+		// The governing predicate is identified by name, not by a /Z or /M
+		// qualifier: most data-processing ops write <Pg>/Z or <Pg>/M, but some
+		// governing predicates have no qualifier (e.g. the store ST1B {<Zt>.B},
+		// <Pg>, [...]). Either way it is <Pg>. Source predicates <Pn>/<Pm> (e.g. in
+		// AND <Pd>.B, <Pg>/Z, <Pn>.B, <Pm>.B) are ordinary numbered inputs (role
+		// "opN"), real data, and are never flagged all-true.
+		db.Add("implicitAllTrue", unify.NewValue(unify.NewStringExact("true")))
+	}
 	if op.isList {
 		// This register came from a single-register list ("{ <Zt>.<T> }"), a
 		// distinct assembler encoding from a bare register.
@@ -90,13 +108,30 @@ func (inst *Instruction) emitOne(asm string, ops []Operand) *unify.Value {
 		db.Add("details", unify.NewValue(unify.NewStringExact(asComment(doc, 80))))
 	}
 
-	var ins, outs []*unify.Value
-	for i := range ops {
-		if ops[i].role == "destination" {
-			outs = append(outs, ops[i].emit())
+	var inOps, outOps []Operand
+	for _, op := range ops {
+		if op.role == "destination" {
+			outOps = append(outOps, op)
 		} else {
-			ins = append(ins, ops[i].emit())
+			inOps = append(inOps, op)
 		}
+	}
+	priority := map[string]int{"immediate": 0, "vreg": 1, "greg": 1, "memory": 1, "mask": 2}
+	slices.SortStableFunc(inOps, func(a, b Operand) int {
+		pa := priority[a.Class]
+		pb := priority[b.Class]
+		if pa != pb {
+			return cmp.Compare(pa, pb)
+		}
+		return cmp.Compare(a.AsmPos, b.AsmPos)
+	})
+
+	var ins, outs []*unify.Value
+	for i := range inOps {
+		ins = append(ins, inOps[i].emit())
+	}
+	for i := range outOps {
+		outs = append(outs, outOps[i].emit())
 	}
 	db.Add("in", unify.NewValue(unify.NewTuple(ins...)))
 	db.Add("inVariant", unify.NewValue(unify.NewTuple()))
