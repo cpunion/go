@@ -1570,6 +1570,7 @@ func TestStacklessCoroFusedResumeFrames(t *testing.T) {
 type stacklessCoroFusedFallbackTracker struct {
 	size           uintptr
 	validChunkType bool
+	general        bool
 	firstAction    uint8
 	firstFused     bool
 }
@@ -1582,9 +1583,16 @@ func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
 		runtime.FrameStacklessCoroForTest(ctx))
 	switch frame.State {
 	case 0:
-		childPointer := runtime.TakeStacklessCoroFusedFallbackFrameForTest(
-			ctx, stacklessCoroFusedFallbackResume, tracker.size,
-			tracker.validChunkType)
+		var childPointer unsafe.Pointer
+		if tracker.general {
+			childPointer = runtime.TakeStacklessCoroGeneralFusedFallbackFrameForTest(
+				ctx, stacklessCoroFusedFallbackResume, tracker.size,
+				tracker.validChunkType)
+		} else {
+			childPointer = runtime.TakeStacklessCoroFusedFallbackFrameForTest(
+				ctx, stacklessCoroFusedFallbackResume, tracker.size,
+				tracker.validChunkType)
+		}
 		if childPointer == nil {
 			childPointer = unsafe.Pointer(new(runtime.StacklessCoroSelfFrameForTest))
 		}
@@ -1611,13 +1619,20 @@ func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
 		name           string
 		size           uintptr
 		validChunkType bool
+		general        bool
 	}{
-		{"oversized", runtime.StacklessCoroFrameCacheSize + 1, true},
-		{"invalid-chunk-type", unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{}), false},
+		{name: "oversized", size: runtime.StacklessCoroFrameCacheSize + 1,
+			validChunkType: true},
+		{name: "invalid-chunk-type",
+			size: unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{})},
+		{name: "invalid-general-chunk-type",
+			size:    unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{}),
+			general: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tracker := &stacklessCoroFusedFallbackTracker{
 				size: test.size, validChunkType: test.validChunkType,
+				general: test.general,
 			}
 			stacklessCoroFusedFallbackActive = tracker
 			root := new(runtime.StacklessCoroSelfFrameForTest)

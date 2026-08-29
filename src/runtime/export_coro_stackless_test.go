@@ -226,6 +226,16 @@ func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
 	return coroTakeSelfFrame(ctx, resume, size, chunkType)
 }
 
+func TakeStacklessCoroGeneralFusedFallbackFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, size uintptr,
+	validChunkType bool) unsafe.Pointer {
+	chunkType := abi.TypeFor[uintptr]()
+	if validChunkType {
+		chunkType = abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
+	}
+	return coroTakeFusedFrame(ctx, resume, size, chunkType, true)
+}
+
 func AwaitStacklessCoroFusedResumeFrameForTest(ctx, frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) uint8 {
 	return coroAwaitFusedFrame(ctx, frame, resume)
@@ -269,15 +279,16 @@ func ValidStacklessCoroAdaptiveFrameChunksForTest() bool {
 		stacklessCoroFrameChunkLength(smallLast+1) ==
 			stacklessCoroLargeFrameChunkSize &&
 		validStacklessCoroFrameChunkType(largeChunk, largeSize) &&
-		stacklessCoroFrameChunkEligible(largeChunk, largeSize) &&
-		!stacklessCoroFrameChunkEligible(tooLargeChunk, tooLargeSize) &&
+		!validStacklessCoroFrameChunkType(tooLargeChunk, tooLargeSize) &&
 		!validStacklessCoroFrameChunkType(oversizedChunk, largeSize) &&
 		validStacklessCoroFusedFrameMarker(
-			stacklessCoroFusedFrameShortChunk|shortLast) &&
+			stacklessCoroFusedFrameChunkValidated|
+				stacklessCoroFusedFrameShortChunk|shortLast) &&
 		!validStacklessCoroFusedFrameMarker(
 			stacklessCoroFusedFrameShortChunk|shortLast+1) &&
 		validStacklessCoroSelfFrameMarker(
-			stacklessCoroFusedFrameShortChunk|shortLast)
+			stacklessCoroFusedFrameChunkValidated|
+				stacklessCoroFusedFrameShortChunk|shortLast)
 }
 
 func StacklessCoroAdaptiveFrameChunkMarkersForTest() bool {

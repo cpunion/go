@@ -565,7 +565,7 @@ func stacklessCoroFrameChunkInvariantResume(ctx unsafe.Pointer) uint8 {
 		if child == nil {
 			child = unsafe.Pointer(new(runtime.StacklessCoroLargeSelfFrameForTest))
 		}
-		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask + 1
+		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask
 		return runtime.AwaitStacklessCoroSelfFrameForTest(ctx, child,
 			stacklessCoroFrameChunkInvariantResume)
 	case "fused-take":
@@ -579,7 +579,7 @@ func stacklessCoroFrameChunkInvariantResume(ctx unsafe.Pointer) uint8 {
 		if child == nil {
 			child = unsafe.Pointer(new(runtime.StacklessCoroLargeSelfFrameForTest))
 		}
-		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask + 1
+		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask
 		return runtime.AwaitStacklessCoroLargeFusedFrameForTest(ctx, child,
 			stacklessCoroFrameChunkInvariantResume)
 	}
