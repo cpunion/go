@@ -1397,3 +1397,69 @@ Combined normal and race profiles execute 49 of 53 added runtime statements
 (92.45%). The four unexecuted statements are the two fail-closed cache
 invariant `throw` bodies; their validator, every state transition, both cache
 directions, overflow disposal, panic path, and race path are covered.
+
+#### Resume early operations directly
+
+Revision `d27a9580e1`, based on exact parent `2cef2cc392`, avoids a ready-queue
+round trip when an operation completes before its initiating resume call
+returns `Wait`. If the current native executor still owns the task and no
+logical work competes with it, the scheduler changes the task from `Waiting`
+back to `Running` and resumes it in place. A queued task, a completed root, a
+managed executor, a race build, or the pull-comparison build retains the
+ordinary publication path.
+
+The producer does not signal while the resume is active. The executor either
+consumes the pending readiness directly or publishes it and supplies the
+deferred signal. A later producer still signals normally. This removes stale
+wake tokens without losing the delayed-completion wake. It also preserves
+FIFO ordering when another task is ready. Normal and panic operation
+completion share the protocol. No runtime object changes size, and the
+compiler ABI, lowering, operation sources, and annotation-free source model
+are unchanged.
+
+The exact binaries used identical compiler and linker executables, disabled
+inlining, one P, and the stable import path
+`cmd/compile/testdata/corobench`. Parent and candidate executions alternated.
+Darwin/arm64 ran natively on an Apple M4 Max with 12 independent matched
+`-randlayout` seeds at 300 ms per probe. Linux/amd64 ran under Rosetta with 16
+independent matched layouts at 500 ms per probe, so its timing is directional
+while its allocation results are exact.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 parent -> candidate |
+| --- | ---: | ---: |
+| ready select | 137.65 ns -> 114.15 ns (-17.95%, `p=0.0063`) | 236.85 ns -> 201.45 ns (-16.19%, `p<0.001`) |
+| ready file read | 340.70 ns -> 331.10 ns (-2.74%, `p=0.0063`) | 248.45 ns -> 229.10 ns (-7.53%, `p=0.0042`) |
+| ready TCP read | 306.75 ns -> 299.95 ns (-3.48%, `p=0.146`) | 287.95 ns -> 265.30 ns (-7.88%, `p=0.021`) |
+
+Ready select improved in 11 of 12 Darwin layouts and 15 of 16 Linux layouts;
+file improved in 11 of 12 and 14 of 16, and TCP improved in 9 of 12 and 13 of
+16. Channel, positive-timer, task, yield, scalar-C, and blocking-C controls
+had no statistically significant regression. Every timing probe retained its
+parent allocation result; the three operation probes remained at zero bytes
+and zero allocations per iteration.
+
+Fifteen alternating 200 ms fixed-layout samples independently reproduced the
+target-path medians. Translated Linux also reported a 65.47% fixed-layout
+`YieldBatch` slowdown even though `runTasks` started at the same address and
+its private-yield hot-loop bytes were identical. Across the 16 matched
+layouts that control was neutral (-0.63% median, 8 improvements and 8
+regressions, `p=1.0`). The fixed result is therefore retained as a Rosetta
+code-address artifact rather than attributed to the handoff.
+
+Regression tests cover direct ownership, managed fallback, queued-task FIFO,
+delayed signaling, race fallback, pull comparison, normal and panic channel
+and select completion, and concurrent file and socket operation. Normal,
+race, and `checkptr=2` stackless runtime tests, the complete compiler
+coroutine suite, `go vet runtime`, and the lowering, symbol, allocation, and
+public-read audit pass on native Darwin/arm64 and translated Linux/amd64. Full
+`coro` and `nocoro` runtime suites pass on Darwin. The translated Linux full
+runtime is not a gate because Rosetta traps in unrelated address-space crash
+tests; its focused suites pass, and native Linux CI remains the full-runtime
+gate. Linux/386, Linux/arm64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64
+runtime test binaries also cross-compile with the experiment enabled.
+
+Combined normal, race, and pull profiles report 97.3% coverage for
+`runTasks`, 100% for normal operation completion, 88.2% for panic operation
+completion, and 89.5% for the wait transition. Every executable production
+statement added by this checkpoint is covered; the remaining function-level
+gaps are pre-existing fail-closed invariant throws.
