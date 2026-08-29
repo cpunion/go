@@ -1818,6 +1818,78 @@ func TestLowerStateMachines(t *testing.T) {
 		}
 	}
 
+	var structuredResume *ir.Func
+	for _, generated := range typecheck.Target.Funcs {
+		if generated.OClosure != nil && generated.ClosureParent != nil &&
+			generated.ClosureParent.Sym().Name == "structured.coro" {
+			structuredResume = generated
+			break
+		}
+	}
+	if structuredResume == nil {
+		t.Fatal("structured caller has no generated resume function")
+	}
+	var dispatch *ir.SwitchStmt
+	dispatchIndex := -1
+	for i, stmt := range structuredResume.Body {
+		if candidate, ok := stmt.(*ir.SwitchStmt); ok {
+			if dispatch != nil {
+				t.Fatal("structured resume has multiple top-level dispatches")
+			}
+			dispatch = candidate
+			dispatchIndex = i
+		}
+		if _, ok := stmt.(*ir.ForStmt); ok {
+			t.Fatal("structured resume retains a top-level dispatch loop")
+		}
+	}
+	if dispatch == nil {
+		t.Fatal("structured resume has no top-level dispatch")
+	}
+	entryTargets := make(map[*types.Sym]bool, len(dispatch.Cases))
+	for i, clause := range dispatch.Cases {
+		if len(clause.Body) != 1 {
+			t.Fatalf("dispatch case %d has %d statements, want one goto",
+				i, len(clause.Body))
+		}
+		branch, ok := clause.Body[0].(*ir.BranchStmt)
+		if !ok || branch.Op() != ir.OGOTO || branch.Label == nil {
+			t.Fatalf("dispatch case %d body = %v, want labeled goto",
+				i, clause.Body)
+		}
+		entryTargets[branch.Label] = true
+	}
+	definedLabels := make(map[*types.Sym]bool, len(entryTargets))
+	directGotos, pcStores, continues := 0, 0, 0
+	for _, stmt := range structuredResume.Body[dispatchIndex+1:] {
+		ir.Visit(stmt, func(node ir.Node) {
+			switch node := node.(type) {
+			case *ir.LabelStmt:
+				definedLabels[node.Label] = true
+			case *ir.BranchStmt:
+				switch node.Op() {
+				case ir.OGOTO:
+					directGotos++
+				case ir.OCONTINUE:
+					continues++
+				}
+			case *ir.AssignStmt:
+				if ir.SameSafeExpr(node.X, dispatch.Tag) {
+					pcStores++
+				}
+			}
+		})
+	}
+	for label := range entryTargets {
+		if !definedLabels[label] {
+			t.Errorf("dispatch target %s has no state label", label.Name)
+		}
+	}
+	if directGotos <= pcStores || pcStores == 0 || continues != 0 {
+		t.Errorf("structured state edges have %d direct gotos, %d PC stores, and %d continues; want direct gotos and suspension stores only",
+			directGotos, pcStores, continues)
+	}
+
 	var sleeperResume *ir.Func
 	for _, generated := range typecheck.Target.Funcs {
 		if generated.OClosure != nil && generated.ClosureParent != nil &&
