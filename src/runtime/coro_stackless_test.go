@@ -4995,6 +4995,21 @@ func TestStacklessCoroTimerOwnerReuse(t *testing.T) {
 func TestStacklessCoroOperationReuse(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
+	runtime.DrainStacklessCoroSharedOperationsForTest()
+	defer runtime.DrainStacklessCoroSharedOperationsForTest()
+	if !runtime.CheckStacklessCoroSharedOperationCacheForTest() {
+		t.Fatal("shared operation cache accepted invalid state")
+	}
+	if !runtime.CheckStacklessCoroSharedOperationPanicForTest() {
+		t.Fatal("operation panic bypassed the shared cache after local saturation")
+	}
+	wantDrained := 1
+	if race.Enabled {
+		wantDrained = 0
+	}
+	if got := runtime.DrainStacklessCoroSharedOperationsForTest(); got != wantDrained {
+		t.Fatalf("drained shared operations = %d, want %d", got, wantDrained)
+	}
 	baselineOperations := runtime.StacklessCoroOperationCountForTest()
 
 	cacheCount := func(t *testing.T, ctx unsafe.Pointer) {
@@ -5074,8 +5089,10 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 	})
 
 	t.Run("bounded", func(t *testing.T) {
-		const operations = runtime.StacklessCoroOperationCacheSize + 1
+		const operations = runtime.StacklessCoroOperationCacheSize +
+			runtime.StacklessCoroSharedOperationCacheSize + 1
 		timers := make([]runtime.StacklessCoroTimerTokenForTest, operations)
+		tokens := make([]unsafe.Pointer, operations)
 		var started, completed atomic.Int32
 		parentState := 0
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -5089,6 +5106,7 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 						case 0:
 							timers[index] = runtime.StartSleepStacklessCoroForTest(
 								childCtx, int64(time.Hour))
+							tokens[index] = runtime.StacklessCoroTimerOperationForTest(timers[index])
 							started.Add(1)
 							childState = 1
 							return runtime.StacklessCoroActionWait
@@ -5133,6 +5151,43 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				return runtime.StacklessCoroActionInvalid
 			}
 		})
+
+		wantShared := runtime.StacklessCoroSharedOperationCacheSize
+		if race.Enabled {
+			wantShared = 0
+		}
+		if got := runtime.StacklessCoroSharedOperationCountForTest(); got != wantShared {
+			t.Fatalf("shared cached operations = %d, want %d", got, wantShared)
+		}
+		if !race.Enabled {
+			release := make(chan struct{})
+			var reused unsafe.Pointer
+			state := 0
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					runtime.CallReadStacklessCoroForTest(ctx, func() {
+						<-release
+					})
+					reused = runtime.StacklessCoroOperationTokenForTest(ctx)
+					close(release)
+					state = 1
+					return runtime.StacklessCoroActionWait
+				case 1:
+					state = 2
+					return runtime.StacklessCoroActionComplete
+				default:
+					t.Fatalf("unexpected shared operation reuse state %d", state)
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+			lastShared := runtime.StacklessCoroOperationCacheSize +
+				runtime.StacklessCoroSharedOperationCacheSize - 1
+			if reused != tokens[lastShared] {
+				t.Fatalf("shared operation cache reused %p, want newest entry %p; remaining = %d",
+					reused, tokens[lastShared], runtime.StacklessCoroSharedOperationCountForTest())
+			}
+		}
 	})
 
 	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
