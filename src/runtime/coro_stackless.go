@@ -2701,10 +2701,13 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	op.element = element
 	op.received = received
 	op.send = send
-	// A queued channel waiter retains op through its GC-visible coroutine
-	// owner. Immediate completion retains op on the executor stack. Neither
-	// path needs the process-wide ID registry used by asynchronous sources.
-	op.id = stacklessCoroChannelOperationID
+	// A scanned channel retains a queued waiter and its operation directly.
+	// Noscan buffered scalar channels and nil channels use the registry.
+	if stacklessCoroChannelWaiterRooted(channel) {
+		op.id = stacklessCoroChannelOperationID
+	} else {
+		registerStacklessCoroOperation(op)
+	}
 	if send {
 		chansendStackless(op)
 	} else {
@@ -2713,14 +2716,26 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	return op
 }
 
+// stacklessCoroChannelWaiterRooted reports whether the channel allocation is
+// scanned. Unbuffered and zero-size channels use a scanned header while this
+// experiment is enabled; buffered pointer elements already require one.
+func stacklessCoroChannelWaiterRooted(channel *hchan) bool {
+	return channel != nil && (channel.elemsize == 0 ||
+		channel.dataqsiz == 0 || channel.elemtype.Pointers())
+}
+
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
 	op := (*stacklessCoroOperation)(owner)
 	if op != nil && op.selection.active() {
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
-	if op == nil || op.id != stacklessCoroChannelOperationID {
+	if op == nil {
 		throw("runtime: invalid stackless coroutine channel completion")
+	}
+	if op.id != stacklessCoroChannelOperationID &&
+		takeStacklessCoroOperation(op.id) != op {
+		throw("runtime: invalid registered stackless coroutine channel completion")
 	}
 	if waiter != nil {
 		waiter.coro.clear()

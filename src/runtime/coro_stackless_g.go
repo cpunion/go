@@ -18,6 +18,8 @@ type stacklessCoroG struct {
 	stacklessCoro *stacklessCoroGState
 }
 
+const stacklessCoroChannelWaiterScanning = true
+
 type stacklessCoroSudog struct {
 	owner unsafe.Pointer
 }
