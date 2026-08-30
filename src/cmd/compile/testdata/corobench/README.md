@@ -1906,15 +1906,25 @@ native Linux `all.bash` job runs after a merge reaches `coro/main`.
 
 #### Keep channel operations off the global registry
 
-Revision `40fc6a722f`, based on exact parent `3ac36dd089`, removes ordinary
-channel operations from the global asynchronous-operation registry. A queued
-channel operation is already kept alive by the GC-visible owner pointer in its
-channel waiter. An immediately completed operation remains live on the
-executor stack. The channel path can therefore use a local sentinel identity
-without weakening operation lifetime or race synchronization. File, network,
-and other externally completed operations remain registered. Select remains
-registered so its multi-waiter completion protocol can be changed and measured
-independently.
+Revision `40fc6a722f`, based on exact parent `3ac36dd089`, removes channel
+operations from the global asynchronous-operation registry when the channel
+allocation is GC-scanned. A queued operation is then retained by the owner
+pointer in its channel waiter. An immediately completed operation remains live
+on the executor stack. File, network, and other externally completed operations
+remain registered. Select remains registered so its multi-waiter completion
+protocol can be changed and measured independently.
+
+Compiler integration testing exposed an important ownership difference from a
+normal channel waiter. A normal waiter is also retained by its owning G, while
+a stackless coroutine waiter has no G. The runtime deliberately allocates
+unbuffered, zero-sized-element, and buffered pointer-free channels as noscan
+objects when possible, so a waiter linked only from such a channel is not
+necessarily a GC root. Revision `7711509ffe` makes the zero-storage channel
+header scanned while the experiment is enabled. Buffered pointer-element
+channels already use scanned allocations. Both kinds use the local sentinel;
+buffered scalar channels retain their compact noscan allocation and use the
+registry as a rooting fallback. Nil-channel operations use the same fallback.
+No task, operation, waiter, or channel structure grows.
 
 A rate-one CPU profile of 10,000 simultaneously parked tasks attributed about
 22% of the exact parent's CPU time to removing channel operations from the
@@ -1931,16 +1941,17 @@ woke 10,000 tasks:
 | --- | ---: | ---: |
 | exact official Go | 10.881 ms | 1.00x |
 | exact parent | 68.623 ms | 6.31x |
-| candidate | 38.419 ms | 3.53x |
+| candidate | 38.394 ms | 3.53x |
 
-The candidate is 44.01% faster than its exact parent, and every matched pair
-moved in the same direction. Allocation and retained-footprint results are
-unchanged because this revision removes indexing rather than ownership:
+The candidate is 44.05% faster than its exact parent. The rooting correction
+changed the preceding candidate median by -0.07%, and allocation and retained
+footprint results are unchanged because it changes GC visibility rather than
+object ownership:
 
-The controlled Linux/amd64 environment used the same revisions, source,
-processor count, warm-up count, fresh-process sample count, and alternating
-order. Its parent median was 80.691 ms and its candidate median was 31.190 ms,
-a 61.35% reduction with all 12 pairs moving in the same direction. The
+The controlled Linux/amd64 environment used the same source, processor count,
+warm-up count, and 12 fresh-process samples. Its parent median was 80.691 ms
+and its corrected candidate median was 31.382 ms, a 61.11% reduction. The
+rooting correction changed the preceding candidate median by +0.62%. The
 environment reports a VirtualApple CPU, so this result confirms the mechanism
 and allocation accounting rather than native x86 timing.
 
@@ -1962,19 +1973,20 @@ registry-chain and lock transitions. This revision removes the registry term;
 combining channel allocation ownership and reducing the remaining transitions
 are separate follow-up targets.
 
-A GC regression test parks a receive, verifies that the registry count does
-not change, forces collection, and then completes the receive. Cross-kind
-reuse tests also verify that channel operations never become registered. The
+GC regression tests park operations on unbuffered, zero-sized, buffered
+pointer-element, and buffered scalar channels, force collection, and complete
+them. They also verify that only the buffered scalar case uses the fallback
+registry. Cross-kind reuse tests continue to cover operation lifetime. The
 focused normal and race channel suites, full normal and race runtime suites,
 pull and pull-plus-race comparisons, and `checkptr=2` pass on native
 Darwin/arm64. All runtime-oriented `run` and `runoutput` programs under
 `test/chan` pass with coroutine lowering; the one `errorcheck` generator is
 outside this runtime-focused audit. Focused coverage executes
-`startStacklessCoroChannel` completely and the valid completion paths in
-`finishStacklessCoroChannel`; its remaining branch is the fatal invalid-kind
-invariant. Translated Linux/amd64 independently passes the focused normal and
-race suites, pull and pull-plus-race comparisons, `checkptr=2`, the same
-runtime-oriented channel programs, and the complete coroutine benchmark
-audit. Its full runtime run reaches the pre-existing Rosetta address-space
-allocation trap after 556 seconds instead of reporting a Go assertion or test
-failure; the native Ubuntu pull-request job remains the Linux full-suite gate.
+`startStacklessCoroChannel` and its rooting classifier completely, both valid
+completion routes, and the registry fallback. Its remaining completion
+branches are fatal invariants or unrelated paths. Linux/amd64 independently
+passes the focused normal, race, pull, and `checkptr=2` suites, compiler
+channel lowering, and the complete coroutine benchmark audit. Its full runtime
+run reaches the pre-existing Rosetta address-space allocation trap after 556
+seconds instead of reporting a Go assertion or test failure; the native Ubuntu
+pull-request job remains the Linux full-suite gate.
