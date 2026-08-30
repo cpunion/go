@@ -219,7 +219,7 @@ if ! awk '
 	exit 1
 fi
 if ! "$test_binary" -test.run '^$' \
-	-test.bench '^(BenchmarkRecursiveYield64|BenchmarkRecursiveYield4096)$' \
+	-test.bench '^(BenchmarkRecursiveYield64|BenchmarkRecursiveYield4096|BenchmarkMutualYield4096)$' \
 	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
 	>"$recursive_allocation_output"; then
 	tail -n 100 "$recursive_allocation_output" >&2
@@ -263,7 +263,18 @@ if ! awk '
 			}
 		}
 	}
-	END { exit shallow == 3 && deep == 3 && large == 3 && !bad ? 0 : 1 }
+	$1 ~ /^BenchmarkMutualYield4096(-[0-9]+)?$/ {
+		mutual++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "B/op" && $(i - 1) > 277000) {
+				bad = 1
+			}
+			if ($i == "allocs/op" && $(i - 1) > 1000) {
+				bad = 1
+			}
+		}
+	}
+	END { exit shallow == 3 && deep == 3 && large == 3 && mutual == 3 && !bad ? 0 : 1 }
 ' "$recursive_allocation_output"; then
 	cat "$recursive_allocation_output" >&2
 	echo "recursive coroutine frame allocation exceeds its bound" >&2

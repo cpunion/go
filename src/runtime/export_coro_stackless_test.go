@@ -219,9 +219,67 @@ func CompleteStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer) uint8 {
 func TakeStacklessCoroFusedResumeFrameForTest(ctx unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
 	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroFusedResumeFrameForTest]()
-	coroRequestFusedFrame(ctx)
+	coroRequestFusedFrame(ctx, false)
 	return coroTakeFusedFrame(ctx, resume,
 		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType, false)
+}
+
+func TakeStacklessCoroCompatibleFusedResumeFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]StacklessCoroFusedResumeFrameForTest]()
+	coroRequestFusedFrame(ctx, true)
+	return coroTakeFusedFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType, false)
+}
+
+// MarkStacklessCoroFusedChunkForTest creates an invalid pending-chunk state so
+// subprocess tests can verify the runtime's fail-closed invariant checks.
+func MarkStacklessCoroFusedChunkForTest(ctx unsafe.Pointer) {
+	(*stacklessCoroContext)(ctx).task().setFlag(stacklessCoroTaskFusedChunk, true)
+}
+
+func saturateStacklessCoroFrameCacheForTest(ctx unsafe.Pointer) (
+	*stacklessCoroScheduler, uint16, uint16) {
+	s := (*stacklessCoroContext)(ctx).scheduler
+	lock(&s.lock)
+	tasks, bytes := s.cachedFrameTasks, s.cachedFrameBytes
+	s.cachedFrameTasks = stacklessCoroTaskCacheSize
+	s.cachedFrameBytes = stacklessCoroFrameCacheSize
+	unlock(&s.lock)
+	return s, tasks, bytes
+}
+
+func restoreStacklessCoroFrameCacheForTest(s *stacklessCoroScheduler,
+	tasks, bytes uint16) {
+	lock(&s.lock)
+	s.cachedFrameTasks, s.cachedFrameBytes = tasks, bytes
+	unlock(&s.lock)
+}
+
+// SaturateStacklessCoroFrameCacheForTest forces a fatal subprocess test onto
+// the uncached frame path. The process must not continue after using it.
+func SaturateStacklessCoroFrameCacheForTest(ctx unsafe.Pointer) {
+	saturateStacklessCoroFrameCacheForTest(ctx)
+}
+
+func TakeStacklessCoroUncachedFusedResumeFrameForTest(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) unsafe.Pointer {
+	frameType := abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroFusedResumeFrameForTest]()
+	coroRequestFusedFrame(ctx, false)
+	s, tasks, bytes := saturateStacklessCoroFrameCacheForTest(ctx)
+	frame := coroTakeFusedFrame(ctx, resume,
+		unsafe.Sizeof(StacklessCoroFusedResumeFrameForTest{}), frameType, false)
+	restoreStacklessCoroFrameCacheForTest(s, tasks, bytes)
+	return frame
+}
+
+func TakeStacklessCoroUncachedGeneralFusedFallbackFrameForTest(
+	ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8,
+	size uintptr) unsafe.Pointer {
+	s, tasks, bytes := saturateStacklessCoroFrameCacheForTest(ctx)
+	frame := coroTakeFusedFrame(ctx, resume, size, abi.TypeFor[uintptr](), true)
+	restoreStacklessCoroFrameCacheForTest(s, tasks, bytes)
+	return frame
 }
 
 func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
@@ -232,16 +290,6 @@ func TakeStacklessCoroFusedFallbackFrameForTest(ctx unsafe.Pointer,
 		chunkType = abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
 	}
 	return coroTakeSelfFrame(ctx, resume, size, chunkType)
-}
-
-func TakeStacklessCoroGeneralFusedFallbackFrameForTest(ctx unsafe.Pointer,
-	resume func(unsafe.Pointer) uint8, size uintptr,
-	validChunkType bool) unsafe.Pointer {
-	chunkType := abi.TypeFor[uintptr]()
-	if validChunkType {
-		chunkType = abi.TypeFor[[stacklessCoroFrameChunkSize]StacklessCoroSelfFrameForTest]()
-	}
-	return coroTakeFusedFrame(ctx, resume, size, chunkType, true)
 }
 
 func AwaitStacklessCoroFusedResumeFrameForTest(ctx, frame unsafe.Pointer,

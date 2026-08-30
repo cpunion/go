@@ -329,6 +329,8 @@ func TestLowerMethodReceiver(t *testing.T) {
 }
 
 func TestExplicitFrameChunkLength(t *testing.T) {
+	prepareLowerTest(t)
+
 	for _, test := range []struct {
 		size, want int64
 	}{
@@ -343,6 +345,27 @@ func TestExplicitFrameChunkLength(t *testing.T) {
 			t.Errorf("explicitFrameChunkLength(%d) = %d, want %d",
 				test.size, got, test.want)
 		}
+	}
+	if got := explicitFrameAllocationSize(0); got != 0 {
+		t.Errorf("explicitFrameAllocationSize(0) = %d, want 0", got)
+	}
+	if got := explicitFrameAllocationSize(explicitFrameChunkByteLimit + 1); got != 0 {
+		t.Errorf("explicitFrameAllocationSize(over limit) = %d, want 0", got)
+	}
+	if got := explicitFrameAllocationSize(72); got != 80 {
+		t.Errorf("explicitFrameAllocationSize(72) = %d, want 80", got)
+	}
+	if got := explicitFrameAllocationSize(4 * 72); got != 288 {
+		t.Errorf("explicitFrameAllocationSize(288) = %d, want 288", got)
+	}
+	if !explicitFrameChunkReducesAllocation(72, explicitLargeFrameChunkSize) {
+		t.Fatal("four 72-byte frames do not reduce their allocation size")
+	}
+	if explicitFrameChunkReducesAllocation(80, explicitLargeFrameChunkSize) {
+		t.Fatal("four 80-byte frames unexpectedly reduce their allocation size")
+	}
+	if explicitFrameChunkReducesAllocation(64, explicitFrameChunkSize*2) {
+		t.Fatal("sixteen 64-byte frames unexpectedly preserve their allocation size")
 	}
 }
 
@@ -555,6 +578,7 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 	}
 
 	runtimeCalls := make(map[string]int)
+	compatibleRequests := 0
 	for _, generated := range typecheck.Target.Funcs {
 		ir.VisitList(generated.Body, func(node ir.Node) {
 			call, ok := node.(*ir.CallExpr)
@@ -563,7 +587,15 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 			}
 			name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
 			runtimeCalls[name]++
+			if name == "runtime.coroRequestFusedFrame" &&
+				len(call.Args) == 2 && ir.BoolVal(call.Args[1]) {
+				compatibleRequests++
+			}
 		})
+	}
+	if compatibleRequests != 0 {
+		t.Errorf("heterogeneous lowering has %d compatible chunk requests, want none",
+			compatibleRequests)
 	}
 	for name, want := range map[string]int{
 		"runtime.coroRequestFusedFrame":  1,
@@ -575,6 +607,79 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 			t.Errorf("heterogeneous lowering has %d %s calls, want %d",
 				runtimeCalls[name], name, want)
 		}
+	}
+}
+
+func TestLowerMutualFrameChunks(t *testing.T) {
+	prepareLowerTest(t)
+
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	pkg := types.NewPkg("example.com/coro/mutualframe", "mutualframe")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+
+	first := newLowerTestFunc(pkg, "first")
+	second := newLowerTestFunc(pkg, "second")
+	firstCall := newLowerTestCall(second)
+	secondCall := newLowerTestCall(first)
+	first.Body = ir.Nodes{firstCall, newLowerTestReturn()}
+	second.Body = ir.Nodes{secondCall, newLowerTestReturn()}
+	firstFunction := &Function{
+		Func: first, Local: MaySuspend, Effect: MaySuspend,
+		Primary: CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: second,
+			CalleeName: symbolName(second.Nname), Node: firstCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: firstCall}},
+	}
+	secondFunction := &Function{
+		Func: second, Local: MaySuspend, Effect: MaySuspend,
+		Primary: CoroPrimary,
+		Edges: []Edge{{
+			Kind: DirectCall, Callee: first,
+			CalleeName: symbolName(first.Nname), Node: secondCall,
+		}},
+		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: secondCall}},
+	}
+
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
+		first: firstFunction, second: secondFunction,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Lowered != 2 || result.Skipped != 0 {
+		t.Fatalf("Lower result = %+v, want two lowered functions", result)
+	}
+
+	requests, compatible, takes := 0, 0, 0
+	for _, generated := range typecheck.Target.Funcs {
+		ir.VisitList(generated.Body, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok {
+				return
+			}
+			switch symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) {
+			case "runtime.coroRequestFusedFrame":
+				requests++
+				if len(call.Args) == 2 && ir.BoolVal(call.Args[1]) {
+					compatible++
+				}
+			case "runtime.coroTakeFusedFrame":
+				takes++
+			}
+		})
+	}
+	if requests != 2 || compatible != 2 || takes != 2 {
+		t.Fatalf("mutual lowering has %d requests (%d compatible) and %d takes, want 2, 2, and 2",
+			requests, compatible, takes)
 	}
 }
 
