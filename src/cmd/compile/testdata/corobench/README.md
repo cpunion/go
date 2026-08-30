@@ -1821,3 +1821,84 @@ Windows/amd64, and Darwin/amd64 runtime tests cross-compile with the experiment
 enabled. The preceding `coro/main` merge is green in the focused macOS and
 Ubuntu jobs and the native Linux `all.bash` job; the pull request CI remains
 the native full-suite gate for this revision.
+
+#### Reuse compatible heterogeneous frame chunks
+
+The two-commit checkpoint ending at revision `cdef4c8768`, based on exact
+series parent `b345d28b98`, extends typed frame chunks from homogeneous self
+recursion to compiler-proven structured calls between different resume
+entries. The Darwin parent toolchain identifies as
+`a0af4864fa`, the second parent of the merge; its source tree is byte-identical
+to `b345d28b98`. The Linux parent toolchain was built directly at the merge
+revision.
+
+The compiler resolves compatibility only after all generated frame types are
+available. A call is eligible when both frames have the extended fused header,
+both factories use four-element chunks, `types.Identical` proves the complete
+anonymous frame types have the same layout and pointer bitmap, and one typed
+chunk occupies strictly fewer allocator bytes than four individual frames.
+The allocation model uses the target pointer width, the pointerful-object
+malloc-header threshold, and the runtime's generated size-class tables, so a
+cross-compiling host cannot decide using its own header boundary. A
+compiler-private proof bit carries the result through the existing structured
+factory request; incompatible and unproven calls retain the general frame
+path.
+
+The strict allocator test is intentional. An earlier 16-element prototype for
+small frames reduced `BenchmarkRecursiveYield4096` from 486 to 246 allocations,
+but a 56-byte frame crossed the malloc-header and size-class boundary when
+multiplied by 16. Bytes per operation regressed from 215,424 to 246,144
+(+14.26%), so that design was rejected. Four compatible 72-byte mutual frames,
+by contrast, occupy 288 bytes together instead of four 80-byte allocator
+classes, saving 32 bytes for every complete chunk.
+
+The runtime uses one previously spare task flag to carry the proof until the
+matching factory and await consume it. A cache-owned single-frame holder still
+takes priority. Only a cache miss validates the typed four-element array and
+then enters the existing direct-prefix and chunk-marker transitions. This
+keeps the common shallow path from repeating type and marker work. Related
+state checks use masks, and the proof bit is written without a branch. Task
+and frame sizes, public compiler interfaces, source syntax, annotations, and
+the homogeneous adaptive chunk policy do not change. Race and pull-comparison
+builds continue to use distinct tasks.
+
+The fixed allocation audit now includes `BenchmarkMutualYield4096` and takes
+three 100-iteration samples. It requires at most 277,000 bytes and 1,000
+allocations per operation. The exact results on both measured platforms are:
+
+| Probe | Exact parent | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| mutual recursion, depth 4096 | 307,200 B, 3,840 allocs | 276,672 B, 965 allocs | -9.94% bytes, -74.87% allocs |
+| self recursion, depth 4096 | 215,424 B, 486 allocs | 215,424 B, 486 allocs | unchanged |
+| mutual recursion, depth 64 | 0 B, 0 allocs | 0 B, 0 allocs | unchanged |
+
+Timing used identical benchmark source, disabled inlining, one P, six matched
+randomized linker layouts, a 150 ms warm-up for each binary and layout, and
+three alternating-order 750 ms samples per layout. The Darwin results are
+native Apple M4 Max measurements. Linux/amd64 ran under OrbStack translation,
+so its absolute times are directional while its allocation accounting and
+functional results remain exact.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| self recursion, depth 4096 | 216.7 us -> 214.3 us (-1.11%, `p=0.034`) | 432.8 us -> 425.1 us (-1.77%, `p<0.001`) |
+| mutual recursion, depth 64 | 2.792 us -> 2.755 us (-1.31%, `p<0.001`) | 6.616 us -> 6.436 us (-2.72%, `p<0.001`) |
+| mutual recursion, depth 4096 | 307.5 us -> 307.5 us (~, `p=0.521`) | 585.6 us -> 547.3 us (-6.53%, `p<0.001`) |
+
+The complete coroutine compiler suite reports 93.5% statement coverage, and
+the new allocation and compatibility helpers are each covered at 100%. Across
+added or modified production blocks, 159 of 167 statements execute (95.21%).
+The eight uncovered statements are the `unlock` and `throw` bodies of four
+fail-closed request, marker, chunk-class, and consumption invariants. Each has
+a fatal subprocess regression test; its coverage counters cannot return after
+the runtime terminates the subprocess.
+
+The full normal and race runtime suites pass on native Darwin/arm64, as do
+pull, pull-plus-race, `checkptr=2`, `go vet`, experiment-off compilation, and
+the complete benchmark audit. The same benchmark audit passes on translated
+Linux/amd64. Linux/386, Linux/amd64, Linux/arm64, Linux/riscv64,
+FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests cross-compile at
+the final revision; the Linux/386 and Linux/amd64 stackless suites also run to
+completion under OrbStack. The translated full Linux runtime remains an
+unsuitable gate because of its existing Rosetta `TestCheckFDs` address-space
+trap; native Linux pull-request CI remains the full-suite gate.
