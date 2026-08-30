@@ -1937,6 +1937,13 @@ The candidate is 44.01% faster than its exact parent, and every matched pair
 moved in the same direction. Allocation and retained-footprint results are
 unchanged because this revision removes indexing rather than ownership:
 
+The controlled Linux/amd64 environment used the same revisions, source,
+processor count, warm-up count, fresh-process sample count, and alternating
+order. Its parent median was 80.691 ms and its candidate median was 31.190 ms,
+a 61.35% reduction with all 12 pairs moving in the same direction. The
+environment reports a VirtualApple CPU, so this result confirms the mechanism
+and allocation accounting rather than native x86 timing.
+
 | Metric for 10,000 parked tasks | Official Go | Candidate |
 | --- | ---: | ---: |
 | allocated bytes | 6,230,992 | 3,405,856 |
@@ -1965,4 +1972,9 @@ Darwin/arm64. All runtime-oriented `run` and `runoutput` programs under
 outside this runtime-focused audit. Focused coverage executes
 `startStacklessCoroChannel` completely and the valid completion paths in
 `finishStacklessCoroChannel`; its remaining branch is the fatal invalid-kind
-invariant.
+invariant. Translated Linux/amd64 independently passes the focused normal and
+race suites, pull and pull-plus-race comparisons, `checkptr=2`, the same
+runtime-oriented channel programs, and the complete coroutine benchmark
+audit. Its full runtime run reaches the pre-existing Rosetta address-space
+allocation trap after 556 seconds instead of reporting a Go assertion or test
+failure; the native Ubuntu pull-request job remains the Linux full-suite gate.
