@@ -569,8 +569,14 @@ func stacklessCoroFrameChunkInvariantResume(ctx unsafe.Pointer) uint8 {
 		return runtime.AwaitStacklessCoroSelfFrameForTest(ctx, child,
 			stacklessCoroFrameChunkInvariantResume)
 	case "fused-take":
+		runtime.SaturateStacklessCoroFrameCacheForTest(ctx)
 		frame.Marker = runtime.StacklessCoroFusedFrameShortChunk |
 			runtime.StacklessCoroFusedFrameChunkFirst
+		runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+	case "fused-invalid-marker":
+		runtime.SaturateStacklessCoroFrameCacheForTest(ctx)
+		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask
 		runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
 			stacklessCoroFrameChunkInvariantResume)
 	case "fused-await":
@@ -582,6 +588,15 @@ func stacklessCoroFrameChunkInvariantResume(ctx unsafe.Pointer) uint8 {
 		frame.Marker = runtime.StacklessCoroFusedFrameAllocationMask
 		return runtime.AwaitStacklessCoroLargeFusedFrameForTest(ctx, child,
 			stacklessCoroFrameChunkInvariantResume)
+	case "fused-unrequested-chunk":
+		runtime.MarkStacklessCoroFusedChunkForTest(ctx)
+		runtime.TakeStacklessCoroLargeFusedFrameForTest(ctx,
+			stacklessCoroFrameChunkInvariantResume)
+	case "fused-unconsumed-chunk":
+		runtime.MarkStacklessCoroFusedChunkForTest(ctx)
+		child := new(runtime.StacklessCoroFusedResumeFrameForTest)
+		return runtime.AwaitStacklessCoroFusedResumeFrameForTest(ctx,
+			unsafe.Pointer(child), stacklessCoroFrameChunkInvariantResume)
 	}
 	return runtime.StacklessCoroActionInvalid
 }
@@ -602,7 +617,10 @@ func TestStacklessCoroFrameChunkInvariants(t *testing.T) {
 		{mode: "self-take", want: "mismatched stackless coroutine self-frame chunk"},
 		{mode: "self-await", want: "invalid stackless coroutine parent self-frame marker"},
 		{mode: "fused-take", want: "mismatched stackless coroutine fused-frame chunk"},
+		{mode: "fused-invalid-marker", want: "invalid stackless coroutine fused-frame marker"},
 		{mode: "fused-await", want: "invalid stackless coroutine parent fused-frame marker"},
+		{mode: "fused-unrequested-chunk", want: "unrequested stackless coroutine fused frame chunk"},
+		{mode: "fused-unconsumed-chunk", want: "unconsumed stackless coroutine fused frame chunk"},
 	} {
 		t.Run(test.mode, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0],

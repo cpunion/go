@@ -41,6 +41,37 @@ func explicitFrameChunkLength(frameSize int64) int64 {
 	return explicitLargeFrameChunkSize
 }
 
+// explicitFrameAllocationSize reports the allocator size class, including a
+// pointerful object's malloc header. The compiler must use target pointer
+// widths here because it can cross-compile from a host with a different
+// header threshold.
+func explicitFrameAllocationSize(size int64) int64 {
+	if size <= 0 || size > gc.MaxSmallSize-gc.MallocHeaderSize {
+		return 0
+	}
+	request := size
+	ptrSize := int64(types.PtrSize)
+	minHeaderSize := ptrSize * ptrSize * 8
+	if request > minHeaderSize {
+		request += gc.MallocHeaderSize
+	}
+	var class uint8
+	if request <= gc.SmallSizeMax-8 {
+		class = gc.SizeToSizeClass8[(request+gc.SmallSizeDiv-1)/gc.SmallSizeDiv]
+	} else {
+		class = gc.SizeToSizeClass128[(request-gc.SmallSizeMax+
+			gc.LargeSizeDiv-1)/gc.LargeSizeDiv]
+	}
+	return int64(gc.SizeClassToSize[class])
+}
+
+func explicitFrameChunkReducesAllocation(frameSize, chunkLength int64) bool {
+	frameAllocation := explicitFrameAllocationSize(frameSize)
+	chunkAllocation := explicitFrameAllocationSize(frameSize * chunkLength)
+	return frameAllocation != 0 && chunkAllocation != 0 &&
+		chunkAllocation < frameAllocation*chunkLength
+}
+
 // LowerResult summarizes one package lowering pass.
 type LowerResult struct {
 	Lowered     int
@@ -49,31 +80,34 @@ type LowerResult struct {
 }
 
 type lowerCandidate struct {
-	function      *Function
-	transitions   map[*ir.CallExpr]SiteKind
-	foreignCalls  map[*ir.CallExpr]ForeignCallClass
-	directCalls   map[*ir.CallExpr]lowerDirectCall
-	dependencies  map[*ir.Func]bool
-	deferDeps     map[*ir.Func]bool
-	defers        []*lowerDefer
-	dynamicDefers bool
-	channels      map[ir.Node]*lowerChannel
-	selects       map[*ir.SelectStmt]*lowerSelect
-	rangeVars     []*ir.Name
-	panics        map[*ir.UnaryExpr]bool
-	parameters    map[*ir.Name]*ir.Name
-	results       map[*ir.Name]*ir.Name
-	resultValues  []*ir.Name
-	resultPtrs    []*ir.Name
-	factory       *ir.Func
-	factoryABI    FactoryABI
-	fusedAwaits   map[*ir.CallExpr]bool
-	fusedRequests map[*ir.CallExpr]bool
-	fusedFrame    bool
-	fusedResume   bool
-	fusedSelf     bool
-	selfAwait     bool
-	selfSpawn     bool
+	function         *Function
+	transitions      map[*ir.CallExpr]SiteKind
+	foreignCalls     map[*ir.CallExpr]ForeignCallClass
+	directCalls      map[*ir.CallExpr]lowerDirectCall
+	dependencies     map[*ir.Func]bool
+	deferDeps        map[*ir.Func]bool
+	defers           []*lowerDefer
+	dynamicDefers    bool
+	channels         map[ir.Node]*lowerChannel
+	selects          map[*ir.SelectStmt]*lowerSelect
+	rangeVars        []*ir.Name
+	panics           map[*ir.UnaryExpr]bool
+	parameters       map[*ir.Name]*ir.Name
+	results          map[*ir.Name]*ir.Name
+	resultValues     []*ir.Name
+	resultPtrs       []*ir.Name
+	factory          *ir.Func
+	factoryABI       FactoryABI
+	fusedAwaits      map[*ir.CallExpr]bool
+	fusedRequests    map[*ir.CallExpr]bool
+	fusedChunkProofs map[*ir.CallExpr]ir.Node
+	fusedFrame       bool
+	fusedResume      bool
+	fusedSelf        bool
+	frameType        *types.Type
+	frameChunkLength int64
+	selfAwait        bool
+	selfSpawn        bool
 }
 
 type lowerDirectCall struct {
@@ -333,6 +367,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 		}
 		result.Lowered++
 	}
+	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
 		if function.Primary == CoroPrimary {
 			result.Skipped++
@@ -1394,6 +1429,29 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 				}
 				candidate.fusedRequests[call] = true
 				child.fusedResume = true
+			}
+		}
+	}
+}
+
+// resolveFusedFrameChunkProofs enables chunk reuse across different resume
+// entries only after every generated frame type is available. Structural
+// identity proves the allocation has the same pointer bitmap, while the
+// allocator check requires each complete chunk to save heap bytes.
+func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
+	for _, parent := range candidates {
+		for call, proof := range parent.fusedChunkProofs {
+			edge := edgeForCall(parent.function, call)
+			child := candidates[edge.Callee]
+			compatible := parent.fusedFrame && child != nil &&
+				parent.frameType != nil && child.frameType != nil &&
+				parent.frameChunkLength == explicitLargeFrameChunkSize &&
+				child.frameChunkLength == parent.frameChunkLength &&
+				types.Identical(parent.frameType, child.frameType) &&
+				explicitFrameChunkReducesAllocation(child.frameType.Size(),
+					child.frameChunkLength)
+			if compatible {
+				proof.SetVal(constant.MakeBool(true))
 			}
 		}
 	}
@@ -2927,9 +2985,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			ir.NewDecl(call.Pos(), ir.ODCL, childResume),
 		}
 		if candidate.fusedRequests[call] {
-			setup = append(setup, typecheck.Call(call.Pos(),
+			proof := ir.NewBool(call.Pos(), false)
+			request := typecheck.Call(call.Pos(),
 				typecheck.LookupRuntime("coroRequestFusedFrame"),
-				ir.Nodes{ctx}, false))
+				ir.Nodes{ctx, proof}, false)
+			if candidate.fusedChunkProofs == nil {
+				candidate.fusedChunkProofs = make(map[*ir.CallExpr]ir.Node)
+			}
+			candidate.fusedChunkProofs[call] = request.(*ir.CallExpr).Args[1]
+			setup = append(setup, request)
 		}
 		setup = append(setup, assignment)
 		return lowerFactoryCall{
@@ -3856,6 +3920,8 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)
+	types.CalcSize(frameType)
+	candidate.frameType = frameType
 	framePointerType := types.NewPtr(frameType)
 	frame := typecheck.TempAt(pos, resume, framePointerType)
 
@@ -3980,7 +4046,6 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 
 	factoryFrame := typecheck.TempAt(pos, factory, framePointerType)
 	declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, factoryFrame))
-	types.CalcSize(frameType)
 	factoryResume := typecheck.TempAt(pos, factory, stacklessResumeType())
 	factoryCtx, _ := factory.Type().Param(0).Nname.(*ir.Name)
 	declarations = append(declarations,
@@ -4000,8 +4065,11 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
 	if fusedFrame {
-		frameChunkType := types.NewArray(frameType,
-			explicitFrameChunkLength(frameType.Size()))
+		candidate.frameChunkLength = explicitFrameChunkLength(frameType.Size())
+		if candidate.fusedResume && !candidate.fusedSelf {
+			candidate.frameChunkLength = explicitLargeFrameChunkSize
+		}
+		frameChunkType := types.NewArray(frameType, candidate.frameChunkLength)
 		takeHelper := "coroTakeFusedFrame"
 		takeArgs := ir.Nodes{
 			factoryCtx, factoryResume, frameSize(),

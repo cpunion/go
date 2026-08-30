@@ -1463,8 +1463,8 @@ func stacklessCoroFusedResumeMiddle(ctx unsafe.Pointer) uint8 {
 	switch frame.State {
 	case 0:
 		tracker.trace = append(tracker.trace, "middle")
-		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
-			stacklessCoroFusedResumeLeaf)
+		childPointer := runtime.TakeStacklessCoroUncachedFusedResumeFrameForTest(
+			ctx, stacklessCoroFusedResumeLeaf)
 		if childPointer == nil {
 			childPointer = unsafe.Pointer(
 				new(runtime.StacklessCoroFusedResumeFrameForTest))
@@ -1577,29 +1577,33 @@ func TestStacklessCoroPlainParentFusedAwait(t *testing.T) {
 }
 
 type stacklessCoroFusedFallbackTracker struct {
-	size           uintptr
-	validChunkType bool
-	general        bool
-	firstAction    uint8
-	firstFused     bool
+	size             uintptr
+	validChunkType   bool
+	uncachedGeneral  bool
+	directFusedAwait bool
+	firstAction      uint8
+	firstFused       bool
 }
 
 var stacklessCoroFusedFallbackActive *stacklessCoroFusedFallbackTracker
 
-func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
+func stacklessCoroFusedFallbackResumeFor(ctx unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) uint8 {
 	tracker := stacklessCoroFusedFallbackActive
 	frame := (*runtime.StacklessCoroSelfFrameForTest)(
 		runtime.FrameStacklessCoroForTest(ctx))
 	switch frame.State {
 	case 0:
 		var childPointer unsafe.Pointer
-		if tracker.general {
-			childPointer = runtime.TakeStacklessCoroGeneralFusedFallbackFrameForTest(
-				ctx, stacklessCoroFusedFallbackResume, tracker.size,
-				tracker.validChunkType)
-		} else {
+		switch {
+		case tracker.directFusedAwait:
+		case tracker.uncachedGeneral:
+			childPointer =
+				runtime.TakeStacklessCoroUncachedGeneralFusedFallbackFrameForTest(
+					ctx, resume, tracker.size)
+		default:
 			childPointer = runtime.TakeStacklessCoroFusedFallbackFrameForTest(
-				ctx, stacklessCoroFusedFallbackResume, tracker.size,
+				ctx, resume, tracker.size,
 				tracker.validChunkType)
 		}
 		if childPointer == nil {
@@ -1608,8 +1612,13 @@ func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
 		child := (*runtime.StacklessCoroSelfFrameForTest)(childPointer)
 		*child = runtime.StacklessCoroSelfFrameForTest{State: 2}
 		frame.State = 1
-		tracker.firstAction = runtime.AwaitStacklessCoroSelfFrameForTest(
-			ctx, childPointer, stacklessCoroFusedFallbackResume)
+		if tracker.directFusedAwait {
+			tracker.firstAction = runtime.AwaitStacklessCoroFusedResumeFrameForTest(
+				ctx, childPointer, resume)
+		} else {
+			tracker.firstAction = runtime.AwaitStacklessCoroSelfFrameForTest(
+				ctx, childPointer, resume)
+		}
 		tracker.firstFused = child.Parent != nil
 		return tracker.firstAction
 	case 1, 2:
@@ -1619,34 +1628,50 @@ func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
 	}
 }
 
+func stacklessCoroFusedFallbackResume(ctx unsafe.Pointer) uint8 {
+	return stacklessCoroFusedFallbackResumeFor(ctx,
+		stacklessCoroFusedFallbackResume)
+}
+
+func stacklessCoroUncachedGeneralFusedFallbackResume(ctx unsafe.Pointer) uint8 {
+	return stacklessCoroFusedFallbackResumeFor(ctx,
+		stacklessCoroUncachedGeneralFusedFallbackResume)
+}
+
 func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	defer func() { stacklessCoroFusedFallbackActive = nil }()
 
 	for _, test := range []struct {
-		name           string
-		size           uintptr
-		validChunkType bool
-		general        bool
+		name             string
+		size             uintptr
+		validChunkType   bool
+		uncachedGeneral  bool
+		directFusedAwait bool
 	}{
 		{name: "oversized", size: runtime.StacklessCoroFrameCacheSize + 1,
 			validChunkType: true},
 		{name: "invalid-chunk-type",
 			size: unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{})},
 		{name: "invalid-general-chunk-type",
-			size:    unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{}),
-			general: true},
+			size:            unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{}),
+			uncachedGeneral: true},
+		{name: "unrequested-fused-await", directFusedAwait: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tracker := &stacklessCoroFusedFallbackTracker{
 				size: test.size, validChunkType: test.validChunkType,
-				general: test.general,
+				uncachedGeneral:  test.uncachedGeneral,
+				directFusedAwait: test.directFusedAwait,
 			}
 			stacklessCoroFusedFallbackActive = tracker
 			root := new(runtime.StacklessCoroSelfFrameForTest)
-			runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
-				stacklessCoroFusedFallbackResume)
+			resume := stacklessCoroFusedFallbackResume
+			if test.uncachedGeneral {
+				resume = stacklessCoroUncachedGeneralFusedFallbackResume
+			}
+			runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root), resume)
 			if tracker.firstAction != runtime.StacklessCoroActionWait ||
 				tracker.firstFused {
 				t.Fatalf("first await = (action %d, fused %t), want (%d, false)",
@@ -1658,11 +1683,13 @@ func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
 }
 
 type stacklessCoroFusedResumeDeepTracker struct {
-	completed   int
-	uncached    int
-	panicLeaf   bool
-	firstAction uint8
-	firstFused  bool
+	completed     int
+	uncached      int
+	panicLeaf     bool
+	firstAction   uint8
+	firstFused    bool
+	sawChunkFirst bool
+	sawChunkLast  bool
 }
 
 var stacklessCoroFusedResumeDeepActive *stacklessCoroFusedResumeDeepTracker
@@ -1676,6 +1703,12 @@ func stacklessCoroFusedResumeDeep(ctx unsafe.Pointer,
 	tracker := stacklessCoroFusedResumeDeepActive
 	frame := (*runtime.StacklessCoroFusedResumeFrameForTest)(
 		runtime.FrameStacklessCoroForTest(ctx))
+	allocation := frame.Marker & runtime.StacklessCoroFusedFrameAllocationMask
+	tracker.sawChunkFirst = tracker.sawChunkFirst ||
+		allocation == runtime.StacklessCoroFusedFrameChunkFirst
+	tracker.sawChunkLast = tracker.sawChunkLast ||
+		allocation == runtime.StacklessCoroFusedFrameChunkFirst+
+			runtime.StacklessCoroLargeFrameChunkSize-1
 	switch frame.State {
 	case 0:
 		if frame.Depth == 0 {
@@ -1685,8 +1718,8 @@ func stacklessCoroFusedResumeDeep(ctx unsafe.Pointer,
 			*frame.Value += 1
 			return completeStacklessCoroFusedResume(ctx, frame)
 		}
-		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
-			next)
+		childPointer :=
+			runtime.TakeStacklessCoroCompatibleFusedResumeFrameForTest(ctx, next)
 		if childPointer == nil {
 			tracker.uncached++
 			childPointer = unsafe.Pointer(
@@ -1772,6 +1805,13 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	}
 	if tracker.uncached == 0 {
 		t.Fatal("deep heterogeneous fusion did not cross the frame cache")
+	}
+	wantUncached := runtime.StacklessCoroTaskCacheSize +
+		runtime.StacklessCoroFrameChunkDirectCount
+	if !race.Enabled && (tracker.uncached != wantUncached ||
+		!tracker.sawChunkFirst || !tracker.sawChunkLast) {
+		t.Fatalf("compatible heterogeneous chunks = %+v, want %d direct frames and complete chunks",
+			tracker, wantUncached)
 	}
 }
 
