@@ -1903,3 +1903,66 @@ completion under OrbStack. The translated full Linux runtime remains an
 unsuitable gate because of its existing Rosetta `TestCheckFDs` address-space
 trap. Native Ubuntu and macOS focused jobs are the pull-request gates, and the
 native Linux `all.bash` job runs after a merge reaches `coro/main`.
+
+#### Keep channel operations off the global registry
+
+Revision `40fc6a722f`, based on exact parent `3ac36dd089`, removes ordinary
+channel operations from the global asynchronous-operation registry. A queued
+channel operation is already kept alive by the GC-visible owner pointer in its
+channel waiter. An immediately completed operation remains live on the
+executor stack. The channel path can therefore use a local sentinel identity
+without weakening operation lifetime or race synchronization. File, network,
+and other externally completed operations remain registered. Select remains
+registered so its multi-waiter completion protocol can be changed and measured
+independently.
+
+A rate-one CPU profile of 10,000 simultaneously parked tasks attributed about
+22% of the exact parent's CPU time to removing channel operations from the
+registry. The tasks occupied 16 operation buckets, so repeated removal scanned
+long collision chains. That function disappears from the candidate's profile;
+the remaining time is dominated by scheduler and channel lock transitions,
+yield, and terminal-action processing.
+
+Native Darwin/arm64 timing used one P, three warm-up pairs, and 12 matched
+fresh-process samples in alternating order. Each sample created, parked, and
+woke 10,000 tasks:
+
+| Toolchain | Median | Relative to official Go |
+| --- | ---: | ---: |
+| exact official Go | 10.881 ms | 1.00x |
+| exact parent | 68.623 ms | 6.31x |
+| candidate | 38.419 ms | 3.53x |
+
+The candidate is 44.01% faster than its exact parent, and every matched pair
+moved in the same direction. Allocation and retained-footprint results are
+unchanged because this revision removes indexing rather than ownership:
+
+| Metric for 10,000 parked tasks | Official Go | Candidate |
+| --- | ---: | ---: |
+| allocated bytes | 6,230,992 | 3,405,856 |
+| allocation count | 20,018 | 40,036 |
+| live heap bytes per task | 623.1 | 340.6 |
+| live objects per task | 2.002 | 3.253 |
+| live stack bytes per task | 2,048.0 | 6.554 |
+
+The scale effect is not proportional to ordinary task creation. On the same
+revision, sequential task creation took 138--156 ns versus 310--341 ns for
+official Go, and a 100-task burst took 9.4--10.1 us versus 19--24 us. Parking
+100 tasks was also comparable at 17.5--25.2 us versus 21.9--27.1 us. The
+10,000-task gap instead crosses the 256-entry task and operation caches,
+allocates separate operation and channel-waiter objects, and amplifies
+registry-chain and lock transitions. This revision removes the registry term;
+combining channel allocation ownership and reducing the remaining transitions
+are separate follow-up targets.
+
+A GC regression test parks a receive, verifies that the registry count does
+not change, forces collection, and then completes the receive. Cross-kind
+reuse tests also verify that channel operations never become registered. The
+focused normal and race channel suites, full normal and race runtime suites,
+pull and pull-plus-race comparisons, and `checkptr=2` pass on native
+Darwin/arm64. All runtime-oriented `run` and `runoutput` programs under
+`test/chan` pass with coroutine lowering; the one `errorcheck` generator is
+outside this runtime-focused audit. Focused coverage executes
+`startStacklessCoroChannel` completely and the valid completion paths in
+`finishStacklessCoroChannel`; its remaining branch is the fatal invalid-kind
+invariant.
