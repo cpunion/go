@@ -1901,4 +1901,5 @@ FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests cross-compile at
 the final revision; the Linux/386 and Linux/amd64 stackless suites also run to
 completion under OrbStack. The translated full Linux runtime remains an
 unsuitable gate because of its existing Rosetta `TestCheckFDs` address-space
-trap; native Linux pull-request CI remains the full-suite gate.
+trap. Native Ubuntu and macOS focused jobs are the pull-request gates, and the
+native Linux `all.bash` job runs after a merge reaches `coro/main`.
