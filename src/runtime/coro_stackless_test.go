@@ -3969,6 +3969,55 @@ func TestStacklessCoroChannelWaiterCache(t *testing.T) {
 	cache.CycleAcrossGC()
 }
 
+func TestStacklessCoroChannelOperationRoot(t *testing.T) {
+	type result struct {
+		value    int
+		received bool
+	}
+	channel := make(chan int)
+	started := make(chan struct{})
+	done := make(chan result, 1)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	go func() {
+		state := 0
+		value := -1
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
+					&value, &received)
+				close(started)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		done <- result{value: value, received: received}
+	}()
+	<-started
+	waitStacklessCoroChannelWaiters(t, channel, 0, 1, 1)
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
+	}
+	runtime.GC()
+	channel <- 71
+	select {
+	case got := <-done:
+		if got.value != 71 || !got.received {
+			t.Fatalf("receive after GC = (%d, %t), want (71, true)",
+				got.value, got.received)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel operation did not survive GC")
+	}
+}
+
 func TestStacklessCoroSelectStorageCache(t *testing.T) {
 	cache := runtime.NewStacklessCoroSelectStorageForTest()
 	cache.Cycle(2)
@@ -6000,8 +6049,12 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				return runtime.StacklessCoroActionWait
 			case 1:
 				cacheCount(t, ctx)
-				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
-				tokens[1] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				tokens[1] = runtime.StartStacklessCoroSendIntForTest(ctx,
+					channel, &value)
+				registered := runtime.StacklessCoroOperationTokenForTest(ctx)
+				if registered != nil {
+					t.Fatalf("channel operation registered as %p", registered)
+				}
 				runtime.ReadySleepStacklessCoroForTest(timer)
 				close(startReceiver)
 				state = 2

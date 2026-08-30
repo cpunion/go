@@ -120,6 +120,7 @@ const (
 )
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 const stacklessCoroDeferredSleepOperationID = ^uint64(0)
+const stacklessCoroChannelOperationID = stacklessCoroDeferredSleepOperationID - 1
 
 const (
 	stacklessCoroExecutorStateOff uint32 = iota
@@ -2694,18 +2695,22 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 }
 
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
-	element unsafe.Pointer, received *bool, send bool) {
+	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
 	op := stacklessCoroStartOperation(ctx, "channel")
 	op.channel = channel
 	op.element = element
 	op.received = received
 	op.send = send
-	op.id = registerStacklessCoroOperation(op)
+	// A queued channel waiter retains op through its GC-visible coroutine
+	// owner. Immediate completion retains op on the executor stack. Neither
+	// path needs the process-wide ID registry used by asynchronous sources.
+	op.id = stacklessCoroChannelOperationID
 	if send {
 		chansendStackless(op)
 	} else {
 		chanrecvStackless(op)
 	}
+	return op
 }
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
@@ -2714,7 +2719,7 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
-	if op == nil || takeStacklessCoroOperation(op.id) != op {
+	if op == nil || op.id != stacklessCoroChannelOperationID {
 		throw("runtime: invalid stackless coroutine channel completion")
 	}
 	if waiter != nil {
