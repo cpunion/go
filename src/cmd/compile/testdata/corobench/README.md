@@ -1753,3 +1753,71 @@ type, and marker helpers at 100%. Across changed compiler and runtime blocks,
 `unlock` and `throw` bodies of six fail-closed marker invariants; four invariant
 classes also have fatal subprocess tests, whose counters cannot be returned
 after `throw` terminates the process.
+
+#### Bucket concurrent operation lookup
+
+Revision `28adf7dc48`, based on exact parent `af5fe7c5bd`, replaces the single
+stackless-operation registry chain with 16 chains selected by the monotonically
+assigned operation ID. The old registry prepended new operations. Closing a
+channel wakes its logical waiters in FIFO order, so completing 100 parked tasks
+repeatedly searched near the end of that LIFO chain and performed quadratic
+work. Each bucket retains the existing intrusive link and lock; operation IDs,
+completion validation, recycling, and object layout do not change.
+
+The pointerful bucket array and the bounded netpoll scan cursor live in one
+process-lifetime registry object allocated during runtime initialization. The
+static registry handle therefore remains the same size as the former
+single-list handle: 32 bytes on Darwin/arm64 and 24 bytes on Linux/amd64 in the
+benchmark binaries. Sixteen buckets use 128 bytes of pointer slots on 64-bit
+targets and distribute 64 consecutive operations over four links per chain.
+The netpoll idle retry still examines at most 64 operations, but rotates its
+starting bucket after a bounded or successful pass. Larger concurrent sets
+remain correct through the chains.
+
+The exact parent and candidate used identical compiler flags and probe source,
+disabled inlining, one P, one 50 ms warm-up, alternating execution order, and
+matched randomized linker layouts. Native Darwin/arm64 used ten layouts with
+two 300 ms samples per layout. Linux/amd64 used six layouts under Rosetta with
+the same sampling; its absolute times are directional.
+
+| Probe | Darwin/arm64 parent -> candidate | Linux/amd64 translated parent -> candidate |
+| --- | ---: | ---: |
+| park and wake 100 tasks | 18.96 us -> 12.34 us (-34.88%) | 26.20 us -> 19.61 us (-25.15%) |
+
+The Darwin result improved in all ten layouts (`p<0.001`). Five of the six
+initial Linux layouts improved; the remaining sample coincided with external
+host load, and a five-pair isolated repeat of that exact layout measured
+26.68 us -> 19.86 us (-25.55%, `p=0.008`). The allocation count remains one per
+benchmark iteration, and the runtime operation-size regression test is
+unchanged.
+
+Yield entry, channel round trip, ready select, ready file and TCP reads, scalar
+C calls, and blocking-C handoff had no significant regression. Because the
+one-nanosecond timer does not access this registry but was order-sensitive in
+the combined run, it was also measured alone in fresh processes for every
+layout. Darwin measured 147.3 ns -> 148.3 ns (+0.68%, boundary `p=0.045`), and
+translated Linux measured 205.1 ns -> 209.2 ns (neutral, `p=0.418`); both
+retained zero bytes and zero allocations. The small unrelated Darwin movement
+is treated as address-layout noise rather than registry-path cost.
+
+A focused native Darwin CPU profile reduced
+`takeStacklessCoroOperation` from 30.80% to 1.89% flat CPU and from 32.13% to
+3.79% cumulative CPU. Its five-second task-park measurement improved from
+19.154 us to 12.599 us while retaining one allocation per benchmark iteration.
+
+Regression tests force two IDs into one bucket, find and remove both positions
+in the collision chain, reject stale and repeated removal, and force more than
+the 64-operation netpoll scan bound into one bucket. The focused profile covers
+registration at 90%, take, find, and bucket selection at 100%, and bounded
+netpoll scanning at 96%; the uncovered registration statement is the 64-bit ID
+wrap defense.
+
+The full runtime, race, pull, pull-plus-race, and `checkptr=2` tests pass on
+native Darwin/arm64. On translated Linux/amd64, the focused normal and race
+tests, pull, pull-plus-race, `checkptr=2`, `go vet runtime`, experiment-off
+compilation, and the complete lowering, symbol, allocation, and public-read
+audit pass. Linux/386, Linux/arm64, Linux/riscv64, FreeBSD/amd64,
+Windows/amd64, and Darwin/amd64 runtime tests cross-compile with the experiment
+enabled. The preceding `coro/main` merge is green in the focused macOS and
+Ubuntu jobs and the native Linux `all.bash` job; the pull request CI remains
+the native full-suite gate for this revision.

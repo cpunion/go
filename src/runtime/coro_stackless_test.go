@@ -6113,6 +6113,12 @@ func TestStacklessCoroOperationRegistry(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroOperationRegistryScan(t *testing.T) {
+	if !runtime.CheckStacklessCoroOperationRegistryScanForTest() {
+		t.Fatal("operation registry scan did not rotate after its bound")
+	}
+}
+
 func TestStacklessCoroEarlyReady(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		if !runtime.CheckEarlyReadyStacklessCoroForTest() {
