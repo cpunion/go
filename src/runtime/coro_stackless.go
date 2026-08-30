@@ -152,6 +152,10 @@ const (
 	stacklessCoroTaskFusedPending
 	stacklessCoroTaskFusedChunk
 	stacklessCoroTaskSwitchPending
+	stacklessCoroTaskFusedTransitionMask = stacklessCoroTaskFusedRequested |
+		stacklessCoroTaskFusedPending | stacklessCoroTaskFusedChunk
+	stacklessCoroTaskCompletionMask = stacklessCoroTaskFusedFrames |
+		stacklessCoroTaskFusedTransitionMask | stacklessCoroTaskSwitchPending
 )
 
 type stacklessCoroTask struct {
@@ -945,11 +949,7 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 	if task == &s.root || !validFrame || task.parent != nil ||
 		task.next != nil || task.state != stacklessCoroTaskComplete ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
-		task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskFusedRequested) ||
-		task.hasFlag(stacklessCoroTaskFusedPending) ||
-		task.hasFlag(stacklessCoroTaskFusedChunk) ||
-		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.flags&stacklessCoroTaskCompletionMask != 0 ||
 		task.resuming || task.readyPending ||
 		task.context.scheduler != nil ||
 		hasTerminalValue {
@@ -1285,8 +1285,8 @@ func coroFrameNeedsClear(ctx unsafe.Pointer) bool {
 		task.state != stacklessCoroTaskRunning || !task.resuming {
 		throw("runtime: invalid stackless coroutine frame-clear query")
 	}
-	return task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskCacheFrame) ||
+	return task.flags&(stacklessCoroTaskFusedFrames|
+		stacklessCoroTaskCacheFrame) != 0 ||
 		isStacklessCoroFrameChunkElement(task.frameSize)
 }
 
@@ -1486,9 +1486,8 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
-		parent.hasFlag(stacklessCoroTaskFusedPending) ||
-		parent.hasFlag(stacklessCoroTaskFusedChunk) ||
-		parent.hasFlag(stacklessCoroTaskSwitchPending) ||
+		parent.flags&(stacklessCoroTaskFusedPending|
+			stacklessCoroTaskFusedChunk|stacklessCoroTaskSwitchPending) != 0 ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine self-frame reservation outside resume")
@@ -1567,9 +1566,10 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 	}
 	s := context.scheduler
 	lock(&s.lock)
+	pendingFlags := parent.flags & (stacklessCoroTaskFusedPending |
+		stacklessCoroTaskFusedChunk)
 	if raceenabled || stacklessCoroIsPullComparison(s) ||
-		!parent.hasFlag(stacklessCoroTaskFusedPending) || parent.resume == nil ||
-		parent.hasFlag(stacklessCoroTaskFusedChunk) ||
+		pendingFlags != stacklessCoroTaskFusedPending || parent.resume == nil ||
 		stacklessCoroResumeIdentity(parent.resume) !=
 			stacklessCoroResumeIdentity(child) {
 		unlock(&s.lock)
@@ -1646,10 +1646,8 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
-		!task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskFusedPending) ||
-		task.hasFlag(stacklessCoroTaskFusedChunk) ||
-		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.flags&stacklessCoroTaskCompletionMask !=
+			stacklessCoroTaskFusedFrames ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine self-frame completion outside resume")
@@ -1714,19 +1712,15 @@ func coroRequestFusedFrame(ctx unsafe.Pointer, chunkCompatible bool) {
 	}
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
-		parent.hasFlag(stacklessCoroTaskFusedRequested) ||
-		parent.hasFlag(stacklessCoroTaskFusedPending) ||
-		parent.hasFlag(stacklessCoroTaskFusedChunk) ||
-		parent.hasFlag(stacklessCoroTaskSwitchPending) ||
+		parent.flags&(stacklessCoroTaskFusedTransitionMask|
+			stacklessCoroTaskSwitchPending) != 0 ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine fused-frame request outside resume")
 	}
-	requestFlags := stacklessCoroTaskFusedRequested
-	if chunkCompatible {
-		requestFlags |= stacklessCoroTaskFusedChunk
-	}
-	parent.flags |= requestFlags
+	parent.flags |= stacklessCoroTaskFusedRequested |
+		stacklessCoroTaskFlags(bool2int(chunkCompatible))*
+			stacklessCoroTaskFusedChunk
 	unlock(&s.lock)
 }
 
@@ -1757,14 +1751,16 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
-		parent.hasFlag(stacklessCoroTaskFusedPending) ||
-		parent.hasFlag(stacklessCoroTaskSwitchPending) ||
+		parent.flags&(stacklessCoroTaskFusedPending|
+			stacklessCoroTaskSwitchPending) != 0 ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine fused-frame reservation outside resume")
 	}
-	requested := parent.hasFlag(stacklessCoroTaskFusedRequested)
-	requestedChunk := parent.hasFlag(stacklessCoroTaskFusedChunk)
+	requestFlags := parent.flags & (stacklessCoroTaskFusedRequested |
+		stacklessCoroTaskFusedChunk)
+	requested := requestFlags&stacklessCoroTaskFusedRequested != 0
+	requestedChunk := requestFlags&stacklessCoroTaskFusedChunk != 0
 	if !requested && requestedChunk {
 		unlock(&s.lock)
 		throw("runtime: unrequested stackless coroutine fused frame chunk")
@@ -1805,7 +1801,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		task.parent = parent
 	}
 	if task != nil {
-		parent.setFlag(stacklessCoroTaskFusedPending, true)
+		parent.flags |= stacklessCoroTaskFusedPending
 		task.next = s.reservedTasks
 		s.reservedTasks = task
 		frame := task.context.frame
@@ -1814,7 +1810,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	chunkCompatible := sameResume || requestedChunk
 	if !chunkCompatible {
-		parent.setFlag(stacklessCoroTaskFusedPending, true)
+		parent.flags |= stacklessCoroTaskFusedPending
 		unlock(&s.lock)
 		return nil
 	}
@@ -1880,13 +1876,14 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 	}
 	s := context.scheduler
 	lock(&s.lock)
-	if parent.hasFlag(stacklessCoroTaskFusedRequested) {
+	transitionFlags := parent.flags & stacklessCoroTaskFusedTransitionMask
+	if transitionFlags&stacklessCoroTaskFusedRequested != 0 {
 		unlock(&s.lock)
 		throw("runtime: unconsumed stackless coroutine fused-frame request")
 	}
-	pendingChunk := parent.hasFlag(stacklessCoroTaskFusedChunk)
+	pendingChunk := transitionFlags&stacklessCoroTaskFusedChunk != 0
 	if raceenabled || stacklessCoroIsPullComparison(s) ||
-		!parent.hasFlag(stacklessCoroTaskFusedPending) {
+		transitionFlags&stacklessCoroTaskFusedPending == 0 {
 		if pendingChunk {
 			unlock(&s.lock)
 			throw("runtime: unconsumed stackless coroutine fused frame chunk")
@@ -2001,11 +1998,8 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
-		!task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskFusedRequested) ||
-		task.hasFlag(stacklessCoroTaskFusedPending) ||
-		task.hasFlag(stacklessCoroTaskFusedChunk) ||
-		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.flags&stacklessCoroTaskCompletionMask !=
+			stacklessCoroTaskFusedFrames ||
 		task.terminal != stacklessCoroTerminalNone ||
 		task.goexit {
 		unlock(&s.lock)
@@ -3331,9 +3325,7 @@ func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine panic recovery")
 	}
 	s.discardFusedFramesLocked(task)
-	task.setFlag(stacklessCoroTaskFusedRequested, false)
-	task.setFlag(stacklessCoroTaskFusedPending, false)
-	task.setFlag(stacklessCoroTaskFusedChunk, false)
+	task.flags &^= stacklessCoroTaskFusedTransitionMask
 	s.cancelReservedFrameTasksLocked(task)
 	task.resuming = false
 	s.readyLocked(task)
@@ -3354,11 +3346,7 @@ func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bo
 		task.parent != nil || task.next != nil ||
 		task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
-		task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskFusedRequested) ||
-		task.hasFlag(stacklessCoroTaskFusedPending) ||
-		task.hasFlag(stacklessCoroTaskFusedChunk) ||
-		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.flags&stacklessCoroTaskCompletionMask != 0 ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		return false
 	}
@@ -3376,11 +3364,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
-		task.hasFlag(stacklessCoroTaskFusedFrames) ||
-		task.hasFlag(stacklessCoroTaskFusedRequested) ||
-		task.hasFlag(stacklessCoroTaskFusedPending) ||
-		task.hasFlag(stacklessCoroTaskFusedChunk) ||
-		task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.flags&stacklessCoroTaskCompletionMask != 0 ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
@@ -3444,9 +3428,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine termination")
 	}
 	s.discardFusedFramesLocked(task)
-	task.setFlag(stacklessCoroTaskFusedRequested, false)
-	task.setFlag(stacklessCoroTaskFusedPending, false)
-	task.setFlag(stacklessCoroTaskFusedChunk, false)
+	task.flags &^= stacklessCoroTaskFusedTransitionMask
 	s.cancelReservedFrameTasksLocked(task)
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
@@ -3495,9 +3477,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine Goexit termination")
 	}
 	s.discardFusedFramesLocked(task)
-	task.setFlag(stacklessCoroTaskFusedRequested, false)
-	task.setFlag(stacklessCoroTaskFusedPending, false)
-	task.setFlag(stacklessCoroTaskFusedChunk, false)
+	task.flags &^= stacklessCoroTaskFusedTransitionMask
 	s.cancelReservedFrameTasksLocked(task)
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
