@@ -507,6 +507,21 @@ func StacklessCoroOperationSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroOperation{})
 }
 
+func StacklessCoroChannelOperationSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroChannelOperation{})
+}
+
+func NewStacklessCoroChannelOperationForTest() unsafe.Pointer {
+	return unsafe.Pointer(newStacklessCoroChannelOperation())
+}
+
+func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
+	op := (*stacklessCoroOperation)(token)
+	return op != nil && validReleasedStacklessCoroSudog(op.waiter) &&
+		unsafe.Pointer(op.waiter) == add(token,
+			unsafe.Offsetof(stacklessCoroChannelOperation{}.waiter))
+}
+
 func StacklessCoroSchedulerSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroScheduler{})
 }

@@ -984,12 +984,28 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := 22 * ptrSize
+	wantChannel := uintptr(288)
 	if ptrSize == 4 {
 		want = 26 * ptrSize
+		wantChannel = 172
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine operation size = %d, want %d", got, want)
 	}
+	if got := runtime.StacklessCoroChannelOperationSizeForTest(); got != wantChannel {
+		t.Fatalf("stackless coroutine channel operation size = %d, want %d",
+			got, wantChannel)
+	}
+	var token unsafe.Pointer
+	if got := testing.AllocsPerRun(100, func() {
+		token = runtime.NewStacklessCoroChannelOperationForTest()
+	}); got != 1 {
+		t.Fatalf("stackless coroutine channel operation allocations = %v, want 1", got)
+	}
+	if !runtime.StacklessCoroChannelOperationValidForTest(token) {
+		t.Fatal("stackless coroutine channel operation did not embed its waiter")
+	}
+	runtime.KeepAlive(token)
 }
 
 func TestStacklessCoroSchedulerSize(t *testing.T) {
