@@ -61,6 +61,42 @@ func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {
 	return
 }
 
+func stacklessCoroNativeSelfFrameCacheBytes(ctx *stacklessCoroNativeContext) uintptr {
+	return uintptr(ctx.selfFrameCount)*ctx.selfFrameSize +
+		uintptr(ctx.selfFrameChunkCount)*ctx.selfFrameChunkSize
+}
+
+func StacklessCoroNativePoolSelfFrameCacheForTest() (warm, overflow,
+	perContextLimit, chunkLimit uintptr) {
+	chunkLimit = stacklessCoroSelfFrameChunkCacheSize
+	perContextLimit = stacklessCoroSelfFrameChunkCacheSize +
+		stacklessCoroFrameChunkDirectCount*
+			(stacklessCoroSelfFrameChunkCacheSize/stacklessCoroLargeFrameChunkSize)
+	for i := range stacklessCoroNativePool.slots {
+		slot := &stacklessCoroNativePool.slots[i]
+		for {
+			ctx := slot.Load()
+			if ctx == nil {
+				break
+			}
+			if !slot.CompareAndSwap(ctx, nil) {
+				continue
+			}
+			warm += stacklessCoroNativeSelfFrameCacheBytes(ctx)
+			if !slot.CompareAndSwap(nil, ctx) {
+				releaseStacklessCoroNativeContext(ctx)
+			}
+			break
+		}
+	}
+	lock(&stacklessCoroNativePool.lock)
+	for ctx := stacklessCoroNativePool.overflow; ctx != nil; ctx = ctx.poolNext {
+		overflow += stacklessCoroNativeSelfFrameCacheBytes(ctx)
+	}
+	unlock(&stacklessCoroNativePool.lock)
+	return
+}
+
 func StacklessCoroClearNativeTaskCachesForTest() int {
 	count := 0
 	for i := range stacklessCoroNativePool.slots {
@@ -78,6 +114,14 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 			ctx.freeFrameBytes = 0
 			ctx.cachedFrameTasks = 0
 			ctx.cachedFrameBytes = 0
+			ctx.selfFrames = nil
+			ctx.selfFrameChunks = nil
+			ctx.selfFrameResume = nil
+			ctx.selfFrameChunkType = nil
+			ctx.selfFrameSize = 0
+			ctx.selfFrameChunkSize = 0
+			ctx.selfFrameChunkCount = 0
+			ctx.selfFrameCount = 0
 			if !slot.CompareAndSwap(nil, ctx) {
 				releaseStacklessCoroNativeContext(ctx)
 			}

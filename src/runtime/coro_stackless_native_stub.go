@@ -6,6 +6,8 @@
 
 package runtime
 
+import "unsafe"
+
 type stacklessCoroNativeDriver struct{}
 
 func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool) *stacklessCoroScheduler {
@@ -20,6 +22,15 @@ func (*stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
 
 func coroRunOnNativeStack(*stacklessCoroScheduler) *stacklessCoroScheduler {
 	return nil
+}
+
+func takeStacklessCoroNativeSelfFrame(stacklessCoroResume,
+	uintptr, *_type, bool) unsafe.Pointer {
+	return nil
+}
+
+func cacheStacklessCoroNativeSelfFrame(stacklessCoroResume, unsafe.Pointer,
+	uint8) {
 }
 
 //go:nosplit

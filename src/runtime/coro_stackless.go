@@ -1588,14 +1588,24 @@ func validStacklessCoroSelfFrameMarker(marker uint8) bool {
 }
 
 func allocateStacklessCoroSelfFrame(frame unsafe.Pointer, size uintptr,
-	chunkType *_type, marker uint8) unsafe.Pointer {
+	chunkType *_type, resume stacklessCoroResume, marker uint8,
+	reuse bool) unsafe.Pointer {
 	allocation := marker & stacklessCoroFusedFrameAllocationMask
 	chunkLast := stacklessCoroFusedFrameChunkLastFor(marker)
 	switch {
 	case allocation == 0 || allocation < stacklessCoroFusedFrameDirectLast:
+		if reuse {
+			return takeStacklessCoroNativeSelfFrame(resume, size, chunkType, false)
+		}
 		return nil
 	case allocation == stacklessCoroFusedFrameDirectLast ||
 		allocation == chunkLast:
+		if reuse {
+			if frame := takeStacklessCoroNativeSelfFrame(resume, size, chunkType,
+				true); frame != nil {
+				return frame
+			}
+		}
 		return newobject(chunkType)
 	case allocation >= stacklessCoroFusedFrameChunkFirst &&
 		allocation < chunkLast:
@@ -1671,7 +1681,7 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		}
 		parent.setFlag(stacklessCoroTaskFusedPending, true)
 		return allocateStacklessCoroSelfFrame(context.frame, size,
-			chunkType, header.marker)
+			chunkType, child, header.marker, true)
 	}
 	lock(&s.lock)
 	if stacklessCoroIsPullComparison(s) {
@@ -1729,8 +1739,10 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 	marker := header.marker
 	frame := context.frame
+	reuse := !stacklessCoroIsPullComparison(s)
 	unlock(&s.lock)
-	return allocateStacklessCoroSelfFrame(frame, size, chunkType, marker)
+	return allocateStacklessCoroSelfFrame(frame, size, chunkType, child, marker,
+		reuse)
 }
 
 // coroAwaitSelfFrame switches a homogeneous structured self-await to its next
@@ -1856,12 +1868,18 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 			task.terminal != stacklessCoroTerminalNone || task.goexit {
 			throw("runtime: invalid stackless coroutine local self-frame completion")
 		}
+		allocation := header.marker & stacklessCoroFusedFrameAllocationMask
 		parentFrame := header.parent
 		header.parent = nil
 		header.marker = 0
 		context.frame = parentFrame
 		parentHeader := (*stacklessCoroFusedFrameHeader)(parentFrame)
 		task.setFlag(stacklessCoroTaskFusedFrames, parentHeader.parent != nil)
+		if (allocation >= stacklessCoroFusedFrameDirectFirst &&
+			allocation <= stacklessCoroFusedFrameDirectLast) ||
+			allocation == stacklessCoroFusedFrameChunkFirst {
+			cacheStacklessCoroNativeSelfFrame(task.resume, frame, allocation)
+		}
 		if s.runnableState.Load() == 0 {
 			task.setFlag(stacklessCoroTaskSwitchPending, true)
 			return stacklessCoroActionSwitch
@@ -1900,6 +1918,12 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	context.frame = parentFrame
 	parentHeader := (*stacklessCoroFusedFrameHeader)(parentFrame)
 	task.setFlag(stacklessCoroTaskFusedFrames, parentHeader.parent != nil)
+	if !stacklessCoroIsPullComparison(s) &&
+		((allocation >= stacklessCoroFusedFrameDirectFirst &&
+			allocation <= stacklessCoroFusedFrameDirectLast) ||
+			allocation == stacklessCoroFusedFrameChunkFirst) {
+		cacheStacklessCoroNativeSelfFrame(task.resume, frame, allocation)
+	}
 	if owner != nil {
 		owner.state = stacklessCoroTaskComplete
 		s.recycleTaskLocked(owner)
