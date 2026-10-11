@@ -2082,3 +2082,90 @@ focused coverage, and the common operation-start helper executes both fresh
 allocation choices. Linux/386 runs the exact 32-bit size and one-allocation
 test; Linux/amd64, Linux/arm64, Linux/riscv64, FreeBSD/amd64, Windows/amd64,
 and Darwin/amd64 runtime tests cross-compile with the experiment enabled.
+
+#### Continue and reuse homogeneous self frames
+
+The two code commits ending at revision `a00b1b397a`, based on exact code
+parent `fac9f4e56a`, remove two independent costs from deep homogeneous
+recursion. Revision `dffa1c107c` keeps an uncontended self-frame transition in
+the current generated resume invocation. Revision `a00b1b397a` reuses the
+resulting typed frame storage on a bounded native executor context.
+
+For a compiler-proven self-only explicit frame, lowering now places a reload
+label immediately before the generated frame load. A self-frame await or
+completion that returns `Switch` consumes its private pending transition and
+jumps back to that label. A real `Yield` still returns to the logical scheduler
+when another coroutine is runnable. The runtime side performs the matching
+uncached self-frame reservation, await, and completion without taking the
+scheduler lock only while the running task exclusively owns a validated
+homogeneous lineage. Race and pull-comparison builds retain the serialized
+path. This is entirely compiler-generated; it adds no source annotation and
+does not alter the public coroutine ABI.
+
+The local loop removes scheduler dispatch but does not remove the allocation
+required when logical frames replace a growing Go stack. Each supported native
+executor therefore retains one exact `(resume, frame size, chunk type)` cache.
+It keeps at most the six direct-prefix frames and 256 KiB of typed chunks. A
+different key drops the old roots instead of accumulating type diversity. Only
+normally completed, compiler-cleared frames enter the cache; panic and Goexit
+paths do not retain active storage. The first frame header is the free-list link
+after its parent, owner, and marker fields have been cleared. Exact runtime type
+identity preserves the GC pointer bitmap. The four-context warm pool may retain
+these caches, while contexts created for peak concurrency clear them before
+entering the overflow pool.
+
+The fixed allocation audit uses identical source, disabled inlining, one P,
+and repeated fixed-count samples. Its exact native Darwin/arm64 results are:
+
+| Probe | Exact parent | Local loop plus cache | Change |
+| --- | ---: | ---: | ---: |
+| self recursion, depth 4096 | 215,424 B, 486 allocs | 0 B, 0 allocs | all steady-state allocation removed |
+| large-frame self recursion, depth 512 | 2,752,256 B, 131 allocs | 2,458,880 B, 113 allocs | -10.66% bytes, -13.74% allocs |
+
+The ordinary 4096-depth frame set fits within the cache bound. The deliberately
+large frame does not, so it verifies that excess storage remains ordinary GC
+work instead of expanding retained memory.
+
+Twelve rotating-order fixed-count samples also compared exact official Go at
+the series merge base `603439a1c6`, the exact parent, the local-loop-only
+revision, and the final revision. The host was heavily loaded, so these
+medians establish direction rather than a stable absolute latency:
+
+| Toolchain | Recursive yield, depth 4096 |
+| --- | ---: |
+| exact official Go | 38.321 us |
+| exact coroutine parent | 668.406 us |
+| local loop only | 522.015 us |
+| local loop plus cache | 253.476 us |
+
+The final revision is 62.08% faster than its exact coroutine parent in that
+run and remains 6.61x slower than official Go. The remaining gap includes the
+explicit state-machine reload and completion protocol; official Go instead
+uses native calls on a reusable growing stack.
+
+Regression tests run two complete recursive rounds and require address reuse
+for both a direct frame and a typed chunk, verify that a pointer field is clear
+before reuse, fill the chunk cache to its exact byte bound, and require zero
+retention in overflow contexts. Separate tests cover the compiler rewrite,
+local `Switch` consumption, logical-sibling fairness, timer waits, panic,
+Goexit, race, pull comparison, and `checkptr=2`. The complete compiler coroutine
+suite reports 93.5% statement coverage. Focused native-cache coverage executes
+all valid take and insertion paths, the chunk capacity rejection, key
+replacement, direct and chunk reuse, and overflow disposal; its uncovered
+branches are fatal internal-consistency guards.
+
+The full runtime suite and the normal, race, pull, pull-plus-race, and
+`checkptr=2` stackless suites pass on native Darwin/arm64, as do the complete
+compiler coroutine suite, `go vet runtime`, experiment-off compilation, the
+complete benchmark audit, and the runtime-oriented `test/chan` programs. A
+fresh Linux/amd64 toolchain reproduces both exact allocation results above and
+passes the same focused runtime modes, the affected compiler lowering and
+integration tests, `go vet runtime`, experiment-off compilation, and the
+complete benchmark audit. Its highly parallel convergence build first hit the
+translated environment's existing asynchronous-preemption address-space trap;
+a low-parallelism build with bootstrap asynchronous preemption disabled
+completed, and the generated toolchain then passed its runtime tests with
+ordinary asynchronous preemption enabled. Native Ubuntu CI remains the full
+Linux gate. Linux/386, Linux/amd64, Linux/arm64, Linux/riscv64,
+FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests cross-compile with
+the experiment enabled.
