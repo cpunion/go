@@ -1587,6 +1587,58 @@ func validStacklessCoroSelfFrameMarker(marker uint8) bool {
 			stacklessCoroFusedFrameChunkLastFor(marker)
 }
 
+func allocateStacklessCoroSelfFrame(frame unsafe.Pointer, size uintptr,
+	chunkType *_type, resume stacklessCoroResume, marker uint8,
+	reuse bool) unsafe.Pointer {
+	allocation := marker & stacklessCoroFusedFrameAllocationMask
+	chunkLast := stacklessCoroFusedFrameChunkLastFor(marker)
+	switch {
+	case allocation == 0 || allocation < stacklessCoroFusedFrameDirectLast:
+		if reuse {
+			return takeStacklessCoroNativeSelfFrame(resume, size, chunkType, false)
+		}
+		return nil
+	case allocation == stacklessCoroFusedFrameDirectLast ||
+		allocation == chunkLast:
+		if reuse {
+			if frame := takeStacklessCoroNativeSelfFrame(resume, size, chunkType,
+				true); frame != nil {
+				return frame
+			}
+		}
+		return newobject(chunkType)
+	case allocation >= stacklessCoroFusedFrameChunkFirst &&
+		allocation < chunkLast:
+		return add(frame, size)
+	default:
+		throw("runtime: invalid stackless coroutine self-frame allocation")
+		return nil
+	}
+}
+
+func nextStacklessCoroSelfFrameMarker(marker uint8) uint8 {
+	flags := marker & (stacklessCoroFusedFrameChunkValidated |
+		stacklessCoroFusedFrameShortChunk)
+	allocation := marker & stacklessCoroFusedFrameAllocationMask
+	chunkLast := stacklessCoroFusedFrameChunkLastFor(marker)
+	switch {
+	case allocation == 0:
+		return flags | stacklessCoroFusedFrameDirectFirst
+	case allocation >= stacklessCoroFusedFrameDirectFirst &&
+		allocation < stacklessCoroFusedFrameDirectLast:
+		return flags | (allocation + 1)
+	case allocation == stacklessCoroFusedFrameDirectLast ||
+		allocation == chunkLast:
+		return flags | stacklessCoroFusedFrameChunkFirst
+	case allocation >= stacklessCoroFusedFrameChunkFirst &&
+		allocation < chunkLast:
+		return flags | (allocation + 1)
+	default:
+		throw("runtime: invalid stackless coroutine self-frame transition")
+		return 0
+	}
+}
+
 // coroTakeSelfFrame keeps the homogeneous recursive fast path separate from
 // heterogeneous fusion. Matching resumes need neither a request transition
 // nor an extended frame header.
@@ -1611,6 +1663,26 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 
 	s := context.scheduler
+	header := (*stacklessCoroFusedFrameHeader)(context.frame)
+	if !stacklessCoroIsPullComparison(s) &&
+		header.marker&stacklessCoroFusedFrameAllocationMask != 0 &&
+		header.marker&stacklessCoroFusedFrameChunkValidated != 0 &&
+		validStacklessCoroSelfFrameMarker(header.marker) &&
+		header.parent != nil && header.owner == nil {
+		// An uncached homogeneous lineage is owned exclusively by its running
+		// task. Its typed chunk was validated before the first uncached frame,
+		// so later elements do not need scheduler-cache serialization.
+		if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending ||
+			parent.flags&(stacklessCoroTaskFusedPending|
+				stacklessCoroTaskFusedChunk|stacklessCoroTaskSwitchPending) != 0 ||
+			parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+			throw("runtime: invalid stackless coroutine local self-frame reservation")
+		}
+		parent.setFlag(stacklessCoroTaskFusedPending, true)
+		return allocateStacklessCoroSelfFrame(context.frame, size,
+			chunkType, child, header.marker, true)
+	}
 	lock(&s.lock)
 	if stacklessCoroIsPullComparison(s) {
 		unlock(&s.lock)
@@ -1624,7 +1696,6 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine self-frame reservation outside resume")
 	}
-	header := (*stacklessCoroFusedFrameHeader)(context.frame)
 	if header.marker&stacklessCoroFusedFrameChunkValidated == 0 {
 		if !validStacklessCoroSelfFrameMarker(header.marker) {
 			unlock(&s.lock)
@@ -1666,24 +1737,12 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return frame
 	}
-	marker := header.marker & stacklessCoroFusedFrameAllocationMask
-	chunkLast := stacklessCoroFusedFrameChunkLastFor(header.marker)
+	marker := header.marker
 	frame := context.frame
+	reuse := !stacklessCoroIsPullComparison(s)
 	unlock(&s.lock)
-
-	switch {
-	case marker == 0 || marker < stacklessCoroFusedFrameDirectLast:
-		return nil
-	case marker == stacklessCoroFusedFrameDirectLast ||
-		marker == chunkLast:
-		return newobject(chunkType)
-	case marker >= stacklessCoroFusedFrameChunkFirst &&
-		marker < chunkLast:
-		return add(frame, size)
-	default:
-		throw("runtime: invalid stackless coroutine self-frame allocation")
-		return nil
-	}
+	return allocateStacklessCoroSelfFrame(frame, size, chunkType, child, marker,
+		reuse)
 }
 
 // coroAwaitSelfFrame switches a homogeneous structured self-await to its next
@@ -1697,6 +1756,43 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		throw("runtime: invalid stackless coroutine self-frame await")
 	}
 	s := context.scheduler
+	parentHeader := (*stacklessCoroFusedFrameHeader)(context.frame)
+	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		parentHeader.marker&stacklessCoroFusedFrameAllocationMask != 0 &&
+		parentHeader.marker&stacklessCoroFusedFrameChunkValidated != 0 &&
+		validStacklessCoroSelfFrameMarker(parentHeader.marker) &&
+		parentHeader.parent != nil && parentHeader.owner == nil {
+		// No scheduler-owned task retains an uncached frame. The active task
+		// exclusively owns its frame link and flags until this resume returns;
+		// runnableState supplies the same fairness snapshot as the locked path.
+		pendingFlags := parent.flags & (stacklessCoroTaskFusedPending |
+			stacklessCoroTaskFusedChunk)
+		if pendingFlags != stacklessCoroTaskFusedPending ||
+			parent.resume == nil ||
+			stacklessCoroResumeIdentity(parent.resume) !=
+				stacklessCoroResumeIdentity(child) ||
+			parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending ||
+			parent.hasFlag(stacklessCoroTaskSwitchPending) ||
+			parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+			throw("runtime: invalid stackless coroutine local self-frame await")
+		}
+		childHeader := (*stacklessCoroFusedFrameHeader)(frame)
+		if childHeader.parent != nil || childHeader.owner != nil ||
+			childHeader.marker != 0 {
+			throw("runtime: invalid initialized stackless coroutine local self frame")
+		}
+		parent.setFlag(stacklessCoroTaskFusedPending, false)
+		childHeader.marker = nextStacklessCoroSelfFrameMarker(parentHeader.marker)
+		childHeader.parent = context.frame
+		context.frame = frame
+		parent.setFlag(stacklessCoroTaskFusedFrames, true)
+		if s.runnableState.Load() == 0 {
+			parent.setFlag(stacklessCoroTaskSwitchPending, true)
+			return stacklessCoroActionSwitch
+		}
+		return stacklessCoroActionYield
+	}
 	lock(&s.lock)
 	pendingFlags := parent.flags & (stacklessCoroTaskFusedPending |
 		stacklessCoroTaskFusedChunk)
@@ -1717,7 +1813,6 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 	}
 	parent.setFlag(stacklessCoroTaskFusedPending, false)
 	childHeader := (*stacklessCoroFusedFrameHeader)(frame)
-	parentHeader := (*stacklessCoroFusedFrameHeader)(context.frame)
 	if childHeader.parent != nil || childHeader.owner != nil ||
 		childHeader.marker != 0 {
 		unlock(&s.lock)
@@ -1727,32 +1822,16 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine parent self-frame marker")
 	}
-	chunkFlag := parentHeader.marker & (stacklessCoroFusedFrameChunkValidated |
-		stacklessCoroFusedFrameShortChunk)
-	childHeader.marker = chunkFlag
 	owner := s.takeReservedFrameTaskLocked(parent, frame, child)
 	if owner != nil {
 		owner.parent = nil
 		childHeader.owner = owner
+		childHeader.marker = parentHeader.marker &
+			(stacklessCoroFusedFrameChunkValidated |
+				stacklessCoroFusedFrameShortChunk)
 	} else {
-		marker := parentHeader.marker & stacklessCoroFusedFrameAllocationMask
-		chunkLast := stacklessCoroFusedFrameChunkLastFor(parentHeader.marker)
-		switch {
-		case marker == 0:
-			childHeader.marker |= stacklessCoroFusedFrameDirectFirst
-		case marker >= stacklessCoroFusedFrameDirectFirst &&
-			marker < stacklessCoroFusedFrameDirectLast:
-			childHeader.marker |= marker + 1
-		case marker == stacklessCoroFusedFrameDirectLast ||
-			marker == chunkLast:
-			childHeader.marker |= stacklessCoroFusedFrameChunkFirst
-		case marker >= stacklessCoroFusedFrameChunkFirst &&
-			marker < chunkLast:
-			childHeader.marker |= marker + 1
-		default:
-			unlock(&s.lock)
-			throw("runtime: invalid stackless coroutine self-frame transition")
-		}
+		childHeader.marker = nextStacklessCoroSelfFrameMarker(
+			parentHeader.marker)
 	}
 	childHeader.parent = context.frame
 	context.frame = frame
@@ -1775,6 +1854,38 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 		throw("runtime: invalid stackless coroutine self-frame completion")
 	}
 	s := context.scheduler
+	frame := context.frame
+	header := (*stacklessCoroFusedFrameHeader)(frame)
+	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		header.marker&stacklessCoroFusedFrameAllocationMask != 0 &&
+		header.marker&stacklessCoroFusedFrameChunkValidated != 0 &&
+		validStacklessCoroSelfFrameMarker(header.marker) &&
+		header.parent != nil && header.owner == nil {
+		if task.state != stacklessCoroTaskRunning || !task.resuming ||
+			task.readyPending ||
+			task.flags&stacklessCoroTaskCompletionMask !=
+				stacklessCoroTaskFusedFrames ||
+			task.terminal != stacklessCoroTerminalNone || task.goexit {
+			throw("runtime: invalid stackless coroutine local self-frame completion")
+		}
+		allocation := header.marker & stacklessCoroFusedFrameAllocationMask
+		parentFrame := header.parent
+		header.parent = nil
+		header.marker = 0
+		context.frame = parentFrame
+		parentHeader := (*stacklessCoroFusedFrameHeader)(parentFrame)
+		task.setFlag(stacklessCoroTaskFusedFrames, parentHeader.parent != nil)
+		if (allocation >= stacklessCoroFusedFrameDirectFirst &&
+			allocation <= stacklessCoroFusedFrameDirectLast) ||
+			allocation == stacklessCoroFusedFrameChunkFirst {
+			cacheStacklessCoroNativeSelfFrame(task.resume, frame, allocation)
+		}
+		if s.runnableState.Load() == 0 {
+			task.setFlag(stacklessCoroTaskSwitchPending, true)
+			return stacklessCoroActionSwitch
+		}
+		return stacklessCoroActionYield
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -1784,8 +1895,6 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine self-frame completion outside resume")
 	}
-	frame := context.frame
-	header := (*stacklessCoroFusedFrameHeader)(frame)
 	if header.parent == nil ||
 		header.marker&stacklessCoroFusedFrameChunkValidated == 0 {
 		unlock(&s.lock)
@@ -1809,6 +1918,12 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	context.frame = parentFrame
 	parentHeader := (*stacklessCoroFusedFrameHeader)(parentFrame)
 	task.setFlag(stacklessCoroTaskFusedFrames, parentHeader.parent != nil)
+	if !stacklessCoroIsPullComparison(s) &&
+		((allocation >= stacklessCoroFusedFrameDirectFirst &&
+			allocation <= stacklessCoroFusedFrameDirectLast) ||
+			allocation == stacklessCoroFusedFrameChunkFirst) {
+		cacheStacklessCoroNativeSelfFrame(task.resume, frame, allocation)
+	}
 	if owner != nil {
 		owner.state = stacklessCoroTaskComplete
 		s.recycleTaskLocked(owner)
@@ -1820,6 +1935,22 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 	}
 	unlock(&s.lock)
 	return stacklessCoroActionYield
+}
+
+// coroContinueSelfFrame consumes an uncontended homogeneous frame switch while
+// compiler-generated code remains in the current resume invocation. A running
+// task owns this transition exclusively, as it does when runTasks consumes the
+// same action after a resume call returns.
+func coroContinueSelfFrame(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
+		!task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
+		throw("runtime: invalid stackless coroutine local frame switch")
+	}
+	task.setFlag(stacklessCoroTaskSwitchPending, false)
 }
 
 // coroRequestFusedFrame marks the next local ABI 3 factory call as a

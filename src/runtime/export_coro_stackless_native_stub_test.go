@@ -7,3 +7,8 @@
 package runtime
 
 func StacklessCoroClearNativeTaskCachesForTest() int { return 0 }
+
+func StacklessCoroNativePoolSelfFrameCacheForTest() (warm, overflow,
+	perContextLimit, chunkLimit uintptr) {
+	return 0, 0, 0, 0
+}

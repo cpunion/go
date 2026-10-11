@@ -483,6 +483,31 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 				runtimeCalls[name], name)
 		}
 	}
+	if runtimeCalls["runtime.coroContinueSelfFrame"] != 2 {
+		t.Errorf("lowered recursive function has %d local frame continuations, want two",
+			runtimeCalls["runtime.coroContinueSelfFrame"])
+	}
+
+	localLabels, localGotos := 0, 0
+	for _, generated := range typecheck.Target.Funcs {
+		ir.VisitList(generated.Body, func(node ir.Node) {
+			switch node := node.(type) {
+			case *ir.LabelStmt:
+				if strings.HasPrefix(node.Label.Name, ".coroReload") {
+					localLabels++
+				}
+			case *ir.BranchStmt:
+				if node.Op() == ir.OGOTO && node.Label != nil &&
+					strings.HasPrefix(node.Label.Name, ".coroReload") {
+					localGotos++
+				}
+			}
+		})
+	}
+	if localLabels != 1 || localGotos != 2 {
+		t.Errorf("lowered recursive function has %d local reload labels and %d branches, want one and two",
+			localLabels, localGotos)
+	}
 }
 
 func TestLowerHeterogeneousFrameFusion(t *testing.T) {
@@ -602,6 +627,7 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 		"runtime.coroTakeFusedFrame":     1,
 		"runtime.coroAwaitFusedFrame":    2,
 		"runtime.coroCompleteFusedFrame": 1,
+		"runtime.coroContinueSelfFrame":  0,
 	} {
 		if runtimeCalls[name] != want {
 			t.Errorf("heterogeneous lowering has %d %s calls, want %d",

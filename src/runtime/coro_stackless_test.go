@@ -1039,6 +1039,12 @@ type stacklessCoroSelfFrameTracker struct {
 	sawChunkFirst        bool
 	sawChunkLast         bool
 	roundsRemaining      int
+	round                int
+	firstDirect          unsafe.Pointer
+	firstChunk           unsafe.Pointer
+	reusedDirect         bool
+	reusedChunk          bool
+	unclearedFrame       bool
 }
 
 var stacklessCoroSelfFrameActive *stacklessCoroSelfFrameTracker
@@ -1113,6 +1119,9 @@ func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
 			childPointer = unsafe.Pointer(new(runtime.StacklessCoroSelfFrameForTest))
 		}
 		child := (*runtime.StacklessCoroSelfFrameForTest)(childPointer)
+		if tracker.round > 0 && child.Value != nil {
+			tracker.unclearedFrame = true
+		}
 		*child = runtime.StacklessCoroSelfFrameForTest{
 			Depth: frame.Depth - 1,
 			Value: frame.Value,
@@ -1123,13 +1132,26 @@ func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
 		if child.Owner != nil {
 			tracker.sawCacheOwner = true
 		}
-		switch child.Marker & runtime.StacklessCoroFusedFrameAllocationMask {
+		allocation := child.Marker & runtime.StacklessCoroFusedFrameAllocationMask
+		switch allocation {
 		case runtime.StacklessCoroFusedFrameDirectFirst:
 			tracker.sawDirectFirst = true
+			if tracker.round == 0 && tracker.firstDirect == nil {
+				tracker.firstDirect = childPointer
+			} else if tracker.round > 0 &&
+				childPointer == tracker.firstDirect {
+				tracker.reusedDirect = true
+			}
 		case runtime.StacklessCoroFusedFrameDirectLast:
 			tracker.sawDirectLast = true
 		case runtime.StacklessCoroFusedFrameChunkFirst:
 			tracker.sawChunkFirst = true
+			if tracker.round == 0 && tracker.firstChunk == nil {
+				tracker.firstChunk = childPointer
+			} else if tracker.round > 0 &&
+				childPointer == tracker.firstChunk {
+				tracker.reusedChunk = true
+			}
 		case runtime.StacklessCoroFusedFrameChunkLast:
 			tracker.sawChunkLast = true
 		}
@@ -1145,6 +1167,7 @@ func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
 		}
 		if frame.Depth == tracker.rootDepth && tracker.roundsRemaining > 1 {
 			tracker.roundsRemaining--
+			tracker.round++
 			frame.State = 0
 			return runtime.StacklessCoroActionYield
 		}
@@ -1169,6 +1192,83 @@ func runStacklessCoroSelfFrames(t *testing.T, tracker *stacklessCoroSelfFrameTra
 	}
 	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
 		stacklessCoroSelfFrameResume)
+}
+
+type stacklessCoroSelfFrameLoopTracker struct {
+	completed int
+	continued int
+}
+
+var stacklessCoroSelfFrameLoopActive *stacklessCoroSelfFrameLoopTracker
+
+func stacklessCoroSelfFrameLoopResume(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroSelfFrameLoopActive
+	for {
+		frame := (*runtime.StacklessCoroSelfFrameForTest)(
+			runtime.FrameStacklessCoroForTest(ctx))
+		var action uint8
+		switch frame.State {
+		case 0:
+			if frame.Depth == 0 {
+				tracker.completed++
+				if frame.Parent == nil {
+					return runtime.StacklessCoroActionComplete
+				}
+				action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+				break
+			}
+			childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+				stacklessCoroSelfFrameLoopResume)
+			if childPointer == nil {
+				childPointer = unsafe.Pointer(
+					new(runtime.StacklessCoroSelfFrameForTest))
+			}
+			*(*runtime.StacklessCoroSelfFrameForTest)(childPointer) =
+				runtime.StacklessCoroSelfFrameForTest{Depth: frame.Depth - 1}
+			frame.State = 1
+			action = runtime.AwaitStacklessCoroSelfFrameForTest(ctx,
+				childPointer, stacklessCoroSelfFrameLoopResume)
+		case 1:
+			tracker.completed++
+			if frame.Parent == nil {
+				return runtime.StacklessCoroActionComplete
+			}
+			action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+		if action != runtime.StacklessCoroActionSwitch {
+			return action
+		}
+		runtime.ContinueStacklessCoroSelfFrameForTest(ctx)
+		tracker.continued++
+	}
+}
+
+func TestStacklessCoroSelfFrameLoop(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroSelfFrameLoopActive = nil }()
+
+	depth := runtime.StacklessCoroTaskCacheSize +
+		runtime.StacklessCoroFrameChunkDirectCount +
+		2*runtime.StacklessCoroFrameChunkSize
+	tracker := new(stacklessCoroSelfFrameLoopTracker)
+	stacklessCoroSelfFrameLoopActive = tracker
+	root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroSelfFrameLoopResume)
+	if tracker.completed != depth+1 {
+		t.Fatalf("completed frames = %d, want %d", tracker.completed, depth+1)
+	}
+	wantContinued := 2 * depth
+	if runtime.Raceenabled {
+		wantContinued = 0
+	}
+	if tracker.continued != wantContinued {
+		t.Fatalf("local frame continuations = %d, want %d",
+			tracker.continued, wantContinued)
+	}
 }
 
 type stacklessCoroLargeSelfFrameTracker struct {
@@ -1403,6 +1503,73 @@ func TestStacklessCoroSelfFrameFusion(t *testing.T) {
 				tracker.sawCacheOwner, tracker.sawDirectFirst,
 				tracker.sawDirectLast, tracker.sawChunkFirst,
 				tracker.sawChunkLast)
+		}
+	})
+
+	t.Run("native-storage-reuse", func(t *testing.T) {
+		depth := runtime.StacklessCoroTaskCacheSize +
+			runtime.StacklessCoroFrameChunkDirectCount +
+			2*runtime.StacklessCoroFrameChunkSize
+		tracker := &stacklessCoroSelfFrameTracker{
+			rootDepth: depth, roundsRemaining: 2,
+		}
+		runStacklessCoroSelfFrames(t, tracker)
+		if tracker.total != 2*depth+1 {
+			t.Fatalf("completed cached frames = %d, want %d",
+				tracker.total, 2*depth+1)
+		}
+		nativeCache := !race.Enabled &&
+			((runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") ||
+				(runtime.GOOS == "linux" && runtime.GOARCH == "amd64"))
+		if nativeCache && (!tracker.sawDirectFirst ||
+			tracker.firstDirect == nil || !tracker.reusedDirect ||
+			!tracker.sawChunkFirst || tracker.firstChunk == nil ||
+			!tracker.reusedChunk || tracker.unclearedFrame) {
+			t.Fatalf("self-frame native cache = %+v, want reused storage", tracker)
+		}
+		if nativeCache {
+			warm, overflow, limit, _ :=
+				runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+			if warm == 0 || warm >
+				uintptr(runtime.StacklessCoroWarmExecutorCount)*limit ||
+				overflow != 0 {
+				t.Fatalf("native self-frame cache = (%d warm bytes, %d overflow bytes), want (1..%d, 0)",
+					warm, overflow,
+					uintptr(runtime.StacklessCoroWarmExecutorCount)*limit)
+			}
+		}
+	})
+
+	t.Run("native-storage-bound", func(t *testing.T) {
+		nativeCache := !race.Enabled &&
+			((runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") ||
+				(runtime.GOOS == "linux" && runtime.GOARCH == "amd64"))
+		if !nativeCache {
+			t.Skip("native self-frame cache is unavailable")
+		}
+		runtime.StacklessCoroClearNativeTaskCachesForTest()
+		defer runtime.StacklessCoroClearNativeTaskCachesForTest()
+		_, _, _, chunkLimit :=
+			runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+		frameSize := unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{})
+		chunkSize := frameSize * runtime.StacklessCoroFrameChunkSize
+		chunkCount := chunkLimit / chunkSize
+		depth := runtime.StacklessCoroTaskCacheSize +
+			runtime.StacklessCoroFrameChunkDirectCount +
+			int(chunkCount+2)*runtime.StacklessCoroFrameChunkSize
+		tracker := &stacklessCoroSelfFrameTracker{rootDepth: depth}
+		runStacklessCoroSelfFrames(t, tracker)
+		if tracker.total != depth+1 {
+			t.Fatalf("completed bounded frames = %d, want %d",
+				tracker.total, depth+1)
+		}
+		warm, overflow, _, _ :=
+			runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+		want := chunkCount*chunkSize +
+			runtime.StacklessCoroFrameChunkDirectCount*frameSize
+		if warm != want || overflow != 0 {
+			t.Fatalf("bounded native self-frame cache = (%d warm bytes, %d overflow bytes), want (%d, 0)",
+				warm, overflow, want)
 		}
 	})
 
