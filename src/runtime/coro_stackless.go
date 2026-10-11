@@ -1211,6 +1211,18 @@ func (scope *stacklessCoroRunScope) leave() {
 	}
 }
 
+// stacklessCoroGoschedIfRunnable yields the host G only when another ordinary
+// G can use its P. The logical scheduler has already established that it can
+// resume the same task directly, so an unconditional Gosched would turn an
+// otherwise private yield loop into a host-scheduler round trip.
+func stacklessCoroGoschedIfRunnable() {
+	gp := getg()
+	pp := gp.m.p.ptr()
+	if gp.preempt || pp == nil || !runqempty(pp) || !sched.runq.empty() {
+		Gosched()
+	}
+}
+
 // runTasks drives the ready queue until the root completes, one resume panics,
 // or a non-parking episode exhausts ready work. A recovered panic returns to
 // run, which starts another queue-driving episode after this native activation
@@ -1275,6 +1287,7 @@ resumeActive:
 	action := task.resume(unsafe.Pointer(&task.context))
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
+		stacklessCoroGoschedIfRunnable()
 		goto resumeActive
 	}
 	task.context.scheduler = nil
@@ -1285,6 +1298,10 @@ resumeActive:
 		directInitialRoot = false
 		resumeDirectly, foreignReturner := s.yield(task, native)
 		if resumeDirectly {
+			// The logical queue is empty, but an ordinary goroutine may be
+			// runnable on the host scheduler. Retain task ownership while
+			// honoring the source Gosched operation at that boundary.
+			stacklessCoroGoschedIfRunnable()
 			goto resume
 		}
 		if !native || foreignReturner {
