@@ -174,6 +174,7 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 		s.executorState.Load() == stacklessCoroExecutorStateOff &&
 		s.freeTasks != nil {
 		s.discardFreeOverflowTasks()
+		s.discardFreeBatchedTasks()
 		ctx.freeTasks = s.freeTasks
 		ctx.freePlainTaskCount = s.freePlainTaskCount
 		ctx.freeFrameBytes = s.freeFrameBytes

@@ -1990,3 +1990,50 @@ channel lowering, and the complete coroutine benchmark audit. Its full runtime
 run reaches the pre-existing Rosetta address-space allocation trap after 556
 seconds instead of reporting a Go assertion or test failure; the native Ubuntu
 pull-request job remains the Linux full-suite gate.
+
+#### Batch storage for concurrent tasks
+
+Revision `d065dccc0b`, based on exact parent `d828b9d2d8`, allocates ordinary
+logical-task headers in four-element typed chunks after an eight-task direct
+prefix. Four 48-byte tasks exactly fill the 192-byte allocation class on
+64-bit targets; four 28-byte tasks similarly fill the 112-byte class on
+32-bit targets. The direct prefix preserves the footprint of small concurrent
+sets, while a large set receives four stable task identities per heap object.
+
+Never-used ordinary slots have a marker distinct from the existing recursive
+overflow slots. Any task may consume an ordinary slot, but only the matching
+uncached recursive lineage may consume an overflow slot. Plain recycled tasks
+continue to take priority over both kinds. The native context drops unused
+slots before retaining its bounded completed-task cache, and race builds keep
+one allocation per task so every race synchronization identity remains unique.
+The 64-bit task and scheduler remain 48 and 192 bytes; their 32-bit sizes
+remain 28 and 112 bytes.
+
+Fresh-process, fixed-count measurements of 10,000 simultaneously parked tasks
+on native Darwin/arm64 produced the following exact allocation result.
+Linux/amd64 reproduced every candidate allocation and footprint value:
+
+| Metric | Exact parent | Batched tasks | Change |
+| --- | ---: | ---: | ---: |
+| allocated bytes | 3,405,856 | 3,405,856 | unchanged |
+| allocation count | 40,036 | 32,734 | -18.24% |
+| live heap bytes per task | 340.6 | 340.6 | unchanged |
+| live objects per task | 3.253 | 2.523 | -22.44% |
+| live stack bytes per task | 6.554 | 6.554 | unchanged |
+
+Ten alternating fresh-process timing pairs measured fixed-layout medians of
+42.53 ms and 41.39 ms, but the loaded host produced wide per-pair variation.
+Timing is therefore not attributed to this change; the allocation counts and
+memory metrics are deterministic release checks. Keeping the cold chunk
+allocator out of line also limits `newTaskLocked` to 81 disassembly lines,
+compared with 73 in the exact parent and 125 when chunk setup was inlined.
+
+Normal, race, and `checkptr=2` focused runtime tests, the complete stackless
+runtime suite, `go vet runtime`, and the lowering, symbol, timer, file, TCP,
+direct-C, blocking-C, coverage, and allocation audit pass on native
+Darwin/arm64. Linux/386, Linux/arm64, Linux/riscv64, FreeBSD/amd64,
+Windows/amd64, and Darwin/amd64 runtime test binaries cross-compile with the
+experiment enabled. The focused production functions report 81.5%--100%
+statement coverage; the new allocator reports 93.3%, with its remaining branch
+belonging to race mode. Linux/amd64 independently runs the same focused and
+end-to-end checks.
