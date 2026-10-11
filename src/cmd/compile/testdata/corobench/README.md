@@ -2037,3 +2037,48 @@ experiment enabled. The focused production functions report 81.5%--100%
 statement coverage; the new allocator reports 93.3%, with its remaining branch
 belonging to race mode. Linux/amd64 independently runs the same focused and
 end-to-end checks.
+
+#### Coallocate channel operations and waiters
+
+Revision `fac9f4e56a`, based on exact parent `fdd982e0e0`, gives a newly
+allocated channel operation its retained first `sudog` in the same typed heap
+object. The operation remains the first field, so its address is still the
+allocation base used by channel ownership and the race-detector synchronization
+hooks. The waiter points back into the same GC-scanned object. Completion clears
+all channel links before the operation enters its existing local or shared
+cache; a self-contained unreachable object remains collectable.
+
+The combined object is exactly 288 bytes on 64-bit targets: the existing
+176-byte operation followed by the existing 112-byte waiter. On 32-bit targets
+its typed size is 172 bytes and its pointerful allocator charge rounds to the
+same 192 bytes previously charged for the separate objects. An operation reused
+from a non-channel source may still acquire its waiter separately; subsequent
+reuse retains it as before. Select continues to allocate its initial operation
+through the general path, while a combined operation later reused for select
+safely supplies its first waiter and allocates only additional cases.
+
+The fixed-count 10,000-task probe on native Darwin/arm64 produced:
+
+| Metric | Batched-task parent | Combined storage | Change |
+| --- | ---: | ---: | ---: |
+| allocated bytes | 3,405,856 | 3,405,856 | unchanged |
+| allocation count | 32,734 | 22,734 | -30.55% |
+| live heap bytes per task | 340.6 | 340.6 | unchanged |
+| live objects per task | 2.523 | 1.523 | -39.64% |
+| live stack bytes per task | 6.554 | 6.554 | unchanged |
+
+Relative to the pre-batching checkpoint, the two changes reduce allocation
+count from 40,036 to 22,734 (-43.22%) and live objects per task from 3.253 to
+1.523 (-53.18%) without changing bytes or stack footprint. Ten alternating
+fresh-process pairs measured fixed-layout medians of 39.49 ms and 39.26 ms,
+which is neutral. The optimization targets GC object count rather than latency.
+
+The benchmark audit now runs this footprint probe in a fresh process and
+enforces bounds for allocated bytes and objects, live heap and object count,
+and live stack. The exact candidate result passes on both Darwin/arm64 and
+Linux/amd64. Normal, race, `checkptr=2`, push, and pull runtime suites exercise
+channel rooting and cross-kind cache reuse. The combined allocator has 100%
+focused coverage, and the common operation-start helper executes both fresh
+allocation choices. Linux/386 runs the exact 32-bit size and one-allocation
+test; Linux/amd64, Linux/arm64, Linux/riscv64, FreeBSD/amd64, Windows/amd64,
+and Darwin/amd64 runtime tests cross-compile with the experiment enabled.
