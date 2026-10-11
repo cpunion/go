@@ -1171,6 +1171,83 @@ func runStacklessCoroSelfFrames(t *testing.T, tracker *stacklessCoroSelfFrameTra
 		stacklessCoroSelfFrameResume)
 }
 
+type stacklessCoroSelfFrameLoopTracker struct {
+	completed int
+	continued int
+}
+
+var stacklessCoroSelfFrameLoopActive *stacklessCoroSelfFrameLoopTracker
+
+func stacklessCoroSelfFrameLoopResume(ctx unsafe.Pointer) uint8 {
+	tracker := stacklessCoroSelfFrameLoopActive
+	for {
+		frame := (*runtime.StacklessCoroSelfFrameForTest)(
+			runtime.FrameStacklessCoroForTest(ctx))
+		var action uint8
+		switch frame.State {
+		case 0:
+			if frame.Depth == 0 {
+				tracker.completed++
+				if frame.Parent == nil {
+					return runtime.StacklessCoroActionComplete
+				}
+				action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+				break
+			}
+			childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
+				stacklessCoroSelfFrameLoopResume)
+			if childPointer == nil {
+				childPointer = unsafe.Pointer(
+					new(runtime.StacklessCoroSelfFrameForTest))
+			}
+			*(*runtime.StacklessCoroSelfFrameForTest)(childPointer) =
+				runtime.StacklessCoroSelfFrameForTest{Depth: frame.Depth - 1}
+			frame.State = 1
+			action = runtime.AwaitStacklessCoroSelfFrameForTest(ctx,
+				childPointer, stacklessCoroSelfFrameLoopResume)
+		case 1:
+			tracker.completed++
+			if frame.Parent == nil {
+				return runtime.StacklessCoroActionComplete
+			}
+			action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+		if action != runtime.StacklessCoroActionSwitch {
+			return action
+		}
+		runtime.ContinueStacklessCoroSelfFrameForTest(ctx)
+		tracker.continued++
+	}
+}
+
+func TestStacklessCoroSelfFrameLoop(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroSelfFrameLoopActive = nil }()
+
+	depth := runtime.StacklessCoroTaskCacheSize +
+		runtime.StacklessCoroFrameChunkDirectCount +
+		2*runtime.StacklessCoroFrameChunkSize
+	tracker := new(stacklessCoroSelfFrameLoopTracker)
+	stacklessCoroSelfFrameLoopActive = tracker
+	root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
+	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+		stacklessCoroSelfFrameLoopResume)
+	if tracker.completed != depth+1 {
+		t.Fatalf("completed frames = %d, want %d", tracker.completed, depth+1)
+	}
+	wantContinued := 2 * depth
+	if runtime.Raceenabled {
+		wantContinued = 0
+	}
+	if tracker.continued != wantContinued {
+		t.Fatalf("local frame continuations = %d, want %d",
+			tracker.continued, wantContinued)
+	}
+}
+
 type stacklessCoroLargeSelfFrameTracker struct {
 	total         int
 	fused         bool

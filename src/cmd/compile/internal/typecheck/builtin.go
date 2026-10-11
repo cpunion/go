@@ -165,24 +165,25 @@ var runtimeDecls = [...]struct {
 	{"coroAwaitFrame", funcTag, 129},
 	{"coroAwaitSelfFrame", funcTag, 130},
 	{"coroCompleteSelfFrame", funcTag, 123},
-	{"coroRequestFusedFrame", funcTag, 131},
+	{"coroContinueSelfFrame", funcTag, 131},
+	{"coroRequestFusedFrame", funcTag, 132},
 	{"coroAwaitFusedFrame", funcTag, 130},
 	{"coroCompleteFusedFrame", funcTag, 123},
 	{"coroSpawn", funcTag, 128},
 	{"coroSpawnFrame", funcTag, 129},
-	{"coroPanic", funcTag, 132},
-	{"coroPanicPending", funcTag, 133},
-	{"coroFrameNeedsClear", funcTag, 133},
-	{"coroSleep", funcTag, 134},
-	{"coroChanSend", funcTag, 135},
-	{"coroChanRecv", funcTag, 137},
-	{"coroSelect", funcTag, 139},
-	{"coroFileRead", funcTag, 140},
-	{"coroSocketRead", funcTag, 140},
-	{"coroCallRead", funcTag, 141},
+	{"coroPanic", funcTag, 133},
+	{"coroPanicPending", funcTag, 134},
+	{"coroFrameNeedsClear", funcTag, 134},
+	{"coroSleep", funcTag, 135},
+	{"coroChanSend", funcTag, 136},
+	{"coroChanRecv", funcTag, 138},
+	{"coroSelect", funcTag, 140},
+	{"coroFileRead", funcTag, 141},
+	{"coroSocketRead", funcTag, 141},
+	{"coroCallRead", funcTag, 142},
 	{"coroEnterForeign", funcTag, 9},
 	{"coroExitForeign", funcTag, 9},
-	{"coroEnterBlocking", funcTag, 142},
+	{"coroEnterBlocking", funcTag, 131},
 	{"coroExitBlocking", funcTag, 9},
 	{"coroAsyncDouble", funcTag, 144},
 	{"makeslice", funcTag, 145},
@@ -284,12 +285,12 @@ var runtimeDecls = [...]struct {
 	{"asanregisterglobals", funcTag, 158},
 	{"KeepAlive", funcTag, 11},
 	{"coroDeferToken", funcTag, 186},
-	{"coroDeferCall", funcTag, 141},
+	{"coroDeferCall", funcTag, 142},
 	{"coroDeferRun", funcTag, 128},
-	{"coroDeferGoexit", funcTag, 142},
-	{"coroDeferPanic", funcTag, 132},
+	{"coroDeferGoexit", funcTag, 131},
+	{"coroDeferPanic", funcTag, 133},
 	{"coroDeferRecover", funcTag, 187},
-	{"coroGoexit", funcTag, 142},
+	{"coroGoexit", funcTag, 131},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 188},
 	{"coroTakeFrameChunk", funcTag, 189},
@@ -430,18 +431,18 @@ func runtimeTypes() []*types.Type {
 	typs[128] = newSig(params(typs[7], typs[123]), nil)
 	typs[129] = newSig(params(typs[7], typs[7], typs[123]), nil)
 	typs[130] = newSig(params(typs[7], typs[7], typs[123]), params(typs[71]))
-	typs[131] = newSig(params(typs[7], typs[6]), nil)
-	typs[132] = newSig(params(typs[7], typs[10]), nil)
-	typs[133] = newSig(params(typs[7]), params(typs[6]))
-	typs[134] = newSig(params(typs[7], typs[22]), params(typs[6]))
-	typs[135] = newSig(params(typs[7], typs[110], typs[3]), params(typs[6]))
-	typs[136] = types.NewPtr(typs[6])
-	typs[137] = newSig(params(typs[7], typs[107], typs[3], typs[136]), params(typs[6]))
-	typs[138] = types.NewPtr(typs[13])
-	typs[139] = newSig(params(typs[7], typs[1], typs[13], typs[13], typs[6], typs[138], typs[136]), params(typs[6]))
-	typs[140] = newSig(params(typs[7], typs[13], typs[42], typs[138], typs[78]), nil)
-	typs[141] = newSig(params(typs[7], typs[9]), nil)
-	typs[142] = newSig(params(typs[7]), nil)
+	typs[131] = newSig(params(typs[7]), nil)
+	typs[132] = newSig(params(typs[7], typs[6]), nil)
+	typs[133] = newSig(params(typs[7], typs[10]), nil)
+	typs[134] = newSig(params(typs[7]), params(typs[6]))
+	typs[135] = newSig(params(typs[7], typs[22]), params(typs[6]))
+	typs[136] = newSig(params(typs[7], typs[110], typs[3]), params(typs[6]))
+	typs[137] = types.NewPtr(typs[6])
+	typs[138] = newSig(params(typs[7], typs[107], typs[3], typs[137]), params(typs[6]))
+	typs[139] = types.NewPtr(typs[13])
+	typs[140] = newSig(params(typs[7], typs[1], typs[13], typs[13], typs[6], typs[139], typs[137]), params(typs[6]))
+	typs[141] = newSig(params(typs[7], typs[13], typs[42], typs[139], typs[78]), nil)
+	typs[142] = newSig(params(typs[7], typs[9]), nil)
 	typs[143] = types.NewPtr(typs[24])
 	typs[144] = newSig(params(typs[7], typs[13], typs[13], typs[24], typs[143], typs[78]), nil)
 	typs[145] = newSig(params(typs[1], typs[13], typs[13]), params(typs[7]))

@@ -185,6 +185,15 @@ func TestProbes(t *testing.T) {
 	runtime.GOMAXPROCS(old)
 }
 
+func TestDeepRecursiveFrames(t *testing.T) {
+	if got := recursiveYield(4096); got != 4097 {
+		t.Fatalf("recursiveYield(4096) = %d, want 4097", got)
+	}
+	if got := recursiveLargeFrame(512); got != 769 {
+		t.Fatalf("recursiveLargeFrame(512) = %d, want 769", got)
+	}
+}
+
 func TestCBlockingGroupCapacity(t *testing.T) {
 	old := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(old)

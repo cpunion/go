@@ -3868,6 +3868,47 @@ func explicitFrameField(pos src.XPos, frame ir.Node,
 	return selector
 }
 
+func rewriteSelfFrameSwitches(resume *ir.Func, ctx ir.Node,
+	action *ir.Name, reload *types.Sym) {
+	await := typecheck.LookupRuntime("coroAwaitSelfFrame").Sym()
+	complete := typecheck.LookupRuntime("coroCompleteSelfFrame").Sym()
+	var rewrite func(ir.Node) ir.Node
+	rewrite = func(node ir.Node) ir.Node {
+		ret, ok := node.(*ir.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			ir.EditChildren(node, rewrite)
+			return node
+		}
+		call, ok := ret.Results[0].(*ir.CallExpr)
+		if !ok {
+			ir.EditChildren(node, rewrite)
+			return node
+		}
+		name, ok := call.Fun.(*ir.Name)
+		if !ok || name.Sym() != await && name.Sym() != complete {
+			ir.EditChildren(node, rewrite)
+			return node
+		}
+		pos := ret.Pos()
+		isSwitch := ir.NewBinaryExpr(pos, ir.OEQ, action,
+			typedInt(pos, types.Types[types.TUINT8], int64(actionSwitch)))
+		consume := typecheck.Call(pos,
+			typecheck.LookupRuntime("coroContinueSelfFrame"),
+			ir.Nodes{ctx}, false)
+		return ir.NewBlockStmt(pos, ir.Nodes{
+			ir.NewAssignStmt(pos, action, call),
+			ir.NewIfStmt(pos, isSwitch, ir.Nodes{
+				consume,
+				ir.NewBranchStmt(pos, ir.OGOTO, reload),
+			}, nil),
+			ir.NewReturnStmt(pos, []ir.Node{action}),
+		})
+	}
+	for i, stmt := range resume.Body {
+		resume.Body[i] = rewrite(stmt)
+	}
+}
+
 func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations ir.Nodes) {
 	fn := candidate.function.Func
@@ -4009,14 +4050,28 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 
 	ctx := resume.Dcl[0]
+	var switchAction *ir.Name
+	var reloadFrame *types.Sym
+	if selfOnly {
+		switchAction = typecheck.TempAt(pos, resume,
+			types.Types[types.TUINT8])
+		reloadFrame = resume.Sym().Pkg.LookupNum(".coroReload",
+			int(resume.Label))
+		resume.Label++
+		rewriteSelfFrameSwitches(resume, ctx, switchAction, reloadFrame)
+	}
 	unsafePointerType := types.Types[types.TUNSAFEPTR]
 	packetPointer := typecheck.ConvNop(ctx, types.NewPtr(unsafePointerType))
 	packetFrame := typedDeref(pos, packetPointer, unsafePointerType)
 	loadFrame := typecheck.ConvNop(packetFrame, framePointerType)
-	resume.Body = append(ir.Nodes{
-		ir.NewDecl(pos, ir.ODCL, frame),
-		ir.NewAssignStmt(pos, frame, loadFrame),
-	}, resume.Body...)
+	prefix := ir.Nodes{ir.NewDecl(pos, ir.ODCL, frame)}
+	if selfOnly {
+		prefix = append(prefix,
+			ir.NewDecl(pos, ir.ODCL, switchAction),
+			ir.NewLabelStmt(pos, reloadFrame))
+	}
+	prefix = append(prefix, ir.NewAssignStmt(pos, frame, loadFrame))
+	resume.Body = append(prefix, resume.Body...)
 
 	autoInitializers := make(map[*ir.Name]bool)
 	for _, variable := range closureVars {
