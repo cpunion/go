@@ -2770,6 +2770,18 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 			t.Fatal("overflow-task selection violated cache priority or isolation")
 		}
 	})
+
+	t.Run("select-batched-task", func(t *testing.T) {
+		if !runtime.StacklessCoroBatchedTaskSelectionForTest() {
+			t.Fatal("batched-task selection violated cache priority or isolation")
+		}
+	})
+
+	t.Run("discard-batched-task-slots", func(t *testing.T) {
+		if !runtime.StacklessCoroDiscardBatchedTasksForTest() {
+			t.Fatal("discarding batched task slots changed retained cache entries")
+		}
+	})
 }
 
 func TestStacklessCoroTaskReuse(t *testing.T) {
@@ -2840,6 +2852,54 @@ func TestStacklessCoroTaskReuse(t *testing.T) {
 				return runtime.StacklessCoroActionComplete
 			default:
 				t.Fatalf("unexpected parent state %d", parentState)
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+	})
+
+	t.Run("batched-allocation", func(t *testing.T) {
+		oldProcs := runtime.GOMAXPROCS(1)
+		defer runtime.GOMAXPROCS(oldProcs)
+		const tasks = runtime.StacklessCoroDirectBatchedTaskCount +
+			2*runtime.StacklessCoroTaskChunkSize - 2
+		var release atomic.Bool
+		var completed atomic.Int32
+		child := func(unsafe.Pointer) uint8 {
+			if !release.Load() {
+				return runtime.StacklessCoroActionYield
+			}
+			completed.Add(1)
+			return runtime.StacklessCoroActionComplete
+		}
+		var parentState int
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch parentState {
+			case 0:
+				for range tasks {
+					runtime.SpawnStacklessCoroForTest(ctx, child)
+				}
+				free, direct := runtime.StacklessCoroBatchedTaskCountsForTest(ctx)
+				if race.Enabled {
+					if free != 0 || direct != 0 {
+						t.Fatalf("race batched task counts = (%d, %d), want zero",
+							free, direct)
+					}
+				} else if wantFree := runtime.StacklessCoroTaskChunkSize - 2; free != wantFree ||
+					direct != runtime.StacklessCoroDirectBatchedTaskCount {
+					t.Fatalf("batched task counts = (%d, %d), want (%d, %d)",
+						free, direct, wantFree,
+						runtime.StacklessCoroDirectBatchedTaskCount)
+				}
+				release.Store(true)
+				parentState = 1
+				return runtime.StacklessCoroActionYield
+			case 1:
+				if completed.Load() != tasks {
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
+			default:
+				t.Fatalf("unexpected batched task parent state %d", parentState)
 				return runtime.StacklessCoroActionInvalid
 			}
 		})
