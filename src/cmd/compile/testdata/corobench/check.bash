@@ -27,6 +27,7 @@ test_binary="$output_dir/coro.test"
 build_output="$output_dir/build.txt"
 allocation_output="$output_dir/public-entry-allocation.txt"
 recursive_allocation_output="$output_dir/recursive-frame-allocation.txt"
+task_footprint_output="$output_dir/task-footprint-allocation.txt"
 read_output="$output_dir/read-lowering.txt"
 correctness_output="$output_dir/correctness.txt"
 public_coverage_output="$output_dir/public-read-coverage.txt"
@@ -278,6 +279,40 @@ if ! awk '
 ' "$recursive_allocation_output"; then
 	cat "$recursive_allocation_output" >&2
 	echo "recursive coroutine frame allocation exceeds its bound" >&2
+	exit 1
+fi
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^BenchmarkTaskParkFootprint10000$' \
+	-test.benchmem -test.benchtime=1x -test.count=1 -test.cpu=1 \
+	>"$task_footprint_output"; then
+	tail -n 100 "$task_footprint_output" >&2
+	exit 1
+fi
+if ! awk '
+	$1 ~ /^BenchmarkTaskParkFootprint10000(-[0-9]+)?$/ {
+		samples++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "live-heap-B/task" && $(i - 1) > 341) {
+				bad = 1
+			}
+			if ($i == "live-objects/task" && $(i - 1) > 1.6) {
+				bad = 1
+			}
+			if ($i == "live-stack-B/task" && $(i - 1) > 7) {
+				bad = 1
+			}
+			if ($i == "B/op" && $(i - 1) > 3410000) {
+				bad = 1
+			}
+			if ($i == "allocs/op" && $(i - 1) > 23000) {
+				bad = 1
+			}
+		}
+	}
+	END { exit samples == 1 && !bad ? 0 : 1 }
+' "$task_footprint_output"; then
+	cat "$task_footprint_output" >&2
+	echo "parked coroutine task footprint exceeds its bound" >&2
 	exit 1
 fi
 

@@ -311,6 +311,21 @@ type stacklessCoroOperation struct {
 	selection *stacklessCoroSelect
 }
 
+// stacklessCoroChannelOperation gives a new channel operation its first waiter
+// without a second heap object. The operation is first so its address remains
+// the allocation base used as the channel and race synchronization identity.
+type stacklessCoroChannelOperation struct {
+	operation stacklessCoroOperation
+	waiter    sudog
+}
+
+func newStacklessCoroChannelOperation() *stacklessCoroOperation {
+	storage := new(stacklessCoroChannelOperation)
+	op := &storage.operation
+	op.waiter = &storage.waiter
+	return op
+}
+
 // A stacklessCoroOperationState is owned by its source until that source
 // publishes a terminal fact. Registered sources carry only id. Timers use a
 // stable owner and generation so a late callback cannot complete a reused
@@ -2812,7 +2827,7 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
-	op := stacklessCoroStartOperation(ctx, "channel")
+	op := stacklessCoroStartChannelOperation(ctx)
 	op.channel = channel
 	op.element = element
 	op.received = received
@@ -3110,6 +3125,15 @@ func coroExitSyscall() {
 }
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
+	return stacklessCoroStartOperationWithWaiter(ctx, name, false)
+}
+
+func stacklessCoroStartChannelOperation(ctx unsafe.Pointer) *stacklessCoroOperation {
+	return stacklessCoroStartOperationWithWaiter(ctx, "channel", true)
+}
+
+func stacklessCoroStartOperationWithWaiter(ctx unsafe.Pointer, name string,
+	allocateWaiter bool) *stacklessCoroOperation {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil {
@@ -3148,7 +3172,11 @@ func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoro
 	if op == nil {
 		op = takeStacklessCoroSharedOperation()
 		if op == nil {
-			op = new(stacklessCoroOperation)
+			if allocateWaiter {
+				op = newStacklessCoroChannelOperation()
+			} else {
+				op = new(stacklessCoroOperation)
+			}
 		}
 	}
 	op.scheduler = s
