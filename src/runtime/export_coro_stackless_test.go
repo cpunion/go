@@ -213,6 +213,10 @@ func CompleteStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) uint8 {
 	return coroCompleteSelfFrame(ctx)
 }
 
+func ContinueStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) {
+	coroContinueSelfFrame(ctx)
+}
+
 func CompleteStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer) uint8 {
 	return coroCompleteFusedFrame(ctx)
 }

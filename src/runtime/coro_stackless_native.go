@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	stacklessCoroSchedulerSize = 64 << 10
+	stacklessCoroSchedulerSize           = 64 << 10
+	stacklessCoroSelfFrameChunkCacheSize = 256 << 10
 
 	// coroNativeStart runs in a frame entered by mcall on the original g0
 	// stack. Leave that frame and its caller above the executor's synthetic
@@ -24,22 +25,30 @@ const (
 )
 
 type stacklessCoroNativeContext struct {
-	gState             stacklessCoroGState
-	scheduler          *stacklessCoroScheduler
-	freeTasks          *stacklessCoroTask
-	freePlainTaskCount uint16
-	freeFrameBytes     uint16
-	cachedFrameTasks   uint16
-	cachedFrameBytes   uint16
-	schedulerG         *g
-	executor           *g
-	caller             *g
-	nativeG0           *g
-	lockedG            guintptr
-	lockedInt          uint32
-	g0Accurate         bool
-	initialRoot        bool
-	poolNext           *stacklessCoroNativeContext
+	gState              stacklessCoroGState
+	scheduler           *stacklessCoroScheduler
+	freeTasks           *stacklessCoroTask
+	selfFrames          unsafe.Pointer
+	selfFrameChunks     unsafe.Pointer
+	selfFrameResume     *funcval
+	selfFrameChunkType  *_type
+	selfFrameSize       uintptr
+	selfFrameChunkSize  uintptr
+	freePlainTaskCount  uint16
+	freeFrameBytes      uint16
+	cachedFrameTasks    uint16
+	cachedFrameBytes    uint16
+	selfFrameChunkCount uint16
+	selfFrameCount      uint8
+	schedulerG          *g
+	executor            *g
+	caller              *g
+	nativeG0            *g
+	lockedG             guintptr
+	lockedInt           uint32
+	g0Accurate          bool
+	initialRoot         bool
+	poolNext            *stacklessCoroNativeContext
 	// deferredSleep is owned by the driver between adjacent fixed-stack
 	// episodes. Keeping it here avoids growing the shared logical scheduler.
 	deferredSleep *stacklessCoroOperation
@@ -240,10 +249,115 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	ctx.freeFrameBytes = 0
 	ctx.cachedFrameTasks = 0
 	ctx.cachedFrameBytes = 0
+	ctx.selfFrames = nil
+	ctx.selfFrameChunks = nil
+	ctx.selfFrameResume = nil
+	ctx.selfFrameChunkType = nil
+	ctx.selfFrameSize = 0
+	ctx.selfFrameChunkSize = 0
+	ctx.selfFrameChunkCount = 0
+	ctx.selfFrameCount = 0
 	lock(&stacklessCoroNativePool.lock)
 	ctx.poolNext = stacklessCoroNativePool.overflow
 	stacklessCoroNativePool.overflow = ctx
 	unlock(&stacklessCoroNativePool.lock)
+}
+
+// takeStacklessCoroNativeSelfFrame reuses homogeneous typed storage on the
+// executor that allocated it. A native context is owned by one executor at a
+// time, so this cache needs no scheduler lock. Keeping one resume identity
+// bounds both lookup cost and retained type diversity.
+func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
+	frameSize uintptr, chunkType *_type, chunk bool) unsafe.Pointer {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	var chunkSize uintptr
+	if chunkType != nil {
+		chunkSize = chunkType.Size_
+	}
+	if raceenabled || ctx == nil || ctx.executor != gp || resume == nil ||
+		frameSize == 0 || chunkSize == 0 ||
+		chunkSize > stacklessCoroSelfFrameChunkCacheSize {
+		return nil
+	}
+	identity := stacklessCoroResumeIdentity(resume)
+	if ctx.selfFrameResume != identity || ctx.selfFrameSize != frameSize ||
+		ctx.selfFrameChunkType != chunkType {
+		ctx.selfFrames = nil
+		ctx.selfFrameChunks = nil
+		ctx.selfFrameResume = identity
+		ctx.selfFrameChunkType = chunkType
+		ctx.selfFrameSize = frameSize
+		ctx.selfFrameChunkSize = chunkSize
+		ctx.selfFrameChunkCount = 0
+		ctx.selfFrameCount = 0
+		return nil
+	}
+	link := &ctx.selfFrames
+	count := &ctx.selfFrameCount
+	if chunk {
+		link = &ctx.selfFrameChunks
+	}
+	frame := *link
+	if frame == nil {
+		if (chunk && ctx.selfFrameChunkCount != 0) ||
+			(!chunk && *count != 0) {
+			throw("runtime: invalid stackless coroutine self-frame cache")
+		}
+		return nil
+	}
+	header := (*stacklessCoroFusedFrameHeader)(frame)
+	*link = header.parent
+	header.parent = nil
+	if chunk {
+		if ctx.selfFrameChunkCount == 0 {
+			throw("runtime: invalid stackless coroutine self-frame chunk count")
+		}
+		ctx.selfFrameChunkCount--
+	} else {
+		if *count == 0 {
+			throw("runtime: invalid stackless coroutine self-frame count")
+		}
+		*count--
+	}
+	return frame
+}
+
+// cacheStacklessCoroNativeSelfFrame retains only storage whose allocation key
+// still matches the active executor cache. Interleaved recursive identities
+// may replace that key; the older lineage then remains ordinary GC work.
+func cacheStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
+	frame unsafe.Pointer, allocation uint8) {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if raceenabled || ctx == nil || ctx.executor != gp || resume == nil ||
+		frame == nil ||
+		ctx.selfFrameResume != stacklessCoroResumeIdentity(resume) ||
+		ctx.selfFrameSize == 0 || ctx.selfFrameChunkSize == 0 {
+		return
+	}
+	header := (*stacklessCoroFusedFrameHeader)(frame)
+	if header.parent != nil || header.owner != nil || header.marker != 0 {
+		throw("runtime: initialized stackless coroutine cached self frame")
+	}
+	switch {
+	case allocation >= stacklessCoroFusedFrameDirectFirst &&
+		allocation <= stacklessCoroFusedFrameDirectLast:
+		if ctx.selfFrameCount >= stacklessCoroFrameChunkDirectCount {
+			return
+		}
+		header.parent = ctx.selfFrames
+		ctx.selfFrames = frame
+		ctx.selfFrameCount++
+	case allocation == stacklessCoroFusedFrameChunkFirst:
+		if uintptr(ctx.selfFrameChunkCount) >=
+			stacklessCoroSelfFrameChunkCacheSize/ctx.selfFrameChunkSize {
+			return
+		}
+		header.parent = ctx.selfFrameChunks
+		ctx.selfFrameChunks = frame
+		ctx.selfFrameChunkCount++
+	}
 }
 
 func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
