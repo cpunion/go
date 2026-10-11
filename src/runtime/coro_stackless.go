@@ -1231,6 +1231,9 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot bool
+	// Check the host queues on the first private yield and then at most 256
+	// logical yields apart. A pending preemption bypasses that delay.
+	hostYieldCheck := ^uint8(0)
 	defer func() {
 		if task == nil || task.context.scheduler != s {
 			return
@@ -1287,7 +1290,10 @@ resumeActive:
 	action := task.resume(unsafe.Pointer(&task.context))
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
-		stacklessCoroGoschedIfRunnable()
+		hostYieldCheck++
+		if hostYieldCheck == 0 || getg().preempt {
+			stacklessCoroGoschedIfRunnable()
+		}
 		goto resumeActive
 	}
 	task.context.scheduler = nil
@@ -1301,7 +1307,10 @@ resumeActive:
 			// The logical queue is empty, but an ordinary goroutine may be
 			// runnable on the host scheduler. Retain task ownership while
 			// honoring the source Gosched operation at that boundary.
-			stacklessCoroGoschedIfRunnable()
+			hostYieldCheck++
+			if hostYieldCheck == 0 || getg().preempt {
+				stacklessCoroGoschedIfRunnable()
+			}
 			goto resume
 		}
 		if !native || foreignReturner {

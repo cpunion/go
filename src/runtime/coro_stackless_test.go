@@ -8,6 +8,7 @@ package runtime_test
 
 import (
 	"bytes"
+	"fmt"
 	"internal/race"
 	"runtime"
 	"sync/atomic"
@@ -47,43 +48,50 @@ func TestStacklessCoroYieldRunsOrdinaryGoroutine(t *testing.T) {
 	if runtime.Raceenabled {
 		t.Skip("race mode retains the queued yield path")
 	}
-	oldProcs := runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(oldProcs)
+	for _, readyAfter := range []int{0, 1} {
+		name := fmt.Sprintf("ready-after-%d-yields", readyAfter)
+		t.Run(name, func(t *testing.T) {
+			oldProcs := runtime.GOMAXPROCS(1)
+			defer runtime.GOMAXPROCS(oldProcs)
 
-	gate := make(chan struct{})
-	waiting := make(chan struct{})
-	done := make(chan struct{})
-	var ran atomic.Bool
-	go func() {
-		close(waiting)
-		<-gate
-		ran.Store(true)
-		close(done)
-	}()
-	<-waiting
+			gate := make(chan struct{})
+			waiting := make(chan struct{})
+			done := make(chan struct{})
+			var ran atomic.Bool
+			go func() {
+				close(waiting)
+				<-gate
+				ran.Store(true)
+				close(done)
+			}()
+			<-waiting
 
-	// Keep the unfixed path well below the asynchronous-preemption period so
-	// only an explicit host-scheduler handoff can satisfy this test.
-	const yieldLimit = 1 << 14
-	yields := 0
-	sawOrdinary := false
-	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
-		if yields == 0 {
-			close(gate)
-		}
-		if ran.Load() {
-			sawOrdinary = true
-			return runtime.StacklessCoroActionComplete
-		}
-		yields++
-		if yields == yieldLimit {
-			return runtime.StacklessCoroActionComplete
-		}
-		return runtime.StacklessCoroActionYield
-	})
-	<-done
-	if !sawOrdinary {
-		t.Fatalf("ordinary goroutine did not run during %d logical yields", yields)
+			// Keep the unfixed path well below the asynchronous-preemption
+			// period so only an explicit host-scheduler handoff can satisfy
+			// this test. readyAfter=1 also verifies the periodic check after
+			// the first private-yield check found no runnable G.
+			const yieldLimit = 1 << 14
+			yields := 0
+			sawOrdinary := false
+			runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+				if yields == readyAfter {
+					close(gate)
+				}
+				if ran.Load() {
+					sawOrdinary = true
+					return runtime.StacklessCoroActionComplete
+				}
+				yields++
+				if yields == yieldLimit {
+					return runtime.StacklessCoroActionComplete
+				}
+				return runtime.StacklessCoroActionYield
+			})
+			<-done
+			if !sawOrdinary {
+				t.Fatalf("ordinary goroutine did not run during %d logical yields", yields)
+			}
+		})
 	}
 }
 
