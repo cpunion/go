@@ -10,6 +10,8 @@ import "unsafe"
 
 type stacklessCoroG struct{}
 
+const stacklessCoroChannelWaiterScanning = false
+
 type stacklessCoroSudog struct{}
 
 func (*stacklessCoroSudog) get() unsafe.Pointer {

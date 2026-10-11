@@ -3969,6 +3969,146 @@ func TestStacklessCoroChannelWaiterCache(t *testing.T) {
 	cache.CycleAcrossGC()
 }
 
+func TestStacklessCoroChannelOperationRoot(t *testing.T) {
+	type result struct {
+		value    int
+		received bool
+	}
+	channel := make(chan int)
+	started := make(chan struct{})
+	done := make(chan result, 1)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	go func() {
+		state := 0
+		value := -1
+		received := false
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			switch state {
+			case 0:
+				state = 1
+				runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
+					&value, &received)
+				close(started)
+				return runtime.StacklessCoroActionWait
+			case 1:
+				state = 2
+				return runtime.StacklessCoroActionComplete
+			default:
+				return runtime.StacklessCoroActionInvalid
+			}
+		})
+		done <- result{value: value, received: received}
+	}()
+	<-started
+	waitStacklessCoroChannelWaiters(t, channel, 0, 1, 1)
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
+	}
+	runtime.GC()
+	channel <- 71
+	select {
+	case got := <-done:
+		if got.value != 71 || !got.received {
+			t.Fatalf("receive after GC = (%d, %t), want (71, true)",
+				got.value, got.received)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel operation did not survive GC")
+	}
+}
+
+func TestStacklessCoroChannelOperationRootingModes(t *testing.T) {
+	run := func(t *testing.T, channel any, element unsafe.Pointer,
+		wantRegistered bool, release func()) {
+		t.Helper()
+		started := make(chan struct{})
+		done := make(chan struct{})
+		baselineOperations := runtime.StacklessCoroOperationCountForTest()
+		go func() {
+			state := 0
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0:
+					state = 1
+					runtime.StartStacklessCoroSendForTest(ctx, channel,
+						element)
+					close(started)
+					return runtime.StacklessCoroActionWait
+				case 1:
+					state = 2
+					return runtime.StacklessCoroActionComplete
+				default:
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+			close(done)
+		}()
+		<-started
+		waitStacklessCoroChannelWaiters(t, channel, 1, 0, 1)
+		wantOperations := baselineOperations
+		if wantRegistered {
+			wantOperations++
+		}
+		if operations := runtime.StacklessCoroOperationCountForTest(); operations != wantOperations {
+			t.Fatalf("operation count = %d, want %d",
+				operations, wantOperations)
+		}
+		runtime.GC()
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("channel operation did not survive GC")
+		}
+		if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+			t.Fatalf("completed operation count = %d, want %d",
+				operations, baselineOperations)
+		}
+	}
+
+	t.Run("buffered-scalar", func(t *testing.T) {
+		channel := make(chan int, 1)
+		channel <- 11
+		value := 71
+		run(t, channel, unsafe.Pointer(&value), true, func() {
+			if got := <-channel; got != 11 {
+				t.Fatalf("first value = %d, want 11", got)
+			}
+			if got := <-channel; got != value {
+				t.Fatalf("second value = %d, want %d", got, value)
+			}
+		})
+	})
+
+	t.Run("buffered-pointer", func(t *testing.T) {
+		channel := make(chan *int, 1)
+		first := new(int)
+		*first = 11
+		channel <- first
+		value := new(int)
+		*value = 71
+		run(t, channel, unsafe.Pointer(&value), false, func() {
+			if got := <-channel; got != first {
+				t.Fatalf("first value = %p, want %p", got, first)
+			}
+			if got := <-channel; got != value {
+				t.Fatalf("second value = %p, want %p", got, value)
+			}
+		})
+	})
+
+	t.Run("buffered-zero-size", func(t *testing.T) {
+		channel := make(chan struct{}, 1)
+		channel <- struct{}{}
+		value := struct{}{}
+		run(t, channel, unsafe.Pointer(&value), false, func() {
+			<-channel
+			<-channel
+		})
+	})
+}
+
 func TestStacklessCoroSelectStorageCache(t *testing.T) {
 	cache := runtime.NewStacklessCoroSelectStorageForTest()
 	cache.Cycle(2)
@@ -6000,8 +6140,12 @@ func TestStacklessCoroOperationReuse(t *testing.T) {
 				return runtime.StacklessCoroActionWait
 			case 1:
 				cacheCount(t, ctx)
-				runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
-				tokens[1] = runtime.StacklessCoroOperationTokenForTest(ctx)
+				tokens[1] = runtime.StartStacklessCoroSendIntForTest(ctx,
+					channel, &value)
+				registered := runtime.StacklessCoroOperationTokenForTest(ctx)
+				if registered != nil {
+					t.Fatalf("channel operation registered as %p", registered)
+				}
 				runtime.ReadySleepStacklessCoroForTest(timer)
 				close(startReceiver)
 				state = 2

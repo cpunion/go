@@ -865,9 +865,9 @@ func SleepStacklessCoroForTest(ctx unsafe.Pointer, ns int64) bool {
 	return coroSleep(ctx, ns)
 }
 
-func StartStacklessCoroSendIntForTest(ctx unsafe.Pointer, channel chan<- int, value *int) {
-	startStacklessCoroChannel(ctx, *(**hchan)(unsafe.Pointer(&channel)),
-		unsafe.Pointer(value), nil, true)
+func StartStacklessCoroSendIntForTest(ctx unsafe.Pointer, channel chan<- int, value *int) unsafe.Pointer {
+	return unsafe.Pointer(startStacklessCoroChannel(ctx,
+		*(**hchan)(unsafe.Pointer(&channel)), unsafe.Pointer(value), nil, true))
 }
 
 func StartStacklessCoroSendForTest(ctx unsafe.Pointer, channel any,

@@ -96,7 +96,13 @@ func makechan(t *chantype, size int) *hchan {
 	switch {
 	case mem == 0:
 		// Queue or element size is zero.
-		c = (*hchan)(mallocgc(hchanSize, nil, true))
+		if stacklessCoroChannelWaiterScanning {
+			// A stackless coroutine waiter is retained by the channel rather
+			// than an owning G, so its operation must be visible to the GC.
+			c = new(hchan)
+		} else {
+			c = (*hchan)(mallocgc(hchanSize, nil, true))
+		}
 		// Race detector uses this location for synchronization.
 		c.buf = c.raceaddr()
 	case !elem.Pointers():

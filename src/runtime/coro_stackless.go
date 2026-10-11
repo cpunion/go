@@ -120,6 +120,7 @@ const (
 )
 const stacklessCoroForeignReturnerBit = uint32(1 << 31)
 const stacklessCoroDeferredSleepOperationID = ^uint64(0)
+const stacklessCoroChannelOperationID = stacklessCoroDeferredSleepOperationID - 1
 
 const (
 	stacklessCoroExecutorStateOff uint32 = iota
@@ -2694,18 +2695,33 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 }
 
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
-	element unsafe.Pointer, received *bool, send bool) {
+	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
 	op := stacklessCoroStartOperation(ctx, "channel")
 	op.channel = channel
 	op.element = element
 	op.received = received
 	op.send = send
-	op.id = registerStacklessCoroOperation(op)
+	// A scanned channel retains a queued waiter and its operation directly.
+	// Noscan buffered scalar channels and nil channels use the registry.
+	if stacklessCoroChannelWaiterRooted(channel) {
+		op.id = stacklessCoroChannelOperationID
+	} else {
+		registerStacklessCoroOperation(op)
+	}
 	if send {
 		chansendStackless(op)
 	} else {
 		chanrecvStackless(op)
 	}
+	return op
+}
+
+// stacklessCoroChannelWaiterRooted reports whether the channel allocation is
+// scanned. Unbuffered and zero-size channels use a scanned header while this
+// experiment is enabled; buffered pointer elements already require one.
+func stacklessCoroChannelWaiterRooted(channel *hchan) bool {
+	return channel != nil && (channel.elemsize == 0 ||
+		channel.dataqsiz == 0 || channel.elemtype.Pointers())
 }
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
@@ -2714,8 +2730,12 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
-	if op == nil || takeStacklessCoroOperation(op.id) != op {
+	if op == nil {
 		throw("runtime: invalid stackless coroutine channel completion")
+	}
+	if op.id != stacklessCoroChannelOperationID &&
+		takeStacklessCoroOperation(op.id) != op {
+		throw("runtime: invalid registered stackless coroutine channel completion")
 	}
 	if waiter != nil {
 		waiter.coro.clear()
