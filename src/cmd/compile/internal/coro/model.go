@@ -270,11 +270,23 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteFile,
 		Effect: MaySuspend,
 	},
+	"os.(*File).Write": {
+		Kind:   SiteFile,
+		Effect: MaySuspend,
+	},
 	"net.(*TCPConn).Read": {
 		Kind:   SitePoll,
 		Effect: MaySuspend,
 	},
 	"net.(*conn).Read": {
+		Kind:   SitePoll,
+		Effect: MaySuspend,
+	},
+	"net.(*TCPConn).Write": {
+		Kind:   SitePoll,
+		Effect: MaySuspend,
+	},
+	"net.(*conn).Write": {
 		Kind:   SitePoll,
 		Effect: MaySuspend,
 	},

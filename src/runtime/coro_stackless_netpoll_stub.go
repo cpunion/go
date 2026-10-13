@@ -6,12 +6,12 @@
 
 package runtime
 
-func stacklessCoroPollReadAtIdle(*stacklessCoroScheduler,
+func stacklessCoroPollIOAtIdle(*stacklessCoroScheduler,
 	*stacklessCoroTask, *stacklessCoroTask) *stacklessCoroTask {
 	return nil
 }
 
-func stacklessCoroPollReadBeforePark(*stacklessCoroScheduler,
+func stacklessCoroPollIOBeforePark(*stacklessCoroScheduler,
 	*stacklessCoroTask) *stacklessCoroTask {
 	return nil
 }

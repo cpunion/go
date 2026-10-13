@@ -116,13 +116,13 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 	}
 }
 
-// stacklessCoroPollReadAtIdle claims one read that still belongs to s and does
+// stacklessCoroPollIOAtIdle claims one I/O operation that belongs to s and does
 // not belong to either excluded task. The caller permanently excludes the task
 // that just armed and rotates the second exclusion between bounded attempts so
 // multiple older waiters get a chance. This lets readiness produced by another
 // task in the same scheduler complete without a locked-M round trip. An
-// unavailable read is rearmed before this function returns.
-func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
+// unavailable operation is rearmed before this function returns.
+func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 	exclude, previous *stacklessCoroTask) *stacklessCoroTask {
 	lock(&stacklessCoroOperations.lock)
 	registry := stacklessCoroOperations.registry
@@ -144,13 +144,17 @@ func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 			}
 			pd := (*pollDesc)(unsafe.Pointer(
 				uintptr(op.packet[stacklessCoroPollDescWord])))
-			if !netpollCoroReadClaim(pd, op) {
+			mode := int32('r')
+			if op.pollWrite {
+				mode = 'w'
+			}
+			if !netpollCoroClaim(pd, op, mode) {
 				continue
 			}
 			task := op.task
 			registry.scan = uint16((index + 1) % len(registry.buckets))
 			unlock(&stacklessCoroOperations.lock)
-			stacklessCoroSocketReadAttempt(op)
+			stacklessCoroSocketAttempt(op)
 			return task
 		}
 	}
@@ -160,22 +164,22 @@ func stacklessCoroPollReadAtIdle(s *stacklessCoroScheduler,
 }
 
 //go:noinline
-func stacklessCoroPollReadBeforePark(s *stacklessCoroScheduler,
+func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 	exclude *stacklessCoroTask) *stacklessCoroTask {
 	var previous *stacklessCoroTask
 	for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
-		claimed := stacklessCoroPollReadAtIdle(s, exclude, previous)
+		claimed := stacklessCoroPollIOAtIdle(s, exclude, previous)
 		if claimed == nil && previous != nil {
 			// Every other waiter had a chance. Start another bounded pass
 			// while continuing to exclude the task that just armed.
 			previous = nil
-			claimed = stacklessCoroPollReadAtIdle(s, exclude, nil)
+			claimed = stacklessCoroPollIOAtIdle(s, exclude, nil)
 		}
 		if claimed == nil {
 			return nil
 		}
 		// A successful retry may have made its waiter runnable. Take it
-		// before another bounded retry; if the read remains unavailable,
+		// before another bounded retry; if the operation remains unavailable,
 		// the scheduler parks after the final attempt.
 		if task := s.take(); task != nil {
 			return task
@@ -197,6 +201,10 @@ func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) 
 }
 
 func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, readErrno uintptr) {
+	stacklessCoroSocketFinish(op, int(count), readErrno)
+}
+
+func stacklessCoroSocketFinish(op *stacklessCoroOperation, count int, errno uintptr) {
 	if op.packet[stacklessCoroPollNextWord] != 0 {
 		throw("runtime: queued stackless coroutine socket completion")
 	}
@@ -214,13 +222,21 @@ func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, read
 		if count < 0 {
 			*op.n = -1
 		} else {
-			*op.n = int(count)
+			*op.n = count
 		}
 	}
 	if op.errno != nil {
-		*op.errno = readErrno
+		*op.errno = errno
 	}
 	completeStacklessCoroOperation(op)
+}
+
+func stacklessCoroSocketAttempt(op *stacklessCoroOperation) {
+	if op.pollWrite {
+		stacklessCoroSocketWriteAttempt(op)
+	} else {
+		stacklessCoroSocketReadAttempt(op)
+	}
 }
 
 func stacklessCoroNetpollInit() {
@@ -268,7 +284,7 @@ func stacklessCoroNetpollLoop() {
 				findStacklessCoroOperation(op.id) != op {
 				throw("runtime: invalid stackless coroutine poll completion")
 			}
-			stacklessCoroSocketReadAttempt(op)
+			stacklessCoroSocketAttempt(op)
 		}
 
 		if !stacklessCoroNetpoll.wake.CompareAndSwap(pdReady, pdNil) &&

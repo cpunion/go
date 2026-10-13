@@ -18,8 +18,16 @@ const (
 // reports false if readiness raced with installation and the caller should
 // retry the nonblocking read.
 func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
-	if err := netpollcheckerr(pd, 'r'); err != pollNoError {
+	return netpollCoroArm(pd, op, 'r')
+}
+
+func netpollCoroArm(pd *pollDesc, op *stacklessCoroOperation, mode int32) (bool, int) {
+	if err := netpollcheckerr(pd, mode); err != pollNoError {
 		return false, err
+	}
+	gpp := &pd.rg
+	if mode == 'w' {
+		gpp = &pd.wg
 	}
 	pointer := uintptr(unsafe.Pointer(op))
 	if pointer&netpollCoroTagMask != 0 {
@@ -27,9 +35,9 @@ func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
 	}
 	token := pointer | netpollCoroTag
 	for {
-		old := pd.rg.Load()
+		old := gpp.Load()
 		if old == pdReady {
-			if pd.rg.CompareAndSwap(pdReady, pdNil) {
+			if gpp.CompareAndSwap(pdReady, pdNil) {
 				return false, pollNoError
 			}
 		} else if old != pdNil {
@@ -39,20 +47,37 @@ func netpollCoroReadArm(pd *pollDesc, op *stacklessCoroOperation) (bool, int) {
 			// the token immediately after the compare-and-swap and return a
 			// negative delta to its caller.
 			netpollAdjustWaiters(1)
-			if pd.rg.CompareAndSwap(pdNil, token) {
-				return true, pollNoError
+			if gpp.CompareAndSwap(pdNil, token) {
+				return netpollCoroArmCheck(pd, op, mode)
 			}
 			netpollAdjustWaiters(-1)
 		}
 	}
 }
 
-// netpollCoroReadClaim removes an armed coroutine read before netpoll has
-// consumed it. The caller may retry the nonblocking read after a successful
-// claim.
-func netpollCoroReadClaim(pd *pollDesc, op *stacklessCoroOperation) bool {
+// netpollCoroArmCheck rechecks errors after publishing the waiter. Close and
+// deadline updates publish their error before looking for a waiter, so the
+// initial check alone can miss an update that precedes token installation.
+func netpollCoroArmCheck(pd *pollDesc, op *stacklessCoroOperation, mode int32) (bool, int) {
+	if err := netpollcheckerr(pd, mode); err != pollNoError {
+		if netpollCoroClaim(pd, op, mode) {
+			return false, err
+		}
+		// Readiness or an error notification already claimed the token.
+		// Its queued completion owns op, even if the error is now visible.
+	}
+	return true, pollNoError
+}
+
+// netpollCoroClaim removes an armed operation before netpoll has consumed it.
+// The caller may retry the nonblocking I/O after a successful claim.
+func netpollCoroClaim(pd *pollDesc, op *stacklessCoroOperation, mode int32) bool {
+	gpp := &pd.rg
+	if mode == 'w' {
+		gpp = &pd.wg
+	}
 	token := uintptr(unsafe.Pointer(op)) | netpollCoroTag
-	if !pd.rg.CompareAndSwap(token, pdNil) {
+	if !gpp.CompareAndSwap(token, pdNil) {
 		return false
 	}
 	netpollAdjustWaiters(-1)
