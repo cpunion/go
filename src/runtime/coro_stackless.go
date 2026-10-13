@@ -349,15 +349,17 @@ type stacklessCoroOperationState struct {
 	errno        *uintptr
 	valueOut     *uint64
 	// packet holds a deferred-sleep deadline, an asynchronous C reply, or a
-	// socket read's pointer-free poll descriptor and completion link. The
+	// socket operation's pointer-free poll descriptor and completion link. The
 	// operation registry remains the GC root for a linked socket operation.
 	packet [2]uint64
 	async  bool
 	// ownsPollDesc distinguishes the explicit raw-descriptor adapter from a
 	// descriptor borrowed under its library owner's lifetime locks.
 	ownsPollDesc bool
-	next         *stacklessCoroOperation
-	workNext     *stacklessCoroOperation
+	// pollWrite selects the write semaphore of a borrowed poll descriptor.
+	pollWrite bool
+	next      *stacklessCoroOperation
+	workNext  *stacklessCoroOperation
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
@@ -1268,7 +1270,7 @@ next:
 	task = s.take()
 	if task == nil {
 		if native {
-			task = stacklessCoroPollReadBeforePark(s, idlePollSkip)
+			task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
 		}
 		if task == nil {
 			if !park {

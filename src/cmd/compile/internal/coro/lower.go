@@ -175,9 +175,10 @@ type lowerSelectCase struct {
 	elementValue *ir.Name
 }
 
-type lowerRead struct {
+type lowerIO struct {
 	call      *ir.CallExpr
 	statement ir.Node
+	operation string
 	receiver  *ir.Name
 	buffer    *ir.Name
 	n         *ir.Name
@@ -196,7 +197,7 @@ type lowerState struct {
 	call       *ir.CallExpr
 	channel    *lowerChannel
 	selection  *lowerSelect
-	read       *lowerRead
+	io         *lowerIO
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -2907,11 +2908,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				if candidate.transitions[call] == SiteGoexit {
 					stateNext = cleanupState
 				}
-				var read *lowerRead
-				if ordinaryReadOperation(call) {
-					read = &lowerRead{call: call, statement: stmt}
+				var io *lowerIO
+				if operation := ordinaryIOOperation(call); operation != "" {
+					io = &lowerIO{call: call, statement: stmt, operation: operation}
 					stateNext = addState(lowerState{
-						read:      read,
+						io:        io,
 						next:      stateNext,
 						thenState: -1,
 						elseState: -1,
@@ -2920,7 +2921,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return addState(lowerState{
 					transition: candidate.transitions[call],
 					call:       call,
-					read:       read,
+					io:         io,
 					statement:  stmt,
 					next:       stateNext,
 					thenState:  -1,
@@ -3175,19 +3176,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	}
 
-	preparedReads := make(map[*lowerRead]bool)
+	preparedIO := make(map[*lowerIO]bool)
 	for i := range states {
 		state := &states[i]
-		read := state.read
-		if read == nil || state.transition == SiteInvalid || preparedReads[read] {
+		io := state.io
+		if io == nil || state.transition == SiteInvalid || preparedIO[io] {
 			continue
 		}
-		preparedReads[read] = true
-		if len(read.call.Args) != 2 {
-			return fmt.Errorf("%s: ordinary read has %d arguments, want receiver and buffer",
-				ir.PkgFuncName(fn), len(read.call.Args))
+		preparedIO[io] = true
+		if len(io.call.Args) != 2 {
+			return fmt.Errorf("%s: ordinary %s has %d arguments, want receiver and buffer",
+				ir.PkgFuncName(fn), io.operation, len(io.call.Args))
 		}
-		targets, err := callResultTargets(read.call, read.statement, 2)
+		targets, err := callResultTargets(io.call, io.statement, 2)
 		if err != nil {
 			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 		}
@@ -3196,48 +3197,48 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				continue
 			}
 			if _, ok := target.(*ir.Name); !ok {
-				return fmt.Errorf("%s: ordinary read result %d is not a variable",
-					ir.PkgFuncName(fn), i)
+				return fmt.Errorf("%s: ordinary %s result %d is not a variable",
+					ir.PkgFuncName(fn), io.operation, i)
 			}
 		}
-		read.start, err = ordinaryReadMethod(read.call.Pos(),
-			read.call.Args[0].Type(), "coroReadStart")
+		io.start, err = ordinaryIOMethod(io.call.Pos(),
+			io.call.Args[0].Type(), "coro"+io.operation+"Start")
 		if err != nil {
 			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 		}
-		read.finish, err = ordinaryReadMethod(read.call.Pos(),
-			read.call.Args[0].Type(), "coroReadFinish")
+		io.finish, err = ordinaryIOMethod(io.call.Pos(),
+			io.call.Args[0].Type(), "coro"+io.operation+"Finish")
 		if err != nil {
 			return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 		}
-		read.receiver = typecheck.TempAt(read.call.Pos(), factory,
-			read.call.Args[0].Type())
-		read.buffer = typecheck.TempAt(read.call.Pos(), resume,
-			read.call.Args[1].Type())
-		read.wait = typecheck.TempAt(read.call.Pos(), resume,
+		io.receiver = typecheck.TempAt(io.call.Pos(), factory,
+			io.call.Args[0].Type())
+		io.buffer = typecheck.TempAt(io.call.Pos(), resume,
+			io.call.Args[1].Type())
+		io.wait = typecheck.TempAt(io.call.Pos(), resume,
 			types.Types[types.TBOOL])
-		read.n, _ = targets[0].(*ir.Name)
-		if read.n == nil {
-			read.n = typecheck.TempAt(read.call.Pos(), factory,
+		io.n, _ = targets[0].(*ir.Name)
+		if io.n == nil {
+			io.n = typecheck.TempAt(io.call.Pos(), factory,
 				types.Types[types.TINT])
-			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL, read.n))
+			addDeclaration(ir.NewDecl(io.call.Pos(), ir.ODCL, io.n))
 		}
-		read.err, _ = targets[1].(*ir.Name)
-		if read.err == nil {
-			read.dummyErr = typecheck.TempAt(read.call.Pos(), factory,
+		io.err, _ = targets[1].(*ir.Name)
+		if io.err == nil {
+			io.dummyErr = typecheck.TempAt(io.call.Pos(), factory,
 				types.ErrorType)
-			read.err = read.dummyErr
-			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL,
-				read.dummyErr))
+			io.err = io.dummyErr
+			addDeclaration(ir.NewDecl(io.call.Pos(), ir.ODCL,
+				io.dummyErr))
 		}
-		read.direct = typecheck.TempAt(read.call.Pos(), factory,
+		io.direct = typecheck.TempAt(io.call.Pos(), factory,
 			types.Types[types.TBOOL])
-		read.status = typecheck.TempAt(read.call.Pos(), factory,
+		io.status = typecheck.TempAt(io.call.Pos(), factory,
 			types.Types[types.TUINTPTR])
 		for _, name := range []*ir.Name{
-			read.receiver, read.direct, read.status,
+			io.receiver, io.direct, io.status,
 		} {
-			addDeclaration(ir.NewDecl(read.call.Pos(), ir.ODCL, name))
+			addDeclaration(ir.NewDecl(io.call.Pos(), ir.ODCL, name))
 		}
 	}
 
@@ -3477,25 +3478,25 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
 			}))
-		} else if state.read != nil && state.transition == SiteInvalid {
+		} else if state.io != nil && state.transition == SiteInvalid {
 			if state.next < 0 {
-				return fmt.Errorf("%s: read finish state %d has no continuation",
+				return fmt.Errorf("%s: I/O finish state %d has no continuation",
 					ir.PkgFuncName(fn), i)
 			}
-			read := state.read
-			body = append(body, typecheck.Call(read.call.Pos(), read.finish,
+			io := state.io
+			body = append(body, typecheck.Call(io.call.Pos(), io.finish,
 				ir.Nodes{
-					edit(read.receiver),
-					typecheck.NodAddr(edit(read.n)),
-					typecheck.NodAddr(edit(read.err)),
-					edit(read.direct), edit(read.status),
+					edit(io.receiver),
+					typecheck.NodAddr(edit(io.n)),
+					typecheck.NodAddr(edit(io.err)),
+					edit(io.direct), edit(io.status),
 				}, false))
-			for _, name := range []*ir.Name{read.receiver, read.dummyErr} {
+			for _, name := range []*ir.Name{io.receiver, io.dummyErr} {
 				if name == nil {
 					continue
 				}
-				body = append(body, ir.NewAssignStmt(read.call.Pos(),
-					edit(name), ir.NewZero(read.call.Pos(), name.Type())))
+				body = append(body, ir.NewAssignStmt(io.call.Pos(),
+					edit(name), ir.NewZero(io.call.Pos(), name.Type())))
 			}
 			body = append(body,
 				assignResumePC(state.next),
@@ -3684,32 +3685,32 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					gotoState(state.next),
 				)
 			case SiteFile, SitePoll:
-				if ordinaryReadOperation(state.call) {
-					read := state.read
-					if read == nil {
-						return fmt.Errorf("%s: ordinary read has no lowering plan",
+				if ordinaryIOOperation(state.call) != "" {
+					io := state.io
+					if io == nil {
+						return fmt.Errorf("%s: ordinary I/O has no lowering plan",
 							ir.PkgFuncName(fn))
 					}
 					for _, init := range state.call.Init() {
 						body = append(body, edit(init))
 					}
 					body = append(body,
-						ir.NewAssignStmt(state.call.Pos(), edit(read.receiver),
+						ir.NewAssignStmt(state.call.Pos(), edit(io.receiver),
 							edit(state.call.Args[0])),
-						ir.NewAssignStmt(state.call.Pos(), edit(read.buffer),
+						ir.NewAssignStmt(state.call.Pos(), edit(io.buffer),
 							edit(state.call.Args[1])))
-					wait := typecheck.Call(state.call.Pos(), read.start, ir.Nodes{
-						edit(read.receiver), ctx, edit(read.buffer),
-						typecheck.NodAddr(edit(read.n)),
-						typecheck.NodAddr(edit(read.err)),
-						typecheck.NodAddr(edit(read.direct)),
-						typecheck.NodAddr(edit(read.status)),
+					wait := typecheck.Call(state.call.Pos(), io.start, ir.Nodes{
+						edit(io.receiver), ctx, edit(io.buffer),
+						typecheck.NodAddr(edit(io.n)),
+						typecheck.NodAddr(edit(io.err)),
+						typecheck.NodAddr(edit(io.direct)),
+						typecheck.NodAddr(edit(io.status)),
 					}, false)
 					body = append(body,
-						ir.NewAssignStmt(state.call.Pos(), edit(read.wait), wait),
-						ir.NewAssignStmt(state.call.Pos(), edit(read.buffer),
-							ir.NewZero(state.call.Pos(), read.buffer.Type())),
-						ir.NewIfStmt(state.call.Pos(), edit(read.wait), ir.Nodes{
+						ir.NewAssignStmt(state.call.Pos(), edit(io.wait), wait),
+						ir.NewAssignStmt(state.call.Pos(), edit(io.buffer),
+							ir.NewZero(state.call.Pos(), io.buffer.Type())),
+						ir.NewIfStmt(state.call.Pos(), edit(io.wait), ir.Nodes{
 							ir.NewReturnStmt(state.call.Pos(), []ir.Node{
 								typedInt(state.call.Pos(),
 									types.Types[types.TUINT8], int64(actionWait)),
@@ -4530,19 +4531,21 @@ func transitionCall(stmt ir.Node, transitions map[*ir.CallExpr]SiteKind) *ir.Cal
 	return found
 }
 
-func ordinaryReadOperation(call *ir.CallExpr) bool {
+func ordinaryIOOperation(call *ir.CallExpr) string {
 	name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
 	switch symbolName(name) {
 	case "os.(*File).Read", "net.(*TCPConn).Read", "net.(*conn).Read":
-		return true
+		return "Read"
+	case "os.(*File).Write", "net.(*TCPConn).Write", "net.(*conn).Write":
+		return "Write"
 	}
-	return false
+	return ""
 }
 
-func ordinaryReadMethod(pos src.XPos, receiver *types.Type, name string) (ir.Node, error) {
+func ordinaryIOMethod(pos src.XPos, receiver *types.Type, name string) (ir.Node, error) {
 	base := types.ReceiverBaseType(receiver)
 	if base == nil || base.Sym() == nil || base.Sym().Pkg == nil {
-		return nil, fmt.Errorf("ordinary read receiver %v has no named base type",
+		return nil, fmt.Errorf("ordinary I/O receiver %v has no named base type",
 			receiver)
 	}
 	sym := base.Sym().Pkg.Lookup(name)
@@ -4552,7 +4555,7 @@ func ordinaryReadMethod(pos src.XPos, receiver *types.Type, name string) (ir.Nod
 			return typecheck.NewMethodExpr(pos, receiver, sym), nil
 		}
 	}
-	return nil, fmt.Errorf("ordinary read receiver %v has no %s method",
+	return nil, fmt.Errorf("ordinary I/O receiver %v has no %s method",
 		receiver, name)
 }
 

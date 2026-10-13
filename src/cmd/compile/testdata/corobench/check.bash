@@ -29,6 +29,7 @@ allocation_output="$output_dir/public-entry-allocation.txt"
 recursive_allocation_output="$output_dir/recursive-frame-allocation.txt"
 task_footprint_output="$output_dir/task-footprint-allocation.txt"
 read_output="$output_dir/read-lowering.txt"
+write_output="$output_dir/write-lowering.txt"
 correctness_output="$output_dir/correctness.txt"
 public_coverage_output="$output_dir/public-read-coverage.txt"
 poll_coverage_output="$output_dir/poll-read-coverage.txt"
@@ -55,7 +56,7 @@ if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
 	exit 1
 fi
 if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
-	-coverprofile="$poll_coverage" internal/poll -run '^TestCoroRead' \
+	-coverprofile="$poll_coverage" internal/poll -run '^TestCoro(Read|Write)' \
 	>"$poll_coverage_output" 2>&1; then
 	tail -n 100 "$poll_coverage_output" >&2
 	exit 1
@@ -97,6 +98,15 @@ coverage_targets=(
 	'net/fd_coro.go:coroReadStart'
 	'net/fd_coro.go:coroReadFinish'
 	'net/fd_coro.go:coroReadError'
+	'internal/poll/fd_coro_write_unix.go:tryWriteLock'
+	'internal/poll/fd_coro_write_unix.go:CoroWriteStart'
+	'internal/poll/fd_coro_write_unix.go:CoroWriteFinish'
+	'internal/poll/fd_coro_write_unix.go:CoroCallWrite'
+	'os/file_coro_write.go:coroWriteStart'
+	'os/file_coro_write.go:coroWriteFinish'
+	'net/fd_coro_write.go:coroWriteStart'
+	'net/fd_coro_write.go:coroWriteFinish'
+	'net/fd_coro_write.go:coroWriteError'
 )
 for target in "${coverage_targets[@]}"; do
 	file=${target%:*}
@@ -145,6 +155,16 @@ expected=(
 	sleepLoop
 	fileReads
 	tcpReads
+	fileWrite
+	tcpWrite
+	fileWrites
+	tcpWrites
+	udpWrite
+	fileWriteDiscard
+	blockingFileWrite
+	blockingTCPWrite
+	startFileWrites
+	startTCPWrites
 	waitForEpoch
 	contendedFileRead
 	contendedFileRead1
@@ -347,6 +367,26 @@ for function in "${read_functions[@]}"; do
 		echo "$function still calls the generic read worker" >&2
 		exit 1
 	fi
+done
+: >"$write_output"
+for function in fileWrite fileWrites fileWriteDiscard blockingFileWrite tcpWrite tcpWrites udpWrite blockingTCPWrite; do
+	disassembly=$("$coro_goroot/bin/go" tool objdump \
+		-s "${function}\\.coro\\.func[0-9]+$" "$test_binary")
+	printf '%s\n' "$disassembly" >>"$write_output"
+	case "$function" in
+	fileWrite | fileWrites | fileWriteDiscard | blockingFileWrite)
+		write_type='os.(*File)'
+		;;
+	*)
+		write_type='net.(*conn)'
+		;;
+	esac
+	for phase in Start Finish; do
+		if ! grep -Fq "$write_type.coroWrite$phase" <<<"$disassembly"; then
+			echo "$function does not call $write_type.coroWrite$phase" >&2
+			exit 1
+		fi
+	done
 done
 for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block \
 	probe_block_group; do
