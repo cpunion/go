@@ -1138,9 +1138,9 @@ func TestStacklessCoroOperationSize(t *testing.T) {
 
 func TestStacklessCoroSchedulerSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := uintptr(192)
+	want := uintptr(208)
 	if ptrSize == 4 {
-		want = 112
+		want = 124
 	}
 	if got := runtime.StacklessCoroSchedulerSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine scheduler size = %d, want %d", got, want)
