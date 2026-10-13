@@ -4098,34 +4098,34 @@ func (r *reader) importedDef() bool {
 
 // MakeWrappers constructs all wrapper methods needed for the target
 // compilation unit.
-func MakeWrappers(target *ir.Package) {
+func MakeWrappers(target *ir.Package, preserveCall func(*ir.Func) bool) {
 	// always generate a wrapper for error.Error (#29304)
 	needWrapperTypes = append(needWrapperTypes, types.ErrorType)
 
 	seen := make(map[string]*types.Type)
 
 	for _, typ := range haveWrapperTypes {
-		wrapType(typ, target, seen, false)
+		wrapType(typ, target, seen, false, preserveCall)
 	}
 	haveWrapperTypes = nil
 
 	for _, typ := range needWrapperTypes {
-		wrapType(typ, target, seen, true)
+		wrapType(typ, target, seen, true, preserveCall)
 	}
 	needWrapperTypes = nil
 
 	for _, wrapper := range haveMethodValueWrappers {
-		wrapMethodValue(wrapper.rcvr, wrapper.method, target, false)
+		wrapMethodValue(wrapper.rcvr, wrapper.method, target, false, preserveCall)
 	}
 	haveMethodValueWrappers = nil
 
 	for _, wrapper := range needMethodValueWrappers {
-		wrapMethodValue(wrapper.rcvr, wrapper.method, target, true)
+		wrapMethodValue(wrapper.rcvr, wrapper.method, target, true, preserveCall)
 	}
 	needMethodValueWrappers = nil
 }
 
-func wrapType(typ *types.Type, target *ir.Package, seen map[string]*types.Type, needed bool) {
+func wrapType(typ *types.Type, target *ir.Package, seen map[string]*types.Type, needed bool, preserveCall func(*ir.Func) bool) {
 	key := typ.LinkString()
 	if prev := seen[key]; prev != nil {
 		if !types.Identical(typ, prev) {
@@ -4148,22 +4148,22 @@ func wrapType(typ *types.Type, target *ir.Package, seen map[string]*types.Type, 
 			base.FatalfAt(meth.Pos, "invalid method: %v", meth)
 		}
 
-		methodWrapper(0, typ, meth, target)
+		methodWrapper(0, typ, meth, target, preserveCall)
 
 		// For non-interface types, we also want *T wrappers.
 		if !typ.IsInterface() {
-			methodWrapper(1, typ, meth, target)
+			methodWrapper(1, typ, meth, target, preserveCall)
 
 			// For not-in-heap types, *T is a scalar, not pointer shaped,
 			// so the interface wrappers use **T.
 			if typ.NotInHeap() {
-				methodWrapper(2, typ, meth, target)
+				methodWrapper(2, typ, meth, target, preserveCall)
 			}
 		}
 	}
 }
 
-func methodWrapper(derefs int, tbase *types.Type, method *types.Field, target *ir.Package) {
+func methodWrapper(derefs int, tbase *types.Type, method *types.Field, target *ir.Package, preserveCall func(*ir.Func) bool) {
 	wrapper := tbase
 	for i := 0; i < derefs; i++ {
 		wrapper = types.NewPtr(wrapper)
@@ -4203,10 +4203,10 @@ func methodWrapper(derefs int, tbase *types.Type, method *types.Field, target *i
 
 	addTailCall(pos, fn, recv, method)
 
-	finishWrapperFunc(fn, target)
+	finishWrapperFunc(fn, target, preserveCall)
 }
 
-func wrapMethodValue(recvType *types.Type, method *types.Field, target *ir.Package, needed bool) {
+func wrapMethodValue(recvType *types.Type, method *types.Field, target *ir.Package, needed bool, preserveCall func(*ir.Func) bool) {
 	sym := ir.MethodSymSuffix(recvType, method.Sym, "-fm")
 	if sym.Uniq() {
 		return
@@ -4228,7 +4228,7 @@ func wrapMethodValue(recvType *types.Type, method *types.Field, target *ir.Packa
 
 	addTailCall(pos, fn, recv, method)
 
-	finishWrapperFunc(fn, target)
+	finishWrapperFunc(fn, target, preserveCall)
 }
 
 func newWrapperFunc(pos src.XPos, sym *types.Sym, wrapper *types.Type, method *types.Field) *ir.Func {
@@ -4240,7 +4240,7 @@ func newWrapperFunc(pos src.XPos, sym *types.Sym, wrapper *types.Type, method *t
 	return fn
 }
 
-func finishWrapperFunc(fn *ir.Func, target *ir.Package) {
+func finishWrapperFunc(fn *ir.Func, target *ir.Package, preserveCall func(*ir.Func) bool) {
 	ir.WithFunc(fn, func() {
 		typecheck.Stmts(fn.Body)
 	})
@@ -4248,7 +4248,7 @@ func finishWrapperFunc(fn *ir.Func, target *ir.Package) {
 	// We generate wrappers after the global inlining pass,
 	// so we're responsible for applying inlining ourselves here.
 	// TODO(prattmic): plumb PGO.
-	interleaved.DevirtualizeAndInlineFunc(fn, nil)
+	interleaved.DevirtualizeAndInlineFunc(fn, nil, preserveCall)
 
 	// The body of wrapper function after inlining may reveal new ir.OMETHVALUE node,
 	// we don't know whether wrapper function has been generated for it or not, so
@@ -4259,7 +4259,7 @@ func finishWrapperFunc(fn *ir.Func, target *ir.Package) {
 	// closure that we see when visiting body of the wrapper function.
 	ir.VisitFuncAndClosures(fn, func(n ir.Node) {
 		if n, ok := n.(*ir.SelectorExpr); ok && n.Op() == ir.OMETHVALUE {
-			wrapMethodValue(n.X.Type(), n.Selection, target, true)
+			wrapMethodValue(n.X.Type(), n.Selection, target, true, preserveCall)
 		}
 	})
 

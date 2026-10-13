@@ -18,8 +18,9 @@ import (
 )
 
 // DevirtualizeAndInlinePackage interleaves devirtualization and inlining on
-// all functions within pkg.
-func DevirtualizeAndInlinePackage(pkg *ir.Package, profile *pgoir.Profile) {
+// all functions within pkg. If preserveCall is non-nil, it identifies callees
+// whose call boundaries must survive inlining for a later compiler pass.
+func DevirtualizeAndInlinePackage(pkg *ir.Package, profile *pgoir.Profile, preserveCall func(*ir.Func) bool) {
 	if base.Flag.W > 1 {
 		for _, fn := range typecheck.Target.Funcs {
 			s := fmt.Sprintf("\nbefore devirtualize-and-inline %v", fn.Sym())
@@ -61,7 +62,7 @@ func DevirtualizeAndInlinePackage(pkg *ir.Package, profile *pgoir.Profile) {
 			fmt.Printf("%v: function %v considered 'big'; reducing max cost of inlinees\n", ir.Line(fn), fn)
 		}
 
-		s := &inlClosureState{bigCaller: bigCaller, profile: profile, fn: fn, callSites: make(map[*ir.ParenExpr]bool), useCounts: calleeUseCounts}
+		s := &inlClosureState{bigCaller: bigCaller, profile: profile, fn: fn, callSites: make(map[*ir.ParenExpr]bool), useCounts: calleeUseCounts, preserveCall: preserveCall}
 		s.parenthesize()
 		inlState[fn] = s
 
@@ -156,7 +157,7 @@ func DevirtualizeAndInlinePackage(pkg *ir.Package, profile *pgoir.Profile) {
 
 // DevirtualizeAndInlineFunc interleaves devirtualization and inlining
 // on a single function.
-func DevirtualizeAndInlineFunc(fn *ir.Func, profile *pgoir.Profile) {
+func DevirtualizeAndInlineFunc(fn *ir.Func, profile *pgoir.Profile, preserveCall func(*ir.Func) bool) {
 	ir.WithFunc(fn, func() {
 		if base.Flag.LowerL != 0 {
 			if inlheur.Enabled() && !fn.Wrapper() {
@@ -173,7 +174,7 @@ func DevirtualizeAndInlineFunc(fn *ir.Func, profile *pgoir.Profile) {
 			fmt.Printf("%v: function %v considered 'big'; reducing max cost of inlinees\n", ir.Line(fn), fn)
 		}
 
-		s := &inlClosureState{bigCaller: bigCaller, profile: profile, fn: fn, callSites: make(map[*ir.ParenExpr]bool), useCounts: make(map[*ir.Func]int)}
+		s := &inlClosureState{bigCaller: bigCaller, profile: profile, fn: fn, callSites: make(map[*ir.ParenExpr]bool), useCounts: make(map[*ir.Func]int), preserveCall: preserveCall}
 		s.parenthesize()
 		s.fixpoint()
 		s.unparenthesize()
@@ -186,13 +187,14 @@ type callSite struct {
 }
 
 type inlClosureState struct {
-	fn        *ir.Func
-	profile   *pgoir.Profile
-	callSites map[*ir.ParenExpr]bool // callSites[p] == "p appears in parens" (do not append again)
-	resolved  []*ir.Func             // for each call in parens, the resolved target of the call
-	useCounts map[*ir.Func]int       // shared among all InlClosureStates
-	parens    []*ir.ParenExpr
-	bigCaller bool
+	fn           *ir.Func
+	profile      *pgoir.Profile
+	callSites    map[*ir.ParenExpr]bool // callSites[p] == "p appears in parens" (do not append again)
+	resolved     []*ir.Func             // for each call in parens, the resolved target of the call
+	useCounts    map[*ir.Func]int       // shared among all InlClosureStates
+	parens       []*ir.ParenExpr
+	bigCaller    bool
+	preserveCall func(*ir.Func) bool
 }
 
 // resolve attempts to resolve a call to a potentially inlineable callee
@@ -234,6 +236,9 @@ func (s *inlClosureState) edit(state *devirtualize.State, i int) (*ir.CallExpr, 
 	// must be re-checked.
 	callee, count := s.resolve(state, i)
 	if count <= 0 {
+		return nil, nil
+	}
+	if s.preserveCall != nil && s.preserveCall(callee) {
 		return nil, nil
 	}
 	if inlCall := inline.TryInlineCall(s.fn, call, s.bigCaller, s.profile, count == 1 && callee.ClosureParent != nil); inlCall != nil {
