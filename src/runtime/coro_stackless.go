@@ -1050,7 +1050,9 @@ func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
 
 func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 	task *stacklessCoroTask) {
-	if task.hasFlag(stacklessCoroTaskCacheFrame) {
+	// Public root frames belong to the root-frame cache. Only non-root
+	// frames are charged to this scheduler's task and byte limits.
+	if task != &s.root && task.hasFlag(stacklessCoroTaskCacheFrame) {
 		if s.cachedFrameTasks == 0 ||
 			s.cachedFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine cached-frame ownership")
