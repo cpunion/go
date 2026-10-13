@@ -594,9 +594,7 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
 	quiescent bool) {
 	defer func() {
-		if raceenabled {
-			s.discardWake()
-		} else {
+		if !raceenabled {
 			quiescent = releaseStacklessCoroRootScheduler(s)
 		}
 	}()
@@ -606,10 +604,10 @@ func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
 
 func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// An operation producer can still hold a completed root scheduler after
-	// removing its operation from the global registry. Detach its wake channel,
-	// but do not inspect or reuse the remaining scheduler state in that case.
+	// removing its operation from the global registry. It may still read wake
+	// to signal an already completed task, so retain the immutable channel and
+	// leave both allocations to GC rather than inspecting or reusing them.
 	if s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 {
-		s.discardWake()
 		return false
 	}
 	state := s.executorState.Load()
