@@ -246,6 +246,39 @@ type OperationRecipe struct {
 }
 
 var operationRecipes = map[string]OperationRecipe{
+	// These declarations park an ordinary goroutine in the runtime. Their
+	// bodies are unavailable to effect analysis, so propagate suspension
+	// explicitly through the synchronization packages and their callers.
+	// Until they have coroutine entries, the ordinary await dependency check
+	// keeps those callers on the Go entry instead of parking an executor.
+	"internal/sync.runtime_SemacquireMutex": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"sync.runtime_Semacquire": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"sync.runtime_SemacquireRWMutexR": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"sync.runtime_SemacquireRWMutex": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"sync.runtime_SemacquireWaitGroup": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"internal/poll.runtime_Semacquire": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
+	"sync.runtime_notifyListWait": {
+		Kind:   SiteAwait,
+		Effect: MaySuspend,
+	},
 	"runtime.Gosched": {
 		Kind:   SiteYield,
 		Effect: MaySuspend,
