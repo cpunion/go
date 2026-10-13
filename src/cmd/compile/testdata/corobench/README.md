@@ -6,6 +6,15 @@ exact upstream merge-base. The same source directory is compiled by both
 toolchains. It imports no private coroutine package and uses no source
 annotation to select coroutine functions.
 
+Default inlining remains enabled for ordinary calls. With coroutine lowering
+enabled, calls that may need a coroutine entry and compiler-owned operation
+entries retain their call boundaries, including in generated method wrappers.
+This currently includes local functions that may panic, because their ordinary
+entry may be replaced with a logical-task scheduler entry. General inlining of
+these calls needs a control-flow normalization that preserves suspension,
+argument evaluation, and inline debug information. The historical measurements
+below continue to use their recorded inlining settings.
+
 [`PUSH_PULL.md`](PUSH_PULL.md) defines the controlled comparison between the
 current exact-task push queue, a Rust-like wake-and-poll driver with identical
 task representation, and a compact structured-frame pull model.
