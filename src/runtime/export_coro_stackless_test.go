@@ -1165,6 +1165,9 @@ func StacklessCoroPollWaitCountForTest() int {
 			}
 			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
 			token := pd.rg.Load()
+			if op.pollWrite {
+				token = pd.wg.Load()
+			}
 			if token&netpollCoroTagMask == netpollCoroTag &&
 				token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op)) {
 				count++
@@ -1249,10 +1252,10 @@ func StacklessCoroPollArmForTest(fd int, ready, timeout bool) (waiting bool, err
 	}
 	waiting, errno = netpollCoroReadArm(pd, op)
 	if waiting {
-		tokenMatches = netpollCoroReadClaim(pd, op)
+		tokenMatches = netpollCoroClaim(pd, op, 'r')
 		if tokenMatches {
 			delta--
-			if netpollCoroReadClaim(pd, op) {
+			if netpollCoroClaim(pd, op, 'r') {
 				throw("runtime: claimed stackless coroutine poll token twice")
 			}
 		}
@@ -1293,15 +1296,15 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 		throw("runtime: failed to arm coroutine idle-retry descriptor")
 	}
 
-	skipped = stacklessCoroPollReadAtIdle(s, task, nil) == nil
-	claimed = stacklessCoroPollReadAtIdle(s, nil, nil) == task
+	skipped = stacklessCoroPollIOAtIdle(s, task, nil) == nil
+	claimed = stacklessCoroPollIOAtIdle(s, nil, nil) == task
 	token := pd.rg.Load()
 	rearmed = token&netpollCoroTagMask == netpollCoroTag &&
 		token&^netpollCoroTagMask == uintptr(unsafe.Pointer(op))
 	if !skipped || !claimed || !rearmed {
 		throw("runtime: failed coroutine idle poll retry")
 	}
-	if !netpollCoroReadClaim(pd, op) {
+	if !netpollCoroClaim(pd, op, 'r') {
 		throw("runtime: lost rearmed coroutine idle-retry descriptor")
 	}
 	if takeStacklessCoroOperation(id) != op {
@@ -1379,6 +1382,33 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 
 func PublicFileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	poll_runtime_coroFileRead(ctx, fd, buffer, n, errno)
+}
+
+func FileWriteStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, status *uintptr) {
+	poll_runtime_coroFileWrite(ctx, fd, buffer, n, status)
+}
+
+func SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
+	fd int, buffer []byte, n *int, status *uintptr) {
+	poll_runtime_coroSocketWrite(ctx, uintptr(descriptor), fd, buffer, n, status)
+}
+
+func ExpireWriteStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
+	poll_runtime_pollSetDeadline((*pollDesc)(descriptor), -1, 'w')
+}
+
+func StacklessCoroWriteResultForTest(size, written int, count int32) (int, uintptr, bool) {
+	result := new(struct {
+		n      int
+		status uintptr
+	})
+	result.n = written
+	op := new(stacklessCoroOperation)
+	op.buffer = make([]byte, size)
+	op.n = &result.n
+	op.errno = &result.status
+	done := stacklessCoroWriteResult(op, count)
+	return result.n, result.status, done
 }
 
 func SocketReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
@@ -1722,7 +1752,7 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 	oldScan := registry.scan
 	registry.scan = uint16(bucket)
 	unlock(&stacklessCoroOperations.lock)
-	valid := stacklessCoroPollReadAtIdle(s, nil, nil) == nil
+	valid := stacklessCoroPollIOAtIdle(s, nil, nil) == nil
 	lock(&stacklessCoroOperations.lock)
 	valid = valid && int(registry.scan) ==
 		(bucket+1)%stacklessCoroOperationRegistryBucketCount

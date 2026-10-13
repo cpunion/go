@@ -2466,10 +2466,194 @@ func TestLowerStateMachines(t *testing.T) {
 	}
 }
 
-func TestOrdinaryReadMethodErrors(t *testing.T) {
+func TestOrdinaryIOOperations(t *testing.T) {
 	prepareLowerTest(t)
 
-	if _, err := ordinaryReadMethod(src.NoXPos,
+	for _, test := range []struct {
+		path      string
+		name      string
+		operation string
+		kind      SiteKind
+	}{
+		{"os", "(*File).Read", "Read", SiteFile},
+		{"os", "(*File).Write", "Write", SiteFile},
+		{"net", "(*TCPConn).Read", "Read", SitePoll},
+		{"net", "(*TCPConn).Write", "Write", SitePoll},
+		{"net", "(*conn).Read", "Read", SitePoll},
+		{"net", "(*conn).Write", "Write", SitePoll},
+		{"example.com/os", "(*File).Write", "", SiteInvalid},
+		{"os", "(*File).WriteAt", "", SiteInvalid},
+		{"net", "(*UDPConn).Write", "", SiteInvalid},
+		{"io", "(*Writer).Write", "", SiteInvalid},
+	} {
+		t.Run(test.path+"."+test.name, func(t *testing.T) {
+			pkg := types.NewPkg(test.path, test.path)
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(test.name),
+				types.NewSignature(nil, nil, nil))
+			if got := ordinaryIOOperation(newLowerTestCall(fn)); got != test.operation {
+				t.Errorf("operation = %q, want %q", got, test.operation)
+			}
+			recipe, ok := operationRecipe(fn)
+			if ok != (test.operation != "") || recipe.Kind != test.kind {
+				t.Fatalf("recipe = (%+v, %t), want kind %v", recipe, ok, test.kind)
+			}
+			if ok && recipe.Effect != MaySuspend {
+				t.Errorf("effect = %v, want may-suspend", recipe.Effect)
+			}
+		})
+	}
+
+	// A function value with the same spelling is not a static I/O operation.
+	fn := ir.NewNameAt(src.NoXPos, types.LocalPkg.Lookup("Write"),
+		types.NewSignature(nil, nil, nil))
+	fn.Class = ir.PAUTO
+	call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, fn, nil)
+	if got := ordinaryIOOperation(call); got != "" {
+		t.Errorf("dynamic call operation = %q, want none", got)
+	}
+}
+
+func TestLowerOrdinaryIO(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	oldCurFunc := ir.CurFunc
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+		ir.CurFunc = oldCurFunc
+	}()
+
+	for _, receiver := range []struct {
+		path string
+		name string
+	}{
+		{"os", "File"},
+		{"net", "conn"},
+		{"net", "TCPConn"},
+	} {
+		for _, operation := range []string{"Read", "Write"} {
+			for _, results := range []string{"assign", "blank", "discard"} {
+				name := receiver.path + "." + receiver.name + "." + operation + "/" + results
+				t.Run(name, func(t *testing.T) {
+					pkg := types.NewPkg("example.com/coro/io/"+name, "testio")
+					types.LocalPkg = pkg
+					typecheck.Target = new(ir.Package)
+					ioPkg := types.NewPkg(receiver.path, receiver.path)
+					typeName := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, ioPkg.Lookup(receiver.name))
+					typ := types.NewNamed(typeName)
+					typeName.SetType(typ)
+					typeName.SetTypecheck(1)
+					typ.SetUnderlying(types.NewStruct(nil))
+					ptr := types.NewPtr(typ)
+					recv := types.NewField(src.NoXPos, nil, ptr)
+					bufferType := types.NewSlice(types.ByteType)
+					method := ir.NewFunc(src.NoXPos, src.NoXPos,
+						ioPkg.Lookup("(*"+receiver.name+")."+operation),
+						types.NewSignature(recv, []*types.Field{
+							types.NewField(src.NoXPos, nil, bufferType),
+						}, []*types.Field{
+							types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+							types.NewField(src.NoXPos, nil, types.ErrorType),
+						}))
+					method.DeclareParams(true)
+					startName := "coro" + operation + "Start"
+					finishName := "coro" + operation + "Finish"
+					startParams := []*types.Field{
+						types.NewField(src.NoXPos, nil, types.Types[types.TUNSAFEPTR]),
+						types.NewField(src.NoXPos, nil, bufferType),
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TINT])),
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.ErrorType)),
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TBOOL])),
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TUINTPTR])),
+					}
+					finishParams := []*types.Field{
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TINT])),
+						types.NewField(src.NoXPos, nil, types.NewPtr(types.ErrorType)),
+						types.NewField(src.NoXPos, nil, types.Types[types.TBOOL]),
+						types.NewField(src.NoXPos, nil, types.Types[types.TUINTPTR]),
+					}
+					methods := []*types.Field{
+						types.NewField(src.NoXPos, ioPkg.Lookup(operation), method.Type()),
+						types.NewField(src.NoXPos, ioPkg.Lookup(startName),
+							types.NewSignature(recv, startParams, []*types.Field{
+								types.NewField(src.NoXPos, nil, types.Types[types.TBOOL]),
+							})),
+						types.NewField(src.NoXPos, ioPkg.Lookup(finishName),
+							types.NewSignature(recv, finishParams, nil)),
+					}
+					typ.SetMethods(methods)
+					typ.SetAllMethods(methods)
+					fn := newLowerTestFunc(pkg, "run")
+					call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, method.Nname,
+						ir.Nodes{ir.NewNilExpr(src.NoXPos, ptr), ir.NewNilExpr(src.NoXPos, bufferType)})
+					call.SetTypecheck(1)
+					call.SetType(method.Type().ResultsTuple())
+					if results == "discard" {
+						fn.Body = append(fn.Body, call)
+					} else {
+						lhs := ir.Nodes{ir.BlankNode, ir.BlankNode}
+						if results == "assign" {
+							for i, result := range method.Type().Results() {
+								local := fn.NewLocal(src.NoXPos, pkg.LookupNum("result", i), result.Type)
+								fn.Body = append(fn.Body, ir.NewDecl(src.NoXPos, ir.ODCL, local))
+								lhs[i] = local
+							}
+						}
+						assign := ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC, lhs, ir.Nodes{call})
+						assign.SetTypecheck(1)
+						fn.Body = append(fn.Body, assign)
+					}
+					fn.Body = append(fn.Body, newLowerTestReturn())
+					plan, err := Analyze([]*ir.Func{fn}, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					result, err := Lower(plan)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if result.Lowered != 1 || result.Skipped != 0 {
+						t.Fatalf("Lower = %+v, want one lowered function", result)
+					}
+					var starts, finishes, ordinaryCalls int
+					for _, generated := range typecheck.Target.Funcs {
+						if generated.OClosure == nil || generated.ClosureParent == nil ||
+							generated.ClosureParent.Sym().Name != "run.coro" {
+							continue
+						}
+						ir.Visit(generated, func(node ir.Node) {
+							call, ok := node.(*ir.CallExpr)
+							if !ok {
+								return
+							}
+							if selector, ok := call.Fun.(*ir.SelectorExpr); ok {
+								switch selector.Sel.Name {
+								case startName:
+									starts++
+								case finishName:
+									finishes++
+								}
+							}
+							if ordinaryIOOperation(call) != "" {
+								ordinaryCalls++
+							}
+						})
+					}
+					if starts != 1 || finishes != 1 || ordinaryCalls != 0 {
+						t.Errorf("calls = (%d starts, %d finishes, %d ordinary), want (1, 1, 0)",
+							starts, finishes, ordinaryCalls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestOrdinaryIOMethodErrors(t *testing.T) {
+	prepareLowerTest(t)
+
+	if _, err := ordinaryIOMethod(src.NoXPos,
 		types.NewPtr(types.NewStruct(nil)), "coroReadStart"); err == nil ||
 		!strings.Contains(err.Error(), "no named base type") {
 		t.Fatalf("unnamed receiver error = %v", err)
@@ -2481,7 +2665,7 @@ func TestOrdinaryReadMethodErrors(t *testing.T) {
 	name.SetType(typ)
 	name.SetTypecheck(1)
 	typ.SetUnderlying(types.NewStruct(nil))
-	if _, err := ordinaryReadMethod(src.NoXPos,
+	if _, err := ordinaryIOMethod(src.NoXPos,
 		types.NewPtr(typ), "coroReadStart"); err == nil ||
 		!strings.Contains(err.Error(), "no coroReadStart method") {
 		t.Fatalf("missing method error = %v", err)
