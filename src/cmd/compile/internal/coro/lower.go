@@ -90,6 +90,7 @@ type lowerCandidate struct {
 	dynamicDefers    bool
 	channels         map[ir.Node]*lowerChannel
 	selects          map[*ir.SelectStmt]*lowerSelect
+	branches         map[*ir.BranchStmt]ir.Node
 	rangeVars        []*ir.Name
 	panics           map[*ir.UnaryExpr]bool
 	parameters       map[*ir.Name]*ir.Name
@@ -402,6 +403,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	channelContainers := make(map[ir.Node]ir.Node)
 	selects := make(map[*ir.SelectStmt]*lowerSelect)
 	selectOperations := make(map[ir.Node]*ir.SelectStmt)
+	branches := make(map[*ir.BranchStmt]ir.Node)
+	var breakTarget, continueTarget ir.Node
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	dynamicDefers := false
@@ -545,7 +548,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						return err
 					}
 				}
-				if err := collectStatements(stmt.Body, true); err != nil {
+				oldBreak, oldContinue := breakTarget, continueTarget
+				breakTarget, continueTarget = stmt, stmt
+				err := collectStatements(stmt.Body, true)
+				breakTarget, continueTarget = oldBreak, oldContinue
+				if err != nil {
 					return err
 				}
 			case *ir.RangeStmt:
@@ -561,7 +568,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					recordedRangeVars[variable.Canonical()] = true
 					rangeVars = append(rangeVars, variable)
 				}
-				if err := collectStatements(stmt.Body, true); err != nil {
+				oldBreak, oldContinue := breakTarget, continueTarget
+				breakTarget, continueTarget = stmt, stmt
+				err := collectStatements(stmt.Body, true)
+				breakTarget, continueTarget = oldBreak, oldContinue
+				if err != nil {
 					return err
 				}
 			case *ir.SelectStmt:
@@ -578,10 +589,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					if err := collectStatements(clause.Init(), inLoop); err != nil {
 						return err
 					}
-					if err := collectStatements(clause.Body, inLoop); err != nil {
+					oldBreak := breakTarget
+					breakTarget = stmt
+					err := collectStatements(clause.Body, inLoop)
+					breakTarget = oldBreak
+					if err != nil {
 						return err
 					}
 				}
+			case *ir.BranchStmt:
+				var target ir.Node
+				if stmt.Label == nil {
+					switch stmt.Op() {
+					case ir.OBREAK:
+						target = breakTarget
+					case ir.OCONTINUE:
+						target = continueTarget
+					}
+				}
+				if target == nil {
+					return fmt.Errorf("control flow %v", stmt.Op())
+				}
+				branches[stmt] = target
 			case *ir.ReturnStmt:
 				if len(stmt.Results) != 0 && len(stmt.Results) != sig.NumResults() {
 					return fmt.Errorf("return has %d results, want %d",
@@ -589,19 +618,25 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 			default:
 				hasDefer := false
+				hasBranch := false
 				ir.Visit(stmt, func(node ir.Node) {
 					if deferStmt, ok := node.(*ir.GoDeferStmt); ok &&
 						deferStmt.Op() == ir.ODEFER {
 						hasDefer = true
+					}
+					if _, ok := node.(*ir.BranchStmt); ok {
+						hasBranch = true
 					}
 				})
 				if hasDefer {
 					return fmt.Errorf("defer in unsupported control flow %v",
 						stmt.Op())
 				}
+				if hasBranch {
+					return fmt.Errorf("branch in unsupported control flow %v", stmt.Op())
+				}
 				switch stmt.Op() {
-				case ir.OBREAK, ir.OCONTINUE, ir.OFALL, ir.OGOTO,
-					ir.OLABEL:
+				case ir.OLABEL:
 					return fmt.Errorf("control flow %v", stmt.Op())
 				}
 			}
@@ -663,6 +698,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		dynamicDefers: dynamicDefers,
 		channels:      make(map[ir.Node]*lowerChannel),
 		selects:       selects,
+		branches:      branches,
 		rangeVars:     rangeVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
@@ -2516,6 +2552,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				required = true
 				return
 			}
+			if branch, ok := node.(*ir.BranchStmt); ok && candidate.branches[branch] != nil {
+				required = true
+				return
+			}
 			if candidate.channels[node] != nil {
 				required = true
 				return
@@ -2543,6 +2583,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		switch stmt := stmt.(type) {
 		case *ir.ReturnStmt:
 			return true
+		case *ir.BranchStmt:
+			return candidate.branches[stmt] != nil
 		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.SelectStmt:
 			return requiresControlLowering(stmt)
 		}
@@ -2559,6 +2601,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return false
 	}
 
+	// Bind branches to the states of their lexical targets. A select supplies
+	// a break target, but a continue inside it still targets the enclosing loop.
+	breakStates := make(map[ir.Node]int)
+	continueStates := make(map[ir.Node]int)
 	var lowerStatements func(ir.Nodes, int) int
 	var lowerStatement func(ir.Node, int) int
 	lowerStatements = func(list ir.Nodes, next int) int {
@@ -2575,6 +2621,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	lowerStatement = func(stmt ir.Node, next int) int {
 		switch stmt := stmt.(type) {
+		case *ir.BranchStmt:
+			target := candidate.branches[stmt]
+			state, ok := breakStates[target]
+			if stmt.Op() == ir.OCONTINUE {
+				state, ok = continueStates[target]
+			}
+			if !ok {
+				panic("unexpected coroutine branch target")
+			}
+			return lowerStatements(stmt.Init(), state)
+
 		case *ir.UnaryExpr:
 			if stmt.Op() != ir.OPANIC || !candidate.panics[stmt] {
 				if candidate.channels[stmt] != nil {
@@ -2626,6 +2683,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if stmt.Post != nil {
 				postState = lowerStatements(ir.Nodes{stmt.Post}, conditionState)
 			}
+			breakStates[stmt] = next
+			continueStates[stmt] = postState
 			bodyState := lowerStatements(stmt.Body, postState)
 			states[conditionState].thenState = bodyState
 			return lowerStatements(stmt.Init(), conditionState)
@@ -2664,6 +2723,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					ir.NewZero(stmt.Pos(), elementType))
 				bodyNext = newBodyState(ir.Nodes{clear}, bodyNext)
 			}
+			breakStates[stmt] = next
+			continueStates[stmt] = bodyNext
 			bodyState := lowerStatements(stmt.Body, bodyNext)
 			if stmt.Key != nil && !ir.IsBlank(stmt.Key) {
 				value := ir.Node(channel.recvValue)
@@ -2695,6 +2756,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if selection == nil || selection.statement != stmt {
 				panic("unexpected coroutine select boundary")
 			}
+			breakStates[stmt] = next
 			if len(selection.cases) == 0 &&
 				selection.defaultCase != nil {
 				entry := lowerStatements(selection.defaultCase.Body, next)
