@@ -267,6 +267,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		// instrumented Go and general cgo paths.
 		cgoDirectives = nil
 	}
+	var preserveCall func(*ir.Func) bool
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
 		plan, err := coro.Analyze(typecheck.Target.Funcs,
@@ -278,11 +279,14 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			fmt.Fprintln(os.Stderr, "coro: phase=provisional")
 			plan.Dump(os.Stderr)
 		}
+		if base.Debug.Coro > 3 && !instrumented {
+			preserveCall = plan.PreserveCall
+		}
 	}
 
 	// Interleaved devirtualization and inlining.
 	base.Timer.Start("fe", "devirtualize-and-inline")
-	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
+	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile, preserveCall)
 
 	for _, fn := range typecheck.Target.Funcs {
 		if ir.MatchAstDump(fn, "devirtualize-and-inline") {
@@ -290,7 +294,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		}
 	}
 
-	noder.MakeWrappers(typecheck.Target) // must happen after inlining
+	noder.MakeWrappers(typecheck.Target, preserveCall) // must happen after inlining
 
 	// Get variable capture right in for loops.
 	var transformed []loopvar.VarAndLoop
