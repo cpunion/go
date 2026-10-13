@@ -87,6 +87,14 @@ jobs:
           internal/buildcfg
           runtime
 
+      - name: Test host fairness without asynchronous preemption
+        env:
+          GOEXPERIMENT: coro
+          GODEBUG: asyncpreemptoff=1
+        run: >-
+          ./bin/go test -count=100 runtime
+          -run '^TestStacklessCoro(Queued)?YieldRunsOrdinaryGoroutine$'
+
       - name: Test push and pull comparison
         env:
           GOEXPERIMENT: coro

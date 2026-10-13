@@ -2169,3 +2169,76 @@ ordinary asynchronous preemption enabled. Native Ubuntu CI remains the full
 Linux gate. Linux/386, Linux/amd64, Linux/arm64, Linux/riscv64,
 FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests cross-compile with
 the experiment enabled.
+
+#### Preserve host fairness during logical yields
+
+Revisions `17fd18ef01` through `24c9cc08b4`, based on `coro/main` after the
+self-frame changes above, let ordinary goroutines run during stackless yield
+loops. With one P, a logical task waiting for an ordinary goroutine previously
+kept the native executor running until asynchronous preemption. The 10,000-task
+footprint probe exposed this when its ordinary control goroutine needed to
+observe the parked tasks and release them. Several preemption intervals could
+dominate the operation even though individual task creation was inexpensive.
+A second regression test reproduces starvation while two logical tasks keep
+the ready queue nonempty, so checking only the direct-resume path is insufficient.
+
+The executor now checks the host queues on its first logical yield and at most
+256 logical yields apart afterward. A pending preemption requests an immediate
+check. A nonempty local or global host run queue causes `runtime.Gosched`;
+otherwise the executor continues its logical work. The same counter covers
+private-root, ordinary direct-resume, and queued yields. Race and pull-comparison
+paths retain their existing handoff protocol. The native G remains locked to
+its M across a host handoff, preserving ownership of its fixed native stack.
+
+Twelve fresh-process samples in rotating toolchain order on native Darwin/arm64
+compared exact official Go at `603439a1c6`, the self-frame parent, and the final
+runtime change. All samples use the same probe source, disabled inlining, and
+one P. The host was heavily loaded; the following medians are directional
+observations, not stable absolute latency or evidence that every control probe
+improved:
+
+| Probe | Official Go | Exact parent | Candidate |
+| --- | ---: | ---: | ---: |
+| yield batch | 227.2 ns | 8.368 ns | 11.650 ns |
+| sequential task | 1,107 ns | 693.7 ns | 594.75 ns |
+| 100-task burst | 78.360 us | 57.910 us | 31.927 us |
+| 100-task park and wake | 74.889 us | 52.709 us | 73.500 us |
+| 10,000-task park, observe, and wake | 15.365 ms | 41.187 ms | 5.862 ms |
+
+The last probe uses 85.77% less time than its exact parent and has a 2.62x
+speedup over official Go in this run. Its candidate samples range from 4.377
+to 18.956 ms; parent samples range from 24.279 to 144.200 ms. The pure-yield counter and branch
+have a measurable cost, and the noisy 100-task park median is higher than its
+parent. These controls should be remeasured on an otherwise idle machine before
+attributing small-case timing changes. The deterministic improvement is forward
+progress without asynchronous preemption, rather than relying on a particular
+loaded-host speedup.
+
+The fresh-process footprint result is unchanged from the exact parent on both
+Darwin/arm64 and Linux/amd64. The official baseline column is measured on
+Darwin/arm64:
+
+| Metric for 10,000 parked tasks | Official Go | Parent and candidate |
+| --- | ---: | ---: |
+| allocated bytes | 6,230,992 | 3,405,920 |
+| allocation count | 20,018 | 22,734 |
+| live heap bytes per task | 623.1 | 340.6 |
+| live objects per task | 2.002 | 1.523 |
+| live stack bytes per task | 2,048.0 | 6.554 |
+
+The 64-byte difference from the earlier footprint checkpoint is present in
+both current binaries; this change adds no task or operation storage. The
+benchmark audit continues to enforce the existing footprint bounds.
+
+Regression tests cover the first and periodic private-root checks, the same
+checks after an immediately completed channel wait, and progress with a
+nonempty logical ready queue. The queue regression failed before its matching
+runtime fix. Both platforms repeat these tests 100 times with asynchronous
+preemption disabled; this check also runs in both focused CI jobs. The helper
+and all added production statements execute in the focused coverage run.
+Normal, race, pull, pull-plus-race, and `checkptr=2` runtime suites, runtime vet,
+experiment-off compilation, and the full benchmark audit exercise the final
+change. The native Darwin/arm64 full runtime suite and the runtime-oriented
+`test/chan` programs also pass. Linux/386, Linux/amd64, Linux/arm64,
+Linux/riscv64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests
+cross-compile with the experiment enabled.
