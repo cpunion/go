@@ -2205,9 +2205,9 @@ improved:
 | 100-task park and wake | 74.889 us | 52.709 us | 73.500 us |
 | 10,000-task park, observe, and wake | 15.365 ms | 41.187 ms | 5.862 ms |
 
-The last probe is 85.77% faster than its exact parent and 2.62x faster than
-official Go in this run. Its candidate samples range from 4.377 to 18.956 ms;
-parent samples range from 24.279 to 144.200 ms. The pure-yield counter and branch
+The last probe uses 85.77% less time than its exact parent and has a 2.62x
+speedup over official Go in this run. Its candidate samples range from 4.377
+to 18.956 ms; parent samples range from 24.279 to 144.200 ms. The pure-yield counter and branch
 have a measurable cost, and the noisy 100-task park median is higher than its
 parent. These controls should be remeasured on an otherwise idle machine before
 attributing small-case timing changes. The deterministic improvement is forward
@@ -2215,7 +2215,8 @@ progress without asynchronous preemption, rather than relying on a particular
 loaded-host speedup.
 
 The fresh-process footprint result is unchanged from the exact parent on both
-Darwin/arm64 and Linux/amd64:
+Darwin/arm64 and Linux/amd64. The official baseline column is measured on
+Darwin/arm64:
 
 | Metric for 10,000 parked tasks | Official Go | Parent and candidate |
 | --- | ---: | ---: |
