@@ -9,10 +9,9 @@
 // suspension seeds. The effect propagates through ordinary calls and defer,
 // but not from the target of a go statement back to its caller.
 //
-// The current experiment exports the analysis result. Its provisional result
-// observes the program before inlining, but does not constrain the inliner
-// until a coroutine ABI and stable site plan consume that constraint. It does
-// not yet change the native backend or generate coroutine state machines.
+// The provisional plan preserves call boundaries needed by coroutine lowering.
+// The final plan, built after inlining, selects coroutine factories and exports
+// their effects and entry-point capabilities.
 package coro
 
 import (
@@ -257,6 +256,18 @@ func (p *Plan) PublishSummaries() {
 			Defer:    function.Defer,
 		})
 	}
+}
+
+// PreserveCall reports whether inlining fn would erase a coroutine boundary.
+// Operation declarations must remain calls so that the final analysis can
+// recognize their recipes. Other functions retain a boundary when lowering
+// may replace their ordinary body with a coroutine scheduler entry.
+func (p *Plan) PreserveCall(fn *ir.Func) bool {
+	if _, ok := p.operationRecipe(fn); ok {
+		return true
+	}
+	summary, known := p.funcSummary(fn)
+	return known && p.edgeNeedsCoroEntry(Edge{Callee: fn, Imported: summary})
 }
 
 // Analyze computes coroutine effects for funcs. cgoDirectives is
