@@ -357,8 +357,8 @@ Structured await frames belong to their parent's lifetime and do not add to
 the independent-task count.
 
 After the first spawn, the public driver leaves its native activation before
-selecting queued work. An independent owner G takes over that driver's existing
-executor slot, while the ordinary caller waits only for the root's outcome.
+selecting queued work. If work remains, an independent owner G takes over that
+driver's existing executor slot, while the ordinary caller waits only for the root's outcome.
 There is one owner per such scheduler, not one G per logical task. This transfer
 must precede executing a spawned blocking C call: a later transfer at root
 completion would leave the ordinary caller trapped below that child's C frame.
