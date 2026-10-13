@@ -112,6 +112,65 @@ func TestStacklessCoroYieldRunsOrdinaryGoroutine(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroQueuedYieldRunsOrdinaryGoroutine(t *testing.T) {
+	if runtime.Raceenabled {
+		t.Skip("race mode retains the queued yield path")
+	}
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	gate := make(chan struct{})
+	waiting := make(chan struct{})
+	done := make(chan struct{})
+	var ran atomic.Bool
+	go func() {
+		close(waiting)
+		<-gate
+		ran.Store(true)
+		close(done)
+	}()
+	<-waiting
+
+	const yieldLimit = 1 << 14
+	yields := 0
+	childDone := false
+	sawOrdinary := false
+	child := func(unsafe.Pointer) uint8 {
+		// The parent already yielded before this child can run. Publish the
+		// ordinary G after that first check and keep both logical tasks
+		// runnable until a later check hands off the P.
+		if yields == 0 {
+			close(gate)
+		}
+		if ran.Load() {
+			sawOrdinary = true
+			childDone = true
+			return runtime.StacklessCoroActionComplete
+		}
+		yields++
+		if yields == yieldLimit {
+			childDone = true
+			return runtime.StacklessCoroActionComplete
+		}
+		return runtime.StacklessCoroActionYield
+	}
+	started := false
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if !started {
+			started = true
+			runtime.SpawnStacklessCoroForTest(ctx, child)
+		}
+		if childDone {
+			return runtime.StacklessCoroActionComplete
+		}
+		return runtime.StacklessCoroActionYield
+	})
+	<-done
+	if !sawOrdinary {
+		t.Fatalf("ordinary goroutine did not run during %d queued logical yields", yields)
+	}
+}
+
 func TestStacklessCoroForeignState(t *testing.T) {
 	calls := runtime.NumCgoCall()
 	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {

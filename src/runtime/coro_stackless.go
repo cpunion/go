@@ -1212,9 +1212,8 @@ func (scope *stacklessCoroRunScope) leave() {
 }
 
 // stacklessCoroGoschedIfRunnable yields the host G only when another ordinary
-// G can use its P. The logical scheduler has already established that it can
-// resume the same task directly, so an unconditional Gosched would turn an
-// otherwise private yield loop into a host-scheduler round trip.
+// G can use its P. Otherwise, the logical scheduler can continue running
+// ready tasks without a host-scheduler round trip.
 func stacklessCoroGoschedIfRunnable() {
 	gp := getg()
 	pp := gp.m.p.ptr()
@@ -1231,7 +1230,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial bool) {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot bool
-	// Check the host queues on the first private yield and then at most 256
+	// Check the host queues on the first logical yield and then at most 256
 	// logical yields apart. A pending preemption bypasses that delay.
 	hostYieldCheck := ^uint8(0)
 	defer func() {
@@ -1318,6 +1317,11 @@ resumeActive:
 			// native executor implementation or a foreign-call executor
 			// needs a P to return from syscall state.
 			Gosched()
+		} else if !raceenabled && !stacklessCoroIsPullComparison(s) {
+			hostYieldCheck++
+			if hostYieldCheck == 0 || getg().preempt {
+				stacklessCoroGoschedIfRunnable()
+			}
 		}
 	case stacklessCoroActionWait:
 		if s.waiting(task, native) {

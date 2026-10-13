@@ -93,7 +93,7 @@ jobs:
           GODEBUG: asyncpreemptoff=1
         run: >-
           ./bin/go test -count=100 runtime
-          -run '^TestStacklessCoroYieldRunsOrdinaryGoroutine$'
+          -run '^TestStacklessCoro(Queued)?YieldRunsOrdinaryGoroutine$'
 
       - name: Test push and pull comparison
         env:
