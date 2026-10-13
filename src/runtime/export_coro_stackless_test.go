@@ -135,19 +135,20 @@ func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 	s.root.resume = resume
 	s.root.context.frame = frame
 	s.ready(&s.root, false)
-	s.run(false)
+	s.run(false, true)
 	s.finish()
 }
 
 func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) {
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
+		liveSpawns: 1,
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.resume = root
 	s.ready(&s.root, false)
 	s.ready(&stacklessCoroTask{resume: detached}, false)
-	s.run(false)
+	s.run(false, true)
 	throw("runtime: detached stackless coroutine test returned")
 }
 
@@ -1544,6 +1545,17 @@ func ClearStacklessCoroRootFramePoolForTest() int {
 func SchedulerStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	context := (*stacklessCoroContext)(ctx)
 	return unsafe.Pointer(context.scheduler)
+}
+
+func DrainedStacklessCoroSchedulerForTest(pointer unsafe.Pointer) bool {
+	s := (*stacklessCoroScheduler)(pointer)
+	lock(&s.lock)
+	drained := s.drained() && s.liveSpawns == 0 && s.head == nil &&
+		s.tail == nil && s.reservedTasks == nil && len(s.terminalValues) == 0 &&
+		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit
+	unlock(&s.lock)
+	return drained && s.blockingExecutors.Load() == 0 &&
+		s.foreignReturners.Load() == 0 && s.runnableState.Load() == 0
 }
 
 func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
