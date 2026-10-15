@@ -584,6 +584,15 @@ func StacklessCoroFreeFrameBytesForTest(ctx unsafe.Pointer) int {
 	return bytes
 }
 
+func StacklessCoroLiveSpawnCountForTest(ctx unsafe.Pointer) uint64 {
+	context := (*stacklessCoroContext)(ctx)
+	s := context.scheduler
+	lock(&s.lock)
+	count := s.liveSpawns
+	unlock(&s.lock)
+	return count
+}
+
 func StacklessCoroReservedFrameCountForTest(ctx unsafe.Pointer) int {
 	context := (*stacklessCoroContext)(ctx)
 	if context == nil || context.scheduler == nil || context.task() == nil {
