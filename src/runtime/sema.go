@@ -260,6 +260,10 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		if handoff && cansemacquire(addr) {
 			s.ticket = 1
 		}
+		if s.coro.get() != nil {
+			readyStacklessCoroSemaphore(s)
+			return
+		}
 		readyWithTime(s, 5+skipframes)
 		if s.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0 {
 			// Direct G handoff
@@ -302,11 +306,13 @@ func cansemacquire(addr *uint32) bool {
 
 // queue adds s to the blocked goroutines in semaRoot.
 func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
-	s.g = getg()
+	if s.coro.get() == nil {
+		s.g = getg()
+		// Storing this pointer so that we can trace the semaphore address
+		// from the blocked goroutine when checking for goroutine leaks.
+		s.g.waiting = s
+	}
 	s.elem.set(unsafe.Pointer(addr))
-	// Storing this pointer so that we can trace the semaphore address
-	// from the blocked goroutine when checking for goroutine leaks.
-	s.g.waiting = s
 	s.next = nil
 	s.prev = nil
 	s.waiters = 0
@@ -476,7 +482,9 @@ Found:
 		tailtime = s.acquiretime
 	}
 	// Goroutine is no longer blocked. Clear the waiting pointer.
-	s.g.waiting = nil
+	if s.coro.get() == nil {
+		s.g.waiting = nil
+	}
 	s.parent = nil
 	s.elem.set(nil)
 	s.next = nil

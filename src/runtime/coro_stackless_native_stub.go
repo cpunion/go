@@ -10,7 +10,7 @@ import "unsafe"
 
 type stacklessCoroNativeDriver struct{}
 
-func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool) *stacklessCoroScheduler {
+func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool, bool) *stacklessCoroScheduler {
 	return nil
 }
 
