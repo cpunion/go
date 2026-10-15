@@ -620,6 +620,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			default:
 				hasDefer := false
 				hasBranch := false
+				hasReturn := false
 				ir.Visit(stmt, func(node ir.Node) {
 					if deferStmt, ok := node.(*ir.GoDeferStmt); ok &&
 						deferStmt.Op() == ir.ODEFER {
@@ -628,6 +629,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					if _, ok := node.(*ir.BranchStmt); ok {
 						hasBranch = true
 					}
+					if node.Op() == ir.ORETURN {
+						hasReturn = true
+					}
 				})
 				if hasDefer {
 					return fmt.Errorf("defer in unsupported control flow %v",
@@ -635,6 +639,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				if hasBranch {
 					return fmt.Errorf("branch in unsupported control flow %v", stmt.Op())
+				}
+				// Neither lowering path rewrites returns inside an otherwise
+				// unsupported statement. Copying them into a resume would
+				// return source values as actions and bypass result cleanup.
+				// Visit excludes closure bodies, whose returns remain valid.
+				if hasReturn {
+					return fmt.Errorf("return in unsupported control flow %v", stmt.Op())
 				}
 				switch stmt.Op() {
 				case ir.OLABEL:
