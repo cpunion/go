@@ -360,3 +360,7 @@ func coroTakeFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr) unsafe.P
 func coroTakeFrameChunk(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeSelfFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeFusedFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte, bool) unsafe.Pointer
+
+// stackless coroutine synchronization
+func coroSemacquireMutex(unsafe.Pointer, *uint32, bool, int, *unsafe.Pointer) bool
+func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool

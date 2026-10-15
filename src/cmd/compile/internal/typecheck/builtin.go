@@ -296,10 +296,12 @@ var runtimeDecls = [...]struct {
 	{"coroTakeFrameChunk", funcTag, 189},
 	{"coroTakeSelfFrame", funcTag, 189},
 	{"coroTakeFusedFrame", funcTag, 190},
+	{"coroSemacquireMutex", funcTag, 193},
+	{"coroSemrelease", funcTag, 194},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [191]*types.Type
+	var typs [195]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -491,6 +493,10 @@ func runtimeTypes() []*types.Type {
 	typs[188] = newSig(params(typs[7], typs[123], typs[5]), params(typs[7]))
 	typs[189] = newSig(params(typs[7], typs[123], typs[5], typs[1]), params(typs[7]))
 	typs[190] = newSig(params(typs[7], typs[123], typs[5], typs[1], typs[6]), params(typs[7]))
+	typs[191] = types.NewPtr(typs[67])
+	typs[192] = types.NewPtr(typs[7])
+	typs[193] = newSig(params(typs[7], typs[191], typs[6], typs[13], typs[192]), params(typs[6]))
+	typs[194] = newSig(params(typs[7], typs[191], typs[6], typs[13]), params(typs[6]))
 	return typs[:]
 }
 

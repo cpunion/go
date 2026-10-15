@@ -20,6 +20,7 @@ func TestSynchronizationDependencies(t *testing.T) {
 	})
 	for _, name := range []string{
 		"internal/sync.runtime_SemacquireMutex",
+		"internal/sync.runtime_Semrelease",
 		"sync.runtime_Semacquire",
 		"sync.runtime_SemacquireRWMutexR",
 		"sync.runtime_SemacquireRWMutex",

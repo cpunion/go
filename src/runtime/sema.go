@@ -87,7 +87,7 @@ func poll_runtime_Semacquire(addr *uint32) {
 //
 //go:linkname sync_runtime_Semrelease sync.runtime_Semrelease
 func sync_runtime_Semrelease(addr *uint32, handoff bool, skipframes int) {
-	semrelease1(addr, handoff, skipframes)
+	semrelease2(addr, handoff, skipframes, false)
 }
 
 //go:linkname internal_sync_runtime_SemacquireMutex internal/sync.runtime_SemacquireMutex
@@ -121,7 +121,7 @@ func poll_runtime_Semrelease(addr *uint32) {
 
 //go:linkname internal_sync_runtime_Semrelease internal/sync.runtime_Semrelease
 func internal_sync_runtime_Semrelease(addr *uint32, handoff bool, skipframes int) {
-	semrelease1(addr, handoff, skipframes)
+	semrelease2(addr, handoff, skipframes, false)
 }
 
 func readyWithTime(s *sudog, traceskip int) {
@@ -205,6 +205,14 @@ func semrelease(addr *uint32) {
 }
 
 func semrelease1(addr *uint32, handoff bool, skipframes int) {
+	semrelease2(addr, handoff, skipframes+1, false)
+}
+
+// semrelease2 shares semaphore dequeue and profiling between ordinary and
+// logical goroutines. A logical releaser yields through its coroutine driver,
+// never by parking the native resume activation in goyield.
+// The sync entry points call it directly to preserve their profiling skip counts.
+func semrelease2(addr *uint32, handoff bool, skipframes int, logicalRelease bool) bool {
 	root := semtable.rootFor(addr)
 	atomic.Xadd(addr, 1)
 
@@ -212,7 +220,7 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	// This check must happen after the xadd, to avoid a missed wakeup
 	// (see loop in semacquire).
 	if root.nwait.Load() == 0 {
-		return
+		return false
 	}
 
 	// Harder case: search for a waiter and wake it.
@@ -221,7 +229,7 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		// The count is already consumed by another goroutine,
 		// so no need to wake up another goroutine.
 		unlock(&root.lock)
-		return
+		return false
 	}
 	s, t0, tailtime := root.dequeue(addr)
 	if s != nil {
@@ -260,12 +268,16 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		if handoff && cansemacquire(addr) {
 			s.ticket = 1
 		}
-		if s.coro.get() != nil {
+		// The waiter may consume its ticket and release or reuse s as soon
+		// as readiness is published. Snapshot both fields before waking it.
+		ticket := s.ticket == 1
+		logicalWaiter := s.coro.get() != nil
+		if logicalWaiter {
 			readyStacklessCoroSemaphore(s)
-			return
+			return ticket
 		}
 		readyWithTime(s, 5+skipframes)
-		if s.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0 {
+		if ticket && !logicalRelease && getg().m.locks == 0 && getg() != getg().m.g0 {
 			// Direct G handoff
 			//
 			// readyWithTime has added the waiter G as runnext in the
@@ -289,7 +301,9 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 			// system stack, since it's not safe to enter the scheduler.
 			goyield()
 		}
+		return ticket
 	}
+	return false
 }
 
 func cansemacquire(addr *uint32) bool {

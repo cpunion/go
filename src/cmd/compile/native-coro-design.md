@@ -1140,8 +1140,9 @@ ordinary identity. The cells and snapshots remain typed GC roots.
 This first slice covers declarations already represented in the supported
 structured body and initialization forms. Directly capturing a `for` induction
 variable can make the frontend loop-variable pass introduce an unlabeled
-`break`; that function retains its ordinary entry until branch lowering is
-implemented.
+`break`; structured branch lowering now handles unlabeled `break` and
+`continue` with their enclosing loop or select targets. This does not remove
+the separate restrictions on general closure-frame lowering.
 
 The same result target is used for an awaited coroutine assignment. An
 ordinary `os.File.Read` or supported network read worker captures the typed
@@ -1181,8 +1182,38 @@ propagation remains a separate general-closure task.
 
 Channel and select operations become typed operation recipes. A channel
 producer may publish readiness or a committed result, but it may not resume a
-frame directly. Mutexes, semaphores, notes, and condition variables need the
-same park/wake boundary.
+frame directly. Mutexes use the same park/wake boundary through the runtime's
+shared semaphore queues. Other synchronization primitives still need their
+own supported operation recipes.
+
+The Mutex slice preserves the source algorithms in `sync` and `internal/sync`.
+It recognizes only the exact `internal/sync.runtime_SemacquireMutex` and
+`internal/sync.runtime_Semrelease` declarations. Acquire evaluates its arguments
+once, stores them and its waiter state in the typed coroutine frame, and retries
+after a wakeup until it consumes a token or a starvation handoff ticket. The
+logical waiter shares the ordinary semaphore table, FIFO/LIFO queue ordering,
+and block/mutex profiling paths; it does not park an ordinary goroutine or
+delegate the lock to a worker.
+
+Release publishes readiness without entering `goyield` from the native resume.
+A reserved ticket returns a handoff action to the driver, which gives logical
+work and runnable ordinary goroutines a scheduling opportunity before resuming
+the releaser. This host check is not delayed by the ordinary yield batching
+interval. Ordinary runtime semaphore entries retain their existing `goyield`
+handoff. The logical driver does not promise the exact ordinary `runnext` order.
+
+Runtime tests mix genuine ordinary-G and logical semaphore waiters and check
+their queue identities, mutual exclusion, normal and handoff completion,
+profiling, and one-P progress. Compiler tests lower the public Mutex methods,
+all four internal lock/unlock methods, and their callers, with default inlining
+and `-l`; they also check that a child waiting on a Mutex survives its root's
+return. A lowered public method's original entry is a coroutine root adapter,
+so calling it from an ordinary helper does not prove an ordinary-G Mutex wait.
+Coexisting ordinary and logical public Mutex entries are not implemented here.
+Deferred `Unlock` also retains the ordinary caller because suspending defers
+are not supported; the explicit `Lock`/`Unlock` call sequence is lowered.
+RWMutex, WaitGroup, Cond, general semaphore declarations, and runtime notes
+retain conservative fallback; this is not complete `sync` support.
 
 The first channel slice lowers ordinary sends, discarded or single-value
 receives, and comma-ok receives with simple variable targets. It preserves the
@@ -2381,16 +2412,19 @@ reported separately above.
 ### 15.4 Remaining restrictions
 
 The MVP does not yet support general non-channel range loops, labeled control
-flow, dynamic calls, interfaces, unlabeled branch control, closure capture of
+flow, dynamic calls, interfaces, closure capture of
 a per-iteration channel-range variable, general escaping closures, nested
 closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive
-destinations, multiple channel operations in one expression, mutex parking,
+destinations, multiple channel operations in one expression, synchronization
+operations beyond the supported Mutex semaphore recipes,
 reflection, callbacks, variadic C calls, or general C ABI type classification.
 Ordinary channel send, discarded or single-value receive, comma-ok receive,
 receive-channel range, and select with simple receive targets are supported
-through the runtime's shared channel wait queues.
+through the runtime's shared channel wait queues. Unlabeled `break` and
+`continue` in supported structured loops and selects are lowered. Mutex
+parking uses the shared semaphore queues described in section 11.2.
 Explicit and implicit panic and Goexit
 through structured calls, implicit unhandled panic and isolated Goexit from a
 spawned logical goroutine, fixed or repeated-simple-loop defer cleanup,
@@ -3797,8 +3831,8 @@ are three fail-closed invariant or unreachable bounded-cache fallback bodies.
 
 The likely compatibility order remains:
 
-1. add mutexes, semaphores, and runtime notes through the same park/wake
-   boundary;
+1. extend the Mutex semaphore park/wake boundary to RWMutex, WaitGroup, Cond,
+   other semaphore operations, and runtime notes;
 2. broaden aggregate System ABI support beyond the bounded typed bridge and
    add platform-error conventions beyond POSIX errno;
 3. extend expression, assignment, and branch normalization to short-circuit

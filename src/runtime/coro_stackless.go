@@ -25,6 +25,7 @@ const (
 	stacklessCoroActionPanic
 	stacklessCoroActionGoexit
 	stacklessCoroActionSwitch
+	stacklessCoroActionHandoff
 )
 
 const stacklessCoroWarmExecutorCount = 4
@@ -1358,7 +1359,7 @@ resumeActive:
 	task.context.scheduler = nil
 
 	switch action {
-	case stacklessCoroActionYield:
+	case stacklessCoroActionYield, stacklessCoroActionHandoff:
 		idlePollSkip = nil
 		directInitialRoot = false
 		resumeDirectly, foreignReturner := s.yield(task, native)
@@ -1367,7 +1368,7 @@ resumeActive:
 			// runnable on the host scheduler. Retain task ownership while
 			// honoring the source Gosched operation at that boundary.
 			hostYieldCheck++
-			if hostYieldCheck == 0 || getg().preempt {
+			if action == stacklessCoroActionHandoff || hostYieldCheck == 0 || getg().preempt {
 				stacklessCoroGoschedIfRunnable()
 			}
 			goto resume
@@ -1377,6 +1378,10 @@ resumeActive:
 			// native executor implementation or a foreign-call executor
 			// needs a P to return from syscall state.
 			Gosched()
+		} else if action == stacklessCoroActionHandoff {
+			// Starvation handoff may have readied an ordinary waiter.
+			// Do not defer its chance to run to the periodic yield check.
+			stacklessCoroGoschedIfRunnable()
 		} else if !raceenabled && !stacklessCoroIsPullComparison(s) {
 			hostYieldCheck++
 			if hostYieldCheck == 0 || getg().preempt {

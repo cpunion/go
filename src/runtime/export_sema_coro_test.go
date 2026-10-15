@@ -10,6 +10,12 @@ import "unsafe"
 
 var SemacquireMutexOrdinaryForTest = internal_sync_runtime_SemacquireMutex
 
+const StacklessCoroActionHandoff = stacklessCoroActionHandoff
+
+func SemreleaseStacklessCoroForTest(ctx unsafe.Pointer, addr *uint32, handoff bool) bool {
+	return coroSemrelease(ctx, addr, handoff, 0)
+}
+
 func SemacquireMutexStacklessCoroForTest(ctx unsafe.Pointer, addr *uint32,
 	lifo bool, state *unsafe.Pointer) bool {
 	return coroSemacquireMutex(ctx, addr, lifo, 0, state)

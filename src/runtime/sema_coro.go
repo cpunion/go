@@ -29,9 +29,6 @@ type stacklessCoroSemaWaiter struct {
 //
 // Like semacquire1, this operation cannot be canceled. A queued task cannot
 // return or unwind until it acquires the semaphore and resumes execution.
-// The compiler does not yet emit this entry. Acquire and release lowering
-// must also preserve logical starvation handoff before public sync calls can
-// use it.
 func coroSemacquireMutex(ctx unsafe.Pointer, addr *uint32, lifo bool,
 	skipframes int, state *unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
@@ -103,6 +100,20 @@ func coroSemacquireMutex(ctx unsafe.Pointer, addr *uint32, lifo bool,
 	return true
 }
 
+// coroSemrelease releases a semaphore without yielding the native resume
+// activation. A true result reserved a handoff ticket for a waiter; the caller
+// must save its continuation and return stacklessCoroActionHandoff so both
+// logical and ordinary waiters can run before it continues.
+func coroSemrelease(ctx unsafe.Pointer, addr *uint32, handoff bool, skipframes int) bool {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
+		task.state != stacklessCoroTaskRunning || !task.resuming {
+		throw("runtime: invalid stackless coroutine semaphore release")
+	}
+	return semrelease2(addr, handoff, skipframes, true)
+}
+
 func (w *stacklessCoroSemaWaiter) finish(state *unsafe.Pointer) {
 	if w.waiter.releasetime > 0 {
 		blockevent(w.waiter.releasetime-w.startTime, 3+w.skipframes)
@@ -115,7 +126,7 @@ func (w *stacklessCoroSemaWaiter) finish(state *unsafe.Pointer) {
 	*state = nil
 }
 
-// readyStacklessCoroSemaphore is called after semrelease1 has removed the
+// readyStacklessCoroSemaphore is called after semrelease2 has removed the
 // waiter from the common semaphore queue and optionally reserved a ticket.
 // It must not access w after publishing readiness: the task can immediately
 // retry the acquisition and release the waiter on another executor.
