@@ -2285,6 +2285,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	factory := candidate.factory
 	resumeType := stacklessResumeType()
 	pos := fn.Pos()
+	localVariables := invocationLocals(function)
+	var resumeLocals []*ir.Name
 
 	var declarations []ir.Node
 	declared := make(map[*ir.Name]bool)
@@ -2351,13 +2353,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		return captureStorage[name.Canonical()]
 	}
-	// Source locals become factory locals. ABI 1 captures them in an ordinary
-	// closure; the explicit-frame ABIs copy their initial values into one
-	// typed frame.
+	// Source locals that can survive a resume invocation become factory
+	// locals. ABI 1 captures them in an ordinary closure; the explicit-frame
+	// ABIs copy their initial values into one typed frame.
 	fnDcl := make([]*ir.Name, 0, len(fn.Dcl))
 	for _, name := range fn.Dcl {
 		switch name.Class {
 		case ir.PAUTO, ir.PAUTOHEAP:
+			if localVariables[name] {
+				resumeLocals = append(resumeLocals, name)
+				continue
+			}
 			name.Curfn = factory
 			factory.Dcl = append(factory.Dcl, name)
 			addDeclaration(ir.NewDecl(name.Pos(), ir.ODCL, name))
@@ -2418,6 +2424,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
 	ctx := resume.Dcl[0]
+	for _, name := range resumeLocals {
+		name.Curfn = resume
+		resume.Dcl = append(resume.Dcl, name)
+	}
 
 	captured := make(map[*ir.Name]*ir.Name)
 	capture := func(name *ir.Name) *ir.Name {
@@ -2494,6 +2504,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				stmt.(ir.InitNode).SetInit(init)
 			}
 			if decl, ok := stmt.(*ir.Decl); ok {
+				if localVariables[decl.X.Canonical()] {
+					filtered = append(filtered, decl)
+					continue
+				}
 				if captureCell(decl.X) != nil {
 					name := decl.X.Canonical()
 					if !allocated[name] {
@@ -3086,6 +3100,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	edit = func(node ir.Node) ir.Node {
 		switch node := node.(type) {
 		case *ir.Decl:
+			if localVariables[node.X.Canonical()] {
+				return node
+			}
 			addDeclaration(node)
 			return ir.NewBlockStmt(node.Pos(), nil)
 		case *ir.AssignStmt:
@@ -3873,6 +3890,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
 	resume.Body = ir.Nodes{}
+	for _, name := range resumeLocals {
+		// The dispatcher exposes even non-suspending states to SSA. Give
+		// every entry a definition; reachable suffix paths still execute
+		// the original initializer before using the variable.
+		resume.Body.Append(ir.NewAssignStmt(pos, name, ir.NewZero(pos, name.Type())))
+	}
 	if resumeDeferToken != nil {
 		token := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroDeferToken"), ir.Nodes{ctx}, false)
