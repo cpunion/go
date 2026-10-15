@@ -21,7 +21,7 @@ func zeroInitializedFrameLocals(declarations ir.Nodes) map[*ir.Name]bool {
 		}
 	}
 	for _, node := range declarations {
-		if _, ok := node.(*ir.Decl); ok && len(node.Init()) == 0 {
+		if _, ok := node.(*ir.Decl); ok {
 			continue
 		}
 		if assignment, ok := node.(*ir.AssignStmt); ok && len(node.Init()) == 0 {
