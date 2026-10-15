@@ -429,6 +429,7 @@ syntax, types2, Unified IR
   -> devirtualization, inlining, wrappers
   -> final effect, execution, value-flow, and demand fixed points
   -> freeze function and site plans
+  -> source-local escape ownership query when native lowering is enabled
   -> native coroutine lowering
        - create typed frame types
        - split control flow at planned sites
@@ -568,6 +569,20 @@ Compiler-generated frame types are ordinary typed heap objects. The existing
 collector scans pointer fields. Stores into pointer fields use ordinary write
 barriers. This is the principal benefit of lowering before escape analysis and
 before Go SSA construction.
+
+An explicit frame may be cleared and reused after its function returns. A
+source local whose address escapes therefore needs storage independent of
+that frame. Before lowering, `escape.HeapLocals` queries the ordinary escape
+graph without rewriting expressions or retaining escape annotations. Lowering
+gives escaping address-taken locals typed cells, while nonescaping arrays stay
+in the reusable frame. Ordinary escape analysis still runs on all generated
+code after lowering; closure-frame factories keep ordinary Go ownership.
+
+Local cells are allocated at their declaration, including declarations inside
+inlined expressions and repeated loop bodies. Parameter cells are initialized
+per invocation. A boxed named result also publishes its final value in the
+fixed result slot read by the root entry; returning its address must not expose
+the reusable frame's result slot.
 
 The runtime scheduler must retain a typed root to each runnable or waiting
 logical G. A foreign producer must not retain that root.

@@ -244,7 +244,9 @@ func (e *escape) goDeferStmt(n *ir.GoDeferStmt) {
 
 		// force stack allocation of defer record, unless
 		// open-coded defers are used (see ssa.go)
-		n.SetEsc(ir.EscNever)
+		if e.heapAnalysis == nil {
+			n.SetEsc(ir.EscNever)
+		}
 	}
 
 	// If the function is already a zero argument/result function call,
@@ -262,7 +264,7 @@ func (e *escape) goDeferStmt(n *ir.GoDeferStmt) {
 		base.FatalfAt(n.Pos(), "expected signature without parameters or results: %v", sig)
 	}
 
-	if clo, ok := call.Fun.(*ir.ClosureExpr); ok && n.Op() == ir.OGO {
+	if clo, ok := call.Fun.(*ir.ClosureExpr); ok && n.Op() == ir.OGO && e.heapAnalysis == nil {
 		clo.IsGoWrap = true
 	}
 
@@ -276,6 +278,9 @@ func (e *escape) rewriteArgument(arg ir.Node, call *ir.CallExpr, fns []*ir.Name)
 	for _, fn := range fns {
 		if fn.Func != nil {
 			pragma |= fn.Func.Pragma
+			if e.heapAnalysis != nil && len(fn.Func.Body) == 0 {
+				pragma |= ir.UintptrKeepAlive
+			}
 		}
 	}
 	if pragma&(ir.UintptrKeepAlive|ir.UintptrEscapes) == 0 {
@@ -296,6 +301,14 @@ func (e *escape) rewriteArgument(arg ir.Node, call *ir.CallExpr, fns []*ir.Name)
 		}
 		if !conv.X.Type().IsUnsafePtr() || !conv.Type().IsUintptr() {
 			return // not an unsafe.Pointer->uintptr conversion
+		}
+		if e.heapAnalysis != nil {
+			k := e.mutatorHole()
+			if pragma&ir.UintptrEscapes != 0 {
+				k = e.heapHole().note(conv, "//go:uintptrescapes")
+			}
+			e.expr(k, conv.X)
+			return
 		}
 
 		// Create and declare a new pointer-typed temp variable.

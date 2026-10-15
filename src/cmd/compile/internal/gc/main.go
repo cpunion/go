@@ -325,6 +325,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			plan.Dump(os.Stderr)
 		}
 		if base.Debug.Coro > 3 && !instrumented {
+			plan.HeapLocals = escape.HeapLocals(typecheck.Target.Funcs)
 			result, err := coro.Lower(plan)
 			if err != nil {
 				base.Fatalf("lowering coroutine plan: %v", err)
