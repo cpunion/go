@@ -505,7 +505,6 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 					if !pd.rg.CompareAndSwap(old, pdNil) {
 						continue
 					}
-					delta--
 					coroRead = old &^ netpollCoroTagMask
 					break
 				}
@@ -536,7 +535,7 @@ func netpollready(toRun *gList, pd *pollDesc, mode int32) int32 {
 		toRun.push(wg)
 	}
 	if coroRead != 0 {
-		if gp := netpollCoroDispatch(coroRead); gp != nil {
+		if gp := netpollCoroDispatch(coroRead, &delta); gp != nil {
 			toRun.push(gp)
 		}
 	}
@@ -648,10 +647,10 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool, delta *int32) *g {
 			if old == pdWait {
 				old = pdNil
 			} else if old != pdNil {
+				if netpollCoroEnabled && old&netpollCoroTagMask == netpollCoroTag {
+					return netpollCoroDispatch(old&^netpollCoroTagMask, delta)
+				}
 				*delta -= 1
-			}
-			if netpollCoroEnabled && old&netpollCoroTagMask == netpollCoroTag {
-				return netpollCoroDispatch(old &^ netpollCoroTagMask)
 			}
 			return (*g)(unsafe.Pointer(old))
 		}

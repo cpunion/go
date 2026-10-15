@@ -13,6 +13,6 @@ const (
 )
 
 //go:nowritebarrier
-func netpollCoroDispatch(uintptr) *g {
+func netpollCoroDispatch(uintptr, *int32) *g {
 	return nil
 }

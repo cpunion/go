@@ -85,7 +85,18 @@ func netpollCoroClaim(pd *pollDesc, op *stacklessCoroOperation, mode int32) bool
 }
 
 //go:nowritebarrier
-func netpollCoroDispatch(token uintptr) *g {
-	return stacklessCoroNetpollReady(
+func netpollCoroDispatch(token uintptr, delta *int32) *g {
+	gp := stacklessCoroNetpollReady(
 		(*stacklessCoroOperation)(unsafe.Pointer(token)))
+	if gp != nil {
+		// Keep the waiter accounted for until the caller readies the
+		// completion goroutine, just as for an ordinary network waiter.
+		*delta -= 1
+	} else {
+		// The completion goroutine is already active. In this case netpoll
+		// may return an empty runnable list, whose caller does not apply
+		// delta, so account for this consumed waiter here.
+		netpollAdjustWaiters(-1)
+	}
+	return gp
 }
