@@ -248,6 +248,9 @@ func saturateStacklessCoroFrameCacheForTest(ctx unsafe.Pointer) (
 	*stacklessCoroScheduler, uint16, uint16) {
 	s := (*stacklessCoroContext)(ctx).scheduler
 	lock(&s.lock)
+	// Saturation must prevent replacement as well as new cache entries.
+	for s.discardFreeCachedFrameTaskLocked() {
+	}
 	tasks, bytes := s.cachedFrameTasks, s.cachedFrameBytes
 	s.cachedFrameTasks = stacklessCoroTaskCacheSize
 	s.cachedFrameBytes = stacklessCoroFrameCacheSize
