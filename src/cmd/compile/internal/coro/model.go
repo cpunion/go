@@ -138,6 +138,7 @@ const (
 	SiteForeign
 	SitePanic
 	SiteGoexit
+	SiteSemaphore
 )
 
 func (k SiteKind) String() string {
@@ -164,6 +165,8 @@ func (k SiteKind) String() string {
 		return "panic"
 	case SiteGoexit:
 		return "goexit"
+	case SiteSemaphore:
+		return "semaphore"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -246,15 +249,19 @@ type OperationRecipe struct {
 }
 
 var operationRecipes = map[string]OperationRecipe{
+	"internal/sync.runtime_SemacquireMutex": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
+	"internal/sync.runtime_Semrelease": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
 	// These declarations park an ordinary goroutine in the runtime. Their
 	// bodies are unavailable to effect analysis, so propagate suspension
 	// explicitly through the synchronization packages and their callers.
 	// Until they have coroutine entries, the ordinary await dependency check
 	// keeps those callers on the Go entry instead of parking an executor.
-	"internal/sync.runtime_SemacquireMutex": {
-		Kind:   SiteAwait,
-		Effect: MaySuspend,
-	},
 	"sync.runtime_Semacquire": {
 		Kind:   SiteAwait,
 		Effect: MaySuspend,
@@ -346,6 +353,11 @@ func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 		return OperationRecipe{}, false
 	}
 	recipe, ok := operationRecipes[symbolName(fn.Nname)]
+	if recipe.Kind == SiteSemaphore && !semaphoreSignature(fn.Type()) {
+		// An unexpected runtime declaration remains a suspension boundary,
+		// but cannot use the compiler-owned semaphore calling convention.
+		recipe.Kind = SiteAwait
+	}
 	return recipe, ok
 }
 

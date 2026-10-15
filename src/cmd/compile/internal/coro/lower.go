@@ -25,6 +25,7 @@ const (
 	actionPanic
 	actionGoexit
 	actionSwitch
+	actionHandoff
 )
 
 // Keep these in sync with runtime's stackless coroutine frame chunk sizes. The
@@ -199,6 +200,7 @@ type lowerState struct {
 	channel    *lowerChannel
 	selection  *lowerSelect
 	io         *lowerIO
+	semaphore  *lowerSemaphore
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -207,6 +209,14 @@ type lowerState struct {
 	cleanup    bool
 	terminal   uint8
 	panicValue ir.Node
+}
+
+// lowerSemaphore retains the arguments and acquisition state across retries.
+// Entry evaluates the arguments once; a wakeup only reenters the retry state.
+type lowerSemaphore struct {
+	call  *ir.CallExpr
+	args  [3]*ir.Name
+	state *ir.Name
 }
 
 // Lower rewrites supported coroutine primaries into explicit state machines.
@@ -762,6 +772,10 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
+		case SiteSemaphore:
+			if !statementCalls[call] || semaphoreOperation(call) == "" {
+				return nil, fmt.Errorf("unsupported semaphore site %d", site.ID)
+			}
 		case SiteYield, SiteTimer, SiteFile, SitePoll, SiteGoexit:
 			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested %s site %d", site.Kind, site.ID)
@@ -1435,7 +1449,7 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
 		// These transitions keep their suspended state in the resume frame.
-		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll:
+		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore:
 		default:
 			return false
 		}
@@ -2619,7 +2633,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
 			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore,
 				SiteGoexit:
 				return true
 			}
@@ -2996,13 +3010,31 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return lowerStatements(init, continuation)
 			}
 			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore,
 				SiteGoexit:
 				stateNext := next
 				if candidate.transitions[call] == SiteGoexit {
 					stateNext = cleanupState
 				}
 				var io *lowerIO
+				var semaphore *lowerSemaphore
+				if semaphoreOperation(call) == "coroSemacquireMutex" {
+					semaphore = &lowerSemaphore{call: call}
+					for i, arg := range call.Args {
+						name := typecheck.TempAt(call.Pos(), factory, arg.Type())
+						addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, name))
+						semaphore.args[i] = name
+					}
+					semaphore.state = typecheck.TempAt(call.Pos(), factory,
+						types.Types[types.TUNSAFEPTR])
+					addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, semaphore.state))
+					stateNext = addState(lowerState{
+						semaphore: semaphore,
+						next:      stateNext,
+						thenState: -1,
+						elseState: -1,
+					})
+				}
 				if operation := ordinaryIOOperation(call); operation != "" {
 					io = &lowerIO{call: call, statement: stmt, operation: operation}
 					stateNext = addState(lowerState{
@@ -3016,6 +3048,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					transition: candidate.transitions[call],
 					call:       call,
 					io:         io,
+					semaphore:  semaphore,
 					statement:  stmt,
 					next:       stateNext,
 					thenState:  -1,
@@ -3575,6 +3608,26 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
 			}))
+		} else if state.semaphore != nil && state.transition == SiteInvalid {
+			semaphore := state.semaphore
+			args := ir.Nodes{ctx}
+			for _, arg := range semaphore.args {
+				args = append(args, edit(arg))
+			}
+			args = append(args, typecheck.NodAddr(edit(semaphore.state)))
+			wait := typecheck.Call(semaphore.call.Pos(),
+				typecheck.LookupRuntime("coroSemacquireMutex"), args, false)
+			body = append(body,
+				ir.NewIfStmt(semaphore.call.Pos(), wait, ir.Nodes{
+					ir.NewReturnStmt(semaphore.call.Pos(), []ir.Node{
+						typedInt(semaphore.call.Pos(), types.Types[types.TUINT8],
+							int64(actionWait)),
+					}),
+				}, nil),
+				ir.NewAssignStmt(semaphore.call.Pos(), edit(semaphore.args[0]),
+					ir.NewZero(semaphore.call.Pos(), semaphore.args[0].Type())),
+				assignResumePC(state.next),
+				gotoState(state.next))
 		} else if state.io != nil && state.transition == SiteInvalid {
 			if state.next < 0 {
 				return fmt.Errorf("%s: I/O finish state %d has no continuation",
@@ -3607,6 +3660,29 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			action := actionInvalid
 			var actionResult ir.Node
 			switch state.transition {
+			case SiteSemaphore:
+				if semaphore := state.semaphore; semaphore != nil {
+					for j, arg := range semaphore.args {
+						body = append(body, ir.NewAssignStmt(state.call.Pos(),
+							edit(arg), edit(state.call.Args[j])))
+					}
+					body = append(body, gotoState(state.next))
+					break
+				}
+				args := ir.Nodes{ctx}
+				for _, arg := range state.call.Args {
+					args = append(args, edit(arg))
+				}
+				handoff := typecheck.Call(state.call.Pos(),
+					typecheck.LookupRuntime("coroSemrelease"), args, false)
+				body = append(body,
+					ir.NewIfStmt(state.call.Pos(), handoff, ir.Nodes{
+						ir.NewReturnStmt(state.call.Pos(), []ir.Node{
+							typedInt(state.call.Pos(), types.Types[types.TUINT8],
+								int64(actionHandoff)),
+						}),
+					}, nil),
+					gotoState(state.next))
 			case SiteYield:
 				action = actionYield
 			case SiteGoexit:
