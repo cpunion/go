@@ -2739,7 +2739,9 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 		const children = 3
 		var state int
 		var done atomic.Int32
-		var bytes, cachePolls int
+		var bytes int
+		var live uint64
+		deadline := time.Now().Add(5 * time.Second)
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch state {
 			case 0:
@@ -2758,20 +2760,25 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				}
 				return runtime.StacklessCoroActionYield
 			case 1:
-				if done.Load() != children {
+				// done is incremented inside the child's resume function,
+				// before the runtime recycles its frame. Wait for logical
+				// completion under the scheduler lock instead of assuming a
+				// fixed number of root yields lets the children finish.
+				live = runtime.StacklessCoroLiveSpawnCountForTest(ctx)
+				if live != 0 && time.Now().Before(deadline) {
 					return runtime.StacklessCoroActionYield
 				}
 				bytes = runtime.StacklessCoroFreeFrameBytesForTest(ctx)
-				if !race.Enabled && bytes == 0 && cachePolls < 1000 {
-					cachePolls++
-					return runtime.StacklessCoroActionYield
-				}
 				return runtime.StacklessCoroActionComplete
 			default:
 				t.Fatalf("unexpected frame-cache bound state %d", state)
 				return runtime.StacklessCoroActionInvalid
 			}
 		})
+		if live != 0 || done.Load() != children {
+			t.Fatalf("frame-cache children = (%d live, %d resumed), want (0, %d)",
+				live, done.Load(), children)
+		}
 		if bytes > runtime.StacklessCoroFrameCacheSize {
 			t.Fatalf("cached frame bytes = %d, limit %d",
 				bytes, runtime.StacklessCoroFrameCacheSize)
