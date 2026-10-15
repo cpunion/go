@@ -155,6 +155,70 @@ func TestResumeFactorySupported(t *testing.T) {
 	}
 }
 
+func TestLowerRejectsClosureContext(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	oldLocalPkg := types.LocalPkg
+	defer func() {
+		typecheck.Target = oldTarget
+		types.LocalPkg = oldLocalPkg
+	}()
+
+	for _, kind := range []string{"hidden-parameter", "context-only", "capture-only"} {
+		t.Run(kind, func(t *testing.T) {
+			pkg := types.NewPkg("example.com/coro/context/"+kind, "context")
+			types.LocalPkg = pkg
+			typecheck.Target = new(ir.Package)
+			fn := newLowerTestFunc(pkg, "wrapper")
+			if kind == "context-only" {
+				fn.SetNeedctxt(true)
+			} else {
+				ir.NewHiddenParam(src.NoXPos, fn, pkg.Lookup(".this"),
+					types.NewPtr(types.Types[types.TINT]))
+				if kind == "capture-only" {
+					fn.SetNeedctxt(false)
+				}
+			}
+			yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+				types.NewSignature(nil, nil, nil))
+			call := newLowerTestCall(yield)
+			fn.Body = ir.Nodes{call, newLowerTestReturn()}
+			function := &Function{
+				Func: fn, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
+				Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}},
+			}
+			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+			result, err := Lower(plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Lowered != 0 || result.Skipped != 1 ||
+				len(result.Diagnostics) != 1 ||
+				!strings.Contains(result.Diagnostics[0], "requires closure context") {
+				t.Fatalf("Lower = %+v, want closure-context fallback", result)
+			}
+			if len(fn.Body) != 2 || fn.Body[0] != call {
+				t.Fatal("fallback changed the ordinary body")
+			}
+			if resumeFactorySupported(fn) {
+				t.Fatal("context-dependent function supports a factory")
+			}
+			plan.PublishSummaries()
+			defer delete(summaries, fn)
+			if summary, ok := Summary(fn); !ok || summary.Factory != NoFactory ||
+				summary.Effect != MaySuspend {
+				t.Fatalf("summary = (%+v, %t), want may-suspend without a factory", summary, ok)
+			}
+			// Do not accept an imported factory claim for a function whose
+			// hidden arguments cannot be represented by the factory ABI.
+			SetSummary(fn, FuncSummary{Effect: MaySuspend, Factory: FactoryABI3})
+			if factory, ok := importedResumeFactory(fn); ok || factory != nil {
+				t.Fatal("accepted a context-dependent imported factory")
+			}
+		})
+	}
+}
+
 func TestLowerMethodReceiver(t *testing.T) {
 	prepareLowerTest(t)
 

@@ -383,6 +383,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if fn == nil || fn.OClosure != nil {
 		return nil, fmt.Errorf("not a top-level function")
 	}
+	// Method value wrappers have hidden receiver parameters even though
+	// they are not closure literals. The factory ABI carries only explicit
+	// receiver and function parameters, not a closure context.
+	if fn.Needctxt() || len(fn.ClosureVars) != 0 {
+		return nil, fmt.Errorf("function requires closure context")
+	}
 	sig := fn.Type()
 	if sig.HasShape() {
 		return nil, fmt.Errorf("generic shape")
@@ -1284,7 +1290,8 @@ func stacklessResumeType() *types.Type {
 }
 
 func resumeFactorySupported(fn *ir.Func) bool {
-	if fn == nil || fn.OClosure != nil || fn.Type() == nil {
+	if fn == nil || fn.OClosure != nil || fn.Type() == nil ||
+		fn.Needctxt() || len(fn.ClosureVars) != 0 {
 		return false
 	}
 	return !fn.Type().HasShape()
