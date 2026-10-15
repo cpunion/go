@@ -32,6 +32,7 @@ implementations differ most:
   `select`;
 - zero and one-nanosecond sleeps;
 - ready one-byte reads through `os.File.Read` and `net.TCPConn.Read`;
+- ready 64-byte writes through `os.File.Write` and `net.TCPConn.Write`;
 - blocking pipe and loopback TCP reads released by a runnable logical sibling;
 - fixed-work task batches at `GOMAXPROCS=1,2,4`;
 - scalar, aggregate, errno, and libm C calls;
@@ -46,10 +47,11 @@ borrow their existing poll descriptors; none of these common paths creates a
 read closure or uses the worker pool. A concurrent read that cannot acquire the
 same descriptor's read lock is the bounded worker fallback. The blocking
 probes release each public read with a one-byte raw write syscall that cannot
-fill the empty pipe or socket buffer; this keeps the release path out of the
-unsupported public write lowering. A preceding `Sleep(0)` keeps the release
-worker on the automatically colored path without adding a positive-duration
-timer.
+fill the empty pipe or socket buffer. This deliberately isolates read readiness
+from the write-operation path; public write lowering is supported and has
+separate ready-write benchmarks and blocking-progress tests described below.
+A preceding `Sleep(0)` keeps the release worker on the automatically colored
+path without adding a positive-duration timer.
 
 Every probe is interpreted as one of three capability states. A native fast
 path is a performance result. An adapter fallback is an end-to-end measurement
@@ -58,6 +60,28 @@ capacity-limited path is a capability result only and is not presented as
 performance. The eight-call C benchmark performs a self-timed preflight and
 skips its timing when the logical scheduler cannot keep all calls blocked
 while retaining an executor to release them.
+
+## Current validation scope
+
+The native Go-toolchain experiment targets Darwin/arm64 and Linux/amd64. Its
+regressions cover public read/write progress, detached-task lifetime and frame
+reuse, and the supported Mutex semaphore recipes. The Mutex fixture explicitly
+compiles `internal/sync`, `sync`, and its caller with lowering enabled; this is
+not a claim of general standard-library conversion. Unsupported source retains
+the ordinary Go path and must not be counted as a stackless performance result.
+
+Before interpreting timings, run the public I/O and lowering audit, then the
+compiler fixtures that include default inlining, `-l`, and experiment-off
+controls:
+
+```
+./check.bash /path/to/coroutine /tmp/corobench-check
+GOEXPERIMENT=coro /path/to/coroutine/bin/go test cmd/compile/internal/coro \
+  -run '^(TestMutex|TestInlineMarks|TestNormalizeFallbackInitializers|TestInvocationLocalLifetime)$'
+```
+
+The tables below retain their recorded revisions and settings; they are not
+fresh measurements of the current head.
 
 ## Reproducibility
 
@@ -141,7 +165,7 @@ space fell from about 2048 B to 6.554 B per task and live heap fell from
 623.1 B to 372.4 B per task. Live objects increased from 2.002 to 4.252 per
 task, while the park/wake operation became 35-64 times slower. Deep recursion
 similarly replaced native stack growth with 464.5 KiB and 16,393 allocations
-per operation. A public coroutine entry currently costs 520 B and eight
+per operation. A public coroutine entry cost 520 B and eight
 allocations.
 
 The ready-path adapters also make their fixed costs visible: each timer call
@@ -2236,8 +2260,14 @@ Darwin/arm64:
 | live stack bytes per task | 2,048.0 | 6.554 |
 
 The 64-byte difference from the earlier footprint checkpoint is present in
-both current binaries; this change adds no task or operation storage. The
+both checkpoint binaries; this change adds no task or operation storage. The
 benchmark audit continues to enforce the existing footprint bounds.
+
+This table predates the detached-lifetime correction. Its later exact-parent
+Darwin/arm64 measurement recorded an additional 736 allocated bytes and four
+allocations per scheduler, not per task, for the same 10,000-task probe. The
+recorded live stack remained 6.554 bytes per task. These are checkpoint-specific
+allocation results, not a remeasurement of current-head latency or footprint.
 
 Regression tests cover the first and periodic private-root checks, the same
 checks after an immediately completed channel wait, and progress with a
@@ -2289,3 +2319,5 @@ adapter and poll helper alongside the existing read checks.
 ordinary goroutine. Each benchmark loops inside the compiled function, rather
 than measuring a new public coroutine root per write. These are ready-write
 throughput controls, not measurements of independent backpressure latency.
+The historical timing list in `run.bash` does not select these two benchmarks;
+select them explicitly when collecting write-throughput results.
