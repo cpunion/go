@@ -87,7 +87,7 @@ func (fd *FD) CoroReadFinish(n *int, status uintptr) error {
 	return fd.eofError(*n, err)
 }
 
-// CoroCallRead runs call on the bounded blocking-read worker pool.
+// CoroCallRead runs call on the bounded blocking-I/O worker pool.
 func CoroCallRead(ctx unsafe.Pointer, call func()) {
 	runtime_coroCallRead(ctx, call)
 }

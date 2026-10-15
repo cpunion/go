@@ -2251,3 +2251,41 @@ change. The native Darwin/arm64 full runtime suite and the runtime-oriented
 `test/chan` programs also pass. Linux/386, Linux/amd64, Linux/arm64,
 Linux/riscv64, FreeBSD/amd64, Windows/amd64, and Darwin/amd64 runtime tests
 cross-compile with the experiment enabled.
+
+#### Public writes and bidirectional I/O
+
+The public I/O recipes also recognize `(*os.File).Write` and statically
+resolved connection writes. The compiler shares the existing two-phase read
+lowering, selecting a write start and finish method without a new source
+annotation or factory ABI. The generated frame retains the receiver and
+completion slots until the operation finishes.
+
+Stream writes hold the FD write lock through completion. Nonblocking writes
+borrow the existing poll descriptor's write semaphore; blocking descriptors
+use the same compensated syscall boundary as direct file reads. Partial
+writes accumulate their byte count, retry EINTR, and either finish the whole
+buffer or return an error. A zero-length write still checks deadlines and
+issues a syscall. The public adapters preserve error wrapping and SIGPIPE
+handling. Write-lock contention, datagrams, and race/sanitizer builds retain
+the ordinary Write implementation on the bounded I/O worker pool. Datagrams
+must not be split, and instrumented builds must retain syscall.Write's hooks.
+
+The shared poll registration now rechecks close and deadline errors after
+publishing a logical waiter. An error arriving between the initial check and
+publication must either let the caller reclaim its token or leave completion
+to the notification that already claimed it. This applies to both reads and
+writes.
+
+The probes cover empty and discarded writes, read-only and closed files,
+invalid connections, datagrams, expired and partial-write deadlines, blocked
+writers, FD-lock contention, and data retention across GC. Runtime tests also
+arm reads and writes on the same descriptor and require another logical task
+to progress with one P. The audit checks actual state-machine symbols and
+start/finish calls, and enforces at least 90% coverage for each public write
+adapter and poll helper alongside the existing read checks.
+
+`BenchmarkFileWrite` writes 64-byte buffers to the null device;
+`BenchmarkTCPWrite` writes the same buffer to a connection drained by an
+ordinary goroutine. Each benchmark loops inside the compiled function, rather
+than measuring a new public coroutine root per write. These are ready-write
+throughput controls, not measurements of independent backpressure latency.

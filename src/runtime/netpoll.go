@@ -619,7 +619,7 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 // netpollunblock moves either pd.rg (if mode == 'r') or
 // pd.wg (if mode == 'w') into the pdReady state.
 // This returns a goroutine that should be made runnable. Usually that is the
-// goroutine blocked on pd.{rg,wg}. A stackless coroutine read token instead
+// goroutine blocked on pd.{rg,wg}. A stackless coroutine I/O token instead
 // publishes its logical completion and may return the poll bridge goroutine.
 // It adds any adjustment to netpollWaiters to *delta;
 // this adjustment should be applied after the goroutine has
