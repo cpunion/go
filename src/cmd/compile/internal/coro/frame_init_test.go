@@ -14,7 +14,7 @@ import (
 
 func TestZeroInitializedFrameLocals(t *testing.T) {
 	prepareLowerTest(t)
-	for _, mode := range []string{"zero", "pointer-zero", "write", "read", "address", "init", "scalar"} {
+	for _, mode := range []string{"zero", "pointer-zero", "write", "read", "address", "init", "rhs-init", "declaration-init", "scalar"} {
 		t.Run(mode, func(t *testing.T) {
 			fn := testFunc("frameLocals")
 			fn.DeclareParams(true)
@@ -45,6 +45,12 @@ func TestZeroInitializedFrameLocals(t *testing.T) {
 				assignment := ir.NewAssignStmt(src.NoXPos, state, ir.NewZero(src.NoXPos, state.Type()))
 				assignment.PtrInit().Append(write)
 				declarations.Append(assignment)
+			case "rhs-init":
+				zero := ir.NewZero(src.NoXPos, typ)
+				zero.(ir.InitNode).PtrInit().Append(write)
+				declarations.Append(ir.NewAssignStmt(src.NoXPos, other, zero))
+			case "declaration-init":
+				declarations[0].(ir.InitNode).PtrInit().Append(write)
 			}
 			if got, want := zeroInitializedFrameLocals(declarations)[local], mode == "zero" || mode == "pointer-zero"; got != want {
 				t.Fatalf("zeroInitializedFrameLocals includes local = %t, want %t", got, want)

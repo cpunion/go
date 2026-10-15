@@ -108,6 +108,9 @@ func main() {
 			if !strings.Contains(string(assembly), "runtime.coroTakeSelfFrame(SB)") {
 				t.Fatalf("recursive function did not select explicit self frames:\n%s", assembly)
 			}
+			if !strings.Contains(string(assembly), "main.pointers.coro STEXT") {
+				t.Fatalf("pointer-array function was not lowered:\n%s", assembly)
+			}
 			match := regexp.MustCompile(`(?m)^main\.recursive\.coro STEXT .* locals=(0x[0-9a-f]+)`).FindSubmatch(assembly)
 			if len(match) != 2 {
 				t.Fatalf("missing recursive coroutine factory frame size:\n%s", assembly)
