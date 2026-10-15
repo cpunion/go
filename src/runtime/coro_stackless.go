@@ -1861,6 +1861,12 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	}
 
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
+	if task == nil {
+		for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
+			uintptr(s.cachedFrameBytes)+size > stacklessCoroFrameCacheSize) &&
+			s.discardFreeCachedFrameTaskLocked() {
+		}
+	}
 	if task == nil && s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
 		uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
 		task = s.newFrameReservationTaskLocked(child, parent, size)
@@ -2189,7 +2195,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
-	if task == nil && !sameResume {
+	if task == nil {
 		for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
 			uintptr(s.cachedFrameBytes)+size > stacklessCoroFrameCacheSize) &&
 			s.discardFreeCachedFrameTaskLocked() {
@@ -2586,7 +2592,7 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 
 // discardFreeCachedFrameTaskLocked makes room for a new typed frame identity.
 // Native contexts retain a bounded cache across roots; without replacement, a
-// deep call of one type could permanently force later heterogeneous frames to
+// deep call of one type could permanently force later frames of another type to
 // allocate. Active frames stay untouched.
 func (s *stacklessCoroScheduler) discardFreeCachedFrameTaskLocked() bool {
 	var previous *stacklessCoroTask

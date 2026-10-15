@@ -1150,6 +1150,7 @@ func TestStacklessCoroSchedulerSize(t *testing.T) {
 type stacklessCoroSelfFrameTracker struct {
 	rootDepth            int
 	total                int
+	cachedFrames         int
 	firstAwaitAction     uint8
 	firstAwaitFused      bool
 	spawnAwaitSibling    bool
@@ -1259,6 +1260,7 @@ func stacklessCoroSelfFrameResume(ctx unsafe.Pointer) uint8 {
 			stacklessCoroSelfFrameResume)
 		if child.Owner != nil {
 			tracker.sawCacheOwner = true
+			tracker.cachedFrames++
 		}
 		allocation := child.Marker & runtime.StacklessCoroFusedFrameAllocationMask
 		switch allocation {
@@ -1401,6 +1403,7 @@ func TestStacklessCoroSelfFrameLoop(t *testing.T) {
 
 type stacklessCoroLargeSelfFrameTracker struct {
 	total         int
+	cachedFrames  int
 	fused         bool
 	panicLeaf     bool
 	sawShortChunk bool
@@ -1467,6 +1470,9 @@ func stacklessCoroLargeSelfFrameResume(ctx unsafe.Pointer) uint8 {
 		} else {
 			action = runtime.AwaitStacklessCoroSelfFrameForTest(ctx,
 				childPointer, stacklessCoroLargeSelfFrameResume)
+		}
+		if child.Owner != nil {
+			tracker.cachedFrames++
 		}
 		marker := child.Marker
 		tracker.sawShortChunk = tracker.sawShortChunk ||
@@ -1537,6 +1543,83 @@ func TestStacklessCoroLargeSelfFrameFusion(t *testing.T) {
 		runStacklessCoroLargeSelfFrames(depth, tracker)
 		t.Fatal("large-frame panic returned")
 	})
+}
+
+func TestStacklessCoroSelfFrameCacheReplacement(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds do not reuse frame addresses")
+	}
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() {
+		stacklessCoroSelfFrameActive = nil
+		stacklessCoroLargeSelfFrameActive = nil
+	}()
+
+	largeSize := int(unsafe.Sizeof(runtime.StacklessCoroLargeSelfFrameForTest{}))
+	largeDepth := runtime.StacklessCoroFrameCacheSize / largeSize
+	for _, test := range []struct {
+		name      string
+		warmLarge bool
+		fused     bool
+	}{
+		{name: "count-self"},
+		{name: "count-general", fused: true},
+		{name: "bytes", warmLarge: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			smallDepth := runtime.StacklessCoroTaskCacheSize + 32
+			if test.warmLarge {
+				smallDepth = runtime.StacklessCoroTaskCacheSize
+			}
+			small := &stacklessCoroSelfFrameTracker{rootDepth: smallDepth}
+			large := &stacklessCoroLargeSelfFrameTracker{fused: test.fused}
+			stacklessCoroSelfFrameActive = small
+			stacklessCoroLargeSelfFrameActive = large
+			state, cachedBytes := 0, 0
+			runtime.RunStacklessCoroInlineForTest(func(ctx unsafe.Pointer) uint8 {
+				switch state {
+				case 0, 1:
+					useLarge := (state == 1) != test.warmLarge
+					state++
+					if useLarge {
+						frame := &runtime.StacklessCoroLargeSelfFrameForTest{
+							Depth: largeDepth, Value: &large.total,
+						}
+						runtime.AwaitStacklessCoroFrameForTest(ctx, unsafe.Pointer(frame),
+							stacklessCoroLargeSelfFrameResume)
+					} else {
+						frame := &runtime.StacklessCoroSelfFrameForTest{
+							Depth: smallDepth, Value: &small.total,
+						}
+						runtime.AwaitStacklessCoroFrameForTest(ctx, unsafe.Pointer(frame),
+							stacklessCoroSelfFrameResume)
+					}
+					return runtime.StacklessCoroActionWait
+				case 2:
+					cachedBytes = runtime.StacklessCoroFreeFrameBytesForTest(ctx)
+					return runtime.StacklessCoroActionComplete
+				default:
+					return runtime.StacklessCoroActionInvalid
+				}
+			})
+			if small.total != smallDepth+1 || large.total != largeDepth+1 {
+				t.Fatalf("completed frames = (%d small, %d large), want (%d, %d)",
+					small.total, large.total, smallDepth+1, largeDepth+1)
+			}
+			if large.cachedFrames != largeDepth {
+				t.Errorf("cached large frames = %d, want %d", large.cachedFrames, largeDepth)
+			}
+			if small.cachedFrames != runtime.StacklessCoroTaskCacheSize {
+				t.Errorf("cached small frames = %d, want %d", small.cachedFrames,
+					runtime.StacklessCoroTaskCacheSize)
+			}
+			if cachedBytes == 0 || cachedBytes > runtime.StacklessCoroFrameCacheSize {
+				t.Errorf("cached frame bytes = %d, want 1..%d",
+					cachedBytes, runtime.StacklessCoroFrameCacheSize)
+			}
+		})
+	}
 }
 
 func TestStacklessCoroSelfFrameFusion(t *testing.T) {
