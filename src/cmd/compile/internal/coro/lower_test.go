@@ -5631,6 +5631,71 @@ func TestSupportsAwaitInit(t *testing.T) {
 	}
 }
 
+func TestLowerBranchTargets(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldLocalPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+	defer func() {
+		typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldLocalPkg, oldCurFunc
+	}()
+	pkg := types.NewPkg("example.com/coro/branchtargets", "branchtargets")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	fn := newLowerTestFunc(pkg, "branches")
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"),
+		types.NewSignature(nil, nil, nil))
+	call := newLowerTestCall(yield)
+	outer := ir.NewForStmt(src.NoXPos, nil, nil, nil, nil, false)
+	inner := ir.NewForStmt(src.NoXPos, nil, nil, nil, nil, false)
+	innerBreak := ir.NewBranchStmt(src.NoXPos, ir.OBREAK, nil)
+	innerContinue := ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)
+	inner.Body = ir.Nodes{ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true),
+		ir.Nodes{innerBreak}, ir.Nodes{innerContinue})}
+	selectBreak := ir.NewBranchStmt(src.NoXPos, ir.OBREAK, nil)
+	selectContinue := ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)
+	selection := ir.NewSelectStmt(src.NoXPos, []*ir.CommClause{
+		ir.NewCommStmt(src.NoXPos, nil, ir.Nodes{
+			ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true),
+				ir.Nodes{selectBreak}, ir.Nodes{selectContinue}),
+		}),
+	})
+	outerBreak := ir.NewBranchStmt(src.NoXPos, ir.OBREAK, nil)
+	outerContinue := ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)
+	outer.Body = ir.Nodes{call, inner, selection,
+		ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true),
+			ir.Nodes{outerBreak}, ir.Nodes{outerContinue}),
+	}
+	fn.Body = ir.Nodes{outer, newLowerTestReturn()}
+	function := &Function{
+		Func: fn, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}},
+	}
+	plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
+	candidate, err := newLowerCandidate(plan, function)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for branch, want := range map[*ir.BranchStmt]ir.Node{
+		innerBreak: inner, innerContinue: inner,
+		selectBreak: selection, selectContinue: outer,
+		outerBreak: outer, outerContinue: outer,
+	} {
+		if got := candidate.branches[branch]; got != want {
+			t.Errorf("branch %v target = %v, want %v", branch.Op(), got, want)
+		}
+	}
+	result, err := Lower(plan)
+	if err != nil || result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower = (%+v, %v), want one lowered function", result, err)
+	}
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			if node.Op() == ir.OBREAK || node.Op() == ir.OCONTINUE {
+				t.Errorf("generated function %s retains %v", generated.Sym(), node.Op())
+			}
+		})
+	}
+}
+
 func TestLowerRejectsUnsupportedControl(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -5720,12 +5785,38 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 			want: "control flow break",
 		},
 		{
-			name: "for-body",
+			name: "labeled-break",
 			body: func(*ir.CallExpr) ir.Nodes {
+				branch := ir.NewBranchStmt(src.NoXPos, ir.OBREAK, pkg.Lookup("loop"))
 				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
-					nil, ir.Nodes{branch()}, false)}
+					nil, ir.Nodes{branch}, false)}
 			},
 			want: "control flow break",
+		},
+		{
+			name: "continue-outside-loop",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)}
+			},
+			want: "control flow continue",
+		},
+		{
+			name: "goto",
+			body: func(*ir.CallExpr) ir.Nodes {
+				return ir.Nodes{ir.NewBranchStmt(src.NoXPos, ir.OGOTO, pkg.Lookup("done"))}
+			},
+			want: "control flow goto",
+		},
+		{
+			name: "continue-in-switch",
+			body: func(*ir.CallExpr) ir.Nodes {
+				branch := ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)
+				clause := ir.NewCaseStmt(src.NoXPos, nil, ir.Nodes{branch})
+				switchStmt := ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})
+				return ir.Nodes{ir.NewForStmt(src.NoXPos, nil, nil,
+					nil, ir.Nodes{switchStmt}, false)}
+			},
+			want: "branch in unsupported control flow switch",
 		},
 		{
 			name: "non-normalized-defer",
