@@ -146,7 +146,8 @@ func stacklessCoroNativeReplacementDrainResume(unsafe.Pointer) uint8 {
 
 func StacklessCoroNativeReplacementDrainForTest() (runs int, native bool) {
 	s := &stacklessCoroScheduler{
-		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
+		liveSpawns: 2,
 	}
 	lockInit(&s.lock, lockRankLeafRank)
 	s.root.state = stacklessCoroTaskWaiting

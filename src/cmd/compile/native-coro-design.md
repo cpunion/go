@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-08-29
+Last updated: 2026-10-13
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -349,6 +349,28 @@ Every completed resume episode therefore release-merges its task identity, a
 completion producer release-merges its result publication, and the next
 executor acquires that identity after claiming the runnable token. The root
 owner also acquires the terminal task before returning to ordinary Go code.
+
+A public root and the goroutines it spawns have separate completion lifetimes.
+Root completion releases the ordinary caller; the scheduler drains only after
+the root and every independently spawned logical goroutine have completed.
+Structured await frames belong to their parent's lifetime and do not add to
+the independent-task count.
+
+After the first spawn, the public driver leaves its native activation before
+selecting queued work. If work remains, an independent owner G takes over that
+driver's existing executor slot, while the ordinary caller waits only for the root's outcome.
+There is one owner per such scheduler, not one G per logical task. This transfer
+must precede executing a spawned blocking C call: a later transfer at root
+completion would leave the ordinary caller trapped below that child's C frame.
+The C call stays on its original M, and replacement executors continue logical
+work until the scheduler drains. Roots without a spawn keep their direct path.
+
+An owner-managed scheduler and root frame are not returned to the public-root
+caches while children can retain them. Operation completion can also publish
+readiness before sending its final wake notification. A scheduler that has
+started an operation therefore keeps its wake channel immutable and leaves
+both objects to GC; task completion alone does not prove that every producer
+has stopped accessing it.
 
 An executor entry has a deterministic reduction budget. Queue dequeue, resume,
 destroy, source fact, result reconciliation, and child completion each consume

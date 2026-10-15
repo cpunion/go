@@ -1138,9 +1138,9 @@ func TestStacklessCoroOperationSize(t *testing.T) {
 
 func TestStacklessCoroSchedulerSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := uintptr(192)
+	want := uintptr(208)
 	if ptrSize == 4 {
-		want = 112
+		want = 124
 	}
 	if got := runtime.StacklessCoroSchedulerSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine scheduler size = %d, want %d", got, want)
@@ -3558,9 +3558,39 @@ func TestStacklessCoroRootSchedulerPool(t *testing.T) {
 			got, want)
 	}
 
+	var detachedRelease atomic.Bool
+	var detachedScheduler unsafe.Pointer
+	detachedDone := make(chan struct{})
+	t.Cleanup(func() {
+		detachedRelease.Store(true)
+		if detachedScheduler == nil {
+			return
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-detachedDone:
+		case <-timer.C:
+			t.Error("detached scheduler-pool task did not stop")
+			return
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for !runtime.DrainedStacklessCoroSchedulerForTest(detachedScheduler) {
+			if time.Now().After(deadline) {
+				t.Error("detached scheduler-pool task did not drain")
+				return
+			}
+			runtime.Gosched()
+		}
+	})
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		detachedScheduler = runtime.SchedulerStacklessCoroForTest(ctx)
 		runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
-			return runtime.StacklessCoroActionYield
+			if !detachedRelease.Load() {
+				return runtime.StacklessCoroActionYield
+			}
+			close(detachedDone)
+			return runtime.StacklessCoroActionComplete
 		})
 		return runtime.StacklessCoroActionComplete
 	})
