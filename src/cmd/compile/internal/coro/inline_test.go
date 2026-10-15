@@ -6,10 +6,60 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"testing"
 )
+
+func TestLowerInlineMarks(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldLocalPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+	defer func() {
+		typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldLocalPkg, oldCurFunc
+	}()
+	for _, closure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "explicit-frame", true: "closure-frame"}[closure], func(t *testing.T) {
+			pkg := types.NewPkg("example.com/coro/inlinemarks/"+t.Name(), "inlinemarks")
+			types.LocalPkg = pkg
+			typecheck.Target = new(ir.Package)
+			fn := newLowerTestFunc(pkg, "marked")
+			first := ir.NewInlineMarkStmt(src.NoXPos, 17)
+			last := ir.NewInlineMarkStmt(src.NoXPos, 23)
+			yield := newLowerTestCall(testFunc("yield"))
+			fn.Body = ir.Nodes{first, yield, last, newLowerTestReturn()}
+			wantABI := FactoryABI3
+			if closure {
+				literal := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+					types.NewSignature(nil, nil, nil), fn, typecheck.Target, 0)
+				literal.DeclareParams(true)
+				literal.Body = ir.Nodes{newLowerTestReturn()}
+				fn.Body.Prepend(ir.NewAssignStmt(src.NoXPos, ir.BlankNode, literal.OClosure))
+				wantABI = FactoryABI1
+			}
+			function := &Function{
+				Func: fn, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
+				Sites: []Site{{ID: 1, Kind: SiteYield, Node: yield}},
+			}
+			result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}})
+			if err != nil || result.Lowered != 1 || function.Factory != wantABI {
+				t.Fatalf("Lower = %+v, %v, factory = %v, want %v", result, err, function.Factory, wantABI)
+			}
+			found := make(map[*ir.InlineMarkStmt]bool)
+			for _, generated := range typecheck.Target.Funcs {
+				ir.VisitList(generated.Body, func(node ir.Node) {
+					if mark, ok := node.(*ir.InlineMarkStmt); ok {
+						found[mark] = true
+					}
+				})
+			}
+			if !found[first] || !found[last] || first.Index != 17 || last.Index != 23 ||
+				first.Typecheck() != 1 || last.Typecheck() != 1 {
+				t.Fatal("inline marks were removed, changed, or left unchecked")
+			}
+		})
+	}
+}
 
 func TestPreserveCall(t *testing.T) {
 	for _, test := range []struct {

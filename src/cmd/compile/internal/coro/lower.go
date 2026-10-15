@@ -3914,6 +3914,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	declarations ir.Nodes) {
+	// Inline marks are emitted after type checking. They carry no typed
+	// operands, but lowering can expose them as statements in generated
+	// control flow that must be type checked again.
+	ir.VisitList(resume.Body, func(node ir.Node) {
+		if node.Op() == ir.OINLMARK {
+			node.SetTypecheck(1)
+		}
+	})
 	if candidate.factoryABI == FactoryABI3 {
 		finishExplicitFrameLowering(candidate, resume, declarations)
 		return
