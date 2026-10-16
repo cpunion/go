@@ -115,6 +115,42 @@ workloads, and all unfavorable samples retained.
 
 ## Reproducibility
 
+### Completed-frame retention
+
+`RetainedControl`, `RetainedSelf4096`, `RetainedMutual4096`, and
+`RetainedLarge512` are memory diagnostics, not throughput benchmarks. Run each
+in a **separate fresh process** with `-benchtime=1x -count=1 -cpu=1`. They prime
+only the public root entry, force two initial collections, and sample the
+completed call immediately and after one, two, and four further collections.
+The control performs no recursive work. No tasks remain detached at a sample.
+Prior frame shapes affect cache admission, so running all four in one process
+does not reproduce these isolated controls.
+
+After building the same fixture into baseline and coroutine test binaries, run
+each binary separately, for example:
+
+```
+for probe in RetainedControl RetainedSelf4096 RetainedMutual4096 RetainedLarge512; do
+  GOMAXPROCS=1 GOGC=100 GOMEMLIMIT=off /tmp/coro.test \
+    -test.run='^$' -test.bench="^Benchmark${probe}$" \
+    -test.benchtime=1x -test.count=1 -test.cpu=1
+done
+```
+
+Only the custom `returned/gc1/gc2/gc4-heap-B`, `-objects`, and `-Go-stack-B`
+metrics describe the snapshots. `call-total-B` and `call-allocs` describe the
+call before the post-call collections; they are not retained memory. **Do not
+interpret the default ns/op, B/op, or allocs/op:** those include controller,
+collection, and metric-reporting work. All snapshots finish before reporting
+can allocate maps or labels. Signed deltas, including negative controls, are
+retained rather than clamped. Go heap/stack counters exclude native OS-thread
+stacks and total RSS. Use matching frozen tools and source, and retain every
+control, GC stage, and unfavorable sample; this is not a leak proof or a
+per-goroutine minimum. The regular timing and manual collector selections are
+unchanged; these probes are opt-in isolated diagnostics.
+
+### Paired collections
+
 For new collections, `collect.bash BASELINE_GOROOT CORO_GOROOT NEW_OUTPUT_DIRECTORY`
 builds the same fixtures with independently built default/experiment tools and
 requires the exact upstream merge-base, clean source trees and matching Git
