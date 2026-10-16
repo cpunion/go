@@ -83,6 +83,36 @@ GOEXPERIMENT=coro /path/to/coroutine/bin/go test cmd/compile/internal/coro \
 The tables below retain their recorded revisions and settings; they are not
 fresh measurements of the current head.
 
+## Large-task and mixed-frame controls
+
+The probes also retain the large-task fixtures used to investigate creation,
+parking and allocation costs. `TaskBurst1000/100000` and
+`TaskPark1000/100000` keep normal GC enabled; the `MixedParkScalarFirst100000`
+and `MixedParkPointerFirst100000` variants interleave one PC-only worker with
+three pointer-bearing workers, changing which frame shape is encountered
+first. Both orders matter: saving allocation events for one shape can retain
+extra unused batch capacity for another. Do not infer a universal memory or
+latency improvement from only the pure or PC-first case.
+
+`LiveTaskFootprint1/1000/100000`, the 256/264/265/266/267/268 boundary variants,
+and `MixedScalarFirst1000/100000` and `MixedPointerFirst1000/100000` require
+`-benchtime=1x`. They disable GC for the live snapshot, include coordinator
+and executor setup, and report allocation events, live heap/objects, Go-stack
+bytes, ordinary goroutines and thread-creation records. Every worker has
+published readiness and cannot finish before release, but readiness precedes
+channel receive: the snapshot does not assert every channel waiter is
+installed. Go-stack bytes exclude native OS stacks and total RSS; thread
+creation records are not a live thread census. Small setup variations and
+negative memory deltas are retained, not clamped away.
+
+`check.bash` requires native lowering of both mixed workers and runs all 19
+new probes once as correctness/lifecycle smoke checks, preserving the raw
+allocation output in `large-task-smoke.txt`. These executions, especially
+under concurrent CI load, are not latency measurements. The historical
+`run.bash` timing selection remains unchanged; collect repeated balanced
+measurements separately with matching frozen toolchains, no concurrent own
+workloads, and all unfavorable samples retained.
+
 ## Reproducibility
 
 Fetch the upstream development branch, then build one GOROOT at its exact
