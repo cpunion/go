@@ -21,13 +21,25 @@ func semaphoreTestSignature(pkg *types.Pkg) *types.Type {
 	}, nil)
 }
 
+var semaphoreTestDeclarations = []struct {
+	path, name string
+	acquire    bool
+}{
+	{"internal/sync", "runtime_SemacquireMutex", true},
+	{"internal/sync", "runtime_Semrelease", false},
+	{"sync", "runtime_SemacquireRWMutexR", true},
+	{"sync", "runtime_SemacquireRWMutex", true},
+	{"sync", "runtime_Semrelease", false},
+}
+
 func TestSemaphoreRecipeSignature(t *testing.T) {
 	prepareLowerTest(t)
 	if got := SiteSemaphore.String(); got != "semaphore" {
 		t.Fatalf("semaphore site name = %q", got)
 	}
-	pkg := types.NewPkg("internal/sync", "sync")
-	for _, name := range []string{"runtime_SemacquireMutex", "runtime_Semrelease"} {
+	for _, declaration := range semaphoreTestDeclarations {
+		pkg := types.NewPkg(declaration.path, "sync")
+		name := declaration.name
 		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name), semaphoreTestSignature(pkg))
 		recipe, ok := operationRecipe(fn)
 		if !ok || recipe.Kind != SiteSemaphore || recipe.Effect != MaySuspend {
@@ -59,12 +71,13 @@ func TestLowerSemaphore(t *testing.T) {
 	t.Cleanup(func() {
 		typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldLocalPkg, oldCurFunc
 	})
-	for _, name := range []string{"runtime_SemacquireMutex", "runtime_Semrelease"} {
-		t.Run(name, func(t *testing.T) {
+	for _, declaration := range semaphoreTestDeclarations {
+		name := declaration.name
+		t.Run(declaration.path+"."+name, func(t *testing.T) {
 			typecheck.Target = new(ir.Package)
-			pkg := types.NewPkg("example.com/coro/semaphore/"+name, "semaphore")
+			pkg := types.NewPkg("example.com/coro/semaphore/"+declaration.path+"/"+name, "semaphore")
 			types.LocalPkg = pkg
-			primitivePkg := types.NewPkg("internal/sync", "sync")
+			primitivePkg := types.NewPkg(declaration.path, "sync")
 			primitive := ir.NewFunc(src.NoXPos, src.NoXPos, primitivePkg.Lookup(name),
 				semaphoreTestSignature(primitivePkg))
 			primitive.DeclareParams(true)
@@ -75,7 +88,7 @@ func TestLowerSemaphore(t *testing.T) {
 			for _, arg := range fn.Dcl {
 				call.Args = append(call.Args, arg)
 			}
-			if name == "runtime_SemacquireMutex" {
+			if declaration.acquire {
 				// An argument initializer belongs to the entry, not the retry.
 				call.SetInit(ir.Nodes{ir.NewAssignStmt(src.NoXPos, call.Args[2],
 					typedInt(src.NoXPos, types.Types[types.TINT], 17))})
@@ -93,7 +106,7 @@ func TestLowerSemaphore(t *testing.T) {
 				t.Fatalf("factory = %v, want explicit frame", plan.Functions[fn].Factory)
 			}
 			want := "runtime.coroSemacquireMutex"
-			if name == "runtime_Semrelease" {
+			if !declaration.acquire {
 				want = "runtime.coroSemrelease"
 			}
 			found := 0
@@ -111,7 +124,7 @@ func TestLowerSemaphore(t *testing.T) {
 			if found != 1 {
 				t.Fatalf("generated %d calls to %s, want 1", found, want)
 			}
-			checkSemaphoreTransition(t, resume, helper, name == "runtime_SemacquireMutex")
+			checkSemaphoreTransition(t, resume, helper, declaration.acquire)
 		})
 	}
 }

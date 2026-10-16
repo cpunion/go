@@ -25,9 +25,10 @@ func semaphoreOperation(call *ir.CallExpr) string {
 	}
 	name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
 	switch symbolName(name) {
-	case "internal/sync.runtime_SemacquireMutex":
+	case "internal/sync.runtime_SemacquireMutex",
+		"sync.runtime_SemacquireRWMutexR", "sync.runtime_SemacquireRWMutex":
 		return "coroSemacquireMutex"
-	case "internal/sync.runtime_Semrelease":
+	case "internal/sync.runtime_Semrelease", "sync.runtime_Semrelease":
 		return "coroSemrelease"
 	}
 	return ""
