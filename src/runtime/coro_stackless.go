@@ -2499,6 +2499,36 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 		throw("runtime: invalid stackless coroutine fused-frame completion")
 	}
 	s := context.scheduler
+	frame := context.frame
+	header := (*stacklessCoroFusedFrameHeader)(frame)
+	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		header.owner == nil && header.parent != nil &&
+		header.marker&stacklessCoroFusedFrameAllocationMask != 0 &&
+		validStacklessCoroFusedFrameMarker(header.marker) &&
+		task.state == stacklessCoroTaskRunning && task.resuming &&
+		!task.readyPending && !task.goexit &&
+		task.terminal == stacklessCoroTerminalNone &&
+		task.flags&stacklessCoroTaskCompletionMask == stacklessCoroTaskFusedFrames {
+		if header.marker&stacklessCoroFusedFrameResume == 0 ||
+			(*stacklessCoroFusedResumeFrameHeader)(frame).resume != nil {
+			// The active task owns the uncached frame and its resume link. No
+			// shared cache holder is recycled; runnableState gives the same
+			// fairness snapshot as the local self-frame completion path.
+			allocation := header.marker & stacklessCoroFusedFrameAllocationMask
+			completedResume := task.resume
+			cacheChunk := allocation == stacklessCoroFusedFrameChunkFirst &&
+				header.marker&stacklessCoroFusedFrameChunkValidated != 0
+			restoreStacklessCoroFusedParent(context, task, header)
+			if cacheChunk {
+				cacheStacklessCoroNativeSelfFrame(completedResume, frame, allocation)
+			}
+			if s.runnableState.Load() == 0 {
+				task.setFlag(stacklessCoroTaskSwitchPending, true)
+				return stacklessCoroActionSwitch
+			}
+			return stacklessCoroActionYield
+		}
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -2509,8 +2539,6 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine fused-frame completion outside resume")
 	}
-	frame := context.frame
-	header := (*stacklessCoroFusedFrameHeader)(frame)
 	if header.parent == nil || !validStacklessCoroFusedFrameMarker(header.marker) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completed fused frame")
@@ -2526,8 +2554,6 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine fused-frame ownership")
 	}
-	parentFrame := header.parent
-	parentFused := header.marker&stacklessCoroFusedFrameParent != 0
 	// Cache under the child's identity, before restoring the parent resume.
 	completedResume := task.resume
 	cacheChunk := allocation == stacklessCoroFusedFrameChunkFirst &&
@@ -2538,15 +2564,8 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 			unlock(&s.lock)
 			throw("runtime: missing stackless coroutine fused resume")
 		}
-		task.resume = *(*stacklessCoroResume)(unsafe.Pointer(
-			&resumeHeader.resume))
-		resumeHeader.resume = nil
 	}
-	header.parent = nil
-	header.owner = nil
-	header.marker = 0
-	context.frame = parentFrame
-	task.setFlag(stacklessCoroTaskFusedFrames, parentFused)
+	restoreStacklessCoroFusedParent(context, task, header)
 	if owner != nil {
 		owner.state = stacklessCoroTaskComplete
 		s.recycleTaskLocked(owner)
@@ -2561,6 +2580,25 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 	}
 	unlock(&s.lock)
 	return stacklessCoroActionYield
+}
+
+// restoreStacklessCoroFusedParent restores a validated parent and clears its
+// completed child's links. The caller owns the active task and has checked
+// the saved resume, when present. Cached holders are recycled separately.
+func restoreStacklessCoroFusedParent(context *stacklessCoroContext,
+	task *stacklessCoroTask, header *stacklessCoroFusedFrameHeader) {
+	parentFrame := header.parent
+	parentFused := header.marker&stacklessCoroFusedFrameParent != 0
+	if header.marker&stacklessCoroFusedFrameResume != 0 {
+		resumeHeader := (*stacklessCoroFusedResumeFrameHeader)(unsafe.Pointer(header))
+		task.resume = *(*stacklessCoroResume)(unsafe.Pointer(&resumeHeader.resume))
+		resumeHeader.resume = nil
+	}
+	header.parent = nil
+	header.owner = nil
+	header.marker = 0
+	context.frame = parentFrame
+	task.setFlag(stacklessCoroTaskFusedFrames, parentFused)
 }
 
 // discardFusedFramesLocked drops every fused child after a terminal outcome.
