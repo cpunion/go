@@ -3967,6 +3967,23 @@ does not implement general closure or dynamic-call lowering. Tests require
 actual frame spawning rather than accepting a successful ordinary fallback,
 and separately require fallback for dynamic and value-returning targets.
 
+### 16.9 Typed frames for foreign-only functions
+
+A run-to-completion foreign function can use factory ABI 3 and the existing
+typed root-frame cache without gaining a state-machine dispatch. Its static
+resume retains the original blocks, branches, loops, and foreign enter/exit
+boundaries. Captured parameters, locals, and result slots move into the same
+GC-described storage already used by supported suspending functions.
+
+Nested source closures, range-variable ownership, defer and terminal behavior
+retain the previous fallback rules. A foreign call in a loop post statement
+also retains its existing lowering until that control-flow form is supported.
+No callback, Go-pointer, thread-affinity, foreign ABI, cache-budget, or source
+annotation contract changes. Default and instrumented builds retain their
+ordinary Go/cgo paths. The public-entry allocation regression checks scalar
+and libm calls after warmup; this does not remove the remaining cost of
+crossing from an ordinary Go caller into a native executor.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:
