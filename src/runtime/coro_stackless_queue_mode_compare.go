@@ -6,6 +6,8 @@
 
 package runtime
 
+const stacklessCoroQueueComparison = true
+
 // stacklessCoroPullComparisonMarker is a test-driver sentinel. A real queue
 // tail can never refer to it. The comparison reuses head for its current
 // structured leaf, which keeps the production scheduler in its original size

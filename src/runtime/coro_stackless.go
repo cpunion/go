@@ -2204,23 +2204,26 @@ func coroRequestFusedFrame(ctx unsafe.Pointer, chunkCompatible bool) {
 		return
 	}
 	s := context.scheduler
-	lock(&s.lock)
-	if stacklessCoroIsPullComparison(s) {
+	// Only the active resume owns its request flags. Comparison builds also
+	// inspect queue state; serialize that snapshot before changing the task.
+	if stacklessCoroQueueComparison {
+		lock(&s.lock)
+		pull := stacklessCoroIsPullComparison(s)
 		unlock(&s.lock)
-		return
+		if pull {
+			return
+		}
 	}
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
 		parent.flags&(stacklessCoroTaskFusedTransitionMask|
 			stacklessCoroTaskSwitchPending) != 0 ||
 		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
-		unlock(&s.lock)
 		throw("runtime: stackless coroutine fused-frame request outside resume")
 	}
 	parent.flags |= stacklessCoroTaskFusedRequested |
 		stacklessCoroTaskFlags(bool2int(chunkCompatible))*
 			stacklessCoroTaskFusedChunk
-	unlock(&s.lock)
 }
 
 // coroTakeFusedFrame extends typed-frame reuse for a compiler-proven
