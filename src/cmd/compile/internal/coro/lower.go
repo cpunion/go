@@ -1771,6 +1771,9 @@ func rewriteDeferTerminal(fn *ir.Func, token *ir.Name,
 					typecheck.LookupRuntime("coroDeferRecover"),
 					ir.Nodes{token}, false)
 			}
+			if node.Op() != ir.OCALLFUNC {
+				break
+			}
 			callee := ir.StaticCalleeName(node.Fun)
 			if callee != nil {
 				if recipe, ok := operationRecipe(callee.Func); ok &&
