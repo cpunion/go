@@ -912,10 +912,10 @@ func TestStacklessCoroGoexitAwait(t *testing.T) {
 
 func TestStacklessCoroGoexitSpawn(t *testing.T) {
 	var rootState int
-	var childCleanup bool
+	cleanupDone := make(chan struct{})
 	child := func(ctx unsafe.Pointer) uint8 {
 		runtime.GoexitStacklessCoroForTest(ctx)
-		childCleanup = true
+		close(cleanupDone)
 		return runtime.TerminalActionStacklessCoroForTest(ctx)
 	}
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -932,9 +932,15 @@ func TestStacklessCoroGoexitSpawn(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
-	if rootState != 2 || !childCleanup {
-		t.Fatalf("spawn Goexit state = (%d, %t), want (2, true)",
-			rootState, childCleanup)
+	// A detached child can outlive the public root. Synchronize with its
+	// cleanup instead of assuming the root's return joins the child.
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("spawned Goexit cleanup did not complete")
+	}
+	if rootState != 2 {
+		t.Fatalf("spawn Goexit root state = %d, want 2", rootState)
 	}
 }
 
