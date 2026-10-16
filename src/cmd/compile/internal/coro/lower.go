@@ -4311,6 +4311,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		}
 	}
 	declarations = initializedDeclarations
+	zeroLocals := zeroInitializedFrameLocals(declarations)
 
 	factoryFrame := typecheck.TempAt(pos, factory, framePointerType)
 	declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, factoryFrame))
@@ -4393,8 +4394,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
 		resultField := rootResultTargets[variable.Outer.Canonical()]
 		if resultField == nil {
+			value := ir.Node(variable.Outer)
+			if zeroLocals[variable.Outer.Canonical()] {
+				value = ir.NewZero(pos, fields[i].Type)
+			}
 			declarations = append(declarations,
-				ir.NewAssignStmt(pos, target, variable.Outer))
+				ir.NewAssignStmt(pos, target, value))
 			continue
 		}
 		selfTarget := typecheck.NodAddr(explicitFrameField(variable.Pos(),
