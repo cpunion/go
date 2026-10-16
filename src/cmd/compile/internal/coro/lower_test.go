@@ -984,7 +984,6 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 			t.Errorf("%s candidate supports an explicit frame", kind)
 		}
 	}
-
 	deferABI := candidate(SiteYield)
 	deferABI.function.Defer = DeferABI1
 	if explicitFrameFactorySupported(deferABI) {
@@ -1017,14 +1016,24 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 		t.Error("closure candidate supports an explicit frame")
 	}
 
-	runToCompletion := candidate(SiteForeign)
-	call := newLowerTestCall(newLowerTestFunc(pkg, "foreign"))
-	runToCompletion.function.Effect = NoSuspend
-	runToCompletion.function.Sites[0].Foreign = DirectNoBlock
-	runToCompletion.foreignCalls[call] = DirectNoBlock
-	runToCompletion.function.Func.Body = []ir.Node{call, newLowerTestReturn()}
-	if explicitFrameFactorySupported(runToCompletion) {
-		t.Error("run-to-completion candidate supports an explicit frame")
+	for _, class := range []ForeignCallClass{DirectNoBlock, DirectMayBlock} {
+		foreign := candidate(SiteForeign)
+		call := newLowerTestCall(newLowerTestFunc(pkg, "foreign"))
+		foreign.function.Effect = NoSuspend
+		foreign.function.Sites[0].Foreign = class
+		foreign.foreignCalls[call] = class
+		foreign.function.Func.Body = []ir.Node{call, newLowerTestReturn()}
+		if !explicitFrameFactorySupported(foreign) {
+			t.Errorf("run-to-completion %s candidate does not support an explicit frame", class)
+		}
+		nested := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+			types.NewSignature(nil, nil, nil), foreign.function.Func,
+			typecheck.Target, 0)
+		nested.DeclareParams(true)
+		foreign.function.Func.Body = append(foreign.function.Func.Body, nested.OClosure)
+		if explicitFrameFactorySupported(foreign) {
+			t.Errorf("run-to-completion %s candidate with a nested closure supports an explicit frame", class)
+		}
 	}
 }
 
@@ -2492,6 +2501,7 @@ func TestLowerStateMachines(t *testing.T) {
 		})
 		wantCalls := []string{
 			"coroEnterForeign", "directValueEntry", "coroExitForeign",
+			"coroFrameNeedsClear", "coroFrameNeedsClear",
 		}
 		if !slices.Equal(calls, wantCalls) {
 			t.Errorf("%s calls = %v, want %v", test.name, calls, wantCalls)
@@ -2515,6 +2525,7 @@ func TestLowerStateMachines(t *testing.T) {
 		child: true, parent: true, spawned: true,
 		sleeper: true, fileReader: true, socketReader: true,
 		ordinaryFileReader: true, structured: true,
+		runToCompletion: true, runSingle: true, runStructured: true,
 	}
 	for _, fn := range []*ir.Func{
 		child, parent, spawned, spawner, sleeper, fileReader, socketReader,

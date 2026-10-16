@@ -1439,19 +1439,24 @@ func resumeFactoryABI(factory, fn *ir.Func) FactoryABI {
 	return NoFactory
 }
 
-// explicitFrameFactorySupported limits explicit-frame lowering to
-// state-machine functions whose storage can move into one generated frame
-// without rewriting nested closure or defer capture ownership.
+// explicitFrameFactorySupported limits explicit-frame lowering to functions
+// whose storage can move into one generated frame without rewriting nested
+// closure or defer capture ownership.
 func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
-	if candidate == nil || canLowerRunToCompletion(candidate) ||
+	if candidate == nil ||
 		candidate.function.Defer != NoDeferABI || len(candidate.defers) != 0 ||
 		len(candidate.rangeVars) != 0 || candidate.function.Terminal != 0 {
 		return false
 	}
+	runToCompletion := canLowerRunToCompletion(candidate)
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
 		// These transitions keep their suspended state in the resume frame.
 		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore:
+		case SiteForeign:
+			if !runToCompletion {
+				return false
+			}
 		default:
 			return false
 		}
@@ -1956,13 +1961,16 @@ func rewriteDeferFactoryCall(deferred *lowerDefer, resume *ir.Func,
 	return closure, nil
 }
 
-// lowerRunToCompletion builds a single-invocation resume closure. Foreign
+// lowerRunToCompletion builds a single-invocation resume. Foreign
 // calls are instrumented in place, so ordinary blocks, branches, and loops
 // retain their source control flow.
 func lowerRunToCompletion(candidate *lowerCandidate) error {
 	fn := candidate.function.Func
 	factory := candidate.factory
 	resumeType := factory.Type().Result(0).Type
+	if candidate.factoryABI == FactoryABI3 {
+		resumeType = factory.Type().Result(1).Type
+	}
 	pos := fn.Pos()
 	terminalAware := needsTerminalEntry(candidate)
 
