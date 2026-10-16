@@ -432,8 +432,12 @@ func (p *Plan) scan(function *Function) {
 		}
 
 		edge := Edge{Kind: kind, Node: call}
-		if call.Op() == ir.OCALLFUNC {
-			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
+		calleeCall := call
+		if kind == GoCall {
+			calleeCall = unwrapGoCall(call)
+		}
+		if calleeCall.Op() == ir.OCALLFUNC {
+			if name := ir.StaticCalleeName(ir.StaticValue(calleeCall.Fun)); name != nil {
 				edge.Callee = name.Func
 				edge.CalleeName = symbolName(name)
 				if _, local := p.Functions[edge.Callee]; !local {

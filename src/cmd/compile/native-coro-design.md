@@ -3936,6 +3936,28 @@ The likely compatibility order remains:
 10. add other targets only after their platform operation sources and stack
     contracts are explicit.
 
+### 16.8 Named go calls with frozen arguments
+
+The ordinary frontend already normalizes a parameterized go call into a
+zero-argument wrapper and freezes its operands in the go statement's Init.
+Coroutine analysis recognizes only compiler-generated wrappers with one
+statically named call and a matching WrappedFunc. It substitutes captures with
+the caller's frozen temporaries in a copied call; it does not modify the
+original wrapper or its fallback implementation.
+
+Spawn lowering evaluates the original Init exactly once before calling the
+child factory. When operand evaluation suspends, the existing Init state
+machinery completes that evaluation before emitting the spawn. Argument
+snapshots and pointer roots therefore use the same frontend representation
+rather than a second go-call normalization pass or source annotations.
+
+The target must still satisfy the existing factory restrictions. Dynamic
+function values, arbitrary source closures, unsupported signatures, returned
+values and explicit-panic spawn targets retain the ordinary Go path. This
+does not implement general closure or dynamic-call lowering. Tests require
+actual frame spawning rather than accepting a successful ordinary fallback,
+and separately require fallback for dynamic and value-returning targets.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:

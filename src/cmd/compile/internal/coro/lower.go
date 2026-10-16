@@ -3032,6 +3032,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return lowerStatements(init, continuation)
 			}
 			switch candidate.transitions[call] {
+			case SiteSpawn:
+				// A go statement can become a boundary when evaluating its
+				// arguments suspends. Its Init has already been detached;
+				// emit the spawn only after those states have completed.
+				return newBodyState(ir.Nodes{stmt}, next)
 			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore,
 				SiteGoexit:
 				stateNext := next
@@ -3088,6 +3093,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	factoryCall := func(call *ir.CallExpr,
 		statement ir.Node) (lowerFactoryCall, error) {
 		edge := edgeForCall(function, call)
+		sourceCall := call
+		if edge.Kind == GoCall {
+			sourceCall = unwrapGoCall(call)
+		}
 		child := factories[edge.Callee]
 		if child == nil {
 			return lowerFactoryCall{}, fmt.Errorf("%s: missing factory for %s",
@@ -3098,14 +3107,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return lowerFactoryCall{}, fmt.Errorf("%s: invalid factory for %s",
 				ir.PkgFuncName(fn), edge.CalleeName)
 		}
-		args := make(ir.Nodes, 0, len(call.Args)+1)
+		args := make(ir.Nodes, 0, len(sourceCall.Args)+1)
 		if childABI == FactoryABI3 {
 			args = append(args, ctx)
 		}
-		for _, arg := range call.Args {
+		for _, arg := range sourceCall.Args {
 			args = append(args, edit(arg))
 		}
-		targets, err := callResultTargets(call, statement,
+		targets, err := callResultTargets(sourceCall, statement,
 			edge.Callee.Type().NumResults())
 		if err != nil {
 			return lowerFactoryCall{}, fmt.Errorf("%s: %v",
@@ -3484,6 +3493,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if goStmt, ok := stmt.(*ir.GoDeferStmt); ok {
 				if call, ok := goStmt.Call.(*ir.CallExpr); ok &&
 					candidate.transitions[call] == SiteSpawn {
+					for _, init := range goStmt.Init() {
+						body = append(body, edit(init))
+					}
 					child, err := factoryCall(call, nil)
 					if err != nil {
 						return err
