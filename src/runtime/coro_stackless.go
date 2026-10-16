@@ -316,9 +316,36 @@ type stacklessCoroScheduler struct {
 // transient unrooted pointer while a native executor clears the operation.
 type stacklessCoroOperation struct {
 	stacklessCoroOperationState
+	*stacklessCoroIOState
 	timer     *stacklessCoroTimer
 	waiter    *sudog
 	selection *stacklessCoroSelect
+}
+
+// stacklessCoroIOState keeps IO-only fields out of cold channel allocations.
+// A cached operation retains its cleared IO storage across changes of source
+// kind without retaining buffers, result pointers, or closures.
+type stacklessCoroIOState struct {
+	buffer   []byte
+	call     func()
+	n        *int
+	errno    *uintptr
+	valueOut *uint64
+	workNext *stacklessCoroOperation
+}
+
+// stacklessCoroIOOperation gives a new non-channel operation its first IO
+// storage without a second heap allocation.
+type stacklessCoroIOOperation struct {
+	operation stacklessCoroOperation
+	io        stacklessCoroIOState
+}
+
+func newStacklessCoroIOOperation() *stacklessCoroOperation {
+	storage := new(stacklessCoroIOOperation)
+	op := &storage.operation
+	op.stacklessCoroIOState = &storage.io
+	return op
 }
 
 // stacklessCoroChannelOperation gives a new channel operation its first waiter
@@ -353,11 +380,6 @@ type stacklessCoroOperationState struct {
 	// also linked from a channel queue.
 	waiterActive bool
 	fd           int32
-	buffer       []byte
-	call         func()
-	n            *int
-	errno        *uintptr
-	valueOut     *uint64
 	// packet holds a deferred-sleep deadline, an asynchronous C reply, or a
 	// socket operation's pointer-free poll descriptor and completion link. The
 	// operation registry remains the GC root for a linked socket operation.
@@ -369,7 +391,6 @@ type stacklessCoroOperationState struct {
 	// pollWrite selects the write semaphore of a borrowed poll descriptor.
 	pollWrite bool
 	next      *stacklessCoroOperation
-	workNext  *stacklessCoroOperation
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
@@ -3466,9 +3487,12 @@ func stacklessCoroStartOperationWithWaiter(ctx unsafe.Pointer, name string,
 			if allocateWaiter {
 				op = newStacklessCoroChannelOperation()
 			} else {
-				op = new(stacklessCoroOperation)
+				op = newStacklessCoroIOOperation()
 			}
 		}
+	}
+	if !allocateWaiter && op.stacklessCoroIOState == nil {
+		op.stacklessCoroIOState = new(stacklessCoroIOState)
 	}
 	op.scheduler = s
 	op.task = task
@@ -3487,12 +3511,16 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
 	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
 		(op.timer != nil && op.timer.active.Load() != 0) ||
-		op.timerWait || op.waiterActive || op.next != nil || op.workNext != nil {
+		op.timerWait || op.waiterActive || op.next != nil ||
+		(op.stacklessCoroIOState != nil && op.workNext != nil) {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	s := op.scheduler
 	task := op.task
 	op.stacklessCoroOperationState = stacklessCoroOperationState{}
+	if op.stacklessCoroIOState != nil {
+		*op.stacklessCoroIOState = stacklessCoroIOState{}
+	}
 	return s, task
 }
 

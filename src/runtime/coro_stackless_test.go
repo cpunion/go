@@ -1111,11 +1111,11 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := 22 * ptrSize
-	wantChannel := uintptr(288)
+	want := 15 * ptrSize
+	wantChannel := uintptr(232)
 	if ptrSize == 4 {
-		want = 26 * ptrSize
-		wantChannel = 172
+		want = 19 * ptrSize
+		wantChannel = 144
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine operation size = %d, want %d", got, want)
