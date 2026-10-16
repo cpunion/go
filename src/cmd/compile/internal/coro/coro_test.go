@@ -244,6 +244,7 @@ var childStage int
 var parentSaw int
 var spawnStage int
 var spawnSaw int
+var spawnDone = make(chan struct{})
 var slept bool
 var fileFD int
 var fileBuffer = make([]byte, 4)
@@ -268,6 +269,7 @@ var ordinarySocketDeadlineOK bool
 var ordinarySocketCloseOK bool
 var ordinarySocketZeroOK bool
 var socketProgress int
+var socketProgressDone = make(chan struct{}, 1)
 var parameterResult int
 var returnedResult int
 var controlResult int
@@ -308,13 +310,14 @@ func spawnedChild() {
 	spawnStage = 1
 	runtime.Gosched()
 	spawnStage = 2
+	close(spawnDone)
 }
 
 //go:noinline
 func spawner() {
 	go spawnedChild()
 	runtime.Gosched()
-	runtime.Gosched()
+	<-spawnDone
 	spawnSaw = spawnStage
 }
 
@@ -348,12 +351,14 @@ func ordinaryFileDiscard() {
 func ordinarySocketReader() {
 	go socketProgressor()
 	ordinarySocketN, ordinarySocketErr = ordinarySocket.Read(ordinarySocketBuffer)
+	<-socketProgressDone
 }
 
 //go:noinline
 func socketProgressor() {
 	socketProgress++
 	runtime.Gosched()
+	socketProgressDone <- struct{}{}
 }
 
 //go:noinline
