@@ -469,8 +469,14 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	types.LocalPkg = pkg
 	typecheck.Target = new(ir.Package)
 
-	recursive := newLowerTestFunc(pkg, "recursive")
+	parameter := types.NewField(src.NoXPos, pkg.Lookup("p"),
+		types.NewPtr(types.Types[types.TINT]))
+	recursive := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("recursive"),
+		types.NewSignature(nil, []*types.Field{parameter}, nil))
+	recursive.DeclareParams(true)
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, recursive)
 	call := newLowerTestCall(recursive)
+	call.Args = ir.Nodes{parameter.Nname.(*ir.Name)}
 	recursive.Body = ir.Nodes{call, newLowerTestReturn()}
 	function := &Function{
 		Func:    recursive,
@@ -588,6 +594,48 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	if runtimeCalls["runtime.coroTerminalAction"] != 1 {
 		t.Errorf("lowered recursive function has %d terminal queries, want one at resume entry",
 			runtimeCalls["runtime.coroTerminalAction"])
+	}
+	if runtimeCalls["runtime.coroFrameNeedsClear"] != 1 {
+		t.Errorf("lowered recursive function has %d frame-clear queries, want one for the root frame",
+			runtimeCalls["runtime.coroFrameNeedsClear"])
+	}
+	guardedClears, pointerClears := 0, 0
+	for _, generated := range typecheck.Target.Funcs {
+		ir.VisitList(generated.Body, func(node ir.Node) {
+			condition, ok := node.(*ir.IfStmt)
+			if !ok {
+				return
+			}
+			logical, ok := condition.Cond.(*ir.LogicalExpr)
+			if !ok || logical.Op() != ir.OOROR {
+				return
+			}
+			query, ok := logical.Y.(*ir.CallExpr)
+			if !ok || symbolName(ir.StaticCalleeName(ir.StaticValue(query.Fun))) !=
+				"runtime.coroFrameNeedsClear" {
+				return
+			}
+			parent, ok := logical.X.(*ir.BinaryExpr)
+			if !ok || parent.Op() != ir.ONE || !ir.IsNil(parent.Y) {
+				t.Fatalf("frame-clear guard = %v, want non-nil parent test", logical.X)
+			}
+			field, ok := parent.X.(*ir.SelectorExpr)
+			if !ok || field.Selection == nil ||
+				field.Selection.Sym.Name != ".coroParent" {
+				t.Fatalf("frame-clear guard uses %v, want the frame parent", parent.X)
+			}
+			guardedClears++
+			for _, stmt := range condition.Body {
+				assignment, ok := stmt.(*ir.AssignStmt)
+				if ok && assignment.X.Type().HasPointers() && ir.IsZero(assignment.Y) {
+					pointerClears++
+				}
+			}
+		})
+	}
+	if guardedClears != 1 || pointerClears == 0 {
+		t.Errorf("lowered recursive function has %d parent guards and %d pointer clears, want one guard and pointer clearing",
+			guardedClears, pointerClears)
 	}
 
 	localLabels, localGotos := 0, 0

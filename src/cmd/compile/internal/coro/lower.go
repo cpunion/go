@@ -4231,13 +4231,22 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.Int64Val(ret.Results[0]) == int64(actionComplete) {
 			var completion ir.Nodes
 			if len(pointerClears)+len(resultPointerClears) != 0 {
-				cacheFrame := typecheck.Call(ret.Pos(),
+				var needsClear ir.Node = typecheck.Call(ret.Pos(),
 					typecheck.LookupRuntime("coroFrameNeedsClear"),
 					ir.Nodes{resume.Dcl[0]}, false)
+				if selfOnly {
+					// A parented self frame is retained by its fused lineage.
+					// Only a root needs the runtime's retention query.
+					parent := explicitFrameField(ret.Pos(), frame, fusedParentField)
+					hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
+						ir.NewNilExpr(ret.Pos(), fusedParentField.Type))
+					needsClear = ir.NewLogicalExpr(ret.Pos(), ir.OOROR,
+						hasParent, needsClear)
+				}
 				clears := slices.Clone(resultPointerClears)
 				clears = append(clears, pointerClears...)
 				completion = append(completion,
-					ir.NewIfStmt(ret.Pos(), cacheFrame, clears, nil))
+					ir.NewIfStmt(ret.Pos(), needsClear, clears, nil))
 			}
 			if fusedFrame {
 				parent := explicitFrameField(ret.Pos(), frame,
