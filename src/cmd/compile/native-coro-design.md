@@ -3745,6 +3745,17 @@ result, or fairness ownership. It should remain separate from the blocking-C
 handoff work, which must leave a blocking call on its original M even if the
 replacement transfer becomes cheaper.
 
+Homogeneous local self-frame loops query a pending terminal outcome only at
+the physical resume entry, before the local frame-reload label. The validated
+normal await and completion helpers cannot return a local `Switch` with a
+pending terminal outcome, so those branches reload the next frame without
+repeating the query. These explicit frames have no deferred cleanup: a pending
+panic or Goexit returns its action directly, and the runtime discards the fused
+lineage as before. Scheduler re-entry after a wait or queued sibling still
+executes the entry query. Heterogeneous, closure-frame, and deferred-cleanup
+paths retain their original terminal dispatch and cleanup queries; frame
+clearing, fairness snapshots, and runtime helper validation are unchanged.
+
 ### 16.6 Early operation-completion handoff
 
 An operation may complete before the resume call that started it returns

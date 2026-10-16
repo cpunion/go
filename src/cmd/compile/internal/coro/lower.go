@@ -1465,6 +1465,14 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	return supported
 }
 
+// localSelfFrameLoop reports whether homogeneous frame switches stay in one
+// resume invocation. These frames have no deferred cleanup; a terminal outcome
+// on re-entry can return directly so the runtime discards the fused lineage.
+func (candidate *lowerCandidate) localSelfFrameLoop() bool {
+	return candidate.factoryABI == FactoryABI3 && candidate.fusedSelf &&
+		!candidate.fusedResume && len(candidate.defers) == 0
+}
+
 // markFusedFrameCandidates identifies local structured awaits whose explicit
 // frames can share one logical task. Cross-package factories retain the
 // ordinary task path until their export ABI describes the extended frame
@@ -2398,6 +2406,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	fn.Dcl = fnDcl
 
 	terminalAware := needsTerminalEntry(candidate)
+	localSelfFrames := candidate.localSelfFrameLoop()
 	for _, result := range candidate.resultValues {
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, result))
 		if terminalAware {
@@ -3600,7 +3609,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						armed, ir.Nodes{clear, call}, nil))
 				}
 			}
-			if terminalAware {
+			if terminalAware && !localSelfFrames {
 				terminalAction := typecheck.TempAt(pos, resume,
 					types.Types[types.TUINT8])
 				body = append(body, ir.NewAssignStmt(pos, terminalAction,
@@ -4003,7 +4012,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		resume.Body = append(resume.Body,
 			ir.NewAssignStmt(pos, resumeDeferToken, token))
 	}
-	if terminalAware {
+	if terminalAware && !localSelfFrames {
 		terminalAction := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)
 		hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
@@ -4129,7 +4138,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	pos := fn.Pos()
 	closureVars := slices.Clone(resume.ClosureVars)
 	fusedFrame := candidate.fusedFrame
-	selfOnly := candidate.fusedSelf && !candidate.fusedResume
+	selfOnly := candidate.localSelfFrameLoop()
 	fields := make([]*types.Field, len(closureVars))
 	replacements := make(map[*ir.Name]*types.Field, len(closureVars))
 	outerFields := make(map[*ir.Name]*types.Field, len(closureVars))
@@ -4279,8 +4288,15 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	loadFrame := typecheck.ConvNop(packetFrame, framePointerType)
 	prefix := ir.Nodes{ir.NewDecl(pos, ir.ODCL, frame)}
 	if selfOnly {
+		// A local Switch follows a validated normal await or completion. Only
+		// a fresh invocation can carry a terminal outcome from the scheduler.
 		prefix = append(prefix,
 			ir.NewDecl(pos, ir.ODCL, switchAction),
+			ir.NewAssignStmt(pos, switchAction, typecheck.Call(pos,
+				typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)),
+			ir.NewIfStmt(pos, ir.NewBinaryExpr(pos, ir.ONE, switchAction,
+				typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid))),
+				ir.Nodes{ir.NewReturnStmt(pos, []ir.Node{switchAction})}, nil),
 			ir.NewLabelStmt(pos, reloadFrame))
 	}
 	prefix = append(prefix, ir.NewAssignStmt(pos, frame, loadFrame))

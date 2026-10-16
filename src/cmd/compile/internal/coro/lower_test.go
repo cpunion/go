@@ -433,6 +433,28 @@ func TestExplicitFrameChunkLength(t *testing.T) {
 	}
 }
 
+func TestLocalSelfFrameLoop(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		candidate lowerCandidate
+		want      bool
+	}{
+		{"no-factory", lowerCandidate{fusedSelf: true}, false},
+		{"closure", lowerCandidate{factoryABI: FactoryABI1, fusedSelf: true}, false},
+		{"explicit", lowerCandidate{factoryABI: FactoryABI2, fusedSelf: true}, false},
+		{"nonrecursive", lowerCandidate{factoryABI: FactoryABI3}, false},
+		{"self", lowerCandidate{factoryABI: FactoryABI3, fusedSelf: true}, true},
+		{"heterogeneous", lowerCandidate{factoryABI: FactoryABI3, fusedSelf: true, fusedResume: true}, false},
+		{"defer", lowerCandidate{factoryABI: FactoryABI3, fusedSelf: true, defers: []*lowerDefer{nil}}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.candidate.localSelfFrameLoop(); got != test.want {
+				t.Errorf("localSelfFrameLoop() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLowerRecursiveFrameChunk(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -551,6 +573,10 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		t.Errorf("lowered recursive function has %d local frame continuations, want two",
 			runtimeCalls["runtime.coroContinueSelfFrame"])
 	}
+	if runtimeCalls["runtime.coroTerminalAction"] != 1 {
+		t.Errorf("lowered recursive function has %d terminal queries, want one at resume entry",
+			runtimeCalls["runtime.coroTerminalAction"])
+	}
 
 	localLabels, localGotos := 0, 0
 	for _, generated := range typecheck.Target.Funcs {
@@ -571,6 +597,24 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	if localLabels != 1 || localGotos != 2 {
 		t.Errorf("lowered recursive function has %d local reload labels and %d branches, want one and two",
 			localLabels, localGotos)
+	}
+	for _, generated := range typecheck.Target.Funcs {
+		afterReload := false
+		for _, stmt := range generated.Body {
+			if label, ok := stmt.(*ir.LabelStmt); ok &&
+				strings.HasPrefix(label.Label.Name, ".coroReload") {
+				afterReload = true
+			}
+			if afterReload {
+				ir.Visit(stmt, func(node ir.Node) {
+					if call, ok := node.(*ir.CallExpr); ok &&
+						symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) ==
+							"runtime.coroTerminalAction" {
+						t.Error("local self-frame loop repeats the terminal entry query")
+					}
+				})
+			}
+		}
 	}
 }
 
