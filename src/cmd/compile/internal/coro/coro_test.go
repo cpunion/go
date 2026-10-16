@@ -244,6 +244,7 @@ var childStage int
 var parentSaw int
 var spawnStage int
 var spawnSaw int
+var spawnDone = make(chan struct{})
 var slept bool
 var fileFD int
 var fileBuffer = make([]byte, 4)
@@ -268,6 +269,7 @@ var ordinarySocketDeadlineOK bool
 var ordinarySocketCloseOK bool
 var ordinarySocketZeroOK bool
 var socketProgress int
+var socketProgressDone = make(chan struct{}, 1)
 var parameterResult int
 var returnedResult int
 var controlResult int
@@ -308,13 +310,14 @@ func spawnedChild() {
 	spawnStage = 1
 	runtime.Gosched()
 	spawnStage = 2
+	close(spawnDone)
 }
 
 //go:noinline
 func spawner() {
 	go spawnedChild()
 	runtime.Gosched()
-	runtime.Gosched()
+	<-spawnDone
 	spawnSaw = spawnStage
 }
 
@@ -348,12 +351,14 @@ func ordinaryFileDiscard() {
 func ordinarySocketReader() {
 	go socketProgressor()
 	ordinarySocketN, ordinarySocketErr = ordinarySocket.Read(ordinarySocketBuffer)
+	<-socketProgressDone
 }
 
 //go:noinline
 func socketProgressor() {
 	socketProgress++
 	runtime.Gosched()
+	socketProgressDone <- struct{}{}
 }
 
 //go:noinline
@@ -2615,6 +2620,7 @@ var overlayRecovered any
 var detachedExited bool
 var detachedParentObserved bool
 var detachedReturned bool
+var detachedDone = make(chan struct{})
 var immediateReturned bool
 var immediateRecovered any
 
@@ -2668,6 +2674,7 @@ func overlay(done chan struct{}) {
 func detached() {
 	defer func() {
 		detachedExited = true
+		close(detachedDone)
 	}()
 	runtime.Gosched()
 	runtime.Goexit()
@@ -2681,7 +2688,7 @@ func spawnRoot(done chan struct{}) {
 	}()
 	go detached()
 	runtime.Gosched()
-	runtime.Gosched()
+	<-detachedDone
 	detachedParentObserved = detachedExited
 }
 
@@ -2766,6 +2773,25 @@ func main() {
 	if want := "stackless-coro-goexit-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
+	t.Run("ordinary-race", func(t *testing.T) {
+		if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+			t.Skip("race detector is not supported")
+		}
+		testenv.MustHaveCGO(t)
+		ordinary := filepath.Join(tmp, "ordinary-race")
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-race",
+			"-gcflags=-l", "-o", ordinary, src)
+		cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=nocoro", "GOWORK=off")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("ordinary race build failed: %v\n%s", err, out)
+		}
+		cmd = testenv.Command(t, ordinary)
+		cmd.Env = append(cmd.Environ(), "GOMAXPROCS=4")
+		if out, err := cmd.CombinedOutput(); err != nil ||
+			!strings.Contains(string(out), "stackless-coro-goexit-ok") {
+			t.Fatalf("ordinary race execution = (%v, %q)", err, out)
+		}
+	})
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
 		"-s", `main\.(leaf|middle|structured|overlay|detached|spawnRoot|immediate)\.coro\.func[0-9]+$`,
