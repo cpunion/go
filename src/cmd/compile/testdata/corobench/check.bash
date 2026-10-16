@@ -27,6 +27,7 @@ test_binary="$output_dir/coro.test"
 build_output="$output_dir/build.txt"
 allocation_output="$output_dir/public-entry-allocation.txt"
 recursive_allocation_output="$output_dir/recursive-frame-allocation.txt"
+isolated_allocation_output="$output_dir/isolated-frame-allocation.txt"
 task_footprint_output="$output_dir/task-footprint-allocation.txt"
 read_output="$output_dir/read-lowering.txt"
 write_output="$output_dir/write-lowering.txt"
@@ -299,6 +300,43 @@ if ! awk '
 ' "$recursive_allocation_output"; then
 	cat "$recursive_allocation_output" >&2
 	echo "recursive coroutine frame allocation exceeds its bound" >&2
+	exit 1
+fi
+# A cold mutual-only process can admit its chunk key. Alternating roots must
+# preserve the existing self-recursive working set instead of evicting it.
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^BenchmarkMutualYield4096$' \
+	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
+	>"$isolated_allocation_output"; then
+	tail -n 100 "$isolated_allocation_output" >&2
+	exit 1
+fi
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^BenchmarkAlternatingDeepFrames$' \
+	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
+	>>"$isolated_allocation_output"; then
+	tail -n 100 "$isolated_allocation_output" >&2
+	exit 1
+fi
+if ! awk '
+	$1 ~ /^BenchmarkMutualYield4096(-[0-9]+)?$/ {
+		mutual++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "B/op" && $(i - 1) > 20000) bad = 1
+			if ($i == "allocs/op" && $(i - 1) > 70) bad = 1
+		}
+	}
+	$1 ~ /^BenchmarkAlternatingDeepFrames(-[0-9]+)?$/ {
+		mixed++
+		for (i = 2; i <= NF; i++) {
+			if ($i == "B/op" && $(i - 1) > 327680) bad = 1
+			if ($i == "allocs/op" && $(i - 1) > 1600) bad = 1
+		}
+	}
+	END { exit mutual == 3 && mixed == 3 && !bad ? 0 : 1 }
+' "$isolated_allocation_output"; then
+	cat "$isolated_allocation_output" >&2
+	echo "isolated or alternating coroutine frame allocation exceeds its bound" >&2
 	exit 1
 fi
 if ! "$test_binary" -test.run '^$' \

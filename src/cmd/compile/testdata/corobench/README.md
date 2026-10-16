@@ -2321,3 +2321,36 @@ than measuring a new public coroutine root per write. These are ready-write
 throughput controls, not measurements of independent backpressure latency.
 The historical timing list in `run.bash` does not select these two benchmarks;
 select them explicitly when collecting write-throughput results.
+
+#### Compatible fused-chunk reuse
+
+Whole chunks in a compiler-proven compatible await chain can reuse the
+existing native executor cache. Its key still requires the same first resume,
+frame size, and chunk type, and its chunk budget remains 256 KiB. Fused chunks
+only initialize an unused key or reuse a matching key; they do not replace an
+established identity, even when its free list is temporarily empty because
+frames are active. This preserves an existing self-recursive working set.
+The direct prefix does not query this single-key cache: alternating its resume
+identities would otherwise discard retained chunks before each repeated root.
+Completion saves the child's identity before restoring the parent's resume.
+Escaping source addresses retain independent cells rather than pointing into
+reusable frame storage.
+
+The two-function, depth-4,096 probe uses a stable chunk identity. Three native
+Darwin/arm64, 100-iteration samples after benchmark warm-up reproduce these
+order-sensitive results:
+
+| Probe | Parent bytes / allocations | Non-replacing reuse |
+| --- | ---: | ---: |
+| mutual recursion in a fresh process | 276,672 / 965 | 14,592 / 55 |
+| mutual recursion after deep self recursion | 276,672 / 965 | unchanged |
+| alternating deep self and mutual recursion | 313,536 / 1,477 | unchanged |
+| deep self recursion | 0 / 0 | unchanged |
+
+The isolated 262,080-byte saving is exactly 910 cached 288-byte chunks. The
+public audit bounds that isolated case at 20,000 B and 70 allocations, while
+separately enforcing the ordered and alternating controls. Concurrent
+validation prevents an elapsed-time claim. Other heterogeneous chains may
+still miss this deliberately single-key cache; a later phase does not evict
+an established key merely to improve its own isolated result. No cache budget
+is increased to obtain these results.

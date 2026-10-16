@@ -535,6 +535,16 @@ func BenchmarkMutualYield4096(b *testing.B) {
 	intSink = total
 }
 
+func BenchmarkAlternatingDeepFrames(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveYield(4096)
+		total += mutualYieldA(4096)
+	}
+	intSink = total
+}
+
 func BenchmarkHeterogeneousFrameCacheReplacement(b *testing.B) {
 	b.ReportAllocs()
 	if got := recursiveYield(4096); got != 4097 {

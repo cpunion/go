@@ -29,6 +29,11 @@ func takeStacklessCoroNativeSelfFrame(stacklessCoroResume,
 	return nil
 }
 
+func takeStacklessCoroNativeFusedChunk(stacklessCoroResume,
+	uintptr, *_type) unsafe.Pointer {
+	return nil
+}
+
 func cacheStacklessCoroNativeSelfFrame(stacklessCoroResume, unsafe.Pointer,
 	uint8) {
 }

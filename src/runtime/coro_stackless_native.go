@@ -265,6 +265,25 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	unlock(&stacklessCoroNativePool.lock)
 }
 
+// takeStacklessCoroNativeFusedChunk opportunistically reuses compatible chunks
+// without replacing an established cache identity. In particular, alternating
+// deep self and mutual recursion must not discard the self-recursive working
+// set. A non-nil identity can also describe storage still in active use.
+func takeStacklessCoroNativeFusedChunk(resume stacklessCoroResume,
+	frameSize uintptr, chunkType *_type) unsafe.Pointer {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if raceenabled || ctx == nil || ctx.executor != gp || resume == nil {
+		return nil
+	}
+	if ctx.selfFrameResume != nil &&
+		(ctx.selfFrameResume != stacklessCoroResumeIdentity(resume) ||
+			ctx.selfFrameSize != frameSize || ctx.selfFrameChunkType != chunkType) {
+		return nil
+	}
+	return takeStacklessCoroNativeSelfFrame(resume, frameSize, chunkType, true)
+}
+
 // takeStacklessCoroNativeSelfFrame reuses homogeneous typed storage on the
 // executor that allocated it. A native context is owned by one executor at a
 // time, so this cache needs no scheduler lock. Keeping one resume identity
