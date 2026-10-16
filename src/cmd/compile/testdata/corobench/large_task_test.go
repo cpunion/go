@@ -23,6 +23,28 @@ func TestMixedTaskProbes(t *testing.T) {
 	}
 }
 
+func TestMixedTaskParkUntilReleased(t *testing.T) {
+	for _, tasks := range []int{1, 3, 17} {
+		for _, offset := range []int{0, 1} {
+			atomic.StoreUint64(&taskParkReady, 0)
+			done := make(chan uint64, 1)
+			go func() { done <- mixedTaskParkUntilReleased(tasks, offset) }()
+			for atomic.LoadUint64(&taskParkReady) < uint64(tasks) {
+				runtime.Gosched()
+			}
+			select {
+			case <-done:
+				t.Fatal("mixed task completed before release")
+			default:
+			}
+			atomic.StoreUint64(&taskParkRelease, 1)
+			if got := <-done; got != uint64(tasks) {
+				t.Fatalf("tasks=%d offset=%d: completed %d tasks", tasks, offset, got)
+			}
+		}
+	}
+}
+
 func BenchmarkTaskBurst1000(b *testing.B) {
 	b.ReportAllocs()
 	if got := taskBursts(b.N, 1000); got != uint64(1000*b.N) {
