@@ -94,7 +94,7 @@ first. Both orders matter: saving allocation events for one shape can retain
 extra unused batch capacity for another. Do not infer a universal memory or
 latency improvement from only the pure or PC-first case.
 
-`LiveTaskFootprint1/1000/100000`, the256/264/265/266/267/268 boundary variants,
+`LiveTaskFootprint1/1000/100000`, the 256/264/265/266/267/268 boundary variants,
 and `MixedScalarFirst1000/100000` and `MixedPointerFirst1000/100000` require
 `-benchtime=1x`. They disable GC for the live snapshot, include coordinator
 and executor setup, and report allocation events, live heap/objects, Go-stack
@@ -105,7 +105,7 @@ installed. Go-stack bytes exclude native OS stacks and total RSS; thread
 creation records are not a live thread census. Small setup variations and
 negative memory deltas are retained, not clamped away.
 
-`check.bash` requires native lowering of both mixed workers and runs all19
+`check.bash` requires native lowering of both mixed workers and runs all 19
 new probes once as correctness/lifecycle smoke checks, preserving the raw
 allocation output in `large-task-smoke.txt`. These executions, especially
 under concurrent CI load, are not latency measurements. The historical

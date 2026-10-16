@@ -452,7 +452,7 @@ if ! "$test_binary" -test.run '^$' -test.bench \
 fi
 if ! awk '$1 ~ /^Benchmark/ { samples++ } END { exit samples == 19 ? 0 : 1 }' \
 	"$large_task_output"; then
-	echo "large-task smoke did not execute all19 probes" >&2
+	echo "large-task smoke did not execute all 19 probes" >&2
 	exit 1
 fi
 
