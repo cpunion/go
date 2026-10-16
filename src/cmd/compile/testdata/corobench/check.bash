@@ -450,7 +450,21 @@ if ! "$test_binary" -test.run '^$' -test.bench \
 	tail -n 100 "$large_task_output" >&2
 	exit 1
 fi
-if ! awk '$1 ~ /^Benchmark/ { samples++ } END { exit samples == 19 ? 0 : 1 }' \
+if ! awk '
+	$1 ~ /^Benchmark/ {
+		samples++
+		if ($2 != 1 || seen[$1]++) {
+			bad = 1
+		}
+		bytes = allocs = 0
+		for (i = 3; i <= NF; i++) {
+			if ($i == "B/op") bytes++
+			if ($i == "allocs/op") allocs++
+		}
+		if (bytes != 1 || allocs != 1) bad = 1
+	}
+	END { exit samples == 19 && !bad ? 0 : 1 }
+' \
 	"$large_task_output"; then
 	echo "large-task smoke did not execute all 19 probes" >&2
 	exit 1
