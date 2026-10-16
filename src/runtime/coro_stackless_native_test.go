@@ -144,6 +144,66 @@ func TestStacklessCoroNativeTaskReuse(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeFusedChunkReuse(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	const depth = 512
+	run := func() {
+		tracker := new(stacklessCoroFusedResumeDeepTracker)
+		runStacklessCoroFusedResumeDeep(depth, tracker)
+		if tracker.completed != depth+1 || !tracker.sawChunkFirst || !tracker.sawChunkLast {
+			t.Fatalf("fused chain = %+v, want %d completed frames and typed chunks", tracker, depth+1)
+		}
+	}
+	// Warm the cache, then require reuse of chunks beyond the scheduler-owned
+	// prefix. The six direct frames and test entry may still allocate.
+	allocations := testing.AllocsPerRun(3, run)
+	t.Logf("warm heterogeneous chain allocations = %.0f", allocations)
+	if allocations > 32 {
+		t.Fatalf("warm heterogeneous chain allocated %.0f objects, want at most 32", allocations)
+	}
+	warm, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if warm == 0 || overflow != 0 {
+		t.Fatalf("retained native frame bytes = (%d warm, %d overflow), want positive warm and zero overflow", warm, overflow)
+	}
+	for range 3 {
+		stacklessCoroFusedResumeDeepActive = nil
+		runtime.GC()
+		run()
+	}
+}
+
+func TestStacklessCoroNativeFusedChunkPreservesSelfCache(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	runStacklessCoroSelfFrames(t, &stacklessCoroSelfFrameTracker{rootDepth: 4096})
+	warm, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if warm == 0 || overflow != 0 {
+		t.Fatalf("self-frame cache = (%d warm, %d overflow), want positive warm and zero overflow", warm, overflow)
+	}
+	runStacklessCoroFusedResumeDeep(512, new(stacklessCoroFusedResumeDeepTracker))
+	after, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if after != warm || overflow != 0 {
+		t.Fatalf("heterogeneous chain changed self-frame cache to (%d warm, %d overflow), want (%d, 0)", after, overflow, warm)
+	}
+}
+
+func TestStacklessCoroFusedChunkInline(t *testing.T) {
+	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+	tracker := new(stacklessCoroFusedResumeDeepTracker)
+	stacklessCoroFusedResumeDeepActive = tracker
+	root := &runtime.StacklessCoroSelfFrameForTest{Depth: 512}
+	runtime.RunStacklessCoroFrameInlineForTest(unsafe.Pointer(root),
+		stacklessCoroFusedResumeDeepRoot)
+	if tracker.completed != 513 || !tracker.sawChunkFirst || !tracker.sawChunkLast {
+		t.Fatalf("inline heterogeneous chain = %+v, want 513 completed frames and typed chunks", tracker)
+	}
+}
+
 func TestStacklessCoroNativeDropsOverflowTaskSlots(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)

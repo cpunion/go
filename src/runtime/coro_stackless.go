@@ -2264,6 +2264,11 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		return nil
 	case marker == stacklessCoroFusedFrameDirectLast ||
 		marker == chunkLast:
+		// Alternating the direct prefix's resume identities would evict
+		// this single-key cache on every root. Reuse only whole chunks.
+		if cached := takeStacklessCoroNativeFusedChunk(child, size, chunkType); cached != nil {
+			return cached
+		}
 		return newobject(chunkType)
 	case marker >= stacklessCoroFusedFrameChunkFirst &&
 		marker < chunkLast:
@@ -2435,6 +2440,10 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 	}
 	parentFrame := header.parent
 	parentFused := header.marker&stacklessCoroFusedFrameParent != 0
+	// Cache under the child's identity, before restoring the parent resume.
+	completedResume := task.resume
+	cacheChunk := allocation == stacklessCoroFusedFrameChunkFirst &&
+		header.marker&stacklessCoroFusedFrameChunkValidated != 0
 	if header.marker&stacklessCoroFusedFrameResume != 0 {
 		resumeHeader := (*stacklessCoroFusedResumeFrameHeader)(frame)
 		if resumeHeader.resume == nil {
@@ -2453,6 +2462,9 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 	if owner != nil {
 		owner.state = stacklessCoroTaskComplete
 		s.recycleTaskLocked(owner)
+	}
+	if cacheChunk {
+		cacheStacklessCoroNativeSelfFrame(completedResume, frame, allocation)
 	}
 	if s.head == nil {
 		task.setFlag(stacklessCoroTaskSwitchPending, true)
