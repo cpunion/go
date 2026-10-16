@@ -44,7 +44,7 @@ func poll_runtime_coroCallRead(ctx unsafe.Pointer, call func()) {
 }
 
 func coroFileRead1(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr, retryEINTR bool) {
-	op := stacklessCoroStartOperation(ctx, "read")
+	op := stacklessCoroStartIOOperation(ctx, "read")
 	// This operation is completed directly below and is never registered.
 	// It still needs a nonzero identity for the common completion checks.
 	op.id = stacklessCoroDirectOperationID
@@ -98,7 +98,7 @@ func coroCallRead(ctx unsafe.Pointer, call func()) {
 	if call == nil {
 		throw("runtime: nil stackless coroutine read call")
 	}
-	op := stacklessCoroStartOperation(ctx, "read call")
+	op := stacklessCoroStartIOOperation(ctx, "read call")
 	op.call = call
 	registerStacklessCoroOperation(op)
 	stacklessCoroReadEnqueue(op)
@@ -120,7 +120,7 @@ func coroAsyncDouble(ctx unsafe.Pointer, readFD, writeFD int, value uint64, resu
 func coroSubmit(id, value uint64, fd int32) int32
 
 func startStacklessCoroAsync(ctx unsafe.Pointer, readFD int, result *uint64, errno *uintptr) *stacklessCoroOperation {
-	op := stacklessCoroStartOperation(ctx, "async foreign call")
+	op := stacklessCoroStartIOOperation(ctx, "async foreign call")
 	op.fd = int32(readFD)
 	op.errno = errno
 	op.valueOut = result

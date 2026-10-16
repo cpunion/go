@@ -544,11 +544,90 @@ func NewStacklessCoroChannelOperationForTest() unsafe.Pointer {
 	return unsafe.Pointer(newStacklessCoroChannelOperation())
 }
 
+func NewStacklessCoroIOOperationForTest() unsafe.Pointer {
+	return unsafe.Pointer(newStacklessCoroIOOperation())
+}
+
+func StacklessCoroIOOperationValidForTest(token unsafe.Pointer) bool {
+	op := (*stacklessCoroOperation)(token)
+	return op != nil && op.stacklessCoroIOState != nil && op.waiter == nil &&
+		unsafe.Pointer(op.stacklessCoroIOState) == add(token,
+			unsafe.Offsetof(stacklessCoroIOOperation{}.io))
+}
+
 func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
-	return op != nil && validReleasedStacklessCoroSudog(op.waiter) &&
+	return op != nil && op.stacklessCoroIOState == nil &&
+		validReleasedStacklessCoroSudog(op.waiter) &&
 		unsafe.Pointer(op.waiter) == add(token,
 			unsafe.Offsetof(stacklessCoroChannelOperation{}.waiter))
+}
+
+func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
+	s := new(stacklessCoroScheduler)
+	task := &s.root
+	task.context.scheduler = s
+	start := func(kind stacklessCoroOperationKind) *stacklessCoroOperation {
+		task.state = stacklessCoroTaskRunning
+		task.resuming = true
+		return stacklessCoroStartOperationOfKind(
+			unsafe.Pointer(&task.context), "test IO storage", kind)
+	}
+	recycle := func(op *stacklessCoroOperation) {
+		lock(&s.lock)
+		s.recycleOperationLocked(op)
+		unlock(&s.lock)
+	}
+	op := start(stacklessCoroOperationChannel)
+	first, waiter := op, op.waiter
+	op.id = stacklessCoroChannelOperationID
+	clearStacklessCoroOperation(op)
+	recycle(op)
+
+	op = start(stacklessCoroOperationIO)
+	reused = op == first
+	storage := op.stacklessCoroIOState
+	op.id = 1
+	op.fd = 7
+	op.buffer = make([]byte, 8)
+	op.call = func() {}
+	op.n = new(int)
+	op.errno = new(uintptr)
+	op.valueOut = new(uint64)
+	op.packet = [2]uint64{1, 2}
+	op.async = true
+	op.ownsPollDesc = true
+	op.pollWrite = true
+	clearStacklessCoroOperation(op)
+	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
+		op.stacklessCoroIOState == storage && storage != nil &&
+		op.buffer == nil && op.call == nil && op.n == nil &&
+		op.errno == nil && op.valueOut == nil && op.workNext == nil
+	recycle(op)
+	GC()
+
+	op = start(stacklessCoroOperationPlain)
+	if !raceenabled {
+		reused = reused && op == first
+		cleared = cleared && op.stacklessCoroIOState == storage
+	} else {
+		reused = reused || op == first
+		cleared = cleared && op.stacklessCoroIOState == nil
+	}
+	op.id = 1
+	clearStacklessCoroOperation(op)
+	recycle(op)
+
+	op = start(stacklessCoroOperationChannel)
+	if !raceenabled {
+		reused = reused && op == first && op.waiter == waiter &&
+			op.stacklessCoroIOState == storage
+	} else {
+		reused = reused || op == first
+	}
+	op.id = stacklessCoroChannelOperationID
+	clearStacklessCoroOperation(op)
+	return
 }
 
 func StacklessCoroSchedulerSizeForTest() uintptr {
@@ -1315,14 +1394,11 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 	s := new(stacklessCoroScheduler)
 	task := new(stacklessCoroTask)
 	buffer := make([]byte, 1)
-	op := &stacklessCoroOperation{
-		stacklessCoroOperationState: stacklessCoroOperationState{
-			scheduler: s,
-			task:      task,
-			fd:        int32(fd),
-			buffer:    buffer,
-		},
-	}
+	op := newStacklessCoroIOOperation()
+	op.scheduler = s
+	op.task = task
+	op.fd = int32(fd)
+	op.buffer = buffer
 	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	id := registerStacklessCoroOperation(op)
 	waiting, waitErr := netpollCoroReadArm(pd, op)
@@ -1437,7 +1513,7 @@ func StacklessCoroWriteResultForTest(size, written int, count int32) (int, uintp
 		status uintptr
 	})
 	result.n = written
-	op := new(stacklessCoroOperation)
+	op := newStacklessCoroIOOperation()
 	op.buffer = make([]byte, size)
 	op.n = &result.n
 	op.errno = &result.status
@@ -1481,7 +1557,7 @@ func StacklessCoroReadLengthForTest(length int) int32 {
 }
 
 func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	op := stacklessCoroStartOperation(ctx, "expired read")
+	op := stacklessCoroStartIOOperation(ctx, "expired read")
 	op.fd = int32(fd)
 	op.buffer = buffer
 	op.n = n

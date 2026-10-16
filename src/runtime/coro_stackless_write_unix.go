@@ -18,7 +18,7 @@ const stacklessCoroWriteNoProgressTag = stacklessCoroPollErrorTag >> 1
 
 func newStacklessCoroWriteOperation(ctx unsafe.Pointer, fd int, buffer []byte,
 	n *int, status *uintptr) *stacklessCoroOperation {
-	op := stacklessCoroStartOperation(ctx, "write")
+	op := stacklessCoroStartIOOperation(ctx, "write")
 	op.fd = int32(fd)
 	op.buffer = buffer
 	op.n = n
