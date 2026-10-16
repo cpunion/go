@@ -216,7 +216,7 @@ type lowerState struct {
 // Entry evaluates the arguments once; a wakeup only reenters the retry state.
 type lowerSemaphore struct {
 	call  *ir.CallExpr
-	args  [3]*ir.Name
+	args  []*ir.Name
 	state *ir.Name
 }
 
@@ -3045,8 +3045,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				var io *lowerIO
 				var semaphore *lowerSemaphore
-				if semaphoreOperation(call) == "coroSemacquireMutex" {
-					semaphore = &lowerSemaphore{call: call}
+				operation := semaphoreOperation(call)
+				if operation == "coroSemacquireMutex" || operation == "coroSemacquire" {
+					semaphore = &lowerSemaphore{call: call, args: make([]*ir.Name, len(call.Args))}
 					for i, arg := range call.Args {
 						name := typecheck.TempAt(call.Pos(), factory, arg.Type())
 						addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, name))
@@ -3665,7 +3666,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			args = append(args, typecheck.NodAddr(edit(semaphore.state)))
 			wait := typecheck.Call(semaphore.call.Pos(),
-				typecheck.LookupRuntime("coroSemacquireMutex"), args, false)
+				typecheck.LookupRuntime(semaphoreOperation(semaphore.call)), args, false)
 			body = append(body,
 				ir.NewIfStmt(semaphore.call.Pos(), wait, ir.Nodes{
 					ir.NewReturnStmt(semaphore.call.Pos(), []ir.Node{
@@ -3723,7 +3724,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					args = append(args, edit(arg))
 				}
 				handoff := typecheck.Call(state.call.Pos(),
-					typecheck.LookupRuntime("coroSemrelease"), args, false)
+					typecheck.LookupRuntime(semaphoreOperation(state.call)), args, false)
 				body = append(body,
 					ir.NewIfStmt(state.call.Pos(), handoff, ir.Nodes{
 						ir.NewReturnStmt(state.call.Pos(), []ir.Node{

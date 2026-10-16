@@ -269,20 +269,24 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteSemaphore,
 		Effect: MaySuspend,
 	},
+	"sync.runtime_Semacquire": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
+	"internal/poll.runtime_Semacquire": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
+	"internal/poll.runtime_Semrelease": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
 	// These declarations park an ordinary goroutine in the runtime. Their
 	// bodies are unavailable to effect analysis, so propagate suspension
 	// explicitly through the synchronization packages and their callers.
 	// Until they have coroutine entries, the ordinary await dependency check
 	// keeps those callers on the Go entry instead of parking an executor.
-	"sync.runtime_Semacquire": {
-		Kind:   SiteAwait,
-		Effect: MaySuspend,
-	},
 	"sync.runtime_SemacquireWaitGroup": {
-		Kind:   SiteAwait,
-		Effect: MaySuspend,
-	},
-	"internal/poll.runtime_Semacquire": {
 		Kind:   SiteAwait,
 		Effect: MaySuspend,
 	},
@@ -356,8 +360,9 @@ func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 	if fn == nil || fn.Nname == nil {
 		return OperationRecipe{}, false
 	}
-	recipe, ok := operationRecipes[symbolName(fn.Nname)]
-	if recipe.Kind == SiteSemaphore && !semaphoreSignature(fn.Type()) {
+	name := symbolName(fn.Nname)
+	recipe, ok := operationRecipes[name]
+	if recipe.Kind == SiteSemaphore && !semaphoreSignature(name, fn.Type()) {
 		// An unexpected runtime declaration remains a suspension boundary,
 		// but cannot use the compiler-owned semaphore calling convention.
 		recipe.Kind = SiteAwait

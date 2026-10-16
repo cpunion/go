@@ -17,6 +17,7 @@ type stacklessCoroSemaWaiter struct {
 	task       *stacklessCoroTask
 	addr       *uint32
 	lifo       bool
+	profile    uint8
 	skipframes int
 	startTime  int64
 	waiter     sudog
@@ -31,6 +32,17 @@ type stacklessCoroSemaWaiter struct {
 // return or unwind until it acquires the semaphore and resumes execution.
 func coroSemacquireMutex(ctx unsafe.Pointer, addr *uint32, lifo bool,
 	skipframes int, state *unsafe.Pointer) bool {
+	return coroSemacquire1(ctx, addr, lifo, semaBlockProfile|semaMutexProfile, skipframes, state)
+}
+
+// coroSemacquire is the logical counterpart of sync and poll Semacquire.
+// Unlike a mutex acquisition, its waiter does not contribute mutex samples.
+func coroSemacquire(ctx unsafe.Pointer, addr *uint32, state *unsafe.Pointer) bool {
+	return coroSemacquire1(ctx, addr, false, semaBlockProfile, 0, state)
+}
+
+func coroSemacquire1(ctx unsafe.Pointer, addr *uint32, lifo bool,
+	profile semaProfileFlags, skipframes int, state *unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil || state == nil {
@@ -43,14 +55,14 @@ func coroSemacquireMutex(ctx unsafe.Pointer, addr *uint32, lifo bool,
 			return false
 		}
 		w = &stacklessCoroSemaWaiter{
-			scheduler: s, task: task, addr: addr, lifo: lifo, skipframes: skipframes,
+			scheduler: s, task: task, addr: addr, lifo: lifo, skipframes: skipframes, profile: uint8(profile),
 		}
 		w.waiter.coro.set(unsafe.Pointer(w))
-		if blockprofilerate > 0 {
+		if profile&semaBlockProfile != 0 && blockprofilerate > 0 {
 			w.startTime = cputicks()
 			w.waiter.releasetime = -1
 		}
-		if mutexprofilerate > 0 {
+		if profile&semaMutexProfile != 0 && mutexprofilerate > 0 {
 			if w.startTime == 0 {
 				w.startTime = cputicks()
 			}
@@ -59,7 +71,7 @@ func coroSemacquireMutex(ctx unsafe.Pointer, addr *uint32, lifo bool,
 		*state = unsafe.Pointer(w)
 	} else {
 		if w.scheduler != s || w.task != task || w.addr != addr ||
-			w.lifo != lifo || w.skipframes != skipframes ||
+			w.lifo != lifo || w.skipframes != skipframes || w.profile != uint8(profile) ||
 			w.waiter.elem.get() != nil || w.waiter.g != nil ||
 			w.waiter.coro.get() != unsafe.Pointer(w) {
 			throw("runtime: invalid resumed stackless coroutine semaphore")
@@ -112,6 +124,11 @@ func coroSemrelease(ctx unsafe.Pointer, addr *uint32, handoff bool, skipframes i
 		throw("runtime: invalid stackless coroutine semaphore release")
 	}
 	return semrelease2(addr, handoff, skipframes, true)
+}
+
+// coroSemreleasePoll preserves the poll declaration's single-argument ABI.
+func coroSemreleasePoll(ctx unsafe.Pointer, addr *uint32) bool {
+	return coroSemrelease(ctx, addr, false, 0)
 }
 
 func (w *stacklessCoroSemaWaiter) finish(state *unsafe.Pointer) {

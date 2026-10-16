@@ -13,23 +13,29 @@ import (
 	"testing"
 )
 
-func semaphoreTestSignature(pkg *types.Pkg) *types.Type {
-	return types.NewSignature(nil, []*types.Field{
+func semaphoreTestSignature(pkg *types.Pkg, params int) *types.Type {
+	fields := []*types.Field{
 		types.NewField(src.NoXPos, pkg.Lookup("addr"), types.NewPtr(types.Types[types.TUINT32])),
 		types.NewField(src.NoXPos, pkg.Lookup("flag"), types.Types[types.TBOOL]),
 		types.NewField(src.NoXPos, pkg.Lookup("skipframes"), types.Types[types.TINT]),
-	}, nil)
+	}
+	return types.NewSignature(nil, fields[:params], nil)
 }
 
 var semaphoreTestDeclarations = []struct {
 	path, name string
 	acquire    bool
+	params     int
+	operation  string
 }{
-	{"internal/sync", "runtime_SemacquireMutex", true},
-	{"internal/sync", "runtime_Semrelease", false},
-	{"sync", "runtime_SemacquireRWMutexR", true},
-	{"sync", "runtime_SemacquireRWMutex", true},
-	{"sync", "runtime_Semrelease", false},
+	{"internal/sync", "runtime_SemacquireMutex", true, 3, "coroSemacquireMutex"},
+	{"internal/sync", "runtime_Semrelease", false, 3, "coroSemrelease"},
+	{"sync", "runtime_SemacquireRWMutexR", true, 3, "coroSemacquireMutex"},
+	{"sync", "runtime_SemacquireRWMutex", true, 3, "coroSemacquireMutex"},
+	{"sync", "runtime_Semrelease", false, 3, "coroSemrelease"},
+	{"sync", "runtime_Semacquire", true, 1, "coroSemacquire"},
+	{"internal/poll", "runtime_Semacquire", true, 1, "coroSemacquire"},
+	{"internal/poll", "runtime_Semrelease", false, 1, "coroSemreleasePoll"},
 }
 
 func TestSemaphoreRecipeSignature(t *testing.T) {
@@ -40,12 +46,14 @@ func TestSemaphoreRecipeSignature(t *testing.T) {
 	for _, declaration := range semaphoreTestDeclarations {
 		pkg := types.NewPkg(declaration.path, "sync")
 		name := declaration.name
-		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name), semaphoreTestSignature(pkg))
+		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name), semaphoreTestSignature(pkg, declaration.params))
 		recipe, ok := operationRecipe(fn)
 		if !ok || recipe.Kind != SiteSemaphore || recipe.Effect != MaySuspend {
 			t.Fatalf("%s recipe = %+v, %t, want semaphore suspension", name, recipe, ok)
 		}
 		for _, typ := range []*types.Type{
+			nil,
+			types.Types[types.TINT],
 			types.NewSignature(nil, nil, nil),
 			types.NewSignature(nil, fn.Type().Params(), []*types.Field{
 				types.NewField(src.NoXPos, nil, types.Types[types.TBOOL]),
@@ -61,6 +69,47 @@ func TestSemaphoreRecipeSignature(t *testing.T) {
 			if !ok || recipe.Kind != SiteAwait || recipe.Effect != MaySuspend {
 				t.Fatalf("changed %s signature recipe = %+v, %t, want conservative await", name, recipe, ok)
 			}
+		}
+		for index := range declaration.params {
+			params := make([]*types.Field, declaration.params)
+			for i, field := range fn.Type().Params() {
+				typ := field.Type
+				if i == index {
+					typ = types.Types[types.TUINTPTR]
+				}
+				params[i] = types.NewField(src.NoXPos, nil, typ)
+			}
+			bad := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name), types.NewSignature(nil, params, nil))
+			if recipe, ok := operationRecipe(bad); !ok || recipe.Kind != SiteAwait {
+				t.Fatalf("changed %s parameter %d recipe = %+v, %t, want conservative await", name, index, recipe, ok)
+			}
+		}
+	}
+}
+
+func TestSemaphoreOperation(t *testing.T) {
+	prepareLowerTest(t)
+	if got := semaphoreOperation(nil); got != "" {
+		t.Fatalf("nil semaphore operation = %q", got)
+	}
+	for _, declaration := range semaphoreTestDeclarations {
+		pkg := types.NewPkg(declaration.path, "sync")
+		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(declaration.name),
+			semaphoreTestSignature(pkg, declaration.params))
+		call := newLowerTestCall(fn)
+		call.Args = make(ir.Nodes, declaration.params)
+		if got := semaphoreOperation(call); got != declaration.operation {
+			t.Fatalf("%s.%s operation = %q, want %q", declaration.path, declaration.name, got, declaration.operation)
+		}
+		call.Args = call.Args[:len(call.Args)-1]
+		if got := semaphoreOperation(call); got != "" {
+			t.Fatalf("changed arity operation = %q", got)
+		}
+		call.Args = append(call.Args, nil)
+		other := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("otherSemaphore"), fn.Type())
+		call.Fun = other.Nname
+		if got := semaphoreOperation(call); got != "" {
+			t.Fatalf("unknown semaphore operation = %q", got)
 		}
 	}
 }
@@ -79,9 +128,9 @@ func TestLowerSemaphore(t *testing.T) {
 			types.LocalPkg = pkg
 			primitivePkg := types.NewPkg(declaration.path, "sync")
 			primitive := ir.NewFunc(src.NoXPos, src.NoXPos, primitivePkg.Lookup(name),
-				semaphoreTestSignature(primitivePkg))
+				semaphoreTestSignature(primitivePkg, declaration.params))
 			primitive.DeclareParams(true)
-			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("wait"), semaphoreTestSignature(pkg))
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("wait"), semaphoreTestSignature(pkg, declaration.params))
 			fn.DeclareParams(true)
 			typecheck.Target.Funcs = append(typecheck.Target.Funcs, fn)
 			call := newLowerTestCall(primitive)
@@ -90,8 +139,10 @@ func TestLowerSemaphore(t *testing.T) {
 			}
 			if declaration.acquire {
 				// An argument initializer belongs to the entry, not the retry.
-				call.SetInit(ir.Nodes{ir.NewAssignStmt(src.NoXPos, call.Args[2],
-					typedInt(src.NoXPos, types.Types[types.TINT], 17))})
+				counter := typecheck.TempAt(src.NoXPos, fn, types.Types[types.TINT])
+				call.SetInit(ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, counter),
+					ir.NewAssignStmt(src.NoXPos, counter,
+						typedInt(src.NoXPos, types.Types[types.TINT], 17))})
 			}
 			fn.Body = ir.Nodes{call, newLowerTestReturn()}
 			plan, err := Analyze([]*ir.Func{fn}, nil)
@@ -105,10 +156,7 @@ func TestLowerSemaphore(t *testing.T) {
 			if plan.Functions[fn].Factory != FactoryABI3 {
 				t.Fatalf("factory = %v, want explicit frame", plan.Functions[fn].Factory)
 			}
-			want := "runtime.coroSemacquireMutex"
-			if !declaration.acquire {
-				want = "runtime.coroSemrelease"
-			}
+			want := "runtime." + declaration.operation
 			found := 0
 			var resume *ir.Func
 			var helper *ir.CallExpr
@@ -133,9 +181,9 @@ func TestLowerSemaphoreChangedCall(t *testing.T) {
 	prepareLowerTest(t)
 	pkg := types.NewPkg("internal/sync", "sync")
 	primitive := ir.NewFunc(src.NoXPos, src.NoXPos,
-		pkg.Lookup("runtime_SemacquireMutex"), semaphoreTestSignature(pkg))
+		pkg.Lookup("runtime_SemacquireMutex"), semaphoreTestSignature(pkg, 3))
 	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("changedCall"),
-		semaphoreTestSignature(pkg))
+		semaphoreTestSignature(pkg, 3))
 	fn.DeclareParams(true)
 	call := newLowerTestCall(primitive)
 	for _, arg := range fn.Dcl {
@@ -149,7 +197,7 @@ func TestLowerSemaphoreChangedCall(t *testing.T) {
 	// Recheck the target at lowering time, even when inference selected the
 	// semaphore recipe. The same ABI on another function is not sufficient.
 	other := ir.NewFunc(src.NoXPos, src.NoXPos,
-		pkg.Lookup("otherSemaphore"), semaphoreTestSignature(pkg))
+		pkg.Lookup("otherSemaphore"), semaphoreTestSignature(pkg, 3))
 	call.Fun = other.Nname
 	if _, err := newLowerCandidate(plan, plan.Functions[fn]); err == nil ||
 		!strings.Contains(err.Error(), "unsupported semaphore site") {
@@ -160,6 +208,7 @@ func TestLowerSemaphoreChangedCall(t *testing.T) {
 func checkSemaphoreTransition(t *testing.T, resume *ir.Func, helper *ir.CallExpr, acquire bool) {
 	t.Helper()
 	var label *types.Sym
+	params := len(helper.Args) - 2 // context and waiter state are not source arguments.
 	for i, node := range resume.Body {
 		if node, ok := node.(*ir.LabelStmt); ok {
 			label = node.Label
@@ -195,15 +244,15 @@ func checkSemaphoreTransition(t *testing.T, resume *ir.Func, helper *ir.CallExpr
 		}
 		for j, node := range resume.Body {
 			jump, ok := node.(*ir.BranchStmt)
-			if !ok || jump.Label != label || j < 4 {
+			if !ok || jump.Label != label || j < params+2 {
 				continue
 			}
-			pc, ok := resume.Body[j-4].(*ir.AssignStmt)
+			pc, ok := resume.Body[j-params-1].(*ir.AssignStmt)
 			if !ok || pc.X.Type() != types.Types[types.TUINT32] ||
 				ir.Int64Val(pc.Y) != retryPC {
 				t.Fatal("acquire entry does not save the retry PC")
 			}
-			entry := resume.Body[j-5].(*ir.LabelStmt)
+			entry := resume.Body[j-params-2].(*ir.LabelStmt)
 			initializers := 0
 			for k, node := range resume.Body {
 				init, ok := node.(*ir.AssignStmt)
@@ -219,8 +268,8 @@ func checkSemaphoreTransition(t *testing.T, resume *ir.Func, helper *ir.CallExpr
 			if initializers != 1 {
 				t.Fatalf("argument initializer occurs %d times, want 1", initializers)
 			}
-			for k := range 3 {
-				assignment, ok := resume.Body[j-3+k].(*ir.AssignStmt)
+			for k := range params {
+				assignment, ok := resume.Body[j-params+k].(*ir.AssignStmt)
 				if !ok || !ir.SameSafeExpr(assignment.X, helper.Args[k+1]) {
 					t.Fatalf("acquire argument %d is not saved before retry", k)
 				}

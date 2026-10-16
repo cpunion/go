@@ -1235,6 +1235,14 @@ logical waiter shares the ordinary semaphore table, FIFO/LIFO queue ordering,
 and block/mutex profiling paths; it does not park an ordinary goroutine or
 delegate the lock to a worker.
 
+The single-argument `sync.runtime_Semacquire` and
+`internal/poll.runtime_Semacquire` declarations share that queue and retry
+protocol, with FIFO insertion and block profiling only. They must not use the
+Mutex entry's acquisition timestamps or contribute mutex samples. The waiter
+retains its profiling mode across retries. The single-argument poll release
+uses the existing logical release path with no handoff request. Exact signature
+checks keep changed declarations on the conservative ordinary-Go path.
+
 Release publishes readiness without entering `goyield` from the native resume.
 A reserved ticket returns a handoff action to the driver, which gives logical
 work and runnable ordinary goroutines a scheduling opportunity before resuming
@@ -1258,7 +1266,7 @@ priority, profiles, and detached waiters with one and four Ps. The tests compile
 the synchronization packages with the existing lowering option; an unlowered
 dependency still keeps its caller on the ordinary Go entry. The root adapter
 caveat also applies to public RWMutex calls.
-WaitGroup acquisition, Cond, general semaphore declarations, and runtime notes
+WaitGroup acquisition, Cond, other semaphore declarations, and runtime notes
 retain conservative fallback; this is not complete `sync` support.
 
 The first channel slice lowers ordinary sends, discarded or single-value
@@ -2471,7 +2479,7 @@ closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive
 destinations, multiple channel operations in one expression, synchronization
-operations beyond the supported Mutex semaphore recipes,
+operations beyond the supported Mutex, RWMutex, and plain semaphore recipes,
 reflection, callbacks, variadic C calls, or general C ABI type classification.
 Ordinary channel send, discarded or single-value receive, comma-ok receive,
 receive-channel range, and select with simple receive targets are supported
@@ -3923,7 +3931,7 @@ are three fail-closed invariant or unreachable bounded-cache fallback bodies.
 
 The likely compatibility order remains:
 
-1. extend the Mutex semaphore park/wake boundary to RWMutex, WaitGroup, Cond,
+1. extend the supported semaphore park/wake boundary to WaitGroup, Cond,
    other semaphore operations, and runtime notes;
 2. broaden aggregate System ABI support beyond the bounded typed bridge and
    add platform-error conventions beyond POSIX errno;
