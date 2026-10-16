@@ -3756,6 +3756,14 @@ executes the entry query. Heterogeneous, closure-frame, and deferred-cleanup
 paths retain their original terminal dispatch and cleanup queries; frame
 clearing, fairness snapshots, and runtime helper validation are unchanged.
 
+The self-frame await and completion helpers also distinguish a local switch
+from one returned to `runTasks`. Generated local loops request the former and
+reload immediately without publishing and then consuming `SwitchPending` in a
+separate runtime call. A switch returned to the scheduler retains that flag
+protocol. Both modes retain the same ownership, terminal and readiness checks;
+queued siblings still force the existing yield path. This is an internal
+compiler/runtime contract, not a source annotation or another feature flag.
+
 ### 16.6 Early operation-completion handoff
 
 An operation may complete before the resume call that started it returns

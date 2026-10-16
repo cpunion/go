@@ -202,7 +202,12 @@ func TakeStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer,
 
 func AwaitStacklessCoroSelfFrameForTest(ctx, frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) uint8 {
-	return coroAwaitSelfFrame(ctx, frame, resume)
+	return coroAwaitSelfFrame(ctx, frame, resume, false)
+}
+
+func AwaitStacklessCoroLocalSelfFrameForTest(ctx, frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8) uint8 {
+	return coroAwaitSelfFrame(ctx, frame, resume, true)
 }
 
 func AwaitStacklessCoroLargeFusedFrameForTest(ctx, frame unsafe.Pointer,
@@ -211,11 +216,27 @@ func AwaitStacklessCoroLargeFusedFrameForTest(ctx, frame unsafe.Pointer,
 }
 
 func CompleteStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) uint8 {
-	return coroCompleteSelfFrame(ctx)
+	return coroCompleteSelfFrame(ctx, false)
+}
+
+func CompleteStacklessCoroLocalSelfFrameForTest(ctx unsafe.Pointer) uint8 {
+	return coroCompleteSelfFrame(ctx, true)
+}
+
+func StacklessCoroSelfFrameSwitchPendingForTest(ctx unsafe.Pointer) bool {
+	return (*stacklessCoroContext)(ctx).task().hasFlag(stacklessCoroTaskSwitchPending)
 }
 
 func ContinueStacklessCoroSelfFrameForTest(ctx unsafe.Pointer) {
-	coroContinueSelfFrame(ctx)
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil ||
+		!task.hasFlag(stacklessCoroTaskSwitchPending) ||
+		task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending {
+		throw("runtime: invalid stackless coroutine local frame switch")
+	}
+	task.setFlag(stacklessCoroTaskSwitchPending, false)
 }
 
 func CompleteStacklessCoroLargeFusedFrameForTest(ctx unsafe.Pointer) uint8 {

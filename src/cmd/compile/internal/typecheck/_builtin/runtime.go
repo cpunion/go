@@ -199,9 +199,8 @@ func coroTakeRootFrame(func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
 func coroReleaseRootFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr)
 func coroAwait(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroAwaitFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
-func coroAwaitSelfFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
-func coroCompleteSelfFrame(unsafe.Pointer) uint8
-func coroContinueSelfFrame(unsafe.Pointer)
+func coroAwaitSelfFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8, bool) uint8
+func coroCompleteSelfFrame(unsafe.Pointer, bool) uint8
 func coroRequestFusedFrame(unsafe.Pointer, bool)
 func coroAwaitFusedFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
 func coroCompleteFusedFrame(unsafe.Pointer) uint8

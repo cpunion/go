@@ -6307,11 +6307,9 @@ func main() {
 				}
 			}
 		}
-		hasLocalContinue := strings.Contains(disassembly,
-			"runtime.coroContinueSelfFrame")
-		if hasLocalContinue != test.self {
-			t.Errorf("%s local self-frame continuation = %t, want %t\n%s",
-				test.resume, hasLocalContinue, test.self, disassembly)
+		if strings.Contains(disassembly, "runtime.coroContinueSelfFrame") {
+			t.Errorf("%s calls a separate self-frame continuation helper\n%s",
+				test.resume, disassembly)
 		}
 		hasRequest := strings.Contains(disassembly,
 			"runtime.coroRequestFusedFrame")
