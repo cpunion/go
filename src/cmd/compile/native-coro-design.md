@@ -1223,9 +1223,12 @@ frame directly. Mutexes use the same park/wake boundary through the runtime's
 shared semaphore queues. Other synchronization primitives still need their
 own supported operation recipes.
 
-The Mutex slice preserves the source algorithms in `sync` and `internal/sync`.
-It recognizes only the exact `internal/sync.runtime_SemacquireMutex` and
-`internal/sync.runtime_Semrelease` declarations. Acquire evaluates its arguments
+The Mutex and RWMutex slices preserve the source algorithms in `sync` and
+`internal/sync`. They recognize the exact `internal/sync.runtime_SemacquireMutex`,
+`sync.runtime_SemacquireRWMutexR`, `sync.runtime_SemacquireRWMutex`, and the
+three-argument `runtime_Semrelease` declarations in both packages. These acquire
+declarations share their argument ABI and block/mutex profiling flags, so they
+reuse the same logical semaphore entry. Acquire evaluates its arguments
 once, stores them and its waiter state in the typed coroutine frame, and retries
 after a wakeup until it consumes a token or a starvation handoff ticket. The
 logical waiter shares the ordinary semaphore table, FIFO/LIFO queue ordering,
@@ -1249,7 +1252,13 @@ so calling it from an ordinary helper does not prove an ordinary-G Mutex wait.
 Coexisting ordinary and logical public Mutex entries are not implemented here.
 Deferred `Unlock` also retains the ordinary caller because suspending defers
 are not supported; the explicit `Lock`/`Unlock` call sequence is lowered.
-RWMutex, WaitGroup, Cond, general semaphore declarations, and runtime notes
+Public RWMutex tests likewise require native `Lock`, `Unlock`, `RLock`, and
+`RUnlock` entries. They check shared readers, exclusive writers, pending-writer
+priority, profiles, and detached waiters with one and four Ps. The tests compile
+the synchronization packages with the existing lowering option; an unlowered
+dependency still keeps its caller on the ordinary Go entry. The root adapter
+caveat also applies to public RWMutex calls.
+WaitGroup acquisition, Cond, general semaphore declarations, and runtime notes
 retain conservative fallback; this is not complete `sync` support.
 
 The first channel slice lowers ordinary sends, discarded or single-value

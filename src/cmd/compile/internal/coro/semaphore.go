@@ -25,9 +25,12 @@ func semaphoreOperation(call *ir.CallExpr) string {
 	}
 	name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
 	switch symbolName(name) {
-	case "internal/sync.runtime_SemacquireMutex":
+	// Mutex and RWMutex acquisitions use the same profiling flags as well
+	// as the same argument ABI; no new runtime entry is needed.
+	case "internal/sync.runtime_SemacquireMutex",
+		"sync.runtime_SemacquireRWMutexR", "sync.runtime_SemacquireRWMutex":
 		return "coroSemacquireMutex"
-	case "internal/sync.runtime_Semrelease":
+	case "internal/sync.runtime_Semrelease", "sync.runtime_Semrelease":
 		return "coroSemrelease"
 	}
 	return ""
