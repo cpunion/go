@@ -65,7 +65,7 @@ func poll_runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr,
 
 func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
 	buffer []byte, n *int, errno *uintptr) *stacklessCoroOperation {
-	op := stacklessCoroStartOperation(ctx, "read")
+	op := stacklessCoroStartIOOperation(ctx, "read")
 	op.fd = int32(fd)
 	op.buffer = buffer
 	op.n = n

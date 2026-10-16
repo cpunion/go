@@ -1852,8 +1852,10 @@ The runtime:
   socket, and asynchronous C completion;
 - keeps I/O-only buffers, closures, result pointers, and worker links in typed
   storage outside the common operation state, so cold channel waits do not
-  allocate those unused fields; first-source constructors embed their initial
-  I/O storage or channel waiter in one allocation, and cross-kind reuse retains
+  allocate those unused fields; timers and selects use only the common state
+  unless reusing storage retained by an earlier I/O operation; I/O and channel
+  constructors embed their initial storage or waiter in one allocation, and
+  cross-kind reuse retains
   the cleared storage without keeping source-owned pointers alive;
 - registers ordinary channel send and receive directly in the runtime channel
   wait queues, shares FIFO and buffering with parked goroutines, publishes

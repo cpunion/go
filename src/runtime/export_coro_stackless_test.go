@@ -567,24 +567,24 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	s := new(stacklessCoroScheduler)
 	task := &s.root
 	task.context.scheduler = s
-	start := func(channel bool) *stacklessCoroOperation {
+	start := func(kind stacklessCoroOperationKind) *stacklessCoroOperation {
 		task.state = stacklessCoroTaskRunning
 		task.resuming = true
-		return stacklessCoroStartOperationWithWaiter(
-			unsafe.Pointer(&task.context), "test IO storage", channel)
+		return stacklessCoroStartOperationOfKind(
+			unsafe.Pointer(&task.context), "test IO storage", kind)
 	}
 	recycle := func(op *stacklessCoroOperation) {
 		lock(&s.lock)
 		s.recycleOperationLocked(op)
 		unlock(&s.lock)
 	}
-	op := start(true)
+	op := start(stacklessCoroOperationChannel)
 	first, waiter := op, op.waiter
 	op.id = stacklessCoroChannelOperationID
 	clearStacklessCoroOperation(op)
 	recycle(op)
 
-	op = start(false)
+	op = start(stacklessCoroOperationIO)
 	reused = op == first
 	storage := op.stacklessCoroIOState
 	op.id = 1
@@ -606,7 +606,19 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	recycle(op)
 	GC()
 
-	op = start(true)
+	op = start(stacklessCoroOperationPlain)
+	if !raceenabled {
+		reused = reused && op == first
+		cleared = cleared && op.stacklessCoroIOState == storage
+	} else {
+		reused = reused || op == first
+		cleared = cleared && op.stacklessCoroIOState == nil
+	}
+	op.id = 1
+	clearStacklessCoroOperation(op)
+	recycle(op)
+
+	op = start(stacklessCoroOperationChannel)
 	if !raceenabled {
 		reused = reused && op == first && op.waiter == waiter &&
 			op.stacklessCoroIOState == storage
@@ -1545,7 +1557,7 @@ func StacklessCoroReadLengthForTest(length int) int32 {
 }
 
 func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	op := stacklessCoroStartOperation(ctx, "expired read")
+	op := stacklessCoroStartIOOperation(ctx, "expired read")
 	op.fd = int32(fd)
 	op.buffer = buffer
 	op.n = n

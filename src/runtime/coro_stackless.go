@@ -334,7 +334,15 @@ type stacklessCoroIOState struct {
 	workNext *stacklessCoroOperation
 }
 
-// stacklessCoroIOOperation gives a new non-channel operation its first IO
+type stacklessCoroOperationKind uint8
+
+const (
+	stacklessCoroOperationPlain stacklessCoroOperationKind = iota
+	stacklessCoroOperationChannel
+	stacklessCoroOperationIO
+)
+
+// stacklessCoroIOOperation gives a new IO operation its first IO
 // storage without a second heap allocation.
 type stacklessCoroIOOperation struct {
 	operation stacklessCoroOperation
@@ -3437,15 +3445,19 @@ func coroExitSyscall() {
 }
 
 func stacklessCoroStartOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
-	return stacklessCoroStartOperationWithWaiter(ctx, name, false)
+	return stacklessCoroStartOperationOfKind(ctx, name, stacklessCoroOperationPlain)
+}
+
+func stacklessCoroStartIOOperation(ctx unsafe.Pointer, name string) *stacklessCoroOperation {
+	return stacklessCoroStartOperationOfKind(ctx, name, stacklessCoroOperationIO)
 }
 
 func stacklessCoroStartChannelOperation(ctx unsafe.Pointer) *stacklessCoroOperation {
-	return stacklessCoroStartOperationWithWaiter(ctx, "channel", true)
+	return stacklessCoroStartOperationOfKind(ctx, "channel", stacklessCoroOperationChannel)
 }
 
-func stacklessCoroStartOperationWithWaiter(ctx unsafe.Pointer, name string,
-	allocateWaiter bool) *stacklessCoroOperation {
+func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
+	kind stacklessCoroOperationKind) *stacklessCoroOperation {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil {
@@ -3484,14 +3496,17 @@ func stacklessCoroStartOperationWithWaiter(ctx unsafe.Pointer, name string,
 	if op == nil {
 		op = takeStacklessCoroSharedOperation()
 		if op == nil {
-			if allocateWaiter {
+			switch kind {
+			case stacklessCoroOperationChannel:
 				op = newStacklessCoroChannelOperation()
-			} else {
+			case stacklessCoroOperationIO:
 				op = newStacklessCoroIOOperation()
+			default:
+				op = new(stacklessCoroOperation)
 			}
 		}
 	}
-	if !allocateWaiter && op.stacklessCoroIOState == nil {
+	if kind == stacklessCoroOperationIO && op.stacklessCoroIOState == nil {
 		op.stacklessCoroIOState = new(stacklessCoroIOState)
 	}
 	op.scheduler = s
