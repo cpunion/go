@@ -3045,10 +3045,11 @@ allocation policy.
 For a four-byte generated frame on a target with larger pointers, the frame
 cannot contain a pointer. Such frame reservations can pair four task headers
 with four typed `uint32` slots in one allocation, after the same bounded direct
-prefix. A flag on never-used slots distinguishes this storage; initialization
-consumes it before the task becomes active, and discarding unused slots clears
-their interior pointers. Ordinary and pointer-bearing reservations preserve
-the existing cache priority and never receive scalar storage. Race and 32-bit
+prefix. Only never-used slots can carry this scalar storage: cache extraction
+clears old typed frames, initialization replaces the unused slot's context,
+and discarding unused slots clears their interior pointers. No additional flag
+or active-task state is needed. Ordinary and pointer-bearing reservations
+preserve the existing cache priority and never receive scalar storage. Race and 32-bit
 paths do not pair frames, and the logical task header and cache bounds do not
 grow. Partly used or mixed-size chunks can retain unused scalar capacity, so
 this representation reduces allocation events without promising a byte saving
