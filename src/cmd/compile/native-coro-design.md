@@ -3764,6 +3764,13 @@ protocol. Both modes retain the same ownership, terminal and readiness checks;
 queued siblings still force the existing yield path. This is an internal
 compiler/runtime contract, not a source annotation or another feature flag.
 
+Completion clearing in the same local self-frame loop first tests the frame's
+parent link. A parented frame is retained by its fused lineage, so it still
+clears its pointer fields without asking the runtime whether clearing is
+needed. Only a root frame consults the runtime retention flags. This preserves
+root result ownership, cached and chunk-frame clearing, and all heterogeneous
+or deferred-cleanup paths; it does not change frame layout or cache budgets.
+
 ### 16.6 Early operation-completion handoff
 
 An operation may complete before the resume call that started it returns

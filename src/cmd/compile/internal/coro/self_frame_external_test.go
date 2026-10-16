@@ -52,6 +52,17 @@ func invoke(n, kind int) (result int, recovered any) {
 	return
 }
 
+func pointer(n int, value *int) *int {
+	if n == 0 {
+		gcRequest <- true
+		<-gcDone
+		runtime.Gosched()
+		return value
+	}
+	result := pointer(n-1, value)
+	return result
+}
+
 func exiting(n int) {
 	if n == 0 {
 		runtime.Gosched()
@@ -65,6 +76,11 @@ func main() {
 	go collect()
 	for round := 0; round < 2; round++ {
 		for _, depth := range []int{0, 1, 64, 256, 262, 263, 264, 4096} {
+			value := new(int)
+			*value = depth
+			result := pointer(depth, value)
+			runtime.GC()
+			if result != value || *result != depth { panic("self-frame pointer result") }
 			for kind := 0; kind < 3; kind++ {
 				after = 0
 				got, recovered := invoke(depth, kind)
@@ -115,27 +131,29 @@ func main() {
 			if test.experiment != "coro" {
 				return
 			}
-			cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-				"-s", `^main\.descend\.coro(\.func[0-9]+)?$`, exe)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("objdump failed: %v\n%s", err, out)
-			}
-			assembly := string(out)
-			for _, helper := range []string{
-				"runtime.coroTakeSelfFrame(SB)",
-				"runtime.coroAwaitSelfFrame(SB)",
-				"runtime.coroCompleteSelfFrame(SB)",
-			} {
-				if !strings.Contains(assembly, helper) {
-					t.Fatalf("missing %s; self-frame path was not selected:\n%s", helper, assembly)
+			for _, name := range []string{"descend", "pointer"} {
+				cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+					"-s", `^main\.`+name+`\.coro(\.func[0-9]+)?$`, exe)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("objdump failed: %v\n%s", err, out)
 				}
-			}
-			if strings.Contains(assembly, "runtime.coroContinueSelfFrame(SB)") {
-				t.Fatalf("local self-frame switch uses a separate continuation call:\n%s", assembly)
-			}
-			if got := strings.Count(assembly, "runtime.coroTerminalAction(SB)"); got != 1 {
-				t.Fatalf("self-frame terminal queries = %d, want one at resume entry:\n%s", got, assembly)
+				assembly := string(out)
+				for _, helper := range []string{
+					"runtime.coroTakeSelfFrame(SB)",
+					"runtime.coroAwaitSelfFrame(SB)",
+					"runtime.coroCompleteSelfFrame(SB)",
+				} {
+					if !strings.Contains(assembly, helper) {
+						t.Fatalf("missing %s; self-frame path was not selected:\n%s", helper, assembly)
+					}
+				}
+				if strings.Contains(assembly, "runtime.coroContinueSelfFrame(SB)") {
+					t.Fatalf("local self-frame switch uses a separate continuation call:\n%s", assembly)
+				}
+				if got := strings.Count(assembly, "runtime.coroTerminalAction(SB)"); got != 1 {
+					t.Fatalf("self-frame terminal queries = %d, want one at resume entry:\n%s", got, assembly)
+				}
 			}
 		})
 	}
