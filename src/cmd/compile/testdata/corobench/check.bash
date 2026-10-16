@@ -29,6 +29,7 @@ allocation_output="$output_dir/public-entry-allocation.txt"
 recursive_allocation_output="$output_dir/recursive-frame-allocation.txt"
 isolated_allocation_output="$output_dir/isolated-frame-allocation.txt"
 task_footprint_output="$output_dir/task-footprint-allocation.txt"
+large_task_output="$output_dir/large-task-smoke.txt"
 read_output="$output_dir/read-lowering.txt"
 write_output="$output_dir/write-lowering.txt"
 correctness_output="$output_dir/correctness.txt"
@@ -145,6 +146,9 @@ expected=(
 	taskParkWorker
 	taskParkBursts
 	taskParkUntilReleased
+	mixedPointerWorker
+	mixedTaskParkUntilReleased
+	mixedTaskParkBursts
 	parallelSpawnWorker
 	parallelSpawnProgress
 	parallelYieldWorker
@@ -435,5 +439,35 @@ for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block \
 		exit 1
 	fi
 done
+
+# These single-iteration executions check task counts and lifecycle only.
+# CI timings are not a performance comparison, and partial/mixed batches need
+# not reduce allocation bytes. Preserve their raw allocation metrics.
+if ! "$test_binary" -test.run '^$' -test.bench \
+	'^Benchmark(TaskBurst(1000|100000)|TaskPark(1000|100000)|MixedPark(Scalar|Pointer)First100000|LiveTaskFootprint(1|256|264|265|266|267|268|1000|100000)|Mixed(Scalar|Pointer)First(1000|100000))$' \
+	-test.benchtime=1x -test.count=1 -test.cpu=1 -test.benchmem \
+	>"$large_task_output" 2>&1; then
+	tail -n 100 "$large_task_output" >&2
+	exit 1
+fi
+if ! awk '
+	$1 ~ /^Benchmark/ {
+		samples++
+		if ($2 != 1 || seen[$1]++) {
+			bad = 1
+		}
+		bytes = allocs = 0
+		for (i = 3; i <= NF; i++) {
+			if ($i == "B/op") bytes++
+			if ($i == "allocs/op") allocs++
+		}
+		if (bytes != 1 || allocs != 1) bad = 1
+	}
+	END { exit samples == 19 && !bad ? 0 : 1 }
+' \
+	"$large_task_output"; then
+	echo "large-task smoke did not execute all 19 probes" >&2
+	exit 1
+fi
 
 printf 'coroutine checks passed; artifacts: %s\n' "$output_dir"

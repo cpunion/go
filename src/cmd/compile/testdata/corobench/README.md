@@ -83,7 +83,74 @@ GOEXPERIMENT=coro /path/to/coroutine/bin/go test cmd/compile/internal/coro \
 The tables below retain their recorded revisions and settings; they are not
 fresh measurements of the current head.
 
+## Large-task and mixed-frame controls
+
+The probes also retain the large-task fixtures used to investigate creation,
+parking and allocation costs. `TaskBurst1000/100000` and
+`TaskPark1000/100000` keep normal GC enabled; the `MixedParkScalarFirst100000`
+and `MixedParkPointerFirst100000` variants interleave one PC-only worker with
+three pointer-bearing workers, changing which frame shape is encountered
+first. Both orders matter: saving allocation events for one shape can retain
+extra unused batch capacity for another. Do not infer a universal memory or
+latency improvement from only the pure or PC-first case.
+
+`LiveTaskFootprint1/1000/100000`, the 256/264/265/266/267/268 boundary variants,
+and `MixedScalarFirst1000/100000` and `MixedPointerFirst1000/100000` require
+`-benchtime=1x`. They disable GC for the live snapshot, include coordinator
+and executor setup, and report allocation events, live heap/objects, Go-stack
+bytes, ordinary goroutines and thread-creation records. Every worker has
+published readiness and cannot finish before release, but readiness precedes
+channel receive: the snapshot does not assert every channel waiter is
+installed. Go-stack bytes exclude native OS stacks and total RSS; thread
+creation records are not a live thread census. Small setup variations and
+negative memory deltas are retained, not clamped away.
+
+`check.bash` requires native lowering of both mixed workers and runs all 19
+new probes once as correctness/lifecycle smoke checks, preserving the raw
+allocation output in `large-task-smoke.txt`. These executions, especially
+under concurrent CI load, are not latency measurements. The historical
+`run.bash` timing selection remains unchanged; collect repeated balanced
+measurements separately with matching frozen toolchains, no concurrent own
+workloads, and all unfavorable samples retained.
+
 ## Reproducibility
+
+For new collections, `collect.bash BASELINE_GOROOT CORO_GOROOT NEW_OUTPUT_DIRECTORY`
+builds the same fixtures with independently built default/experiment tools and
+requires the exact upstream merge-base, clean source trees and matching Git
+version stamps. The output parent must exist; output must be new and outside
+the source trees. Both native Git-derived `_COMMIT` and archive `-COMMIT`
+version stamps are checked against the actual source revision, never a release
+number alone. Set `UPSTREAM_REF` when the upstream ref is not `origin/master`.
+
+The collector finishes compilation and correctness audits before executing
+frozen binaries. It retains separate warmups, alternates baseline/coroutine
+order, covers regular and large workloads, measures scaling at 1/2/4 Ps, and
+runs every live-footprint probe in a fresh process. Defaults are six samples,
+two warmups, 200ms per benchmark and four one-shot footprint samples; sample
+counts must be even. `SAMPLES`, `WARMUP_SAMPLES`, `BENCHTIME` and
+`FOOTPRINT_SAMPLES` override those defaults. Versions, source/binary hashes,
+host/load information, errors and every raw sample are retained. Missing,
+duplicate or skipped measurements fail collection instead of becoming timing
+results. Eight-way blocking C capacity remains a separate capability test,
+not an assumed timing result.
+
+These are observational fixed-layout measurements on a host that is not
+assumed quiet; do not infer stable speedups or ignore unfavorable samples.
+Use `COLLECTION_KIND=validation-only` and `BENCHTIME=1x` for collector smoke
+tests, not performance evidence. Go-stack/heap snapshots do not report total
+RSS or native OS stacks. No LLVM backend or alternate compiler is involved.
+
+The existing workflow can collect on a native Linux runner with:
+
+```
+gh workflow run coro.yml --repo cpunion/go --ref coro/main -f benchmarks=true
+```
+
+The optional job waits for full focused/default/experiment and native full
+tests. It is disabled for ordinary PR and push events, so sampling does not
+increase their CI time. Its `native-corobench-linux` artifact includes the
+complete receipts, including partial results when collection fails.
 
 Fetch the upstream development branch, then build one GOROOT at its exact
 merge-base with the coroutine revision and another at the coroutine revision
