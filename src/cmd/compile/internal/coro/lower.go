@@ -110,6 +110,7 @@ type lowerCandidate struct {
 	frameChunkLength int64
 	selfAwait        bool
 	selfSpawn        bool
+	heapLocals       map[*ir.Name]bool
 }
 
 type lowerDirectCall struct {
@@ -251,6 +252,7 @@ func Lower(plan *Plan) (LowerResult, error) {
 			continue
 		}
 		candidates[function.Func] = candidate
+		candidate.heapLocals = plan.HeapLocals
 	}
 
 	factories := make(map[*ir.Func]*ir.Func)
@@ -2353,6 +2355,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	for _, variable := range candidate.rangeVars {
 		addCaptureCell(variable)
 	}
+	if candidate.factoryABI == FactoryABI3 {
+		for _, variable := range fn.Dcl {
+			if variable.Addrtaken() &&
+				(candidate.heapLocals == nil || candidate.heapLocals[variable.Canonical()]) {
+				addCaptureCell(variable)
+			}
+		}
+	}
 	for _, deferred := range candidate.defers {
 		if !deferred.sourceLiteral {
 			continue
@@ -3136,6 +3146,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if localVariables[node.X.Canonical()] {
 				return node
 			}
+			if allocation := captureCellAllocation(node.X); allocation != nil {
+				// Declarations inside inlined expressions are not separate
+				// state-machine statements. Allocate their cells at the
+				// original declaration, just like top-level declarations.
+				return allocation
+			}
 			addDeclaration(node)
 			return ir.NewBlockStmt(node.Pos(), nil)
 		case *ir.AssignStmt:
@@ -3602,8 +3618,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
+				result := edit(value)
+				if candidate.factoryABI == FactoryABI3 && captureCell(value) != nil {
+					// The root entry reads results from fixed frame slots. A
+					// boxed named result must keep its independently owned cell,
+					// while publishing its final value in that result slot.
+					slot := capture(value)
+					body = append(body, ir.NewAssignStmt(pos, slot, result))
+					result = slot
+				}
 				body = append(body, ir.NewAssignStmt(pos,
-					ir.NewStarExpr(pos, pointer), edit(value)))
+					ir.NewStarExpr(pos, pointer), result))
 			}
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),

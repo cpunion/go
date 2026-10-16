@@ -92,6 +92,7 @@ type batch struct {
 	allLocs         []*location
 	closures        []closure
 	reassignOracles map[*ir.Func]*ir.ReassignOracle
+	heapAnalysis    *heapAnalysis
 
 	heapLoc    location
 	mutatorLoc location
@@ -123,28 +124,37 @@ type escape struct {
 }
 
 func Funcs(all []*ir.Func) {
+	funcs(all, nil)
+}
+
+func funcs(all []*ir.Func, analysis *heapAnalysis) {
 	// Make a cache of ir.ReassignOracles. The cache is lazily populated.
 	// TODO(thepudds): consider adding a field on ir.Func instead. We might also be able
 	// to use that field elsewhere, like in walk. See discussion in https://go.dev/cl/688075.
 	reassignOracles := make(map[*ir.Func]*ir.ReassignOracle)
 
 	ir.VisitFuncsBottomUp(all, func(list []*ir.Func, recursive bool) {
-		Batch(list, reassignOracles)
+		batchFuncs(list, reassignOracles, analysis)
 	})
 }
 
 // Batch performs escape analysis on a minimal batch of
 // functions.
 func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
+	batchFuncs(fns, reassignOracles, nil)
+}
+
+func batchFuncs(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle, analysis *heapAnalysis) {
 	var b batch
 	b.heapLoc.attrs = attrEscapes | attrPersists | attrMutates | attrCalls
 	b.mutatorLoc.attrs = attrMutates
 	b.calleeLoc.attrs = attrCalls
 	b.reassignOracles = reassignOracles
+	b.heapAnalysis = analysis
 
 	// Construct data-flow graph from syntax trees.
 	for _, fn := range fns {
-		if base.Flag.W > 1 {
+		if b.heapAnalysis == nil && base.Flag.W > 1 {
 			s := fmt.Sprintf("\nbefore escape %v", fn)
 			ir.Dump(s, fn)
 		}
@@ -167,7 +177,9 @@ func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
 
 	for _, loc := range b.allLocs {
 		// Try to replace some non-constant expressions with literals.
-		b.rewriteWithLiterals(loc.n, loc.curfn)
+		if b.heapAnalysis == nil {
+			b.rewriteWithLiterals(loc.n, loc.curfn)
+		}
 
 		// Check if the node must be heap allocated for certain reasons
 		// such as OMAKESLICE for a large slice.
@@ -177,6 +189,10 @@ func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
 	}
 
 	b.walkAll()
+	if b.heapAnalysis != nil {
+		b.finishHeapAnalysis(fns)
+		return
+	}
 	b.finish(fns)
 }
 
@@ -193,8 +209,11 @@ func (b *batch) initFunc(fn *ir.Func) {
 	if fn.Esc() != escFuncUnknown {
 		base.Fatalf("unexpected node: %v", fn)
 	}
+	if b.heapAnalysis != nil {
+		b.heapAnalysis.funcs[fn] = heapFunctionState{fn.Esc(), fn.ClosureResultsLost()}
+	}
 	fn.SetEsc(escFuncPlanned)
-	if base.Flag.LowerM > 3 {
+	if b.heapAnalysis == nil && base.Flag.LowerM > 3 {
 		ir.Dump("escAnalyze", fn)
 	}
 
@@ -260,15 +279,18 @@ func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
 		}
 
 		// Capture by value for variables <= 128 bytes that are never reassigned.
-		n.SetByval(!loc.addrtaken && !loc.reassigned && n.Type().Size() <= 128)
-		if !n.Byval() {
-			n.SetAddrtaken(true)
-			if n.Sym().Name == typecheck.LocalDictName {
-				base.FatalfAt(n.Pos(), "dictionary variable not captured by value")
+		byval := !loc.addrtaken && !loc.reassigned && n.Type().Size() <= 128
+		if b.heapAnalysis == nil {
+			n.SetByval(byval)
+			if !byval {
+				n.SetAddrtaken(true)
+				if n.Sym().Name == typecheck.LocalDictName {
+					base.FatalfAt(n.Pos(), "dictionary variable not captured by value")
+				}
 			}
 		}
 
-		if base.Flag.LowerM > 1 {
+		if b.heapAnalysis == nil && base.Flag.LowerM > 1 {
 			how := "ref"
 			if n.Byval() {
 				how = "value"
@@ -278,7 +300,7 @@ func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
 
 		// Flow captured variables to closure.
 		k := k
-		if !cv.Byval() {
+		if !byval {
 			k = k.addr(cv, "reference")
 		}
 		b.flow(k.note(cv, "captured by a closure"), loc)
@@ -428,7 +450,7 @@ func (b *batch) paramTag(fn *ir.Func, narg int, f *types.Field) string {
 	// Only report diagnostics for user code;
 	// not for wrappers generated around them.
 	// TODO(mdempsky): Generalize this.
-	diagnose := base.Flag.LowerM != 0 && !(fn.Wrapper() || fn.Dupok())
+	diagnose := b.heapAnalysis == nil && base.Flag.LowerM != 0 && !(fn.Wrapper() || fn.Dupok())
 
 	if len(fn.Body) == 0 {
 		// Assume that uintptr arguments must be held live across the call.
@@ -437,7 +459,9 @@ func (b *batch) paramTag(fn *ir.Func, narg int, f *types.Field) string {
 		// This really doesn't have much to do with escape analysis per se,
 		// but we are reusing the ability to annotate an individual function
 		// argument and pass those annotations along to importing code.
-		fn.Pragma |= ir.UintptrKeepAlive
+		if b.heapAnalysis == nil {
+			fn.Pragma |= ir.UintptrKeepAlive
+		}
 
 		if f.Type.IsUintptr() {
 			if diagnose {

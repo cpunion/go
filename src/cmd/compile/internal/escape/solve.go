@@ -138,7 +138,7 @@ func (b *batch) walk(s walkState, roots []*location, walkgen uint32, enqueue fun
 	// we don't have to worry about infinite negative cycles since
 	// we bound intermediate dereference counts to 0.
 
-	diagnose := base.Flag.LowerM >= 2 || logopt.Enabled()
+	diagnose := b.heapAnalysis == nil && (base.Flag.LowerM >= 2 || logopt.Enabled())
 	var paths map[*location]*walkPath
 	if diagnose {
 		paths = make(map[*location]*walkPath)

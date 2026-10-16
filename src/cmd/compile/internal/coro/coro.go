@@ -240,8 +240,11 @@ type Function struct {
 // Plan is the result of analyzing one package.
 type Plan struct {
 	Functions map[*ir.Func]*Function
-	cgoDirect map[string]cgoDirectCall
-	localFunc map[string]*ir.Func
+	// HeapLocals retains source escape facts across lowering. A nil map
+	// conservatively gives address-taken variables independent storage.
+	HeapLocals map[*ir.Name]bool
+	cgoDirect  map[string]cgoDirectCall
+	localFunc  map[string]*ir.Func
 }
 
 // PublishSummaries makes this package's final effects available to the
