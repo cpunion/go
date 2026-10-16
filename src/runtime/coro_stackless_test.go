@@ -1325,14 +1325,25 @@ func runStacklessCoroSelfFrames(t *testing.T, tracker *stacklessCoroSelfFrameTra
 }
 
 type stacklessCoroSelfFrameLoopTracker struct {
-	completed int
-	continued int
+	completed      int
+	continued      int
+	badSwitchFlags int
+	depth          int
+	local          bool
+	queued         bool
+	siblingRan     atomic.Uint32
 }
 
 var stacklessCoroSelfFrameLoopActive *stacklessCoroSelfFrameLoopTracker
 
 func stacklessCoroSelfFrameLoopResume(ctx unsafe.Pointer) uint8 {
 	tracker := stacklessCoroSelfFrameLoopActive
+	await := runtime.AwaitStacklessCoroSelfFrameForTest
+	complete := runtime.CompleteStacklessCoroSelfFrameForTest
+	if tracker.local {
+		await = runtime.AwaitStacklessCoroLocalSelfFrameForTest
+		complete = runtime.CompleteStacklessCoroLocalSelfFrameForTest
+	}
 	for {
 		frame := (*runtime.StacklessCoroSelfFrameForTest)(
 			runtime.FrameStacklessCoroForTest(ctx))
@@ -1344,8 +1355,14 @@ func stacklessCoroSelfFrameLoopResume(ctx unsafe.Pointer) uint8 {
 				if frame.Parent == nil {
 					return runtime.StacklessCoroActionComplete
 				}
-				action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+				action = complete(ctx)
 				break
+			}
+			if frame.Depth == tracker.depth && tracker.queued {
+				runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+					tracker.siblingRan.Store(1)
+					return runtime.StacklessCoroActionComplete
+				})
 			}
 			childPointer := runtime.TakeStacklessCoroSelfFrameForTest(ctx,
 				stacklessCoroSelfFrameLoopResume)
@@ -1356,21 +1373,26 @@ func stacklessCoroSelfFrameLoopResume(ctx unsafe.Pointer) uint8 {
 			*(*runtime.StacklessCoroSelfFrameForTest)(childPointer) =
 				runtime.StacklessCoroSelfFrameForTest{Depth: frame.Depth - 1}
 			frame.State = 1
-			action = runtime.AwaitStacklessCoroSelfFrameForTest(ctx,
+			action = await(ctx,
 				childPointer, stacklessCoroSelfFrameLoopResume)
 		case 1:
 			tracker.completed++
 			if frame.Parent == nil {
 				return runtime.StacklessCoroActionComplete
 			}
-			action = runtime.CompleteStacklessCoroSelfFrameForTest(ctx)
+			action = complete(ctx)
 		default:
 			return runtime.StacklessCoroActionInvalid
 		}
 		if action != runtime.StacklessCoroActionSwitch {
 			return action
 		}
-		runtime.ContinueStacklessCoroSelfFrameForTest(ctx)
+		if runtime.StacklessCoroSelfFrameSwitchPendingForTest(ctx) == tracker.local {
+			tracker.badSwitchFlags++
+		}
+		if !tracker.local {
+			runtime.ContinueStacklessCoroSelfFrameForTest(ctx)
+		}
 		tracker.continued++
 	}
 }
@@ -1383,21 +1405,40 @@ func TestStacklessCoroSelfFrameLoop(t *testing.T) {
 	depth := runtime.StacklessCoroTaskCacheSize +
 		runtime.StacklessCoroFrameChunkDirectCount +
 		2*runtime.StacklessCoroFrameChunkSize
-	tracker := new(stacklessCoroSelfFrameLoopTracker)
-	stacklessCoroSelfFrameLoopActive = tracker
-	root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
-	runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
-		stacklessCoroSelfFrameLoopResume)
-	if tracker.completed != depth+1 {
-		t.Fatalf("completed frames = %d, want %d", tracker.completed, depth+1)
-	}
-	wantContinued := 2 * depth
-	if runtime.Raceenabled {
-		wantContinued = 0
-	}
-	if tracker.continued != wantContinued {
-		t.Fatalf("local frame continuations = %d, want %d",
-			tracker.continued, wantContinued)
+	for _, test := range []struct {
+		name   string
+		local  bool
+		queued bool
+	}{
+		{"scheduler", false, false},
+		{"local", true, false},
+		{"scheduler/queued", false, true},
+		{"local/queued", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracker := &stacklessCoroSelfFrameLoopTracker{
+				depth: depth, local: test.local, queued: test.queued,
+			}
+			stacklessCoroSelfFrameLoopActive = tracker
+			root := &runtime.StacklessCoroSelfFrameForTest{Depth: depth}
+			runtime.RunStacklessCoroFrameForTest(unsafe.Pointer(root),
+				stacklessCoroSelfFrameLoopResume)
+			if tracker.completed != depth+1 || tracker.badSwitchFlags != 0 {
+				t.Fatalf("completed frames = %d, bad switch flags = %d; want %d, 0",
+					tracker.completed, tracker.badSwitchFlags, depth+1)
+			}
+			if test.queued && tracker.siblingRan.Load() != 1 {
+				t.Fatal("queued sibling did not run")
+			}
+			wantContinued := 2 * depth
+			if runtime.Raceenabled {
+				wantContinued = 0
+			}
+			if !test.queued && tracker.continued != wantContinued {
+				t.Fatalf("local frame continuations = %d, want %d",
+					tracker.continued, wantContinued)
+			}
+		})
 	}
 }
 

@@ -1894,9 +1894,11 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 }
 
 // coroAwaitSelfFrame switches a homogeneous structured self-await to its next
-// frame while preserving the original fast-path scheduling behavior.
+// frame while preserving the original fast-path scheduling behavior. A caller
+// that consumes Switch before returning from resume sets localSwitch, avoiding
+// publication of a switch for runTasks to consume.
 func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
-	child stacklessCoroResume) uint8 {
+	child stacklessCoroResume, localSwitch bool) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -1936,7 +1938,9 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		context.frame = frame
 		parent.setFlag(stacklessCoroTaskFusedFrames, true)
 		if s.runnableState.Load() == 0 {
-			parent.setFlag(stacklessCoroTaskSwitchPending, true)
+			if !localSwitch {
+				parent.setFlag(stacklessCoroTaskSwitchPending, true)
+			}
 			return stacklessCoroActionSwitch
 		}
 		return stacklessCoroActionYield
@@ -1985,7 +1989,9 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 	context.frame = frame
 	parent.setFlag(stacklessCoroTaskFusedFrames, true)
 	if s.head == nil {
-		parent.setFlag(stacklessCoroTaskSwitchPending, true)
+		if !localSwitch {
+			parent.setFlag(stacklessCoroTaskSwitchPending, true)
+		}
 		unlock(&s.lock)
 		return stacklessCoroActionSwitch
 	}
@@ -1994,7 +2000,8 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 }
 
 // coroCompleteSelfFrame restores a suspended homogeneous parent frame.
-func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
+// localSwitch has the same meaning as in coroAwaitSelfFrame.
+func coroCompleteSelfFrame(ctx unsafe.Pointer, localSwitch bool) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -2029,7 +2036,9 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 			cacheStacklessCoroNativeSelfFrame(task.resume, frame, allocation)
 		}
 		if s.runnableState.Load() == 0 {
-			task.setFlag(stacklessCoroTaskSwitchPending, true)
+			if !localSwitch {
+				task.setFlag(stacklessCoroTaskSwitchPending, true)
+			}
 			return stacklessCoroActionSwitch
 		}
 		return stacklessCoroActionYield
@@ -2077,28 +2086,14 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer) uint8 {
 		s.recycleTaskLocked(owner)
 	}
 	if s.head == nil {
-		task.setFlag(stacklessCoroTaskSwitchPending, true)
+		if !localSwitch {
+			task.setFlag(stacklessCoroTaskSwitchPending, true)
+		}
 		unlock(&s.lock)
 		return stacklessCoroActionSwitch
 	}
 	unlock(&s.lock)
 	return stacklessCoroActionYield
-}
-
-// coroContinueSelfFrame consumes an uncontended homogeneous frame switch while
-// compiler-generated code remains in the current resume invocation. A running
-// task owns this transition exclusively, as it does when runTasks consumes the
-// same action after a resume call returns.
-func coroContinueSelfFrame(ctx unsafe.Pointer) {
-	context := (*stacklessCoroContext)(ctx)
-	task := context.task()
-	if context == nil || context.scheduler == nil || task == nil ||
-		!task.hasFlag(stacklessCoroTaskSwitchPending) ||
-		task.state != stacklessCoroTaskRunning || !task.resuming ||
-		task.readyPending {
-		throw("runtime: invalid stackless coroutine local frame switch")
-	}
-	task.setFlag(stacklessCoroTaskSwitchPending, false)
 }
 
 // coroRequestFusedFrame marks the next local ABI 3 factory call as a

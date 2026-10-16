@@ -553,6 +553,18 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 			}
 			name := symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun)))
 			runtimeCalls[name]++
+			args := 0
+			switch name {
+			case "runtime.coroAwaitSelfFrame":
+				args = 4
+			case "runtime.coroCompleteSelfFrame":
+				args = 2
+			}
+			if args != 0 && (len(call.Args) != args ||
+				!ir.IsConst(call.Args[args-1], constant.Bool) ||
+				!ir.BoolVal(call.Args[args-1])) {
+				t.Errorf("%s does not request a local switch", name)
+			}
 		})
 	}
 	if runtimeCalls["runtime.coroRequestFusedFrame"] != 0 {
@@ -569,8 +581,8 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 				runtimeCalls[name], name)
 		}
 	}
-	if runtimeCalls["runtime.coroContinueSelfFrame"] != 2 {
-		t.Errorf("lowered recursive function has %d local frame continuations, want two",
+	if runtimeCalls["runtime.coroContinueSelfFrame"] != 0 {
+		t.Errorf("lowered recursive function has %d local frame continuation calls, want none",
 			runtimeCalls["runtime.coroContinueSelfFrame"])
 	}
 	if runtimeCalls["runtime.coroTerminalAction"] != 1 {

@@ -124,11 +124,15 @@ func main() {
 			assembly := string(out)
 			for _, helper := range []string{
 				"runtime.coroTakeSelfFrame(SB)",
-				"runtime.coroContinueSelfFrame(SB)",
+				"runtime.coroAwaitSelfFrame(SB)",
+				"runtime.coroCompleteSelfFrame(SB)",
 			} {
 				if !strings.Contains(assembly, helper) {
 					t.Fatalf("missing %s; self-frame path was not selected:\n%s", helper, assembly)
 				}
+			}
+			if strings.Contains(assembly, "runtime.coroContinueSelfFrame(SB)") {
+				t.Fatalf("local self-frame switch uses a separate continuation call:\n%s", assembly)
 			}
 			if got := strings.Count(assembly, "runtime.coroTerminalAction(SB)"); got != 1 {
 				t.Fatalf("self-frame terminal queries = %d, want one at resume entry:\n%s", got, assembly)

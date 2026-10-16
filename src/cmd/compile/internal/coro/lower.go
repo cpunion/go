@@ -3746,9 +3746,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				if fusedAwait {
 					helper := "coroAwaitFusedFrame"
 					edge := edgeForCall(function, state.call)
-					if edge.Callee == fn && candidate.fusedSelf &&
-						!candidate.fusedResume {
+					if edge.Callee == fn && localSelfFrames {
 						helper = "coroAwaitSelfFrame"
+						args = append(args, ir.NewBool(pos, true))
 					}
 					actionResult = typecheck.Call(state.call.Pos(),
 						typecheck.LookupRuntime(helper),
@@ -4090,7 +4090,7 @@ func explicitFrameField(pos src.XPos, frame ir.Node,
 	return selector
 }
 
-func rewriteSelfFrameSwitches(resume *ir.Func, ctx ir.Node,
+func rewriteSelfFrameSwitches(resume *ir.Func,
 	action *ir.Name, reload *types.Sym) {
 	await := typecheck.LookupRuntime("coroAwaitSelfFrame").Sym()
 	complete := typecheck.LookupRuntime("coroCompleteSelfFrame").Sym()
@@ -4114,13 +4114,9 @@ func rewriteSelfFrameSwitches(resume *ir.Func, ctx ir.Node,
 		pos := ret.Pos()
 		isSwitch := ir.NewBinaryExpr(pos, ir.OEQ, action,
 			typedInt(pos, types.Types[types.TUINT8], int64(actionSwitch)))
-		consume := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroContinueSelfFrame"),
-			ir.Nodes{ctx}, false)
 		return ir.NewBlockStmt(pos, ir.Nodes{
 			ir.NewAssignStmt(pos, action, call),
 			ir.NewIfStmt(pos, isSwitch, ir.Nodes{
-				consume,
 				ir.NewBranchStmt(pos, ir.OGOTO, reload),
 			}, nil),
 			ir.NewReturnStmt(pos, []ir.Node{action}),
@@ -4249,12 +4245,14 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
 					ir.NewNilExpr(ret.Pos(), fusedParentField.Type))
 				completionHelper := "coroCompleteFusedFrame"
+				args := ir.Nodes{resume.Dcl[0]}
 				if selfOnly {
 					completionHelper = "coroCompleteSelfFrame"
+					args = append(args, ir.NewBool(pos, true))
 				}
 				action := typecheck.Call(ret.Pos(),
 					typecheck.LookupRuntime(completionHelper),
-					ir.Nodes{resume.Dcl[0]}, false)
+					args, false)
 				completion = append(completion, ir.NewIfStmt(ret.Pos(),
 					hasParent, ir.Nodes{ir.NewReturnStmt(ret.Pos(),
 						[]ir.Node{action})}, nil))
@@ -4280,7 +4278,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		reloadFrame = resume.Sym().Pkg.LookupNum(".coroReload",
 			int(resume.Label))
 		resume.Label++
-		rewriteSelfFrameSwitches(resume, ctx, switchAction, reloadFrame)
+		rewriteSelfFrameSwitches(resume, switchAction, reloadFrame)
 	}
 	unsafePointerType := types.Types[types.TUNSAFEPTR]
 	packetPointer := typecheck.ConvNop(ctx, types.NewPtr(unsafePointerType))
