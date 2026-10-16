@@ -158,10 +158,36 @@ func testStacklessCoroSemaphoreRetry(t *testing.T, mode string, plain bool) {
 		if n, _ := runtime.BlockProfile(nil); n == 0 {
 			t.Fatal("logical semaphore wait did not record a block event")
 		}
+		checkStacklessCoroSemaphoreBlockFrames(t)
 	}
 	if !plain && (mode == "profile" || mode == "mutexprofile") {
 		if n, _ := runtime.MutexProfile(nil); n == 0 {
 			t.Fatal("logical semaphore release did not record a mutex event")
+		}
+	}
+}
+
+func checkStacklessCoroSemaphoreBlockFrames(t *testing.T) {
+	t.Helper()
+	var records []runtime.BlockProfileRecord
+	for {
+		n, _ := runtime.BlockProfile(nil)
+		records = make([]runtime.BlockProfileRecord, n)
+		if n, ok := runtime.BlockProfile(records); ok {
+			records = records[:n]
+			break
+		}
+	}
+	for _, record := range records {
+		frames := runtime.CallersFrames(record.Stack())
+		for {
+			frame, more := frames.Next()
+			if strings.HasPrefix(frame.Function, "runtime.coroSemacquire") {
+				t.Errorf("block profile exposes semaphore implementation frame %s", frame.Function)
+			}
+			if !more {
+				break
+			}
 		}
 	}
 }

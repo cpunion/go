@@ -133,7 +133,8 @@ func coroSemreleasePoll(ctx unsafe.Pointer, addr *uint32) bool {
 
 func (w *stacklessCoroSemaWaiter) finish(state *unsafe.Pointer) {
 	if w.waiter.releasetime > 0 {
-		blockevent(w.waiter.releasetime-w.startTime, 3+w.skipframes)
+		// The shared acquire helper adds a frame below the declaration entry.
+		blockevent(w.waiter.releasetime-w.startTime, 4+w.skipframes)
 	}
 	w.waiter.coro.clear()
 	w.waiter.ticket = 0
