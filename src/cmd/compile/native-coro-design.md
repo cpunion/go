@@ -3049,6 +3049,19 @@ and ownership lifetimes. Any frame arena or batch design must preserve those
 typed roots and bounded retention before it can replace the current one-frame
 allocation policy.
 
+For a four-byte generated frame on a target with larger pointers, the frame
+cannot contain a pointer. Such frame reservations can pair four task headers
+with four typed `uint32` slots in one allocation, after the same bounded direct
+prefix. Only never-used slots can carry this scalar storage: cache extraction
+clears old typed frames, initialization replaces the unused slot's context,
+and discarding unused slots clears their interior pointers. No additional flag
+or active-task state is needed. Ordinary and pointer-bearing reservations
+preserve the existing cache priority and never receive scalar storage. Race and 32-bit
+paths do not pair frames, and the logical task header and cache bounds do not
+grow. Partly used or mixed-size chunks can retain unused scalar capacity, so
+this representation reduces allocation events without promising a byte saving
+for every workload.
+
 ### 15.8 Saturated typed-frame chunks
 
 The task-slab change leaves compiler-generated frames as the larger remaining

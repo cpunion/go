@@ -191,6 +191,15 @@ type stacklessCoroTask struct {
 	context      stacklessCoroContext
 }
 
+// stacklessCoroScalarTaskChunk pairs task identities with pointer-free frames.
+// The scalar slots are used only when a complete generated frame fits in one
+// uint32 on a target whose pointers are larger. The ordinary typed allocation
+// keeps task pointers visible to the GC even when only a scalar slot is rooted.
+type stacklessCoroScalarTaskChunk struct {
+	tasks  [stacklessCoroTaskChunkSize]stacklessCoroTask
+	frames [stacklessCoroTaskChunkSize]uint32
+}
+
 func (task *stacklessCoroTask) hasFlag(flag stacklessCoroTaskFlags) bool {
 	return task.flags&flag != 0
 }
@@ -851,7 +860,61 @@ func (s *stacklessCoroScheduler) newFrameReservationTaskLocked(
 		return initializeStacklessCoroTask(new(stacklessCoroTask), nil,
 			resume, parent)
 	}
+	if !raceenabled && size == unsafe.Sizeof(uint32(0)) &&
+		size < unsafe.Sizeof(uintptr(0)) {
+		return s.newScalarFrameTaskLocked(resume, parent)
+	}
 	return s.newTaskLocked(nil, resume, parent)
+}
+
+// newScalarFrameTaskLocked follows the ordinary task-cache priority, but can
+// consume the scalar storage of a never-used paired slot before initialization
+// replaces its context. A cached task may still require a separate frame.
+func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
+	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
+	var task *stacklessCoroTask
+	if s.overflowTaskCounts&stacklessCoroFreeTaskChunkMask != 0 {
+		task = s.takeFreeTaskChunkSlotLocked(false)
+	} else {
+		task = s.takeFreeTaskLocked()
+	}
+	if task == nil {
+		task = s.allocateScalarFrameTasksLocked()
+	}
+	// Cache extraction clears old typed frames. A remaining frame can only
+	// be an unused scalar slot supplied by allocateScalarFrameTasksLocked.
+	frame := task.context.frame
+	if frame != nil {
+		*(*uint32)(frame) = 0
+	}
+	return initializeStacklessCoroTask(task, frame, resume, parent)
+}
+
+// allocateScalarFrameTasksLocked preserves the ordinary direct prefix and
+// batches only the later pointer-free frame reservations. The active task has
+// no extra fields or flags after initializeStacklessCoroTask returns.
+//
+//go:noinline
+func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoroTask {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask <
+		stacklessCoroDirectBatchedTaskCount {
+		return s.allocateBatchedTaskLocked()
+	}
+	chunk := new(stacklessCoroScalarTaskChunk)
+	first := &chunk.tasks[0]
+	first.context.frame = unsafe.Pointer(&chunk.frames[0])
+	for i := 1; i < len(chunk.tasks); i++ {
+		task := &chunk.tasks[i]
+		task.context.frame = unsafe.Pointer(&chunk.frames[i])
+		task.flags = stacklessCoroTaskFreeChunk
+		task.frameSize = stacklessCoroFreeBatchedTask
+		task.next = s.freeTasks
+		s.freeTasks = task
+	}
+	s.batchedTaskCounts |= uint8(stacklessCoroTaskChunkSize-1) <<
+		stacklessCoroFreeBatchedTaskCountShift
+	s.overflowTaskCounts |= stacklessCoroFreeBatchedTaskPresent
+	return first
 }
 
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
@@ -1102,6 +1165,7 @@ func (s *stacklessCoroScheduler) discardFreeBatchedTasks() {
 			task.frameSize == stacklessCoroFreeBatchedTask {
 			*link = task.next
 			task.next = nil
+			task.context.frame = nil
 			s.batchedTaskCounts -= 1 << stacklessCoroFreeBatchedTaskCountShift
 			if s.batchedTaskCounts < 1<<stacklessCoroFreeBatchedTaskCountShift {
 				s.overflowTaskCounts &^= stacklessCoroFreeBatchedTaskPresent
