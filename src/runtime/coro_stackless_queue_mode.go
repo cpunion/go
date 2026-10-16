@@ -6,6 +6,8 @@
 
 package runtime
 
+const stacklessCoroQueueComparison = false
+
 // stacklessCoroIsPullComparison is constant in ordinary builds, allowing the
 // compiler to remove the measurement-only queue policy from the hot path.
 func stacklessCoroIsPullComparison(*stacklessCoroScheduler) bool {
