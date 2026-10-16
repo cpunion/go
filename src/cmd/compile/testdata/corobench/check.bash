@@ -218,15 +218,17 @@ for function in "${expected[@]}"; do
 		exit 1
 	fi
 done
+# Like testing.AllocsPerRun, measure reuse with one P so scheduler startup on
+# other Ps is not charged to steady-state frame allocation.
 if ! "$test_binary" -test.run '^$' \
 	-test.bench '^(BenchmarkYieldEntry|BenchmarkHeterogeneousFrameCacheReplacement)$' \
-	-test.benchmem -test.benchtime=10000x -test.count=3 \
+	-test.benchmem -test.benchtime=10000x -test.count=3 -test.cpu=1 \
 	>"$allocation_output"; then
 	tail -n 100 "$allocation_output" >&2
 	exit 1
 fi
 if ! awk '
-	$1 ~ /^Benchmark(YieldEntry|HeterogeneousFrameCacheReplacement)-/ {
+	$1 ~ /^Benchmark(YieldEntry|HeterogeneousFrameCacheReplacement)(-[0-9]+)?$/ {
 		samples++
 		for (i = 2; i <= NF; i++) {
 			if (($i == "B/op" || $i == "allocs/op") && $(i - 1) != 0) {
