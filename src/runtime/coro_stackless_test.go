@@ -6909,11 +6909,13 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 
 	var writes atomic.Int32
 	var writeFailed atomic.Bool
+	done := make(chan struct{}, rounds)
 	sibling := func(unsafe.Pointer) uint8 {
 		if _, err := syscall.Write(fds[1], []byte{'p'}); err != nil {
 			writeFailed.Store(true)
 		}
 		writes.Add(1)
+		done <- struct{}{}
 		return runtime.StacklessCoroActionComplete
 	}
 	var state int
@@ -6940,6 +6942,17 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+	// Reading a byte does not wait for the writer's accounting, and the root
+	// task can finish before its siblings. Join them before checking the totals.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for range rounds {
+		select {
+		case <-done:
+		case <-deadline.C:
+			t.Fatal("replacement executor write did not finish")
+		}
+	}
 	if writeFailed.Load() {
 		t.Fatal("replacement executor write failed")
 	}
