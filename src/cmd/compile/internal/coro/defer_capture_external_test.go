@@ -43,8 +43,10 @@ func (c counter) result(seed int) (value int) {
 }
 
 func repeated(count int) (value int) {
-	for i := 0; i < count; i++ {
-		defer func() { value += func() int { return i }() }()
+	i := 0
+	for ; i < count; i++ {
+		copy := i
+		defer func() { value += func() int { return copy }() }()
 	}
 	gcRequest <- true
 	<-gcDone
@@ -112,10 +114,16 @@ func main() {
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
-				for _, name := range []string{"counter.result", "repeated", "recovered", "exiting"} {
+				for _, name := range []string{"counter.result", "recovered", "exiting"} {
 					if !strings.Contains(string(symbols), "main."+name+".coro") {
 						t.Errorf("missing native factory %s\n%s", name, out)
 					}
+				}
+				// Repeated nested captures still use the existing conservative
+				// fallback unless inlining removes the nested closure.
+				if config.name != "inline" && !strings.Contains(string(out),
+					"coro: skip main.repeated: nested repeated source defer capture") {
+					t.Errorf("repeated nested capture did not preserve its fallback boundary\n%s", out)
 				}
 			}
 			run := testenv.Command(t, exe)
