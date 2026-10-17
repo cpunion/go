@@ -47,9 +47,15 @@ func TestCallback(t *testing.T) {
 	}
 }
 
+var pointerRoot **uint64
+
 func TestPointerCheck(t *testing.T) {
 	value := uint64(42)
 	p := &value
+	// Force both objects onto the heap: the runtime does not inspect the
+	// contents of unknown stack pointers in cgoCheckUnknownPointer.
+	pointerRoot = &p
+	defer func() { pointerRoot = nil }()
 	defer func() {
 		got := recover()
 		if got == nil || !strings.Contains(got.(error).Error(), "cgo argument has Go pointer to unpinned Go pointer") {
@@ -62,6 +68,8 @@ func TestPointerCheck(t *testing.T) {
 func TestPinnedPointer(t *testing.T) {
 	value := uint64(42)
 	p := &value
+	pointerRoot = &p
+	defer func() { pointerRoot = nil }()
 	var pins runtime.Pinner
 	pins.Pin(p)
 	defer pins.Unpin()
