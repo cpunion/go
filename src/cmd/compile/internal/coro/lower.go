@@ -3273,23 +3273,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A repeated site snapshots each capture before constructing its wrapper;
 	// otherwise every registration would observe the last value written to
 	// the shared frame slot.
-	rewriteLiteralCapture := func(fn *ir.Func, variable, pointer *ir.Name) {
-		var rewrite func(ir.Node) ir.Node
-		rewrite = func(node ir.Node) ir.Node {
-			if node == variable {
-				return typedDeref(node.Pos(), pointer, variable.Type())
-			}
-			ir.EditChildren(node, rewrite)
-			return node
-		}
-		for i, stmt := range fn.Body {
-			fn.Body[i] = rewrite(stmt)
-		}
-		fn.ClosureVars = slices.DeleteFunc(fn.ClosureVars,
-			func(candidate *ir.Name) bool {
-				return candidate == variable
-			})
-	}
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
 		if deferred.directGoexit {
@@ -3333,7 +3316,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					cell.Type())
 				pointer := ir.NewClosureVar(variable.Pos(), closure.Func,
 					snapshot)
-				rewriteLiteralCapture(closure.Func, variable, pointer)
+				rewriteDeferCapture(closure.Func, variable, pointer)
 				deferred.captures = append(deferred.captures,
 					lowerDeferCapture{
 						source: capture(cell), snapshot: snapshot,
