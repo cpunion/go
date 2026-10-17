@@ -14,7 +14,7 @@ func TestStableTerminalAction(t *testing.T) {
 	}{
 		{"await", func(*lowerCandidate) {}, true},
 		{"yield", func(c *lowerCandidate) { c.function.Sites = append(c.function.Sites, Site{Kind: SiteYield}) }, true},
-		{"child-terminal", func(c *lowerCandidate) { c.function.Terminal = MayPanic | MayGoexit }, true},
+		{"child-terminal", func(c *lowerCandidate) { c.function.Terminal = MayPanic | MayGoexit }, false},
 		{"no-factory", func(c *lowerCandidate) { c.factoryABI = NoFactory }, false},
 		{"closure-factory", func(c *lowerCandidate) { c.factoryABI = FactoryABI1 }, false},
 		{"explicit-factory", func(c *lowerCandidate) { c.factoryABI = FactoryABI2 }, false},

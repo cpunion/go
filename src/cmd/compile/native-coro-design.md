@@ -4071,8 +4071,9 @@ A fused resume that has no deferred calls and only await/yield operation sites
 can retain its entry terminal-action query until completion. Both operations
 return from the resume before another logical frame runs. An ordinary Go panic
 unwinds the resume, and the subsequent invocation queries the outcome again.
-Inherited child panic and Goexit outcomes therefore still propagate through a
-fresh entry query; an explicit local panic/Goexit site is not eligible.
+An implicit child panic therefore still propagates through a fresh entry
+query. Known terminal effects, including explicit panic/Goexit and their
+callers, retain the existing factory restrictions and are not eligible.
 
 This avoids one repeated runtime query on the normal completion path without
 removing entry validation, changing scheduler locking, extending cache budgets

@@ -1506,7 +1506,8 @@ func (candidate *lowerCandidate) localSelfFrameLoop() bool {
 // deferred calls can update the outcome within this invocation.
 func (candidate *lowerCandidate) stableTerminalAction() bool {
 	if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
-		len(candidate.defers) != 0 || len(candidate.function.Sites) == 0 {
+		len(candidate.defers) != 0 || candidate.function.Terminal != 0 ||
+		len(candidate.function.Sites) == 0 {
 		return false
 	}
 	for _, site := range candidate.function.Sites {

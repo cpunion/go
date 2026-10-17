@@ -30,9 +30,7 @@ var pointer *int
 
 func leaf(mode int) int {
 	runtime.Gosched()
-	if mode == 1 { panic(42) }
 	if mode == 2 { return *pointer }
-	if mode == 3 { runtime.Goexit() }
 	return 42
 }
 
@@ -54,15 +52,40 @@ func second(depth, mode int) int {
 	return value+1
 }
 
+func terminalLeaf(mode int) int {
+	runtime.Gosched()
+	if mode == 1 { panic(42) }
+	if mode == 3 { runtime.Goexit() }
+	return 42
+}
+
+func third(depth, mode int) int {
+	if depth == 0 {
+		value := terminalLeaf(mode)
+		return value
+	}
+	value := fourth(depth-1, mode)
+	return value+1
+}
+
+func fourth(depth, mode int) int {
+	if depth == 0 {
+		value := terminalLeaf(mode)
+		return value
+	}
+	value := third(depth-1, mode)
+	return value+1
+}
+
 func recovered(mode int) (value any) {
 	defer func() { value = recover() }()
-	first(129, mode)
+	if mode == 2 { first(129, mode) } else { third(129, mode) }
 	return nil
 }
 
 func exiting(done chan bool) {
 	defer close(done)
-	first(129, 3)
+	third(129, 3)
 	panic("Goexit returned")
 }
 
@@ -111,7 +134,7 @@ func main() {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			native := config.experiment == "coro" && config.name != "race"
-			for _, name := range []string{"first", "second", "leaf"} {
+			for _, name := range []string{"first", "second", "leaf", "third", "fourth", "terminalLeaf"} {
 				if got := strings.Contains(string(symbols), "main."+name+".coro"); got != native {
 					t.Errorf("%s native factory = %v, want %v\n%s", name, got, native, out)
 				}
@@ -121,8 +144,8 @@ func main() {
 				dump := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s", "main\\."+name+"\\.coro\\.func1$", exe)
 				out, err := dump.CombinedOutput()
 				want := 1
-				if name == "leaf" {
-					want = 2 // Explicit panic and Goexit still require a fresh query.
+				if name == "third" || name == "fourth" || name == "terminalLeaf" {
+					want = 2 // Known terminal effects retain the conservative path.
 				}
 				if got := strings.Count(string(out), "CALL runtime.coroTerminalAction"); err != nil || got != want {
 					t.Errorf("%s: %d terminal queries, want %d: %v\n%s", name, got, want, err, out)
