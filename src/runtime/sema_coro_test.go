@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,9 +27,13 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 	if mode := os.Getenv("GO_TEST_CORO_SEMAPHORE"); mode != "" {
 		switch mode {
 		case "fast", "retry", "profile", "mutexprofile":
-			testStacklessCoroSemaphoreRetry(t, mode)
+			testStacklessCoroSemaphoreRetry(t, mode, false)
+		case "plainfast", "plainretry", "plainprofile":
+			testStacklessCoroSemaphoreRetry(t, strings.TrimPrefix(mode, "plain"), true)
 		case "fifo", "lifo":
-			testStacklessCoroSemaphoreMixed(t, mode == "lifo")
+			testStacklessCoroSemaphoreMixed(t, mode == "lifo", false)
+		case "plainfifo":
+			testStacklessCoroSemaphoreMixed(t, false, true)
 		case "contention", "handoff":
 			testStacklessCoroSemaphoreContention(t, mode == "handoff")
 		case "sibling":
@@ -39,7 +44,7 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 		return
 	}
 	for _, procs := range []int{1, 4} {
-		for _, mode := range []string{"fast", "retry", "profile", "mutexprofile", "fifo", "lifo", "contention", "handoff", "sibling"} {
+		for _, mode := range []string{"fast", "retry", "profile", "mutexprofile", "fifo", "lifo", "contention", "handoff", "sibling", "plainfast", "plainretry", "plainprofile", "plainfifo"} {
 			t.Run(mode+"/P"+strconv.Itoa(procs), func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -55,13 +60,20 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 	}
 }
 
-func testStacklessCoroSemaphoreRetry(t *testing.T, mode string) {
+func testStacklessCoroSemaphoreRetry(t *testing.T, mode string, plain bool) {
+	acquire := stacklessCoroSemaphoreAcquire(plain)
 	var sema uint32
 	var state unsafe.Pointer
 	if mode == "fast" {
 		sema = 1
+		if plain {
+			sema = 0
+		}
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if runtime.SemacquireMutexStacklessCoroForTest(ctx, &sema, false, &state) {
+			if plain && runtime.SemreleasePollStacklessCoroForTest(ctx, &sema) {
+				panic("plain release requested a handoff")
+			}
+			if acquire(ctx, &sema, false, &state) {
 				panic("ready semaphore blocked")
 			}
 			return runtime.StacklessCoroActionComplete
@@ -72,7 +84,7 @@ func testStacklessCoroSemaphoreRetry(t *testing.T, mode string) {
 		ctx := runtime.NewStacklessCoroSemaphoreContextForTest()
 		if allocs := testing.AllocsPerRun(100, func() {
 			sema = 1
-			waiting := runtime.SemacquireMutexStacklessCoroForTest(ctx, &sema, false, &state)
+			waiting := acquire(ctx, &sema, false, &state)
 			if waiting || sema != 0 || state != nil {
 				t.Fatal("ready acquisition did not consume the token without state")
 			}
@@ -91,12 +103,20 @@ func testStacklessCoroSemaphoreRetry(t *testing.T, mode string) {
 	}
 	step := 0
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-		waiting := runtime.SemacquireMutexStacklessCoroForTest(ctx, &sema, false, &state)
+		waiting := acquire(ctx, &sema, false, &state)
 		switch step {
 		case 0:
 			if !waiting || state == nil {
 				panic("empty semaphore did not queue")
 			}
+			if mode == "profile" {
+				block, mutex := runtime.SemaphoreProfileStacklessCoroForTest(state)
+				if !block || mutex == plain {
+					panic("semaphore initialized the wrong profiling state")
+				}
+			}
+			// Acquisition has marked this task Waiting. Simulate a release from
+			// outside the task; the logical release entry requires a running task.
 			runtime.Semrelease1(&sema, false, 0)
 			// A normal wakeup does not reserve ownership. Steal the token
 			// before this resume returns Wait, forcing an early-ready retry.
@@ -138,15 +158,58 @@ func testStacklessCoroSemaphoreRetry(t *testing.T, mode string) {
 		if n, _ := runtime.BlockProfile(nil); n == 0 {
 			t.Fatal("logical semaphore wait did not record a block event")
 		}
+		checkStacklessCoroSemaphoreBlockFrames(t)
 	}
-	if mode == "profile" || mode == "mutexprofile" {
+	if !plain && (mode == "profile" || mode == "mutexprofile") {
 		if n, _ := runtime.MutexProfile(nil); n == 0 {
 			t.Fatal("logical semaphore release did not record a mutex event")
 		}
 	}
 }
 
-func testStacklessCoroSemaphoreMixed(t *testing.T, lifo bool) {
+func checkStacklessCoroSemaphoreBlockFrames(t *testing.T) {
+	t.Helper()
+	var records []runtime.BlockProfileRecord
+	for {
+		n, _ := runtime.BlockProfile(nil)
+		records = make([]runtime.BlockProfileRecord, n)
+		if n, ok := runtime.BlockProfile(records); ok {
+			records = records[:n]
+			break
+		}
+	}
+	for _, record := range records {
+		frames := runtime.CallersFrames(record.Stack())
+		for {
+			frame, more := frames.Next()
+			if strings.HasPrefix(frame.Function, "runtime.coroSemacquire") {
+				t.Errorf("block profile exposes semaphore implementation frame %s", frame.Function)
+			}
+			if !more {
+				break
+			}
+		}
+	}
+}
+
+func stacklessCoroSemaphoreAcquire(plain bool) func(unsafe.Pointer, *uint32, bool, *unsafe.Pointer) bool {
+	if !plain {
+		return runtime.SemacquireMutexStacklessCoroForTest
+	}
+	return func(ctx unsafe.Pointer, addr *uint32, lifo bool, state *unsafe.Pointer) bool {
+		if lifo {
+			panic("plain semaphore requested LIFO acquisition")
+		}
+		return runtime.SemacquireStacklessCoroForTest(ctx, addr, state)
+	}
+}
+
+func testStacklessCoroSemaphoreMixed(t *testing.T, lifo, plain bool) {
+	acquire := stacklessCoroSemaphoreAcquire(plain)
+	ordinary := runtime.SemacquireMutexOrdinaryForTest
+	if plain {
+		ordinary = func(addr *uint32, _ bool, _ int) { runtime.SemacquireOrdinaryForTest(addr) }
+	}
 	runtime.SetBlockProfileRate(1)
 	defer runtime.SetBlockProfileRate(0)
 	old := runtime.SetMutexProfileFraction(1)
@@ -154,14 +217,20 @@ func testStacklessCoroSemaphoreMixed(t *testing.T, lifo bool) {
 	var sema uint32
 	done := make(chan int, 3)
 	go func() {
-		runtime.SemacquireMutexOrdinaryForTest(&sema, false, 0)
+		ordinary(&sema, false, 0)
 		done <- 1
 	}()
 	waitStacklessCoroSemaphoreQueue(&sema, 1, 0)
 	go func() {
 		var state unsafe.Pointer
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if runtime.SemacquireMutexStacklessCoroForTest(ctx, &sema, lifo, &state) {
+			if acquire(ctx, &sema, lifo, &state) {
+				if plain {
+					block, mutex := runtime.SemaphoreProfileStacklessCoroForTest(state)
+					if !block || mutex {
+						panic("plain semaphore initialized mutex profiling state")
+					}
+				}
 				return runtime.StacklessCoroActionWait
 			}
 			done <- 2
@@ -170,7 +239,7 @@ func testStacklessCoroSemaphoreMixed(t *testing.T, lifo bool) {
 	}()
 	waitStacklessCoroSemaphoreQueue(&sema, 1, 1)
 	go func() {
-		runtime.SemacquireMutexOrdinaryForTest(&sema, false, 0)
+		ordinary(&sema, false, 0)
 		done <- 3
 	}()
 	waitStacklessCoroSemaphoreQueue(&sema, 2, 1)
@@ -196,8 +265,12 @@ func testStacklessCoroSemaphoreMixed(t *testing.T, lifo bool) {
 	if n, _ := runtime.BlockProfile(nil); n == 0 {
 		t.Fatal("mixed semaphore wait did not record a block event")
 	}
-	if n, _ := runtime.MutexProfile(nil); n == 0 {
-		t.Fatal("mixed semaphore release did not record a mutex event")
+	// Runtime locks can contribute unrelated samples to the global profile.
+	// The plain waiter is checked directly above, before it can be released.
+	if !plain {
+		if n, _ := runtime.MutexProfile(nil); n == 0 {
+			t.Fatal("mixed semaphore release did not record a mutex event")
+		}
 	}
 }
 

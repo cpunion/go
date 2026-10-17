@@ -9,6 +9,16 @@ package runtime
 import "unsafe"
 
 var SemacquireMutexOrdinaryForTest = internal_sync_runtime_SemacquireMutex
+var SemacquireOrdinaryForTest = sync_runtime_Semacquire
+
+var SemacquireStacklessCoroForTest = coroSemacquire
+var SemreleasePollStacklessCoroForTest = coroSemreleasePoll
+
+func SemaphoreProfileStacklessCoroForTest(state unsafe.Pointer) (block, mutex bool) {
+	w := (*stacklessCoroSemaWaiter)(state)
+	return w.startTime != 0 && w.waiter.releasetime != 0,
+		w.waiter.acquiretime != 0
+}
 
 const StacklessCoroActionHandoff = stacklessCoroActionHandoff
 
