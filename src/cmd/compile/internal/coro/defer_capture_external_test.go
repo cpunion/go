@@ -5,12 +5,15 @@
 package coro_test
 
 import (
+	"context"
 	"internal/testenv"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNestedDeferCapture(t *testing.T) {
@@ -45,8 +48,8 @@ func (c counter) result(seed int) (value int) {
 func repeated(count int) (value int) {
 	i := 0
 	for ; i < count; i++ {
-		copy := i
-		defer func() { value += func() int { return copy }() }()
+		iteration := i
+		defer func() { value += func() int { return iteration }() }()
 	}
 	gcRequest <- true
 	<-gcDone
@@ -126,10 +129,15 @@ func main() {
 					t.Errorf("repeated nested capture did not preserve its fallback boundary\n%s", out)
 				}
 			}
-			run := testenv.Command(t, exe)
-			run.Env = append(run.Environ(), "GOMAXPROCS=1", "GOGC=1")
-			if out, err := run.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "nested-defer-capture-ok" {
-				t.Errorf("execution = (%v, %q), want nested-defer-capture-ok", err, out)
+			for _, procs := range []int{1, 4} {
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+				run := testenv.CommandContext(t, ctx, exe)
+				run.Env = append(run.Environ(), "GOMAXPROCS="+strconv.Itoa(procs), "GOGC=1")
+				out, err := run.CombinedOutput()
+				cancel()
+				if err != nil || strings.TrimSpace(string(out)) != "nested-defer-capture-ok" {
+					t.Errorf("P%d execution = (%v, %q), want nested-defer-capture-ok", procs, err, out)
+				}
 			}
 		})
 	}

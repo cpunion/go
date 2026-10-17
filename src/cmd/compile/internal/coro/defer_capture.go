@@ -4,9 +4,7 @@
 
 package coro
 
-import (
-	"cmd/compile/internal/ir"
-)
+import "cmd/compile/internal/ir"
 
 // refreshNestedClosureCaptures follows the new canonical owner after an
 // enclosing deferred literal's captures have moved into the resume frame.
