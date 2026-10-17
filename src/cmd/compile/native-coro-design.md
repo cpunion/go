@@ -3992,6 +3992,55 @@ ordinary Go/cgo paths. The public-entry allocation regression checks scalar
 and libm calls after warmup; this does not remove the remaining cost of
 crossing from an ordinary Go caller into a native executor.
 
+### 16.10 Ordinary execution inside synctest bubbles
+
+A lowered public entry keeps an independent copy of its ordinary Go body.
+It checks the current G's synctest bubble before allocating a coroutine frame
+or entering an executor. Inside a bubble it executes the source body in the
+original function, without a helper call that would change direct recover
+semantics. Native factories retain their existing entry path.
+
+The noder queries serialized-body availability without constructing IR.
+Lowering first resolves dependency admission, then reads independent bodies
+for admitted functions. This avoids creating orphan closures for rejected
+callers. Parameters, results, local ownership and nested captures are
+reconnected to the public function, and the frontend applies its existing
+loop-variable transformation to the new bodies.
+
+The ordinary path preserves synctest's existing goroutine, channel and fake
+clock accounting. Tests cover timers, spawn and WaitGroup operations, repeated
+entries across bubbles, panic/recover, Goexit and foreign calls. This is not
+native logical-task integration with synctest. Race builds also retain the
+existing ordinary/managed path, rather than native logical-task race support.
+
+### 16.11 Fused-frame state packing and full-chunk admission
+
+On 64-bit targets, a fused resume frame places its uint32 program counter in
+the padding after the one-byte marker. Parent, owner, marker and saved resume
+offsets remain unchanged; the saved resume is still at three pointer widths.
+The corresponding 32-bit frame layout is unchanged.
+
+A compiler-proven compatible full chunk may occupy the same allocator bytes
+as its individual frames, not only strictly fewer bytes. The calculation still
+uses target pointer width, pointerful malloc headers and generated size-class
+tables. It must not increase full-chunk allocator bytes. Partially used tails
+can still cost more, so this is not a general memory-reduction guarantee.
+Cache keys, capacities, byte budgets, pointer maps and frame lifetimes do not
+change, nor does this implement general pointer-bearing spawn-frame batching.
+
+### 16.12 Nested captures in static deferred literals
+
+When a static deferred literal's captures move from public parameters or
+locals into a resume frame, nested literals must follow the same canonical
+owner. Lowering refreshes descendant closure-variable definitions after
+reparenting the enclosing captures. This prevents a nested capture from
+retaining a definition in the old public function.
+
+The change does not extend repeated dynamic-defer capture support. Nested
+recapture of a repeated source cell still takes the conservative ordinary path
+unless an earlier transformation removes that unsupported nesting. Source
+tests distinguish this fallback from actual native static-defer lowering.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:
