@@ -18,6 +18,7 @@ func TestInvocationLocals(t *testing.T) {
 	prepareLowerTest(t)
 	for _, mode := range []string{
 		"suffix", "prefix", "outside-use", "inline", "inline-jump", "argument-site",
+		"inline-prefix", "inline-outside-use", "inline-captured", "inline-address",
 		"block", "branch", "loop", "jump", "captured", "address", "other-function", "parameter",
 	} {
 		t.Run(mode, func(t *testing.T) {
@@ -37,10 +38,28 @@ func TestInvocationLocals(t *testing.T) {
 			case "outside-use":
 				fn.Body = append(ir.Nodes{local}, fn.Body...)
 				want = false
-			case "inline", "inline-jump", "argument-site":
+			case "inline", "inline-jump", "argument-site", "inline-prefix", "inline-outside-use", "inline-captured", "inline-address":
 				local.SetInlLocal(true)
 				inlined := ir.NewInlinedCallExpr(src.NoXPos, body, ir.Nodes{local})
 				fn.Body = ir.Nodes{call, inlined}
+				if strings.HasPrefix(mode, "inline-") && mode != "inline-jump" {
+					fn.Body = ir.Nodes{inlined, call}
+				}
+				if mode == "inline-outside-use" {
+					fn.Body.Append(local)
+					want = false
+				}
+				if mode == "inline-address" {
+					local.SetAddrtaken(true)
+					want = false
+				}
+				if mode == "inline-captured" {
+					closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+						types.NewSignature(nil, nil, nil), fn, new(ir.Package), 0)
+					ir.NewClosureVar(src.NoXPos, closure, local)
+					fn.Body.Prepend(closure.OClosure)
+					want = false
+				}
 				if mode == "inline-jump" {
 					inlined.Body.Append(ir.NewBranchStmt(src.NoXPos, ir.OGOTO, nil))
 					inlined.Body.Append(ir.NewLabelStmt(src.NoXPos, nil))

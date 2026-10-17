@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-10-13
+Last updated: 2026-10-18
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -1266,8 +1266,33 @@ priority, profiles, and detached waiters with one and four Ps. The tests compile
 the synchronization packages with the existing lowering option; an unlowered
 dependency still keeps its caller on the ordinary Go entry. The root adapter
 caveat also applies to public RWMutex calls.
-WaitGroup acquisition, Cond, other semaphore declarations, and runtime notes
-retain conservative fallback; this is not complete `sync` support.
+WaitGroup's two-argument `runtime_SemacquireWaitGroup(*uint32, bool)` has a
+distinct logical entry with the same FIFO, block-only profiling and retry
+protocol as plain acquisition. Arguments and waiter state survive suspension.
+The durable-wait argument is not discarded: public entries inside a synctest
+bubble retain the ordinary source body and its existing accounting. A private
+native call requesting a durable wait is rejected before acquiring a token.
+This does not implement logical-task participation in synctest.
+
+Public `Add`, `Done` and `Wait` use their unchanged source algorithms. Tests
+require native caller entries with and without inlining, exercise a registered
+waiter before release, repeated reuse and GC, and check ordinary synctest and
+race fallback. A call from an ordinary helper can enter a new coroutine root;
+it does not by itself prove a shared-root logical spawn. `WaitGroup.Go` still
+needs broader spawn and closure support. Cond's interface calls and ticketed
+notification, other semaphore declarations, and runtime notes retain
+conservative fallback; this is not complete `sync` support.
+
+Inlining can put a generic dictionary temporary before a suspension even when
+all its uses belong to one non-suspending inlined expression. Such a temporary
+stays in the resume invocation, rather than becoming a factory capture whose
+initializer runs later. The compiler requires all uses and the declaration to
+remain within that expression; address-taken and captured variables retain
+their previous storage. This is not general liveness or closure lowering.
+A non-suspending switch copied as one statement may retain its own unlabeled
+breaks and jumps to labels inside it, including inlined return labels. Returns,
+defers, suspensions and branches escaping that statement still require separate
+lowering or conservative fallback.
 
 The first channel slice lowers ordinary sends, discarded or single-value
 receives, and comma-ok receives with simple variable targets. It preserves the
@@ -2479,7 +2504,8 @@ closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive
 destinations, multiple channel operations in one expression, synchronization
-operations beyond the supported Mutex, RWMutex, and plain semaphore recipes,
+operations beyond the supported Mutex, RWMutex, plain semaphore and WaitGroup
+acquisition recipes,
 reflection, callbacks, variadic C calls, or general C ABI type classification.
 Ordinary channel send, discarded or single-value receive, comma-ok receive,
 receive-channel range, and select with simple receive targets are supported
@@ -3931,8 +3957,8 @@ are three fail-closed invariant or unreachable bounded-cache fallback bodies.
 
 The likely compatibility order remains:
 
-1. extend the supported semaphore park/wake boundary to WaitGroup, Cond,
-   other semaphore operations, and runtime notes;
+1. extend the supported semaphore park/wake boundary beyond WaitGroup
+   acquisition to Cond, other semaphore operations, and runtime notes;
 2. broaden aggregate System ABI support beyond the bounded typed bridge and
    add platform-error conventions beyond POSIX errno;
 3. extend expression, assignment, and branch normalization to short-circuit

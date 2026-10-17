@@ -17,6 +17,8 @@ func semaphoreSignature(name string, typ *types.Type) bool {
 	case "sync.runtime_Semacquire", "internal/poll.runtime_Semacquire",
 		"internal/poll.runtime_Semrelease":
 		params = 1
+	case "sync.runtime_SemacquireWaitGroup":
+		params = 2
 	}
 	if typ == nil || typ.Kind() != types.TFUNC || typ.Recv() != nil ||
 		typ.IsVariadic() || typ.NumParams() != params || typ.NumResults() != 0 ||
@@ -25,7 +27,7 @@ func semaphoreSignature(name string, typ *types.Type) bool {
 	}
 	return params == 1 ||
 		types.Identical(typ.Param(1).Type, types.Types[types.TBOOL]) &&
-			types.Identical(typ.Param(2).Type, types.Types[types.TINT])
+			(params == 2 || types.Identical(typ.Param(2).Type, types.Types[types.TINT]))
 }
 
 func semaphoreOperation(call *ir.CallExpr) string {
@@ -46,6 +48,8 @@ func semaphoreOperation(call *ir.CallExpr) string {
 		return "coroSemrelease"
 	case "sync.runtime_Semacquire", "internal/poll.runtime_Semacquire":
 		return "coroSemacquire"
+	case "sync.runtime_SemacquireWaitGroup":
+		return "coroSemacquireWaitGroup"
 	case "internal/poll.runtime_Semrelease":
 		return "coroSemreleasePoll"
 	}

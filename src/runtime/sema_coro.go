@@ -41,6 +41,18 @@ func coroSemacquire(ctx unsafe.Pointer, addr *uint32, state *unsafe.Pointer) boo
 	return coroSemacquire1(ctx, addr, false, semaBlockProfile, 0, state)
 }
 
+// coroSemacquireWaitGroup preserves WaitGroup's distinct declaration ABI.
+// Public entries use the ordinary body inside a synctest bubble, where the
+// goroutine must participate in durable-wait accounting. Reject that mode if
+// an internal caller bypasses the public entry rather than silently ignoring it.
+func coroSemacquireWaitGroup(ctx unsafe.Pointer, addr *uint32, synctestDurable bool,
+	state *unsafe.Pointer) bool {
+	if synctestDurable {
+		throw("runtime: durable WaitGroup wait in stackless coroutine")
+	}
+	return coroSemacquire1(ctx, addr, false, semaBlockProfile, 0, state)
+}
+
 func coroSemacquire1(ctx unsafe.Pointer, addr *uint32, lifo bool,
 	profile semaProfileFlags, skipframes int, state *unsafe.Pointer) bool {
 	context := (*stacklessCoroContext)(ctx)

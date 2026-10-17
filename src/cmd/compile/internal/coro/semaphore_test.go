@@ -34,6 +34,7 @@ var semaphoreTestDeclarations = []struct {
 	{"sync", "runtime_SemacquireRWMutex", true, 3, "coroSemacquireMutex"},
 	{"sync", "runtime_Semrelease", false, 3, "coroSemrelease"},
 	{"sync", "runtime_Semacquire", true, 1, "coroSemacquire"},
+	{"sync", "runtime_SemacquireWaitGroup", true, 2, "coroSemacquireWaitGroup"},
 	{"internal/poll", "runtime_Semacquire", true, 1, "coroSemacquire"},
 	{"internal/poll", "runtime_Semrelease", false, 1, "coroSemreleasePoll"},
 }

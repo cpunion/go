@@ -654,13 +654,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				hasDefer := false
 				hasBranch := false
 				hasReturn := false
+				localLabels := make(map[*types.Sym]bool)
+				if stmt.Op() == ir.OSWITCH {
+					ir.Visit(stmt, func(node ir.Node) {
+						if label, ok := node.(*ir.LabelStmt); ok {
+							localLabels[label.Label] = true
+						}
+					})
+				}
 				ir.Visit(stmt, func(node ir.Node) {
 					if deferStmt, ok := node.(*ir.GoDeferStmt); ok &&
 						deferStmt.Op() == ir.ODEFER {
 						hasDefer = true
 					}
-					if _, ok := node.(*ir.BranchStmt); ok {
-						hasBranch = true
+					if branch, ok := node.(*ir.BranchStmt); ok {
+						// A copied switch owns its unlabeled breaks and jumps
+						// to labels within it, including inlined return labels.
+						// Neither can escape to a lowered continuation.
+						local := branch.Op() == ir.OBREAK && branch.Label == nil ||
+							branch.Op() == ir.OGOTO && branch.Label != nil && localLabels[branch.Label]
+						if stmt.Op() != ir.OSWITCH || !local {
+							hasBranch = true
+						}
 					}
 					if node.Op() == ir.ORETURN {
 						hasReturn = true
@@ -3099,7 +3114,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				var io *lowerIO
 				var semaphore *lowerSemaphore
 				operation := semaphoreOperation(call)
-				if operation == "coroSemacquireMutex" || operation == "coroSemacquire" {
+				if operation == "coroSemacquireMutex" || operation == "coroSemacquire" ||
+					operation == "coroSemacquireWaitGroup" {
 					semaphore = &lowerSemaphore{call: call, args: make([]*ir.Name, len(call.Args))}
 					for i, arg := range call.Args {
 						name := typecheck.TempAt(call.Pos(), factory, arg.Type())
