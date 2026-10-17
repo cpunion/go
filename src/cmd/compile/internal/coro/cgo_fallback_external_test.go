@@ -64,6 +64,12 @@ func TestCgoFallback(t *testing.T) {
 					!strings.Contains(string(out), "_Cfunc_add") {
 					t.Errorf("public entry lost ordinary cgo fallback: %v\n%s", err, out)
 				}
+				dump = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s", pkg+"\\.scalar\\.coro", exe)
+				out, err = dump.CombinedOutput()
+				if err != nil || !strings.Contains(string(out), "_Cdirect_add") ||
+					strings.Contains(string(out), "_Cfunc_add") {
+					t.Errorf("native entry lost direct C call: %v\n%s", err, out)
+				}
 			}
 			for _, procs := range []int{1, 4} {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)

@@ -30,11 +30,16 @@ import (
 	"unsafe"
 )
 
-func threadID() uintptr { return uintptr(C.thread_id()) }
+//go:noinline
+func threadID() uintptr {
+	value := C.thread_id()
+	return uintptr(value)
+}
 
 //go:noinline
 func scalar(value uint64) uint64 {
-	return uint64(C.add(C.uint64_t(value), 1))
+	result := C.add(C.uint64_t(value), 1)
+	return uint64(result)
 }
 
 // locked is called both with and without a thread lock inherited from Go or
@@ -42,21 +47,25 @@ func scalar(value uint64) uint64 {
 //
 //go:noinline
 func locked(want uintptr) uint64 {
-	if threadID() != want {
+	before := threadID()
+	if before != want {
 		panic("thread changed before yield")
 	}
 	runtime.Gosched()
-	if threadID() != want {
+	after := threadID()
+	if after != want {
 		panic("thread changed after yield")
 	}
-	return scalar(41)
+	result := scalar(41)
+	return result
 }
 
 func callback() uint64 { return uint64(C.call_callback()) }
 
 //export GoCallback
 func GoCallback(want C.uintptr_t) C.uint64_t {
-	return C.uint64_t(locked(uintptr(want)))
+	result := locked(uintptr(want))
+	return C.uint64_t(result)
 }
 
 //go:noinline
