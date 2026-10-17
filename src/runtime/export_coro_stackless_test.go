@@ -11,7 +11,7 @@ import (
 	"unsafe"
 )
 
-var StacklessCoroInBubbleForTest = coroInBubble
+var StacklessCoroUseOrdinaryForTest = coroUseOrdinary
 
 type stacklessCoroFrameChunkExportFrame struct {
 	depth   int

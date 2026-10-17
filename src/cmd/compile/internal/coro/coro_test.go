@@ -5235,7 +5235,7 @@ func main() {
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
 		"-s", `^main\.directExit$`, exe)
 	data, err = cmd.CombinedOutput()
-	if err != nil || !strings.Contains(string(data), "runtime.coroInBubble") ||
+	if err != nil || !strings.Contains(string(data), "runtime.coroUseOrdinary") ||
 		!strings.Contains(string(data), "runtime.Goexit") {
 		t.Fatalf("public entry lost its ordinary Goexit fallback: %v\n%s", err, data)
 	}

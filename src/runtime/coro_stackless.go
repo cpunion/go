@@ -497,11 +497,13 @@ func init() {
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
-// coroInBubble selects the ordinary source body before a public coroutine
-// entry allocates frames or enters an executor. Native logical tasks do not
-// participate in synctest's goroutine and fake-time accounting.
-func coroInBubble() bool {
-	return getg().bubble != nil
+// coroUseOrdinary selects the source body before a public coroutine entry
+// allocates frames or enters an executor. Native tasks do not participate in
+// synctest accounting or inherit the caller's thread lock. C callbacks also
+// hold a thread lock, so nested calls keep the ordinary cgo execution context.
+func coroUseOrdinary() bool {
+	gp := getg()
+	return gp.bubble != nil || gp.lockedm != 0
 }
 
 // coroRun drives one stackless logical goroutine and its children. The

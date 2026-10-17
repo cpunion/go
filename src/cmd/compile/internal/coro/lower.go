@@ -229,7 +229,7 @@ type lowerSemaphore struct {
 // The lowering accepts closed calls, if statements, simple for loops, normal
 // returns, statically resolved defers, and the supported operation sites.
 // Unsupported functions remain unchanged.
-// bodies supplies independent source bodies for synctest fallback. Tests
+// bodies supplies independent source bodies for ordinary fallback. Tests
 // constructing synthetic IR without a frontend may pass nil.
 func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	var result LowerResult

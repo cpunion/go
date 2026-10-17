@@ -4041,6 +4041,30 @@ recapture of a repeated source cell still takes the conservative ordinary path
 unless an earlier transformation removes that unsupported nesting. Source
 tests distinguish this fallback from actual native static-defer lowering.
 
+### 16.13 Thread-bound public entries and cgo fallback
+
+A public coroutine entry selects the ordinary source body when its caller
+is in a synctest bubble or holds an OS-thread lock. This selection happens
+before frame allocation and executor entry, including when a caller inherits
+the lock rather than calling `LockOSThread` in the lowered function. The
+runtime also locks a Go callback to its C caller's thread, so callback entry
+and nested calls retain the ordinary cgo context without new annotations.
+Factories remain the private entry for admitted native call chains.
+
+The C declaration still needs the existing `nocallback` contract for a direct
+entry. A callback-capable declaration keeps its ordinary cgo wrapper. Existing
+generated pointer checks, escape decisions and pinning rules remain in force;
+this does not admit new Go-pointer shapes or implement a native callback
+bridge. An unpinned Go pointer held in heap memory must still be rejected,
+while its explicitly pinned counterpart remains usable through the supported
+ordinary path. Unknown stack pointers are not a reliable negative pointer
+fixture because the ordinary runtime does not inspect their contents.
+
+Tests retain native factories for supported scalar calls while checking nested
+thread locks, yield on the original thread, real C-to-Go callbacks, and pinned
+and unpinned heap pointers. Race configurations use ordinary/managed fallback,
+not native logical-task race instrumentation.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:

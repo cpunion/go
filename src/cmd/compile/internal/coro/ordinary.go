@@ -9,7 +9,7 @@ import (
 	"cmd/compile/internal/typecheck"
 )
 
-// BodyReader supplies independent source bodies for synctest fallback. Have
+// BodyReader supplies independent source bodies for ordinary fallback. Have
 // must not materialize IR: candidates can still be rejected by dependency
 // checks. Read is called only for admitted functions and must return a body.
 type BodyReader struct {
@@ -60,7 +60,7 @@ func addOrdinaryBody(fn, ordinary *ir.Func) {
 		ordinary.Body[i] = edit(stmt)
 	}
 	ordinary.Body = append(ordinary.Body, ir.NewReturnStmt(fn.Pos(), nil))
-	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroInBubble"), nil, false)
+	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
 	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
 	fn.Parents, fn.Marks = ordinary.Parents, ordinary.Marks
 	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
