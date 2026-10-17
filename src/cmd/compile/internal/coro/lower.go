@@ -1499,6 +1499,25 @@ func (candidate *lowerCandidate) localSelfFrameLoop() bool {
 		!candidate.fusedResume && len(candidate.defers) == 0
 }
 
+// stableTerminalAction reports whether a fused resume can reuse its entry
+// query during completion. Await and yield return to the scheduler before a
+// child can publish a terminal outcome. An ordinary Go panic also unwinds the
+// resume; its next invocation makes a fresh query. Other operation sites and
+// deferred calls can update the outcome within this invocation.
+func (candidate *lowerCandidate) stableTerminalAction() bool {
+	if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
+		len(candidate.defers) != 0 || candidate.function.Terminal != 0 ||
+		len(candidate.function.Sites) == 0 {
+		return false
+	}
+	for _, site := range candidate.function.Sites {
+		if site.Kind != SiteAwait && site.Kind != SiteYield {
+			return false
+		}
+	}
+	return true
+}
+
 // markFusedFrameCandidates identifies local structured awaits whose explicit
 // frames can share one logical task. Cross-package factories retain the
 // ordinary task path until their export ABI describes the extended frame
@@ -2489,6 +2508,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
 	ctx := resume.Dcl[0]
+	var entryTerminalAction *ir.Name
+	if terminalAware && !localSelfFrames && candidate.stableTerminalAction() {
+		entryTerminalAction = typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
+	}
 	for _, name := range resumeLocals {
 		name.Curfn = resume
 		resume.Dcl = append(resume.Dcl, name)
@@ -3657,12 +3680,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 			}
 			if terminalAware && !localSelfFrames {
-				terminalAction := typecheck.TempAt(pos, resume,
-					types.Types[types.TUINT8])
-				body = append(body, ir.NewAssignStmt(pos, terminalAction,
-					typecheck.Call(pos,
-						typecheck.LookupRuntime("coroTerminalAction"),
-						ir.Nodes{ctx}, false)))
+				terminalAction := entryTerminalAction
+				if terminalAction == nil {
+					terminalAction = typecheck.TempAt(pos, resume,
+						types.Types[types.TUINT8])
+					body = append(body, ir.NewAssignStmt(pos, terminalAction,
+						typecheck.Call(pos,
+							typecheck.LookupRuntime("coroTerminalAction"),
+							ir.Nodes{ctx}, false)))
+				}
 				hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
 					typedInt(pos, types.Types[types.TUINT8],
 						int64(actionInvalid)))
@@ -4060,8 +4086,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			ir.NewAssignStmt(pos, resumeDeferToken, token))
 	}
 	if terminalAware && !localSelfFrames {
-		terminalAction := typecheck.Call(pos,
+		var terminalAction ir.Node = typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)
+		if entryTerminalAction != nil {
+			resume.Body = append(resume.Body,
+				ir.NewAssignStmt(pos, entryTerminalAction, terminalAction))
+			terminalAction = entryTerminalAction
+		}
 		hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
 			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
 		resume.Body = append(resume.Body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
