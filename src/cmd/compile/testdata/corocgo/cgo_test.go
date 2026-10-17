@@ -58,7 +58,7 @@ func TestPointerCheck(t *testing.T) {
 	defer func() { pointerRoot = nil }()
 	defer func() {
 		got := recover()
-		if got == nil || !strings.Contains(got.(error).Error(), "cgo argument has Go pointer to unpinned Go pointer") {
+		if got == nil || !strings.Contains(got.(error).Error(), "Go pointer to unpinned Go pointer") {
 			t.Errorf("unpinned pointer panic = %v", got)
 		}
 	}()

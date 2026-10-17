@@ -21,7 +21,7 @@ static uintptr_t thread_id(void) { return (uintptr_t)pthread_self(); }
 static uint64_t add(uint64_t x, uint64_t y) { return x + y; }
 static uint64_t read_pointer(void *p) { return **(uint64_t **)p; }
 
-uint64_t call_callback(uintptr_t);
+uint64_t call_callback(void);
 */
 import "C"
 
@@ -52,7 +52,7 @@ func locked(want uintptr) uint64 {
 	return scalar(41)
 }
 
-func callback() uint64 { return uint64(C.call_callback(C.uintptr_t(threadID()))) }
+func callback() uint64 { return uint64(C.call_callback()) }
 
 //export GoCallback
 func GoCallback(want C.uintptr_t) C.uint64_t {

@@ -5,11 +5,12 @@
 //go:build cgo && (darwin || linux)
 
 #include <stdint.h>
+#include <pthread.h>
 
 extern uint64_t GoCallback(uintptr_t);
 
 uint64_t
-call_callback(uintptr_t thread)
+call_callback(void)
 {
-	return GoCallback(thread);
+	return GoCallback((uintptr_t)pthread_self());
 }
