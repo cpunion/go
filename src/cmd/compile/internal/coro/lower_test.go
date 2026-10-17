@@ -422,13 +422,13 @@ func TestExplicitFrameChunkLength(t *testing.T) {
 	if got := explicitFrameAllocationSize(4 * 72); got != 288 {
 		t.Errorf("explicitFrameAllocationSize(288) = %d, want 288", got)
 	}
-	if !explicitFrameChunkReducesAllocation(72, explicitLargeFrameChunkSize) {
+	if !explicitFrameChunkFitsAllocation(72, explicitLargeFrameChunkSize) {
 		t.Fatal("four 72-byte frames do not reduce their allocation size")
 	}
-	if explicitFrameChunkReducesAllocation(80, explicitLargeFrameChunkSize) {
-		t.Fatal("four 80-byte frames unexpectedly reduce their allocation size")
+	if !explicitFrameChunkFitsAllocation(80, explicitLargeFrameChunkSize) {
+		t.Fatal("equal-byte 80-byte frame chunks were rejected")
 	}
-	if explicitFrameChunkReducesAllocation(64, explicitFrameChunkSize*2) {
+	if explicitFrameChunkFitsAllocation(64, explicitFrameChunkSize*2) {
 		t.Fatal("sixteen 64-byte frames unexpectedly preserve their allocation size")
 	}
 }
@@ -757,17 +757,36 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 		}
 		frameType = allocation.Type().Elem()
 	})
-	if frameType == nil || frameType.NumFields() < 4 ||
+	if frameType == nil || frameType.NumFields() < 5 ||
 		!frameType.FieldType(0).IsUnsafePtr() ||
 		!frameType.FieldType(1).IsUnsafePtr() ||
 		frameType.FieldType(2) != types.Types[types.TUINT8] ||
-		!frameType.FieldType(3).IsUnsafePtr() ||
 		frameType.FieldOff(0) != 0 ||
 		frameType.FieldOff(1) != int64(types.PtrSize) ||
-		frameType.FieldOff(2) != int64(2*types.PtrSize) ||
-		frameType.FieldOff(3) != int64(3*types.PtrSize) {
+		frameType.FieldOff(2) != int64(2*types.PtrSize) {
 		t.Fatalf("heterogeneous frame header = %v, want parent, owner, marker, and resume prefix",
 			frameType)
+	}
+	var state, savedResume *types.Field
+	for _, field := range frameType.Fields() {
+		if field.Sym.Name == ".coroResume" {
+			savedResume = field
+		}
+		if field.Type == types.Types[types.TUINT32] {
+			state = field
+		}
+	}
+	if savedResume == nil || !savedResume.Type.IsUnsafePtr() ||
+		savedResume.Offset != int64(3*types.PtrSize) {
+		t.Fatalf("saved resume = %v, want pointer at offset %d", savedResume, 3*types.PtrSize)
+	}
+	wantState, wantSize := int64(4*types.PtrSize), int64(5*types.PtrSize)
+	if types.PtrSize == 8 {
+		wantState, wantSize = 20, 32
+	}
+	if state == nil || state.Offset != wantState || frameType.Size() != wantSize {
+		t.Fatalf("heterogeneous state = %v, frame size = %d; want state at %d and frame size %d",
+			state, frameType.Size(), wantState, wantSize)
 	}
 
 	runtimeCalls := make(map[string]int)
