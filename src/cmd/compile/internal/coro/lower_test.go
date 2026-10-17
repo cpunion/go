@@ -872,7 +872,7 @@ func TestLowerMutualFrameChunks(t *testing.T) {
 		t.Fatalf("Lower result = %+v, want two lowered functions", result)
 	}
 
-	requests, compatible, takes := 0, 0, 0
+	requests, compatible, takes, terminalQueries := 0, 0, 0, 0
 	for _, generated := range typecheck.Target.Funcs {
 		ir.VisitList(generated.Body, func(node ir.Node) {
 			call, ok := node.(*ir.CallExpr)
@@ -887,12 +887,17 @@ func TestLowerMutualFrameChunks(t *testing.T) {
 				}
 			case "runtime.coroTakeFusedFrame":
 				takes++
+			case "runtime.coroTerminalAction":
+				terminalQueries++
 			}
 		})
 	}
 	if requests != 2 || compatible != 2 || takes != 2 {
 		t.Fatalf("mutual lowering has %d requests (%d compatible) and %d takes, want 2, 2, and 2",
 			requests, compatible, takes)
+	}
+	if terminalQueries != 2 {
+		t.Fatalf("mutual lowering has %d terminal queries, want one per resume", terminalQueries)
 	}
 }
 
