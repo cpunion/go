@@ -326,16 +326,19 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		}
 		if base.Debug.Coro > 3 && !instrumented {
 			plan.HeapLocals = escape.HeapLocals(typecheck.Target.Funcs)
-			result, err := coro.Lower(plan, func(fn *ir.Func) *ir.Func {
-				start := len(typecheck.Target.Funcs)
-				body := noder.ReadCoroBody(fn)
-				if body != nil {
-					transformed = append(transformed, loopvar.ForCapture(body)...)
-				}
-				for _, child := range typecheck.Target.Funcs[start:] {
-					transformed = append(transformed, loopvar.ForCapture(child)...)
-				}
-				return body
+			result, err := coro.Lower(plan, &coro.BodyReader{
+				Have: noder.HaveCoroBody,
+				Read: func(fn *ir.Func) *ir.Func {
+					start := len(typecheck.Target.Funcs)
+					body := noder.ReadCoroBody(fn)
+					if body != nil {
+						transformed = append(transformed, loopvar.ForCapture(body)...)
+					}
+					for _, child := range typecheck.Target.Funcs[start:] {
+						transformed = append(transformed, loopvar.ForCapture(child)...)
+					}
+					return body
+				},
 			})
 			if err != nil {
 				base.Fatalf("lowering coroutine plan: %v", err)

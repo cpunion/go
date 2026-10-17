@@ -10,6 +10,13 @@ import (
 	"cmd/compile/internal/types"
 )
 
+// HaveCoroBody reports whether fn has a serialized source body without
+// constructing any local declarations or closures.
+func HaveCoroBody(fn *ir.Func) bool {
+	_, ok := bodyReader[fn]
+	return ok
+}
+
 // ReadCoroBody reads an independent copy of fn's source body for execution
 // inside a synctest bubble. The returned function is only an IR container;
 // coroutine lowering installs its body in fn without adding a call frame.

@@ -99,7 +99,8 @@ func TestLowerOrdinaryBodyUnavailable(t *testing.T) {
 	}
 	called := false
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}},
-		func(got *ir.Func) *ir.Func { called = got == fn; return nil })
+		&BodyReader{Have: func(got *ir.Func) bool { called = got == fn; return false },
+			Read: func(*ir.Func) *ir.Func { t.Fatal("unavailable body was read"); return nil }})
 	if err != nil || !called || result.Lowered != 0 || result.Skipped != 1 ||
 		len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "ordinary body unavailable") {
 		t.Fatalf("Lower = (%+v, %v), reader called = %v", result, err, called)
@@ -125,11 +126,64 @@ func TestLowerOrdinaryBody(t *testing.T) {
 	ordinary := newLowerTestFunc(pkg, "ordinary")
 	ordinary.Body = ir.Nodes{newLowerTestReturn()}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}},
-		func(*ir.Func) *ir.Func { return ordinary })
+		&BodyReader{Have: func(*ir.Func) bool { return true },
+			Read: func(*ir.Func) *ir.Func { return ordinary }})
 	if err != nil || result.Lowered != 1 || result.Skipped != 0 {
 		t.Fatalf("Lower = (%+v, %v), want one lowered function", result, err)
 	}
 	if len(fn.Body) != 1 || fn.Body[0].Op() != ir.OIF {
 		t.Fatal("lowering did not install the ordinary source branch")
+	}
+}
+
+func TestLowerOrdinaryBodyDependencies(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/ordinarydependencies", "ordinarydependencies")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	leaf := newLowerTestFunc(pkg, "leaf")
+	yield := newLowerTestCall(testFunc("yield"))
+	leaf.Body = ir.Nodes{yield, newLowerTestReturn()}
+	caller := newLowerTestFunc(pkg, "caller")
+	call := newLowerTestCall(leaf)
+	caller.Body = ir.Nodes{call, newLowerTestReturn()}
+	plan := &Plan{Functions: map[*ir.Func]*Function{
+		leaf: {Func: leaf, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
+			Sites: []Site{{ID: 1, Kind: SiteYield, Node: yield}}},
+		caller: {Func: caller, Effect: MaySuspend, Primary: CoroPrimary,
+			Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}},
+			Edges: []Edge{{Kind: DirectCall, Callee: leaf, CalleeName: symbolName(leaf.Nname), Node: call}}},
+	}}
+	functions := len(typecheck.Target.Funcs)
+	result, err := Lower(plan, &BodyReader{
+		Have: func(fn *ir.Func) bool { return fn != leaf },
+		Read: func(*ir.Func) *ir.Func {
+			t.Fatal("rejected dependency materialized an ordinary body and orphaned its closures")
+			return nil
+		},
+	})
+	if err != nil || result.Lowered != 0 || result.Skipped != 2 || len(typecheck.Target.Funcs) != functions {
+		t.Fatalf("Lower = (%+v, %v), functions = %d, want %d", result, err, len(typecheck.Target.Funcs), functions)
+	}
+}
+
+func TestLowerOrdinaryBodyMissingAdmitted(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/ordinarymissing", "ordinarymissing")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	fn := newLowerTestFunc(pkg, "leaf")
+	yield := newLowerTestCall(testFunc("yield"))
+	fn.Body = ir.Nodes{yield, newLowerTestReturn()}
+	function := &Function{Func: fn, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: yield}}}
+	_, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}}, &BodyReader{
+		Have: func(*ir.Func) bool { return true },
+		Read: func(*ir.Func) *ir.Func { return nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing admitted ordinary body") {
+		t.Fatalf("Lower error = %v, want missing admitted body", err)
 	}
 }
