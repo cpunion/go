@@ -54,6 +54,9 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 		}
 		return
 	}
+	t.Run("waitgroupready", func(t *testing.T) {
+		testStacklessCoroSemaphoreRetry(t, "fast", "waitgroup")
+	})
 	for _, procs := range []int{1, 4} {
 		for _, mode := range []string{"fast", "retry", "profile", "mutexprofile", "fifo", "lifo", "contention", "handoff", "sibling", "plainfast", "plainretry", "plainprofile", "plainfifo", "waitgroupfast", "waitgroupretry", "waitgroupprofile", "waitgroupfifo", "waitgroupdurable"} {
 			t.Run(mode+"/P"+strconv.Itoa(procs), func(t *testing.T) {
