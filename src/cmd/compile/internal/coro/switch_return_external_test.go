@@ -75,6 +75,9 @@ func switchBreak(x int) int {
 		switch x {
 		case 0:
 			y += 1
+			goto local
+			y += 100000
+		local:
 			break
 		case 1:
 			switch i { case 0: y += 10; break; default: y += 20 }

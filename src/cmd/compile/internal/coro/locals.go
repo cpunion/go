@@ -7,8 +7,9 @@ package coro
 import "cmd/compile/internal/ir"
 
 // invocationLocals finds variables declared and used entirely in a suffix
-// after the last coroutine site. These variables need not occupy persistent
-// frame storage. Address-taken and captured variables keep their existing
+// after the last coroutine site, or in a non-suspending inlined expression.
+// These variables need not occupy persistent frame storage. Address-taken
+// and captured variables keep their existing
 // storage so this does not change allocation points or closure ownership.
 //
 // This is deliberately not a liveness analysis. Uses outside the suffix,
@@ -52,6 +53,31 @@ func invocationLocals(function *Function) map[*ir.Name]bool {
 	if jumps {
 		return locals
 	}
+	// An inlined expression executes in one resume invocation. In particular,
+	// its dictionary temporaries must stay local: their initializers run inside
+	// the resume, so capturing them from the factory would require reference
+	// capture, which is not a valid representation for a dictionary variable.
+	ir.VisitList(function.Func.Body, func(node ir.Node) {
+		inlined, ok := node.(*ir.InlinedCallExpr)
+		if !ok || ir.Any(inlined, func(node ir.Node) bool { return sites[node] }) {
+			return
+		}
+		regionUses := make(map[*ir.Name]int)
+		ir.Visit(inlined, func(node ir.Node) {
+			if name, ok := node.(*ir.Name); ok {
+				regionUses[name.Canonical()]++
+			}
+		})
+		ir.Visit(inlined, func(node ir.Node) {
+			if decl, ok := node.(*ir.Decl); ok {
+				name := decl.X.Canonical()
+				if name.Curfn == function.Func && name.Class == ir.PAUTO && !name.Addrtaken() &&
+					!captured[name] && regionUses[name] == uses[name] {
+					locals[name] = true
+				}
+			}
+		})
+	})
 	var suffix func(ir.Nodes)
 	suffix = func(body ir.Nodes) {
 		start := 0

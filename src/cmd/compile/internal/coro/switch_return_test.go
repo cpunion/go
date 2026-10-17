@@ -22,6 +22,7 @@ func TestSwitchReturnBoundary(t *testing.T) {
 		foreign, yield, escaping bool
 		closure, structured      bool
 		localBreak               bool
+		localGoto                bool
 		wantError                bool
 	}{
 		{name: "yield-return", yield: true, escaping: true, wantError: true},
@@ -32,6 +33,7 @@ func TestSwitchReturnBoundary(t *testing.T) {
 		{name: "yield-closure", yield: true, closure: true},
 		{name: "yield-local-break", yield: true, localBreak: true},
 		{name: "foreign-local-break", foreign: true, localBreak: true},
+		{name: "yield-local-goto", yield: true, localGoto: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			typecheck.Target = new(ir.Package)
@@ -69,6 +71,11 @@ func TestSwitchReturnBoundary(t *testing.T) {
 			}
 			if test.localBreak {
 				body = append(body, ir.NewBranchStmt(src.NoXPos, ir.OBREAK, nil))
+			}
+			if test.localGoto {
+				label := pkg.Lookup("inlinedReturn")
+				body = append(body, ir.NewBranchStmt(src.NoXPos, ir.OGOTO, label),
+					ir.NewLabelStmt(src.NoXPos, label))
 			}
 			clause := ir.NewCaseStmt(src.NoXPos, nil, body)
 			var stmt ir.Node = ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})

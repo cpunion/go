@@ -654,17 +654,26 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				hasDefer := false
 				hasBranch := false
 				hasReturn := false
+				localLabels := make(map[*types.Sym]bool)
+				if stmt.Op() == ir.OSWITCH {
+					ir.Visit(stmt, func(node ir.Node) {
+						if label, ok := node.(*ir.LabelStmt); ok {
+							localLabels[label.Label] = true
+						}
+					})
+				}
 				ir.Visit(stmt, func(node ir.Node) {
 					if deferStmt, ok := node.(*ir.GoDeferStmt); ok &&
 						deferStmt.Op() == ir.ODEFER {
 						hasDefer = true
 					}
 					if branch, ok := node.(*ir.BranchStmt); ok {
-						// A copied switch owns its unlabeled breaks, including
-						// those introduced by inlining. They cannot escape to
-						// a lowered continuation. Other branches still need
-						// explicit control-flow lowering.
-						if stmt.Op() != ir.OSWITCH || branch.Op() != ir.OBREAK || branch.Label != nil {
+						// A copied switch owns its unlabeled breaks and jumps
+						// to labels within it, including inlined return labels.
+						// Neither can escape to a lowered continuation.
+						local := branch.Op() == ir.OBREAK && branch.Label == nil ||
+							branch.Op() == ir.OGOTO && branch.Label != nil && localLabels[branch.Label]
+						if stmt.Op() != ir.OSWITCH || !local {
 							hasBranch = true
 						}
 					}
