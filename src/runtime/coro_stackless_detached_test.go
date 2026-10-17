@@ -230,7 +230,11 @@ func testStacklessCoroDetachedRoot(t *testing.T, mode string) {
 		t.Fatalf("detached read = (%d, %d), want (1, 0)", n, errno)
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for runtime.NumGoroutine() > baselineG {
+	// The child sends done before returning its completion action. A global
+	// goroutine count cannot join this scheduler's cleanup, so also wait for
+	// its drainage predicate before checking retained state.
+	for runtime.NumGoroutine() > baselineG ||
+		!cached && !runtime.DrainedStacklessCoroSchedulerForTest(scheduler) {
 		if time.Now().After(deadline) {
 			t.Fatalf("detached executors remain: goroutines = %d, baseline = %d", runtime.NumGoroutine(), baselineG)
 		}
