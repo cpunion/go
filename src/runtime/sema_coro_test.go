@@ -27,13 +27,24 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 	if mode := os.Getenv("GO_TEST_CORO_SEMAPHORE"); mode != "" {
 		switch mode {
 		case "fast", "retry", "profile", "mutexprofile":
-			testStacklessCoroSemaphoreRetry(t, mode, false)
+			testStacklessCoroSemaphoreRetry(t, mode, "mutex")
 		case "plainfast", "plainretry", "plainprofile":
-			testStacklessCoroSemaphoreRetry(t, strings.TrimPrefix(mode, "plain"), true)
+			testStacklessCoroSemaphoreRetry(t, strings.TrimPrefix(mode, "plain"), "plain")
+		case "waitgroupfast", "waitgroupretry", "waitgroupprofile":
+			testStacklessCoroSemaphoreRetry(t, strings.TrimPrefix(mode, "waitgroup"), "waitgroup")
 		case "fifo", "lifo":
-			testStacklessCoroSemaphoreMixed(t, mode == "lifo", false)
+			testStacklessCoroSemaphoreMixed(t, mode == "lifo", "mutex")
 		case "plainfifo":
-			testStacklessCoroSemaphoreMixed(t, false, true)
+			testStacklessCoroSemaphoreMixed(t, false, "plain")
+		case "waitgroupfifo":
+			testStacklessCoroSemaphoreMixed(t, false, "waitgroup")
+		case "waitgroupdurable":
+			var sema uint32 = 1
+			var state unsafe.Pointer
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				runtime.SemacquireWaitGroupStacklessCoroForTest(ctx, &sema, true, &state)
+				return runtime.StacklessCoroActionComplete
+			})
 		case "contention", "handoff":
 			testStacklessCoroSemaphoreContention(t, mode == "handoff")
 		case "sibling":
@@ -44,7 +55,7 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 		return
 	}
 	for _, procs := range []int{1, 4} {
-		for _, mode := range []string{"fast", "retry", "profile", "mutexprofile", "fifo", "lifo", "contention", "handoff", "sibling", "plainfast", "plainretry", "plainprofile", "plainfifo"} {
+		for _, mode := range []string{"fast", "retry", "profile", "mutexprofile", "fifo", "lifo", "contention", "handoff", "sibling", "plainfast", "plainretry", "plainprofile", "plainfifo", "waitgroupfast", "waitgroupretry", "waitgroupprofile", "waitgroupfifo", "waitgroupdurable"} {
 			t.Run(mode+"/P"+strconv.Itoa(procs), func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -52,7 +63,12 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 					"-test.run=^TestStacklessCoroSemaphore$")
 				cmd.Env = append(cmd.Environ(), "GO_TEST_CORO_SEMAPHORE="+mode,
 					"GOMAXPROCS="+strconv.Itoa(procs))
-				if data, err := cmd.CombinedOutput(); err != nil {
+				data, err := cmd.CombinedOutput()
+				if mode == "waitgroupdurable" {
+					if err == nil || !strings.Contains(string(data), "runtime: durable WaitGroup wait in stackless coroutine") {
+						t.Fatalf("durable WaitGroup wait: %v\n%s", err, data)
+					}
+				} else if err != nil {
 					t.Fatalf("semaphore case: %v\n%s", err, data)
 				}
 			})
@@ -60,8 +76,9 @@ func TestStacklessCoroSemaphore(t *testing.T) {
 	}
 }
 
-func testStacklessCoroSemaphoreRetry(t *testing.T, mode string, plain bool) {
-	acquire := stacklessCoroSemaphoreAcquire(plain)
+func testStacklessCoroSemaphoreRetry(t *testing.T, mode, kind string) {
+	plain := kind != "mutex"
+	acquire := stacklessCoroSemaphoreAcquire(kind)
 	var sema uint32
 	var state unsafe.Pointer
 	if mode == "fast" {
@@ -192,23 +209,30 @@ func checkStacklessCoroSemaphoreBlockFrames(t *testing.T) {
 	}
 }
 
-func stacklessCoroSemaphoreAcquire(plain bool) func(unsafe.Pointer, *uint32, bool, *unsafe.Pointer) bool {
-	if !plain {
+func stacklessCoroSemaphoreAcquire(kind string) func(unsafe.Pointer, *uint32, bool, *unsafe.Pointer) bool {
+	if kind == "mutex" {
 		return runtime.SemacquireMutexStacklessCoroForTest
 	}
 	return func(ctx unsafe.Pointer, addr *uint32, lifo bool, state *unsafe.Pointer) bool {
 		if lifo {
 			panic("plain semaphore requested LIFO acquisition")
 		}
+		if kind == "waitgroup" {
+			return runtime.SemacquireWaitGroupStacklessCoroForTest(ctx, addr, false, state)
+		}
 		return runtime.SemacquireStacklessCoroForTest(ctx, addr, state)
 	}
 }
 
-func testStacklessCoroSemaphoreMixed(t *testing.T, lifo, plain bool) {
-	acquire := stacklessCoroSemaphoreAcquire(plain)
+func testStacklessCoroSemaphoreMixed(t *testing.T, lifo bool, kind string) {
+	plain := kind != "mutex"
+	acquire := stacklessCoroSemaphoreAcquire(kind)
 	ordinary := runtime.SemacquireMutexOrdinaryForTest
 	if plain {
 		ordinary = func(addr *uint32, _ bool, _ int) { runtime.SemacquireOrdinaryForTest(addr) }
+	}
+	if kind == "waitgroup" {
+		ordinary = func(addr *uint32, _ bool, _ int) { runtime.SemacquireWaitGroupOrdinaryForTest(addr, false) }
 	}
 	runtime.SetBlockProfileRate(1)
 	defer runtime.SetBlockProfileRate(0)

@@ -10,8 +10,10 @@ import "unsafe"
 
 var SemacquireMutexOrdinaryForTest = internal_sync_runtime_SemacquireMutex
 var SemacquireOrdinaryForTest = sync_runtime_Semacquire
+var SemacquireWaitGroupOrdinaryForTest = sync_runtime_SemacquireWaitGroup
 
 var SemacquireStacklessCoroForTest = coroSemacquire
+var SemacquireWaitGroupStacklessCoroForTest = coroSemacquireWaitGroup
 var SemreleasePollStacklessCoroForTest = coroSemreleasePoll
 
 func SemaphoreProfileStacklessCoroForTest(state unsafe.Pointer) (block, mutex bool) {

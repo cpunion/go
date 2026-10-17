@@ -68,6 +68,26 @@ func switchClosure(x bool) func() uint64 {
 	}
 	return f
 }
+func switchBreak(x int) int {
+	runtime.Gosched()
+	y := 0
+	for i := 0; i < 2; i++ {
+		switch x {
+		case 0:
+			y += 1
+			break
+		case 1:
+			switch i { case 0: y += 10; break; default: y += 20 }
+			for j := 0; j < 3; j++ { y += 100; if j == 1 { break } }
+			if i == 0 { break }
+			y += 1000
+		default:
+			y += 10000
+		}
+		y += 2
+	}
+	return y
+}
 func main() {
 	if switchUint(0) != 1<<40 || switchUint(1) != 7 { panic("uint64 return") }
 	if switchByte(0) != 3 || switchByte(1) != 7 { panic("uint8 return") }
@@ -80,12 +100,13 @@ func main() {
 	if switchType(uint64(1<<40)) != 1<<40 || switchType(0) != 11 { panic("type switch") }
 	if switchAssignment(0) != 42 || switchAssignment(1) != 43 { panic("assignment switch") }
 	if switchClosure(true)() != 99 || switchClosure(false)() != 100 { panic("closure return") }
+	if switchBreak(0) != 6 || switchBreak(1) != 1434 || switchBreak(2) != 20004 { panic("local switch break") }
 	println("switch-return-ok")
 }
 `
 	testSwitchReturnProgram(t, source,
 		[]string{"switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchType"},
-		[]string{"switchAssignment", "switchClosure"})
+		[]string{"switchAssignment", "switchClosure", "switchBreak"})
 }
 
 func TestSwitchReturnCgo(t *testing.T) {

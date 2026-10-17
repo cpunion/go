@@ -281,15 +281,15 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteSemaphore,
 		Effect: MaySuspend,
 	},
+	"sync.runtime_SemacquireWaitGroup": {
+		Kind:   SiteSemaphore,
+		Effect: MaySuspend,
+	},
 	// These declarations park an ordinary goroutine in the runtime. Their
 	// bodies are unavailable to effect analysis, so propagate suspension
 	// explicitly through the synchronization packages and their callers.
 	// Until they have coroutine entries, the ordinary await dependency check
 	// keeps those callers on the Go entry instead of parking an executor.
-	"sync.runtime_SemacquireWaitGroup": {
-		Kind:   SiteAwait,
-		Effect: MaySuspend,
-	},
 	"sync.runtime_notifyListWait": {
 		Kind:   SiteAwait,
 		Effect: MaySuspend,
