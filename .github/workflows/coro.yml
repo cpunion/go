@@ -162,6 +162,9 @@ jobs:
 
       - name: Run native full test suite
         working-directory: src
+        env:
+          # Source-oracle compiler tests share the all.bash package deadline.
+          GO_TEST_TIMEOUT_SCALE: '2'
         run: ./all.bash
 
   native-benchmarks:
