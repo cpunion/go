@@ -66,11 +66,14 @@ func explicitFrameAllocationSize(size int64) int64 {
 	return int64(gc.SizeClassToSize[class])
 }
 
-func explicitFrameChunkReducesAllocation(frameSize, chunkLength int64) bool {
+// explicitFrameChunkFitsAllocation admits equal allocator bytes as well as
+// savings. Chunking must not increase the total size-class bytes of a full
+// chunk; runtime cache capacities and byte limits remain unchanged.
+func explicitFrameChunkFitsAllocation(frameSize, chunkLength int64) bool {
 	frameAllocation := explicitFrameAllocationSize(frameSize)
 	chunkAllocation := explicitFrameAllocationSize(frameSize * chunkLength)
 	return frameAllocation != 0 && chunkAllocation != 0 &&
-		chunkAllocation < frameAllocation*chunkLength
+		chunkAllocation <= frameAllocation*chunkLength
 }
 
 // LowerResult summarizes one package lowering pass.
@@ -108,6 +111,7 @@ type lowerCandidate struct {
 	fusedResume      bool
 	fusedSelf        bool
 	frameType        *types.Type
+	resumePC         *ir.Name
 	frameChunkLength int64
 	selfAwait        bool
 	selfSpawn        bool
@@ -1538,7 +1542,7 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 // resolveFusedFrameChunkProofs enables chunk reuse across different resume
 // entries only after every generated frame type is available. Structural
 // identity proves the allocation has the same pointer bitmap, while the
-// allocator check requires each complete chunk to save heap bytes.
+// allocator check prevents each complete chunk from increasing heap bytes.
 func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 	for _, parent := range candidates {
 		for call, proof := range parent.fusedChunkProofs {
@@ -1549,7 +1553,7 @@ func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 				parent.frameChunkLength == explicitLargeFrameChunkSize &&
 				child.frameChunkLength == parent.frameChunkLength &&
 				types.Identical(parent.frameType, child.frameType) &&
-				explicitFrameChunkReducesAllocation(child.frameType.Size(),
+				explicitFrameChunkFitsAllocation(child.frameType.Size(),
 					child.frameChunkLength)
 			if compatible {
 				proof.SetVal(constant.MakeBool(true))
@@ -2506,6 +2510,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return closure
 	}
 	resumePC := capture(pc)
+	candidate.resumePC = resumePC
 	var resumeDeferToken *ir.Name
 	if deferToken != nil {
 		resumeDeferToken = capture(deferToken)
@@ -4200,6 +4205,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	frameFields := fields
 	var fusedParentField, fusedOwnerField, fusedMarkerField,
 		fusedResumeField *types.Field
+	var packedState *types.Field
 	if fusedFrame {
 		fusedParentField = types.NewField(pos,
 			typecheck.Lookup(".coroParent"), types.Types[types.TUNSAFEPTR])
@@ -4211,12 +4217,24 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		frameFields = append(frameFields, fusedParentField, fusedOwnerField,
 			fusedMarkerField)
 		if candidate.fusedResume {
+			// The state fits in the 64-bit header's padding. The saved
+			// resume must retain the offset shared with the runtime.
+			if types.PtrSize == 8 {
+				packedState = replacements[candidate.resumePC]
+				if packedState != nil {
+					frameFields = append(frameFields, packedState)
+				}
+			}
 			fusedResumeField = types.NewField(pos,
 				typecheck.Lookup(".coroResume"),
 				types.Types[types.TUNSAFEPTR])
 			frameFields = append(frameFields, fusedResumeField)
 		}
-		frameFields = append(frameFields, fields...)
+		for _, field := range fields {
+			if field != packedState {
+				frameFields = append(frameFields, field)
+			}
+		}
 	}
 	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)
