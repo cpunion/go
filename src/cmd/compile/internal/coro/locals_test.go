@@ -118,7 +118,7 @@ func TestLowerInvocationLocals(t *testing.T) {
 				Func: fn, Local: MaySuspend, Effect: MaySuspend, Primary: CoroPrimary,
 				Sites: []Site{{ID: 1, Kind: SiteYield, Node: yield}},
 			}
-			result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}})
+			result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}}, nil)
 			if err != nil || result.Lowered != 1 {
 				t.Fatalf("Lower = %+v, %v", result, err)
 			}

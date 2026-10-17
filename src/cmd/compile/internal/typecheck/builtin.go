@@ -299,10 +299,11 @@ var runtimeDecls = [...]struct {
 	{"coroSemacquire", funcTag, 196},
 	{"coroSemreleasePoll", funcTag, 197},
 	{"coroSemrelease", funcTag, 198},
+	{"coroInBubble", funcTag, 199},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [199]*types.Type
+	var typs [200]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -502,6 +503,7 @@ func runtimeTypes() []*types.Type {
 	typs[196] = newSig(params(typs[7], typs[193], typs[194]), params(typs[6]))
 	typs[197] = newSig(params(typs[7], typs[193]), params(typs[6]))
 	typs[198] = newSig(params(typs[7], typs[193], typs[6], typs[13]), params(typs[6]))
+	typs[199] = newSig(nil, params(typs[6]))
 	return typs[:]
 }
 

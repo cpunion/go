@@ -82,6 +82,7 @@ type LowerResult struct {
 
 type lowerCandidate struct {
 	function         *Function
+	ordinary         *ir.Func
 	transitions      map[*ir.CallExpr]SiteKind
 	foreignCalls     map[*ir.CallExpr]ForeignCallClass
 	directCalls      map[*ir.CallExpr]lowerDirectCall
@@ -224,7 +225,9 @@ type lowerSemaphore struct {
 // The lowering accepts closed calls, if statements, simple for loops, normal
 // returns, statically resolved defers, and the supported operation sites.
 // Unsupported functions remain unchanged.
-func Lower(plan *Plan) (LowerResult, error) {
+// readBody supplies independent source bodies for synctest fallback. Tests
+// constructing synthetic IR without a frontend may pass nil.
+func Lower(plan *Plan, readBody func(*ir.Func) *ir.Func) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
 		return result, err
@@ -250,6 +253,14 @@ func Lower(plan *Plan) (LowerResult, error) {
 			result.Diagnostics = append(result.Diagnostics,
 				fmt.Sprintf("%s: %v", ir.PkgFuncName(function.Func), err))
 			continue
+		}
+		if readBody != nil {
+			candidate.ordinary = readBody(function.Func)
+			if candidate.ordinary == nil {
+				result.Diagnostics = append(result.Diagnostics,
+					fmt.Sprintf("%s: ordinary body unavailable", ir.PkgFuncName(function.Func)))
+				continue
+			}
 		}
 		candidates[function.Func] = candidate
 		candidate.heapLocals = plan.HeapLocals
@@ -375,6 +386,9 @@ func Lower(plan *Plan) (LowerResult, error) {
 		}
 		if err != nil {
 			return result, err
+		}
+		if candidate.ordinary != nil {
+			addOrdinaryBody(function.Func, candidate.ordinary)
 		}
 		if resumeFactorySupported(function.Func) {
 			function.Factory = candidate.factoryABI

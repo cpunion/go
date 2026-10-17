@@ -5219,7 +5219,7 @@ func main() {
 	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `main\.directExit.*`, exe)
+		"-s", `^main\.directExit\.coro`, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("objdump of direct Goexit defer failed: %v\n%s", err, data)
@@ -5231,6 +5231,13 @@ func main() {
 	}
 	if strings.Contains(disassembly, "runtime.Goexit") {
 		t.Errorf("direct Goexit defer retains runtime.Goexit\n%s", disassembly)
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `^main\.directExit$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(data), "runtime.coroInBubble") ||
+		!strings.Contains(string(data), "runtime.Goexit") {
+		t.Fatalf("public entry lost its ordinary Goexit fallback: %v\n%s", err, data)
 	}
 }
 

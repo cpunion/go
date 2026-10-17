@@ -365,3 +365,6 @@ func coroSemacquireMutex(unsafe.Pointer, *uint32, bool, int, *unsafe.Pointer) bo
 func coroSemacquire(unsafe.Pointer, *uint32, *unsafe.Pointer) bool
 func coroSemreleasePoll(unsafe.Pointer, *uint32) bool
 func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool
+
+// stackless coroutine entry selection
+func coroInBubble() bool
