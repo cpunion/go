@@ -60,8 +60,8 @@ func TestOrdinaryBody(t *testing.T) {
 	addOrdinaryBody(fn, ordinary)
 	branch, ok := fn.Body[0].(*ir.IfStmt)
 	if !ok || len(branch.Else) != 1 || branch.Else[0] != nativeReturn ||
-		symbolName(ir.StaticCalleeName(branch.Cond.(*ir.CallExpr).Fun)) != "runtime.coroInBubble" {
-		t.Fatalf("public entry = %v, want bubble test and unchanged native branch", fn.Body)
+		symbolName(ir.StaticCalleeName(branch.Cond.(*ir.CallExpr).Fun)) != "runtime.coroUseOrdinary" {
+		t.Fatalf("public entry = %v, want context test and unchanged native branch", fn.Body)
 	}
 	if local.Curfn != fn || child.ClosureParent != fn || child.RangeParent != fn ||
 		nested.ClosureParent != child {

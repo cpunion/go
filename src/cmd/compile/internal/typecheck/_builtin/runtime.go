@@ -367,4 +367,4 @@ func coroSemreleasePoll(unsafe.Pointer, *uint32) bool
 func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool
 
 // stackless coroutine entry selection
-func coroInBubble() bool
+func coroUseOrdinary() bool

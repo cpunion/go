@@ -299,7 +299,7 @@ var runtimeDecls = [...]struct {
 	{"coroSemacquire", funcTag, 196},
 	{"coroSemreleasePoll", funcTag, 197},
 	{"coroSemrelease", funcTag, 198},
-	{"coroInBubble", funcTag, 199},
+	{"coroUseOrdinary", funcTag, 199},
 }
 
 func runtimeTypes() []*types.Type {
