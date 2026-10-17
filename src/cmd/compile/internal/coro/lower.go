@@ -225,9 +225,9 @@ type lowerSemaphore struct {
 // The lowering accepts closed calls, if statements, simple for loops, normal
 // returns, statically resolved defers, and the supported operation sites.
 // Unsupported functions remain unchanged.
-// readBody supplies independent source bodies for synctest fallback. Tests
+// bodies supplies independent source bodies for synctest fallback. Tests
 // constructing synthetic IR without a frontend may pass nil.
-func Lower(plan *Plan, readBody func(*ir.Func) *ir.Func) (LowerResult, error) {
+func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
 		return result, err
@@ -254,13 +254,10 @@ func Lower(plan *Plan, readBody func(*ir.Func) *ir.Func) (LowerResult, error) {
 				fmt.Sprintf("%s: %v", ir.PkgFuncName(function.Func), err))
 			continue
 		}
-		if readBody != nil {
-			candidate.ordinary = readBody(function.Func)
-			if candidate.ordinary == nil {
-				result.Diagnostics = append(result.Diagnostics,
-					fmt.Sprintf("%s: ordinary body unavailable", ir.PkgFuncName(function.Func)))
-				continue
-			}
+		if bodies != nil && !bodies.Have(function.Func) {
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: ordinary body unavailable", ir.PkgFuncName(function.Func)))
+			continue
 		}
 		candidates[function.Func] = candidate
 		candidate.heapLocals = plan.HeapLocals
@@ -337,6 +334,12 @@ func Lower(plan *Plan, readBody func(*ir.Func) *ir.Func) (LowerResult, error) {
 		candidate := candidates[function.Func]
 		if candidate == nil {
 			continue
+		}
+		if bodies != nil {
+			candidate.ordinary = bodies.Read(function.Func)
+			if candidate.ordinary == nil {
+				return result, fmt.Errorf("%s: missing admitted ordinary body", ir.PkgFuncName(function.Func))
+			}
 		}
 		candidate.factoryABI = FactoryABI1
 		if explicitFrameFactorySupported(candidate) {

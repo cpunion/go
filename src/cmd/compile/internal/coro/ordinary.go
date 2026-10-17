@@ -9,6 +9,14 @@ import (
 	"cmd/compile/internal/typecheck"
 )
 
+// BodyReader supplies independent source bodies for synctest fallback. Have
+// must not materialize IR: candidates can still be rejected by dependency
+// checks. Read is called only for admitted functions and must return a body.
+type BodyReader struct {
+	Have func(*ir.Func) bool
+	Read func(*ir.Func) *ir.Func
+}
+
 // addOrdinaryBody keeps the source body in the public entry, rather than
 // calling a helper: an extra frame would change direct recover semantics.
 // Native factories bypass this entry and never execute the ordinary body.
