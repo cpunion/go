@@ -1980,8 +1980,9 @@ compiler-private proof bit carries the result through the existing structured
 factory request; incompatible and unproven calls retain the general frame
 path.
 
-The strict allocator test is intentional. An earlier 16-element prototype for
-small frames reduced `BenchmarkRecursiveYield4096` from 486 to 246 allocations,
+That checkpoint's strict allocator test was intentional. An earlier
+16-element prototype for small frames reduced `BenchmarkRecursiveYield4096`
+from 486 to 246 allocations,
 but a 56-byte frame crossed the malloc-header and size-class boundary when
 multiplied by 16. Bytes per operation regressed from 215,424 to 246,144
 (+14.26%), so that design was rejected. Four compatible 72-byte mutual frames,
@@ -2457,3 +2458,43 @@ validation prevents an elapsed-time claim. Other heterogeneous chains may
 still miss this deliberately single-key cache; a later phase does not evict
 an established key merely to improve its own isolated result. No cache budget
 is increased to obtain these results.
+
+#### State packing and equal-byte full chunks
+
+The later state-packing change puts the uint32 program counter in existing
+64-bit fused-header padding. Its minimal zero-argument frame is 32 rather than
+40 bytes, with the saved resume still at offset 24. The 32-bit layout does not
+change. Compatible full chunks may now consume equal allocator bytes, as well
+as fewer bytes, than the individual frames. They may not consume more. Cache
+keys and hard budgets are unchanged; partial tails can still increase cost.
+
+The existing isolated retention probes compare official compiler
+`603439a1c6`, immediate parent `7a6ce97811`, and candidate `df41f2fff3`, with
+matching Go/C fixture sources and inlining disabled. Each probe runs in a fresh
+process, primes only the public root entry, performs one deep call, then samples
+GC1, GC2 and GC4. Four repetitions per compiler and probe produce 48 records,
+including 12 empty controls. All controls are zero and all four repetitions
+agree on the following call allocation counters:
+
+| Probe | Parent bytes / allocations | Candidate bytes / allocations |
+| --- | ---: | ---: |
+| self recursion, depth 4096 | 244,160 / 999 | unchanged |
+| mutual recursion, depth 4096 | 309,520 / 1,478 | 274,624 / 1,478 |
+| large frames, depth 512 | 2,790,176 / 144 | unchanged |
+
+Mutual recursion saves 34,896 call-allocation bytes (11.27%), without reducing
+allocation events. Its GC4 heap delta falls from 294,928 to 274,240 bytes.
+The self and large-frame GC4 heap deltas remain 244,160 and 331,296 bytes.
+These are root-primed, not deep-frame-prewarmed measurements and must not be
+substituted for the historical warmed allocation tables above.
+
+The official compiler reports zero call-allocation Go-heap bytes in these
+probes, while its GC4 Go-stack deltas are 32,768 bytes for self/mutual recursion
+and 229,376 bytes for large frames. Both coroutine versions have zero GC4
+Go-stack deltas for self/mutual recursion and 32,768 bytes for large frames.
+Heap counters do not include Go stacks; neither counter includes native
+OS-thread stacks or total RSS. This is not an
+overall process-memory comparison or a leak proof. Collection occurred under
+correctness-test load: all default ns/op, B/op and allocs/op fields are excluded.
+Only the custom pre/post-call counters and signed GC-stage snapshots are used;
+no timing, statistical speedup or universal improvement is claimed.

@@ -3372,6 +3372,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				variable.Defn = name.Canonical()
 			}
 		}
+		refreshNestedClosureCaptures(closure.Func)
 	}
 
 	preparedIO := make(map[*lowerIO]bool)
