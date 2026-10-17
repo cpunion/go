@@ -10,6 +10,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/profilerecord"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
@@ -48,8 +49,9 @@ const (
 	// we need extra space in order to avoid getting fewer than the
 	// desired maximum number of frames after expansion.
 	// This should be at least as large as the largest skip value
-	// used for profiling; otherwise stacks may be truncated inconsistently
-	maxSkip = 6
+	// used for profiling; otherwise stacks may be truncated inconsistently.
+	// The coroutine semaphore helper adds one frame to block profile stacks.
+	maxSkip = 6 + goexperiment.CoroInt
 
 	// maxProfStackDepth is the highest valid value for debug.profstackdepth.
 	// It's used for the bucket.stk func.
