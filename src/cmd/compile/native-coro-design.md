@@ -4065,6 +4065,25 @@ thread locks, yield on the original thread, real C-to-Go callbacks, and pinned
 and unpinned heap pointers. Race configurations use ordinary/managed fallback,
 not native logical-task race instrumentation.
 
+### 16.14 Reusing an unchanged terminal query
+
+A fused resume that has no deferred calls and only await/yield operation sites
+can retain its entry terminal-action query until completion. Both operations
+return from the resume before another logical frame runs. An ordinary Go panic
+unwinds the resume, and the subsequent invocation queries the outcome again.
+Inherited child panic and Goexit outcomes therefore still propagate through a
+fresh entry query; an explicit local panic/Goexit site is not eligible.
+
+This avoids one repeated runtime query on the normal completion path without
+removing entry validation, changing scheduler locking, extending cache budgets
+or changing frame ownership. Other operation kinds and all deferred cleanup
+retain a fresh completion query. Eligibility uses existing compiler-owned
+operation sites, not source annotations. The optimization is deliberately
+limited to explicit-frame ABI 3 resumes that can change resume identity; the
+existing homogeneous self-frame loop is unchanged. Tests check query selection
+alongside deep normal results, explicit/implicit child panic, Goexit, GC and
+post-terminal reuse. A reduced static call count alone is not a timing claim.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:
