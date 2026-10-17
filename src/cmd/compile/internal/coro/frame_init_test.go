@@ -83,7 +83,7 @@ func TestExplicitFrameArrayInitializer(t *testing.T) {
 		Edges: []Edge{{Kind: DirectCall, Callee: fn, CalleeName: symbolName(fn.Nname), Node: call}},
 		Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}},
 	}
-	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}})
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

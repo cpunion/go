@@ -49,7 +49,7 @@ func TestSynchronizationDependencies(t *testing.T) {
 					t.Fatalf("%s plan = %+v, want suspending await", fn.Sym().Name, function)
 				}
 			}
-			result, err := Lower(plan)
+			result, err := Lower(plan, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -78,7 +78,7 @@ func TestSynchronizationDependencies(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err = Lower(importPlan)
+			result, err = Lower(importPlan, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

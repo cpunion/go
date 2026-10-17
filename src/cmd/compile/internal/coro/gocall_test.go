@@ -147,7 +147,7 @@ func testGoCallPlan(t *testing.T, yieldInit bool) {
 	if err := plan.Verify(); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil || result.Lowered != 2 {
 		t.Fatalf("lower = (%+v, %v), want caller and child lowered", result, err)
 	}

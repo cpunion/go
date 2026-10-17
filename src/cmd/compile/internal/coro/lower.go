@@ -82,6 +82,7 @@ type LowerResult struct {
 
 type lowerCandidate struct {
 	function         *Function
+	ordinary         *ir.Func
 	transitions      map[*ir.CallExpr]SiteKind
 	foreignCalls     map[*ir.CallExpr]ForeignCallClass
 	directCalls      map[*ir.CallExpr]lowerDirectCall
@@ -224,7 +225,9 @@ type lowerSemaphore struct {
 // The lowering accepts closed calls, if statements, simple for loops, normal
 // returns, statically resolved defers, and the supported operation sites.
 // Unsupported functions remain unchanged.
-func Lower(plan *Plan) (LowerResult, error) {
+// bodies supplies independent source bodies for synctest fallback. Tests
+// constructing synthetic IR without a frontend may pass nil.
+func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	var result LowerResult
 	if err := plan.Verify(); err != nil {
 		return result, err
@@ -249,6 +252,11 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if err != nil {
 			result.Diagnostics = append(result.Diagnostics,
 				fmt.Sprintf("%s: %v", ir.PkgFuncName(function.Func), err))
+			continue
+		}
+		if bodies != nil && !bodies.Have(function.Func) {
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: ordinary body unavailable", ir.PkgFuncName(function.Func)))
 			continue
 		}
 		candidates[function.Func] = candidate
@@ -327,6 +335,12 @@ func Lower(plan *Plan) (LowerResult, error) {
 		if candidate == nil {
 			continue
 		}
+		if bodies != nil {
+			candidate.ordinary = bodies.Read(function.Func)
+			if candidate.ordinary == nil {
+				return result, fmt.Errorf("%s: missing admitted ordinary body", ir.PkgFuncName(function.Func))
+			}
+		}
 		candidate.factoryABI = FactoryABI1
 		if explicitFrameFactorySupported(candidate) {
 			candidate.factoryABI = FactoryABI3
@@ -375,6 +389,9 @@ func Lower(plan *Plan) (LowerResult, error) {
 		}
 		if err != nil {
 			return result, err
+		}
+		if candidate.ordinary != nil {
+			addOrdinaryBody(function.Func, candidate.ordinary)
 		}
 		if resumeFactorySupported(function.Func) {
 			function.Factory = candidate.factoryABI

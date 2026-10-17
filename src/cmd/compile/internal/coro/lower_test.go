@@ -188,7 +188,7 @@ func TestLowerRejectsClosureContext(t *testing.T) {
 				Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}},
 			}
 			plan := &Plan{Functions: map[*ir.Func]*Function{fn: function}}
-			result, err := Lower(plan)
+			result, err := Lower(plan, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -275,7 +275,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		method: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		recursive: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +727,7 @@ func TestLowerHeterogeneousFrameFusion(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		caller: callerFunction,
 		leaf:   leafFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -845,7 +845,7 @@ func TestLowerMutualFrameChunks(t *testing.T) {
 
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		first: firstFunction, second: secondFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2086,7 +2086,7 @@ func TestLowerStateMachines(t *testing.T) {
 			Primary: PlainPrimary,
 		},
 	}
-	result, err := Lower(&Plan{Functions: functions})
+	result, err := Lower(&Plan{Functions: functions}, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -2724,7 +2724,7 @@ func TestLowerOrdinaryIO(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					result, err := Lower(plan)
+					result, err := Lower(plan, nil)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -2906,7 +2906,7 @@ func TestLowerPanicOutcome(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3028,7 +3028,7 @@ func TestLowerDeferTerminal(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:      function,
 		closure: deferredFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3864,7 +3864,7 @@ func TestLowerNamedDeferRecover(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:     function,
 		target: targetFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3957,7 +3957,7 @@ func TestLowerNamedDeferGoexit(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:     function,
 		target: targetFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4365,7 +4365,7 @@ func TestLowerDynamicNamedDeferRecover(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:     function,
 		target: targetFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4452,7 +4452,7 @@ func TestLowerRunsPanickingNamedDeferFactory(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn:     function,
 		target: targetFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4539,7 +4539,7 @@ func TestLowerRequiresDeferSafeTransitiveFactory(t *testing.T) {
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		target: targetFunction,
 		caller: callerFunction,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4607,7 +4607,7 @@ func TestLowerDirectDeferGoexit(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4774,7 +4774,7 @@ func TestLowerGoexitOutcome(t *testing.T) {
 		Primary:       CoroPrimary,
 		Sites:         []Site{{ID: 1, Kind: SiteGoexit, Node: call}},
 	}
-	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}})
+	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{fn: function}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4921,7 +4921,7 @@ func TestLowerRejectsUnsupportedDependency(t *testing.T) {
 			}},
 		},
 	}}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -5002,7 +5002,7 @@ func TestLowerNestedSystemABIUsesFactory(t *testing.T) {
 			}},
 		},
 	}}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -5148,7 +5148,7 @@ func TestLowerImportedFactory(t *testing.T) {
 				functions = append(functions, function)
 			}
 
-			result, err := Lower(plan)
+			result, err := Lower(plan, nil)
 			if err != nil {
 				t.Fatalf("Lower failed: %v", err)
 			}
@@ -5798,7 +5798,7 @@ func TestLowerBranchTargets(t *testing.T) {
 			t.Errorf("branch %v target = %v, want %v", branch.Op(), got, want)
 		}
 	}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil || result.Lowered != 1 || result.Skipped != 0 {
 		t.Fatalf("Lower = (%+v, %v), want one lowered function", result, err)
 	}
@@ -6292,7 +6292,7 @@ func TestLowerParametersAndResults(t *testing.T) {
 			}},
 		},
 	}}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -6514,7 +6514,7 @@ func TestLowerNormalizedResults(t *testing.T) {
 			},
 		},
 	}}
-	result, err := Lower(plan)
+	result, err := Lower(plan, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -6651,7 +6651,7 @@ func TestLowerChannelOperations(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -6767,7 +6767,7 @@ func TestLowerChannelRange(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}
@@ -6860,7 +6860,7 @@ func TestLowerChannelSelect(t *testing.T) {
 	}
 	result, err := Lower(&Plan{Functions: map[*ir.Func]*Function{
 		fn: function,
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatalf("Lower failed: %v", err)
 	}

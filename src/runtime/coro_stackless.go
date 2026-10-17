@@ -497,6 +497,13 @@ func init() {
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
+// coroInBubble selects the ordinary source body before a public coroutine
+// entry allocates frames or enters an executor. Native logical tasks do not
+// participate in synctest's goroutine and fake-time accounting.
+func coroInBubble() bool {
+	return getg().bubble != nil
+}
+
 // coroRun drives one stackless logical goroutine and its children. The
 // compiler emits calls to coroRun only for coroutine root adapters.
 func coroRun(resume stacklessCoroResume) {

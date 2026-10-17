@@ -149,7 +149,7 @@ func TestLowerSemaphore(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err := Lower(plan)
+			result, err := Lower(plan, nil)
 			if err != nil || result.Lowered != 1 || result.Skipped != 0 {
 				t.Fatalf("Lower = %+v, %v", result, err)
 			}
