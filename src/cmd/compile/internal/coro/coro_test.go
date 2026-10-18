@@ -2151,9 +2151,11 @@ import "runtime"
 
 var sink int
 
+func cleanup() { println("stackless-coro-spawn-cleanup") }
+
 //go:noinline
 func child() {
-	defer println("stackless-coro-spawn-cleanup")
+	defer cleanup()
 	runtime.Gosched()
 	var pointer *int
 	sink = *pointer
@@ -2194,6 +2196,16 @@ func main() {
 		want := "coro: func=main." + name + " "
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
+	}
+	for _, name := range []string{"child", "root"} {
+		if !strings.Contains(string(symbols), " main."+name+".coro\n") {
+			t.Fatalf("missing native %s entry\n%s", name, out)
 		}
 	}
 
@@ -2543,20 +2555,38 @@ import (
 	"runtime"
 )
 
+var release = make(chan struct{})
+
+func cleanup() { println("stackless-coro-child-cleanup") }
+func leafCleanup() { println("stackless-coro-leaf-cleanup") }
+
 //go:noinline
-func panics() {
-	defer println("stackless-coro-child-cleanup")
+func panicLeaf() {
+	defer leafCleanup()
 	runtime.Gosched()
 	panic("spawn panic")
 }
 
 //go:noinline
-func spawn() {
+func panics(nested bool) {
+	defer cleanup()
+	<-release
+	runtime.Gosched()
+	if nested { panicLeaf() }
+	panic("spawn panic")
+}
+
+//go:noinline
+func spawn(active, nested bool) {
 	defer func() {
 		if recover() != nil { println("incorrect-creator-recovery") }
 	}()
 	runtime.Gosched()
-	go panics()
+	go panics(nested)
+	if active {
+		close(release)
+		for { runtime.Gosched() }
+	}
 }
 
 //go:noinline
@@ -2573,7 +2603,8 @@ func main() {
 		if recover() != nil { println("incorrect-main-recovery") }
 	}()
 	if len(os.Args) > 1 {
-		spawn()
+		spawn(os.Args[1] == "active", len(os.Args) > 2)
+		close(release)
 		for { runtime.Gosched() }
 	}
 	if recovered := recoverer(); recovered != "recovered" {
@@ -2605,7 +2636,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("nm: %v\n%s", err, symbols)
 	}
-	for _, name := range []string{"panics", "spawn", "recoverer"} {
+	for _, name := range []string{"panicLeaf", "panics", "spawn", "recoverer"} {
 		if !strings.Contains(string(symbols), " main."+name+".coro\n") {
 			t.Errorf("missing native %s entry\n%s", name, data)
 		}
@@ -2619,17 +2650,25 @@ func main() {
 	if want := "stackless-coro-spawn-terminal-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd = testenv.CommandContext(t, ctx, exe, "panic")
-	data, err = cmd.CombinedOutput()
-	if ctx.Err() != nil || err == nil {
-		t.Fatalf("unhandled child panic did not terminate: %v, %v\n%s", ctx.Err(), err, data)
-	}
-	if strings.Count(string(data), "stackless-coro-child-cleanup") != 1 ||
-		!strings.Contains(string(data), "panic: spawn panic") ||
-		strings.Contains(string(data), "incorrect-") {
-		t.Fatalf("child panic escaped its logical goroutine or lost cleanup\n%s", data)
+	for _, mode := range []string{"active", "detached"} {
+		for _, nested := range []bool{false, true} {
+			args := []string{mode}
+			leafCleanups := 0
+			if nested {
+				args = append(args, "nested")
+				leafCleanups = 1
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			cmd = testenv.CommandContext(t, ctx, exe, args...)
+			data, err = cmd.CombinedOutput()
+			ctxErr := ctx.Err()
+			cancel()
+			if ctxErr != nil || err == nil || strings.Count(string(data), "stackless-coro-child-cleanup") != 1 ||
+				strings.Count(string(data), "stackless-coro-leaf-cleanup") != leafCleanups ||
+				!strings.Contains(string(data), "panic: spawn panic") || strings.Contains(string(data), "incorrect-") {
+				t.Fatalf("%s nested=%v child panic escaped its goroutine or lost cleanup: %v, %v\n%s", mode, nested, ctxErr, err, data)
+			}
+		}
 	}
 }
 
