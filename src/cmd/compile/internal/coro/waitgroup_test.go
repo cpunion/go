@@ -28,6 +28,8 @@ func TestWaitGroup(t *testing.T) {
 
 import "runtime"
 
+const CoroWaitGroupNative = false
+
 func coroWaitGroupWait(wg *WaitGroup) { wg.Wait() }
 func coroWaitGroupDone(wg *WaitGroup) { wg.Done() }
 func coroWaitGroupCycle(wg *WaitGroup, request, completed chan int) {
@@ -67,6 +69,25 @@ var CoroWaitGroupDeferred = coroWaitGroupDeferred
 var CoroWaitGroupDeferredPanic = coroWaitGroupDeferredPanic
 var CoroWaitGroupDeferredExit = coroWaitGroupDeferredExit
 var CoroWaitGroupDeferredRecover = coroWaitGroupDeferredRecover
+
+func coroWaitGroupWorker(wg *WaitGroup, started chan struct{}, release <-chan struct{}, mode int) {
+ defer wg.Done()
+ defer func() {
+  if value := recover(); value != nil && value != "spawn recover" { panic(value) }
+ }()
+ runtime.Gosched()
+ started <- struct{}{}
+ <-release
+ if mode == 1 { panic("spawn recover") }
+ if mode == 2 { runtime.Goexit() }
+}
+func coroWaitGroupSpawn(wg *WaitGroup, started chan struct{}, release <-chan struct{}, count, mode int) {
+ runtime.Gosched()
+ for i := 0; i < count; i++ {
+  go coroWaitGroupWorker(wg, started, release, mode)
+ }
+}
+var CoroWaitGroupSpawn = coroWaitGroupSpawn
 
 func CoroWaitGroupWaiters(wg *WaitGroup) uint32 {
  return uint32(wg.state.Load() & 0x7fffffff)
@@ -157,6 +178,25 @@ func TestCoroWaitGroupDeferred(t *testing.T) {
   }
  }
 }
+
+func TestCoroWaitGroupSpawn(t *testing.T) {
+ const count = 128
+ for mode := 0; mode < 3; mode++ {
+  var wg sync.WaitGroup
+  started, release := make(chan struct{}, count), make(chan struct{})
+  wg.Add(count)
+  before := runtime.NumGoroutine()
+  sync.CoroWaitGroupSpawn(&wg, started, release, count, mode)
+  for i := 0; i < count; i++ { <-started }
+  parked := runtime.NumGoroutine()
+  runtime.GC()
+  close(release)
+  wg.Wait()
+  if sync.CoroWaitGroupNative && parked > before+32 {
+   t.Fatalf("mode %d created ordinary goroutines: before=%d parked=%d", mode, before, parked)
+  }
+ }
+}
 `
 	for _, config := range []struct {
 		name, experiment, flags string
@@ -181,6 +221,11 @@ func TestCoroWaitGroupDeferred(t *testing.T) {
 				"coro_waitgroup_entry_test.go":      source,
 				"coro_waitgroup_controller_test.go": controller,
 			} {
+				if name == "coro_waitgroup_entry_test.go" {
+					native := config.experiment == "coro" && !config.race
+					text = strings.Replace(text, "const CoroWaitGroupNative = false",
+						"const CoroWaitGroupNative = "+strconv.FormatBool(native), 1)
+				}
 				fixture := filepath.Join(tmp, name)
 				if err := os.WriteFile(fixture, []byte(text), 0o666); err != nil {
 					t.Fatal(err)
@@ -213,7 +258,7 @@ func TestCoroWaitGroupDeferred(t *testing.T) {
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
-				for _, name := range []string{"Wait", "Done", "Cycle", "Deferred", "DeferredPanic", "DeferredExit", "DeferredRecover"} {
+				for _, name := range []string{"Wait", "Done", "Cycle", "Deferred", "DeferredPanic", "DeferredExit", "DeferredRecover", "Spawn", "Worker"} {
 					if !strings.Contains(string(symbols), "sync.coroWaitGroup"+name+".coro") {
 						var diagnostics []string
 						for _, line := range strings.Split(string(data), "\n") {

@@ -866,9 +866,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if edge.Callee.Type().NumResults() != 0 {
 				return nil, fmt.Errorf("spawn target returns values")
 			}
-			if summary, known := plan.edgeSummary(edge); !known ||
-				summary.Terminal&MayPanic != 0 {
-				return nil, fmt.Errorf("spawn target may panic")
+			if _, known := plan.edgeSummary(edge); !known {
+				return nil, fmt.Errorf("unknown spawn target")
 			}
 			candidate.dependencies[edge.Callee] = true
 			if edge.Callee == fn {

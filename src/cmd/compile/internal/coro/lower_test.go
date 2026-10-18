@@ -4894,10 +4894,13 @@ func TestLowerRejectsTerminalControl(t *testing.T) {
 				}
 			}
 			plan := &Plan{Functions: functions}
-			if _, err := newLowerCandidate(plan, function); err == nil ||
-				!strings.Contains(err.Error(), "spawn target may panic") {
-				t.Fatalf("newLowerCandidate error = %v, want spawn rejection",
-					err)
+			candidate, err := newLowerCandidate(plan, function)
+			if test.unknown {
+				if err == nil || !strings.Contains(err.Error(), "unknown spawn target") {
+					t.Fatalf("newLowerCandidate error = %v, want unknown spawn rejection", err)
+				}
+			} else if err != nil || !candidate.dependencies[child] {
+				t.Fatalf("known may-panic spawn lost its dependency: %v", err)
 			}
 		})
 	}

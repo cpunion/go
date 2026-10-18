@@ -2531,23 +2531,30 @@ func main() {
 	}
 }
 
-func TestSpawnPanicFallback(t *testing.T) {
+func TestSpawnPanicLowering(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "main.go")
 	program := `package main
 
-import "runtime"
+import (
+	"os"
+	"runtime"
+)
 
 //go:noinline
 func panics() {
+	defer println("stackless-coro-child-cleanup")
 	runtime.Gosched()
 	panic("spawn panic")
 }
 
 //go:noinline
 func spawn() {
+	defer func() {
+		if recover() != nil { println("incorrect-creator-recovery") }
+	}()
 	runtime.Gosched()
 	go panics()
 }
@@ -2562,17 +2569,24 @@ func recoverer() (recovered any) {
 }
 
 func main() {
-	if recovered := recoverer(); recovered != "recovered" {
-		panic("bad recover fallback")
+	defer func() {
+		if recover() != nil { println("incorrect-main-recovery") }
+	}()
+	if len(os.Args) > 1 {
+		spawn()
+		for { runtime.Gosched() }
 	}
-	println("stackless-coro-terminal-fallback-ok")
+	if recovered := recoverer(); recovered != "recovered" {
+		panic("bad recovered outcome")
+	}
+	println("stackless-coro-spawn-terminal-ok")
 }
 `
 	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
 		t.Fatal(err)
 	}
 
-	exe := filepath.Join(tmp, "coro-terminal-fallback")
+	exe := filepath.Join(tmp, "coro-spawn-terminal")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
 		"-gcflags=command-line-arguments=-l -d=coro=4",
@@ -2583,26 +2597,39 @@ func main() {
 		"GOWORK=off",
 	)
 	data, err := cmd.CombinedOutput()
-	out := string(data)
 	if err != nil {
-		t.Fatalf("building terminal fallback program failed: %v\n%s", err, out)
+		t.Fatalf("building spawn terminal program failed: %v\n%s", err, data)
 	}
-	for _, want := range []string{
-		"coro: phase=lower lowered=3 skipped=1",
-		"main.spawn: spawn target may panic",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output does not contain %q\n%s", want, out)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
+	}
+	for _, name := range []string{"panics", "spawn", "recoverer"} {
+		if !strings.Contains(string(symbols), " main."+name+".coro\n") {
+			t.Errorf("missing native %s entry\n%s", name, data)
 		}
 	}
 
 	cmd = testenv.Command(t, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("terminal fallback program failed: %v\n%s", err, data)
+		t.Fatalf("recovered outcome failed: %v\n%s", err, data)
 	}
-	if want := "stackless-coro-terminal-fallback-ok"; !strings.Contains(string(data), want) {
+	if want := "stackless-coro-spawn-terminal-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd = testenv.CommandContext(t, ctx, exe, "panic")
+	data, err = cmd.CombinedOutput()
+	if ctx.Err() != nil || err == nil {
+		t.Fatalf("unhandled child panic did not terminate: %v, %v\n%s", ctx.Err(), err, data)
+	}
+	if strings.Count(string(data), "stackless-coro-child-cleanup") != 1 ||
+		!strings.Contains(string(data), "panic: spawn panic") ||
+		strings.Contains(string(data), "incorrect-") {
+		t.Fatalf("child panic escaped its logical goroutine or lost cleanup\n%s", data)
 	}
 }
 
