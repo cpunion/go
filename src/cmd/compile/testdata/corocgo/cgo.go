@@ -42,6 +42,15 @@ func scalar(value uint64) uint64 {
 	return uint64(result)
 }
 
+//go:noinline
+func scalarRange(n uint64) uint64 {
+	var value C.uint64_t
+	for i := range n {
+		value = C.add(value, C.uint64_t(i))
+	}
+	return uint64(value)
+}
+
 // locked is called both with and without a thread lock inherited from Go or
 // a C callback. Its public entry must choose the body before entering C.
 //

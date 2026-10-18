@@ -18,6 +18,14 @@ func TestScalar(t *testing.T) {
 	}
 }
 
+func TestScalarRange(t *testing.T) {
+	for _, n := range []uint64{0, 5, 128} {
+		if got, want := scalarRange(n), n*(n-1)/2; got != want {
+			t.Errorf("scalarRange(%d) = %d, want %d", n, got, want)
+		}
+	}
+}
+
 func TestLockedThread(t *testing.T) {
 	for range 10 {
 		runtime.LockOSThread()
