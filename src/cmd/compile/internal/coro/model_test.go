@@ -28,6 +28,7 @@ func TestFuncSummaryPrimary(t *testing.T) {
 		{FuncSummary{Effect: MaySuspend}, CoroPrimary},
 		{FuncSummary{Exec: NeedsPreempt}, CoroPrimary},
 		{FuncSummary{Exec: NeedsSystemABI}, CoroPrimary},
+		{FuncSummary{Exec: NeedsTaskContext}, CoroPrimary},
 		{FuncSummary{Terminal: MayPanic}, CoroPrimary},
 		{FuncSummary{Terminal: MayGoexit}, CoroPrimary},
 		{FuncSummary{Terminal: UsesRecover}, PlainPrimary},
@@ -44,8 +45,8 @@ func TestExecFlagsString(t *testing.T) {
 	if got, want := ExecFlags(0).String(), "-"; got != want {
 		t.Errorf("ExecFlags(0).String() = %q, want %q", got, want)
 	}
-	flags := NeedsPreempt | NeedsSystemABI | ExecFlags(1<<20)
-	if got, want := flags.String(), "preempt,system-abi,ExecFlags(0x100000)"; got != want {
+	flags := NeedsPreempt | NeedsSystemABI | NeedsTaskContext | ExecFlags(1<<20)
+	if got, want := flags.String(), "preempt,system-abi,task-context,ExecFlags(0x100000)"; got != want {
 		t.Errorf("ExecFlags.String() = %q, want %q", got, want)
 	}
 }
@@ -110,9 +111,20 @@ func TestDecodeFuncSummary(t *testing.T) {
 
 	next, reads = read(uint64(NoSuspend), 0, uint64(FactoryABI1),
 		uint64(MayGoexit), uint64(DeferABI1))
-	summary, ok, err = DecodeFuncSummary(SummaryVersion, next)
+	summary, ok, err = DecodeFuncSummary(deferSummaryVersion, next)
 	want = FuncSummary{
 		Factory: FactoryABI1, Terminal: MayGoexit, Defer: DeferABI1,
+	}
+	if err != nil || !ok || summary != want || *reads != 5 {
+		t.Fatalf("defer summary = %+v, %t, %v with %d reads, want %+v",
+			summary, ok, err, *reads, want)
+	}
+
+	next, reads = read(uint64(NoSuspend), uint64(NeedsTaskContext), uint64(FactoryABI1),
+		uint64(MayGoexit), uint64(DeferABI1))
+	summary, ok, err = DecodeFuncSummary(SummaryVersion, next)
+	want = FuncSummary{
+		Exec: NeedsTaskContext, Factory: FactoryABI1, Terminal: MayGoexit, Defer: DeferABI1,
 	}
 	if err != nil || !ok || summary != want || *reads != 5 {
 		t.Fatalf("current summary = %+v, %t, %v with %d reads, want %+v",
@@ -229,6 +241,11 @@ func TestEdgeNeedsCoroEntry(t *testing.T) {
 		t.Fatal("panicking local edge does not require a coroutine entry")
 	}
 	if !plan.edgeNeedsCoroEntry(Edge{
+		Imported: FuncSummary{Exec: NeedsTaskContext},
+	}) {
+		t.Fatal("task-creating imported edge without a factory does not require fallback")
+	}
+	if !plan.edgeNeedsCoroEntry(Edge{
 		Imported: FuncSummary{Terminal: MayGoexit},
 	}) {
 		t.Fatal("Goexit imported edge does not require a coroutine entry")
@@ -236,6 +253,7 @@ func TestEdgeNeedsCoroEntry(t *testing.T) {
 }
 
 func TestAnalyzeTerminalControl(t *testing.T) {
+	prepareLowerTest(t)
 	pkg := types.NewPkg("example.com/coro/terminaltest", "terminaltest")
 	newFunc := func(name string) *ir.Func {
 		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name),
@@ -301,10 +319,10 @@ func TestAnalyzeTerminalControl(t *testing.T) {
 	}{
 		{panicking, MayPanic, MayPanic, CoroPrimary, []SiteKind{SitePanic}},
 		{caller, 0, MayPanic, CoroPrimary, []SiteKind{SiteAwait}},
-		{launched, 0, 0, PlainPrimary, []SiteKind{SiteSpawn}},
+		{launched, 0, 0, CoroPrimary, []SiteKind{SiteSpawn}},
 		{recovering, UsesRecover, UsesRecover, PlainPrimary, nil},
 		{exiting, MayGoexit, MayGoexit, CoroPrimary, []SiteKind{SiteGoexit}},
-		{launchedGoexit, 0, 0, PlainPrimary, []SiteKind{SiteSpawn}},
+		{launchedGoexit, 0, 0, CoroPrimary, []SiteKind{SiteSpawn}},
 	} {
 		function := plan.Functions[test.fn]
 		if function.LocalTerminal != test.local ||

@@ -58,9 +58,13 @@ const (
 	// defer entry capabilities were recorded.
 	terminalSummaryVersion uint64 = 4
 
+	// deferSummaryVersion is the coroutine summary format before task-context
+	// execution requirements were recorded.
+	deferSummaryVersion uint64 = 5
+
 	// SummaryVersion is the current coroutine function summary format stored
 	// in the compiler-private Unified IR extension.
-	SummaryVersion uint64 = 5
+	SummaryVersion uint64 = 6
 )
 
 // The compiler processes one package per process, so summaries are package
@@ -76,7 +80,8 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 		return FuncSummary{}, false, nil
 	}
 	if version != legacySummaryVersion && version != factorySummaryVersion &&
-		version != terminalSummaryVersion && version != SummaryVersion {
+		version != terminalSummaryVersion && version != deferSummaryVersion &&
+		version != SummaryVersion {
 		return FuncSummary{}, false,
 			fmt.Errorf("unsupported coroutine summary version %d", version)
 	}
@@ -111,7 +116,7 @@ func DecodeFuncSummary(version uint64, next func() uint64) (FuncSummary, bool, e
 		}
 		summary.Terminal = TerminalFlags(terminalValue)
 	}
-	if version == SummaryVersion {
+	if version >= deferSummaryVersion {
 		deferValue := next()
 		if deferValue > uint64(^DeferABI(0)) {
 			return FuncSummary{}, false,
@@ -516,6 +521,7 @@ func (p *Plan) scan(function *Function) {
 			}
 		}
 		if kind == GoCall {
+			function.LocalExec |= NeedsTaskContext
 			addSite(SiteSpawn, call, edge.Recipe.Foreign)
 		}
 		function.Edges = append(function.Edges, edge)

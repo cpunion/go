@@ -156,19 +156,19 @@ func TestAnalysis(t *testing.T) {
 		"coro: func=p.receive effect=may-suspend local=may-suspend recursive=false seeds=channel-receive",
 		"coro: func=p.direct effect=may-suspend local=nosuspend recursive=false seeds=-",
 		"coro: func=p.deferred effect=may-suspend local=nosuspend recursive=false seeds=-",
-		"coro: func=p.launched effect=nosuspend local=nosuspend recursive=false seeds=-",
+		"coro: func=p.launched effect=nosuspend local=nosuspend recursive=false seeds=- primary=coro exec=task-context",
 		"coro: func=p.cycleA effect=may-suspend local=nosuspend recursive=true seeds=-",
 		"coro: func=p.cycleB effect=may-suspend local=may-suspend recursive=true seeds=channel-receive",
 		"coro: func=p.channelRange effect=may-suspend local=may-suspend recursive=false seeds=channel-range",
 		"coro: func=p.selecting effect=may-suspend local=may-suspend recursive=false seeds=channel-receive,channel-select",
 		"coro: func=p.dynamic effect=may-suspend local=may-suspend recursive=false seeds=unknown-call",
-		"coro: func=p.launchedDynamic effect=nosuspend local=nosuspend recursive=false seeds=-",
+		"coro: func=p.launchedDynamic effect=nosuspend local=nosuspend recursive=false seeds=- primary=coro exec=task-context",
 		"coro: func=p.yielding effect=may-suspend local=may-suspend recursive=false seeds=scheduler-yield primary=coro",
 		"coro: func=p.yieldCaller effect=may-suspend local=nosuspend recursive=false seeds=- primary=coro",
 		"coro: func=p.sleeping effect=may-suspend local=may-suspend recursive=false seeds=timer-wait primary=coro",
 		"coro: func=p.panicking effect=nosuspend local=nosuspend recursive=false seeds=- primary=coro exec=- terminal=panic local-terminal=panic",
 		"coro: func=p.panicCaller effect=nosuspend local=nosuspend recursive=false seeds=- primary=coro exec=- terminal=panic local-terminal=-",
-		"coro: func=p.panicLaunched effect=nosuspend local=nosuspend recursive=false seeds=- primary=plain exec=- terminal=- local-terminal=-",
+		"coro: func=p.panicLaunched effect=nosuspend local=nosuspend recursive=false seeds=- primary=coro exec=task-context terminal=- local-terminal=-",
 		"coro: func=p.goexiting effect=may-suspend local=may-suspend recursive=false seeds=scheduler-yield primary=coro exec=- terminal=goexit local-terminal=goexit",
 		"coro: site=1 func=p.yielding kind=yield foreign=-",
 		"coro: site=1 func=p.yieldCaller kind=await foreign=-",
@@ -3697,6 +3697,11 @@ var manyChannel chan int
 var manyReady atomic.Uint32
 var pointerChannel chan *int
 var gcDone atomic.Uint32
+var gcRequest = make(chan struct{})
+
+// Start the ordinary GC controller before entering the native channel test.
+// Calling a dynamic go helper from that test would require ordinary fallback.
+func init() { go collect() }
 
 //go:noinline
 func nextValue() int {
@@ -3740,13 +3745,9 @@ func directionalRecv(ch <-chan int) int {
 
 //go:noinline
 func collect() {
+	<-gcRequest
 	runtime.GC()
 	gcDone.Store(1)
-}
-
-//go:noinline
-func launch(f func()) {
-	go f()
 }
 
 //go:noinline
@@ -3864,7 +3865,7 @@ func main() {
 	pointerChannel = pointers
 	go sendPointer()
 	runtime.Gosched()
-	launch(collect)
+	gcRequest <- struct{}{}
 	for gcDone.Load() == 0 {
 		runtime.Gosched()
 	}

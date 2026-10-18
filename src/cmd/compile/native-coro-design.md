@@ -1051,7 +1051,10 @@ rejected because the child may outlive the parent slot.
 
 Summary version 2 carries effect and execution requirements, version 3 adds
 the factory capability, version 4 adds `MayPanic`, `UsesRecover`, and
-`MayGoexit`, and version 5 adds the defer-entry capability. All older versions
+`MayGoexit`, version 5 adds the defer-entry capability, and version 6 records
+task-context execution requirements. The latter version prevents an older
+importer from silently ignoring the new execution bit and using a plain entry.
+All older versions
 decode with absent newer capabilities. Unknown factory or defer ABI values
 are treated as unavailable; an unknown summary format version is rejected as
 incompatible. This lets explicit terminal effects propagate through imported
@@ -4053,6 +4056,15 @@ child factory. When operand evaluation suspends, the existing Init state
 machinery completes that evaluation before emitting the spawn. Argument
 snapshots and pointer roots therefore use the same frontend representation
 rather than a second go-call normalization pass or source annotations.
+
+A go statement requires a logical task context even when its creator cannot
+suspend. Analysis records `NeedsTaskContext` independently of suspension and
+propagates it through direct and deferred calls, but not from a go target to
+its creator. Pure-spawn helpers and their callers retain coroutine boundaries
+and use the existing factory ABI without acquiring a `MaySuspend` effect from
+the child. An imported task-creating helper without a factory forces ordinary
+fallback before entering the native executor. Execution-constrained defer
+targets remain unsupported, rather than creating tasks during native cleanup.
 
 The target must still satisfy the existing factory restrictions. Dynamic
 function values, arbitrary source closures, unsupported signatures and returned
