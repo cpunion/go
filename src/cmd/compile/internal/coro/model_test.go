@@ -109,6 +109,17 @@ func TestDecodeFuncSummary(t *testing.T) {
 			summary, ok, err, *reads, want)
 	}
 
+	next, reads = read(uint64(NoSuspend), 0, uint64(FactoryABI1),
+		uint64(MayGoexit), uint64(DeferABI1))
+	summary, ok, err = DecodeFuncSummary(deferSummaryVersion, next)
+	want = FuncSummary{
+		Factory: FactoryABI1, Terminal: MayGoexit, Defer: DeferABI1,
+	}
+	if err != nil || !ok || summary != want || *reads != 5 {
+		t.Fatalf("defer summary = %+v, %t, %v with %d reads, want %+v",
+			summary, ok, err, *reads, want)
+	}
+
 	next, reads = read(uint64(NoSuspend), uint64(NeedsTaskContext), uint64(FactoryABI1),
 		uint64(MayGoexit), uint64(DeferABI1))
 	summary, ok, err = DecodeFuncSummary(SummaryVersion, next)

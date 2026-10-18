@@ -1051,7 +1051,10 @@ rejected because the child may outlive the parent slot.
 
 Summary version 2 carries effect and execution requirements, version 3 adds
 the factory capability, version 4 adds `MayPanic`, `UsesRecover`, and
-`MayGoexit`, and version 5 adds the defer-entry capability. All older versions
+`MayGoexit`, version 5 adds the defer-entry capability, and version 6 records
+task-context execution requirements. The latter version prevents an older
+importer from silently ignoring the new execution bit and using a plain entry.
+All older versions
 decode with absent newer capabilities. Unknown factory or defer ABI values
 are treated as unavailable; an unknown summary format version is rejected as
 incompatible. This lets explicit terminal effects propagate through imported
