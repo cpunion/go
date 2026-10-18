@@ -594,7 +594,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("labeled range loop")
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
-					!stmt.X.Type().IsChan() {
+					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger()) {
 					return fmt.Errorf("unsupported range loop")
 				}
 				if variable := transformedRangeVariable(stmt); variable != nil &&
@@ -2225,6 +2225,17 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 				stmt.SetTypecheck(0)
 				body = append(body, stmt)
 				continue
+
+			case *ir.RangeStmt:
+				// A run-to-completion candidate cannot contain a channel
+				// receive. Integer ranges can use the ordinary loop rewrite.
+				loop := integerRangeLoop(stmt, factory)
+				rewritten, err := rewriteList(ir.Nodes{loop})
+				if err != nil {
+					return nil, err
+				}
+				body = append(body, rewritten...)
+				continue
 			}
 
 			init, err := rewriteList(ir.TakeInit(stmt))
@@ -2718,7 +2729,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return true
 		case *ir.BranchStmt:
 			return candidate.branches[stmt] != nil
-		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.SelectStmt:
+		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.RangeStmt, *ir.SelectStmt:
 			return requiresControlLowering(stmt)
 		}
 		if channelOperation(stmt, candidate.channels) != nil {
@@ -2740,6 +2751,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	continueStates := make(map[ir.Node]int)
 	var lowerStatements func(ir.Nodes, int) int
 	var lowerStatement func(ir.Node, int) int
+	lowerLoop := func(target ir.Node, loop *ir.ForStmt, next int) int {
+		conditionState := addState(lowerState{
+			condition: loop.Cond,
+			next:      -1,
+			thenState: -1,
+			elseState: next,
+		})
+		postState := conditionState
+		if loop.Post != nil {
+			postState = lowerStatements(ir.Nodes{loop.Post}, conditionState)
+		}
+		breakStates[target] = next
+		continueStates[target] = postState
+		bodyState := lowerStatements(loop.Body, postState)
+		states[conditionState].thenState = bodyState
+		return lowerStatements(loop.Init(), conditionState)
+	}
 	lowerStatements = func(list ir.Nodes, next int) int {
 		end := len(list)
 		for i := len(list) - 1; i >= 0; i-- {
@@ -2806,23 +2834,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return lowerStatements(stmt.Init(), branch)
 
 		case *ir.ForStmt:
-			conditionState := addState(lowerState{
-				condition: stmt.Cond,
-				next:      -1,
-				thenState: -1,
-				elseState: next,
-			})
-			postState := conditionState
-			if stmt.Post != nil {
-				postState = lowerStatements(ir.Nodes{stmt.Post}, conditionState)
-			}
-			breakStates[stmt] = next
-			continueStates[stmt] = postState
-			bodyState := lowerStatements(stmt.Body, postState)
-			states[conditionState].thenState = bodyState
-			return lowerStatements(stmt.Init(), conditionState)
+			return lowerLoop(stmt, stmt, next)
 
 		case *ir.RangeStmt:
+			if stmt.X.Type().IsInteger() {
+				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
+			}
 			channel := candidate.channels[stmt]
 			if channel == nil || channel.rangeStmt != stmt {
 				panic("unexpected coroutine range boundary")
