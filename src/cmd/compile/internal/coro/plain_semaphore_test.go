@@ -43,6 +43,7 @@ func coroPlainSpawn(addr *uint32, ready, done chan struct{}) {
 }
 
 func coroPlainReleaseMany(addr *uint32) {
+ runtime.Gosched()
  for i := 0; i < 129; i++ { coroPlainRelease(addr) }
 }
 
@@ -142,7 +143,13 @@ func TestCoroPlainSemaphoreEntry(t *testing.T) {
 						if err != nil {
 							t.Fatalf("nm: %v\n%s", err, symbols)
 						}
-						for _, name := range []string{"Acquire", "Release", "Waiter", "Spawn", "ReleaseMany"} {
+						names := []string{"Acquire", "Waiter", "Spawn", "ReleaseMany"}
+						if pkg == "internal/poll" {
+							names = append(names, "Release")
+						} else if strings.Contains(string(symbols), pkg+".coroPlainRelease.coro") {
+							t.Fatal("non-handoff release has an unnecessary coroutine entry")
+						}
+						for _, name := range names {
 							if !strings.Contains(string(symbols), pkg+".coroPlain"+name+".coro") {
 								var diagnostics []string
 								for _, line := range strings.Split(string(data), "\n") {

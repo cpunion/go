@@ -5967,6 +5967,14 @@ func TestLowerRejectsUnsupportedControl(t *testing.T) {
 			want: "branch in unsupported control flow switch",
 		},
 		{
+			name: "escaping-goto-in-inline",
+			body: func(*ir.CallExpr) ir.Nodes {
+				branch := ir.NewBranchStmt(src.NoXPos, ir.OGOTO, pkg.Lookup("outside"))
+				return ir.Nodes{ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{branch}, nil)}
+			},
+			want: "branch in unsupported control flow INLCALL",
+		},
+		{
 			name: "non-normalized-defer",
 			body: func(call *ir.CallExpr) ir.Nodes {
 				call.Args = ir.Nodes{ir.NewBasicLit(src.NoXPos,

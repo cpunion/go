@@ -454,6 +454,11 @@ func (p *Plan) scan(function *Function) {
 			edge.Unknown = true
 		}
 		if recipe, ok := p.operationRecipe(edge.Callee); ok {
+			if kind == DirectCall && recipe.Kind == SiteSemaphore && semaphoreNoHandoff(call) {
+				// With no handoff ticket, the ordinary release entry shares
+				// the same wakeup path without parking or yielding this task.
+				recipe.Kind, recipe.Effect = SiteInvalid, NoSuspend
+			}
 			edge.Recipe = recipe
 			edge.Direct = p.localFunc[recipe.Direct]
 			edge.Imported = FuncSummary{
@@ -474,7 +479,7 @@ func (p *Plan) scan(function *Function) {
 					addSeed(TimerWait)
 				}
 			}
-			if kind != GoCall {
+			if kind != GoCall && recipe.Kind != SiteInvalid {
 				addSite(recipe.Kind, call, recipe.Foreign)
 			}
 		}
