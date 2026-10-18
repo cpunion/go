@@ -2819,15 +2819,18 @@ func main() {
 	if err != nil {
 		t.Fatalf("building Goexit coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=7"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain %q\n%s", want, out)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
 	}
 	for _, name := range []string{
 		"main.leaf", "main.middle", "main.structured",
 		"main.overlay", "main.detached", "main.spawnRoot", "main.immediate",
+		"main.main",
 	} {
-		if strings.Contains(out, "coro: skip "+name+":") {
-			t.Errorf("Goexit function %s was not lowered\n%s", name, out)
+		if !strings.Contains(string(symbols), " "+name+".coro\n") {
+			t.Errorf("missing native Goexit %s entry\n%s", name, out)
 		}
 	}
 
