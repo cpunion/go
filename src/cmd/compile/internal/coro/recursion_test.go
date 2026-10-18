@@ -57,7 +57,13 @@ func TestPlainRecursiveExecution(t *testing.T) {
 			if function.Effect != NoSuspend || len(function.Seeds) != 0 {
 				t.Fatalf("%s: recursion changed suspension effect", fn.Sym().Name)
 			}
-			if fn == leaf || fn == launcher || fn == cleanup {
+			if fn == launcher {
+				if function.Primary != CoroPrimary || function.Exec != NeedsTaskContext {
+					t.Fatal("launcher did not retain its own task-creation requirement")
+				}
+				continue
+			}
+			if fn == leaf || fn == cleanup {
 				if function.Primary != PlainPrimary || function.Exec != 0 {
 					t.Fatalf("%s: unrelated function needs a coroutine context", fn.Sym().Name)
 				}

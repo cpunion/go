@@ -4054,6 +4054,15 @@ machinery completes that evaluation before emitting the spawn. Argument
 snapshots and pointer roots therefore use the same frontend representation
 rather than a second go-call normalization pass or source annotations.
 
+A go statement requires a logical task context even when its creator cannot
+suspend. Analysis records `NeedsTaskContext` independently of suspension and
+propagates it through direct and deferred calls, but not from a go target to
+its creator. Pure-spawn helpers and their callers retain coroutine boundaries
+and use the existing factory ABI without acquiring a `MaySuspend` effect from
+the child. An imported task-creating helper without a factory forces ordinary
+fallback before entering the native executor. Execution-constrained defer
+targets remain unsupported, rather than creating tasks during native cleanup.
+
 The target must still satisfy the existing factory restrictions. Dynamic
 function values, arbitrary source closures, unsupported signatures and returned
 values retain the ordinary Go path. A statically known native target may panic;

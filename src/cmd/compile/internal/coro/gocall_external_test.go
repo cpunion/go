@@ -146,7 +146,7 @@ var next int
 func argument() int { next++; return next }
 func worker(value int) { runtime.Gosched(); done <- value }
 func returning(value int) int { worker(value); return value }
-func spawn() { GO_CALL; runtime.Gosched() }
+func spawn() { GO_CALL }
 func main() {
 	dynamic = worker
 	spawn()
@@ -196,7 +196,7 @@ import "runtime"
 var started bool
 func argument() int { panic(42) }
 func worker(value int) { started = true; runtime.Gosched() }
-func spawn() { go worker(argument()); runtime.Gosched() }
+func spawn() { go worker(argument()) }
 func check() {
 	defer func() {
 		if recover() != 42 || started { panic("argument panic escaped its caller or spawned a child") }

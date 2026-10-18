@@ -516,6 +516,7 @@ func (p *Plan) scan(function *Function) {
 			}
 		}
 		if kind == GoCall {
+			function.LocalExec |= NeedsTaskContext
 			addSite(SiteSpawn, call, edge.Recipe.Foreign)
 		}
 		function.Edges = append(function.Edges, edge)

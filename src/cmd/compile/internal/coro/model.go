@@ -17,13 +17,16 @@ const (
 	MayBlockThread
 	NeedsSystemABI
 	ThreadAffine
+	// NeedsTaskContext keeps task creation on the logical scheduler even
+	// when the creating function cannot suspend its caller.
+	NeedsTaskContext
 )
 
 func (f ExecFlags) String() string {
 	if f == 0 {
 		return "-"
 	}
-	names := make([]string, 0, 4)
+	names := make([]string, 0, 5)
 	for _, flag := range []struct {
 		flag ExecFlags
 		name string
@@ -32,6 +35,7 @@ func (f ExecFlags) String() string {
 		{MayBlockThread, "block-thread"},
 		{NeedsSystemABI, "system-abi"},
 		{ThreadAffine, "thread-affine"},
+		{NeedsTaskContext, "task-context"},
 	} {
 		if f&flag.flag != 0 {
 			names = append(names, flag.name)
@@ -231,7 +235,7 @@ type FuncSummary struct {
 }
 
 func (s FuncSummary) Primary() PrimaryKind {
-	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI) != 0 ||
+	if s.Effect == MaySuspend || s.Exec&(NeedsPreempt|NeedsSystemABI|NeedsTaskContext) != 0 ||
 		s.Terminal&(MayPanic|MayGoexit) != 0 {
 		return CoroPrimary
 	}
