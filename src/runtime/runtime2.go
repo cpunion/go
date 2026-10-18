@@ -403,6 +403,7 @@ func (p *maybeTraceableChan) get() *hchan {
 // releaseSudog to allocate and free them. Stackless coroutine channel
 // operations retain their own bounded waiter; see newStacklessCoroSudog.
 // Stackless semaphore operations retain a waiter until acquisition succeeds.
+// Stackless notification operations retain a waiter until its ticket is notified.
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on

@@ -139,6 +139,7 @@ const (
 	SitePanic
 	SiteGoexit
 	SiteSemaphore
+	SiteNotify
 )
 
 func (k SiteKind) String() string {
@@ -167,6 +168,8 @@ func (k SiteKind) String() string {
 		return "goexit"
 	case SiteSemaphore:
 		return "semaphore"
+	case SiteNotify:
+		return "notify"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -285,13 +288,8 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteSemaphore,
 		Effect: MaySuspend,
 	},
-	// These declarations park an ordinary goroutine in the runtime. Their
-	// bodies are unavailable to effect analysis, so propagate suspension
-	// explicitly through the synchronization packages and their callers.
-	// Until they have coroutine entries, the ordinary await dependency check
-	// keeps those callers on the Go entry instead of parking an executor.
 	"sync.runtime_notifyListWait": {
-		Kind:   SiteAwait,
+		Kind:   SiteNotify,
 		Effect: MaySuspend,
 	},
 	"runtime.Gosched": {
@@ -365,6 +363,9 @@ func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 	if recipe.Kind == SiteSemaphore && !semaphoreSignature(name, fn.Type()) {
 		// An unexpected runtime declaration remains a suspension boundary,
 		// but cannot use the compiler-owned semaphore calling convention.
+		recipe.Kind = SiteAwait
+	}
+	if recipe.Kind == SiteNotify && !notifySignature(fn.Type()) {
 		recipe.Kind = SiteAwait
 	}
 	return recipe, ok

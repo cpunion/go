@@ -9,3 +9,7 @@ package runtime
 func readyStacklessCoroSemaphore(*sudog) {
 	throw("runtime: stackless coroutine semaphore without experiment")
 }
+
+func readyStacklessCoroNotify(*sudog) {
+	throw("runtime: stackless coroutine notification without experiment")
+}

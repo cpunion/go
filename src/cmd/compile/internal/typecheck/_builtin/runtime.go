@@ -364,6 +364,7 @@ func coroTakeFusedFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *by
 func coroSemacquireMutex(unsafe.Pointer, *uint32, bool, int, *unsafe.Pointer) bool
 func coroSemacquire(unsafe.Pointer, *uint32, *unsafe.Pointer) bool
 func coroSemacquireWaitGroup(unsafe.Pointer, *uint32, bool, *unsafe.Pointer) bool
+func coroNotifyListWait(unsafe.Pointer, unsafe.Pointer, uint32, *unsafe.Pointer) bool
 func coroSemreleasePoll(unsafe.Pointer, *uint32) bool
 func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool
 
