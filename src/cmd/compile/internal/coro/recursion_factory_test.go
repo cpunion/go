@@ -5,6 +5,7 @@
 package coro_test
 
 import (
+	"fmt"
 	"internal/platform"
 	"internal/testenv"
 	"os"
@@ -67,6 +68,16 @@ func Deferred(n int) (result int) {
 func Wrap(n int) int {
 	return Sum(n)
 }
+
+func MayPanic(n int) int {
+	if n < 0 {
+		panic("negative")
+	}
+	if n == 0 {
+		return 1
+	}
+	return MayPanic(n-1) + 1
+}
 `,
 		"main.go": `package main
 
@@ -106,6 +117,10 @@ func check(n int) int {
 	got = helper.Deferred(n)
 	if got != n+1 {
 		panic("recursive defer")
+	}
+	got = helper.MayPanic(n)
+	if got != n+1 {
+		panic("panic-only recursion")
 	}
 	return got
 }
@@ -175,7 +190,7 @@ func main() {
 			native := mode != "race" && mode != "nocoro"
 			if native {
 				for _, name := range []string{
-					"helper.Sum", "helper.Even", "helper.Odd", "helper.(*Counter).Descend", "helper.Deferred", "helper.Wrap", "main.local",
+					"helper.Sum", "helper.Even", "helper.Odd", "helper.(*Counter).Descend", "helper.Deferred", "helper.Wrap", "helper.MayPanic", "main.local",
 				} {
 					if strings.HasPrefix(name, "helper.") {
 						name = "example.com/plainrecursion/" + name
@@ -200,7 +215,7 @@ func main() {
 			}
 			for _, name := range []string{
 				"helper.Sum", "helper.Even", "helper.Odd", "helper.(*Counter).Descend", "helper.Deferred", "helper.Wrap",
-				"main.local", "main.check", "main.worker", "main.main",
+				"helper.MayPanic", "main.local", "main.check", "main.worker", "main.main",
 			} {
 				if got := strings.Contains(string(symbols), name+".coro"); got != native {
 					t.Errorf("%s native factory = %t, want %t", name, got, native)
@@ -211,6 +226,77 @@ func main() {
 				cmd.Env = append(cmd.Environ(), "GOMAXPROCS="+procs, "GODEBUG=asyncpreemptoff=1")
 				out, err := cmd.CombinedOutput()
 				if err != nil || string(out) != "plain-recursive-factory-ok\n" {
+					t.Fatalf("GOMAXPROCS=%s: run failed: %v\n%s", procs, err, out)
+				}
+			}
+		})
+	}
+}
+
+func TestRecursiveImportedFallback(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	for _, panicking := range []bool{false, true} {
+		t.Run(fmt.Sprintf("panic=%t", panicking), func(t *testing.T) {
+			tmp := t.TempDir()
+			check := ""
+			if panicking {
+				check = `if n < 0 { panic("negative") }`
+			}
+			files := map[string]string{
+				"go.mod": "module example.com/recursivefallback\n\ngo 1.28\n",
+				"helper/helper.go": `package helper
+func Sum(n int) int {
+` + check + `
+	if n == 0 { return 1 }
+	return Sum(n-1) + 1
+}
+`,
+				"main.go": `package main
+import (
+	"example.com/recursivefallback/helper"
+	"runtime"
+)
+func colored(n int) int {
+	runtime.Gosched()
+	return helper.Sum(n)
+}
+func main() {
+	if colored(4096) != 4097 { panic("recursive fallback") }
+	println("recursive-imported-fallback-ok")
+}
+`,
+			}
+			for name, contents := range files {
+				path := filepath.Join(tmp, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(contents), 0o666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exe := filepath.Join(tmp, "recursive")
+			// The helper publishes effects but no native factory. A panic-only
+			// imported summary must not permit unbounded ordinary recursion.
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", exe,
+				"-gcflags=example.com/recursivefallback/helper=-l -d=coro=1",
+				"-gcflags=example.com/recursivefallback=-l -d=coro=4", ".")
+			cmd.Dir = tmp
+			cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=coro", "GOWORK=off")
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "unsupported coroutine dependency") {
+				t.Fatalf("missing dependency fallback: %v\n%s", err, out)
+			}
+			cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+			out, err = cmd.CombinedOutput()
+			if err != nil || strings.Contains(string(out), "main.colored.coro") {
+				t.Fatalf("unsupported caller has a native entry: %v\n%s", err, out)
+			}
+			for _, procs := range []string{"1", "4"} {
+				cmd = testenv.Command(t, exe)
+				cmd.Env = append(cmd.Environ(), "GOMAXPROCS="+procs, "GODEBUG=asyncpreemptoff=1")
+				out, err = cmd.CombinedOutput()
+				if err != nil || string(out) != "recursive-imported-fallback-ok\n" {
 					t.Fatalf("GOMAXPROCS=%s: run failed: %v\n%s", procs, err, out)
 				}
 			}

@@ -331,10 +331,10 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		}
 	}
 
-	// A recursive plain call can exhaust the fixed executor stack even when
-	// it cannot suspend. Require resumable entries without changing its
-	// suspension effect. Wait for effects and terminal flags to settle so
-	// already-colored recursion retains its existing execution constraints.
+	// A recursive call can exhaust the fixed executor stack even when it
+	// cannot suspend. Require resumable entries without changing suspension
+	// effects. Wait for effects and terminal flags to settle so functions
+	// already requiring a constrained entry retain their execution flags.
 	needsContext := false
 	for _, function := range p.Functions {
 		summary := FuncSummary{
@@ -343,7 +343,9 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		// VisitFuncsBottomUp groups closures with their enclosing function.
 		// Calls propagate constraints to a closure that actually recurses;
 		// leaf cleanup closures must not inherit the group's recursion flag.
-		if function.Recursive && function.Func.OClosure == nil && summary.Primary() == PlainPrimary {
+		if function.Recursive && function.Func.OClosure == nil &&
+			summary.Effect == NoSuspend && summary.Exec&(NeedsPreempt|NeedsSystemABI) == 0 &&
+			summary.Terminal&MayGoexit == 0 {
 			function.LocalExec |= NeedsPreempt
 			needsContext = true
 		}

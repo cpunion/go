@@ -106,8 +106,12 @@ func TestColoredRecursiveExecution(t *testing.T) {
 			t.Fatal(err)
 		}
 		function := plan.Functions[fn]
-		if !function.Recursive || function.Primary != CoroPrimary || function.Exec != 0 {
-			t.Fatal("already-colored recursion gained unnecessary execution constraints")
+		wantExec := ExecFlags(0)
+		if panicking {
+			wantExec = NeedsPreempt
+		}
+		if !function.Recursive || function.Primary != CoroPrimary || function.Exec != wantExec {
+			t.Fatalf("recursive execution flags = %s, want %s", function.Exec, wantExec)
 		}
 		if panicking && function.Effect != NoSuspend || !panicking && function.Effect != MaySuspend {
 			t.Fatal("already-colored recursion changed suspension effect")
