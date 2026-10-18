@@ -331,6 +331,38 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		}
 	}
 
+	// A recursive call can exhaust the fixed executor stack even when it
+	// cannot suspend. Require resumable entries without changing suspension
+	// effects. Wait for effects and terminal flags to settle so functions
+	// already requiring a constrained entry retain their execution flags.
+	needsContext := false
+	for _, function := range p.Functions {
+		summary := FuncSummary{
+			Effect: function.Effect, Exec: function.Exec, Terminal: function.Terminal,
+		}
+		// VisitFuncsBottomUp groups closures with their enclosing function.
+		// Calls propagate constraints to a closure that actually recurses;
+		// leaf cleanup closures must not inherit the group's recursion flag.
+		if function.Recursive && function.Func.OClosure == nil &&
+			summary.Effect == NoSuspend && summary.Exec&(NeedsPreempt|NeedsSystemABI) == 0 &&
+			summary.Terminal&MayGoexit == 0 {
+			function.LocalExec |= NeedsPreempt
+			needsContext = true
+		}
+	}
+	if needsContext {
+		for changed := true; changed; {
+			changed = false
+			for _, function := range p.Functions {
+				exec := function.LocalExec | p.calledExec(function)
+				if exec != function.Exec {
+					function.Exec = exec
+					changed = true
+				}
+			}
+		}
+	}
+
 	for _, function := range p.Functions {
 		function.Primary = (FuncSummary{
 			Effect:   function.Effect,

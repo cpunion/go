@@ -3985,6 +3985,20 @@ deferral selector at 100%, and covers the native driver's wait path at 92.3%.
 It executes 57 of 63 added executable lines (90.48%); the six remaining lines
 are three fail-closed invariant or unreachable bounded-cache fallback bodies.
 
+An ordinary recursive helper is not safe on the fixed executor stack merely
+because its suspension effect is `NoSuspend`. Analysis gives recursive functions
+the existing `NeedsPreempt` execution constraint unless suspension, System ABI
+execution or Goexit already requires a constrained entry. Calls and exported
+summaries propagate this constraint. Supported calls use resumable factories;
+unsupported dependencies retain ordinary fallback. A panic-only recursive
+helper needs the constraint too: an imported panic-only summary without a
+factory would otherwise permit its ordinary entry on the executor. Suspension
+effects and the frame optimizations of suspending recursion remain unchanged.
+Closures grouped with an enclosing recursive function are not independently
+seeded: real calls propagate constraints, without constraining a nonrecursive
+cleanup closure. This does not prove a general bound on arbitrary ordinary
+helper or foreign-call stack usage.
+
 The likely compatibility order remains:
 
 1. extend the supported semaphore park/wake boundary beyond WaitGroup
