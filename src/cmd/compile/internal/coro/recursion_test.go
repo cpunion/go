@@ -30,6 +30,16 @@ func TestPlainRecursiveExecution(t *testing.T) {
 			second.Body = ir.Nodes{newLowerTestCall(first), newLowerTestReturn()}
 			functions = append(functions, second)
 		}
+		var closurePkg ir.Package
+		cleanup := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+			types.NewSignature(nil, nil, nil), first, &closurePkg, 1)
+		cleanup.Body = ir.Nodes{newLowerTestReturn()}
+		cleanupCall := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, cleanup.OClosure, nil)
+		cleanupCall.SetTypecheck(1)
+		deferred := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, cleanupCall)
+		deferred.SetTypecheck(1)
+		first.Body = append(ir.Nodes{deferred}, first.Body...)
+		functions = append(functions, cleanup)
 		caller.Body = ir.Nodes{newLowerTestCall(first), newLowerTestReturn()}
 		leaf.Body = ir.Nodes{newLowerTestReturn()}
 		spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, newLowerTestCall(first))
@@ -47,7 +57,7 @@ func TestPlainRecursiveExecution(t *testing.T) {
 			if function.Effect != NoSuspend || len(function.Seeds) != 0 {
 				t.Fatalf("%s: recursion changed suspension effect", fn.Sym().Name)
 			}
-			if fn == leaf || fn == launcher {
+			if fn == leaf || fn == launcher || fn == cleanup {
 				if function.Primary != PlainPrimary || function.Exec != 0 {
 					t.Fatalf("%s: unrelated function needs a coroutine context", fn.Sym().Name)
 				}

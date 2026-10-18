@@ -340,7 +340,10 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		summary := FuncSummary{
 			Effect: function.Effect, Exec: function.Exec, Terminal: function.Terminal,
 		}
-		if function.Recursive && summary.Primary() == PlainPrimary {
+		// VisitFuncsBottomUp groups closures with their enclosing function.
+		// Calls propagate constraints to a closure that actually recurses;
+		// leaf cleanup closures must not inherit the group's recursion flag.
+		if function.Recursive && function.Func.OClosure == nil && summary.Primary() == PlainPrimary {
 			function.LocalExec |= NeedsPreempt
 			needsContext = true
 		}
