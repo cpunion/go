@@ -87,18 +87,26 @@ func TestPlainRecursiveExecution(t *testing.T) {
 
 func TestColoredRecursiveExecution(t *testing.T) {
 	prepareLowerTest(t)
-	for _, panicking := range []bool{false, true} {
+	for _, kind := range []string{"suspend", "panic", "goexit", "system"} {
 		pkg := types.NewPkg("example.com/coro/colored-recursion", "recursion")
 		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("recursive"), types.NewSignature(nil, nil, nil))
 		fn.Nname.Defn = fn
 		fn.DeclareParams(true)
 		var seed ir.Node
-		if panicking {
+		if kind == "panic" {
 			seed = ir.NewUnaryExpr(src.NoXPos, ir.OPANIC, ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
 			seed.SetTypecheck(1)
 		} else {
-			yield := ir.NewFunc(src.NoXPos, src.NoXPos, types.NewPkg("runtime", "runtime").Lookup("Gosched"), types.NewSignature(nil, nil, nil))
-			seed = newLowerTestCall(yield)
+			name := "Gosched"
+			if kind == "goexit" {
+				name = "Goexit"
+			}
+			callee := ir.NewFunc(src.NoXPos, src.NoXPos, types.NewPkg("runtime", "runtime").Lookup(name), types.NewSignature(nil, nil, nil))
+			if kind == "system" {
+				callee = ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("foreign"), types.NewSignature(nil, nil, nil))
+				SetSummary(callee, FuncSummary{Exec: NeedsSystemABI})
+			}
+			seed = newLowerTestCall(callee)
 		}
 		fn.Body = ir.Nodes{seed, newLowerTestCall(fn), newLowerTestReturn()}
 		plan, err := Analyze([]*ir.Func{fn}, nil)
@@ -107,14 +115,20 @@ func TestColoredRecursiveExecution(t *testing.T) {
 		}
 		function := plan.Functions[fn]
 		wantExec := ExecFlags(0)
-		if panicking {
+		if kind == "panic" {
 			wantExec = NeedsPreempt
+		} else if kind == "system" {
+			wantExec = NeedsSystemABI
 		}
 		if !function.Recursive || function.Primary != CoroPrimary || function.Exec != wantExec {
 			t.Fatalf("recursive execution flags = %s, want %s", function.Exec, wantExec)
 		}
-		if panicking && function.Effect != NoSuspend || !panicking && function.Effect != MaySuspend {
-			t.Fatal("already-colored recursion changed suspension effect")
+		wantEffect := NoSuspend
+		if kind == "suspend" {
+			wantEffect = MaySuspend
+		}
+		if function.Effect != wantEffect {
+			t.Fatalf("%s: recursive suspension effect = %s, want %s", kind, function.Effect, wantEffect)
 		}
 	}
 }
