@@ -4025,9 +4025,10 @@ snapshots and pointer roots therefore use the same frontend representation
 rather than a second go-call normalization pass or source annotations.
 
 The target must still satisfy the existing factory restrictions. Dynamic
-function values, arbitrary source closures, unsupported signatures, returned
-values and explicit-panic spawn targets retain the ordinary Go path. This
-does not implement general closure or dynamic-call lowering. Tests require
+function values, arbitrary source closures, unsupported signatures and returned
+values retain the ordinary Go path. A statically known native target may panic;
+its independent task owns cleanup and the terminal outcome as described above.
+This does not implement general closure or dynamic-call lowering. Tests require
 actual frame spawning rather than accepting a successful ordinary fallback,
 and separately require fallback for dynamic and value-returning targets.
 
