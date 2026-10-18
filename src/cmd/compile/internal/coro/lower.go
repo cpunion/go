@@ -206,7 +206,7 @@ type lowerState struct {
 	channel    *lowerChannel
 	selection  *lowerSelect
 	io         *lowerIO
-	semaphore  *lowerSemaphore
+	wait       *lowerWait
 	statement  ir.Node
 	next       int
 	condition  ir.Node
@@ -217,9 +217,9 @@ type lowerState struct {
 	panicValue ir.Node
 }
 
-// lowerSemaphore retains the arguments and acquisition state across retries.
+// lowerWait retains semaphore or notification arguments and state across retries.
 // Entry evaluates the arguments once; a wakeup only reenters the retry state.
-type lowerSemaphore struct {
+type lowerWait struct {
 	call  *ir.CallExpr
 	args  []*ir.Name
 	state *ir.Name
@@ -813,6 +813,10 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		case SiteSemaphore:
 			if !statementCalls[call] || semaphoreOperation(call) == "" {
 				return nil, fmt.Errorf("unsupported semaphore site %d", site.ID)
+			}
+		case SiteNotify:
+			if !statementCalls[call] || notifyOperation(call) == "" {
+				return nil, fmt.Errorf("unsupported notification site %d", site.ID)
 			}
 		case SiteYield, SiteTimer, SiteFile, SitePoll, SiteGoexit:
 			if !statementCalls[call] {
@@ -1487,7 +1491,7 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
 		// These transitions keep their suspended state in the resume frame.
-		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore:
+		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify:
 		case SiteForeign:
 			if !runToCompletion {
 				return false
@@ -2722,7 +2726,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
 			switch candidate.transitions[call] {
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
 				SiteGoexit:
 				return true
 			}
@@ -3104,28 +3108,28 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				// arguments suspends. Its Init has already been detached;
 				// emit the spawn only after those states have completed.
 				return newBodyState(ir.Nodes{stmt}, next)
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
 				SiteGoexit:
 				stateNext := next
 				if candidate.transitions[call] == SiteGoexit {
 					stateNext = cleanupState
 				}
 				var io *lowerIO
-				var semaphore *lowerSemaphore
-				operation := semaphoreOperation(call)
+				var wait *lowerWait
+				operation := waitOperation(call)
 				if operation == "coroSemacquireMutex" || operation == "coroSemacquire" ||
-					operation == "coroSemacquireWaitGroup" {
-					semaphore = &lowerSemaphore{call: call, args: make([]*ir.Name, len(call.Args))}
+					operation == "coroSemacquireWaitGroup" || operation == "coroNotifyListWait" {
+					wait = &lowerWait{call: call, args: make([]*ir.Name, len(call.Args))}
 					for i, arg := range call.Args {
 						name := typecheck.TempAt(call.Pos(), factory, arg.Type())
 						addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, name))
-						semaphore.args[i] = name
+						wait.args[i] = name
 					}
-					semaphore.state = typecheck.TempAt(call.Pos(), factory,
+					wait.state = typecheck.TempAt(call.Pos(), factory,
 						types.Types[types.TUNSAFEPTR])
-					addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, semaphore.state))
+					addDeclaration(ir.NewDecl(call.Pos(), ir.ODCL, wait.state))
 					stateNext = addState(lowerState{
-						semaphore: semaphore,
+						wait:      wait,
 						next:      stateNext,
 						thenState: -1,
 						elseState: -1,
@@ -3144,7 +3148,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					transition: candidate.transitions[call],
 					call:       call,
 					io:         io,
-					semaphore:  semaphore,
+					wait:       wait,
 					statement:  stmt,
 					next:       stateNext,
 					thenState:  -1,
@@ -3730,24 +3734,27 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, ir.NewReturnStmt(pos, []ir.Node{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
 			}))
-		} else if state.semaphore != nil && state.transition == SiteInvalid {
-			semaphore := state.semaphore
+		} else if state.wait != nil && state.transition == SiteInvalid {
+			operation := state.wait
 			args := ir.Nodes{ctx}
-			for _, arg := range semaphore.args {
+			for _, arg := range operation.args {
 				args = append(args, edit(arg))
 			}
-			args = append(args, typecheck.NodAddr(edit(semaphore.state)))
-			wait := typecheck.Call(semaphore.call.Pos(),
-				typecheck.LookupRuntime(semaphoreOperation(semaphore.call)), args, false)
+			if notifyOperation(operation.call) != "" {
+				args[1] = typecheck.ConvNop(args[1], types.Types[types.TUNSAFEPTR])
+			}
+			args = append(args, typecheck.NodAddr(edit(operation.state)))
+			wait := typecheck.Call(operation.call.Pos(),
+				typecheck.LookupRuntime(waitOperation(operation.call)), args, false)
 			body = append(body,
-				ir.NewIfStmt(semaphore.call.Pos(), wait, ir.Nodes{
-					ir.NewReturnStmt(semaphore.call.Pos(), []ir.Node{
-						typedInt(semaphore.call.Pos(), types.Types[types.TUINT8],
+				ir.NewIfStmt(operation.call.Pos(), wait, ir.Nodes{
+					ir.NewReturnStmt(operation.call.Pos(), []ir.Node{
+						typedInt(operation.call.Pos(), types.Types[types.TUINT8],
 							int64(actionWait)),
 					}),
 				}, nil),
-				ir.NewAssignStmt(semaphore.call.Pos(), edit(semaphore.args[0]),
-					ir.NewZero(semaphore.call.Pos(), semaphore.args[0].Type())),
+				ir.NewAssignStmt(operation.call.Pos(), edit(operation.args[0]),
+					ir.NewZero(operation.call.Pos(), operation.args[0].Type())),
 				assignResumePC(state.next),
 				gotoState(state.next))
 		} else if state.io != nil && state.transition == SiteInvalid {
@@ -3782,9 +3789,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			action := actionInvalid
 			var actionResult ir.Node
 			switch state.transition {
-			case SiteSemaphore:
-				if semaphore := state.semaphore; semaphore != nil {
-					for j, arg := range semaphore.args {
+			case SiteSemaphore, SiteNotify:
+				if wait := state.wait; wait != nil {
+					for j, arg := range wait.args {
 						body = append(body, ir.NewAssignStmt(state.call.Pos(),
 							edit(arg), edit(state.call.Args[j])))
 					}

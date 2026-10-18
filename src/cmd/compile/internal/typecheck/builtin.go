@@ -298,13 +298,14 @@ var runtimeDecls = [...]struct {
 	{"coroSemacquireMutex", funcTag, 195},
 	{"coroSemacquire", funcTag, 196},
 	{"coroSemacquireWaitGroup", funcTag, 197},
-	{"coroSemreleasePoll", funcTag, 198},
-	{"coroSemrelease", funcTag, 199},
-	{"coroUseOrdinary", funcTag, 200},
+	{"coroNotifyListWait", funcTag, 198},
+	{"coroSemreleasePoll", funcTag, 199},
+	{"coroSemrelease", funcTag, 200},
+	{"coroUseOrdinary", funcTag, 201},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [201]*types.Type
+	var typs [202]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -503,9 +504,10 @@ func runtimeTypes() []*types.Type {
 	typs[195] = newSig(params(typs[7], typs[193], typs[6], typs[13], typs[194]), params(typs[6]))
 	typs[196] = newSig(params(typs[7], typs[193], typs[194]), params(typs[6]))
 	typs[197] = newSig(params(typs[7], typs[193], typs[6], typs[194]), params(typs[6]))
-	typs[198] = newSig(params(typs[7], typs[193]), params(typs[6]))
-	typs[199] = newSig(params(typs[7], typs[193], typs[6], typs[13]), params(typs[6]))
-	typs[200] = newSig(nil, params(typs[6]))
+	typs[198] = newSig(params(typs[7], typs[7], typs[67], typs[194]), params(typs[6]))
+	typs[199] = newSig(params(typs[7], typs[193]), params(typs[6]))
+	typs[200] = newSig(params(typs[7], typs[193], typs[6], typs[13]), params(typs[6]))
+	typs[201] = newSig(nil, params(typs[6]))
 	return typs[:]
 }
 

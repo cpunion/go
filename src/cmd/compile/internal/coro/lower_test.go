@@ -995,7 +995,7 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 		t.Fatal("nil candidate supports an explicit frame")
 	}
 	for _, kind := range []SiteKind{
-		SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore,
+		SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify,
 	} {
 		if got := candidate(kind); !explicitFrameFactorySupported(got) {
 			t.Errorf("%s candidate does not support an explicit frame", kind)

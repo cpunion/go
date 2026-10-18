@@ -675,6 +675,11 @@ func notifyListNotifyAll(l *notifyList) {
 	for s != nil {
 		next := s.next
 		s.next = nil
+		if s.coro.get() != nil {
+			readyStacklessCoroNotify(s)
+			s = next
+			continue
+		}
 		if s.g.bubble != nil && getg().bubble != s.g.bubble {
 			println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
 			fatal("semaphore wake of synctest goroutine from outside bubble")
@@ -732,6 +737,10 @@ func notifyListNotifyOne(l *notifyList) {
 			}
 			unlock(&l.lock)
 			s.next = nil
+			if s.coro.get() != nil {
+				readyStacklessCoroNotify(s)
+				return
+			}
 			if s.g.bubble != nil && getg().bubble != s.g.bubble {
 				println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
 				fatal("semaphore wake of synctest goroutine from outside bubble")

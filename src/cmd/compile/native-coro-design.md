@@ -1308,9 +1308,21 @@ require native caller entries with and without inlining, exercise a registered
 waiter before release, repeated reuse and GC, and check ordinary synctest and
 race fallback. A call from an ordinary helper can enter a new coroutine root;
 it does not by itself prove a shared-root logical spawn. `WaitGroup.Go` still
-needs broader spawn and closure support. Cond's interface calls and ticketed
-notification, other semaphore declarations, and runtime notes retain
+needs broader spawn and closure support. Cond's interface calls, other
+semaphore declarations, and runtime notes retain
 conservative fallback; this is not complete `sync` support.
+
+The exact `sync.runtime_notifyListWait(*notifyList, uint32)` declaration has a
+compiler-owned logical wait entry. Its arguments are evaluated once and its
+waiter is retained in the coroutine frame across suspension. Ordinary goroutines
+and logical tasks share the existing ticketed notify list; Signal and Broadcast
+remove either kind under the same lock and publish readiness after unlocking.
+Notifications before insertion and 32-bit ticket wraparound retain the ordinary
+rules. A resumed logical waiter completes its original ticket instead of
+competing for another notification. The list layout and sync/runtime size check
+are unchanged. This does not admit `Cond.Wait`'s dynamic Locker calls, add native
+synctest or race accounting, or make notification waits cancelable. Unsupported
+declarations and public dynamic Locker calls retain ordinary-body fallback.
 
 Inlining can put a generic dictionary temporary before a suspension even when
 all its uses belong to one non-suspending inlined expression. Such a temporary

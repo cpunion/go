@@ -34,7 +34,7 @@ func TestStableTerminalAction(t *testing.T) {
 			}
 		})
 	}
-	for kind := SiteInvalid; kind <= SiteSemaphore; kind++ {
+	for kind := SiteInvalid; kind <= SiteNotify; kind++ {
 		candidate := &lowerCandidate{
 			factoryABI:  FactoryABI3,
 			fusedResume: true,
