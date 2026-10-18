@@ -26,6 +26,8 @@ func TestWaitGroup(t *testing.T) {
 	}
 	const source = `package sync
 
+import "runtime"
+
 func coroWaitGroupWait(wg *WaitGroup) { wg.Wait() }
 func coroWaitGroupDone(wg *WaitGroup) { wg.Done() }
 func coroWaitGroupCycle(wg *WaitGroup, request, completed chan int) {
@@ -40,6 +42,31 @@ func coroWaitGroupCycle(wg *WaitGroup, request, completed chan int) {
 var CoroWaitGroupWait = coroWaitGroupWait
 var CoroWaitGroupDone = coroWaitGroupDone
 var CoroWaitGroupCycle = coroWaitGroupCycle
+
+func coroWaitGroupDeferred(wg *WaitGroup) {
+ defer wg.Done()
+ runtime.Gosched()
+}
+func coroWaitGroupDeferredPanic(wg *WaitGroup) {
+ defer wg.Done()
+ runtime.Gosched()
+ panic("deferred waitgroup")
+}
+func coroWaitGroupDeferredExit(wg *WaitGroup) {
+ defer wg.Done()
+ runtime.Gosched()
+ runtime.Goexit()
+}
+func coroWaitGroupDeferredRecover(wg *WaitGroup) (value any) {
+ defer func() { value = recover() }()
+ defer wg.Done()
+ runtime.Gosched()
+ return nil
+}
+var CoroWaitGroupDeferred = coroWaitGroupDeferred
+var CoroWaitGroupDeferredPanic = coroWaitGroupDeferredPanic
+var CoroWaitGroupDeferredExit = coroWaitGroupDeferredExit
+var CoroWaitGroupDeferredRecover = coroWaitGroupDeferredRecover
 
 func CoroWaitGroupWaiters(wg *WaitGroup) uint32 {
  return uint32(wg.state.Load() & 0x7fffffff)
@@ -94,8 +121,41 @@ func TestCoroWaitGroupBubble(t *testing.T) {
   }()
   sync.CoroWaitGroupWait(&wg)
   if time.Since(start) != time.Hour { t.Fatal("lost durable wait accounting") }
+  wg.Add(1)
+  sync.CoroWaitGroupDeferred(&wg)
+  wg.Wait()
   synctest.Wait()
  })
+}
+
+func TestCoroWaitGroupDeferred(t *testing.T) {
+ for range 1 {
+  var wg sync.WaitGroup
+  wg.Add(1)
+  sync.CoroWaitGroupDeferred(&wg)
+  wg.Wait()
+  wg.Add(1)
+  func() {
+   defer func() {
+    if v := recover(); v != "deferred waitgroup" { t.Errorf("panic=%v", v) }
+   }()
+   sync.CoroWaitGroupDeferredPanic(&wg)
+   t.Error("panic returned")
+  }()
+  wg.Wait()
+  exited := make(chan struct{})
+  wg.Add(1)
+  go func() {
+   defer close(exited)
+   sync.CoroWaitGroupDeferredExit(&wg)
+   t.Error("Goexit returned")
+  }()
+  wg.Wait()
+  <-exited
+  if v := sync.CoroWaitGroupDeferredRecover(&wg); v != "sync: negative WaitGroup counter" {
+   t.Errorf("negative counter panic=%v", v)
+  }
+ }
 }
 `
 	for _, config := range []struct {
@@ -153,7 +213,7 @@ func TestCoroWaitGroupBubble(t *testing.T) {
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
-				for _, name := range []string{"Wait", "Done", "Cycle"} {
+				for _, name := range []string{"Wait", "Done", "Cycle", "Deferred", "DeferredPanic", "DeferredExit", "DeferredRecover"} {
 					if !strings.Contains(string(symbols), "sync.coroWaitGroup"+name+".coro") {
 						var diagnostics []string
 						for _, line := range strings.Split(string(data), "\n") {

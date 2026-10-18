@@ -7,6 +7,7 @@ package coro
 import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
+	"go/constant"
 )
 
 // semaphoreSignature checks the exact acquire or release declaration.
@@ -28,6 +29,16 @@ func semaphoreSignature(name string, typ *types.Type) bool {
 	return params == 1 ||
 		types.Identical(typ.Param(1).Type, types.Types[types.TBOOL]) &&
 			(params == 2 || types.Identical(typ.Param(2).Type, types.Types[types.TINT]))
+}
+
+// semaphoreNoHandoff recognizes releases that cannot yield to an ordinary
+// waiter. Keep the declaration's conservative effect for every other call.
+func semaphoreNoHandoff(call *ir.CallExpr) bool {
+	if semaphoreOperation(call) != "coroSemrelease" || call.Args[1] == nil {
+		return false
+	}
+	handoff := ir.StaticValue(call.Args[1])
+	return ir.IsConst(handoff, constant.Bool) && !ir.BoolVal(handoff)
 }
 
 func semaphoreOperation(call *ir.CallExpr) string {
