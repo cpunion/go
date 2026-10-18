@@ -49,3 +49,24 @@ func NotifyProfileStacklessCoroForTest(state unsafe.Pointer) bool {
 	w := (*stacklessCoroNotifyWaiter)(state)
 	return w.startTime != 0 && w.waiter.releasetime != 0
 }
+
+// NotifyBeforeQueue exercises the second ticket check without relying on the
+// notifier winning a narrow race between the entry's first check and insertion.
+func (l *NotifyListStacklessCoroForTest) NotifyBeforeQueue(ctx unsafe.Pointer, ticket uint32, broadcast bool) bool {
+	context := (*stacklessCoroContext)(ctx)
+	w := &stacklessCoroNotifyWaiter{scheduler: context.scheduler, task: context.task(), list: &l.list}
+	w.waiter.ticket = ticket
+	w.waiter.coro.set(unsafe.Pointer(w))
+	state := unsafe.Pointer(w)
+	if broadcast {
+		l.Broadcast()
+	} else {
+		l.Signal()
+	}
+	if w.park(&state) {
+		throw("runtime: pre-notified stackless coroutine queued")
+	}
+	return state == nil && w.waiter.coro.get() == nil &&
+		w.scheduler == nil && w.task == nil && w.list == nil &&
+		context.task().state == stacklessCoroTaskRunning
+}

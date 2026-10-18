@@ -55,7 +55,14 @@ func coroNotifyListWait(ctx, list unsafe.Pointer, t uint32, state *unsafe.Pointe
 		w.waiter.releasetime = -1
 	}
 	*state = unsafe.Pointer(w)
+	return w.park(state)
+}
 
+// park publishes the logical wait before checking the notify list again. The
+// list lock closes the race with notification between allocation and insertion.
+func (w *stacklessCoroNotifyWaiter) park(state *unsafe.Pointer) bool {
+	s, task, l := w.scheduler, w.task, w.list
+	t := w.waiter.ticket
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending || task.terminal != stacklessCoroTerminalNone || task.goexit {
@@ -77,7 +84,7 @@ func coroNotifyListWait(ctx, list unsafe.Pointer, t uint32, state *unsafe.Pointe
 		w.finish(state)
 		return false
 	}
-	w.waiter.elem.set(list)
+	w.waiter.elem.set(unsafe.Pointer(l))
 	if l.tail == nil {
 		l.head = &w.waiter
 	} else {

@@ -82,6 +82,15 @@ func testStacklessCoroNotifyFast(t *testing.T) {
 	}
 	list.Signal()
 	list.Broadcast()
+	for _, broadcast := range []bool{false, true} {
+		ticket := list.Add()
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			if !list.NotifyBeforeQueue(ctx, ticket, broadcast) {
+				panic("notification before insertion retained waiting state")
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	}
 }
 
 func waitStacklessCoroNotifyQueue(list *runtime.NotifyListStacklessCoroForTest, ordinary, logical int) {
