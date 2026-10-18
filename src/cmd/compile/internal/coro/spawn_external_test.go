@@ -67,6 +67,11 @@ func launch(ready chan<- int, release <-chan struct{}, done chan<- int, created 
  created <- n
 }
 
+func deferred(ready chan<- int, release <-chan struct{}, done chan<- int) {
+ defer helper.Spawn(0, 1, &helper.Box{Value: 23}, ready, release, done)
+ runtime.Gosched()
+}
+
 func main() {
  ready, done := make(chan int, 128), make(chan int, 128)
  release, created, finished := make(chan struct{}), make(chan int), make(chan struct{})
@@ -89,6 +94,11 @@ func main() {
  sum := 0
  for range 128 { sum += <-done }
  if sum != 128*127/2+128*17 { panic("parked pointer root") }
+ lateReady, lateDone, lateRelease := make(chan int, 1), make(chan int, 1), make(chan struct{})
+ deferred(lateReady, lateRelease, lateDone)
+ if <-lateReady != 0 { panic("deferred spawn argument") }
+ close(lateRelease)
+ if <-lateDone != 23 { panic("deferred spawn fallback") }
  println("spawn-context-ok")
 }
 `,
@@ -166,6 +176,9 @@ func main() {
 				if got := strings.Contains(string(symbols), name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
+			}
+			if strings.Contains(string(symbols), "main.deferred.coro") {
+				t.Error("execution-constrained defer lost conservative fallback")
 			}
 			if native {
 				cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s",

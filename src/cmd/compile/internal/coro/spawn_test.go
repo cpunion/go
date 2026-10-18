@@ -59,6 +59,18 @@ func TestSpawnExecution(t *testing.T) {
 	if function := plan.Functions[leaf]; function.Exec != 0 || function.Primary != PlainPrimary {
 		t.Fatal("unrelated leaf requires a task context")
 	}
+	deferred := newFunc("deferred")
+	deferStmt := ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, newLowerTestCall(spawn))
+	deferStmt.SetTypecheck(1)
+	deferred.Body = ir.Nodes{deferStmt, newLowerTestReturn()}
+	deferPlan, err := Analyze([]*ir.Func{deferred, spawn, worker}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if function := deferPlan.Functions[deferred]; function.Effect != NoSuspend ||
+		function.Exec != NeedsTaskContext || function.Primary != CoroPrimary {
+		t.Fatal("deferred task creation lost its execution requirement")
+	}
 	plan.PublishSummaries()
 	imported := newFunc("imported")
 	imported.Body = ir.Nodes{newLowerTestCall(caller), newLowerTestReturn()}
