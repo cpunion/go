@@ -90,7 +90,8 @@ func coroNotifyListWait(ctx, list unsafe.Pointer, t uint32, state *unsafe.Pointe
 
 func (w *stacklessCoroNotifyWaiter) finish(state *unsafe.Pointer) {
 	if w.waiter.releasetime > 0 {
-		blockevent(w.waiter.releasetime-w.startTime, 2)
+		// finish adds a frame below the notification declaration entry.
+		blockevent(w.waiter.releasetime-w.startTime, 3)
 	}
 	w.waiter.coro.clear()
 	w.scheduler = nil

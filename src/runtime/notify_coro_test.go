@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -33,6 +34,17 @@ func TestStacklessCoroNotifyList(t *testing.T) {
 		}
 		return
 	}
+	// Child processes isolate scheduler configurations, but their coverage
+	// counters do not belong to this test process's profile. Exercise the
+	// valid state transitions here as well.
+	t.Run("direct", func(t *testing.T) {
+		testStacklessCoroNotifyFast(t)
+		for _, mode := range []string{"signal", "broadcast", "profile", "wrap", "missing"} {
+			testStacklessCoroNotifyMixed(t, mode)
+		}
+		testStacklessCoroNotifySiblings(t)
+		testStacklessCoroNotifyRace(t)
+	})
 	for _, procs := range []int{1, 4} {
 		for _, mode := range []string{"fast", "signal", "broadcast", "profile", "wrap", "missing", "siblings", "race"} {
 			t.Run(mode+"/P"+strconv.Itoa(procs), func(t *testing.T) {
@@ -160,6 +172,33 @@ func testStacklessCoroNotifyMixed(t *testing.T, mode string) {
 	waitStacklessCoroNotifyQueue(&list, 0, 0)
 	list.Signal()
 	list.Broadcast()
+	if mode == "profile" {
+		var records []runtime.BlockProfileRecord
+		for {
+			n, _ := runtime.BlockProfile(nil)
+			records = make([]runtime.BlockProfileRecord, n)
+			if n, ok := runtime.BlockProfile(records); ok {
+				records = records[:n]
+				break
+			}
+		}
+		if len(records) == 0 {
+			t.Fatal("logical notification wait did not record a block event")
+		}
+		for _, record := range records {
+			frames := runtime.CallersFrames(record.Stack())
+			for {
+				frame, more := frames.Next()
+				if strings.HasPrefix(frame.Function, "runtime.coroNotifyListWait") ||
+					frame.Function == "runtime.(*stacklessCoroNotifyWaiter).finish" {
+					t.Errorf("block profile exposes notification implementation frame %s", frame.Function)
+				}
+				if !more {
+					break
+				}
+			}
+		}
+	}
 }
 
 func testStacklessCoroNotifySiblings(t *testing.T) {
