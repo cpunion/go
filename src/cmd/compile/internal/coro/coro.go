@@ -331,6 +331,33 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 		}
 	}
 
+	// A recursive plain call can exhaust the fixed executor stack even when
+	// it cannot suspend. Require resumable entries without changing its
+	// suspension effect. Wait for effects and terminal flags to settle so
+	// already-colored recursion retains its existing execution constraints.
+	needsContext := false
+	for _, function := range p.Functions {
+		summary := FuncSummary{
+			Effect: function.Effect, Exec: function.Exec, Terminal: function.Terminal,
+		}
+		if function.Recursive && summary.Primary() == PlainPrimary {
+			function.LocalExec |= NeedsPreempt
+			needsContext = true
+		}
+	}
+	if needsContext {
+		for changed := true; changed; {
+			changed = false
+			for _, function := range p.Functions {
+				exec := function.LocalExec | p.calledExec(function)
+				if exec != function.Exec {
+					function.Exec = exec
+					changed = true
+				}
+			}
+		}
+	}
+
 	for _, function := range p.Functions {
 		function.Primary = (FuncSummary{
 			Effect:   function.Effect,
