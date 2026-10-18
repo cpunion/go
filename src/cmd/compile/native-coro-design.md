@@ -1292,8 +1292,16 @@ not to suspend, although their misuse checks can still panic. A statically
 resolved deferred Done can therefore use the existing compiler-private named
 defer contract. Tests require native callers for normal return, panic, Goexit
 and a recovered negative-counter panic, as well as ordinary bubble/race
-fallback. This does not admit general suspending defers or native go targets
-that may panic; the independent spawn admission rule is unchanged.
+fallback. This does not admit general suspending defers or unknown native go
+targets. A known native spawn target can panic: its independent task owns its
+cleanup and terminal outcome. An unhandled panic terminates the process on its
+executor, rather than transferring to the creator's recover. Structured awaits
+still transfer a child's terminal outcome within the same logical goroutine.
+Tests require native spawner and worker entries, bounded ordinary-goroutine
+counts for parked deferred-Done workers, recovered panic and Goexit completion,
+and an executed unhandled-panic subprocess that cannot be recovered by either
+the creator or main. Pure-spawn plain helpers and integer-range spawn loops
+retain their existing admission boundaries; this does not broaden them.
 
 Tests
 require native caller entries with and without inlining, exercise a registered
@@ -4017,9 +4025,10 @@ snapshots and pointer roots therefore use the same frontend representation
 rather than a second go-call normalization pass or source annotations.
 
 The target must still satisfy the existing factory restrictions. Dynamic
-function values, arbitrary source closures, unsupported signatures, returned
-values and explicit-panic spawn targets retain the ordinary Go path. This
-does not implement general closure or dynamic-call lowering. Tests require
+function values, arbitrary source closures, unsupported signatures and returned
+values retain the ordinary Go path. A statically known native target may panic;
+its independent task owns cleanup and the terminal outcome as described above.
+This does not implement general closure or dynamic-call lowering. Tests require
 actual frame spawning rather than accepting a successful ordinary fallback,
 and separately require fallback for dynamic and value-returning targets.
 

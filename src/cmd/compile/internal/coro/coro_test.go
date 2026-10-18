@@ -2151,9 +2151,11 @@ import "runtime"
 
 var sink int
 
+func cleanup() { println("stackless-coro-spawn-cleanup") }
+
 //go:noinline
 func child() {
-	defer println("stackless-coro-spawn-cleanup")
+	defer cleanup()
 	runtime.Gosched()
 	var pointer *int
 	sink = *pointer
@@ -2194,6 +2196,16 @@ func main() {
 		want := "coro: func=main." + name + " "
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
+		}
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
+	}
+	for _, name := range []string{"child", "root"} {
+		if !strings.Contains(string(symbols), " main."+name+".coro\n") {
+			t.Fatalf("missing native %s entry\n%s", name, out)
 		}
 	}
 
@@ -2531,25 +2543,50 @@ func main() {
 	}
 }
 
-func TestSpawnPanicFallback(t *testing.T) {
+func TestSpawnPanicLowering(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "main.go")
 	program := `package main
 
-import "runtime"
+import (
+	"os"
+	"runtime"
+)
+
+var release = make(chan struct{})
+
+func cleanup() { println("stackless-coro-child-cleanup") }
+func leafCleanup() { println("stackless-coro-leaf-cleanup") }
 
 //go:noinline
-func panics() {
+func panicLeaf() {
+	defer leafCleanup()
 	runtime.Gosched()
 	panic("spawn panic")
 }
 
 //go:noinline
-func spawn() {
+func panics(nested bool) {
+	defer cleanup()
+	<-release
 	runtime.Gosched()
-	go panics()
+	if nested { panicLeaf() }
+	panic("spawn panic")
+}
+
+//go:noinline
+func spawn(active, nested bool) {
+	defer func() {
+		if recover() != nil { println("incorrect-creator-recovery") }
+	}()
+	runtime.Gosched()
+	go panics(nested)
+	if active {
+		close(release)
+		for { runtime.Gosched() }
+	}
 }
 
 //go:noinline
@@ -2562,17 +2599,25 @@ func recoverer() (recovered any) {
 }
 
 func main() {
-	if recovered := recoverer(); recovered != "recovered" {
-		panic("bad recover fallback")
+	defer func() {
+		if recover() != nil { println("incorrect-main-recovery") }
+	}()
+	if len(os.Args) > 1 {
+		spawn(os.Args[1] == "active", len(os.Args) > 2)
+		close(release)
+		for { runtime.Gosched() }
 	}
-	println("stackless-coro-terminal-fallback-ok")
+	if recovered := recoverer(); recovered != "recovered" {
+		panic("bad recovered outcome")
+	}
+	println("stackless-coro-spawn-terminal-ok")
 }
 `
 	if err := os.WriteFile(src, []byte(program), 0o666); err != nil {
 		t.Fatal(err)
 	}
 
-	exe := filepath.Join(tmp, "coro-terminal-fallback")
+	exe := filepath.Join(tmp, "coro-spawn-terminal")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
 		"-gcflags=command-line-arguments=-l -d=coro=4",
@@ -2583,26 +2628,47 @@ func main() {
 		"GOWORK=off",
 	)
 	data, err := cmd.CombinedOutput()
-	out := string(data)
 	if err != nil {
-		t.Fatalf("building terminal fallback program failed: %v\n%s", err, out)
+		t.Fatalf("building spawn terminal program failed: %v\n%s", err, data)
 	}
-	for _, want := range []string{
-		"coro: phase=lower lowered=3 skipped=1",
-		"main.spawn: spawn target may panic",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output does not contain %q\n%s", want, out)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
+	}
+	for _, name := range []string{"panicLeaf", "panics", "spawn", "recoverer"} {
+		if !strings.Contains(string(symbols), " main."+name+".coro\n") {
+			t.Errorf("missing native %s entry\n%s", name, data)
 		}
 	}
 
 	cmd = testenv.Command(t, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("terminal fallback program failed: %v\n%s", err, data)
+		t.Fatalf("recovered outcome failed: %v\n%s", err, data)
 	}
-	if want := "stackless-coro-terminal-fallback-ok"; !strings.Contains(string(data), want) {
+	if want := "stackless-coro-spawn-terminal-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
+	}
+	for _, mode := range []string{"active", "detached"} {
+		for _, nested := range []bool{false, true} {
+			args := []string{mode}
+			leafCleanups := 0
+			if nested {
+				args = append(args, "nested")
+				leafCleanups = 1
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			cmd = testenv.CommandContext(t, ctx, exe, args...)
+			data, err = cmd.CombinedOutput()
+			ctxErr := ctx.Err()
+			cancel()
+			if ctxErr != nil || err == nil || strings.Count(string(data), "stackless-coro-child-cleanup") != 1 ||
+				strings.Count(string(data), "stackless-coro-leaf-cleanup") != leafCleanups ||
+				!strings.Contains(string(data), "panic: spawn panic") || strings.Contains(string(data), "incorrect-") {
+				t.Fatalf("%s nested=%v child panic escaped its goroutine or lost cleanup: %v, %v\n%s", mode, nested, ctxErr, err, data)
+			}
+		}
 	}
 }
 
@@ -2753,15 +2819,18 @@ func main() {
 	if err != nil {
 		t.Fatalf("building Goexit coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=7"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain %q\n%s", want, out)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
+	symbols, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm: %v\n%s", err, symbols)
 	}
 	for _, name := range []string{
 		"main.leaf", "main.middle", "main.structured",
 		"main.overlay", "main.detached", "main.spawnRoot", "main.immediate",
+		"main.main",
 	} {
-		if strings.Contains(out, "coro: skip "+name+":") {
-			t.Errorf("Goexit function %s was not lowered\n%s", name, out)
+		if !strings.Contains(string(symbols), " "+name+".coro\n") {
+			t.Errorf("missing native Goexit %s entry\n%s", name, out)
 		}
 	}
 
