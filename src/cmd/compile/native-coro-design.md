@@ -1839,6 +1839,9 @@ The compiler:
 - lowers receive-channel range to a cyclic receive, status branch, body, and
   pointer-clearing state sequence while evaluating the channel expression
   exactly once;
+- lowers integer range through a hidden counter and a bound evaluated once;
+  the iteration variable is assigned independently on each iteration, and
+  unlabeled break/continue and suspension use the existing loop states;
 - lowers channel select to source-ordered operand evaluation, frame-owned
   typed case storage, one runtime operation, and explicit selected-case
   dispatch; this includes empty and default-only selects, nil and duplicate
@@ -2539,9 +2542,10 @@ reported separately above.
 
 ### 15.4 Remaining restrictions
 
-The MVP does not yet support general non-channel range loops, labeled control
+The MVP does not yet support array, slice, map, string or iterator-function
+range loops, labeled control
 flow, dynamic calls, interfaces, closure capture of
-a per-iteration channel-range variable, general escaping closures, nested
+a per-iteration range variable, general escaping closures, nested
 closures that recapture a repeated-literal cell, indirect recover-capable
 helpers, stackless `go` edges in terminal named defer targets, explicit panic
 from a non-structured spawned task, labeled select or complex select receive

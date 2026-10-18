@@ -88,9 +88,14 @@ func nested() int {
  return sum
 }
 
-func pointers() []*int {
+func pointers(ready, release chan struct{}) []*int {
  var result []*int
- for i := range 5 { result = append(result, &i); runtime.Gosched(); runtime.GC() }
+ for i := range 5 {
+  result = append(result, &i)
+  runtime.Gosched()
+  ready <- struct{}{}
+  <-release
+ }
  return result
 }
 
@@ -144,7 +149,13 @@ func main() {
  if unsigned(255) != 32385 || unsigned(0) != 0 || named(5) != 10 { panic("typed range") }
  if assignment(3) != 40103 || assignment(0) != 99100 { panic("assigned variable") }
  if keyless(4) != 108 || nested() != 68 || early() != 2 { panic("loop control") }
- for i, value := range pointers() { if *value != i { panic("distinct iteration cell") } }
+ pointerReady, pointerRelease := make(chan struct{}), make(chan struct{})
+ go func() {
+  for range 5 { <-pointerReady; runtime.GC(); pointerRelease <- struct{}{} }
+ }()
+ for i, value := range pointers(pointerReady, pointerRelease) {
+  if *value != i { panic("distinct iteration cell") }
+ }
  deferred()
  if trace != 321 { panic("repeated defer order") }
  var wg sync.WaitGroup
@@ -218,12 +229,12 @@ func TestIntegerRange(t *testing.T) {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			for _, name := range []string{"signed", "unsigned", "named", "assignment", "keyless", "nested", "pointers", "early", "deferred", "spawn", "worker", "wait", "bubble"} {
-				if got := strings.Contains(string(symbols), "main."+name+".coro"); got != native {
-					t.Errorf("%s native entry = %t, want %t\n%s", name, got, native, data)
+				if got := strings.Contains(string(symbols), "command-line-arguments."+name+".coro"); got != native {
+					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
 			}
 			for _, name := range []string{"captured", "sliced", "labeled"} {
-				if strings.Contains(string(symbols), "main."+name+".coro") {
+				if strings.Contains(string(symbols), "command-line-arguments."+name+".coro") {
 					t.Errorf("%s lost conservative range fallback", name)
 				}
 			}

@@ -49,7 +49,7 @@ func TestCgoFallback(t *testing.T) {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			native := config.experiment != "nocoro" && config.name != "race"
-			for _, name := range []string{"scalar", "locked"} {
+			for _, name := range []string{"scalar", "scalarRange", "locked"} {
 				if got := strings.Contains(string(symbols), pkg+"."+name+".coro"); got != native {
 					t.Errorf("%s native factory = %v, want %v\n%s", name, got, native, out)
 				}

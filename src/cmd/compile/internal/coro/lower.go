@@ -2144,6 +2144,11 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	rewriteList = func(list ir.Nodes) (ir.Nodes, error) {
 		body := make(ir.Nodes, 0, len(list))
 		for _, stmt := range list {
+			if stmtRange, ok := stmt.(*ir.RangeStmt); ok {
+				// A run-to-completion candidate cannot contain a channel
+				// receive. Integer ranges can use the ordinary loop rewrite.
+				stmt = integerRangeLoop(stmtRange, factory)
+			}
 			switch stmt := stmt.(type) {
 			case *ir.Decl:
 				addDeclaration(stmt)
@@ -2224,17 +2229,6 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 				}
 				stmt.SetTypecheck(0)
 				body = append(body, stmt)
-				continue
-
-			case *ir.RangeStmt:
-				// A run-to-completion candidate cannot contain a channel
-				// receive. Integer ranges can use the ordinary loop rewrite.
-				loop := integerRangeLoop(stmt, factory)
-				rewritten, err := rewriteList(ir.Nodes{loop})
-				if err != nil {
-					return nil, err
-				}
-				body = append(body, rewritten...)
 				continue
 			}
 
