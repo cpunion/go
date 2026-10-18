@@ -655,7 +655,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				hasBranch := false
 				hasReturn := false
 				localLabels := make(map[*types.Sym]bool)
-				if stmt.Op() == ir.OSWITCH {
+				if stmt.Op() == ir.OSWITCH || stmt.Op() == ir.OINLCALL {
 					ir.Visit(stmt, func(node ir.Node) {
 						if label, ok := node.(*ir.LabelStmt); ok {
 							localLabels[label.Label] = true
@@ -668,12 +668,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						hasDefer = true
 					}
 					if branch, ok := node.(*ir.BranchStmt); ok {
-						// A copied switch owns its unlabeled breaks and jumps
-						// to labels within it, including inlined return labels.
+						// Copied switches and inlined expressions own their
+						// local jumps; a switch also owns unlabeled breaks.
 						// Neither can escape to a lowered continuation.
-						local := branch.Op() == ir.OBREAK && branch.Label == nil ||
+						local := stmt.Op() == ir.OSWITCH && branch.Op() == ir.OBREAK && branch.Label == nil ||
 							branch.Op() == ir.OGOTO && branch.Label != nil && localLabels[branch.Label]
-						if stmt.Op() != ir.OSWITCH || !local {
+						if !local {
 							hasBranch = true
 						}
 					}

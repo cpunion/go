@@ -1270,8 +1270,10 @@ Coexisting ordinary and logical public Mutex entries are not implemented here.
 Deferred `Unlock` also retains the ordinary caller because it can request a
 starvation handoff and suspending defers are not supported; the explicit
 `Lock`/`Unlock` call sequence is lowered.
-Public RWMutex tests likewise require native `Lock`, `Unlock`, `RLock`, and
-`RUnlock` entries. They check shared readers, exclusive writers, pending-writer
+Public RWMutex tests likewise require native `Lock`, `Unlock` and `RLock`
+entries. `RUnlock` and its slow helper only release without handoff and keep
+their ordinary entries on the executor. Tests still require native reader and
+writer callers. They check shared readers, exclusive writers, pending-writer
 priority, profiles, and detached waiters with one and four Ps. The tests compile
 the synchronization packages with the existing lowering option; an unlowered
 dependency still keeps its caller on the ordinary Go entry. The root adapter
@@ -1308,8 +1310,9 @@ stays in the resume invocation, rather than becoming a factory capture whose
 initializer runs later. The compiler requires all uses and the declaration to
 remain within that expression; address-taken and captured variables retain
 their previous storage. This is not general liveness or closure lowering.
-A non-suspending switch copied as one statement may retain its own unlabeled
-breaks and jumps to labels inside it, including inlined return labels. Returns,
+A non-suspending switch or standalone inlined expression copied as one
+statement may retain jumps to labels inside it, including inlined return
+labels. A switch also retains its own unlabeled breaks. Returns,
 defers, suspensions and branches escaping that statement still require separate
 lowering or conservative fallback.
 
