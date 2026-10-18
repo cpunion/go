@@ -1244,6 +1244,15 @@ uses the existing logical release path with no handoff request. Exact signature
 checks keep changed declarations on the conservative ordinary-Go path.
 
 Release publishes readiness without entering `goyield` from the native resume.
+A three-argument release with a statically false handoff operand can use the
+ordinary release entry on the current executor. The common dequeue path only
+creates a handoff ticket when that operand is true; without a ticket it cannot
+enter `goyield`. This call-site refinement preserves the source arguments and
+initializers, queue/wakeup behavior and ordinary entry's profiling attribution.
+The declaration itself, true or unknown operands, and changed signatures retain
+their conservative suspension effect. Reassigned or address-taken variables
+are not treated as immutable false operands.
+
 A reserved ticket returns a handoff action to the driver, which gives logical
 work and runnable ordinary goroutines a scheduling opportunity before resuming
 the releaser. This host check is not delayed by the ordinary yield batching
@@ -1258,8 +1267,9 @@ and `-l`; they also check that a child waiting on a Mutex survives its root's
 return. A lowered public method's original entry is a coroutine root adapter,
 so calling it from an ordinary helper does not prove an ordinary-G Mutex wait.
 Coexisting ordinary and logical public Mutex entries are not implemented here.
-Deferred `Unlock` also retains the ordinary caller because suspending defers
-are not supported; the explicit `Lock`/`Unlock` call sequence is lowered.
+Deferred `Unlock` also retains the ordinary caller because it can request a
+starvation handoff and suspending defers are not supported; the explicit
+`Lock`/`Unlock` call sequence is lowered.
 Public RWMutex tests likewise require native `Lock`, `Unlock`, `RLock`, and
 `RUnlock` entries. They check shared readers, exclusive writers, pending-writer
 priority, profiles, and detached waiters with one and four Ps. The tests compile
@@ -1274,7 +1284,16 @@ bubble retain the ordinary source body and its existing accounting. A private
 native call requesting a durable wait is rejected before acquiring a token.
 This does not implement logical-task participation in synctest.
 
-Public `Add`, `Done` and `Wait` use their unchanged source algorithms. Tests
+Public `Add`, `Done` and `Wait` use their unchanged source algorithms. Add's
+release passes a constant false handoff operand, so Add and Done are proven
+not to suspend, although their misuse checks can still panic. A statically
+resolved deferred Done can therefore use the existing compiler-private named
+defer contract. Tests require native callers for normal return, panic, Goexit
+and a recovered negative-counter panic, as well as ordinary bubble/race
+fallback. This does not admit general suspending defers or native go targets
+that may panic; the independent spawn admission rule is unchanged.
+
+Tests
 require native caller entries with and without inlining, exercise a registered
 waiter before release, repeated reuse and GC, and check ordinary synctest and
 race fallback. A call from an ordinary helper can enter a new coroutine root;

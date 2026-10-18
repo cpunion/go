@@ -109,6 +109,44 @@ func TestSemaphoreNoHandoffEffects(t *testing.T) {
 	}
 }
 
+func TestSemaphoreNoHandoffVariable(t *testing.T) {
+	prepareLowerTest(t)
+	for _, mode := range []string{"immutable", "reassigned", "address", "parameter", "wrong-type"} {
+		t.Run(mode, func(t *testing.T) {
+			pkg := types.NewPkg("sync", "sync")
+			primitive := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("runtime_Semrelease"),
+				semaphoreTestSignature(pkg, 3))
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("release"), primitive.Type())
+			fn.DeclareParams(true)
+			flag := fn.NewLocal(src.NoXPos, pkg.Lookup("handoff"), types.Types[types.TBOOL])
+			assign := ir.NewAssignStmt(src.NoXPos, flag, ir.NewBool(src.NoXPos, false))
+			assign.Def, flag.Defn = true, assign
+			fn.Body = ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, flag), assign}
+			call := newLowerTestCall(primitive)
+			call.Args = ir.Nodes{fn.Dcl[0], flag, fn.Dcl[2]}
+			switch mode {
+			case "reassigned":
+				fn.Body.Append(ir.NewAssignStmt(src.NoXPos, flag, ir.NewBool(src.NoXPos, true)))
+			case "address":
+				flag.SetAddrtaken(true)
+			case "parameter":
+				call.Args[1] = fn.Dcl[1]
+			case "wrong-type":
+				params := []*types.Field{
+					types.NewField(src.NoXPos, nil, types.NewPtr(types.Types[types.TUINT32])),
+					types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+					types.NewField(src.NoXPos, nil, types.Types[types.TINT]),
+				}
+				bad := ir.NewFunc(src.NoXPos, src.NoXPos, primitive.Sym(), types.NewSignature(nil, params, nil))
+				call.Fun = bad.Nname
+			}
+			if got := semaphoreNoHandoff(call); got != (mode == "immutable") {
+				t.Fatalf("non-handoff=%v, want %v", got, mode == "immutable")
+			}
+		})
+	}
+}
+
 func TestSemaphoreNoHandoffInit(t *testing.T) {
 	prepareLowerTest(t)
 	pkg := types.NewPkg("example.com/coro/semaphore-init", "effect")
@@ -119,7 +157,8 @@ func TestSemaphoreNoHandoffInit(t *testing.T) {
 	fn.DeclareParams(true)
 	call := newLowerTestCall(primitive)
 	call.Args = ir.Nodes{fn.Dcl[0], ir.NewBool(src.NoXPos, false), fn.Dcl[2]}
-	yield := newLowerTestFunc(types.NewPkg("runtime", "runtime"), "Gosched")
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, types.NewPkg("runtime", "runtime").Lookup("Gosched"),
+		types.NewSignature(nil, nil, nil))
 	init := newLowerTestCall(yield)
 	call.SetInit(ir.Nodes{init})
 	fn.Body = ir.Nodes{call, newLowerTestReturn()}
