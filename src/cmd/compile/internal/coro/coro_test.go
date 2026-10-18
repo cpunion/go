@@ -3697,6 +3697,11 @@ var manyChannel chan int
 var manyReady atomic.Uint32
 var pointerChannel chan *int
 var gcDone atomic.Uint32
+var gcRequest = make(chan struct{})
+
+// Start the ordinary GC controller before entering the native channel test.
+// Calling a dynamic go helper from that test would require ordinary fallback.
+func init() { go collect() }
 
 //go:noinline
 func nextValue() int {
@@ -3740,13 +3745,9 @@ func directionalRecv(ch <-chan int) int {
 
 //go:noinline
 func collect() {
+	<-gcRequest
 	runtime.GC()
 	gcDone.Store(1)
-}
-
-//go:noinline
-func launch(f func()) {
-	go f()
 }
 
 //go:noinline
@@ -3864,7 +3865,7 @@ func main() {
 	pointerChannel = pointers
 	go sendPointer()
 	runtime.Gosched()
-	launch(collect)
+	gcRequest <- struct{}{}
 	for gcDone.Load() == 0 {
 		runtime.Gosched()
 	}
