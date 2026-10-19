@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
 	"fmt"
 	"go/constant"
@@ -881,20 +882,21 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
-			if edge.Callee == nil {
+			if edge.Callee == nil && len(edge.Targets) == 0 {
 				return nil, fmt.Errorf("dynamic await site %d", site.ID)
 			}
+			resultCount := call.Fun.Type().NumResults()
 			container := awaitContainers[call]
 			if statement != container && !supportsAwaitInit(container) {
 				_, err := callResultTargets(call, container,
-					edge.Callee.Type().NumResults())
+					resultCount)
 				if err == nil {
 					err = fmt.Errorf("nested result expression")
 				}
 				return nil, fmt.Errorf("await site %d: %v", site.ID, err)
 			}
 			targets, err := callResultTargets(call, statement,
-				edge.Callee.Type().NumResults())
+				resultCount)
 			if err != nil {
 				return nil, fmt.Errorf("await site %d: %v", site.ID, err)
 			}
@@ -908,9 +910,15 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						site.ID, i)
 				}
 			}
-			candidate.dependencies[edge.Callee] = true
-			if edge.Callee == fn {
-				candidate.selfAwait = true
+			if len(edge.Targets) != 0 {
+				for _, target := range edge.Targets {
+					candidate.dependencies[target] = true
+				}
+			} else {
+				candidate.dependencies[edge.Callee] = true
+				if edge.Callee == fn {
+					candidate.selfAwait = true
+				}
 			}
 		case SiteSpawn:
 			if !goCalls[call] {
@@ -3250,9 +3258,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
 	var edit func(ir.Node) ir.Node
-	factoryCall := func(call *ir.CallExpr,
-		statement ir.Node) (lowerFactoryCall, error) {
-		edge := edgeForCall(function, call)
+	staticFactoryCall := func(call *ir.CallExpr,
+		statement ir.Node, edge Edge, frozenArgs ir.Nodes) (lowerFactoryCall, error) {
 		sourceCall := call
 		if edge.Kind == GoCall {
 			sourceCall = unwrapGoCall(call)
@@ -3271,8 +3278,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		if childABI == FactoryABI3 {
 			args = append(args, ctx)
 		}
-		for _, arg := range sourceCall.Args {
-			args = append(args, edit(arg))
+		for i, arg := range sourceCall.Args {
+			if frozenArgs != nil {
+				args = append(args, frozenArgs[i])
+			} else {
+				args = append(args, edit(arg))
+			}
 		}
 		resultStatement := statement
 		if edge.Kind == GoCall {
@@ -3331,6 +3342,65 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			setup: setup,
 			frame: frame, resume: childResume,
 		}, nil
+	}
+	factoryCall := func(call *ir.CallExpr,
+		statement ir.Node) (lowerFactoryCall, error) {
+		edge := edgeForCall(function, call)
+		if len(edge.Targets) == 0 {
+			return staticFactoryCall(call, statement, edge, nil)
+		}
+
+		// Evaluate the function value and every argument before inspecting the
+		// entry PC. In particular a nil function panics only after its arguments
+		// have run. A selected child is then awaited through the existing frame
+		// ABI; neither the operands nor the dispatch run again on resumption.
+		var setup ir.Nodes
+		freeze := func(value ir.Node) *ir.Name {
+			temp := typecheck.TempAt(call.Pos(), resume, value.Type())
+			setup = append(setup,
+				ir.NewDecl(call.Pos(), ir.ODCL, temp),
+				ir.NewAssignStmt(call.Pos(), temp, value))
+			return temp
+		}
+		fun := freeze(edit(call.Fun))
+		args := make(ir.Nodes, len(call.Args))
+		for i, arg := range call.Args {
+			args[i] = freeze(edit(arg))
+		}
+		pc := freeze(ir.FuncPC(call.Pos(),
+			typecheck.Conv(fun, types.Types[types.TINTER]), obj.ABIInternal))
+		frame := freeze(ir.NewNilExpr(call.Pos(), types.Types[types.TUNSAFEPTR]))
+		childResume := freeze(ir.NewNilExpr(call.Pos(), stacklessResumeType()))
+		var dispatch ir.Nodes
+		for i := len(edge.Targets) - 1; i >= 0; i-- {
+			target := edge.Targets[i]
+			selected := Edge{Kind: DirectCall, Callee: target, CalleeName: ir.PkgFuncName(target)}
+			child, err := staticFactoryCall(call, statement, selected, args)
+			if err != nil {
+				return lowerFactoryCall{}, err
+			}
+			body := child.setup
+			childFrame := child.frame
+			if childFrame == nil {
+				childFrame = ir.NewNilExpr(call.Pos(), frame.Type())
+			}
+			body = append(body,
+				ir.NewAssignStmt(call.Pos(), frame, childFrame),
+				ir.NewAssignStmt(call.Pos(), childResume, child.resume))
+			if i == len(edge.Targets)-1 {
+				// The whole-body proof permits only the named entries or nil.
+				// FuncPC has already performed the nil check, so the final entry
+				// needs no further comparison.
+				dispatch = body
+				continue
+			}
+			targetPC := ir.FuncPC(call.Pos(),
+				typecheck.Conv(target.Nname, types.Types[types.TINTER]), obj.ABIInternal)
+			condition := ir.NewBinaryExpr(call.Pos(), ir.OEQ, pc, targetPC)
+			dispatch = ir.Nodes{ir.NewIfStmt(call.Pos(), condition, body, dispatch)}
+		}
+		setup = append(setup, dispatch...)
+		return lowerFactoryCall{setup: setup, frame: frame, resume: childResume}, nil
 	}
 
 	edit = func(node ir.Node) ir.Node {

@@ -214,8 +214,11 @@ func (s Seed) String() string {
 // Edge is a call from one function to another. Callee is nil for a dynamic
 // call. Unknown is true when the callee has no effect summary in this package.
 type Edge struct {
-	Kind       EdgeKind
-	Callee     *ir.Func
+	Kind   EdgeKind
+	Callee *ir.Func
+	// Targets is a proved closed set for a local function-value call.
+	// Callee remains nil: the selected entry is determined at run time.
+	Targets    []*ir.Func
 	CalleeName string
 	Imported   FuncSummary
 	Unknown    bool
@@ -399,6 +402,17 @@ func (p *Plan) scan(function *Function) {
 			return
 		}
 	}
+	localTargets := localFunctionTargets(function.Func)
+	for name, targets := range localTargets {
+		for _, target := range targets {
+			if _, operation := p.operationRecipe(target); operation {
+				// Operations have call-specific recipes rather than the named
+				// factory contract used by a function-value dispatch.
+				delete(localTargets, name)
+				break
+			}
+		}
+	}
 	goDefer := make(map[*ir.CallExpr]EdgeKind)
 	ir.Visit(function.Func, func(n ir.Node) {
 		if n, ok := n.(*ir.GoDeferStmt); ok {
@@ -485,6 +499,17 @@ func (p *Plan) scan(function *Function) {
 			} else {
 				edge.CalleeName = "<dynamic>"
 				edge.Unknown = true
+				if name, ok := calleeCall.Fun.(*ir.Name); ok && kind == DirectCall {
+					edge.Targets = localTargets[name]
+					if len(edge.Targets) != 0 {
+						edge.Unknown = false
+						for _, target := range edge.Targets {
+							if _, known := p.funcSummary(target); !known {
+								edge.Unknown = true
+							}
+						}
+					}
+				}
 			}
 		} else {
 			edge.CalleeName = "<interface>"
@@ -552,6 +577,15 @@ func (p *Plan) edgeMaySuspend(edge Edge) bool {
 }
 
 func (p *Plan) edgeNeedsCoroEntry(edge Edge) bool {
+	if len(edge.Targets) != 0 {
+		for _, target := range edge.Targets {
+			summary, known := p.funcSummary(target)
+			if p.edgeNeedsCoroEntry(Edge{Callee: target, Imported: summary, Unknown: !known}) {
+				return true
+			}
+		}
+		return false
+	}
 	summary, known := p.edgeSummary(edge)
 	if !known || summary.Primary() != CoroPrimary {
 		return !known
@@ -596,6 +630,21 @@ func (p *Plan) calledTerminal(function *Function) TerminalFlags {
 }
 
 func (p *Plan) edgeSummary(edge Edge) (FuncSummary, bool) {
+	if len(edge.Targets) != 0 {
+		var result FuncSummary
+		for _, target := range edge.Targets {
+			summary, known := p.funcSummary(target)
+			if !known {
+				return FuncSummary{}, false
+			}
+			if summary.Effect == MaySuspend {
+				result.Effect = MaySuspend
+			}
+			result.Exec |= summary.Exec
+			result.Terminal |= summary.Terminal
+		}
+		return result, true
+	}
 	if edge.Recipe.Kind != SiteInvalid {
 		return FuncSummary{
 			Effect:   edge.Recipe.Effect,
