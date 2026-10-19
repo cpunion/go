@@ -1046,8 +1046,10 @@ effectful operand, a `for` condition or post statement, and an assignment with
 an effectful left operand retain the ordinary entry. Moving a hidden call
 ahead of an index, dereference, or other effectful destination would change Go
 evaluation order; those forms require explicit destination stabilization or
-control-flow splitting before suspension. A spawned call with results is
-rejected because the child may outlive the parent slot.
+control-flow splitting before suspension. A spawned call with discarded results
+must not reuse a parent result slot: the child may outlive the creator. Static
+coroutine-capable go targets instead receive independently allocated typed
+destinations through the existing factory ABI, as described in section 16.8.
 
 Summary version 2 carries effect and execution requirements, version 3 adds
 the factory capability, version 4 adds `MayPanic`, `UsesRecover`, and
