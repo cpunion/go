@@ -98,6 +98,7 @@ func collectGC() {
 	for range gcRequest { runtime.GC(); gcDone <- struct{}{} }
 }
 var captures [3]*int
+var escapedAddresses [3]*int
 var cleanups int
 
 //go:noinline
@@ -119,6 +120,33 @@ func captured() (result int) {
 		result++
 	}
 	return
+}
+
+// A source panic selects the ordinary closure factory instead of the explicit
+// frame ABI. Case addresses must still belong to distinct selections.
+//go:noinline
+func addressed() {
+	for i := 0; i < 3; i++ {
+		switch x := any(i+1).(type) {
+		case int:
+			escapedAddresses[i] = &x
+			runtime.Gosched()
+			x += 10
+			gcRequest <- struct{}{}
+			<-gcDone
+		default: panic("int dispatch")
+		}
+	}
+}
+//go:noinline
+func deferredOnce(input any) {
+	switch x := input.(type) {
+	case int:
+		escapedAddresses[0] = &x
+		defer func() { cleanups = x }()
+		runtime.Gosched()
+		x += 10
+	}
 }
 
 //go:noinline
@@ -176,6 +204,10 @@ func main() {
 	if initialized(20) != 40 || initialized(21) != 21 || initialized(nil) != 9 { panic("initializer or nested switch") }
 	if captured() != 15 || cleanups != 1431 { panic("case defer or branch") }
 	if captures[0] == captures[1] || captures[1] == captures[2] || *captures[0] != 11 || *captures[1] != 12 || *captures[2] != 13 { panic("case variable lifetime") }
+	addressed()
+	if escapedAddresses[0] == escapedAddresses[1] || escapedAddresses[1] == escapedAddresses[2] || *escapedAddresses[0] != 11 || *escapedAddresses[1] != 12 || *escapedAddresses[2] != 13 { panic("ordinary factory case variable lifetime") }
+	deferredOnce(42)
+	if cleanups != 52 || *escapedAddresses[0] != 52 { panic("single selection defer capture") }
 	if noBinding(1) != 1 || noBinding("hello") != 2 || noBinding(nil) != 2 || empty(nil) != 3 { panic("unbound dispatch") }
 	if spawned(42, make(chan int)) != 42 { panic("spawned call") }
 	if suspendingGuard(42) != 42 { panic("suspending guard fallback") }
@@ -189,6 +221,6 @@ func main() {
 		{"suspendingGuard", "coroutine site in switch header"},
 		{"escapingClosures", "type switch variable captured by closure"},
 	}, []string{
-		"concrete", "interfaceOrder", "concreteOrder", "initialized", "captured", "noBinding", "empty", "spawned",
+		"concrete", "interfaceOrder", "concreteOrder", "initialized", "captured", "addressed", "deferredOnce", "noBinding", "empty", "spawned",
 	})
 }

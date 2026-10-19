@@ -506,8 +506,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				switches[stmt] = true
 				oldBreak := breakTarget
 				breakTarget = stmt
+				// Type-case bindings use per-selection storage. Snapshot
+				// their defer captures even outside a source loop.
+				dynamicScope := inLoop || stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW
 				for _, clause := range stmt.Cases {
-					if err := collectStatements(clause.Body, inLoop); err != nil {
+					if err := collectStatements(clause.Body, dynamicScope); err != nil {
 						return err
 					}
 				}
@@ -2484,6 +2487,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, variable := range candidate.rangeVars {
 		addCaptureCell(variable)
+	}
+	// Case declarations execute on every selection, including in the closure
+	// factory ABIs. Hoisting their addressable storage to the factory would
+	// make pointers from distinct selections alias each other.
+	for stmt := range candidate.switches {
+		for _, clause := range stmt.Cases {
+			if variable := clause.Var; variable != nil && variable.Addrtaken() {
+				addCaptureCell(variable)
+			}
+		}
 	}
 	if candidate.factoryABI == FactoryABI3 {
 		for _, variable := range fn.Dcl {

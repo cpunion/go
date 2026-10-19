@@ -172,6 +172,15 @@ func TestTypeSwitchAdmission(t *testing.T) {
 }
 
 func TestLowerTypeSwitch(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		addressed bool
+	}{{"value", false}, {"address", true}} {
+		t.Run(test.name, func(t *testing.T) { testLowerTypeSwitch(t, test.addressed) })
+	}
+}
+
+func testLowerTypeSwitch(t *testing.T, addressed bool) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
@@ -186,6 +195,7 @@ func TestLowerTypeSwitch(t *testing.T) {
 	guard.SetTypecheck(1)
 	variable := fn.NewLocal(src.NoXPos, pkg.Lookup("x"), result.Type)
 	variable.Defn = guard
+	variable.SetAddrtaken(addressed)
 	yield := ir.NewFunc(src.NoXPos, src.NoXPos, types.NewPkg("runtime", "runtime").Lookup("Gosched"), types.NewSignature(nil, nil, nil))
 	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{variable})
 	ret.SetTypecheck(1)
@@ -222,6 +232,9 @@ func TestLowerTypeSwitch(t *testing.T) {
 			body := dispatch.Cases[0].Body
 			if len(body) != 3 || body[1].Op() != ir.OAS || body[2].Op() != ir.OGOTO {
 				t.Fatal("selected binding was not saved before entering its continuation")
+			}
+			if addressed && body[0].Op() != ir.OAS {
+				t.Fatal("addressable binding has no per-selection cell allocation")
 			}
 		})
 	}
