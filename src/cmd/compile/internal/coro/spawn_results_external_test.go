@@ -70,6 +70,8 @@ func Panic(implicit bool) (int, *Box) {
  panic("spawn-result-panic")
 }
 
+func Single(value int) int { runtime.Gosched(); return value }
+
 // Returned values alone do not make a plain entry coroutine-capable.
 func Plain(out *int, done chan struct{}) int { *out = 29; close(done); return 29 }
 `,
@@ -94,14 +96,15 @@ func argument() int {
 func spawn(ready chan<- int, gate <-chan struct{}, results *[128]int, done *[128]chan struct{}) {
  for i := range 128 {
   p := &helper.Box{Value: i}
+  index := argument()
   if i%4 == 0 {
-   go helper.Pair(argument(), p, ready, gate, &results[i], done[i])
+   go helper.Pair(index, p, ready, gate, &results[i], done[i])
   } else if i%4 == 1 {
-   go p.Pair(argument(), ready, gate, &results[i], done[i]); p.Value = -1
+   go p.Pair(index, ready, gate, &results[i], done[i]); p.Value = -1
   } else if i%4 == 2 {
-   go helper.Named(argument(), p, ready, gate, &results[i], done[i])
+   go helper.Named(index, p, ready, gate, &results[i], done[i])
   } else {
-   go helper.Exit(argument(), p, ready, gate, &results[i], done[i])
+   go helper.Exit(index, p, ready, gate, &results[i], done[i])
   }
  }
 }
@@ -110,6 +113,8 @@ func plain(out *int, done chan struct{}) { go helper.Plain(out, done) }
 
 func fatal(implicit bool) { go helper.Panic(implicit) }
 
+func argumentSpawn() { go helper.Single(argument()) }
+
 func main() {
  if os.Getenv("ARGUMENT_PANIC") != "" {
   failArgument = true
@@ -117,7 +122,7 @@ func main() {
    if recover() != 42 || next != 0 { panic("argument panic changed") }
    println("spawn-result-argument-ok")
   }()
-  spawn(make(chan int), make(chan struct{}), new([128]int), new([128]chan struct{}))
+  argumentSpawn()
   panic("argument did not panic")
  }
  var results [128]int
@@ -212,7 +217,7 @@ func main() {
 			if err != nil {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
-			for _, name := range []string{"main.spawn", "main.fatal", "example.com/spawnresults/helper.Pair", "example.com/spawnresults/helper.Box.Pair", "example.com/spawnresults/helper.Named", "example.com/spawnresults/helper.Exit", "example.com/spawnresults/helper.Panic"} {
+			for _, name := range []string{"main.spawn", "main.fatal", "main.argumentSpawn", "example.com/spawnresults/helper.Pair", "example.com/spawnresults/helper.Box.Pair", "example.com/spawnresults/helper.Named", "example.com/spawnresults/helper.Exit", "example.com/spawnresults/helper.Panic", "example.com/spawnresults/helper.Single"} {
 				if got := strings.Contains(string(symbols), name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
