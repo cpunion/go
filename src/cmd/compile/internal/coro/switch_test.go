@@ -229,3 +229,62 @@ func TestLowerTypeSwitch(t *testing.T) {
 		t.Fatal("type switch dispatch missing from generated resume")
 	}
 }
+
+func TestTypeSwitchClosureBoundary(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/typeswitchcapture", "typeswitchcapture")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	sig := types.NewSignature(nil, nil, nil)
+	for _, test := range []struct {
+		name                          string
+		bound, captures, deferLiteral bool
+		want                          bool
+	}{
+		{name: "unbound"},
+		{name: "unrelated", bound: true},
+		{name: "ordinary", bound: true, captures: true, want: true},
+		{name: "defer", bound: true, captures: true, deferLiteral: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(test.name), sig)
+			fn.DeclareParams(true)
+			variable := fn.NewLocal(src.NoXPos, pkg.Lookup("x"), types.Types[types.TINT])
+			guard := ir.NewTypeSwitchGuard(src.NoXPos, nil, ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
+			clause := ir.NewCaseStmt(src.NoXPos, nil, nil)
+			if test.bound {
+				clause.Var = variable
+			}
+			closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE, sig, fn, typecheck.Target, 0)
+			captured := variable
+			if !test.captures {
+				captured = fn.NewLocal(src.NoXPos, pkg.Lookup("other"), types.Types[types.TINT])
+			}
+			ir.NewClosureVar(src.NoXPos, closure, captured)
+			call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, closure.OClosure, nil)
+			var defers []*lowerDefer
+			if test.deferLiteral {
+				clause.Body = ir.Nodes{ir.NewGoDeferStmt(src.NoXPos, ir.ODEFER, call)}
+				defers = []*lowerDefer{{call: call}}
+			} else {
+				clause.Body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, ir.BlankNode, closure.OClosure)}
+			}
+			stmt := ir.NewSwitchStmt(src.NoXPos, guard, []*ir.CaseClause{clause})
+			fn.Body = ir.Nodes{stmt}
+			if got := typeSwitchHasOrdinaryClosureCapture(fn, map[*ir.SwitchStmt]bool{stmt: true}, defers); got != test.want {
+				t.Fatalf("ordinary closure capture = %v, want %v", got, test.want)
+			}
+			if test.want {
+				yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"), sig)
+				call := newLowerTestCall(yield)
+				fn.Body = append(ir.Nodes{call}, fn.Body...)
+				_, err := newLowerCandidate(&Plan{}, &Function{Func: fn, Primary: CoroPrimary,
+					Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}}})
+				if err == nil || !strings.Contains(err.Error(), "type switch variable captured by closure") {
+					t.Fatalf("error = %v, want ordinary case capture boundary", err)
+				}
+			}
+		})
+	}
+}

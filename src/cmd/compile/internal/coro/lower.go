@@ -752,6 +752,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if hasUnplannedTypeSwitch(fn.Body, switches) {
 		return nil, fmt.Errorf("type switch in unsupported expression")
 	}
+	if typeSwitchHasOrdinaryClosureCapture(fn, switches, defers) {
+		return nil, fmt.Errorf("type switch variable captured by closure")
+	}
 	if len(rangeVars) != 0 {
 		rangeVariableSet := make(map[*ir.Name]bool, len(rangeVars))
 		for _, variable := range rangeVars {

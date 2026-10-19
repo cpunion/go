@@ -150,6 +150,19 @@ func suspendingGuard(input any) int {
 	}
 	return 0
 }
+//go:noinline
+func escapingClosures() [3]func() int {
+	var fs [3]func() int
+	for i := 0; i < 3; i++ {
+		switch x := any(i+1).(type) {
+		case int:
+			fs[i] = func() int { return x }
+			runtime.Gosched()
+			x += 10
+		}
+	}
+	return fs
+}
 
 func main() {
 	go collectGC()
@@ -166,11 +179,16 @@ func main() {
 	if noBinding(1) != 1 || noBinding("hello") != 2 || noBinding(nil) != 2 || empty(nil) != 3 { panic("unbound dispatch") }
 	if spawned(42, make(chan int)) != 42 { panic("spawned call") }
 	if suspendingGuard(42) != 42 { panic("suspending guard fallback") }
+	fs := escapingClosures()
+	if fs[0]() != 11 || fs[1]() != 12 || fs[2]() != 13 { panic("ordinary closure capture fallback") }
 	close(gcRequest)
 	println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source, []switchFallback{{"suspendingGuard", "coroutine site in switch header"}}, []string{
+	testSwitchReturnProgram(t, source, []switchFallback{
+		{"suspendingGuard", "coroutine site in switch header"},
+		{"escapingClosures", "type switch variable captured by closure"},
+	}, []string{
 		"concrete", "interfaceOrder", "concreteOrder", "initialized", "captured", "noBinding", "empty", "spawned",
 	})
 }

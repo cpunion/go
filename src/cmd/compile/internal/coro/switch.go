@@ -21,6 +21,41 @@ func hasUnplannedTypeSwitch(body ir.Nodes, planned map[*ir.SwitchStmt]bool) bool
 	return false
 }
 
+// Ordinary closure captures still use factory-owned storage. They cannot
+// preserve a distinct mutable case variable on each selection. Source defer
+// literals have separate snapshot/cell lowering that does preserve that scope.
+func typeSwitchHasOrdinaryClosureCapture(fn *ir.Func, planned map[*ir.SwitchStmt]bool, defers []*lowerDefer) bool {
+	variables := make(map[*ir.Name]bool)
+	for stmt := range planned {
+		for _, clause := range stmt.Cases {
+			if clause.Var != nil {
+				variables[clause.Var.Canonical()] = true
+			}
+		}
+	}
+	if len(variables) == 0 {
+		return false
+	}
+	deferred := make(map[*ir.Func]bool)
+	for _, entry := range defers {
+		if closure, ok := entry.call.Fun.(*ir.ClosureExpr); ok {
+			deferred[closure.Func] = true
+		}
+	}
+	return ir.Any(fn, func(node ir.Node) bool {
+		closure, ok := node.(*ir.ClosureExpr)
+		if !ok || deferred[closure.Func] {
+			return false
+		}
+		for _, variable := range closure.Func.ClosureVars {
+			if variables[variable.Canonical()] {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // Type switches need a planned dispatch to preserve their implicit case names.
 // Ordinary expression switches stay intact unless a case needs continuation
 // control or contains a type switch that itself needs a planned dispatch.
