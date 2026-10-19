@@ -40,7 +40,7 @@ func plainSpawnFactorySupported(function *Function) bool {
 	if !(function != nil && function.Primary == PlainPrimary &&
 		function.Effect == NoSuspend && function.Exec == 0 &&
 		function.Terminal == 0 && resumeFactorySupported(function.Func) &&
-		function.Func.Type().NumResults() == 0 && len(function.Func.Body) != 0 &&
+		len(function.Func.Body) != 0 &&
 		len(function.Edges) == 0) {
 		return false
 	}
@@ -63,10 +63,17 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 		factory, typecheck.Target, 0)
 	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
-	args := make(ir.Nodes, len(factory.Type().Params()))
+	inputs := len(fn.Type().RecvParams())
+	args := make(ir.Nodes, inputs)
+	results := make(ir.Nodes, fn.Type().NumResults())
 	for i, field := range factory.Type().Params() {
 		parameter := field.Nname.(*ir.Name)
-		args[i] = ir.NewClosureVar(pos, resume, parameter)
+		capture := ir.NewClosureVar(pos, resume, parameter)
+		if i < inputs {
+			args[i] = capture
+		} else {
+			results[i-inputs] = ir.NewStarExpr(pos, capture)
+		}
 	}
 	// An implicit panic unwinds to the runtime and reenters this resume for
 	// terminal propagation. Never invoke the ordinary body a second time.
@@ -74,6 +81,14 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 		// Reuse the frontend's static callee representation, including a
 		// method expression's explicit receiver and a variadic slice.
 		call := typecheck.Call(pos, ir.DeepCopy(pos, callee), args, fn.Type().IsVariadic())
+		var invoke ir.Node = call
+		// Keep the factory ABI's result destinations meaningful, even though
+		// a go statement discards them. They belong to the independent child.
+		if len(results) == 1 {
+			invoke = ir.NewAssignStmt(pos, results[0], call)
+		} else if len(results) > 1 {
+			invoke = ir.NewAssignListStmt(pos, ir.OAS2, results, ir.Nodes{call})
+		}
 		action := typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
 		query := typecheck.Call(pos, typecheck.LookupRuntime("coroTerminalAction"),
 			ir.Nodes{resume.Dcl[0]}, false)
@@ -83,7 +98,7 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 			ir.NewAssignStmt(pos, action, query),
 			ir.NewIfStmt(pos, pending,
 				ir.Nodes{ir.NewReturnStmt(pos, ir.Nodes{action})}, nil),
-			call,
+			invoke,
 			ir.NewReturnStmt(pos, ir.Nodes{
 				typedInt(pos, types.Types[types.TUINT8], int64(actionComplete)),
 			}),

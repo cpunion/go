@@ -4069,10 +4069,14 @@ fallback before entering the native executor. Execution-constrained defer
 targets remain unsupported, rather than creating tasks during native cleanup.
 
 A statically named local go target with a known `NoSuspend` summary, no
-execution or terminal constraints, an available Go body, and no results can
+execution or terminal constraints, and an available Go body can
 instead use a small factory ABI 1 adapter. The adapter snapshots the explicit
 arguments in a GC-scanned closure and invokes the unchanged ordinary entry
-once. A pending terminal outcome on reentry bypasses that invocation, including
+once. The adapter passes only the original receiver and arguments to that
+entry and writes its returned values through the factory's typed result
+destinations. Scalar, pointer, multiple, and named results use the same ABI;
+no nullable-result convention is introduced. A pending terminal outcome on
+reentry bypasses that invocation, including
 after an implicit panic. Ordinary callers retain their original entry and
 inline body; factory availability is not a suspension or execution effect.
 Factories are generated only for targets demanded by local spawn candidates,
@@ -4095,16 +4099,19 @@ child, remain GC-visible after the creator returns, and are not shared by
 successive loop iterations. Awaited calls keep their existing result-target
 handling. This deliberately adds per-result storage rather than changing the
 factory ABI or making result pointers nullable; result elision is a separate
-optimization. Plain adapters still require no results.
+optimization. Bounded plain adapters use these same child-owned destinations.
 
 Dynamic function values, arbitrary source closures, unsupported signatures and
-plain targets with returned values retain the ordinary Go path.
+imported plain targets without an exported adapter retain the ordinary Go path.
 A statically known native target may panic;
 its independent task owns cleanup and the terminal outcome as described above.
 This does not implement general closure or dynamic-call lowering. Tests require
 actual closure and frame spawning rather than accepting a successful ordinary
-fallback, and separately require fallback for dynamic and plain value-returning
-targets. Discarded-result tests cover a creator returning before its 128 children,
+fallback, and separately require fallback for dynamic targets and missing
+adapters. Plain-adapter tests cover returned values, variadic arguments, value
+and pointer receivers, named results, unchanged ordinary calls, missing-factory,
+race and experiment-disabled fallback, GC, and independent implicit child panics.
+Discarded-result tests cover a creator returning before its 128 children,
 GC-sensitive pointer results, methods, named-result defer, Goexit, argument
 panics and independent child panics, with and without inlining and with checkptr.
 

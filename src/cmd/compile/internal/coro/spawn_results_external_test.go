@@ -72,7 +72,7 @@ func Panic(implicit bool) (int, *Box) {
 
 func Single(value int) int { runtime.Gosched(); return value }
 
-// Returned values alone do not make a plain entry coroutine-capable.
+// No local go statement demands a factory for this exported entry.
 func Plain(out *int, done chan struct{}) int { *out = 29; close(done); return 29 }
 `,
 		"main.go": `package main
@@ -155,7 +155,7 @@ func main() {
  out, signal := 0, make(chan struct{})
  plain(&out, signal)
  <-signal
- if out != 29 { panic("plain returned-value fallback") }
+ if out != 29 { panic("missing plain adapter fallback") }
  if mode := os.Getenv("PANIC"); mode != "" {
   defer func() { if recover() != nil { println("parent-recovered-child") } }()
   fatal(mode == "implicit")
@@ -224,7 +224,7 @@ func main() {
 			}
 			for _, name := range []string{"main.plain", "example.com/spawnresults/helper.Plain"} {
 				if strings.Contains(string(symbols), name+".coro") {
-					t.Errorf("unsupported plain returned-value target lost fallback: %s", name)
+					t.Errorf("plain target without an exported adapter lost fallback: %s", name)
 				}
 			}
 			if native {
