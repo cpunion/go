@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"testing"
@@ -82,5 +83,87 @@ func TestSpawnExecution(t *testing.T) {
 		function.Exec != NeedsTaskContext || function.Primary != CoroPrimary ||
 		len(function.Sites) != 1 || function.Sites[0].Kind != SiteAwait {
 		t.Fatal("imported summary lost task-creation requirements")
+	}
+}
+
+func TestPlainSpawnFactory(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/plainspawn", "plainspawn")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	leaf, unused, caller := newLowerTestFunc(pkg, "leaf"), newLowerTestFunc(pkg, "unused"), newLowerTestFunc(pkg, "caller")
+	leafReturn := newLowerTestReturn()
+	leaf.Body = ir.Nodes{leafReturn}
+	unused.Body = ir.Nodes{newLowerTestReturn()}
+	goStmt := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, newLowerTestCall(leaf))
+	goStmt.SetTypecheck(1)
+	caller.Body = ir.Nodes{goStmt, newLowerTestReturn()}
+	plan, err := Analyze([]*ir.Func{caller, leaf, unused}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fn := range []*ir.Func{leaf, unused} {
+		if function := plan.Functions[fn]; !plainSpawnFactorySupported(function) ||
+			function.Primary != PlainPrimary || function.Exec != 0 || len(function.Sites) != 0 {
+			t.Fatalf("plain leaf requires execution context: %+v", function)
+		}
+	}
+	result, err := Lower(plan, nil)
+	if err != nil || result.Lowered != 1 || result.Skipped != 0 {
+		t.Fatalf("Lower = (%+v, %v), want only the creator rewritten", result, err)
+	}
+	if len(leaf.Body) != 1 || leaf.Body[0] != leafReturn ||
+		plan.Functions[leaf].Factory != FactoryABI1 || plan.Functions[unused].Factory != NoFactory {
+		t.Fatal("factory demand changed an ordinary body or generated an unrelated factory")
+	}
+	plan.PublishSummaries()
+	defer delete(summaries, leaf)
+	summary, ok := Summary(leaf)
+	if !ok || summary.Factory != FactoryABI1 || summary.Primary() != PlainPrimary ||
+		summary.Effect != NoSuspend || summary.Exec != 0 {
+		t.Fatalf("plain factory summary = (%+v, %t)", summary, ok)
+	}
+	if factory, ok := importedResumeFactory(leaf); !ok || factory == nil {
+		t.Fatal("plain factory cannot be imported with the existing ABI")
+	}
+}
+
+func TestPlainSpawnFactoryUnsupported(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/plainspawnunsupported", "plainspawn")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("leaf"), types.NewSignature(nil, nil, nil))
+	for _, function := range []*Function{
+		nil,
+		{},
+		{Func: fn, Primary: CoroPrimary},
+		{Func: fn, Effect: MaySuspend},
+		{Func: fn, Exec: MayBlockThread},
+		{Func: fn, Terminal: UsesRecover},
+		{Func: fn}, // A declaration without an available Go body.
+	} {
+		if plainSpawnFactorySupported(function) {
+			t.Fatalf("unsupported plain factory = %+v", function)
+		}
+	}
+	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	returning := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("returning"),
+		types.NewSignature(nil, nil, []*types.Field{result}))
+	if plainSpawnFactorySupported(&Function{Func: returning}) {
+		t.Fatal("discarded-result spawn target supports a plain factory")
+	}
+	fn.Body = ir.Nodes{newLowerTestReturn()}
+	if plainSpawnFactorySupported(&Function{Func: fn, Edges: []Edge{{Kind: DirectCall}}}) {
+		t.Fatal("ordinary helper call admitted without an execution bound")
+	}
+	for _, stmt := range []ir.Node{
+		ir.NewForStmt(src.NoXPos, nil, nil, nil, nil, false),
+		ir.NewRangeStmt(src.NoXPos, nil, nil, nil, nil, false),
+		ir.NewBranchStmt(src.NoXPos, ir.OGOTO, pkg.Lookup("again")),
+	} {
+		fn.Body = ir.Nodes{stmt}
+		if plainSpawnFactorySupported(&Function{Func: fn}) {
+			t.Fatalf("unbounded plain target supports a factory: %v", stmt.Op())
+		}
 	}
 }

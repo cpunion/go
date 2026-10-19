@@ -4066,6 +4066,25 @@ the child. An imported task-creating helper without a factory forces ordinary
 fallback before entering the native executor. Execution-constrained defer
 targets remain unsupported, rather than creating tasks during native cleanup.
 
+A statically named local go target with a known `NoSuspend` summary, no
+execution or terminal constraints, an available Go body, and no results can
+instead use a small factory ABI 1 adapter. The adapter snapshots the explicit
+arguments in a GC-scanned closure and invokes the unchanged ordinary entry
+once. A pending terminal outcome on reentry bypasses that invocation, including
+after an implicit panic. Ordinary callers retain their original entry and
+inline body; factory availability is not a suspension or execution effect.
+Factories are generated only for targets demanded by local spawn candidates,
+not for every exported plain function. An importing package may use an exported
+adapter through the existing factory summary, but an imported target without
+one still forces ordinary fallback. This does not prove arbitrary ordinary
+helper stack bounds or admit assembly-only declarations. Until execution
+summaries can prove bounded plain calls, adapters reject source calls, loops,
+and goto statements; those targets retain ordinary spawning and host preemption.
+Before inlining, preserve only the static target call inside its generated go
+wrapper using the existing call-site `NoInline` bit. Other calls to the same
+plain entry may still inline. Race and other instrumented builds skip this
+preparation along with native lowering.
+
 The target must still satisfy the existing factory restrictions. Dynamic
 function values, arbitrary source closures, unsupported signatures and returned
 values retain the ordinary Go path. A statically known native target may panic;

@@ -268,6 +268,22 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 
 	factories := make(map[*ir.Func]*ir.Func)
+	for _, function := range functions {
+		if candidates[function.Func] == nil {
+			continue
+		}
+		for _, edge := range function.Edges {
+			if edge.Kind != GoCall || factories[edge.Callee] != nil {
+				continue
+			}
+			child := plan.Functions[edge.Callee]
+			if plainSpawnFactorySupported(child) {
+				factories[edge.Callee] = newPlainSpawnFactory(child.Func,
+					unwrapGoCall(edge.Node).Fun)
+				child.Factory = FactoryABI1
+			}
+		}
+	}
 
 	// Remove callers whose structured children cannot use the required ABI.
 	// Iterate to a fixed point so one unsupported leaf removes every
@@ -1601,11 +1617,11 @@ func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 
 func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
 	factories map[*ir.Func]*ir.Func, fn *ir.Func) bool {
-	if _, local := plan.Functions[fn]; local {
-		return candidates[fn] != nil
-	}
 	if factories[fn] != nil {
 		return true
+	}
+	if _, local := plan.Functions[fn]; local {
+		return candidates[fn] != nil
 	}
 	factory, ok := importedResumeFactory(fn)
 	if ok {

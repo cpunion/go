@@ -280,6 +280,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			plan.Dump(os.Stderr)
 		}
 		if base.Debug.Coro > 3 && !instrumented {
+			plan.PreserveGoCalls()
 			preserveCall = plan.PreserveCall
 		}
 	}
