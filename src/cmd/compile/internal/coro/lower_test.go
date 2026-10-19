@@ -5238,7 +5238,7 @@ func TestLowerImportedFactory(t *testing.T) {
 	}
 }
 
-func TestLowerRejectsSpawnResults(t *testing.T) {
+func TestLowerSpawnResults(t *testing.T) {
 	prepareLowerTest(t)
 
 	oldTarget := typecheck.Target
@@ -5253,28 +5253,56 @@ func TestLowerRejectsSpawnResults(t *testing.T) {
 	typecheck.Target = new(ir.Package)
 
 	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
+	pointerType := types.NewPtr(types.Types[types.TINT])
+	pointerResult := types.NewField(src.NoXPos, nil, pointerType)
 	child := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("child"),
-		types.NewSignature(nil, nil, []*types.Field{result}))
+		types.NewSignature(nil, nil, []*types.Field{result, pointerResult}))
 	child.DeclareParams(true)
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, ir.Pkgs.Runtime.Lookup("Gosched"),
+		types.NewSignature(nil, nil, nil))
+	yield.DeclareParams(true)
+	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{
+		typedInt(src.NoXPos, types.Types[types.TINT], 42),
+		ir.NewNilExpr(src.NoXPos, pointerType),
+	})
+	ret.SetTypecheck(1)
+	child.Body = ir.Nodes{newLowerTestCall(yield), ret}
 	call := newLowerTestCall(child)
+	call.SetType(child.Type().ResultsTuple())
 	spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, call)
 	spawn.SetTypecheck(1)
 	parent := newLowerTestFunc(pkg, "parent")
 	parent.Body = ir.Nodes{spawn, newLowerTestReturn()}
-	function := &Function{
-		Func: parent,
-		Edges: []Edge{{
-			Kind: GoCall, Callee: child,
-			CalleeName: symbolName(child.Nname), Node: call,
-		}},
-		Sites: []Site{{
-			ID: 1, Kind: SiteSpawn, Node: call,
-		}},
+	plan, err := Analyze([]*ir.Func{child, parent}, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	plan := &Plan{Functions: map[*ir.Func]*Function{parent: function}}
-	if _, err := newLowerCandidate(plan, function); err == nil ||
-		!strings.Contains(err.Error(), "spawn target returns values") {
-		t.Fatalf("newLowerCandidate error = %v, want result rejection", err)
+	lowered, err := Lower(plan, nil)
+	if err != nil || lowered.Lowered != 2 || lowered.Skipped != 0 {
+		t.Fatalf("Lower = (%+v, %v), want two native entries", lowered, err)
+	}
+	wantFactory := symbolName(child.Nname) + ".coro"
+	calls := 0
+	for _, generated := range typecheck.Target.Funcs {
+		ir.Visit(generated, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok || symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) != wantFactory {
+				return
+			}
+			calls++
+			if len(call.Args) != 3 {
+				t.Fatalf("factory arguments = %d, want context and two result pointers", len(call.Args))
+			}
+			for i, typ := range []*types.Type{types.Types[types.TINT], pointerType} {
+				arg := call.Args[i+1]
+				if arg.Op() != ir.ONEW || !types.Identical(arg.Type(), types.NewPtr(typ)) {
+					t.Errorf("result %d destination = %v, want new(%v)", i, arg, typ)
+				}
+			}
+		})
+	}
+	if calls != 1 {
+		t.Fatalf("child factory calls = %d, want one spawn", calls)
 	}
 }
 

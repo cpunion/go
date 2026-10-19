@@ -4085,13 +4085,26 @@ wrapper using the existing call-site `NoInline` bit. Other calls to the same
 plain entry may still inline. Race and other instrumented builds skip this
 preparation along with native lowering.
 
-The target must still satisfy the existing factory restrictions. Dynamic
-function values, arbitrary source closures, unsupported signatures and returned
-values retain the ordinary Go path. A statically known native target may panic;
+The target must still satisfy the existing factory restrictions. A statically
+named coroutine-capable target may return values even though a go statement
+discards them. Each spawn supplies a new typed result destination for every
+result through the existing factory ABI. These destinations belong to that
+child, remain GC-visible after the creator returns, and are not shared by
+successive loop iterations. Awaited calls keep their existing result-target
+handling. This deliberately adds per-result storage rather than changing the
+factory ABI or making result pointers nullable; result elision is a separate
+optimization. Plain adapters still require no results.
+
+Dynamic function values, arbitrary source closures, unsupported signatures and
+plain targets with returned values retain the ordinary Go path.
+A statically known native target may panic;
 its independent task owns cleanup and the terminal outcome as described above.
 This does not implement general closure or dynamic-call lowering. Tests require
-actual frame spawning rather than accepting a successful ordinary fallback,
-and separately require fallback for dynamic and value-returning targets.
+actual closure and frame spawning rather than accepting a successful ordinary
+fallback, and separately require fallback for dynamic and plain value-returning
+targets. Discarded-result tests cover a creator returning before its 128 children,
+GC-sensitive pointer results, methods, named-result defer, Goexit, argument
+panics and independent child panics, with and without inlining and with checkptr.
 
 ### 16.9 Typed frames for foreign-only functions
 
