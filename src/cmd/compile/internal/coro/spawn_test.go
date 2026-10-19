@@ -152,4 +152,18 @@ func TestPlainSpawnFactoryUnsupported(t *testing.T) {
 	if plainSpawnFactorySupported(&Function{Func: returning}) {
 		t.Fatal("discarded-result spawn target supports a plain factory")
 	}
+	fn.Body = ir.Nodes{newLowerTestReturn()}
+	if plainSpawnFactorySupported(&Function{Func: fn, Edges: []Edge{{Kind: DirectCall}}}) {
+		t.Fatal("ordinary helper call admitted without an execution bound")
+	}
+	for _, stmt := range []ir.Node{
+		ir.NewForStmt(src.NoXPos, nil, nil, nil, nil, false),
+		ir.NewRangeStmt(src.NoXPos, nil, nil, nil, nil, false),
+		ir.NewBranchStmt(src.NoXPos, ir.OGOTO, pkg.Lookup("again")),
+	} {
+		fn.Body = ir.Nodes{stmt}
+		if plainSpawnFactorySupported(&Function{Func: fn}) {
+			t.Fatalf("unbounded plain target supports a factory: %v", stmt.Op())
+		}
+	}
 }

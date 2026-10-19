@@ -11,13 +11,24 @@ import (
 )
 
 // plainSpawnFactorySupported admits a static go target that can finish on the
-// executor without yielding or requiring terminal-control rewriting. Its
-// ordinary entry remains unchanged, including its inline body.
+// executor without yielding or requiring terminal-control rewriting. Until
+// execution summaries describe bounded plain calls, reject calls and loops.
+// The ordinary entry remains unchanged, including its inline body.
 func plainSpawnFactorySupported(function *Function) bool {
-	return function != nil && function.Primary == PlainPrimary &&
+	if !(function != nil && function.Primary == PlainPrimary &&
 		function.Effect == NoSuspend && function.Exec == 0 &&
 		function.Terminal == 0 && resumeFactorySupported(function.Func) &&
-		function.Func.Type().NumResults() == 0 && len(function.Func.Body) != 0
+		function.Func.Type().NumResults() == 0 && len(function.Func.Body) != 0 &&
+		len(function.Edges) == 0) {
+		return false
+	}
+	return !ir.Any(function.Func, func(node ir.Node) bool {
+		switch node.Op() {
+		case ir.OFOR, ir.ORANGE, ir.OGOTO:
+			return true
+		}
+		return false
+	})
 }
 
 // newPlainSpawnFactory adapts an ordinary entry to the existing closure factory
@@ -40,7 +51,7 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 	ir.WithFunc(resume, func() {
 		// Reuse the frontend's static callee representation, including a
 		// method expression's explicit receiver and a variadic slice.
-		call := typecheck.Call(pos, ir.Copy(callee), args, fn.Type().IsVariadic())
+		call := typecheck.Call(pos, ir.DeepCopy(pos, callee), args, fn.Type().IsVariadic())
 		action := typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
 		query := typecheck.Call(pos, typecheck.LookupRuntime("coroTerminalAction"),
 			ir.Nodes{resume.Dcl[0]}, false)

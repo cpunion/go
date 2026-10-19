@@ -4077,7 +4077,9 @@ Factories are generated only for targets demanded by local spawn candidates,
 not for every exported plain function. An importing package may use an exported
 adapter through the existing factory summary, but an imported target without
 one still forces ordinary fallback. This does not prove arbitrary ordinary
-helper stack bounds or admit assembly-only declarations.
+helper stack bounds or admit assembly-only declarations. Until execution
+summaries can prove bounded plain calls, adapters reject source calls, loops,
+and goto statements; those targets retain ordinary spawning and host preemption.
 
 The target must still satisfy the existing factory restrictions. Dynamic
 function values, arbitrary source closures, unsupported signatures and returned

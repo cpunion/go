@@ -27,9 +27,7 @@ func TestPlainSpawn(t *testing.T) {
 type Box struct { Value int }
 
 func Leaf(p *Box, out *int, done chan struct{}, values ...int) {
- sum := p.Value
- for _, value := range values { sum += value }
- *out = sum
+ *out = p.Value + values[0] + values[1]
  close(done)
 }
 
