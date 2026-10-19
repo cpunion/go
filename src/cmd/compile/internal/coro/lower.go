@@ -883,9 +883,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if edge.Callee == nil {
 				return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
 			}
-			if edge.Callee.Type().NumResults() != 0 {
-				return nil, fmt.Errorf("spawn target returns values")
-			}
 			if _, known := plan.edgeSummary(edge); !known {
 				return nil, fmt.Errorf("unknown spawn target")
 			}
@@ -3214,13 +3211,25 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		for _, arg := range sourceCall.Args {
 			args = append(args, edit(arg))
 		}
-		targets, err := callResultTargets(sourceCall, statement,
+		resultStatement := statement
+		if edge.Kind == GoCall {
+			resultStatement = sourceCall
+		}
+		targets, err := callResultTargets(sourceCall, resultStatement,
 			edge.Callee.Type().NumResults())
 		if err != nil {
 			return lowerFactoryCall{}, fmt.Errorf("%s: %v",
 				ir.PkgFuncName(fn), err)
 		}
 		for i, target := range targets {
+			if edge.Kind == GoCall {
+				// The child may outlive this invocation. Allocate a separate
+				// typed destination on each spawn, not a captured parent local
+				// that later iterations could reuse for concurrent children.
+				args = append(args, typedNew(call.Pos(),
+					edge.Callee.Type().Result(i).Type))
+				continue
+			}
 			if target == nil {
 				temp := typecheck.TempAt(call.Pos(), factory,
 					edge.Callee.Type().Result(i).Type)

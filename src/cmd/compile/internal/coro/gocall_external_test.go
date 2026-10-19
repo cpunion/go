@@ -145,7 +145,6 @@ var dynamic func(int)
 var next int
 func argument() int { next++; return next }
 func worker(value int) { runtime.Gosched(); done <- value }
-func returning(value int) int { worker(value); return value }
 func spawn() { GO_CALL }
 func main() {
 	dynamic = worker
@@ -156,7 +155,6 @@ func main() {
 `
 	for _, test := range []struct{ name, call string }{
 		{"dynamic", "go dynamic(argument())"},
-		{"discarded-result", "go returning(argument())"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()

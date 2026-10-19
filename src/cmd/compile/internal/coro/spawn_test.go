@@ -149,6 +149,9 @@ func TestPlainSpawnFactoryUnsupported(t *testing.T) {
 	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
 	returning := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("returning"),
 		types.NewSignature(nil, nil, []*types.Field{result}))
+	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{typedInt(src.NoXPos, types.Types[types.TINT], 1)})
+	ret.SetTypecheck(1)
+	returning.Body = ir.Nodes{ret}
 	if plainSpawnFactorySupported(&Function{Func: returning}) {
 		t.Fatal("discarded-result spawn target supports a plain factory")
 	}
