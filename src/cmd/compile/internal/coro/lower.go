@@ -201,23 +201,24 @@ type lowerIO struct {
 }
 
 type lowerState struct {
+	body       []ir.Node
+	transition SiteKind
+	call       *ir.CallExpr
+	channel    *lowerChannel
+	selection  *lowerSelect
+	io         *lowerIO
+	wait       *lowerWait
+	statement  ir.Node
+	next       int
+	condition  ir.Node
+	thenState  int
+	elseState  int
+	cleanup    bool
+	terminal   uint8
+	panicValue ir.Node
+
 	switchStmt   *ir.SwitchStmt
 	switchStates []int
-	body         []ir.Node
-	transition   SiteKind
-	call         *ir.CallExpr
-	channel      *lowerChannel
-	selection    *lowerSelect
-	io           *lowerIO
-	wait         *lowerWait
-	statement    ir.Node
-	next         int
-	condition    ir.Node
-	thenState    int
-	elseState    int
-	cleanup      bool
-	terminal     uint8
-	panicValue   ir.Node
 }
 
 // lowerWait retains semaphore or notification arguments and state across retries.

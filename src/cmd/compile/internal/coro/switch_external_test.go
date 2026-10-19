@@ -76,6 +76,13 @@ func looping() int {
 var cleanups int
 func record(n int) { cleanups = cleanups*10 + n }
 
+var gcRequest = make(chan struct{})
+var gcDone = make(chan struct{})
+func collectGC() {
+	for range gcRequest { runtime.GC(); gcDone <- struct{}{} }
+	close(gcDone)
+}
+
 //go:noinline
 func deferred(x int) {
 	for i := 1; i <= 3; i++ {
@@ -96,7 +103,8 @@ func pointerCase(x int) *int {
 		v := new(int)
 		*v = 73
 		runtime.Gosched()
-		runtime.GC()
+		gcRequest <- struct{}{}
+		<-gcDone
 		return v
 	default:
 		runtime.Gosched()
@@ -157,6 +165,7 @@ func falling() int {
 }
 
 func main() {
+	go collectGC()
 	for _, test := range []struct { x, result int; trace string }{
 		{0, -1, "tabcd"}, {1, 10, "ta"}, {2, 10, "tab"},
 		{3, 30, "tabc"}, {4, 40, "tabcd"},
@@ -169,6 +178,8 @@ func main() {
 	deferred(1)
 	if cleanups != 321 { panic("case cleanup order") }
 	if pointerCase(0) != nil || *pointerCase(1) != 73 { panic("case pointer lifetime") }
+	close(gcRequest)
+	<-gcDone
 	if interfaceCase("hello") != 1 || interfaceCase(42) != 2 || interfaceCase(false) != 3 { panic("interface dispatch") }
 	cleanups = 0
 	recoverComparison()
