@@ -450,6 +450,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
+	if hasTypeSwitch(fn.Body) {
+		return nil, fmt.Errorf("type switch")
+	}
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)

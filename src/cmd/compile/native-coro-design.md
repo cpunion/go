@@ -1352,6 +1352,10 @@ Unlabeled break targets the end of the switch; continue still targets the
 enclosing loop. Type-switch case-variable ownership, fallthrough and labeled
 control are not admitted by this slice. A foreign-call function with split
 cases uses the general state machine, not the run-to-completion shortcut.
+Type switches anywhere in a candidate body, including copied or inlined
+expressions, retain the ordinary path. Their implicit case variable must remain
+a name until the ordinary walker initializes it; frame rewriting cannot replace
+that declaration with a field selector. Closure bodies remain independent.
 
 The first channel slice lowers ordinary sends, discarded or single-value
 receives, and comma-ok receives with simple variable targets. It preserves the

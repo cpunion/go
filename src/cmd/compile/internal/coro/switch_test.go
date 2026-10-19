@@ -125,3 +125,45 @@ func TestExpressionSwitchContinue(t *testing.T) {
 		t.Fatal("switch continue lost its enclosing loop target")
 	}
 }
+
+func TestExpressionSwitchTypeBoundary(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/switchtype", "switchtype")
+	sig := types.NewSignature(nil, nil, nil)
+	for _, name := range []string{"direct", "nested", "inlined", "closure"} {
+		t.Run(name, func(t *testing.T) {
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(name), sig)
+			guard := ir.NewTypeSwitchGuard(src.NoXPos, nil, ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
+			stmt := ir.NewSwitchStmt(src.NoXPos, guard, []*ir.CaseClause{ir.NewCaseStmt(src.NoXPos, nil, nil)})
+			var body ir.Node = stmt
+			switch name {
+			case "nested":
+				body = ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{ir.NewCaseStmt(src.NoXPos, nil, ir.Nodes{stmt})})
+			case "inlined":
+				body = ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{stmt}, nil)
+			case "closure":
+				oldTarget := typecheck.Target
+				typecheck.Target = new(ir.Package)
+				defer func() { typecheck.Target = oldTarget }()
+				closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE, sig, fn, typecheck.Target, 0)
+				closure.Body = ir.Nodes{stmt}
+				body = ir.NewAssignStmt(src.NoXPos, ir.BlankNode, closure.OClosure)
+			}
+			yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"), sig)
+			call := newLowerTestCall(yield)
+			fn.Body = ir.Nodes{call, body}
+			if got, want := hasTypeSwitch(fn.Body), name != "closure"; got != want {
+				t.Fatalf("hasTypeSwitch = %v, want %v", got, want)
+			}
+			_, err := newLowerCandidate(&Plan{}, &Function{Func: fn, Primary: CoroPrimary,
+				Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}}})
+			if name == "closure" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "type switch") {
+				t.Fatalf("error = %v, want type switch boundary", err)
+			}
+		})
+	}
+}

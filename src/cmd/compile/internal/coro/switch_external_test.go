@@ -164,6 +164,29 @@ func falling() int {
 	}
 }
 
+//go:noinline
+func nestedType(v any) int {
+	runtime.Gosched()
+	n := 0
+	switch 1 {
+	case 1:
+		switch x := v.(type) {
+		case int: n = x
+		case string: n = len(x)
+		}
+		runtime.Gosched()
+		return n
+	}
+	return -1
+}
+
+func inlineType(v any) int {
+	switch x := v.(type) { case int: return x; default: return 5 }
+}
+
+//go:noinline
+func inlineNestedType(v any) int { runtime.Gosched(); return inlineType(v) }
+
 func main() {
 	go collectGC()
 	for _, test := range []struct { x, result int; trace string }{
@@ -185,6 +208,8 @@ func main() {
 	recoverComparison()
 	if cleanups != 4 { panic("comparison panic cleanup") }
 	if suspendingTag() != 1 || suspendingCase() != 1 || falling() != 5 { panic("ordinary fallback") }
+	if nestedType(42) != 42 || nestedType("hello") != 5 { panic("nested type switch fallback") }
+	if inlineNestedType(42) != 42 || inlineNestedType("hello") != 5 { panic("inlined type switch fallback") }
 	println("switch-return-ok")
 }
 `
@@ -193,6 +218,7 @@ func main() {
 			{"suspendingTag", "coroutine site in switch header"},
 			{"suspendingCase", "coroutine site in switch header"},
 			{"falling", "control flow fallthrough"},
+			{"nestedType", "type switch"},
 		},
 		[]string{"dispatch", "initialized", "looping", "deferred", "pointerCase", "interfaceCase", "comparisonPanic"})
 }

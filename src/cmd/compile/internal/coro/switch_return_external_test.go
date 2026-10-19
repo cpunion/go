@@ -108,7 +108,7 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"switchType", "return in unsupported control flow switch"}},
+		[]switchFallback{{"switchType", "type switch"}},
 		[]string{"switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchAssignment", "switchClosure", "switchBreak"})
 }
 

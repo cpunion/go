@@ -6,13 +6,24 @@ package coro
 
 import "cmd/compile/internal/ir"
 
-// expressionSwitchNeedsLowering leaves ordinary switches intact unless a case
-// needs continuation control. Type switches still require case-variable
-// ownership before their bodies can be moved out of the dispatch.
-func expressionSwitchNeedsLowering(stmt *ir.SwitchStmt, sites map[ir.Node]bool) bool {
-	if stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW {
-		return false
+// hasTypeSwitch also finds type switches inside copied or inlined expressions.
+// CaseClause.Var must remain a Name until walk initializes the selected case.
+// Explicit frame rewriting cannot replace it with a field selector.
+func hasTypeSwitch(body ir.Nodes) bool {
+	for _, stmt := range body {
+		if ir.Any(stmt, func(node ir.Node) bool {
+			stmt, ok := node.(*ir.SwitchStmt)
+			return ok && stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW
+		}) {
+			return true
+		}
 	}
+	return false
+}
+
+// expressionSwitchNeedsLowering leaves ordinary expression switches intact
+// unless a case needs continuation control.
+func expressionSwitchNeedsLowering(stmt *ir.SwitchStmt, sites map[ir.Node]bool) bool {
 	for _, clause := range stmt.Cases {
 		for _, body := range clause.Body {
 			if ir.Any(body, func(node ir.Node) bool {

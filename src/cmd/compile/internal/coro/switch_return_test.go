@@ -96,7 +96,7 @@ func TestSwitchReturnBoundary(t *testing.T) {
 			fn.Body = append(fn.Body, stmt, newLowerTestReturn())
 			candidate, err := newLowerCandidate(&Plan{}, function)
 			if test.wantError {
-				if err == nil || !strings.Contains(err.Error(), "return in unsupported control flow switch") {
+				if err == nil || !strings.Contains(err.Error(), "type switch") {
 					t.Fatalf("candidate error = %v, want switch return boundary", err)
 				}
 				return
