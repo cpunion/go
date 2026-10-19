@@ -108,8 +108,8 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]string{"switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchType"},
-		[]string{"switchAssignment", "switchClosure", "switchBreak"})
+		[]switchFallback{{"switchType", "return in unsupported control flow switch"}},
+		[]string{"switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchAssignment", "switchClosure", "switchBreak"})
 }
 
 func TestSwitchReturnCgo(t *testing.T) {
@@ -139,10 +139,12 @@ func main() {
 	println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source, []string{"directSwitch"}, []string{"directIf"})
+	testSwitchReturnProgram(t, source, nil, []string{"directSwitch", "directIf"})
 }
 
-func testSwitchReturnProgram(t *testing.T, source string, fallback, lowered []string) {
+type switchFallback struct{ name, reason string }
+
+func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallback, lowered []string) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
 	if !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64" ||
@@ -159,12 +161,18 @@ func testSwitchReturnProgram(t *testing.T, source string, fallback, lowered []st
 	}{
 		{"coro/inline", "coro", "-d=coro=4", false},
 		{"coro/noinline", "coro", "-l -d=coro=4", true},
+		{"coro/checkptr", "coro", "-l -d=coro=4 -d=checkptr=2", true},
 		{"nocoro/inline", "nocoro", "", false},
 		{"nocoro/noinline", "nocoro", "-l", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			exe := filepath.Join(t.TempDir(), "switchreturn.exe")
-			cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-gcflags="+test.flags, "-o", exe, file)
+			args := []string{"build"}
+			if test.name == "coro/checkptr" {
+				args = append(args, "-gcflags=all=-d=checkptr=2")
+			}
+			args = append(args, "-gcflags="+test.flags, "-o", exe, file)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), args...)
 			cmd.Env = append(cmd.Environ(), "GOEXPERIMENT="+test.experiment, "GOWORK=off")
 			data, err := cmd.CombinedOutput()
 			if err != nil {
@@ -172,8 +180,8 @@ func testSwitchReturnProgram(t *testing.T, source string, fallback, lowered []st
 			}
 			buildOutput := string(data)
 			if test.checkLowering {
-				for _, name := range fallback {
-					want := "coro: skip main." + name + ": return in unsupported control flow switch"
+				for _, entry := range fallback {
+					want := "coro: skip main." + entry.name + ": " + entry.reason
 					if !strings.Contains(string(data), want) {
 						t.Errorf("missing diagnostic %q\n%s", want, data)
 					}
@@ -194,9 +202,9 @@ func testSwitchReturnProgram(t *testing.T, source string, fallback, lowered []st
 			if err != nil {
 				t.Fatalf("nm failed: %v\n%s", err, data)
 			}
-			for _, name := range fallback {
-				if strings.Contains(string(data), "main."+name+".coro") {
-					t.Errorf("unsupported return has a coroutine factory: %s", name)
+			for _, entry := range fallback {
+				if strings.Contains(string(data), "main."+entry.name+".coro") {
+					t.Errorf("unsupported switch has a coroutine factory: %s", entry.name)
 				}
 			}
 			for _, name := range lowered {

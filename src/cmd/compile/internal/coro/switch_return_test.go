@@ -24,12 +24,14 @@ func TestSwitchReturnBoundary(t *testing.T) {
 		localBreak               bool
 		localGoto                bool
 		inlined                  bool
+		typeSwitch               bool
 		wantError                bool
 	}{
-		{name: "yield-return", yield: true, escaping: true, wantError: true},
-		{name: "foreign-return", foreign: true, escaping: true, wantError: true},
+		{name: "yield-return", yield: true, escaping: true},
+		{name: "foreign-return", foreign: true, escaping: true},
 		{name: "foreign-if-return", foreign: true, escaping: true, structured: true},
-		{name: "foreign-yield-return", foreign: true, yield: true, escaping: true, wantError: true},
+		{name: "foreign-yield-return", foreign: true, yield: true, escaping: true},
+		{name: "type-return", yield: true, escaping: true, typeSwitch: true, wantError: true},
 		{name: "yield-assignment", yield: true},
 		{name: "yield-closure", yield: true, closure: true},
 		{name: "yield-local-break", yield: true, localBreak: true},
@@ -81,6 +83,10 @@ func TestSwitchReturnBoundary(t *testing.T) {
 			}
 			clause := ir.NewCaseStmt(src.NoXPos, nil, body)
 			var stmt ir.Node = ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})
+			if test.typeSwitch {
+				stmt.(*ir.SwitchStmt).Tag = ir.NewTypeSwitchGuard(src.NoXPos, nil,
+					ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER]))
+			}
 			if test.inlined {
 				stmt = ir.NewInlinedCallExpr(src.NoXPos, body, nil)
 			}
@@ -98,8 +104,8 @@ func TestSwitchReturnBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if test.foreign && !canLowerRunToCompletion(candidate) {
-				t.Fatal("foreign structured return lost its run-to-completion entry")
+			if test.foreign && canLowerRunToCompletion(candidate) != (len(candidate.switches) == 0) {
+				t.Fatal("split switch used the structured run-to-completion path")
 			}
 		})
 	}

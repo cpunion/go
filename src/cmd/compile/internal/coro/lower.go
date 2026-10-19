@@ -95,6 +95,7 @@ type lowerCandidate struct {
 	dynamicDefers    bool
 	channels         map[ir.Node]*lowerChannel
 	selects          map[*ir.SelectStmt]*lowerSelect
+	switches         map[*ir.SwitchStmt]bool
 	branches         map[*ir.BranchStmt]ir.Node
 	rangeVars        []*ir.Name
 	panics           map[*ir.UnaryExpr]bool
@@ -200,21 +201,23 @@ type lowerIO struct {
 }
 
 type lowerState struct {
-	body       []ir.Node
-	transition SiteKind
-	call       *ir.CallExpr
-	channel    *lowerChannel
-	selection  *lowerSelect
-	io         *lowerIO
-	wait       *lowerWait
-	statement  ir.Node
-	next       int
-	condition  ir.Node
-	thenState  int
-	elseState  int
-	cleanup    bool
-	terminal   uint8
-	panicValue ir.Node
+	switchStmt   *ir.SwitchStmt
+	switchStates []int
+	body         []ir.Node
+	transition   SiteKind
+	call         *ir.CallExpr
+	channel      *lowerChannel
+	selection    *lowerSelect
+	io           *lowerIO
+	wait         *lowerWait
+	statement    ir.Node
+	next         int
+	condition    ir.Node
+	thenState    int
+	elseState    int
+	cleanup      bool
+	terminal     uint8
+	panicValue   ir.Node
 }
 
 // lowerWait retains semaphore or notification arguments and state across retries.
@@ -452,6 +455,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	channelStatements := make(map[ir.Node]ir.Node)
 	channelContainers := make(map[ir.Node]ir.Node)
 	selects := make(map[*ir.SelectStmt]*lowerSelect)
+	switches := make(map[*ir.SwitchStmt]bool)
+	siteNodes := make(map[ir.Node]bool, len(function.Sites))
+	for _, site := range function.Sites {
+		siteNodes[site.Node] = true
+	}
 	selectOperations := make(map[ir.Node]*ir.SelectStmt)
 	branches := make(map[*ir.BranchStmt]ir.Node)
 	var breakTarget, continueTarget ir.Node
@@ -486,6 +494,24 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				if err := collectStatements(init, inLoop); err != nil {
 					return err
 				}
+			}
+			if stmt, ok := stmt.(*ir.SwitchStmt); ok && expressionSwitchNeedsLowering(stmt, siteNodes) {
+				if stmt.Label != nil {
+					return fmt.Errorf("labeled switch")
+				}
+				if switchHeaderHasSite(stmt, siteNodes) {
+					return fmt.Errorf("coroutine site in switch header")
+				}
+				switches[stmt] = true
+				oldBreak := breakTarget
+				breakTarget = stmt
+				for _, clause := range stmt.Cases {
+					if err := collectStatements(clause.Body, inLoop); err != nil {
+						return err
+					}
+				}
+				breakTarget = oldBreak
+				continue
 			}
 			// Calls returning multiple results inside an expression are
 			// normalized into assignments attached to that expression's
@@ -774,6 +800,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		dynamicDefers: dynamicDefers,
 		channels:      make(map[ir.Node]*lowerChannel),
 		selects:       selects,
+		switches:      switches,
 		branches:      branches,
 		rangeVars:     rangeVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
@@ -1716,7 +1743,8 @@ func plainDeferEntrySupported(plan *Plan, function *Function) bool {
 // loop iteration.
 func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 	if candidate.function.Effect != NoSuspend || len(candidate.defers) != 0 ||
-		candidate.function.Terminal != 0 || len(candidate.foreignCalls) == 0 {
+		candidate.function.Terminal != 0 || len(candidate.foreignCalls) == 0 ||
+		len(candidate.switches) != 0 {
 		return false
 	}
 	for _, site := range candidate.function.Sites {
@@ -2728,6 +2756,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return required
 	}
 	isBoundary := func(stmt ir.Node) bool {
+		if stmt, ok := stmt.(*ir.SwitchStmt); ok && candidate.switches[stmt] {
+			return true
+		}
 		if stmt.Op() == ir.OPANIC {
 			return true
 		}
@@ -2789,6 +2820,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	lowerStatement = func(stmt ir.Node, next int) int {
 		switch stmt := stmt.(type) {
+		case *ir.SwitchStmt:
+			breakStates[stmt] = next
+			entries := make([]int, len(stmt.Cases))
+			for i, clause := range stmt.Cases {
+				entries[i] = lowerStatements(clause.Body, next)
+			}
+			entry := addState(lowerState{
+				switchStmt: stmt, switchStates: entries,
+				next: next, thenState: -1, elseState: -1,
+			})
+			return lowerStatements(stmt.Init(), entry)
+
 		case *ir.BranchStmt:
 			target := candidate.branches[stmt]
 			state, ok := breakStates[target]
@@ -4107,6 +4150,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			body = append(body, ir.NewReturnStmt(pos,
 				[]ir.Node{actionResult}))
+		} else if state.switchStmt != nil {
+			// Let the ordinary switch lowering evaluate the tag and cases.
+			// Only selected bodies move into continuation states, so resuming
+			// a case never repeats the dispatch or earlier case expressions.
+			dispatch := ir.Copy(state.switchStmt).(*ir.SwitchStmt)
+			dispatch.SetInit(nil)
+			dispatch.SetTypecheck(0)
+			for j, clause := range dispatch.Cases {
+				clause = ir.Copy(clause).(*ir.CaseClause)
+				clause.SetTypecheck(0)
+				clause.Body = ir.Nodes{gotoState(state.switchStates[j])}
+				dispatch.Cases[j] = clause
+			}
+			body = append(body, edit(dispatch), gotoState(state.next))
 		} else if state.thenState >= 0 {
 			thenPC := gotoState(state.thenState)
 			if state.condition == nil {

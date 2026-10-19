@@ -1341,6 +1341,18 @@ labels. A switch also retains its own unlabeled breaks. Returns,
 defers, suspensions and branches escaping that statement still require separate
 lowering or conservative fallback.
 
+Expression switches whose cases need continuation control retain the ordinary
+Go switch dispatch, including tag and case evaluation order and interface
+comparison metadata. Each selected body instead jumps to its continuation;
+resuming after suspension does not evaluate the dispatch again. The switch's
+initializer uses the existing statement lowering, while suspension in the tag
+or case expressions retains ordinary fallback. Case-local returns and defers
+use the same result publication and cleanup as other structured statements.
+Unlabeled break targets the end of the switch; continue still targets the
+enclosing loop. Type-switch case-variable ownership, fallthrough and labeled
+control are not admitted by this slice. A foreign-call function with split
+cases uses the general state machine, not the run-to-completion shortcut.
+
 The first channel slice lowers ordinary sends, discarded or single-value
 receives, and comma-ok receives with simple variable targets. It preserves the
 frontend's normalized temporary assignments, including blank results and

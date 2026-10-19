@@ -296,7 +296,7 @@ func main() {
 				t.Fatalf("build failed: %v\n%s", err, data)
 			}
 			if test.checkLowering {
-				for _, function := range []string{"labeledLoop", "gotoLoop", "switchContinue"} {
+				for _, function := range []string{"labeledLoop", "gotoLoop"} {
 					if !strings.Contains(string(data), "coro: skip main."+function+":") {
 						t.Errorf("missing ordinary-entry fallback for %s\n%s", function, data)
 					}
@@ -315,7 +315,7 @@ func main() {
 			for _, function := range []string{
 				"nestedLoops", "advance", "loopPost", "selectBranches",
 				"defaultBranches", "rangeBranches", "deferredLoop", "terminalLoop",
-				"returnLoop", "exitLoop",
+				"returnLoop", "exitLoop", "switchContinue",
 			} {
 				if test.experiment == "coro" && !test.checkLowering {
 					continue
@@ -325,7 +325,7 @@ func main() {
 					t.Errorf("%s has coroutine factory = %v, want %v", function, got, want)
 				}
 			}
-			for _, function := range []string{"labeledLoop", "gotoLoop", "switchContinue"} {
+			for _, function := range []string{"labeledLoop", "gotoLoop"} {
 				if strings.Contains(string(data), "main."+function+".coro") {
 					t.Errorf("unsupported control flow has a coroutine factory: %s", function)
 				}
