@@ -450,14 +450,25 @@ func TestPingPongHog(t *testing.T) {
 	done := make(chan bool)
 	hogChan, lightChan := make(chan bool), make(chan bool)
 	hogCount, lightCount := 0, 0
+	ready := make(chan struct{}, 2)
+	start := make(chan struct{})
+	hogStarted, lightStarted := false, false
 
-	run := func(limit int, counter *int, wake chan bool) {
+	run := func(limit int, counter *int, wake chan bool, started *bool) {
 		for {
 			select {
 			case <-done:
 				return
 
 			case <-wake:
+				// Park each pair's first recipient until both initial
+				// tokens have been received. The wake handoff orders
+				// accesses to started just like accesses to counter.
+				if !*started {
+					*started = true
+					ready <- struct{}{}
+					<-start
+				}
 				for i := 0; i < limit; i++ {
 					*counter++
 				}
@@ -468,18 +479,25 @@ func TestPingPongHog(t *testing.T) {
 
 	// Start two co-scheduled hog goroutines.
 	for i := 0; i < 2; i++ {
-		go run(1e6, &hogCount, hogChan)
+		go run(1e6, &hogCount, hogChan, &hogStarted)
 	}
 
 	// Start two co-scheduled light goroutines.
 	for i := 0; i < 2; i++ {
-		go run(1e3, &lightCount, lightChan)
+		go run(1e3, &lightCount, lightChan, &lightStarted)
 	}
 
-	// Start goroutine pairs and wait for a few preemption rounds.
+	// Seed both pairs before measuring. Otherwise the first pair can
+	// accumulate work while the second is still being started.
 	hogChan <- true
 	lightChan <- true
-	time.Sleep(100 * time.Millisecond)
+	<-ready
+	<-ready
+	// Cover many preemption rounds so a short scheduling delay on a busy
+	// builder does not dominate the measured share of the P.
+	timer := time.NewTimer(time.Second)
+	close(start)
+	<-timer.C
 	close(done)
 	<-hogChan
 	<-lightChan
