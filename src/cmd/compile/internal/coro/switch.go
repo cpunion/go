@@ -6,14 +6,14 @@ package coro
 
 import "cmd/compile/internal/ir"
 
-// hasTypeSwitch also finds type switches inside copied or inlined expressions.
-// CaseClause.Var must remain a Name until walk initializes the selected case.
-// Explicit frame rewriting cannot replace it with a field selector.
-func hasTypeSwitch(body ir.Nodes) bool {
+// hasUnplannedTypeSwitch also finds type switches inside copied or inlined
+// expressions. Only switches with a planned dispatch can replace CaseClause.Var
+// with a resume-local temporary before explicit frame rewriting.
+func hasUnplannedTypeSwitch(body ir.Nodes, planned map[*ir.SwitchStmt]bool) bool {
 	for _, stmt := range body {
 		if ir.Any(stmt, func(node ir.Node) bool {
 			stmt, ok := node.(*ir.SwitchStmt)
-			return ok && stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW
+			return ok && stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW && !planned[stmt]
 		}) {
 			return true
 		}
@@ -21,14 +21,53 @@ func hasTypeSwitch(body ir.Nodes) bool {
 	return false
 }
 
-// expressionSwitchNeedsLowering leaves ordinary expression switches intact
-// unless a case needs continuation control.
-func expressionSwitchNeedsLowering(stmt *ir.SwitchStmt, sites map[ir.Node]bool) bool {
+// Ordinary closure captures still use factory-owned storage. They cannot
+// preserve a distinct mutable case variable on each selection. Source defer
+// literals have separate snapshot/cell lowering that does preserve that scope.
+func typeSwitchHasOrdinaryClosureCapture(fn *ir.Func, planned map[*ir.SwitchStmt]bool, defers []*lowerDefer) bool {
+	variables := make(map[*ir.Name]bool)
+	for stmt := range planned {
+		for _, clause := range stmt.Cases {
+			if clause.Var != nil {
+				variables[clause.Var.Canonical()] = true
+			}
+		}
+	}
+	if len(variables) == 0 {
+		return false
+	}
+	deferred := make(map[*ir.Func]bool)
+	for _, entry := range defers {
+		if closure, ok := entry.call.Fun.(*ir.ClosureExpr); ok {
+			deferred[closure.Func] = true
+		}
+	}
+	return ir.Any(fn, func(node ir.Node) bool {
+		closure, ok := node.(*ir.ClosureExpr)
+		if !ok || deferred[closure.Func] {
+			return false
+		}
+		for _, variable := range closure.Func.ClosureVars {
+			if variables[variable.Canonical()] {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// Type switches need a planned dispatch to preserve their implicit case names.
+// Ordinary expression switches stay intact unless a case needs continuation
+// control or contains a type switch that itself needs a planned dispatch.
+func switchNeedsLowering(stmt *ir.SwitchStmt, sites map[ir.Node]bool) bool {
+	if stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW {
+		return true
+	}
 	for _, clause := range stmt.Cases {
 		for _, body := range clause.Body {
 			if ir.Any(body, func(node ir.Node) bool {
 				return sites[node] || node.Op() == ir.ORETURN ||
-					node.Op() == ir.ODEFER || node.Op() == ir.OCONTINUE
+					node.Op() == ir.ODEFER || node.Op() == ir.OCONTINUE || node.Op() == ir.OTYPESW
 			}) {
 				return true
 			}

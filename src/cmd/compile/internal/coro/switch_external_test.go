@@ -208,7 +208,7 @@ func main() {
 	recoverComparison()
 	if cleanups != 4 { panic("comparison panic cleanup") }
 	if suspendingTag() != 1 || suspendingCase() != 1 || falling() != 5 { panic("ordinary fallback") }
-	if nestedType(42) != 42 || nestedType("hello") != 5 { panic("nested type switch fallback") }
+	if nestedType(42) != 42 || nestedType("hello") != 5 { panic("nested type switch") }
 	if inlineNestedType(42) != 42 || inlineNestedType("hello") != 5 { panic("inlined type switch fallback") }
 	println("switch-return-ok")
 }
@@ -218,7 +218,6 @@ func main() {
 			{"suspendingTag", "coroutine site in switch header"},
 			{"suspendingCase", "coroutine site in switch header"},
 			{"falling", "control flow fallthrough"},
-			{"nestedType", "type switch"},
 		},
-		[]string{"dispatch", "initialized", "looping", "deferred", "pointerCase", "interfaceCase", "comparisonPanic"})
+		[]string{"nestedType", "dispatch", "initialized", "looping", "deferred", "pointerCase", "interfaceCase", "comparisonPanic"})
 }

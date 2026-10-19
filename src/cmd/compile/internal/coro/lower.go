@@ -450,9 +450,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if len(function.Sites) == 0 {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
-	if hasTypeSwitch(fn.Body) {
-		return nil, fmt.Errorf("type switch")
-	}
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
 	awaitContainers := make(map[*ir.CallExpr]ir.Node)
@@ -499,7 +496,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return err
 				}
 			}
-			if stmt, ok := stmt.(*ir.SwitchStmt); ok && expressionSwitchNeedsLowering(stmt, siteNodes) {
+			if stmt, ok := stmt.(*ir.SwitchStmt); ok && switchNeedsLowering(stmt, siteNodes) {
 				if stmt.Label != nil {
 					return fmt.Errorf("labeled switch")
 				}
@@ -509,8 +506,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				switches[stmt] = true
 				oldBreak := breakTarget
 				breakTarget = stmt
+				// Type-case bindings use per-selection storage. Snapshot
+				// their defer captures even outside a source loop.
+				dynamicScope := inLoop || stmt.Tag != nil && stmt.Tag.Op() == ir.OTYPESW
 				for _, clause := range stmt.Cases {
-					if err := collectStatements(clause.Body, inLoop); err != nil {
+					if err := collectStatements(clause.Body, dynamicScope); err != nil {
 						return err
 					}
 				}
@@ -751,6 +751,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	if err := collectStatements(fn.Body, false); err != nil {
 		return nil, err
+	}
+	if hasUnplannedTypeSwitch(fn.Body, switches) {
+		return nil, fmt.Errorf("type switch in unsupported expression")
+	}
+	if typeSwitchHasOrdinaryClosureCapture(fn, switches, defers) {
+		return nil, fmt.Errorf("type switch variable captured by closure")
 	}
 	if len(rangeVars) != 0 {
 		rangeVariableSet := make(map[*ir.Name]bool, len(rangeVars))
@@ -2482,6 +2488,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	for _, variable := range candidate.rangeVars {
 		addCaptureCell(variable)
 	}
+	// Case declarations execute on every selection, including in the closure
+	// factory ABIs. Hoisting their addressable storage to the factory would
+	// make pointers from distinct selections alias each other.
+	for stmt := range candidate.switches {
+		for _, clause := range stmt.Cases {
+			if variable := clause.Var; variable != nil && variable.Addrtaken() {
+				addCaptureCell(variable)
+			}
+		}
+	}
 	if candidate.factoryABI == FactoryABI3 {
 		for _, variable := range fn.Dcl {
 			if variable.Addrtaken() &&
@@ -4165,6 +4181,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				clause = ir.Copy(clause).(*ir.CaseClause)
 				clause.SetTypecheck(0)
 				clause.Body = ir.Nodes{gotoState(state.switchStates[j])}
+				if variable := clause.Var; variable != nil {
+					// Walk initializes CaseClause.Var as a Name. Keep that
+					// binding local to this resume invocation, then save the
+					// selected value before entering its continuation. The
+					// source declaration also allocates a fresh capture cell
+					// on each selection when the case variable escapes.
+					temp := typecheck.TempAt(clause.Pos(), resume, variable.Type())
+					clause.Var = temp
+					clause.Body = append(ir.Nodes{
+						ir.NewDecl(clause.Pos(), ir.ODCL, variable),
+						ir.NewAssignStmt(clause.Pos(), variable, temp),
+					}, clause.Body...)
+				}
 				dispatch.Cases[j] = clause
 			}
 			body = append(body, edit(dispatch), gotoState(state.next))

@@ -9,7 +9,6 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
-	"strings"
 	"testing"
 )
 
@@ -25,13 +24,12 @@ func TestSwitchReturnBoundary(t *testing.T) {
 		localGoto                bool
 		inlined                  bool
 		typeSwitch               bool
-		wantError                bool
 	}{
 		{name: "yield-return", yield: true, escaping: true},
 		{name: "foreign-return", foreign: true, escaping: true},
 		{name: "foreign-if-return", foreign: true, escaping: true, structured: true},
 		{name: "foreign-yield-return", foreign: true, yield: true, escaping: true},
-		{name: "type-return", yield: true, escaping: true, typeSwitch: true, wantError: true},
+		{name: "type-return", yield: true, escaping: true, typeSwitch: true},
 		{name: "yield-assignment", yield: true},
 		{name: "yield-closure", yield: true, closure: true},
 		{name: "yield-local-break", yield: true, localBreak: true},
@@ -95,12 +93,6 @@ func TestSwitchReturnBoundary(t *testing.T) {
 			}
 			fn.Body = append(fn.Body, stmt, newLowerTestReturn())
 			candidate, err := newLowerCandidate(&Plan{}, function)
-			if test.wantError {
-				if err == nil || !strings.Contains(err.Error(), "type switch") {
-					t.Fatalf("candidate error = %v, want switch return boundary", err)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatal(err)
 			}
