@@ -43,6 +43,9 @@ func Spawn(p *Box, out *int, done chan struct{}, value int) {
 func SpawnMethod(b Box, out *int, done chan struct{}) {
  go b.Leaf(out, done)
 }
+
+// No local go statement demands a factory for this exported entry.
+func NoAdapter(out *int, done chan struct{}) { *out = 29; close(done) }
 `,
 		"main.go": `package main
 
@@ -64,6 +67,15 @@ func imported(p *helper.Box, out *int, done chan struct{}) {
 }
 
 func ordinary(p *helper.Box, out *int, done chan struct{}) { helper.Leaf(p, out, done, 1, 2) }
+
+func missing(out *int, done chan struct{}) { go helper.NoAdapter(out, done) }
+
+func loop(out *int, done chan struct{}) {
+ for i := 0; i < 10; i++ { *out += i }
+ close(done)
+}
+
+func unbounded(out *int, done chan struct{}) { go loop(out, done) }
 
 func main() {
  const count = 128
@@ -90,6 +102,14 @@ func main() {
  ordinary(&helper.Box{Value: 17}, &out, done)
  <-done
  if out != 20 { panic("ordinary entry changed") }
+ out, done = 0, make(chan struct{})
+ missing(&out, done)
+ <-done
+ if out != 29 { panic("missing adapter fallback") }
+ out, done = 0, make(chan struct{})
+ unbounded(&out, done)
+ <-done
+ if out != 45 { panic("loop target fallback") }
  if os.Getenv("PANIC") != "" {
   // Implicit nil dereference must terminate the child, not retry its body
   // indefinitely or become recoverable by the task creator.
@@ -160,6 +180,11 @@ func main() {
 			for _, name := range []string{"main.imported", "example.com/plainspawn/helper.Spawn", "example.com/plainspawn/helper.SpawnMethod", "example.com/plainspawn/helper.Leaf", "example.com/plainspawn/helper.Box.Leaf"} {
 				if got := strings.Contains(string(symbols), name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
+				}
+			}
+			for _, name := range []string{"main.missing", "main.unbounded", "main.loop", "example.com/plainspawn/helper.NoAdapter"} {
+				if strings.Contains(string(symbols), name+".coro") {
+					t.Errorf("unsupported target lost ordinary fallback: %s", name)
 				}
 			}
 			if native {
