@@ -166,6 +166,7 @@ func main() {
 			if err != nil {
 				t.Fatalf("build: %v\n%s", err, out)
 			}
+			t.Logf("compiler diagnostics:\n%s", out)
 			nm := testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe)
 			symbols, err := nm.CombinedOutput()
 			if err != nil {

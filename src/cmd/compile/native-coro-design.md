@@ -4080,6 +4080,10 @@ one still forces ordinary fallback. This does not prove arbitrary ordinary
 helper stack bounds or admit assembly-only declarations. Until execution
 summaries can prove bounded plain calls, adapters reject source calls, loops,
 and goto statements; those targets retain ordinary spawning and host preemption.
+Before inlining, preserve only the static target call inside its generated go
+wrapper using the existing call-site `NoInline` bit. Other calls to the same
+plain entry may still inline. Race and other instrumented builds skip this
+preparation along with native lowering.
 
 The target must still satisfy the existing factory restrictions. Dynamic
 function values, arbitrary source closures, unsupported signatures and returned

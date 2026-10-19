@@ -10,6 +10,28 @@ import (
 	"cmd/compile/internal/types"
 )
 
+// PreserveGoCalls keeps an eligible plain target visible inside the frontend's
+// go wrapper. Mark only that call: ordinary calls to the target may still inline.
+// This must run before inlining, and only when native lowering is enabled.
+func (p *Plan) PreserveGoCalls() {
+	for _, function := range p.Functions {
+		for _, edge := range function.Edges {
+			if edge.Kind != GoCall || unwrapGoCall(edge.Node) == edge.Node {
+				continue
+			}
+			child := p.Functions[edge.Callee]
+			summary, known := p.edgeSummary(edge)
+			if !plainSpawnFactorySupported(child) && !(known &&
+				summary.Primary() == PlainPrimary && summary.Effect == NoSuspend &&
+				summary.Exec == 0 && summary.Terminal == 0 && summary.Factory != NoFactory) {
+				continue
+			}
+			wrapper := edge.Node.Fun.(*ir.ClosureExpr).Func
+			wrapper.Body[0].(*ir.CallExpr).NoInline = true
+		}
+	}
+}
+
 // plainSpawnFactorySupported admits a static go target that can finish on the
 // executor without yielding or requiring terminal-control rewriting. Until
 // execution summaries describe bounded plain calls, reject calls and loops.

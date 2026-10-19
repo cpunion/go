@@ -114,6 +114,51 @@ func TestGoCallPlan(t *testing.T) {
 	}
 }
 
+func TestPreservePlainGoCall(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	for _, mode := range []string{"local", "imported", "missing-factory", "unsupported", "source-literal"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newGoCallFixture(t)
+			f.child.Body = ir.Nodes{newLowerTestReturn()}
+			ordinary := newLowerTestCall(f.child)
+			spawn := ir.NewGoDeferStmt(src.NoXPos, ir.OGO, f.call)
+			spawn.SetTypecheck(1)
+			f.caller.Body = ir.Nodes{spawn, ordinary, newLowerTestReturn()}
+			funcs := []*ir.Func{f.caller, f.wrapper}
+			if mode == "imported" || mode == "missing-factory" {
+				summary := FuncSummary{}
+				if mode == "imported" {
+					summary.Factory = FactoryABI1
+				}
+				SetSummary(f.child, summary)
+				defer delete(summaries, f.child)
+			} else {
+				funcs = append(funcs, f.child)
+			}
+			if mode == "unsupported" {
+				f.child.Body = ir.Nodes{newLowerTestCall(f.child)}
+			}
+			if mode == "source-literal" {
+				f.wrapper.SetWrapper(false)
+			}
+			plan, err := Analyze(funcs, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.PreserveGoCalls()
+			want := mode == "local" || mode == "imported"
+			if f.inner.NoInline != want || ordinary.NoInline {
+				t.Fatalf("go boundary preserved = %t, ordinary = %t, want %t/false", f.inner.NoInline, ordinary.NoInline, want)
+			}
+			if want && plan.PreserveCall(f.child) {
+				t.Fatal("plain factory demand prevents ordinary inlining")
+			}
+		})
+	}
+}
+
 func testGoCallPlan(t *testing.T, yieldInit bool) {
 	t.Helper()
 	prepareLowerTest(t)
