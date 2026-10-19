@@ -146,14 +146,29 @@ type switchFallback struct{ name, reason string }
 
 func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallback, lowered []string) {
 	t.Helper()
+	testSwitchReturnFiles(t, map[string]string{"main.go": source}, "", fallback, lowered)
+}
+
+func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string, fallback []switchFallback, lowered []string) {
+	t.Helper()
 	testenv.MustHaveGoBuild(t)
 	if !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64" ||
 		runtime.GOOS == "darwin" && runtime.GOARCH == "arm64") {
 		t.Skip("native coroutine executor is not supported")
 	}
-	file := filepath.Join(t.TempDir(), "main.go")
-	if err := os.WriteFile(file, []byte(source), 0o666); err != nil {
-		t.Fatal(err)
+	tmp := t.TempDir()
+	for name, source := range files {
+		file := filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(file), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(source), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(tmp, "main.go")
+	if pattern != "" {
+		file = "."
 	}
 	for _, test := range []struct {
 		name, experiment, flags string
@@ -171,8 +186,9 @@ func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallb
 			if test.name == "coro/checkptr" {
 				args = append(args, "-gcflags=all=-d=checkptr=2")
 			}
-			args = append(args, "-gcflags="+test.flags, "-o", exe, file)
+			args = append(args, "-gcflags="+pattern+test.flags, "-o", exe, file)
 			cmd := testenv.Command(t, testenv.GoToolPath(t), args...)
+			cmd.Dir = tmp
 			cmd.Env = append(cmd.Environ(), "GOEXPERIMENT="+test.experiment, "GOWORK=off")
 			data, err := cmd.CombinedOutput()
 			if err != nil {

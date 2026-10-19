@@ -216,6 +216,7 @@ func (s Seed) String() string {
 type Edge struct {
 	Kind   EdgeKind
 	Callee *ir.Func
+
 	// Targets is a proved closed set for a local function-value call.
 	// Callee remains nil: the selected entry is determined at run time.
 	Targets    []*ir.Func
@@ -737,6 +738,14 @@ func (p *Plan) Dump(w io.Writer) {
 			}
 			fmt.Fprintf(w, "coro: edge=%s caller=%s callee=%s unknown=%t effect=%s\n",
 				edge.Kind, ir.PkgFuncName(function.Func), edge.CalleeName, edge.Unknown, effect)
+			if len(edge.Targets) != 0 {
+				targets := make([]string, len(edge.Targets))
+				for i, target := range edge.Targets {
+					targets[i] = ir.PkgFuncName(target)
+				}
+				fmt.Fprintf(w, "coro: closed-targets caller=%s targets=%s\n",
+					ir.PkgFuncName(function.Func), strings.Join(targets, ","))
+			}
 		}
 	}
 }

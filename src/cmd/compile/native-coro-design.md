@@ -4248,6 +4248,37 @@ existing homogeneous self-frame loop is unchanged. Tests check query selection
 alongside deep normal results, explicit/implicit child panic, Goexit, GC and
 post-terminal reuse. A reduced static call count alone is not a timing claim.
 
+### 16.15 Closed local function-value calls
+
+A direct call through a local function variable can use native continuations
+when every write in its enclosing function assigns a named, context-free,
+non-generic function or nil. The variable cannot be a parameter, an addressed
+cell, or a closure capture. Alias assignments, method values, range bindings,
+unknown returned values, and compiler operation recipes retain ordinary calls.
+The proof includes statement initializers and writes after the call; a later
+unsupported write invalidates the entire variable's target set.
+
+The effect plan combines suspension, execution constraints, and terminal flags
+from every possible target. When a call requires a continuation, every target
+must provide the existing typed factory capability. Dependency rejection removes
+the caller if any factory is missing. This also works across package boundaries
+using the existing versioned summaries, without a new callable representation.
+
+Lowering evaluates the function value and arguments once, in source order,
+before reading its entry PC. This preserves argument side effects before a nil
+function panic. The PC only discriminates between the proved named targets;
+it never supplies an effect, signature, or ABI for an unknown entry. Each branch
+calls its independently typed factory and joins through the existing opaque
+frame/resume pair, with nil frame for closure factories. The parent resumes
+after the await without repeating dispatch. Result destinations and cleanup
+ownership use the same contracts as static calls.
+
+The original public body remains available for ordinary-context selection.
+Open function parameters and globals, arbitrary closures and interfaces,
+dynamic go/defer calls, and targets lacking a factory remain outside this slice.
+They still need the typed descriptors described above for general support.
+No runtime, scheduler, cache, factory ABI, or source-annotation change is needed.
+
 ## 17. Confirmed MVP decisions
 
 The implemented MVP choices are:
