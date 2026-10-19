@@ -108,8 +108,8 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"switchType", "type switch"}},
-		[]string{"switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchAssignment", "switchClosure", "switchBreak"})
+		nil,
+		[]string{"switchType", "switchUint", "switchByte", "switchError", "switchBare", "switchVoid", "switchAssignment", "switchClosure", "switchBreak"})
 }
 
 func TestSwitchReturnCgo(t *testing.T) {
