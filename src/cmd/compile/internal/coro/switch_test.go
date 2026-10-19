@@ -104,3 +104,24 @@ func TestLowerExpressionSwitch(t *testing.T) {
 		t.Fatal("source switch dispatch missing from generated resume")
 	}
 }
+
+func TestExpressionSwitchContinue(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/switchcontinue", "switchcontinue")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("f"), types.NewSignature(nil, nil, nil))
+	yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"), types.NewSignature(nil, nil, nil))
+	call := newLowerTestCall(yield)
+	branch := ir.NewBranchStmt(src.NoXPos, ir.OCONTINUE, nil)
+	clause := ir.NewCaseStmt(src.NoXPos, nil, ir.Nodes{branch})
+	stmt := ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})
+	loop := ir.NewForStmt(src.NoXPos, nil, nil, nil, ir.Nodes{stmt}, false)
+	fn.Body = ir.Nodes{call, loop}
+	candidate, err := newLowerCandidate(&Plan{}, &Function{Func: fn, Primary: CoroPrimary,
+		Sites: []Site{{ID: 1, Kind: SiteYield, Node: call}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !candidate.switches[stmt] || candidate.branches[branch] != loop {
+		t.Fatal("switch continue lost its enclosing loop target")
+	}
+}
