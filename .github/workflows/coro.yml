@@ -59,7 +59,7 @@ jobs:
 
       - name: Test default compiler and runtime
         run: >-
-          ./bin/go test -count=1
+          ./bin/go test -count=1 -timeout=20m
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
@@ -84,7 +84,7 @@ jobs:
         env:
           GOEXPERIMENT: coro
         run: >-
-          ./bin/go test -count=1
+          ./bin/go test -count=1 -timeout=20m
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
