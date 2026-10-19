@@ -26,14 +26,23 @@ func TestPlainSpawn(t *testing.T) {
 
 type Box struct { Value int }
 
-func Leaf(p *Box, out *int, done chan struct{}, values ...int) {
+func Leaf(p *Box, out *int, done chan struct{}, values ...int) (int, *Box) {
  *out = p.Value + values[0] + values[1]
  close(done)
+ return *out, p
 }
 
-func (b Box) Leaf(out *int, done chan struct{}) {
+func (b Box) Leaf(out *int, done chan struct{}) int {
  *out = b.Value
  close(done)
+ return b.Value
+}
+
+func (b *Box) Pointer(out *int, done chan struct{}) (value int, pointer *Box) {
+ value, pointer = b.Value, b
+ *out = value
+ close(done)
+ return
 }
 
 func Spawn(p *Box, out *int, done chan struct{}, value int) {
@@ -42,6 +51,20 @@ func Spawn(p *Box, out *int, done chan struct{}, value int) {
 
 func SpawnMethod(b Box, out *int, done chan struct{}) {
  go b.Leaf(out, done)
+}
+
+func SpawnPointer(b *Box, out *int, done chan struct{}) {
+ go b.Pointer(out, done)
+}
+
+func Aggregate(b *Box, out *int, done chan struct{}) [64]byte {
+ *out = b.Value
+ close(done)
+ return [64]byte{}
+}
+
+func SpawnAggregate(b *Box, out *int, done chan struct{}) {
+ go Aggregate(b, out, done)
 }
 
 // No local go statement demands a factory for this exported entry.
@@ -55,9 +78,10 @@ import (
  "runtime"
 )
 
-func local(p *helper.Box, out *int, done chan struct{}) {
+func local(p *helper.Box, out *int, done chan struct{}) *helper.Box {
  *out = p.Value
  close(done)
+ return p
 }
 
 func launch(p *helper.Box, out *int, done chan struct{}) { go local(p, out, done) }
@@ -77,6 +101,10 @@ func loop(out *int, done chan struct{}) {
 
 func unbounded(out *int, done chan struct{}) { go loop(out, done) }
 
+func large(done chan struct{}) [2048]byte { close(done); return [2048]byte{} }
+
+func oversized(done chan struct{}) { go large(done) }
+
 func main() {
  const count = 128
  var results [count]int
@@ -84,18 +112,20 @@ func main() {
  for i := range count {
   signals[i] = make(chan struct{})
   p := &helper.Box{Value: i}
-  switch i % 4 {
+  switch i % 6 {
   case 0: launch(p, &results[i], signals[i])
   case 1: helper.Spawn(p, &results[i], signals[i], 7)
   case 2: helper.SpawnMethod(*p, &results[i], signals[i]); p.Value = -1
   case 3: imported(p, &results[i], signals[i])
+  case 4: helper.SpawnPointer(p, &results[i], signals[i])
+  case 5: helper.SpawnAggregate(p, &results[i], signals[i])
   }
  }
  runtime.GC()
  for i := range count {
   <-signals[i]
   want := i
-  if i%4 == 1 || i%4 == 3 { want += 10 }
+  if i%6 == 1 || i%6 == 3 { want += 10 }
   if results[i] != want { panic("plain task argument, receiver, or pointer root") }
  }
  out, done := 0, make(chan struct{})
@@ -110,6 +140,9 @@ func main() {
  unbounded(&out, done)
  <-done
  if out != 45 { panic("loop target fallback") }
+ done = make(chan struct{})
+ oversized(done)
+ <-done
  if os.Getenv("PANIC") != "" {
   // Implicit nil dereference must terminate the child, not retry its body
   // indefinitely or become recoverable by the task creator.
@@ -178,12 +211,12 @@ func main() {
 					t.Errorf("%s native entry = %t", name, got)
 				}
 			}
-			for _, name := range []string{"main.imported", "example.com/plainspawn/helper.Spawn", "example.com/plainspawn/helper.SpawnMethod", "example.com/plainspawn/helper.Leaf", "example.com/plainspawn/helper.Box.Leaf"} {
+			for _, name := range []string{"main.imported", "example.com/plainspawn/helper.Spawn", "example.com/plainspawn/helper.SpawnMethod", "example.com/plainspawn/helper.SpawnPointer", "example.com/plainspawn/helper.SpawnAggregate", "example.com/plainspawn/helper.Leaf", "example.com/plainspawn/helper.Box.Leaf", "example.com/plainspawn/helper.(*Box).Pointer", "example.com/plainspawn/helper.Aggregate"} {
 				if got := strings.Contains(string(symbols), name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
 			}
-			for _, name := range []string{"main.missing", "main.unbounded", "main.loop", "example.com/plainspawn/helper.NoAdapter"} {
+			for _, name := range []string{"main.missing", "main.unbounded", "main.loop", "main.oversized", "main.large", "example.com/plainspawn/helper.NoAdapter"} {
 				if strings.Contains(string(symbols), name+".coro") {
 					t.Errorf("unsupported target lost ordinary fallback: %s", name)
 				}

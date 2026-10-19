@@ -146,15 +146,6 @@ func TestPlainSpawnFactoryUnsupported(t *testing.T) {
 			t.Fatalf("unsupported plain factory = %+v", function)
 		}
 	}
-	result := types.NewField(src.NoXPos, nil, types.Types[types.TINT])
-	returning := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("returning"),
-		types.NewSignature(nil, nil, []*types.Field{result}))
-	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{typedInt(src.NoXPos, types.Types[types.TINT], 1)})
-	ret.SetTypecheck(1)
-	returning.Body = ir.Nodes{ret}
-	if plainSpawnFactorySupported(&Function{Func: returning}) {
-		t.Fatal("discarded-result spawn target supports a plain factory")
-	}
 	fn.Body = ir.Nodes{newLowerTestReturn()}
 	if plainSpawnFactorySupported(&Function{Func: fn, Edges: []Edge{{Kind: DirectCall}}}) {
 		t.Fatal("ordinary helper call admitted without an execution bound")
@@ -168,5 +159,107 @@ func TestPlainSpawnFactoryUnsupported(t *testing.T) {
 		if plainSpawnFactorySupported(&Function{Func: fn}) {
 			t.Fatalf("unbounded plain target supports a factory: %v", stmt.Op())
 		}
+	}
+}
+
+func TestPlainSpawnFactoryResults(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/plainspawnresults", "plainspawnresults")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	for _, count := range []int{0, 1, 2} {
+		input := types.NewField(src.NoXPos, pkg.Lookup("input"), types.Types[types.TINT])
+		fields := make([]*types.Field, count)
+		for i := range fields {
+			typ := types.Types[types.TINT]
+			if i == 1 {
+				typ = types.NewPtr(typ)
+			}
+			fields[i] = types.NewField(src.NoXPos, nil, typ)
+		}
+		fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.LookupNum("leaf", count),
+			types.NewSignature(nil, []*types.Field{input}, fields))
+		fn.Nname.Defn = fn
+		fn.DeclareParams(true)
+		values := make(ir.Nodes, count)
+		for i, field := range fields {
+			if field.Type.IsPtr() {
+				values[i] = ir.NewNilExpr(src.NoXPos, field.Type)
+			} else {
+				values[i] = typedInt(src.NoXPos, field.Type, 1)
+			}
+		}
+		ret := ir.NewReturnStmt(src.NoXPos, values)
+		ret.SetTypecheck(1)
+		fn.Body = ir.Nodes{ret}
+		if !plainSpawnFactorySupported(&Function{Func: fn}) {
+			t.Fatalf("%d results rejected", count)
+		}
+		factory := newPlainSpawnFactory(fn, fn.Nname)
+		if got := factory.Type().NumParams(); got != 1+count {
+			t.Fatalf("factory has %d parameters, want %d", got, 1+count)
+		}
+		resume := factory.Body[0].(*ir.ReturnStmt).Results[0].(*ir.ClosureExpr).Func
+		var call *ir.CallExpr
+		var targets ir.Nodes
+		switch invoke := resume.Body[2].(type) {
+		case *ir.CallExpr:
+			call = invoke
+		case *ir.AssignStmt:
+			targets, call = ir.Nodes{invoke.X}, invoke.Y.(*ir.CallExpr)
+		case *ir.AssignListStmt:
+			targets, call = invoke.Lhs, invoke.Rhs[0].(*ir.CallExpr)
+		default:
+			t.Fatalf("unexpected invocation: %T", invoke)
+		}
+		if len(call.Args) != 1 || len(targets) != count || ir.StaticCalleeName(call.Fun) != fn.Nname {
+			t.Fatalf("%d results changed the ordinary call or result count", count)
+		}
+		for i, target := range targets {
+			pointer := target.(*ir.StarExpr).X.(*ir.Name)
+			if pointer.Canonical() != factory.Type().Param(1+i).Nname ||
+				!types.Identical(target.Type(), fields[i].Type) {
+				t.Fatalf("result %d does not use its typed child destination", i)
+			}
+		}
+	}
+}
+
+func TestPlainSpawnFactoryResultSize(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/plainspawnresultsize", "plainspawn")
+	for _, test := range []struct {
+		name          string
+		input, result int64
+		count         int
+		want          bool
+	}{
+		{"small", 8, 8, 1, true},
+		{"boundary", 0, 120, 1, true},
+		{"alignment", 0, 121, 1, false},
+		{"large", 0, 2048, 1, false},
+		{"inputs", 120, 8, 1, false},
+		{"empty-boundary", 0, 0, 16, true},
+		{"empty-overflow", 0, 0, 17, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var params []*types.Field
+			if test.input != 0 {
+				params = []*types.Field{types.NewField(src.NoXPos, nil,
+					types.NewArray(types.Types[types.TUINT8], test.input))}
+			}
+			results := make([]*types.Field, test.count)
+			for i := range results {
+				results[i] = types.NewField(src.NoXPos, pkg.LookupNum("result", i),
+					types.NewArray(types.Types[types.TUINT8], test.result))
+			}
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(test.name),
+				types.NewSignature(nil, params, results))
+			fn.Body = ir.Nodes{newLowerTestReturn()}
+			if got := plainSpawnFactorySupported(&Function{Func: fn}); got != test.want {
+				t.Fatalf("supported = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
