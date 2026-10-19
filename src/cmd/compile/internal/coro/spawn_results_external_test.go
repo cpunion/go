@@ -97,13 +97,14 @@ func spawn(ready chan<- int, gate <-chan struct{}, results *[128]int, done *[128
  for i := range 128 {
   p := &helper.Box{Value: i}
   index := argument()
-  if i%4 == 0 {
+  switch i%4 {
+  case 0:
    go helper.Pair(index, p, ready, gate, &results[i], done[i])
-  } else if i%4 == 1 {
+  case 1:
    go p.Pair(index, ready, gate, &results[i], done[i]); p.Value = -1
-  } else if i%4 == 2 {
+  case 2:
    go helper.Named(index, p, ready, gate, &results[i], done[i])
-  } else {
+  default:
    go helper.Exit(index, p, ready, gate, &results[i], done[i])
   }
  }

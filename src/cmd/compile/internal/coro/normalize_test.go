@@ -56,7 +56,9 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 		types.Types[types.TINT])
 	prefix := ir.NewDecl(src.NoXPos, ir.ODCL, prefixName)
 	ret.SetInit(ir.Nodes{prefix})
-	caller.Body = ir.Nodes{ret}
+	clause := ir.NewCaseStmt(src.NoXPos, nil, ir.Nodes{ret})
+	stmt := ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})
+	caller.Body = ir.Nodes{stmt}
 
 	normalizeSingleResultCalls(&Function{
 		Func:    caller,
@@ -70,6 +72,9 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 
 	if len(ret.Init()) != 3 {
 		t.Fatalf("return Init has %d statements, want 3", len(ret.Init()))
+	}
+	if len(stmt.Init()) != 0 || len(clause.Body) != 1 || clause.Body[0] != ret {
+		t.Fatal("case expressions moved into the switch dispatch")
 	}
 	if ret.Init()[0] != prefix {
 		t.Fatalf("first normalized statement = %v, want prefix %v",

@@ -77,6 +77,12 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		initNode.SetInit(prefix)
 		normalizeCallList(stmt.Body, fn, calls)
 		return
+	case *ir.SwitchStmt:
+		initNode.SetInit(prefix)
+		for _, clause := range stmt.Cases {
+			normalizeCallList(clause.Body, fn, calls)
+		}
+		return
 	case *ir.ReturnStmt, *ir.AssignStmt, *ir.AssignListStmt:
 		root = stmt
 	case *ir.CallExpr:
