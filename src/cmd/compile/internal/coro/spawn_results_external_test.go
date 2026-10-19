@@ -56,7 +56,7 @@ func Named(index int, p *Box, ready chan<- int, gate <-chan struct{}, out *int, 
 }
 
 func Exit(index int, p *Box, ready chan<- int, gate <-chan struct{}, out *int, done chan struct{}) (int, *Box) {
- defer close(done)
+ defer func() { close(done) }()
  ready <- index
  <-gate
  *out = p.Value
@@ -94,11 +94,14 @@ func argument() int {
 func spawn(ready chan<- int, gate <-chan struct{}, results *[128]int, done *[128]chan struct{}) {
  for i := range 128 {
   p := &helper.Box{Value: i}
-  switch i % 4 {
-  case 0: go helper.Pair(argument(), p, ready, gate, &results[i], done[i])
-  case 1: go p.Pair(argument(), ready, gate, &results[i], done[i]); p.Value = -1
-  case 2: go helper.Named(argument(), p, ready, gate, &results[i], done[i])
-  case 3: go helper.Exit(argument(), p, ready, gate, &results[i], done[i])
+  if i%4 == 0 {
+   go helper.Pair(argument(), p, ready, gate, &results[i], done[i])
+  } else if i%4 == 1 {
+   go p.Pair(argument(), ready, gate, &results[i], done[i]); p.Value = -1
+  } else if i%4 == 2 {
+   go helper.Named(argument(), p, ready, gate, &results[i], done[i])
+  } else {
+   go helper.Exit(argument(), p, ready, gate, &results[i], done[i])
   }
  }
 }
