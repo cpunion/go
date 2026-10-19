@@ -44,6 +44,17 @@ func plainSpawnFactorySupported(function *Function) bool {
 		len(function.Edges) == 0) {
 		return false
 	}
+	if typ := function.Func.Type(); typ.NumResults() != 0 {
+		// The nosplit adapter needs call and result-copy temporaries. Keep
+		// their source ABI footprint, plus the factory's result pointers,
+		// small until larger values can bypass the ordinary return ABI.
+		// This is not a bound on arbitrary source bodies or helper calls.
+		const maxCallSize = 128
+		types.CalcSize(types.NewFuncArgs(typ))
+		if typ.ArgWidth()+int64(typ.NumResults())*int64(types.PtrSize) > maxCallSize {
+			return false
+		}
+	}
 	return !ir.Any(function.Func, func(node ir.Node) bool {
 		switch node.Op() {
 		case ir.OFOR, ir.ORANGE, ir.OGOTO:

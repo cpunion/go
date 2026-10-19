@@ -4086,6 +4086,12 @@ one still forces ordinary fallback. This does not prove arbitrary ordinary
 helper stack bounds or admit assembly-only declarations. Until execution
 summaries can prove bounded plain calls, adapters reject source calls, loops,
 and goto statements; those targets retain ordinary spawning and host preemption.
+Result-bearing adapters additionally limit the aligned source receiver,
+parameter and result footprint plus the factory result pointers to 128 bytes.
+This conservative marshalling budget leaves room for the nosplit adapter's
+call/copy temporaries; larger results retain ordinary Go spawning rather than
+failing the linker's nosplit stack check. Zero-sized result pointers count
+toward the budget. This is not a general proof of ordinary-body stack bounds.
 Before inlining, preserve only the static target call inside its generated go
 wrapper using the existing call-site `NoInline` bit. Other calls to the same
 plain entry may still inline. Race and other instrumented builds skip this
@@ -4110,7 +4116,8 @@ actual closure and frame spawning rather than accepting a successful ordinary
 fallback, and separately require fallback for dynamic targets and missing
 adapters. Plain-adapter tests cover returned values, variadic arguments, value
 and pointer receivers, named results, unchanged ordinary calls, missing-factory,
-race and experiment-disabled fallback, GC, and independent implicit child panics.
+race and experiment-disabled fallback, small aggregate results, oversized-result
+fallback, GC, and independent implicit child panics.
 Discarded-result tests cover a creator returning before its 128 children,
 GC-sensitive pointer results, methods, named-result defer, Goexit, argument
 panics and independent child panics, with and without inlining and with checkptr.

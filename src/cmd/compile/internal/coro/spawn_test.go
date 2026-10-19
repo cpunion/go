@@ -225,3 +225,41 @@ func TestPlainSpawnFactoryResults(t *testing.T) {
 		}
 	}
 }
+
+func TestPlainSpawnFactoryResultSize(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/plainspawnresultsize", "plainspawn")
+	for _, test := range []struct {
+		name          string
+		input, result int64
+		count         int
+		want          bool
+	}{
+		{"small", 8, 8, 1, true},
+		{"boundary", 0, 120, 1, true},
+		{"alignment", 0, 121, 1, false},
+		{"large", 0, 2048, 1, false},
+		{"inputs", 120, 8, 1, false},
+		{"empty-boundary", 0, 0, 16, true},
+		{"empty-overflow", 0, 0, 17, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var params []*types.Field
+			if test.input != 0 {
+				params = []*types.Field{types.NewField(src.NoXPos, nil,
+					types.NewArray(types.Types[types.TUINT8], test.input))}
+			}
+			results := make([]*types.Field, test.count)
+			for i := range results {
+				results[i] = types.NewField(src.NoXPos, pkg.LookupNum("result", i),
+					types.NewArray(types.Types[types.TUINT8], test.result))
+			}
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(test.name),
+				types.NewSignature(nil, params, results))
+			fn.Body = ir.Nodes{newLowerTestReturn()}
+			if got := plainSpawnFactorySupported(&Function{Func: fn}); got != test.want {
+				t.Fatalf("supported = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
