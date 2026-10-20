@@ -27,6 +27,10 @@ func loopBody() int { total:=0;for i:=0;i<3;i++ { total=total+consume(produce())
 func recursive(n int) int { if n==0 {return consume(produce())};return recursive(n-1) }
 func chooseConsumer(which bool) func(int,int)int { trace+="s";runtime.Gosched();if which {return alternate};return consume }
 func selected(which bool) int { return chooseConsumer(which)(produce()) }
+func plainSelector(which bool) func(int,int)int { trace+="s";if which {return alternate};return consume }
+func selectedPlain(which bool) int { return plainSelector(which)(produce()) }
+func nilSelector() func(int,int)int { trace+="n";runtime.Gosched();return nil }
+func nilReturn() (v any) { defer func(){if x:=recover();x!=nil {v=x}}();return nilSelector()(produce()) }
 func triple() (int,int,int) { trace+="t";runtime.Gosched();return 1,2,3 }
 func variadic(a int,rest ...int) int { trace+="v";runtime.Gosched();return a+rest[0]*10+rest[1]*100 }
 func variadicReturn() int { return variadic(triple()) }
@@ -63,6 +67,9 @@ func main() {
  trace="";if recursive(500)!=23 || trace!="pc" {panic("recursion "+trace)}
  trace="";if selected(false)!=23 || trace!="spc" {panic("selected "+trace)}
  trace="";if selected(true)!=203 || trace!="spa" {panic("selected alternate "+trace)}
+ trace="";if selectedPlain(false)!=23 || trace!="spc" {panic("plain selector "+trace)}
+ trace="";if selectedPlain(true)!=203 || trace!="spa" {panic("plain selector alternate "+trace)}
+ trace="";if _,ok:=nilReturn().(runtime.Error);!ok || trace!="np" {panic("nil selector argument order "+trace)}
  trace="";if variadicReturn()!=321 || trace!="tv" {panic("variadic "+trace)}
  trace="";if recoveredReturn()!=0 || trace!="rc" {panic("recovered zero "+trace)}
  trace="";if panicReturn()!="producer" || trace!="x" {panic("producer panic "+trace)}
@@ -77,7 +84,7 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"shortCircuit", "nested await site"}, {"observablePrefix", "nested await site"}, {"missingReturn", "unsupported coroutine dependency main.missing"}, {"unknown", "dynamic await site"}},
+		[]switchFallback{{"shortCircuit", "nested await site"}, {"observablePrefix", "nested await site"}, {"selectedPlain", "nested await site"}, {"nilReturn", "dynamic await site"}, {"missingReturn", "unsupported coroutine dependency main.missing"}, {"unknown", "dynamic await site"}},
 		[]string{"direct", "plainReturn", "forward", "named", "condition", "nested", "statement", "loopBody", "recursive", "selected", "variadicReturn", "recoveredReturn", "panicReturn", "consumerPanic", "exitReturn", "pointerReturn"})
 }
 

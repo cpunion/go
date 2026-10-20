@@ -4330,7 +4330,8 @@ No runtime, scheduler, cache, factory ABI, or source-annotation change is needed
 ### 16.16 Tuple argument call initializers
 
 The frontend expands a call such as `consume(produce())` into a tuple assignment
-to independent typed argument cells in the consumer call's initializer list.
+to independent typed argument cells in an initializer on the consumer call or
+an argument conversion.
 When that consumer is nested in a return or another supported expression,
 normalization exposes its complete ordered initializer prefix before lowering
 the consumer. This includes any earlier callee evaluation and uses the original

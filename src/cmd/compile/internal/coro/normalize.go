@@ -98,7 +98,7 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 
 func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	calls map[*ir.CallExpr]bool, directStatement bool) (ir.Node, ir.Nodes) {
-	var order []*ir.CallExpr
+	var order []ir.Node
 	var visit func(ir.Node)
 	visit = func(node ir.Node) {
 		if node == nil {
@@ -108,24 +108,28 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			visit(child)
 			return false
 		})
-		if call, ok := node.(*ir.CallExpr); ok && (calls[call] || hasAwaitInit(call, calls)) {
-			order = append(order, call)
+		if call, ok := node.(*ir.CallExpr); ok && calls[call] {
+			order = append(order, node)
+		} else if node.Op() != ir.OINLCALL && node.Type() != nil && hasAwaitInit(node, calls) {
+			order = append(order, node)
 		}
 	}
 	visit(root)
 
 	var init ir.Nodes
-	for _, call := range order {
-		if hasAwaitInit(call, calls) && safeCallPrefix(root, call) {
-			// The frontend expands f(g()) into tuple assignments in f's
-			// Init list. Expose those assignments before normalizing f,
-			// preserving the entire ordered prefix, including callee
-			// evaluation. A non-suspending f needs the same treatment.
-			prefix := ir.TakeInit(call)
+	for _, node := range order {
+		if hasAwaitInit(node, calls) && safeCallPrefix(root, node) {
+			// The frontend expands f(g()) into tuple assignments in an
+			// argument conversion's Init list or the call's Init list.
+			// Expose the entire ordered prefix before normalizing f,
+			// including earlier callee evaluation. A non-suspending f
+			// needs the same treatment.
+			prefix := ir.TakeInit(node)
 			normalizeCallList(prefix, fn, calls)
 			init = append(init, prefix...)
 		}
-		if !calls[call] {
+		call, ok := node.(*ir.CallExpr)
+		if !ok || !calls[call] {
 			continue
 		}
 		if directStatement && directCallStatement(root, call) {
@@ -170,8 +174,8 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	return root, init
 }
 
-func hasAwaitInit(call *ir.CallExpr, calls map[*ir.CallExpr]bool) bool {
-	for _, stmt := range call.Init() {
+func hasAwaitInit(node ir.Node, calls map[*ir.CallExpr]bool) bool {
+	for _, stmt := range node.Init() {
 		if ir.Any(stmt, func(node ir.Node) bool {
 			await, ok := node.(*ir.CallExpr)
 			return ok && calls[await]
@@ -204,7 +208,7 @@ func hasNestedCall(root *ir.CallExpr, calls map[*ir.CallExpr]bool) bool {
 // safeCallPrefix reports whether hoisting target before root preserves every
 // observable operation that precedes target. Short-circuit right operands are
 // conditional and therefore cannot be hoisted.
-func safeCallPrefix(root ir.Node, target *ir.CallExpr) bool {
+func safeCallPrefix(root, target ir.Node) bool {
 	if root == target {
 		return true
 	}
@@ -237,7 +241,7 @@ func safeCallPrefix(root ir.Node, target *ir.CallExpr) bool {
 	return found && safe
 }
 
-func containsCall(root ir.Node, target *ir.CallExpr) bool {
+func containsCall(root, target ir.Node) bool {
 	return ir.Any(root, func(node ir.Node) bool {
 		return node == target
 	})

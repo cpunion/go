@@ -14,10 +14,18 @@ import (
 )
 
 func TestNormalizeTupleCallInitializers(t *testing.T) {
+	for _, argumentInit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "call", true: "argument"}[argumentInit], func(t *testing.T) {
+			testNormalizeTupleInitializers(t, argumentInit)
+		})
+	}
+}
+
+func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
-	for _, mode := range []string{"return", "plain-return", "tuple-return", "condition", "statement", "short-circuit", "observable-prefix", "loop", "inlined", "plain-init"} {
+	for _, mode := range []string{"return", "plain-return", "tuple-return", "condition", "statement", "short-circuit", "observable-prefix", "loop", "inlined", "inlined-init", "plain-init"} {
 		t.Run(mode, func(t *testing.T) {
 			pkg := types.NewPkg("example.com/coro/tupleinit/"+mode, "p")
 			types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
@@ -55,7 +63,16 @@ func TestNormalizeTupleCallInitializers(t *testing.T) {
 			}
 			outer.SetTypecheck(1)
 			original := ir.Nodes{prefix, assignment}
-			outer.SetInit(original)
+			var owner ir.Node = outer
+			if argumentInit {
+				conversion := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP, values[0].Type(), values[0])
+				conversion.SetTypecheck(1)
+				outer.Args = slices.Clone(values)
+				outer.Args[0] = conversion
+				owner = conversion
+			}
+			owner.(ir.InitNode).SetInit(original)
+			arguments := slices.Clone(outer.Args)
 			ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{outer})
 			var root ir.Node = ret
 			switch mode {
@@ -71,8 +88,13 @@ func TestNormalizeTupleCallInitializers(t *testing.T) {
 				ret.Results[0] = ir.NewBinaryExpr(src.NoXPos, ir.OADD, prior, outer)
 			case "loop":
 				root = ir.NewForStmt(src.NoXPos, nil, outer, nil, nil, false)
-			case "inlined":
+			case "inlined", "inlined-init":
 				n := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{outer}, ir.Nodes{ir.NewInt(src.NoXPos, 0)})
+				n.SetType(results[0].Type)
+				if mode == "inlined-init" {
+					n.SetInit(ir.TakeInit(owner))
+					owner = n
+				}
 				ret.Results[0] = n
 			}
 			caller.Body = ir.Nodes{root}
@@ -81,13 +103,16 @@ func TestNormalizeTupleCallInitializers(t *testing.T) {
 				sites = append(sites, Site{ID: 2, Kind: SiteAwait, Node: outer})
 			}
 			if mode == "plain-init" {
-				sites = []Site{{ID: 1, Kind: SiteAwait, Node: newLowerTestCall(producer)}}
+				other := newLowerTestCall(producer)
+				other.SetType(producer.Type().ResultsTuple())
+				caller.Body = append(caller.Body, ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC, ir.Nodes{ir.BlankNode, ir.BlankNode}, ir.Nodes{other}))
+				sites = []Site{{ID: 1, Kind: SiteAwait, Node: other}}
 			}
 			function := &Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary, Sites: sites}
 			normalizeSingleResultCalls(function)
 			safe := mode == "return" || mode == "plain-return" || mode == "tuple-return" || mode == "condition" || mode == "statement"
 			if !safe {
-				if len(root.Init()) != 0 || !slices.Equal(outer.Init(), original) {
+				if len(root.Init()) != 0 || !slices.Equal(owner.Init(), original) {
 					t.Fatal("initializer crossed an unsupported expression boundary")
 				}
 				return
@@ -96,17 +121,17 @@ func TestNormalizeTupleCallInitializers(t *testing.T) {
 			if mode == "plain-return" || mode == "statement" {
 				want = 2
 			}
-			if len(root.Init()) != want || root.Init()[0] != prefix || root.Init()[1] != assignment || root != outer && len(outer.Init()) != 0 {
-				t.Fatalf("ordered initializer prefix was not exposed: root=%v outer=%v", root.Init(), outer.Init())
+			if len(root.Init()) != want || root.Init()[0] != prefix || root.Init()[1] != assignment || root != owner && len(owner.Init()) != 0 {
+				t.Fatalf("ordered initializer prefix was not exposed: root=%v owner=%v", root.Init(), owner.Init())
 			}
 			for i, value := range values {
-				if outer.Args[i] != value || value.Name().Defn != assignment || assignment.Init()[i].Op() != ir.ODCL {
+				if outer.Args[i] != arguments[i] || value.Name().Defn != assignment || assignment.Init()[i].Op() != ir.ODCL {
 					t.Fatal("tuple argument cells or declarations changed")
 				}
 			}
 			before := slices.Clone(root.Init())
 			normalizeSingleResultCalls(function)
-			if !slices.Equal(root.Init(), before) || root != outer && len(outer.Init()) != 0 {
+			if !slices.Equal(root.Init(), before) || root != owner && len(owner.Init()) != 0 {
 				t.Fatal("initializer normalization is not idempotent")
 			}
 		})
@@ -152,7 +177,10 @@ func TestLowerTupleCallInitializers(t *testing.T) {
 			outer := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, consumer.Nname, slices.Clone(assignment.Lhs))
 			outer.SetType(types.Types[types.TINT])
 			outer.SetTypecheck(1)
-			outer.SetInit(ir.Nodes{assignment})
+			conversion := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP, outer.Args[0].Type(), outer.Args[0])
+			conversion.SetTypecheck(1)
+			conversion.SetInit(ir.Nodes{assignment})
+			outer.Args[0] = conversion
 			parent.Body = ir.Nodes{ir.NewReturnStmt(src.NoXPos, ir.Nodes{outer})}
 			plan, err := Analyze([]*ir.Func{parent, producer, consumer}, nil)
 			if err != nil {
@@ -166,7 +194,7 @@ func TestLowerTupleCallInitializers(t *testing.T) {
 			if err != nil || result.Lowered != want || len(result.Diagnostics) != 0 {
 				t.Fatalf("Lower=(%+v,%v), want %d", result, err, want)
 			}
-			if inner.Fun != producer.Nname || outer.Fun != consumer.Nname || len(outer.Init()) != 0 {
+			if inner.Fun != producer.Nname || outer.Fun != consumer.Nname || len(outer.Init()) != 0 || len(conversion.Init()) != 0 {
 				t.Fatal("source call identity or initializer ownership changed")
 			}
 		})
