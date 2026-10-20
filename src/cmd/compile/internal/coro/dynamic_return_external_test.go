@@ -137,10 +137,10 @@ func main(){
 			{"parameter", "dynamic await site"}, {"globalResult", "dynamic await site"},
 			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
 			{"closureResult", "dynamic await site"}, {"caseResult", "dynamic await site"},
-			{"namedResult", "dynamic await site"}, {"multipleResult", "dynamic await site"},
+			{"namedResult", "dynamic await site"},
 			{"lateUnknown", "dynamic await site"}, {"missingFactory", "unsupported coroutine dependency main.missing"},
 		},
-		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair"})
+		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair", "multipleResult", "chooseMulti"})
 }
 
 func TestDynamicReturnImported(t *testing.T) {

@@ -10,7 +10,8 @@ import (
 	"cmd/compile/internal/typecheck"
 )
 
-// normalizeSingleResultCalls makes nested single-result awaits explicit.
+// normalizeSingleResultCalls makes nested single-result awaits and sole
+// multi-result return awaits explicit.
 //
 // The normal ordering pass runs after escape analysis, but coroutine lowering
 // must run before it. Keep this pass deliberately smaller: it only introduces
@@ -25,8 +26,7 @@ func normalizeSingleResultCalls(function *Function) {
 	calls := make(map[*ir.CallExpr]bool)
 	for _, site := range function.Sites {
 		call, ok := site.Node.(*ir.CallExpr)
-		if !ok || site.Kind != SiteAwait || call.Type() == nil ||
-			call.Type().IsFuncArgStruct() {
+		if !ok || site.Kind != SiteAwait || call.Type() == nil {
 			continue
 		}
 		calls[call] = true
@@ -121,6 +121,30 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 		}
 		if hasNestedCall(call, calls) ||
 			!safeCallPrefix(root, call) {
+			continue
+		}
+		if call.Type().IsFuncArgStruct() {
+			ret, ok := root.(*ir.ReturnStmt)
+			if !ok || len(ret.Results) != 1 || ret.Results[0] != call ||
+				call.Fun.Type().NumResults() != fn.Type().NumResults() || fn.Type().NumResults() < 2 {
+				continue
+			}
+			// The call is the only return expression. Its result destinations
+			// must be independent typed cells, evaluated before assigning the
+			// function's output slots and running its deferred cleanup.
+			var values, declarations ir.Nodes
+			for _, result := range fn.Type().Results() {
+				temp := typecheck.TempAt(call.Pos(), fn, result.Type)
+				values.Append(temp)
+				declarations.Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+			}
+			assign := ir.NewAssignListStmt(call.Pos(), ir.OAS2, values, ir.Nodes{call})
+			assign.SetInit(declarations)
+			for _, value := range values {
+				value.Name().Defn = assign
+			}
+			init.Append(typecheck.Stmt(assign))
+			ret.Results = values
 			continue
 		}
 

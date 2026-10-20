@@ -4272,11 +4272,16 @@ This analysis overapproximates value flow; copying a function value still has
 ordinary Go value semantics and never aliases its variable's storage.
 
 A static call to a function in the current package can also supply targets
-when that function has one function-valued result and its returned values are
-proved. Result vertices join the same dependency graph as locals,
-so return chains and recursive return/copy cycles reach a least fixed point.
+for its function-valued results. Each result position has an independent
+vertex in the same dependency graph as locals. Tuple assignments and return
+forwarding connect matching positions even when scalar or pointer results
+separate function-valued results. Return chains and recursive return/copy
+cycles reach a least fixed point.
 All returns and local writes participate, including unreachable later writes
-and implicit type/range bindings. Unknown returns invalidate every dependent.
+and implicit type/range bindings. Unknown returns invalidate every dependent
+of that position. An unused unknown result does not invalidate an independent
+closed result; copying or swapping values can introduce dependencies between
+positions and propagates invalidity along those dependencies normally.
 For a named result, the return vertex depends on the result cell rather than
 only the explicit return expressions. Each explicit return writes that cell;
 bare returns read it, and its initial zero value is nil. All ordinary writes,
@@ -4286,12 +4291,20 @@ the result after an explicit return expression has been evaluated. A defer that
 cannot access the result cell does not introduce an unknown function value;
 recovery may still return nil, which the existing dispatch handles normally.
 Bare returns without a proved named result, bodyless
-declarations, multi-result producers, method/closure producers, unknown imported
+declarations, method/closure producers, unknown imported
 results and runtime-selected producers retain ordinary boundaries. There is
 no exported return-target summary or new callable ABI. A local producer may
 return imported named targets, whose independent factory capabilities remain
 required. The producer call and returned function call each retain their normal
 effects, evaluation order, result storage and continuation dependencies.
+
+A sole multi-result return await, such as `return choose()`, is normalized to
+an assignment into independent typed temporaries followed by a return of those
+values. The call and its arguments run once, result assignment conversions are
+preserved, and the function's output slots are assigned before its deferred
+cleanup. Existing typed factory result destinations carry the values across
+suspension. Tuple calls nested in argument lists or other expression layouts
+remain outside this normalization boundary.
 
 The effect plan combines suspension, execution constraints, and terminal flags
 from every possible target. When a call requires a continuation, every target

@@ -11,12 +11,13 @@ import (
 	"strings"
 )
 
-// functionTargetKey denotes either a local cell or a function's single result.
+// functionTargetKey denotes either a local cell or an indexed function result.
 // Result vertices belong only to functions in the package being analyzed; this
 // proof is not an exported callable capability.
 type functionTargetKey struct {
 	local  *ir.Name
 	result *ir.Func
+	index  int
 }
 
 // localFunctionTargets is the single-function form of packageFunctionTargets.
@@ -25,8 +26,8 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 }
 
 // packageFunctionTargets proves closed sets of named functions for local
-// function variables and result cells. Copies and single-result calls form dependencies, and
-// every explicit return contributes to the callee's result vertex. Unknown
+// function variables and result cells. Copies and static calls form dependencies,
+// and every explicit return contributes to the corresponding result vertices. Unknown
 // writes and returns poison their dependents throughout the package, including
 // recursive return/copy cycles. No effects or factory ABIs are inferred here.
 func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Func {
@@ -34,8 +35,8 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 	targets := make(map[functionTargetKey][]*ir.Func)
 	invalid := make(map[functionTargetKey]bool)
 	dependents := make(map[functionTargetKey][]functionTargetKey)
-	results := make(map[*ir.Func]functionTargetKey)
-	outputs := make(map[*ir.Func]*ir.Name)
+	results := make(map[*ir.Func]map[int]functionTargetKey)
+	outputs := make(map[functionTargetKey]*ir.Name)
 	for _, fn := range funcs {
 		locals[fn] = make(map[*ir.Name][]*ir.Func)
 		for _, name := range fn.Dcl {
@@ -46,9 +47,14 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 			}
 		}
 		sig := fn.Type()
-		if resumeFactorySupported(fn) && sig.NumRecvs() == 0 && sig.NumResults() == 1 &&
-			sig.Result(0).Type.Kind() == types.TFUNC {
-			field := sig.Result(0)
+		if !resumeFactorySupported(fn) || sig.NumRecvs() != 0 {
+			continue
+		}
+		for i, field := range sig.Results() {
+			if field.Type.Kind() != types.TFUNC {
+				continue
+			}
+			key := functionTargetKey{result: fn, index: i}
 			if field.Sym != nil && !field.Sym.IsBlank() {
 				name, ok := field.Nname.(*ir.Name)
 				if !ok || name.Class != ir.PPARAMOUT {
@@ -57,10 +63,12 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 				if _, tracked := locals[fn][name]; !tracked {
 					continue
 				}
-				outputs[fn] = name
+				outputs[key] = name
 			}
-			key := functionTargetKey{result: fn}
-			results[fn] = key
+			if results[fn] == nil {
+				results[fn] = make(map[int]functionTargetKey)
+			}
+			results[fn][i] = key
 			targets[key] = nil
 		}
 	}
@@ -69,12 +77,24 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 			dependents[source] = append(dependents[source], destination)
 		}
 	}
-	for fn, name := range outputs {
+	for result, name := range outputs {
 		// Named results have ordinary local storage, initially nil. Every
 		// assignment and explicit return writes that cell; a bare return reads
 		// it. Addressing or capturing the cell invalidates its returned value,
 		// including deferred overwrites after an explicit return expression.
-		depend(functionTargetKey{local: name}, results[fn])
+		depend(functionTargetKey{local: name}, result)
+	}
+	callResult := func(destination functionTargetKey, rhs ir.Node, index, count int) bool {
+		if call, ok := rhs.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
+			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil &&
+				name.Type().NumResults() == count {
+				if result, tracked := results[name.Func][index]; tracked {
+					depend(result, destination)
+					return true
+				}
+			}
+		}
+		return false
 	}
 	write := func(fn *ir.Func, destination functionTargetKey, rhs ir.Node) {
 		for rhs != nil && (rhs.Op() == ir.OCONV || rhs.Op() == ir.OCONVNOP) {
@@ -92,13 +112,8 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 					return
 				}
 			}
-			if call, ok := rhs.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
-				if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
-					if result, tracked := results[name.Func]; tracked {
-						depend(result, destination)
-						return
-					}
-				}
+			if callResult(destination, rhs, 0, 1) {
+				return
 			}
 		}
 		if callee == nil || callee.Func == nil ||
@@ -118,7 +133,7 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 				}
 			}
 		}
-		result, returnsFunction := results[fn]
+		returned := results[fn]
 		sawReturn := false
 		ir.Visit(fn, func(node ir.Node) {
 			switch node := node.(type) {
@@ -129,21 +144,29 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 					if len(node.Lhs) == len(node.Rhs) && node.Op() == ir.OAS2 {
 						localWrite(lhs, node.Rhs[i])
 					} else if name, ok := lhs.(*ir.Name); ok {
-						invalid[functionTargetKey{local: name}] = true
+						key := functionTargetKey{local: name}
+						if _, tracked := locals[fn][name]; tracked && node.Op() == ir.OAS2FUNC &&
+							len(node.Lhs) > 1 && len(node.Rhs) == 1 && callResult(key, node.Rhs[0], i, len(node.Lhs)) {
+							continue
+						}
+						invalid[key] = true
 					}
 				}
 			case *ir.ReturnStmt:
-				if returnsFunction {
-					sawReturn = true
+				sawReturn = true
+				for i, result := range returned {
 					destination := result
-					if name := outputs[fn]; name != nil {
+					if name := outputs[result]; name != nil {
 						destination = functionTargetKey{local: name}
 						if len(node.Results) == 0 {
-							break
+							continue
 						}
 					}
-					if len(node.Results) == 1 {
-						write(fn, destination, node.Results[0])
+					if len(node.Results) == fn.Type().NumResults() {
+						write(fn, destination, node.Results[i])
+					} else if len(node.Results) == 1 && fn.Type().NumResults() > 1 &&
+						callResult(destination, node.Results[0], i, fn.Type().NumResults()) {
+						continue
 					} else {
 						invalid[destination] = true
 					}
@@ -169,10 +192,12 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 				}
 			}
 		})
-		if returnsFunction && !sawReturn {
+		if !sawReturn {
 			// Bodyless declarations and never-returning functions supply no proof
 			// of a returned value, even when a call site has other named writes.
-			invalid[result] = true
+			for _, result := range returned {
+				invalid[result] = true
+			}
 		}
 	}
 	// Compute the least fixed point before pruning unknown or empty vertices.
