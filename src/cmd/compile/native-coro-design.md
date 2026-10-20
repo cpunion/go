@@ -4337,6 +4337,10 @@ normalization exposes its complete ordered initializer prefix before lowering
 the consumer. This includes any earlier callee evaluation and uses the original
 tuple assignment and declarations. A consumer that does not suspend needs the
 same treatment when its initializer contains an await.
+The transformation repeats until no prefix or await can move: exposing a callee
+initializer may make a later argument initializer safe. Each step detaches an
+initializer or replaces an await with a temporary, so the process terminates
+while preserving the original evaluation order.
 
 The existing safe-prefix check governs this transformation. Initializers are
 not hoisted out of short-circuit right operands, across observable earlier

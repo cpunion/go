@@ -158,9 +158,11 @@ func TestLowerTupleCallInitializers(t *testing.T) {
 			}
 			producer := newFunction("producer", nil, fields())
 			consumer := newFunction("consumer", fields(), fields()[:1])
+			chooser := newFunction("chooser", nil, []*types.Field{types.NewField(src.NoXPos, nil, consumer.Type())})
 			parent := newFunction("parent", nil, fields()[:1])
 			yield := ir.NewFunc(src.NoXPos, src.NoXPos, types.NewPkg("runtime", "runtime").Lookup("Gosched"), types.NewSignature(nil, nil, nil))
 			producer.Body = ir.Nodes{newLowerTestCall(yield), ir.NewReturnStmt(src.NoXPos, ir.Nodes{ir.NewInt(src.NoXPos, 7), ir.NewBool(src.NoXPos, true)})}
+			chooser.Body = ir.Nodes{newLowerTestCall(yield), ir.NewReturnStmt(src.NoXPos, ir.Nodes{consumer.Nname})}
 			consumer.Body = ir.Nodes{ir.NewReturnStmt(src.NoXPos, ir.Nodes{consumer.Type().Param(0).Nname.(*ir.Name)})}
 			if suspendingConsumer {
 				consumer.Body.Prepend(newLowerTestCall(yield))
@@ -174,27 +176,46 @@ func TestLowerTupleCallInitializers(t *testing.T) {
 				assignment.Lhs.Append(n)
 				assignment.PtrInit().Append(ir.NewDecl(src.NoXPos, ir.ODCL, n))
 			}
-			outer := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, consumer.Nname, slices.Clone(assignment.Lhs))
+			callee := parent.NewLocal(src.NoXPos, pkg.Lookup("callee"), consumer.Type())
+			choose := newLowerTestCall(chooser)
+			choose.SetType(consumer.Type())
+			calleeAssignment := ir.NewAssignStmt(src.NoXPos, callee, choose)
+			callee.Defn = calleeAssignment
+			calleeAssignment.SetInit(ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, callee)})
+			outer := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, callee, slices.Clone(assignment.Lhs))
 			outer.SetType(types.Types[types.TINT])
 			outer.SetTypecheck(1)
+			outer.SetInit(ir.Nodes{calleeAssignment})
 			conversion := ir.NewConvExpr(src.NoXPos, ir.OCONVNOP, outer.Args[0].Type(), outer.Args[0])
 			conversion.SetTypecheck(1)
 			conversion.SetInit(ir.Nodes{assignment})
 			outer.Args[0] = conversion
 			parent.Body = ir.Nodes{ir.NewReturnStmt(src.NoXPos, ir.Nodes{outer})}
-			plan, err := Analyze([]*ir.Func{parent, producer, consumer}, nil)
+			plan, err := Analyze([]*ir.Func{parent, producer, consumer, chooser}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := 2
+			// Both producer and callee initializers must be detached before
+			// the consumer can be normalized. Preserve their source order.
+			normalizeSingleResultCalls(plan.Functions[parent])
+			prefix := parent.Body[0].Init()
+			if len(prefix) < 2 || prefix[0] != calleeAssignment || prefix[1] != assignment {
+				t.Fatalf("callee/argument prefix order = %v", prefix)
+			}
+			if outer.Fun != callee || inner.Fun != producer.Nname || choose.Fun != chooser.Nname {
+				t.Fatal("normalization changed the source callee identities")
+			}
+			want := 3
 			if suspendingConsumer {
-				want = 3
+				want = 4
 			}
 			result, err := Lower(plan, nil)
 			if err != nil || result.Lowered != want || len(result.Diagnostics) != 0 {
 				t.Fatalf("Lower=(%+v,%v), want %d", result, err, want)
 			}
-			if inner.Fun != producer.Nname || outer.Fun != consumer.Nname || len(outer.Init()) != 0 || len(conversion.Init()) != 0 {
+			// Lowering rewrites an ordinary call's local callee access to
+			// frame storage. Await calls retain their source call nodes.
+			if inner.Fun != producer.Nname || suspendingConsumer && outer.Fun != callee || choose.Fun != chooser.Nname || len(outer.Init()) != 0 || len(conversion.Init()) != 0 {
 				t.Fatal("source call identity or initializer ownership changed")
 			}
 		})
