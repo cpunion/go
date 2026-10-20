@@ -4303,8 +4303,8 @@ an assignment into independent typed temporaries followed by a return of those
 values. The call and its arguments run once, result assignment conversions are
 preserved, and the function's output slots are assigned before its deferred
 cleanup. Existing typed factory result destinations carry the values across
-suspension. Tuple calls nested in argument lists or other expression layouts
-remain outside this normalization boundary.
+suspension. Raw tuple calls in other expression layouts remain outside this
+return normalization boundary.
 
 The effect plan combines suspension, execution constraints, and terminal flags
 from every possible target. When a call requires a continuation, every target
@@ -4326,6 +4326,31 @@ Open function parameters and globals, arbitrary closures and interfaces,
 dynamic go/defer calls, and targets lacking a factory remain outside this slice.
 They still need the typed descriptors described above for general support.
 No runtime, scheduler, cache, factory ABI, or source-annotation change is needed.
+
+### 16.16 Tuple argument call initializers
+
+The frontend expands a call such as `consume(produce())` into a tuple assignment
+to independent typed argument cells in the consumer call's initializer list.
+When that consumer is nested in a return or another supported expression,
+normalization exposes its complete ordered initializer prefix before lowering
+the consumer. This includes any earlier callee evaluation and uses the original
+tuple assignment and declarations. A consumer that does not suspend needs the
+same treatment when its initializer contains an await.
+
+The existing safe-prefix check governs this transformation. Initializers are
+not hoisted out of short-circuit right operands, across observable earlier
+operations, out of repeatedly evaluated loop headers, or through an inlined
+control-flow body. Initializers without an await keep their existing location.
+Raw tuple argument expressions are not expanded by this pass; it consumes the
+frontend's typed initializer form. Ordinary fallback bodies retain the same
+ordered prefix even if another capability prevents native lowering.
+
+The producer and consumer continue to use their independent effect summaries
+and typed factory capabilities, including imported factories. Argument cells
+carry pointer values across either suspension, and result conversion, named
+output assignment, deferred cleanup, panic and Goexit use the existing lowering
+contracts. This adds no runtime, callable/export ABI, source annotation, or
+frame allocation/lifetime policy.
 
 ## 17. Confirmed MVP decisions
 

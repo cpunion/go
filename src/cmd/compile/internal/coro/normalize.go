@@ -10,8 +10,8 @@ import (
 	"cmd/compile/internal/typecheck"
 )
 
-// normalizeSingleResultCalls makes nested single-result awaits and sole
-// multi-result return awaits explicit.
+// normalizeSingleResultCalls makes nested single-result awaits, sole
+// multi-result return awaits, and safe call initializers explicit.
 //
 // The normal ordering pass runs after escape analysis, but coroutine lowering
 // must run before it. Keep this pass deliberately smaller: it only introduces
@@ -108,7 +108,7 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			visit(child)
 			return false
 		})
-		if call, ok := node.(*ir.CallExpr); ok && calls[call] {
+		if call, ok := node.(*ir.CallExpr); ok && (calls[call] || hasAwaitInit(call, calls)) {
 			order = append(order, call)
 		}
 	}
@@ -116,6 +116,18 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 
 	var init ir.Nodes
 	for _, call := range order {
+		if hasAwaitInit(call, calls) && safeCallPrefix(root, call) {
+			// The frontend expands f(g()) into tuple assignments in f's
+			// Init list. Expose those assignments before normalizing f,
+			// preserving the entire ordered prefix, including callee
+			// evaluation. A non-suspending f needs the same treatment.
+			prefix := ir.TakeInit(call)
+			normalizeCallList(prefix, fn, calls)
+			init = append(init, prefix...)
+		}
+		if !calls[call] {
+			continue
+		}
 		if directStatement && directCallStatement(root, call) {
 			continue
 		}
@@ -156,6 +168,18 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 		root = replaceCall(root, call, temp)
 	}
 	return root, init
+}
+
+func hasAwaitInit(call *ir.CallExpr, calls map[*ir.CallExpr]bool) bool {
+	for _, stmt := range call.Init() {
+		if ir.Any(stmt, func(node ir.Node) bool {
+			await, ok := node.(*ir.CallExpr)
+			return ok && calls[await]
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 func directCallStatement(root ir.Node, call *ir.CallExpr) bool {
