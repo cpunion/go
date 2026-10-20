@@ -4253,11 +4253,22 @@ post-terminal reuse. A reduced static call count alone is not a timing claim.
 A direct call through a local function variable can use native continuations
 when every write in its enclosing function assigns a named, context-free,
 non-generic function or nil. The variable cannot be a parameter, an addressed
-cell, or a closure capture. Alias assignments, method values, range bindings,
+cell, or a closure capture. Method values, range bindings,
 implicit type-switch case bindings,
 unknown returned values, and compiler operation recipes retain ordinary calls.
 The proof includes statement initializers and writes after the call; a later
 unsupported write invalidates the entire variable's target set.
+
+Copies between eligible locals form a dependency graph. A whole-body least
+fixed point propagates all named targets and unknown writes through copy chains
+and cycles, including parallel assignments and explicit function-type
+conversions. A seeded cycle shares its reachable targets; a nil-only cycle has
+no factory target and keeps the ordinary call. Any unknown incoming source
+invalidates every dependent, even if a dependent also assigns known functions.
+Implicit range and type-case bindings, addressed or captured source cells, and
+parameters or globals cannot become closed by copying their current values.
+This analysis overapproximates value flow; copying a function value still has
+ordinary Go value semantics and never aliases its variable's storage.
 
 The effect plan combines suspension, execution constraints, and terminal flags
 from every possible target. When a call requires a continuation, every target
