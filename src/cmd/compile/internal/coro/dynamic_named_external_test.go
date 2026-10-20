@@ -47,7 +47,7 @@ func childPanic(which bool) (result any) {defer func(){if v:=recover();v!=nil {r
 func exiting(done chan int) {defer func(){cleanups++}();runtime.Gosched();done<-1;runtime.Goexit()}
 func finishing(done chan int) {runtime.Gosched();done<-2}
 func chooseExit(which bool) (out func(chan int)) {out=finishing;runtime.Gosched();if which {out=exiting};return}
-func childExit(which bool,done chan int) {defer close(done);f:=chooseExit(which);f(done);done<-4}
+func childExit(which bool,done chan int) {defer func(){close(done)}();f:=chooseExit(which);f(done);done<-4}
 var global=callback(second)
 //go:noinline
 func chooseParameter(input callback) (out callback) {out=first;runtime.Gosched();out=input;return}
