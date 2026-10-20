@@ -135,7 +135,7 @@ func main(){
 			{"parameter", "dynamic await site"}, {"globalCopy", "dynamic await site"},
 			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
 			{"lateUnknown", "dynamic await site"}, {"typeCase", "dynamic await site"},
-			{"rangeCopy", "dynamic await site"}, {"multiResult", "dynamic await site"},
+			{"rangeCopy", "unsupported range loop"}, {"multiResult", "dynamic await site"},
 			{"missingFactory", "unsupported coroutine dependency main.missing"},
 		},
 		[]string{"chain", "swapped", "cycle", "self", "nilAlias", "mixed", "pair"})
@@ -174,7 +174,7 @@ func main(){
 }
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/coroalias/...",
+	testSwitchReturnFiles(t, files, "example.com/coroalias/...=",
 		[]switchFallback{{"missingFactory", "unsupported coroutine dependency example.com/coroalias/leaf.Missing"}},
 		[]string{"imported"})
 }
