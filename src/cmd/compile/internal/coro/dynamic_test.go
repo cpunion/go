@@ -23,7 +23,7 @@ func TestLocalFunctionTargets(t *testing.T) {
 		{"branches", 2}, {"converted", 1}, {"parallel", 2}, {"element", 1}, {"zero", 0},
 		{"alias", 0}, {"unknown", 0}, {"multi-result", 0}, {"parameter", 0},
 		{"global", 0}, {"address-flag", 0}, {"address", 0}, {"capture", 0},
-		{"range", 0}, {"closure", 0}, {"shape", 0}, {"method", 0},
+		{"range", 0}, {"type-case", 0}, {"closure", 0}, {"shape", 0}, {"method", 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pkg := types.NewPkg("example.com/coro/dynamicproof/"+test.name, "p")
@@ -72,6 +72,10 @@ func TestLocalFunctionTargets(t *testing.T) {
 				stmt := ir.NewRangeStmt(src.NoXPos, nil, nil, nil, nil, false)
 				stmt.Key = local
 				fn.Body = append(fn.Body, stmt)
+			case "type-case":
+				clause := ir.NewCaseStmt(src.NoXPos, nil, fn.Body)
+				clause.Var = local
+				fn.Body = ir.Nodes{ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})}
 			case "closure":
 				second.OClosure = &ir.ClosureExpr{Func: second}
 				assign.Y = second.OClosure

@@ -106,6 +106,25 @@ func captured(which bool) int {f:=first;change:=func(){f=second};if which {chang
 func missing(x int) int {runtime.Gosched(); goto end; end: return x+30}
 func missingFactory(which bool) int {f:=first;if which {f=missing};value:=f(5);return value}
 func operation(which bool) {f:=runtime.Gosched;if which {f=runtime.Gosched};f()}
+func caseBinding(input any, replace bool) int {
+ switch f:=input.(type) {
+ case func(int)int:
+  if replace {f=first}
+  value:=f(6)
+  return value
+ default:return 0
+ }
+}
+func closedInCase(input any, which bool) int {
+ switch x:=input.(type) {
+ case int:
+  f:=first
+  if which {f=second}
+  value:=f(x)
+  return value
+ default:return 0
+ }
+}
 func main(){
  if choose(0)!=13 || choose(1)!=23 || arguments!=2 {panic("selection or argument evaluation")}
  if repeated()!=105 {panic("repeated dispatch")}
@@ -130,6 +149,8 @@ func main(){
  if _,ok:=<-done;ok || trace!="b;a;v;exit;parent;parent;" {panic("normal cleanup")}
  if parameter(second)!=21 || globalCall(true)!=22 || addressed(true)!=23 || captured(true)!=24 || missingFactory(true)!=35 {panic("fallback result")}
  operation(true)
+ if caseBinding(second,false)!=26 || caseBinding(second,true)!=16 {panic("implicit type-case target")}
+ if closedInCase(2,false)!=12 || closedInCase(2,true)!=22 {panic("closed target inside type case")}
  println("switch-return-ok")
 }
 `
@@ -138,8 +159,9 @@ func main(){
 			{"parameter", "dynamic await site"}, {"globalCall", "dynamic await site"},
 			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
 			{"missingFactory", "unsupported coroutine dependency main.missing"},
+			{"caseBinding", "dynamic await site"},
 		},
-		[]string{"choose", "repeated", "pair", "variadic", "nilCall", "nilSingle", "discarded", "childPanic", "childExit"})
+		[]string{"choose", "repeated", "pair", "variadic", "nilCall", "nilSingle", "discarded", "childPanic", "childExit", "closedInCase"})
 }
 
 func TestDynamicCallImported(t *testing.T) {

@@ -4254,6 +4254,7 @@ A direct call through a local function variable can use native continuations
 when every write in its enclosing function assigns a named, context-free,
 non-generic function or nil. The variable cannot be a parameter, an addressed
 cell, or a closure capture. Alias assignments, method values, range bindings,
+implicit type-switch case bindings,
 unknown returned values, and compiler operation recipes retain ordinary calls.
 The proof includes statement initializers and writes after the call; a later
 unsupported write invalidates the entire variable's target set.

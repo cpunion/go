@@ -67,6 +67,12 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 					invalid[name] = true
 				}
 			}
+		case *ir.CaseClause:
+			// A type-switch case variable receives the selected guard value
+			// implicitly, even when its body also assigns a named function.
+			if node.Var != nil {
+				invalid[node.Var.Canonical()] = true
+			}
 		case *ir.AddrExpr:
 			if name, ok := node.X.(*ir.Name); ok {
 				invalid[name] = true
