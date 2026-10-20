@@ -11,32 +11,56 @@ import (
 	"strings"
 )
 
-// localFunctionTargets proves a closed set of named functions for each local
-// function variable. Every write must be a named function, nil, or another
-// proved local. Addressed and captured variables, parameters, closures, and
-// method values retain the ordinary call boundary. The proof covers the whole
-// body, including writes after the call and writes in statement init lists.
+// functionTargetKey denotes either a local cell or a function's single result.
+// Result vertices belong only to functions in the package being analyzed; this
+// proof is not an exported callable capability.
+type functionTargetKey struct {
+	local  *ir.Name
+	result *ir.Func
+}
+
+// localFunctionTargets is the single-function form of packageFunctionTargets.
 func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
-	targets := make(map[*ir.Name][]*ir.Func)
-	invalid := make(map[*ir.Name]bool)
-	// A copy from source to destination contributes every possible source
-	// target, including writes later in the body. Unknown sources poison all
-	// their dependents, even when a destination also has known writes.
-	dependents := make(map[*ir.Name][]*ir.Name)
-	for _, name := range fn.Dcl {
-		if name.Class == ir.PAUTO && name.Curfn == fn &&
-			name.Type() != nil && name.Type().Kind() == types.TFUNC && !name.Addrtaken() {
-			targets[name] = nil
+	return packageFunctionTargets([]*ir.Func{fn})[fn]
+}
+
+// packageFunctionTargets proves closed sets of named functions for local
+// function variables. Copies and single-result calls form dependencies, and
+// every explicit return contributes to the callee's result vertex. Unknown
+// writes and returns poison their dependents throughout the package, including
+// recursive return/copy cycles. No effects or factory ABIs are inferred here.
+func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Func {
+	locals := make(map[*ir.Func]map[*ir.Name][]*ir.Func)
+	targets := make(map[functionTargetKey][]*ir.Func)
+	invalid := make(map[functionTargetKey]bool)
+	dependents := make(map[functionTargetKey][]functionTargetKey)
+	results := make(map[*ir.Func]functionTargetKey)
+	for _, fn := range funcs {
+		locals[fn] = make(map[*ir.Name][]*ir.Func)
+		for _, name := range fn.Dcl {
+			if name.Class == ir.PAUTO && name.Curfn == fn &&
+				name.Type() != nil && name.Type().Kind() == types.TFUNC && !name.Addrtaken() {
+				locals[fn][name] = nil
+				targets[functionTargetKey{local: name}] = nil
+			}
+		}
+		sig := fn.Type()
+		if resumeFactorySupported(fn) && sig.NumRecvs() == 0 && sig.NumResults() == 1 &&
+			sig.Result(0).Type.Kind() == types.TFUNC &&
+			(sig.Result(0).Sym == nil || sig.Result(0).Sym.IsBlank()) {
+			// A named output cell can be changed by a defer after an explicit
+			// return expression has been evaluated. It needs its own proof.
+			key := functionTargetKey{result: fn}
+			results[fn] = key
+			targets[key] = nil
 		}
 	}
-	write := func(lhs, rhs ir.Node) {
-		name, ok := lhs.(*ir.Name)
-		if !ok {
-			return
+	depend := func(source, destination functionTargetKey) {
+		if !slices.Contains(dependents[source], destination) {
+			dependents[source] = append(dependents[source], destination)
 		}
-		if _, tracked := targets[name]; !tracked {
-			return
-		}
+	}
+	write := func(fn *ir.Func, destination functionTargetKey, rhs ir.Node) {
 		for rhs != nil && (rhs.Op() == ir.OCONV || rhs.Op() == ir.OCONVNOP) {
 			rhs = rhs.(*ir.ConvExpr).X
 		}
@@ -45,73 +69,105 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 		}
 		callee := ir.StaticCalleeName(rhs)
 		if callee == nil {
-			if source, ok := rhs.(*ir.Name); ok {
-				if _, tracked := targets[source]; tracked {
-					if !slices.Contains(dependents[source], name) {
-						dependents[source] = append(dependents[source], name)
-					}
+			if source, ok := rhs.(*ir.Name); ok && source.Curfn == fn {
+				key := functionTargetKey{local: source}
+				if _, tracked := targets[key]; tracked {
+					depend(key, destination)
 					return
+				}
+			}
+			if call, ok := rhs.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
+				if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil {
+					if result, tracked := results[name.Func]; tracked {
+						depend(result, destination)
+						return
+					}
 				}
 			}
 		}
 		if callee == nil || callee.Func == nil ||
 			!resumeFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
-			invalid[name] = true
+			invalid[destination] = true
 			return
 		}
-		if !slices.Contains(targets[name], callee.Func) {
-			targets[name] = append(targets[name], callee.Func)
+		if !slices.Contains(targets[destination], callee.Func) {
+			targets[destination] = append(targets[destination], callee.Func)
 		}
 	}
-	ir.Visit(fn, func(node ir.Node) {
-		switch node := node.(type) {
-		case *ir.AssignStmt:
-			write(node.X, node.Y)
-		case *ir.AssignListStmt:
-			for i, lhs := range node.Lhs {
-				if len(node.Lhs) == len(node.Rhs) && node.Op() == ir.OAS2 {
-					write(lhs, node.Rhs[i])
-				} else if name, ok := lhs.(*ir.Name); ok {
-					invalid[name] = true
+	for _, fn := range funcs {
+		localWrite := func(lhs, rhs ir.Node) {
+			if name, ok := lhs.(*ir.Name); ok {
+				if _, tracked := locals[fn][name]; tracked {
+					write(fn, functionTargetKey{local: name}, rhs)
 				}
-			}
-		case *ir.RangeStmt:
-			for _, lhs := range []ir.Node{node.Key, node.Value} {
-				if name, ok := lhs.(*ir.Name); ok {
-					invalid[name] = true
-				}
-			}
-		case *ir.CaseClause:
-			// A type-switch case variable receives the selected guard value
-			// implicitly, even when its body also assigns a named function.
-			if node.Var != nil {
-				invalid[node.Var.Canonical()] = true
-			}
-		case *ir.AddrExpr:
-			if name, ok := node.X.(*ir.Name); ok {
-				invalid[name] = true
-			}
-		case *ir.ClosureExpr:
-			for _, variable := range node.Func.ClosureVars {
-				invalid[variable.Canonical()] = true
 			}
 		}
-	})
-	// Compute the least fixed point. A seeded cycle acquires all reachable
-	// named targets; a nil-only cycle stays empty and is not lowered. Keep
-	// invalid entries until propagation finishes so unknown values cannot be
-	// hidden by a copy chain or cycle.
-	var pending []*ir.Name
-	queued := make(map[*ir.Name]bool)
-	enqueue := func(name *ir.Name) {
-		if !queued[name] {
-			queued[name] = true
-			pending = append(pending, name)
+		result, returnsFunction := results[fn]
+		sawReturn := false
+		ir.Visit(fn, func(node ir.Node) {
+			switch node := node.(type) {
+			case *ir.AssignStmt:
+				localWrite(node.X, node.Y)
+			case *ir.AssignListStmt:
+				for i, lhs := range node.Lhs {
+					if len(node.Lhs) == len(node.Rhs) && node.Op() == ir.OAS2 {
+						localWrite(lhs, node.Rhs[i])
+					} else if name, ok := lhs.(*ir.Name); ok {
+						invalid[functionTargetKey{local: name}] = true
+					}
+				}
+			case *ir.ReturnStmt:
+				if returnsFunction {
+					sawReturn = true
+					if len(node.Results) == 1 {
+						write(fn, result, node.Results[0])
+					} else {
+						// Named bare returns require a separate output-cell proof. Do not
+						// let an earlier explicit named target hide an implicit result.
+						invalid[result] = true
+					}
+				}
+			case *ir.RangeStmt:
+				for _, lhs := range []ir.Node{node.Key, node.Value} {
+					if name, ok := lhs.(*ir.Name); ok {
+						invalid[functionTargetKey{local: name}] = true
+					}
+				}
+			case *ir.CaseClause:
+				// A type-switch binding receives an unknown guard value implicitly.
+				if node.Var != nil {
+					invalid[functionTargetKey{local: node.Var.Canonical()}] = true
+				}
+			case *ir.AddrExpr:
+				if name, ok := node.X.(*ir.Name); ok {
+					invalid[functionTargetKey{local: name}] = true
+				}
+			case *ir.ClosureExpr:
+				for _, variable := range node.Func.ClosureVars {
+					invalid[functionTargetKey{local: variable.Canonical()}] = true
+				}
+			}
+		})
+		if returnsFunction && !sawReturn {
+			// Bodyless declarations and never-returning functions supply no proof
+			// of a returned value, even when a call site has other named writes.
+			invalid[result] = true
 		}
 	}
-	for name := range targets {
-		if invalid[name] || len(targets[name]) != 0 {
-			enqueue(name)
+	// Compute the least fixed point before pruning unknown or empty vertices.
+	// A seeded cycle acquires every reachable target; a nil-only cycle stays
+	// empty. Invalidity must also cross cycles and later writes.
+	var pending []functionTargetKey
+	queued := make(map[functionTargetKey]bool)
+	enqueue := func(key functionTargetKey) {
+		if !queued[key] {
+			queued[key] = true
+			pending = append(pending, key)
+		}
+	}
+	for key := range targets {
+		if invalid[key] || len(targets[key]) != 0 {
+			enqueue(key)
 		}
 	}
 	for len(pending) != 0 {
@@ -135,14 +191,19 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 			}
 		}
 	}
-	for name, funcs := range targets {
-		if invalid[name] || len(funcs) == 0 {
-			delete(targets, name)
-			continue
+	for _, names := range locals {
+		for name := range names {
+			key := functionTargetKey{local: name}
+			functions := targets[key]
+			if invalid[key] || len(functions) == 0 {
+				delete(names, name)
+				continue
+			}
+			slices.SortFunc(functions, func(a, b *ir.Func) int {
+				return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
+			})
+			names[name] = functions
 		}
-		slices.SortFunc(funcs, func(a, b *ir.Func) int {
-			return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
-		})
 	}
-	return targets
+	return locals
 }
