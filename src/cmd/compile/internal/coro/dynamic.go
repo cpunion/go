@@ -25,7 +25,7 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 }
 
 // packageFunctionTargets proves closed sets of named functions for local
-// function variables. Copies and single-result calls form dependencies, and
+// function variables and result cells. Copies and single-result calls form dependencies, and
 // every explicit return contributes to the callee's result vertex. Unknown
 // writes and returns poison their dependents throughout the package, including
 // recursive return/copy cycles. No effects or factory ABIs are inferred here.
@@ -35,10 +35,11 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 	invalid := make(map[functionTargetKey]bool)
 	dependents := make(map[functionTargetKey][]functionTargetKey)
 	results := make(map[*ir.Func]functionTargetKey)
+	outputs := make(map[*ir.Func]*ir.Name)
 	for _, fn := range funcs {
 		locals[fn] = make(map[*ir.Name][]*ir.Func)
 		for _, name := range fn.Dcl {
-			if name.Class == ir.PAUTO && name.Curfn == fn &&
+			if (name.Class == ir.PAUTO || name.Class == ir.PPARAMOUT) && name.Curfn == fn &&
 				name.Type() != nil && name.Type().Kind() == types.TFUNC && !name.Addrtaken() {
 				locals[fn][name] = nil
 				targets[functionTargetKey{local: name}] = nil
@@ -46,10 +47,18 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 		}
 		sig := fn.Type()
 		if resumeFactorySupported(fn) && sig.NumRecvs() == 0 && sig.NumResults() == 1 &&
-			sig.Result(0).Type.Kind() == types.TFUNC &&
-			(sig.Result(0).Sym == nil || sig.Result(0).Sym.IsBlank()) {
-			// A named output cell can be changed by a defer after an explicit
-			// return expression has been evaluated. It needs its own proof.
+			sig.Result(0).Type.Kind() == types.TFUNC {
+			field := sig.Result(0)
+			if field.Sym != nil && !field.Sym.IsBlank() {
+				name, ok := field.Nname.(*ir.Name)
+				if !ok || name.Class != ir.PPARAMOUT {
+					continue
+				}
+				if _, tracked := locals[fn][name]; !tracked {
+					continue
+				}
+				outputs[fn] = name
+			}
 			key := functionTargetKey{result: fn}
 			results[fn] = key
 			targets[key] = nil
@@ -59,6 +68,13 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 		if !slices.Contains(dependents[source], destination) {
 			dependents[source] = append(dependents[source], destination)
 		}
+	}
+	for fn, name := range outputs {
+		// Named results have ordinary local storage, initially nil. Every
+		// assignment and explicit return writes that cell; a bare return reads
+		// it. Addressing or capturing the cell invalidates its returned value,
+		// including deferred overwrites after an explicit return expression.
+		depend(functionTargetKey{local: name}, results[fn])
 	}
 	write := func(fn *ir.Func, destination functionTargetKey, rhs ir.Node) {
 		for rhs != nil && (rhs.Op() == ir.OCONV || rhs.Op() == ir.OCONVNOP) {
@@ -119,12 +135,17 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 			case *ir.ReturnStmt:
 				if returnsFunction {
 					sawReturn = true
+					destination := result
+					if name := outputs[fn]; name != nil {
+						destination = functionTargetKey{local: name}
+						if len(node.Results) == 0 {
+							break
+						}
+					}
 					if len(node.Results) == 1 {
-						write(fn, result, node.Results[0])
+						write(fn, destination, node.Results[0])
 					} else {
-						// Named bare returns require a separate output-cell proof. Do not
-						// let an earlier explicit named target hide an implicit result.
-						invalid[result] = true
+						invalid[destination] = true
 					}
 				}
 			case *ir.RangeStmt:
