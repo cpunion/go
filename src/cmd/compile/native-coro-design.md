@@ -4252,7 +4252,8 @@ post-terminal reuse. A reduced static call count alone is not a timing claim.
 
 A direct call through a local function variable can use native continuations
 when every write in its enclosing function assigns a named, context-free,
-non-generic function or nil. The variable cannot be a parameter, an addressed
+non-generic function or nil. Function-valued result cells use the same proof.
+The variable cannot be an input parameter, an addressed
 cell, or a closure capture. Method values, range bindings,
 implicit type-switch case bindings,
 unknown returned values, and compiler operation recipes retain ordinary calls.
@@ -4271,13 +4272,20 @@ This analysis overapproximates value flow; copying a function value still has
 ordinary Go value semantics and never aliases its variable's storage.
 
 A static call to a function in the current package can also supply targets
-when that function has one unnamed function-valued result and every explicit
-return is proved. Result vertices join the same dependency graph as locals,
+when that function has one function-valued result and its returned values are
+proved. Result vertices join the same dependency graph as locals,
 so return chains and recursive return/copy cycles reach a least fixed point.
 All returns and local writes participate, including unreachable later writes
 and implicit type/range bindings. Unknown returns invalidate every dependent.
-Named results are excluded because a defer can overwrite their cells after
-the explicit return expression has been evaluated. Bare returns, bodyless
+For a named result, the return vertex depends on the result cell rather than
+only the explicit return expressions. Each explicit return writes that cell;
+bare returns read it, and its initial zero value is nil. All ordinary writes,
+copies, and implicit bindings participate in the same proof. Addressing or
+capturing the cell invalidates it, including a deferred closure that overwrites
+the result after an explicit return expression has been evaluated. A defer that
+cannot access the result cell does not introduce an unknown function value;
+recovery may still return nil, which the existing dispatch handles normally.
+Bare returns without a proved named result, bodyless
 declarations, multi-result producers, method/closure producers, unknown imported
 results and runtime-selected producers retain ordinary boundaries. There is
 no exported return-target summary or new callable ABI. A local producer may
