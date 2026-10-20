@@ -121,6 +121,92 @@ func TestDynamicCallEffects(t *testing.T) {
 	}
 }
 
+func TestLocalFunctionAliasTargets(t *testing.T) {
+	prepareLowerTest(t)
+	for _, test := range []struct {
+		name string
+		want int
+	}{
+		{"chain", 1}, {"converted", 1}, {"diamond", 2}, {"parallel", 2},
+		{"seeded-cycle", 2}, {"self", 1}, {"empty-cycle", 0}, {"nil", 0},
+		{"nil-and-seed", 1}, {"duplicate", 1}, {"isolated-unknown", 1},
+		{"late-unknown", 0}, {"cycle-unknown", 0}, {"parameter", 0},
+		{"global", 0}, {"other-function", 0}, {"address", 0}, {"capture", 0},
+		{"range", 0}, {"type-case", 0}, {"multi-result", 0}, {"closure", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pkg := types.NewPkg("example.com/coro/aliasproof/"+test.name, "p")
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("parent"), types.NewSignature(nil, nil, nil))
+			first := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("first"), fn.Type())
+			second := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("second"), fn.Type())
+			local := func(symbol string) *ir.Name {
+				name := ir.NewNameAt(src.NoXPos, pkg.Lookup(symbol), first.Type())
+				name.Class, name.Curfn = ir.PAUTO, fn
+				fn.Dcl = append(fn.Dcl, name)
+				return name
+			}
+			a, b, c, d := local("a"), local("b"), local("c"), local("d")
+			assign := func(lhs, rhs ir.Node) *ir.AssignStmt { return ir.NewAssignStmt(src.NoXPos, lhs, rhs) }
+			fn.Body = ir.Nodes{assign(a, first.Nname), assign(b, a), assign(c, b), assign(d, c)}
+			switch test.name {
+			case "converted":
+				fn.Body[1].(*ir.AssignStmt).Y = ir.NewConvExpr(src.NoXPos, ir.OCONVNOP, b.Type(), a)
+			case "diamond":
+				fn.Body = append(fn.Body, assign(c, a), assign(b, second.Nname))
+			case "parallel":
+				fn.Body = append(fn.Body, ir.NewAssignListStmt(src.NoXPos, ir.OAS2, ir.Nodes{a, b}, ir.Nodes{b, second.Nname}))
+			case "seeded-cycle":
+				fn.Body = append(fn.Body, assign(a, c), assign(b, second.Nname))
+			case "self":
+				fn.Body = append(fn.Body, assign(b, b))
+			case "empty-cycle":
+				fn.Body[0] = assign(a, c)
+			case "nil":
+				fn.Body[0] = assign(a, ir.NewNilExpr(src.NoXPos, a.Type()))
+			case "nil-and-seed":
+				fn.Body[0] = assign(a, nil)
+				fn.Body = append(fn.Body, assign(b, second.Nname))
+			case "duplicate":
+				fn.Body = append(fn.Body, assign(b, a), assign(b, a))
+			case "isolated-unknown":
+				fn.Body = append(fn.Body, assign(local("unrelated"), newLowerTestCall(second)))
+			case "late-unknown", "cycle-unknown":
+				fn.Body = append(fn.Body, assign(a, newLowerTestCall(second)), assign(d, first.Nname))
+				if test.name == "cycle-unknown" {
+					fn.Body = append(fn.Body, assign(a, d))
+				}
+			case "parameter":
+				a.Class = ir.PPARAM
+			case "global":
+				a.Class = ir.PEXTERN
+			case "other-function":
+				a.Curfn = second
+			case "address":
+				fn.Body = append(fn.Body, ir.NewAddrExpr(src.NoXPos, a))
+			case "capture":
+				second.ClosureVars = []*ir.Name{ir.NewClosureVar(src.NoXPos, second, a)}
+				fn.Body = append(fn.Body, &ir.ClosureExpr{Func: second})
+			case "range":
+				stmt := ir.NewRangeStmt(src.NoXPos, nil, nil, nil, nil, false)
+				stmt.Value = a
+				fn.Body = append(fn.Body, stmt)
+			case "type-case":
+				clause := ir.NewCaseStmt(src.NoXPos, nil, fn.Body)
+				clause.Var = a
+				fn.Body = ir.Nodes{ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})}
+			case "multi-result":
+				fn.Body = append(fn.Body, ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC, ir.Nodes{a}, ir.Nodes{second.Nname}))
+			case "closure":
+				fn.Body = append(fn.Body, assign(a, &ir.ClosureExpr{Func: second}))
+			}
+			got := localFunctionTargets(fn)[d]
+			if len(got) != test.want || test.want == 2 && (got[0] != first || got[1] != second) {
+				t.Fatalf("targets=%v, want %d sorted targets", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLowerDynamicCall(t *testing.T) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
@@ -145,11 +231,15 @@ func TestLowerDynamicCall(t *testing.T) {
 	local := ir.NewNameAt(src.NoXPos, pkg.Lookup("f"), first.Type())
 	local.Class, local.Curfn = ir.PAUTO, parent
 	parent.Dcl = append(parent.Dcl, local)
+	alias := ir.NewNameAt(src.NoXPos, pkg.Lookup("alias"), first.Type())
+	alias.Class, alias.Curfn = ir.PAUTO, parent
+	parent.Dcl = append(parent.Dcl, alias)
 	argument := typedInt(src.NoXPos, types.Types[types.TINT], 42)
-	call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, local, ir.Nodes{argument})
+	call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, alias, ir.Nodes{argument})
 	call.SetTypecheck(1)
 	parent.Body = ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, local), ir.NewAssignStmt(src.NoXPos, local, first.Nname),
-		ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), ir.Nodes{ir.NewAssignStmt(src.NoXPos, local, second.Nname)}, nil), call, newLowerTestReturn()}
+		ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), ir.Nodes{ir.NewAssignStmt(src.NoXPos, local, second.Nname)}, nil),
+		ir.NewDecl(src.NoXPos, ir.ODCL, alias), ir.NewAssignStmt(src.NoXPos, alias, local), call, newLowerTestReturn()}
 	plan, err := Analyze([]*ir.Func{first, second, parent}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +262,7 @@ func TestLowerDynamicCall(t *testing.T) {
 	if err != nil || got.Lowered != 3 {
 		t.Fatalf("Lower=(%+v,%v)", got, err)
 	}
-	if call.Fun != local || len(call.Args) != 1 || call.Args[0] != argument {
+	if call.Fun != alias || len(call.Args) != 1 || call.Args[0] != argument {
 		t.Fatal("original dynamic call changed")
 	}
 	if plan.Functions[first].Factory != FactoryABI3 || plan.Functions[second].Factory != FactoryABI1 {

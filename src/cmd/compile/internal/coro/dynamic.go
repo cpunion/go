@@ -12,13 +12,17 @@ import (
 )
 
 // localFunctionTargets proves a closed set of named functions for each local
-// function variable. Every write must be a named function or nil. Addressed and
-// captured variables, parameters, aliases, closures, and method values retain
-// the ordinary call boundary. The proof covers the whole body, including writes
-// after the call and writes in statement init lists.
+// function variable. Every write must be a named function, nil, or another
+// proved local. Addressed and captured variables, parameters, closures, and
+// method values retain the ordinary call boundary. The proof covers the whole
+// body, including writes after the call and writes in statement init lists.
 func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 	targets := make(map[*ir.Name][]*ir.Func)
 	invalid := make(map[*ir.Name]bool)
+	// A copy from source to destination contributes every possible source
+	// target, including writes later in the body. Unknown sources poison all
+	// their dependents, even when a destination also has known writes.
+	dependents := make(map[*ir.Name][]*ir.Name)
 	for _, name := range fn.Dcl {
 		if name.Class == ir.PAUTO && name.Curfn == fn &&
 			name.Type() != nil && name.Type().Kind() == types.TFUNC && !name.Addrtaken() {
@@ -40,6 +44,16 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 			return
 		}
 		callee := ir.StaticCalleeName(rhs)
+		if callee == nil {
+			if source, ok := rhs.(*ir.Name); ok {
+				if _, tracked := targets[source]; tracked {
+					if !slices.Contains(dependents[source], name) {
+						dependents[source] = append(dependents[source], name)
+					}
+					return
+				}
+			}
+		}
 		if callee == nil || callee.Func == nil ||
 			!resumeFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
 			invalid[name] = true
@@ -83,6 +97,44 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 			}
 		}
 	})
+	// Compute the least fixed point. A seeded cycle acquires all reachable
+	// named targets; a nil-only cycle stays empty and is not lowered. Keep
+	// invalid entries until propagation finishes so unknown values cannot be
+	// hidden by a copy chain or cycle.
+	var pending []*ir.Name
+	queued := make(map[*ir.Name]bool)
+	enqueue := func(name *ir.Name) {
+		if !queued[name] {
+			queued[name] = true
+			pending = append(pending, name)
+		}
+	}
+	for name := range targets {
+		if invalid[name] || len(targets[name]) != 0 {
+			enqueue(name)
+		}
+	}
+	for len(pending) != 0 {
+		source := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		queued[source] = false
+		for _, destination := range dependents[source] {
+			if invalid[destination] {
+				continue
+			}
+			if invalid[source] {
+				invalid[destination] = true
+				enqueue(destination)
+				continue
+			}
+			for _, target := range targets[source] {
+				if !slices.Contains(targets[destination], target) {
+					targets[destination] = append(targets[destination], target)
+					enqueue(destination)
+				}
+			}
+		}
+	}
 	for name, funcs := range targets {
 		if invalid[name] || len(funcs) == 0 {
 			delete(targets, name)
