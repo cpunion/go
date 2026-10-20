@@ -10,8 +10,8 @@ import (
 	"cmd/compile/internal/typecheck"
 )
 
-// normalizeSingleResultCalls makes nested single-result awaits and sole
-// multi-result return awaits explicit.
+// normalizeSingleResultCalls makes nested single-result awaits, sole
+// multi-result return awaits, and safe call initializers explicit.
 //
 // The normal ordering pass runs after escape analysis, but coroutine lowering
 // must run before it. Keep this pass deliberately smaller: it only introduces
@@ -98,7 +98,7 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 
 func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	calls map[*ir.CallExpr]bool, directStatement bool) (ir.Node, ir.Nodes) {
-	var order []*ir.CallExpr
+	var order []ir.Node
 	var visit func(ir.Node)
 	visit = func(node ir.Node) {
 		if node == nil {
@@ -109,53 +109,93 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			return false
 		})
 		if call, ok := node.(*ir.CallExpr); ok && calls[call] {
-			order = append(order, call)
+			order = append(order, node)
+		} else if node.Op() != ir.OINLCALL && node.Type() != nil && hasAwaitInit(node, calls) {
+			order = append(order, node)
 		}
 	}
 	visit(root)
 
 	var init ir.Nodes
-	for _, call := range order {
-		if directStatement && directCallStatement(root, call) {
-			continue
-		}
-		if hasNestedCall(call, calls) ||
-			!safeCallPrefix(root, call) {
-			continue
-		}
-		if call.Type().IsFuncArgStruct() {
-			ret, ok := root.(*ir.ReturnStmt)
-			if !ok || len(ret.Results) != 1 || ret.Results[0] != call ||
-				call.Fun.Type().NumResults() != fn.Type().NumResults() || fn.Type().NumResults() < 2 {
+	// Exposing a call's initializer can make an argument initializer safe on
+	// the next pass. Each change removes an initializer or await from root,
+	// so this reaches a fixed point without duplicating an evaluation.
+	for {
+		changed := false
+		for _, node := range order {
+			if hasAwaitInit(node, calls) && safeCallPrefix(root, node) {
+				// The frontend expands f(g()) into tuple assignments in an
+				// argument conversion's Init list or the call's Init list.
+				// Expose the entire ordered prefix before normalizing f,
+				// including earlier callee evaluation. A non-suspending f
+				// needs the same treatment.
+				prefix := ir.TakeInit(node)
+				normalizeCallList(prefix, fn, calls)
+				init = append(init, prefix...)
+				changed = true
+			}
+			call, ok := node.(*ir.CallExpr)
+			if !ok || !calls[call] {
 				continue
 			}
-			// The call is the only return expression. Its result destinations
-			// must be independent typed cells, evaluated before assigning the
-			// function's output slots and running its deferred cleanup.
-			var values, declarations ir.Nodes
-			for _, result := range fn.Type().Results() {
-				temp := typecheck.TempAt(call.Pos(), fn, result.Type)
-				values.Append(temp)
-				declarations.Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+			if directStatement && directCallStatement(root, call) {
+				continue
 			}
-			assign := ir.NewAssignListStmt(call.Pos(), ir.OAS2, values, ir.Nodes{call})
-			assign.SetInit(declarations)
-			for _, value := range values {
-				value.Name().Defn = assign
+			if hasNestedCall(call, calls) ||
+				!safeCallPrefix(root, call) {
+				continue
 			}
-			init.Append(typecheck.Stmt(assign))
-			ret.Results = values
-			continue
-		}
+			if call.Type().IsFuncArgStruct() {
+				ret, ok := root.(*ir.ReturnStmt)
+				if !ok || len(ret.Results) != 1 || ret.Results[0] != call ||
+					call.Fun.Type().NumResults() != fn.Type().NumResults() || fn.Type().NumResults() < 2 {
+					continue
+				}
+				// The call is the only return expression. Its result destinations
+				// must be independent typed cells, evaluated before assigning the
+				// function's output slots and running its deferred cleanup.
+				var values, declarations ir.Nodes
+				for _, result := range fn.Type().Results() {
+					temp := typecheck.TempAt(call.Pos(), fn, result.Type)
+					values.Append(temp)
+					declarations.Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+				}
+				assign := ir.NewAssignListStmt(call.Pos(), ir.OAS2, values, ir.Nodes{call})
+				assign.SetInit(declarations)
+				for _, value := range values {
+					value.Name().Defn = assign
+				}
+				init.Append(typecheck.Stmt(assign))
+				ret.Results = values
+				changed = true
+				continue
+			}
 
-		temp := typecheck.TempAt(call.Pos(), fn, call.Type())
-		assign := ir.NewAssignStmt(call.Pos(), temp, call)
-		assign.PtrInit().Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
-		temp.Defn = assign
-		init.Append(typecheck.Stmt(assign))
-		root = replaceCall(root, call, temp)
+			temp := typecheck.TempAt(call.Pos(), fn, call.Type())
+			assign := ir.NewAssignStmt(call.Pos(), temp, call)
+			assign.PtrInit().Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+			temp.Defn = assign
+			init.Append(typecheck.Stmt(assign))
+			root = replaceCall(root, call, temp)
+			changed = true
+		}
+		if !changed {
+			break
+		}
 	}
 	return root, init
+}
+
+func hasAwaitInit(node ir.Node, calls map[*ir.CallExpr]bool) bool {
+	for _, stmt := range node.Init() {
+		if ir.Any(stmt, func(node ir.Node) bool {
+			await, ok := node.(*ir.CallExpr)
+			return ok && calls[await]
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 func directCallStatement(root ir.Node, call *ir.CallExpr) bool {
@@ -180,7 +220,7 @@ func hasNestedCall(root *ir.CallExpr, calls map[*ir.CallExpr]bool) bool {
 // safeCallPrefix reports whether hoisting target before root preserves every
 // observable operation that precedes target. Short-circuit right operands are
 // conditional and therefore cannot be hoisted.
-func safeCallPrefix(root ir.Node, target *ir.CallExpr) bool {
+func safeCallPrefix(root, target ir.Node) bool {
 	if root == target {
 		return true
 	}
@@ -213,7 +253,7 @@ func safeCallPrefix(root ir.Node, target *ir.CallExpr) bool {
 	return found && safe
 }
 
-func containsCall(root ir.Node, target *ir.CallExpr) bool {
+func containsCall(root, target ir.Node) bool {
 	return ir.Any(root, func(node ir.Node) bool {
 		return node == target
 	})
