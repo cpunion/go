@@ -4270,6 +4270,21 @@ parameters or globals cannot become closed by copying their current values.
 This analysis overapproximates value flow; copying a function value still has
 ordinary Go value semantics and never aliases its variable's storage.
 
+A static call to a function in the current package can also supply targets
+when that function has one unnamed function-valued result and every explicit
+return is proved. Result vertices join the same dependency graph as locals,
+so return chains and recursive return/copy cycles reach a least fixed point.
+All returns and local writes participate, including unreachable later writes
+and implicit type/range bindings. Unknown returns invalidate every dependent.
+Named results are excluded because a defer can overwrite their cells after
+the explicit return expression has been evaluated. Bare returns, bodyless
+declarations, multi-result producers, method/closure producers, unknown imported
+results and runtime-selected producers retain ordinary boundaries. There is
+no exported return-target summary or new callable ABI. A local producer may
+return imported named targets, whose independent factory capabilities remain
+required. The producer call and returned function call each retain their normal
+effects, evaluation order, result storage and continuation dependencies.
+
 The effect plan combines suspension, execution constraints, and terminal flags
 from every possible target. When a call requires a continuation, every target
 must provide the existing typed factory capability. Dependency rejection removes

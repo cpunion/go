@@ -304,8 +304,9 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 			}
 		}
 	}
+	callableTargets := packageFunctionTargets(funcs)
 	for _, function := range p.Functions {
-		p.scan(function)
+		p.scan(function, callableTargets[function.Func])
 	}
 
 	ir.VisitFuncsBottomUp(funcs, func(funcs []*ir.Func, recursive bool) {
@@ -393,7 +394,7 @@ func Analyze(funcs []*ir.Func, cgoDirectives [][]string) (*Plan, error) {
 	return p, nil
 }
 
-func (p *Plan) scan(function *Function) {
+func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 	// An ABI adapter for a generated cgo wrapper calls the wrapper with the
 	// same symbol name. The direct-call metadata describes source calls to
 	// that wrapper, not this compiler-generated adapter.
@@ -403,7 +404,6 @@ func (p *Plan) scan(function *Function) {
 			return
 		}
 	}
-	localTargets := localFunctionTargets(function.Func)
 	for name, targets := range localTargets {
 		for _, target := range targets {
 			if _, operation := p.operationRecipe(target); operation {
