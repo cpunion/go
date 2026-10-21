@@ -509,6 +509,8 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 		calleeCall := call
 		if kind == GoCall {
 			calleeCall = unwrapGoCall(call)
+		} else if kind == DeferCall {
+			calleeCall = unwrapDynamicDeferCall(call)
 		}
 		if calleeCall.Op() == ir.OCALLFUNC {
 			if name := ir.StaticCalleeName(ir.StaticValue(calleeCall.Fun)); name != nil {
@@ -522,7 +524,7 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 			} else {
 				edge.CalleeName = "<dynamic>"
 				edge.Unknown = true
-				if name, ok := calleeCall.Fun.(*ir.Name); ok && (kind == DirectCall || kind == GoCall) {
+				if name, ok := calleeCall.Fun.(*ir.Name); ok {
 					edge.Targets = localTargets[name]
 					edge.FactoryRequired = p.callbackParameters[name]
 					if len(edge.Targets) != 0 {

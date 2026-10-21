@@ -126,14 +126,17 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 		}
 	}
 	for _, fn := range funcs {
-		goWrappers := make(map[*ir.Func]bool)
+		operandWrappers := make(map[*ir.Func]bool)
 		ir.Visit(fn, func(node ir.Node) {
 			stmt, ok := node.(*ir.GoDeferStmt)
-			if !ok || stmt.Op() != ir.OGO {
+			if !ok {
 				return
 			}
-			if call, ok := stmt.Call.(*ir.CallExpr); ok && unwrapGoCall(call) != call {
-				goWrappers[call.Fun.(*ir.ClosureExpr).Func] = true
+			if call, ok := stmt.Call.(*ir.CallExpr); ok {
+				if stmt.Op() == ir.OGO && unwrapGoCall(call) != call ||
+					stmt.Op() == ir.ODEFER && unwrapDynamicDeferCall(call) != call {
+					operandWrappers[call.Fun.(*ir.ClosureExpr).Func] = true
+				}
 			}
 		})
 		localWrite := func(lhs, rhs ir.Node) {
@@ -197,10 +200,10 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 					invalid[functionTargetKey{local: name}] = true
 				}
 			case *ir.ClosureExpr:
-				// A validated frontend go wrapper only reads the caller's
+				// A validated frontend go/defer wrapper only reads the caller's
 				// operand snapshots. It cannot mutate a function cell or
 				// introduce a new target through its capture.
-				if goWrappers[node.Func] {
+				if operandWrappers[node.Func] {
 					break
 				}
 				for _, variable := range node.Func.ClosureVars {

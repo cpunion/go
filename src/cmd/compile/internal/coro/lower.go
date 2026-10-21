@@ -140,6 +140,8 @@ type lowerDefer struct {
 	statement       *ir.GoDeferStmt
 	call            *ir.CallExpr
 	armed           *ir.Name
+	snapshotCallee  bool
+	calleeSnapshot  *ir.Name
 	sourceLiteral   bool
 	literalCaptures []*ir.Name
 	rewriteTerminal TerminalFlags
@@ -1015,7 +1017,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	for _, deferred := range defers {
 		edge, ok := edges[deferred.call]
-		if !ok || edge.Kind != DeferCall || edge.Callee == nil {
+		if !ok || edge.Kind != DeferCall || edge.Callee == nil && len(edge.Targets) == 0 {
 			return nil, fmt.Errorf("defer has no static call plan")
 		}
 		if edge.Unknown {
@@ -1028,6 +1030,27 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if summary.Exec != 0 {
 			return nil, fmt.Errorf("defer target has execution constraints %s",
 				summary.Exec)
+		}
+		if len(edge.Targets) != 0 {
+			if unwrapDynamicDeferCall(deferred.call) == deferred.call {
+				name, ok := deferred.call.Fun.(*ir.Name)
+				if !ok || name.Curfn != fn {
+					return nil, fmt.Errorf("dynamic defer has no frozen callee")
+				}
+				// A func() call is already normalized without a wrapper.
+				// Save the selected value before arming a fixed defer site.
+				// Repeated sites save it directly in the common defer stack.
+				deferred.snapshotCallee = true
+			}
+			if summary.Terminal != 0 {
+				return nil, fmt.Errorf("dynamic defer target has terminal control %s",
+					summary.Terminal)
+			}
+			// Keep the ordinary wrapper: normalization already froze its
+			// callee and arguments at registration. The existing defer stack
+			// snapshots repeated registrations and catches implicit panics,
+			// including a nil function called only during cleanup.
+			continue
 		}
 		closure, isClosure := deferred.call.Fun.(*ir.ClosureExpr)
 		if edge.Callee.OClosure != nil {
@@ -2623,6 +2646,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			addDeclaration(ir.NewDecl(pos, ir.ODCL, deferToken))
 		}
 		if !candidate.dynamicDefers {
+			if deferred.snapshotCallee {
+				deferred.calleeSnapshot = typecheck.TempAt(deferred.statement.Pos(), factory,
+					deferred.call.Fun.Type())
+				addDeclaration(ir.NewDecl(deferred.statement.Pos(), ir.ODCL,
+					deferred.calleeSnapshot))
+			}
 			deferred.armed = typecheck.TempAt(deferred.statement.Pos(), factory,
 				types.Types[types.TBOOL])
 			addDeclaration(ir.NewDecl(deferred.statement.Pos(), ir.ODCL,
@@ -3766,6 +3795,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
 						stack, appendCall))
 				} else {
+					if deferred.calleeSnapshot != nil {
+						body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
+							capture(deferred.calleeSnapshot), edit(deferred.call.Fun)))
+					}
 					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
 						capture(deferred.armed),
 						ir.NewBasicLit(deferStmt.Pos(),
@@ -3923,6 +3956,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						ir.NewBasicLit(deferred.statement.Pos(),
 							types.Types[types.TBOOL], constant.MakeBool(false)))
 					fun := edit(deferred.call.Fun)
+					if deferred.calleeSnapshot != nil {
+						fun = capture(deferred.calleeSnapshot)
+					}
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
 						fun, nil, false))
 					if deferred.namedRecover {
