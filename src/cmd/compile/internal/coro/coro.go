@@ -500,7 +500,7 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 			} else {
 				edge.CalleeName = "<dynamic>"
 				edge.Unknown = true
-				if name, ok := calleeCall.Fun.(*ir.Name); ok && kind == DirectCall {
+				if name, ok := calleeCall.Fun.(*ir.Name); ok && (kind == DirectCall || kind == GoCall) {
 					edge.Targets = localTargets[name]
 					if len(edge.Targets) != 0 {
 						edge.Unknown = false

@@ -4323,7 +4323,8 @@ ownership use the same contracts as static calls.
 
 The original public body remains available for ordinary-context selection.
 Open function parameters and globals, arbitrary closures and interfaces,
-dynamic go/defer calls, and targets lacking a factory remain outside this slice.
+dynamic defer calls, and targets lacking a factory remain outside this slice.
+Closed local go calls use the additional rules in section 16.17.
 They still need the typed descriptors described above for general support.
 No runtime, scheduler, cache, factory ABI, or source-annotation change is needed.
 
@@ -4356,6 +4357,43 @@ carry pointer values across either suspension, and result conversion, named
 output assignment, deferred cleanup, panic and Goexit use the existing lowering
 contracts. This adds no runtime, callable/export ABI, source annotation, or
 frame allocation/lifetime policy.
+
+### 16.17 Closed local function-value go calls
+
+The same closed named-target proof used by local function-value awaits also
+admits a go statement. Every possible target must provide its independent
+typed factory. A locally demanded bounded plain target may use the existing
+plain spawn adapter; an unavailable imported adapter or any rejected target
+keeps the creator's ordinary body. Child suspension and terminal effects do
+not become effects of the creator. Creating a child requires task context,
+but does not await its completion.
+
+Frontend go wrappers snapshot the function value and arguments in the caller.
+A wrapper may be unpacked only when it is the frontend's single-call shape,
+with an exact named target or a captured caller function temporary. These
+validated wrappers do not invalidate the local target proof: they only read
+the frozen operands. Source closures, addressed cells, open parameters and
+globals, interface calls and unrecognized wrappers retain ordinary boundaries.
+The original wrapper and initializer remain available for fallback.
+
+Lowering freezes the function and arguments once before dispatch. A non-nil
+function selects its proved target by entry PC and creates an independent
+child through that target's existing factory ABI. Result destinations are
+separate typed allocations for each child, even when the source discards the
+results and the creator returns while children remain parked. Closure and
+explicit-frame factories join through the existing frame/resume pair.
+
+A nil function is handled after argument evaluation, before inspecting its
+entry PC. This branch emits an ordinary frontend-normalized go statement using
+the already frozen operands. It preserves the runtime's fatal nil-go startup
+for a zero-argument entry, and a child nil-call panic when a wrapper is needed.
+The creator cannot recover a child failure. An argument panic or Goexit still
+runs in the creator before any child is started. A non-nil child uses native
+spawn and retains independent panic, Goexit and defer ownership.
+
+This does not admit arbitrary callbacks passed to WaitGroup.Go or add general
+closure/interface dispatch. It changes no runtime, callable/export ABI,
+annotation vocabulary, frame cache, or allocation lifetime policy.
 
 ## 17. Confirmed MVP decisions
 

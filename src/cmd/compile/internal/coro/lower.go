@@ -129,6 +129,11 @@ type lowerFactoryCall struct {
 	setup  ir.Nodes
 	frame  ir.Node
 	resume ir.Node
+	// Dynamic spawn dispatch executes only for a non-nil frozen callee.
+	// The nil branch retains the frontend's ordinary go startup semantics.
+	spawnGuard ir.Node
+	spawnSetup ir.Nodes
+	nilSpawn   ir.Node
 }
 
 type lowerDefer struct {
@@ -278,14 +283,23 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			continue
 		}
 		for _, edge := range function.Edges {
-			if edge.Kind != GoCall || factories[edge.Callee] != nil {
+			if edge.Kind != GoCall {
 				continue
 			}
-			child := plan.Functions[edge.Callee]
-			if plainSpawnFactorySupported(child) {
-				factories[edge.Callee] = newPlainSpawnFactory(child.Func,
-					unwrapGoCall(edge.Node).Fun)
-				child.Factory = FactoryABI1
+			targets := edge.Targets
+			if len(targets) == 0 {
+				targets = []*ir.Func{edge.Callee}
+			}
+			for _, target := range targets {
+				child := plan.Functions[target]
+				if factories[target] == nil && plainSpawnFactorySupported(child) {
+					callee := unwrapGoCall(edge.Node).Fun
+					if len(edge.Targets) != 0 {
+						callee = target.Nname
+					}
+					factories[target] = newPlainSpawnFactory(child.Func, callee)
+					child.Factory = FactoryABI1
+				}
 			}
 		}
 	}
@@ -925,15 +939,21 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested spawn site %d", site.ID)
 			}
 			edge := edges[call]
-			if edge.Callee == nil {
+			if edge.Callee == nil && len(edge.Targets) == 0 {
 				return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
 			}
 			if _, known := plan.edgeSummary(edge); !known {
 				return nil, fmt.Errorf("unknown spawn target")
 			}
-			candidate.dependencies[edge.Callee] = true
-			if edge.Callee == fn {
-				candidate.selfSpawn = true
+			targets := edge.Targets
+			if len(targets) == 0 {
+				targets = []*ir.Func{edge.Callee}
+			}
+			for _, target := range targets {
+				candidate.dependencies[target] = true
+				if target == fn {
+					candidate.selfSpawn = true
+				}
 			}
 		case SiteForeign:
 			if site.Foreign != DirectNoBlock && site.Foreign != DirectMayBlock &&
@@ -3352,8 +3372,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 		// Evaluate the function value and every argument before inspecting the
 		// entry PC. In particular a nil function panics only after its arguments
-		// have run. A selected child is then awaited through the existing frame
-		// ABI; neither the operands nor the dispatch run again on resumption.
+		// have run. A selected child uses the existing frame ABI for await or
+		// spawn; neither the operands nor the dispatch run again on resumption.
 		var setup ir.Nodes
 		freeze := func(value ir.Node) *ir.Name {
 			temp := typecheck.TempAt(call.Pos(), resume, value.Type())
@@ -3362,19 +3382,24 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				ir.NewAssignStmt(call.Pos(), temp, value))
 			return temp
 		}
-		fun := freeze(edit(call.Fun))
-		args := make(ir.Nodes, len(call.Args))
-		for i, arg := range call.Args {
+		sourceCall := call
+		if edge.Kind == GoCall {
+			sourceCall = unwrapGoCall(call)
+		}
+		fun := freeze(edit(sourceCall.Fun))
+		args := make(ir.Nodes, len(sourceCall.Args))
+		for i, arg := range sourceCall.Args {
 			args[i] = freeze(edit(arg))
 		}
-		pc := freeze(ir.FuncPC(call.Pos(),
-			typecheck.Conv(fun, types.Types[types.TINTER]), obj.ABIInternal))
 		frame := freeze(ir.NewNilExpr(call.Pos(), types.Types[types.TUNSAFEPTR]))
 		childResume := freeze(ir.NewNilExpr(call.Pos(), stacklessResumeType()))
+		prefix := len(setup)
+		pc := freeze(ir.FuncPC(call.Pos(),
+			typecheck.Conv(fun, types.Types[types.TINTER]), obj.ABIInternal))
 		var dispatch ir.Nodes
 		for i := len(edge.Targets) - 1; i >= 0; i-- {
 			target := edge.Targets[i]
-			selected := Edge{Kind: DirectCall, Callee: target, CalleeName: ir.PkgFuncName(target)}
+			selected := Edge{Kind: edge.Kind, Callee: target, CalleeName: ir.PkgFuncName(target)}
 			child, err := staticFactoryCall(call, statement, selected, args)
 			if err != nil {
 				return lowerFactoryCall{}, err
@@ -3400,6 +3425,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			dispatch = ir.Nodes{ir.NewIfStmt(call.Pos(), condition, body, dispatch)}
 		}
 		setup = append(setup, dispatch...)
+		if edge.Kind == GoCall {
+			var ordinary ir.Node
+			ir.WithFunc(resume, func() {
+				invoke := typecheck.Call(call.Pos(), fun, args, sourceCall.IsDDD)
+				ordinary = typecheck.Stmt(ir.NewGoDeferStmt(call.Pos(), ir.OGO, invoke))
+			})
+			return lowerFactoryCall{
+				setup: setup[:prefix], frame: frame, resume: childResume,
+				spawnGuard: ir.NewBinaryExpr(call.Pos(), ir.ONE, fun,
+					ir.NewNilExpr(call.Pos(), fun.Type())),
+				spawnSetup: setup[prefix:], nilSpawn: ordinary,
+			}, nil
+		}
 		return lowerFactoryCall{setup: setup, frame: frame, resume: childResume}, nil
 	}
 
@@ -3750,8 +3788,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						name = "coroSpawnFrame"
 						args = ir.Nodes{ctx, child.frame, child.resume}
 					}
-					body = append(body, typecheck.Call(goStmt.Pos(),
-						typecheck.LookupRuntime(name), args, false))
+					spawn := typecheck.Call(goStmt.Pos(),
+						typecheck.LookupRuntime(name), args, false)
+					if child.spawnGuard != nil {
+						invoke := append(child.spawnSetup, spawn)
+						body = append(body, ir.NewIfStmt(goStmt.Pos(), child.spawnGuard,
+							invoke, ir.Nodes{child.nilSpawn}))
+					} else {
+						body = append(body, spawn)
+					}
 					continue
 				}
 			}
