@@ -268,7 +268,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				fmt.Sprintf("%s: %v", ir.PkgFuncName(function.Func), err))
 			continue
 		}
-		if bodies != nil && !bodies.Have(function.Func) {
+		if bodies != nil && plan.specializedBodies[function.Func] == nil && !bodies.Have(function.Func) {
 			result.Diagnostics = append(result.Diagnostics,
 				fmt.Sprintf("%s: ordinary body unavailable", ir.PkgFuncName(function.Func)))
 			continue
@@ -278,6 +278,19 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 
 	factories := make(map[*ir.Func]*ir.Func)
+	var callbackTargets []*ir.Func
+	for target := range plan.callbackFactories {
+		callbackTargets = append(callbackTargets, target)
+	}
+	slices.SortFunc(callbackTargets, func(a, b *ir.Func) int {
+		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
+	})
+	for _, target := range callbackTargets {
+		if child := plan.Functions[target]; plainSpawnFactorySupported(child) {
+			factories[target] = newPlainSpawnFactory(target, target.Nname)
+			child.Factory = FactoryABI1
+		}
+	}
 	for _, function := range functions {
 		if candidates[function.Func] == nil {
 			continue
@@ -374,7 +387,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		if candidate == nil {
 			continue
 		}
-		if bodies != nil {
+		if bodies != nil && plan.specializedBodies[function.Func] == nil {
 			candidate.ordinary = bodies.Read(function.Func)
 			if candidate.ordinary == nil {
 				return result, fmt.Errorf("%s: missing admitted ordinary body", ir.PkgFuncName(function.Func))
@@ -439,6 +452,15 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
+		if build := plan.specializedBodies[function.Func]; build != nil {
+			// A rejected caller can still invoke a private helper's ordinary
+			// entry. In particular recover must then run directly in its
+			// deferred Go frame, never through a fresh root scheduler.
+			ordinary := build()
+			remapOrdinaryBody(function.Func, ordinary)
+			function.Func.Body = ordinary.Body
+			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
+		}
 		if function.Primary == CoroPrimary {
 			result.Skipped++
 		}

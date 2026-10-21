@@ -149,7 +149,7 @@ func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallb
 	testSwitchReturnFiles(t, map[string]string{"main.go": source}, "", fallback, lowered)
 }
 
-func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string, fallback []switchFallback, lowered []string) {
+func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string, fallback []switchFallback, lowered []string, extraFlags ...string) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
 	if !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64" ||
@@ -183,6 +183,9 @@ func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string
 		t.Run(test.name, func(t *testing.T) {
 			exe := filepath.Join(t.TempDir(), "switchreturn.exe")
 			args := []string{"build"}
+			if test.experiment == "coro" {
+				args = append(args, extraFlags...)
+			}
 			if test.name == "coro/checkptr" {
 				args = append(args, "-gcflags=all=-d=checkptr=2")
 			}

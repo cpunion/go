@@ -1312,8 +1312,9 @@ Tests
 require native caller entries with and without inlining, exercise a registered
 waiter before release, repeated reuse and GC, and check ordinary synctest and
 race fallback. A call from an ordinary helper can enter a new coroutine root;
-it does not by itself prove a shared-root logical spawn. `WaitGroup.Go` still
-needs broader spawn and closure support. Cond's interface calls, other
+it does not by itself prove a shared-root logical spawn. Section 16.18 adds
+closed named-target `WaitGroup.Go` calls; open callbacks still need broader
+callable support. Cond's interface calls, other
 semaphore declarations, and runtime notes retain
 conservative fallback; this is not complete `sync` support.
 
@@ -4394,6 +4395,53 @@ spawn and retains independent panic, Goexit and defer ownership.
 This does not admit arbitrary callbacks passed to WaitGroup.Go or add general
 closure/interface dispatch. It changes no runtime, callable/export ABI,
 annotation vocabulary, frame cache, or allocation lifetime policy.
+
+### 16.18 Closed named callbacks in WaitGroup.Go
+
+Native lowering preserves the exact `sync.(*WaitGroup).Go(func())` method
+boundary before inlining. After inlining it specializes direct calls whose
+callback is a named function or a local function value with a proved closed
+set of named targets. The proof uses the same package-local copy/return graph
+as function-value awaits and spawns. A public callback parameter never becomes
+a closed set merely because one caller supplies a known function.
+
+Each eligible call site gets private creator, child, and cleanup helpers. The
+creator receives the already evaluated receiver and callback, calls Add(1),
+and spawns the independent child. The child registers named cleanup and awaits
+the selected callback through its existing factory ABI. All targets must have
+validated factories, including an all-plain set; locally demanded bounded
+plain adapters use the existing admission rules. Imported callbacks require
+exported factories. Missing factories remove dependent callers to a fixed
+point and retain the ordinary method call.
+
+Cleanup follows the actual Go source: recover a panic and, if its value is
+non-nil, rethrow it without Done. Normal return and Goexit call Done. With
+legacy panicnil behavior, a nil recovery also calls Done, just as the source
+method does. The nil callback is invoked inside this child wrapper, preserving
+a child nil-call panic rather than bare nil-go startup. Receiver evaluation,
+argument panic/Goexit, and Add failure remain in the creator before any child
+starts. The existing terminal and DeferABI1 contracts implement this policy;
+there is no new runtime entry or callable/export ABI.
+
+Private helper ordinary entries always execute ordinary Go bodies. Only their
+validated factories enter native tasks. This is necessary even when a helper
+has a factory: an unsupported caller or callback can still reach an ordinary
+entry, and direct recover must then remain in its original deferred Go frame.
+Starting a fresh native root in that entry would change recovery and could
+unblock Wait before the original panic becomes fatal. Ordinary creator entries
+call the original WaitGroup.Go method. Public source entries retain their
+existing ordinary-body fallback for synctest and thread-bound execution.
+
+Tests check 128 parked callbacks after their creator returns, pointer roots
+under GC, callback aliases/returned targets, mixed factory ABIs, nested Go,
+reuse, ordinary/logical synchronization, receiver evaluation, parent Add and
+argument failures, child Goexit and fatal panic, nil callbacks, both panicnil
+modes, missing-factory recovery, synctest, thread locking, and instrumented
+fallback. They require actual caller factories and bounded ordinary-goroutine
+counts, with default and native-lowered sync dependencies. Unknown parameters,
+globals, arbitrary source closures, and unavailable factories retain ordinary
+execution. This is not general callback or closure support, public dynamic
+Locker Cond.Wait support, or a new performance result.
 
 ## 17. Confirmed MVP decisions
 
