@@ -313,7 +313,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
-		plan, err := coro.Analyze(typecheck.Target.Funcs,
+		analyze := coro.Analyze
+		if base.Debug.Coro > 3 && !instrumented {
+			analyze = coro.AnalyzeWithCallbacks
+		}
+		plan, err := analyze(typecheck.Target.Funcs,
 			cgoDirectives)
 		if err != nil {
 			base.Fatalf("analyzing coroutine plan: %v", err)

@@ -21,6 +21,16 @@ type BodyReader struct {
 // calling a helper: an extra frame would change direct recover semantics.
 // Native factories bypass this entry and never execute the ordinary body.
 func addOrdinaryBody(fn, ordinary *ir.Func) {
+	remapOrdinaryBody(fn, ordinary)
+	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
+	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
+	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+}
+
+// remapOrdinaryBody installs independent declarations and captures without
+// adding a call frame. Compiler-private callback helper entries always use
+// these ordinary bodies; only their validated factories enter native tasks.
+func remapOrdinaryBody(fn, ordinary *ir.Func) {
 	parameters := make(map[*ir.Name]*ir.Name)
 	count := len(fn.Type().RecvParams()) + fn.Type().NumResults()
 	for i := 0; i < count; i++ {
@@ -60,8 +70,5 @@ func addOrdinaryBody(fn, ordinary *ir.Func) {
 		ordinary.Body[i] = edit(stmt)
 	}
 	ordinary.Body = append(ordinary.Body, ir.NewReturnStmt(fn.Pos(), nil))
-	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
-	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
 	fn.Parents, fn.Marks = ordinary.Parents, ordinary.Marks
-	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
 }
