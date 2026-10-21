@@ -142,6 +142,7 @@ type lowerDefer struct {
 	armed           *ir.Name
 	snapshotCallee  bool
 	calleeSnapshot  *ir.Name
+	terminalTargets []lowerDeferTerminal
 	sourceLiteral   bool
 	literalCaptures []*ir.Name
 	rewriteTerminal TerminalFlags
@@ -1043,8 +1044,25 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				deferred.snapshotCallee = true
 			}
 			if summary.Terminal != 0 {
-				return nil, fmt.Errorf("dynamic defer target has terminal control %s",
-					summary.Terminal)
+				for _, target := range edge.Targets {
+					targetSummary, _ := plan.funcSummary(target)
+					terminal := lowerDeferTerminal{target: target}
+					if targetSummary.Terminal != 0 {
+						var ok bool
+						terminal, ok = planDeferTerminal(plan, target, targetSummary)
+						if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
+							return nil, fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
+								ir.PkgFuncName(target), targetSummary.Terminal)
+						}
+					}
+					deferred.terminalTargets = append(deferred.terminalTargets, terminal)
+					deferred.namedRecover = deferred.namedRecover ||
+						!terminal.factory && targetSummary.Terminal&UsesRecover != 0
+					if terminal.factory {
+						candidate.dependencies[target] = true
+						candidate.deferDeps[target] = true
+					}
+				}
 			}
 			// Keep the ordinary wrapper: normalization already froze its
 			// callee and arguments at registration. The existing defer stack
@@ -2504,6 +2522,11 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	for _, deferred := range candidate.defers {
+		if len(deferred.terminalTargets) != 0 {
+			prepareDynamicDeferWrapper(deferred, fn)
+		}
+	}
 	factory := candidate.factory
 	resumeType := stacklessResumeType()
 	pos := fn.Pos()
@@ -2639,7 +2662,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		if (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
-			deferred.runTerminal || deferred.directGoexit) &&
+			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -3597,7 +3620,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
-		if deferred.directGoexit {
+		if len(deferred.terminalTargets) != 0 {
+			if err := rewriteDynamicDeferCall(deferred, resumeDeferToken, factories); err != nil {
+				return err
+			}
+		} else if deferred.directGoexit {
 			var err error
 			closure, err = rewriteDeferGoexitCall(deferred, resume,
 				resumeDeferToken, deferred.terminalTarget)

@@ -180,11 +180,8 @@ func main() {
 			{"addressed", "defer has no static call plan"},
 			{"literal", "suspending defer"},
 			{"suspended", "suspending defer"},
-			{"terminal", "dynamic defer target has terminal control panic"},
-			{"terminalRecover", "dynamic defer target has terminal control recover"},
-			{"terminalExit", "dynamic defer target has terminal control goexit"},
 		},
-		[]string{"snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting"})
+		[]string{"snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting", "terminal", "terminalRecover", "terminalExit"})
 }
 
 func TestDynamicDeferImported(t *testing.T) {
