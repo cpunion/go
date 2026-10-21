@@ -76,6 +76,13 @@ func AnalyzeWithCallbacks(funcs []*ir.Func, directives [][]string) (*Plan, error
 			if !ok || call.Op() != ir.OCALLFUNC || len(call.Args) != 2 || call.GoDefer {
 				return
 			}
+			// Only replace an already static method expression. Resolving a
+			// caller-local alias here would leave that local in the helper's
+			// ordinary body; unwrapping an inlined callee could also discard
+			// its initialization effects before the receiver and callback.
+			if ir.StaticValue(call.Fun) != call.Fun || len(call.Fun.Init()) != 0 {
+				return
+			}
 			name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
 			if name == nil || !waitGroupGoSignature(name.Func) {
 				return

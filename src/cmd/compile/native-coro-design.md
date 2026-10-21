@@ -4404,6 +4404,10 @@ callback is a named function or a local function value with a proved closed
 set of named targets. The proof uses the same package-local copy/return graph
 as function-value awaits and spawns. A public callback parameter never becomes
 a closed set merely because one caller supplies a known function.
+The method callee itself must already be static and have no initialization
+effects. Caller-local aliases of the Go method and callee expressions with
+inlined initialization retain ordinary execution, preserving both caller-local
+ownership and callee-before-argument evaluation.
 
 Each eligible call site gets private creator, child, and cleanup helpers. The
 creator receives the already evaluated receiver and callback, calls Add(1),

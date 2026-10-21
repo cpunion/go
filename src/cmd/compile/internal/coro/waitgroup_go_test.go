@@ -83,7 +83,7 @@ func TestWaitGroupGoCallbackFactories(t *testing.T) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
-	for _, mode := range []string{"bounded-plain", "unbounded-plain", "open"} {
+	for _, mode := range []string{"bounded-plain", "unbounded-plain", "open", "method-alias", "callee-init"} {
 		t.Run(mode, func(t *testing.T) {
 			types.LocalPkg = types.NewPkg("example.com/coro/wgcallback/"+mode, "p")
 			typecheck.Target = new(ir.Package)
@@ -102,22 +102,35 @@ func TestWaitGroupGoCallbackFactories(t *testing.T) {
 			parent.Nname.Defn = parent
 			parent.DeclareParams(true)
 			typecheck.Target.Funcs = append(typecheck.Target.Funcs, parent)
+			var call *ir.CallExpr
 			ir.WithFunc(parent, func() {
 				var value ir.Node = callback.Nname
 				if mode == "open" {
 					value = parent.Dcl[1]
 				}
 				method := typecheck.NewMethodExpr(src.NoXPos, recv, types.LocalPkg.Lookup("Go"))
-				parent.Body = ir.Nodes{typecheck.Call(src.NoXPos, method, ir.Nodes{parent.Dcl[0], value}, false), newLowerTestReturn()}
+				var callee ir.Node = method
+				if mode == "method-alias" {
+					alias := parent.NewLocal(src.NoXPos, types.LocalPkg.Lookup("method"), method.Type())
+					assignment := ir.NewAssignStmt(src.NoXPos, alias, method)
+					alias.Defn = assignment
+					parent.Body = ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, alias), assignment}
+					callee = alias
+				}
+				if mode == "callee-init" {
+					method.SetInit(ir.Nodes{ir.NewAssignStmt(src.NoXPos, ir.BlankNode, ir.NewInt(src.NoXPos, 1))})
+				}
+				call = typecheck.Call(src.NoXPos, callee, ir.Nodes{parent.Dcl[0], value}, false).(*ir.CallExpr)
+				parent.Body = append(parent.Body, call, newLowerTestReturn())
 				typecheck.Stmts(parent.Body)
 			})
 			plan, err := AnalyzeWithCallbacks(typecheck.Target.Funcs, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if mode == "open" {
-				if len(plan.specializedBodies) != 0 || edgeForCall(plan.Functions[parent], parent.Body[0].(*ir.CallExpr)).Callee != goMethod {
-					t.Fatal("open callback acquired a specialization")
+			if mode == "open" || mode == "method-alias" || mode == "callee-init" {
+				if len(plan.specializedBodies) != 0 || edgeForCall(plan.Functions[parent], call).Callee != goMethod {
+					t.Fatal("open callback or evaluated method callee acquired a specialization")
 				}
 				return
 			}

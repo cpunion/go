@@ -61,6 +61,10 @@ func addPanic() (v any) {defer func(){v=recover()}();broken.Go(plain);return}
 var receiverCount int
 func receiver() *sync.WaitGroup {runtime.Gosched();receiverCount++;return &group}
 func receiverOnce() {f:=yielding;receiver().Go(f)}
+func methodAlias() {g:=(*sync.WaitGroup).Go;g(&group,plain)}
+var calleeCount int
+func methodCallee() func(*sync.WaitGroup,func()) {calleeCount++;return (*sync.WaitGroup).Go}
+func calleeEvaluation() {methodCallee()(&group,yielding)}
 func nilDone() {close(exited)}
 var exited chan struct{}
 func receiverExit() *sync.WaitGroup {runtime.Gosched();runtime.Goexit();return &group}
@@ -97,6 +101,8 @@ func main() {
  if addPanic()==nil || values[0]!=1234 {panic("Add failure spawned callback")}
  group.Wait()
  receiverOnce();group.Wait();if receiverCount!=1 || values[0]!=100 {panic("receiver evaluated once")}
+ methodAlias();group.Wait();if values[0]!=99 {panic("method expression alias fallback")}
+ calleeEvaluation();group.Wait();if calleeCount!=1 || values[0]!=100 {panic("callee evaluation before method entry")}
  exited=make(chan struct{});go argumentExit();<-exited;group.Wait()
  parameter(plain);group.Wait();if values[0]!=99 {panic("parameter fallback")}
  globalCallback();group.Wait();if values[0]!=100 {panic("global fallback")}
@@ -116,6 +122,7 @@ func main() {
 		{"closureCallback", "unsupported coroutine dependency sync.(*WaitGroup).Go"},
 		{"missingFactory", "unsupported coroutine dependency main.missingFactory.wggo"},
 		{"plainLoopSpawn", "unsupported coroutine dependency main.plainLoopSpawn.wggo"},
+		{"methodAlias", "unsupported coroutine dependency sync.(*WaitGroup).Go"},
 	}
 	lowered := []string{"spawn", "mixed", "returned", "exiting", "nestedSpawn", "receiverOnce", "argumentPanic", "nilReceiver", "addPanic", "argumentExit"}
 	t.Run("default-sync", func(t *testing.T) { testSwitchReturnProgram(t, source, fallback, lowered) })
