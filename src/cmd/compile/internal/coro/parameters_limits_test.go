@@ -18,7 +18,7 @@ func TestClosedParameterLimits(t *testing.T) {
 	if got := specializeParameters(nil, nil, nil, nil, nil); len(got) != 0 {
 		t.Fatal("specialization without an independent source reader")
 	}
-	for _, mode := range []string{"shared", "helpers", "calls", "targets", "body", "closure-body", "missing", "nil-clone", "invalid-clone"} {
+	for _, mode := range []string{"shared", "helpers", "calls", "targets", "body", "closure-body", "missing", "nil-clone", "invalid-clone", "spawn-direct", "spawn-wrapper", "defer", "unsupported-wrapper"} {
 		t.Run(mode, func(t *testing.T) {
 			oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 			defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
@@ -44,6 +44,10 @@ func TestClosedParameterLimits(t *testing.T) {
 				ncalls, ntargets, wantCopies, wantRewrites = 1, 17, 0, 0
 			case "body", "closure-body", "missing", "nil-clone", "invalid-clone":
 				ncalls, wantCopies, wantRewrites = 1, 0, 0
+			case "spawn-direct", "spawn-wrapper":
+				ncalls, wantRewrites = 1, 1
+			case "defer", "unsupported-wrapper":
+				ncalls, wantCopies, wantRewrites = 1, 0, 0
 			}
 			if mode == "body" || mode == "closure-body" {
 				owner := source
@@ -67,6 +71,7 @@ func TestClosedParameterLimits(t *testing.T) {
 			}
 			have := map[*ir.Func]bool{source: mode != "missing"}
 			var calls []*ir.CallExpr
+			var wrappers []*ir.Func
 			for i := range ncalls {
 				caller := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup(fmt.Sprintf("caller%d", i)), callback)
 				caller.DeclareParams(true)
@@ -78,8 +83,31 @@ func TestClosedParameterLimits(t *testing.T) {
 					}
 				}
 				call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, source.Nname, ir.Nodes{arg})
-				caller.Body = append(caller.Body, call)
 				calls = append(calls, call)
+				if mode == "spawn-wrapper" || mode == "unsupported-wrapper" {
+					outer := caller.NewLocal(src.NoXPos, pkg.Lookup("frozen"), callback)
+					caller.Body = append(caller.Body, ir.NewAssignStmt(src.NoXPos, outer, arg))
+					wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OGO,
+						types.NewSignature(nil, nil, nil), caller, typecheck.Target, 0)
+					wrapper.SetWrapper(mode != "unsupported-wrapper")
+					wrapper.WrappedFunc = source
+					capture := ir.NewClosureVar(src.NoXPos, wrapper, outer)
+					call.Args = ir.Nodes{capture}
+					wrapper.Body = ir.Nodes{call}
+					wrappers = append(wrappers, wrapper)
+					funcs = append(funcs, wrapper)
+					call = ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, wrapper.OClosure, nil)
+				}
+				if mode == "spawn-direct" || mode == "spawn-wrapper" || mode == "unsupported-wrapper" || mode == "defer" {
+					call.GoDefer = true
+					op := ir.OGO
+					if mode == "defer" {
+						op = ir.ODEFER
+					}
+					caller.Body = append(caller.Body, ir.NewGoDeferStmt(src.NoXPos, op, call))
+				} else {
+					caller.Body = append(caller.Body, call)
+				}
 				funcs = append(funcs, caller)
 				have[caller] = true
 			}
@@ -113,6 +141,12 @@ func TestClosedParameterLimits(t *testing.T) {
 			}
 			if changed != wantRewrites {
 				t.Fatalf("changed calls=%d want %d", changed, wantRewrites)
+			}
+			for _, wrapper := range wrappers {
+				inner := wrapper.Body[0].(*ir.CallExpr)
+				if wrapper.WrappedFunc.Nname != inner.Fun || inner.Args[0] != wrapper.ClosureVars[0] {
+					t.Fatal("rewritten spawn wrapper lost its target or frozen operands")
+				}
 			}
 		})
 	}
