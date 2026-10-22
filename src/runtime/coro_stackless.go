@@ -2255,6 +2255,38 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	sameResume := parent.resume != nil &&
 		stacklessCoroResumeIdentity(parent.resume) ==
 			stacklessCoroResumeIdentity(child)
+	request := parent.flags & (stacklessCoroTaskFusedRequested |
+		stacklessCoroTaskFusedChunk)
+	if !stacklessCoroIsPullComparison(s) &&
+		parent.hasFlag(stacklessCoroTaskFusedFrames) && context.frame != nil &&
+		((self && sameResume && request == 0) ||
+			request == stacklessCoroTaskFusedRequested|stacklessCoroTaskFusedChunk) &&
+		size >= unsafe.Sizeof(stacklessCoroFusedFrameHeader{}) &&
+		size <= stacklessCoroFrameCacheSize {
+		header := (*stacklessCoroFusedFrameHeader)(context.frame)
+		allocation := header.marker & stacklessCoroFusedFrameAllocationMask
+		if header.owner == nil && header.parent != nil &&
+			header.marker&stacklessCoroFusedFrameChunkValidated != 0 &&
+			validStacklessCoroFusedFrameMarker(header.marker) &&
+			allocation >= stacklessCoroFusedFrameChunkFirst &&
+			allocation < stacklessCoroFusedFrameChunkLastFor(header.marker) &&
+			parent.state == stacklessCoroTaskRunning && parent.resuming &&
+			!parent.readyPending &&
+			parent.flags&(stacklessCoroTaskFusedPending|
+				stacklessCoroTaskSwitchPending) == 0 &&
+			parent.terminal == stacklessCoroTerminalNone && !parent.goexit {
+			// The running task owns the next element of this already validated
+			// typed chunk. Neither allocation nor a shared cache reservation is
+			// needed. Chunk boundaries retain the locked allocation/cache path.
+			parent.flags &^= stacklessCoroTaskFusedRequested |
+				stacklessCoroTaskFusedChunk
+			parent.flags |= stacklessCoroTaskFusedPending
+			if !sameResume {
+				parent.flags |= stacklessCoroTaskFusedChunk
+			}
+			return add(context.frame, size)
+		}
+	}
 	lock(&s.lock)
 	if stacklessCoroIsPullComparison(s) {
 		unlock(&s.lock)
