@@ -58,7 +58,7 @@ var exitMark int
 func exiting() {runtime.Gosched();runtime.Goexit()}
 //go:noinline
 func applyVoid(f func()) {defer func(){exitMark++}();f();panic("continued after callback Goexit")}
-func exitWorker() {defer close(exitDone);applyVoid(exiting);panic("continued after parameter Goexit")}
+func exitWorker() {defer func(){close(exitDone)}();applyVoid(exiting);panic("continued after parameter Goexit")}
 func main(){
  if driver(false)!=13 || driver(true)!=23 || repeated(false)!=23 || repeated(true)!=43 || recursiveDriver()!=87 || longDriver()!=11 {panic("closed parameter calls")}
  if plainDriver(false)!=18 || plainDriver(true)!=38 || allPlain()!=35 {panic("plain callback factory")}
