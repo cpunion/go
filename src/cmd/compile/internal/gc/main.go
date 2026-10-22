@@ -313,12 +313,34 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro")
-		analyze := coro.Analyze
-		if base.Debug.Coro > 3 && !instrumented {
-			analyze = coro.AnalyzeWithCallbacks
+		readBody := func(fn *ir.Func, sym *types.Sym) *ir.Func {
+			start := len(typecheck.Target.Funcs)
+			var body *ir.Func
+			if sym == nil {
+				body = noder.ReadCoroBody(fn)
+			} else {
+				body = noder.ReadCoroBodyAs(fn, sym)
+			}
+			if body != nil {
+				transformed = append(transformed, loopvar.ForCapture(body)...)
+			}
+			for _, child := range typecheck.Target.Funcs[start:] {
+				transformed = append(transformed, loopvar.ForCapture(child)...)
+			}
+			return body
 		}
-		plan, err := analyze(typecheck.Target.Funcs,
-			cgoDirectives)
+		bodies := &coro.BodyReader{
+			Have:  noder.HaveCoroBody,
+			Read:  func(fn *ir.Func) *ir.Func { return readBody(fn, nil) },
+			Clone: readBody,
+		}
+		var plan *coro.Plan
+		var err error
+		if base.Debug.Coro > 3 && !instrumented {
+			plan, err = coro.AnalyzeWithSpecializations(typecheck.Target.Funcs, cgoDirectives, bodies)
+		} else {
+			plan, err = coro.Analyze(typecheck.Target.Funcs, cgoDirectives)
+		}
 		if err != nil {
 			base.Fatalf("analyzing coroutine plan: %v", err)
 		}
@@ -331,20 +353,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		}
 		if base.Debug.Coro > 3 && !instrumented {
 			plan.HeapLocals = escape.HeapLocals(typecheck.Target.Funcs)
-			result, err := coro.Lower(plan, &coro.BodyReader{
-				Have: noder.HaveCoroBody,
-				Read: func(fn *ir.Func) *ir.Func {
-					start := len(typecheck.Target.Funcs)
-					body := noder.ReadCoroBody(fn)
-					if body != nil {
-						transformed = append(transformed, loopvar.ForCapture(body)...)
-					}
-					for _, child := range typecheck.Target.Funcs[start:] {
-						transformed = append(transformed, loopvar.ForCapture(child)...)
-					}
-					return body
-				},
-			})
+			result, err := coro.Lower(plan, bodies)
 			if err != nil {
 				base.Fatalf("lowering coroutine plan: %v", err)
 			}

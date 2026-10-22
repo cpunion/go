@@ -66,6 +66,9 @@ func chooseRange() (out callback) {out=first;for _,out=range []callback{second} 
 //go:noinline
 func chooseCase(input any,replace bool) (out callback) {out=first;switch f:=input.(type) {case callback:if replace {f=first};out=f};runtime.Gosched();return}
 func parameter() int {f:=chooseParameter(second);g:=f;v:=g(1);return v}
+// The source parameter remains open even when one call site can specialize it.
+//go:noinline
+func parameterOpen(input callback) int {f:=chooseParameter(input);g:=f;v:=g(1);return v}
 func globalResult() int {f:=chooseGlobal();v:=f(2);return v}
 func addressed() int {f:=chooseAddress(second);v:=f(3);return v}
 func captured() int {f:=chooseCapture(second);v:=f(4);return v}
@@ -88,19 +91,19 @@ func main(){
  if childPanic(false)!=81 || childPanic(true)!=71 {panic("named child panic")}
  done:=make(chan int,8);go childExit(true,done);if <-done!=1 {panic("named Goexit")};if _,ok:=<-done;ok {panic("named Goexit cleanup")}
  done=make(chan int,8);go childExit(false,done);if <-done!=2 || <-done!=4 {panic("named normal child")};if _,ok:=<-done;ok {panic("named normal cleanup")}
- if parameter()!=22 || globalResult()!=23 || addressed()!=24 || captured()!=25 || deferred()!=26 || aliasCapture()!=27 || rangeResult()!=28 || caseResult(false)!=29 || caseResult(true)!=18 || missingFactory()!=39 {panic("named unknown output or deferred overwrite")}
+ if parameter()!=22 || parameterOpen(second)!=22 || globalResult()!=23 || addressed()!=24 || captured()!=25 || deferred()!=26 || aliasCapture()!=27 || rangeResult()!=28 || caseResult(false)!=29 || caseResult(true)!=18 || missingFactory()!=39 {panic("named unknown output or deferred overwrite")}
  println("switch-return-ok")
 }
 `
 	testSwitchReturnProgram(t, source,
 		[]switchFallback{
-			{"parameter", "dynamic await site"}, {"globalResult", "dynamic await site"},
+			{"parameterOpen", "dynamic await site"}, {"globalResult", "dynamic await site"},
 			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
 			{"deferred", "dynamic await site"}, {"aliasCapture", "dynamic await site"},
 			{"rangeResult", "dynamic await site"}, {"caseResult", "dynamic await site"},
 			{"missingFactory", "unsupported coroutine dependency main.missing"},
 		},
-		[]string{"consume", "repeated", "inside", "fromInside", "chooseCopy", "fromCopy", "recursive", "chooseA", "chooseB", "choose", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit"})
+		[]string{"parameter", "consume", "repeated", "inside", "fromInside", "chooseCopy", "fromCopy", "recursive", "chooseA", "chooseB", "choose", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit"})
 }
 
 func TestDynamicNamedResultImported(t *testing.T) {

@@ -262,6 +262,9 @@ type Plan struct {
 	specializedBodies  map[*ir.Func]func() *ir.Func
 	callbackFactories  map[*ir.Func]bool
 	callbackParameters map[*ir.Name]bool
+	// rewrittenCallers must recover their source body if native lowering
+	// rejects them. Calling a specialization from ordinary code adds a frame.
+	rewrittenCallers map[*ir.Func]bool
 }
 
 // PublishSummaries makes this package's final effects available to the
@@ -319,11 +322,10 @@ func analyze(funcs []*ir.Func, cgoDirectives [][]string, specializedTargets map[
 			}
 		}
 	}
-	callableTargets := packageFunctionTargets(funcs)
+	callableTargets := packageFunctionTargetsWithParameters(funcs, specializedTargets)
 	p.callbackParameters = make(map[*ir.Name]bool)
-	for fn, targets := range specializedTargets {
-		callableTargets[fn] = targets
-		for name := range targets {
+	for fn := range specializedTargets {
+		for name := range callableTargets[fn] {
 			p.callbackParameters[name] = true
 		}
 	}
@@ -540,6 +542,12 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 		} else {
 			edge.CalleeName = "<interface>"
 			edge.Unknown = true
+		}
+		if edge.FactoryRequired {
+			// A sealed callback uses a typed factory even when all targets
+			// finish without suspension. Keep its private caller resumable
+			// without inventing a suspension effect for those targets.
+			function.LocalExec |= NeedsTaskContext
 		}
 		if recipe, ok := p.operationRecipe(edge.Callee); ok {
 			if kind == DirectCall && recipe.Kind == SiteSemaphore && semaphoreNoHandoff(call) {

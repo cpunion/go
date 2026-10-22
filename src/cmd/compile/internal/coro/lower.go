@@ -455,6 +455,15 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
+		if plan.rewrittenCallers[function.Func] && candidates[function.Func] == nil {
+			ordinary := bodies.Read(function.Func)
+			if ordinary == nil {
+				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(function.Func))
+			}
+			remapOrdinaryBody(function.Func, ordinary)
+			function.Func.Body = ordinary.Body
+			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
+		}
 		if build := plan.specializedBodies[function.Func]; build != nil {
 			// A rejected caller can still invoke a private helper's ordinary
 			// entry. In particular recover must then run directly in its
