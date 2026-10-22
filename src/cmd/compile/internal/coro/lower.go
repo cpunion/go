@@ -1037,7 +1037,14 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		if summary.Effect != NoSuspend {
 			return nil, fmt.Errorf("suspending defer")
 		}
-		if summary.Exec != 0 {
+		var parameterTarget *ir.Func
+		if call := unwrapGoCall(deferred.call); call != deferred.call {
+			if name := ir.StaticCalleeName(call.Fun); name != nil &&
+				canPlanParameterDeferTarget(plan, name.Func) {
+				parameterTarget = name.Func
+			}
+		}
+		if summary.Exec != 0 && (summary.Exec != NeedsTaskContext || parameterTarget == nil) {
 			return nil, fmt.Errorf("defer target has execution constraints %s",
 				summary.Exec)
 		}
@@ -1118,6 +1125,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						"nested repeated source defer capture")
 				}
 			}
+		}
+		if parameterTarget != nil {
+			// Even an all-plain sealed callback uses its typed factory. Its
+			// task-context flag is internal to dispatch, not permission to
+			// suspend, create children, or enter an arbitrary task context.
+			deferred.terminalTarget = parameterTarget
+			deferred.runTerminal = true
+			candidate.dependencies[parameterTarget] = true
+			candidate.deferDeps[parameterTarget] = true
+			continue
 		}
 		if summary.Terminal != 0 {
 			terminal, ok := planDeferTerminal(plan, edge.Callee, summary)
@@ -1807,6 +1824,9 @@ func deferFactoryCandidates(plan *Plan,
 }
 
 func deferFactoryCandidate(plan *Plan, candidate *lowerCandidate) bool {
+	if candidate != nil && canPlanParameterDeferTarget(plan, candidate.function.Func) {
+		return true
+	}
 	if candidate == nil || candidate.function.Effect != NoSuspend ||
 		candidate.function.Exec != 0 ||
 		candidate.function.Terminal == 0 ||

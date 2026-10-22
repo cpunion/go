@@ -43,10 +43,10 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				solved = packageFunctionTargetsWithParameters(typecheck.Target.Funcs, parameters)
 			}
 			targets := solved[caller]
-			spawns := make(map[*ir.CallExpr]bool)
+			goDefers := make(map[*ir.CallExpr]bool)
 			ir.Visit(caller, func(node ir.Node) {
-				if stmt, ok := node.(*ir.GoDeferStmt); ok && stmt.Op() == ir.OGO {
-					spawns[stmt.Call.(*ir.CallExpr)] = true
+				if stmt, ok := node.(*ir.GoDeferStmt); ok && (stmt.Op() == ir.OGO || stmt.Op() == ir.ODEFER) {
+					goDefers[stmt.Call.(*ir.CallExpr)] = true
 				}
 			})
 			ir.Visit(caller, func(node ir.Node) {
@@ -57,7 +57,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				original := call
 				var wrapper *ir.Func
 				if call.GoDefer {
-					if !spawns[call] {
+					if !goDefers[call] {
 						return
 					}
 					call = unwrapGoCall(call)
@@ -153,7 +153,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				if wrapper == nil {
 					call.Fun = helper.Nname
 				} else {
-					// Read the proof from the creator's already-frozen operands,
+					// Read the proof from the caller's already-frozen operands,
 					// but rewrite the real wrapper, not unwrapGoCall's IR copy.
 					// Keep its captures and argument evaluation in their original
 					// positions. Ordinary callers restore their source bodies.
