@@ -7,14 +7,18 @@ package coro
 import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/types"
 )
 
 // BodyReader supplies independent source bodies for ordinary fallback. Have
 // must not materialize IR: candidates can still be rejected by dependency
-// checks. Read is called only for admitted functions and must return a body.
+// checks. Read supplies admitted ordinary entries or restores rejected callers
+// whose working bodies contain private specialization calls.
 type BodyReader struct {
 	Have func(*ir.Func) bool
 	Read func(*ir.Func) *ir.Func
+	// Clone reads a source body under a compiler-owned helper symbol.
+	Clone func(*ir.Func, *types.Sym) *ir.Func
 }
 
 // addOrdinaryBody keeps the source body in the public entry, rather than

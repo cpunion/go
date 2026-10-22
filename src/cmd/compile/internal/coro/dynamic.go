@@ -31,6 +31,13 @@ func localFunctionTargets(fn *ir.Func) map[*ir.Name][]*ir.Func {
 // writes and returns poison their dependents throughout the package, including
 // recursive return/copy cycles. No effects or factory ABIs are inferred here.
 func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Func {
+	return packageFunctionTargetsWithParameters(funcs, nil)
+}
+
+// Only compiler-owned specializations may seed parameter cells. Source
+// parameters remain unknown regardless of the apparent set of callers.
+func packageFunctionTargetsWithParameters(funcs []*ir.Func,
+	parameters map[*ir.Func]map[*ir.Name][]*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Func {
 	locals := make(map[*ir.Func]map[*ir.Name][]*ir.Func)
 	targets := make(map[functionTargetKey][]*ir.Func)
 	invalid := make(map[functionTargetKey]bool)
@@ -40,10 +47,11 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 	for _, fn := range funcs {
 		locals[fn] = make(map[*ir.Name][]*ir.Func)
 		for _, name := range fn.Dcl {
-			if (name.Class == ir.PAUTO || name.Class == ir.PPARAMOUT) && name.Curfn == fn &&
+			if (name.Class == ir.PAUTO || name.Class == ir.PPARAMOUT ||
+				name.Class == ir.PPARAM && len(parameters[fn][name]) != 0) && name.Curfn == fn &&
 				name.Type() != nil && name.Type().Kind() == types.TFUNC && !name.Addrtaken() {
 				locals[fn][name] = nil
-				targets[functionTargetKey{local: name}] = nil
+				targets[functionTargetKey{local: name}] = slices.Clone(parameters[fn][name])
 			}
 		}
 		sig := fn.Type()

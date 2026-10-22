@@ -62,11 +62,42 @@ func waitGroupMethod(recv *types.Type, name string) *types.Sym {
 // terminal/defer ABIs. No public callback parameter acquires a closed-set proof.
 // Call this only after inlining, when native, uninstrumented lowering is enabled.
 func AnalyzeWithCallbacks(funcs []*ir.Func, directives [][]string) (*Plan, error) {
-	targets := packageFunctionTargets(funcs)
+	return AnalyzeWithSpecializations(funcs, directives, nil)
+}
+
+// AnalyzeWithSpecializations also admits independently materialized callback
+// parameter helpers when a source-body reader is available.
+func AnalyzeWithSpecializations(funcs []*ir.Func, directives [][]string, reader *BodyReader) (*Plan, error) {
 	specialized := make(map[*ir.Func]map[*ir.Name][]*ir.Func)
 	bodies := make(map[*ir.Func]func() *ir.Func)
 	demands := make(map[*ir.Func]bool)
 	index := 0
+	specializeWaitGroupCallbacks(funcs, specialized, bodies, demands, &index)
+	rewritten := specializeParameters(funcs, reader, specialized, bodies, demands)
+	// A specialized source body can itself invoke WaitGroup.Go with the
+	// now-sealed parameter. Compose the recipes before effect analysis.
+	specializeWaitGroupCallbacks(typecheck.Target.Funcs, specialized, bodies, demands, &index)
+	plan, err := analyze(typecheck.Target.Funcs, directives, specialized)
+	if err != nil {
+		return nil, err
+	}
+	plan.specializedBodies, plan.callbackFactories = bodies, demands
+	plan.rewrittenCallers = rewritten
+	allTargets := packageFunctionTargetsWithParameters(typecheck.Target.Funcs, specialized)
+	for fn := range specialized {
+		for _, targets := range allTargets[fn] {
+			for _, target := range targets {
+				demands[target] = true
+			}
+		}
+	}
+	return plan, nil
+}
+
+func specializeWaitGroupCallbacks(funcs []*ir.Func,
+	specialized map[*ir.Func]map[*ir.Name][]*ir.Func,
+	bodies map[*ir.Func]func() *ir.Func, demands map[*ir.Func]bool, index *int) {
+	targets := packageFunctionTargetsWithParameters(typecheck.Target.Funcs, specialized)
 	for _, fn := range funcs {
 		if fn.OClosure != nil || !resumeFactorySupported(fn) {
 			continue
@@ -101,11 +132,11 @@ func AnalyzeWithCallbacks(funcs []*ir.Func, directives [][]string) (*Plan, error
 			if len(closed) == 0 {
 				return
 			}
-			index++
+			*index = *index + 1
 			pos := call.Pos()
 			recv := name.Type().Recv().Type
 			callback := name.Type().Param(0).Type
-			base := fmt.Sprintf("%s.wggo%d", fn.Sym().Name, index)
+			base := fmt.Sprintf("%s.wggo%d", fn.Sym().Name, *index)
 			newHelper := func(suffix string) *ir.Func {
 				typ := types.NewSignature(nil, []*types.Field{
 					types.NewField(pos, typecheck.Lookup("wg"), recv),
@@ -167,12 +198,6 @@ func AnalyzeWithCallbacks(funcs []*ir.Func, directives [][]string) (*Plan, error
 			call.Fun = creator.Nname
 		})
 	}
-	plan, err := analyze(typecheck.Target.Funcs, directives, specialized)
-	if err != nil {
-		return nil, err
-	}
-	plan.specializedBodies, plan.callbackFactories = bodies, demands
-	return plan, nil
 }
 
 // buildWaitGroupChild preserves sync.WaitGroup.Go's recovery policy exactly:
