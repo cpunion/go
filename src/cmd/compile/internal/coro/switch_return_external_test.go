@@ -144,6 +144,40 @@ func main() {
 
 type switchFallback struct{ name, reason string }
 
+// External linking can make Go text symbols local (t). Match the complete
+// factory name in either case; ordinary source wrappers also contain .coro.
+func hasSwitchReturnFactory(symbols []byte, name string) bool {
+	for _, line := range strings.Split(string(symbols), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && (fields[1] == "T" || fields[1] == "t") && fields[2] == "main."+name+".coro" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSwitchReturnFactorySymbols(t *testing.T) {
+	for _, test := range []struct {
+		symbols string
+		want    bool
+	}{
+		{"0010 T main.worker.coro\n", true},
+		{"0010 t main.worker.coro\n", true},
+		{"0010\tt\tmain.worker.coro\n", true},
+		{"0010 T main.worker.coro.go3.gowrap1\n", false},
+		{"0010 T main.worker.coro.func1\n", false},
+		{"0010 T main.worker.coro.abi0\n", false},
+		{"0010 T main.workerOther.coro\n", false},
+		{"0010 D main.worker.coro\n", false},
+		{"T main.worker.coro\n", false},
+		{"", false},
+	} {
+		if got := hasSwitchReturnFactory([]byte(test.symbols), "worker"); got != test.want {
+			t.Errorf("factory in %q = %t, want %t", test.symbols, got, test.want)
+		}
+	}
+}
+
 func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallback, lowered []string) {
 	t.Helper()
 	testSwitchReturnFiles(t, map[string]string{"main.go": source}, "", fallback, lowered)
@@ -222,12 +256,12 @@ func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string
 				t.Fatalf("nm failed: %v\n%s", err, data)
 			}
 			for _, entry := range fallback {
-				if strings.Contains(string(data), " T main."+entry.name+".coro\n") {
+				if hasSwitchReturnFactory(data, entry.name) {
 					t.Errorf("unsupported switch has a coroutine factory: %s", entry.name)
 				}
 			}
 			for _, name := range lowered {
-				if !strings.Contains(string(data), " T main."+name+".coro\n") {
+				if !hasSwitchReturnFactory(data, name) {
 					t.Errorf("supported switch lost its coroutine factory: %s\n%s", name, buildOutput)
 				}
 			}
