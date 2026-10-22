@@ -141,8 +141,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 				return
 			}
 			if call, ok := stmt.Call.(*ir.CallExpr); ok {
-				if stmt.Op() == ir.OGO && unwrapGoCall(call) != call ||
-					stmt.Op() == ir.ODEFER && unwrapDynamicDeferCall(call) != call {
+				if (stmt.Op() == ir.OGO || stmt.Op() == ir.ODEFER) && unwrapGoCall(call) != call {
 					operandWrappers[call.Fun.(*ir.ClosureExpr).Func] = true
 				}
 			}
