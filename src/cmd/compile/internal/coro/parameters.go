@@ -43,10 +43,29 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				solved = packageFunctionTargetsWithParameters(typecheck.Target.Funcs, parameters)
 			}
 			targets := solved[caller]
+			spawns := make(map[*ir.CallExpr]bool)
+			ir.Visit(caller, func(node ir.Node) {
+				if stmt, ok := node.(*ir.GoDeferStmt); ok && stmt.Op() == ir.OGO {
+					spawns[stmt.Call.(*ir.CallExpr)] = true
+				}
+			})
 			ir.Visit(caller, func(node ir.Node) {
 				call, ok := node.(*ir.CallExpr)
-				if !ok || call.Op() != ir.OCALLFUNC || call.GoDefer || replacements >= 256 ||
-					ir.StaticValue(call.Fun) != call.Fun || len(call.Fun.Init()) != 0 {
+				if !ok || call.Op() != ir.OCALLFUNC || replacements >= 256 {
+					return
+				}
+				original := call
+				var wrapper *ir.Func
+				if call.GoDefer {
+					if !spawns[call] {
+						return
+					}
+					call = unwrapGoCall(call)
+					if call != original {
+						wrapper = original.Fun.(*ir.ClosureExpr).Func
+					}
+				}
+				if ir.StaticValue(call.Fun) != call.Fun || len(call.Fun.Init()) != 0 {
 					return
 				}
 				name := ir.StaticCalleeName(call.Fun)
@@ -131,7 +150,16 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				if helper == nil {
 					return
 				}
-				call.Fun = helper.Nname
+				if wrapper == nil {
+					call.Fun = helper.Nname
+				} else {
+					// Read the proof from the creator's already-frozen operands,
+					// but rewrite the real wrapper, not unwrapGoCall's IR copy.
+					// Keep its captures and argument evaluation in their original
+					// positions. Ordinary callers restore their source bodies.
+					wrapper.Body[0].(*ir.CallExpr).Fun = helper.Nname
+					wrapper.WrappedFunc = helper
+				}
 				if reader.Have(caller) {
 					rewritten[caller] = true
 				}
