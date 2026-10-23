@@ -169,7 +169,7 @@ func main() {
  close(done)
  wait(&wg)
  for i, f := range captured() { if f() != i { panic("capture fallback") } }
- if sliced([]int{2, 3}) != 5 || labeled() != 1 { panic("unsupported range fallback") }
+ if sliced([]int{2, 3}) != 5 || labeled() != 1 { panic("slice or labeled range") }
  println("integer-range-ok")
 }
 `
@@ -228,12 +228,12 @@ func TestIntegerRange(t *testing.T) {
 			if err != nil {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
-			for _, name := range []string{"signed", "unsigned", "named", "assignment", "keyless", "nested", "pointers", "early", "deferred", "spawn", "worker", "wait", "bubble"} {
+			for _, name := range []string{"signed", "unsigned", "named", "assignment", "keyless", "nested", "pointers", "early", "deferred", "spawn", "worker", "wait", "bubble", "sliced"} {
 				if got := strings.Contains(string(symbols), "command-line-arguments."+name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
 			}
-			for _, name := range []string{"captured", "sliced", "labeled"} {
+			for _, name := range []string{"captured", "labeled"} {
 				if strings.Contains(string(symbols), "command-line-arguments."+name+".coro") {
 					t.Errorf("%s lost conservative range fallback", name)
 				}

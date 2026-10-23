@@ -691,13 +691,25 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("labeled range loop")
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
-					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger()) {
+					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() && !stmt.X.Type().IsSlice()) {
 					return fmt.Errorf("unsupported range loop")
 				}
-				if variable := transformedRangeVariable(stmt); variable != nil &&
-					!recordedRangeVars[variable.Canonical()] {
-					recordedRangeVars[variable.Canonical()] = true
-					rangeVars = append(rangeVars, variable)
+				if stmt.X.Type().IsSlice() && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
+					(stmt.X.Type().Elem().IsStruct() || stmt.X.Type().Elem().IsArray()) {
+					_, simpleKey := stmt.Key.(*ir.Name)
+					_, simpleValue := stmt.Value.(*ir.Name)
+					if !simpleKey || !simpleValue {
+						// Ordering a parallel aggregate assignment may introduce
+						// a large stack temporary after resume frame planning.
+						return fmt.Errorf("aggregate range value with complex destination")
+					}
+				}
+				for _, operand := range []ir.Node{stmt.Key, stmt.Value} {
+					if variable := transformedRangeVariable(stmt, operand); variable != nil &&
+						!recordedRangeVars[variable.Canonical()] {
+						recordedRangeVars[variable.Canonical()] = true
+						rangeVars = append(rangeVars, variable)
+					}
 				}
 				oldBreak, oldContinue := breakTarget, continueTarget
 				breakTarget, continueTarget = stmt, stmt
@@ -1162,22 +1174,29 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 
 // transformedRangeVariable recognizes the assignment inserted by
 // loopvar.ForCapture for a per-iteration range variable.
-func transformedRangeVariable(stmt *ir.RangeStmt) *ir.Name {
-	if stmt == nil || len(stmt.Body) == 0 {
+func transformedRangeVariable(stmt *ir.RangeStmt, operand ir.Node) *ir.Name {
+	if stmt == nil || operand == nil {
 		return nil
 	}
-	assignment, ok := stmt.Body[0].(*ir.AssignStmt)
-	if !ok || !assignment.Def || assignment.Y != stmt.Key {
-		return nil
-	}
-	variable, ok := assignment.X.(*ir.Name)
-	if !ok {
-		return nil
-	}
-	for _, init := range assignment.Init() {
-		declaration, ok := init.(*ir.Decl)
-		if ok && declaration.X.Canonical() == variable.Canonical() {
-			return variable
+	// loopvar prepends the value assignment after the key assignment. If
+	// both variables escape, the key assignment is therefore second.
+	for i, node := range stmt.Body {
+		if i == 2 {
+			break
+		}
+		assignment, ok := node.(*ir.AssignStmt)
+		if !ok || !assignment.Def || assignment.Y != operand {
+			continue
+		}
+		variable, ok := assignment.X.(*ir.Name)
+		if !ok {
+			continue
+		}
+		for _, init := range assignment.Init() {
+			declaration, ok := init.(*ir.Decl)
+			if ok && declaration.X.Canonical() == variable.Canonical() {
+				return variable
+			}
 		}
 	}
 	return nil
@@ -2319,8 +2338,12 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		for _, stmt := range list {
 			if stmtRange, ok := stmt.(*ir.RangeStmt); ok {
 				// A run-to-completion candidate cannot contain a channel
-				// receive. Integer ranges can use the ordinary loop rewrite.
-				stmt = integerRangeLoop(stmtRange, factory)
+				// receive. Integer and slice ranges use ordinary loop rewrites.
+				if stmtRange.X.Type().IsSlice() {
+					stmt = sliceRangeLoop(stmtRange, factory)
+				} else {
+					stmt = integerRangeLoop(stmtRange, factory)
+				}
 			}
 			switch stmt := stmt.(type) {
 			case *ir.Decl:
@@ -3042,6 +3065,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.RangeStmt:
 			if stmt.X.Type().IsInteger() {
 				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
+			}
+			if stmt.X.Type().IsSlice() {
+				return lowerLoop(stmt, sliceRangeLoop(stmt, factory), next)
 			}
 			channel := candidate.channels[stmt]
 			if channel == nil || channel.rangeStmt != stmt {
