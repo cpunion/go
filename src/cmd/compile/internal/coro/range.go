@@ -42,13 +42,29 @@ func integerRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	return loop
 }
 
-// sliceRangeLoop keeps a typed snapshot of the slice header across resumes.
+// indexedRangeLoop keeps a typed snapshot of an array, array pointer or slice
+// header across resumes. Array values are copied; pointers and slice headers
+// retain the original backing array.
 // The hidden counter and length are independent of assignments in the body;
 // element loads still observe writes to the original backing array. Use an
 // ordinary index rather than walkRange's transient uintptr induction variable,
 // since any body may suspend while the garbage collector runs.
-func sliceRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
+func indexedRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	pos := stmt.Pos()
+	if typ := typecheck.RangeExprType(stmt.X.Type()); typ.IsArray() &&
+		(stmt.Value == nil || ir.IsBlank(stmt.Value)) {
+		// With at most one iteration variable, a constant len means the
+		// range expression is not evaluated. In particular, *nilArray is
+		// valid here. Keep non-constant calls and receives observable.
+		var bound ir.Node = ir.NewUnaryExpr(pos, ir.OLEN, stmt.X)
+		if !ir.Any(stmt.X, rangeLenCallOrReceive) {
+			bound = typedInt(pos, types.Types[types.TINT], typ.NumElem())
+		}
+		bound = typecheck.Expr(bound)
+		copy := *stmt
+		copy.X = bound
+		return integerRangeLoop(&copy, fn)
+	}
 	values := typecheck.TempAt(pos, fn, stmt.X.Type())
 	index := typecheck.TempAt(pos, fn, types.Types[types.TINT])
 	limit := typecheck.TempAt(pos, fn, types.Types[types.TINT])
@@ -104,4 +120,21 @@ func sliceRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	loop.SetInit(init)
 	loop.Label = stmt.Label
 	return loop
+}
+
+// rangeLenCallOrReceive recognizes the non-constant calls and receives that
+// prevent an array length from being a language constant. Constant builtins
+// have already been folded by the frontend. Conversions are not calls.
+func rangeLenCallOrReceive(node ir.Node) bool {
+	switch node.Op() {
+	case ir.OAPPEND, ir.OCALL, ir.OCALLFUNC, ir.OCALLINTER, ir.OCALLMETH,
+		ir.OINLCALL, ir.OCAP, ir.OCLEAR, ir.OCLOSE, ir.OCOMPLEX, ir.OCOPY,
+		ir.ODELETE, ir.OIMAG, ir.OLEN, ir.OMAKE, ir.OMAKECHAN, ir.OMAKEMAP,
+		ir.OMAKESLICE, ir.OMAKESLICECOPY, ir.OMAX, ir.OMIN, ir.ONEW,
+		ir.OPANIC, ir.OPRINT, ir.OPRINTLN, ir.OREAL, ir.ORECOVER, ir.ORECV,
+		ir.OUNSAFEADD, ir.OUNSAFESLICE, ir.OUNSAFESLICEDATA,
+		ir.OUNSAFESTRING, ir.OUNSAFESTRINGDATA:
+		return true
+	}
+	return false
 }

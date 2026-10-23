@@ -691,11 +691,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("labeled range loop")
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
-					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() && !stmt.X.Type().IsSlice()) {
+					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() &&
+						!stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
 					return fmt.Errorf("unsupported range loop")
 				}
-				if stmt.X.Type().IsSlice() && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
-					(stmt.X.Type().Elem().IsStruct() || stmt.X.Type().Elem().IsArray()) {
+				rangeType := typecheck.RangeExprType(stmt.X.Type())
+				if (rangeType.IsSlice() || rangeType.IsArray()) && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
+					(rangeType.Elem().IsStruct() || rangeType.Elem().IsArray()) {
 					_, simpleKey := stmt.Key.(*ir.Name)
 					_, simpleValue := stmt.Value.(*ir.Name)
 					if !simpleKey || !simpleValue {
@@ -2338,9 +2340,9 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		for _, stmt := range list {
 			if stmtRange, ok := stmt.(*ir.RangeStmt); ok {
 				// A run-to-completion candidate cannot contain a channel
-				// receive. Integer and slice ranges use ordinary loop rewrites.
-				if stmtRange.X.Type().IsSlice() {
-					stmt = sliceRangeLoop(stmtRange, factory)
+				// receive. Integer and indexed ranges use ordinary loop rewrites.
+				if !stmtRange.X.Type().IsInteger() {
+					stmt = indexedRangeLoop(stmtRange, factory)
 				} else {
 					stmt = integerRangeLoop(stmtRange, factory)
 				}
@@ -3066,8 +3068,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if stmt.X.Type().IsInteger() {
 				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
 			}
-			if stmt.X.Type().IsSlice() {
-				return lowerLoop(stmt, sliceRangeLoop(stmt, factory), next)
+			if stmt.X.Type().IsSlice() || typecheck.RangeExprType(stmt.X.Type()).IsArray() {
+				return lowerLoop(stmt, indexedRangeLoop(stmt, factory), next)
 			}
 			channel := candidate.channels[stmt]
 			if channel == nil || channel.rangeStmt != stmt {
