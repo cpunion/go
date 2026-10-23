@@ -6,6 +6,23 @@ package coro
 
 import "cmd/compile/internal/ir"
 
+// goDeferOperandWrappers identifies only frontend wrappers attached to an
+// actual go/defer statement and accepted by the frozen-operand proof below.
+// Their captures snapshot operands; source closures still capture mutable cells.
+func goDeferOperandWrappers(fn *ir.Func) map[*ir.Func]bool {
+	wrappers := make(map[*ir.Func]bool)
+	ir.Visit(fn, func(node ir.Node) {
+		stmt, ok := node.(*ir.GoDeferStmt)
+		if !ok || (stmt.Op() != ir.OGO && stmt.Op() != ir.ODEFER) {
+			return
+		}
+		if call, ok := stmt.Call.(*ir.CallExpr); ok && unwrapGoCall(call) != call {
+			wrappers[call.Fun.(*ir.ClosureExpr).Func] = true
+		}
+	})
+	return wrappers
+}
+
 // unwrapGoCall returns the call inside a frontend-generated go/defer wrapper when
 // its captured operands can be read from the caller's frozen temporaries.
 // The original wrapper and statement init remain untouched, so rejected

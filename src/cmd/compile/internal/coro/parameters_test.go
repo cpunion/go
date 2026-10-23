@@ -6,10 +6,65 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"testing"
 )
+
+func TestClosedParameterOperandSnapshots(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	defer func() { typecheck.Target = oldTarget }()
+	for _, mode := range []string{"go", "defer", "forward", "unattached", "source", "call-init", "write", "address", "wrong-parent"} {
+		t.Run(mode, func(t *testing.T) {
+			typecheck.Target = new(ir.Package)
+			pkg := types.NewPkg("example.com/coro/operandproof/"+mode, "p")
+			callback := types.NewSignature(nil, nil, nil)
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("invoke"),
+				types.NewSignature(nil, []*types.Field{types.NewField(src.NoXPos, pkg.Lookup("f"), callback)}, nil))
+			fn.DeclareParams(true)
+			f := fn.Dcl[0]
+			wrapper := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OGO, callback, fn, typecheck.Target, 0)
+			wrapper.SetWrapper(true)
+			capture := ir.NewClosureVar(src.NoXPos, wrapper, f)
+			inner := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, capture, nil)
+			wrapper.Body = ir.Nodes{inner}
+			call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, wrapper.OClosure, nil)
+			call.GoDefer = true
+			op := ir.OGO
+			if mode == "defer" {
+				op = ir.ODEFER
+			}
+			fn.Body = ir.Nodes{ir.NewGoDeferStmt(src.NoXPos, op, call)}
+			switch mode {
+			case "forward":
+				forward := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("forward"), fn.Type())
+				inner.Fun, inner.Args = forward.Nname, ir.Nodes{capture}
+				wrapper.WrappedFunc = forward
+			case "unattached":
+				fn.Body = ir.Nodes{call}
+			case "source":
+				wrapper.SetWrapper(false)
+			case "call-init":
+				call.SetInit(ir.Nodes{ir.NewAssignStmt(src.NoXPos, f, f)})
+			case "write":
+				fn.Body = append(fn.Body, ir.NewAssignStmt(src.NoXPos, f, f))
+			case "address":
+				f.SetAddrtaken(true)
+			case "wrong-parent":
+				wrapper.ClosureParent = nil
+			}
+			want := mode == "go" || mode == "defer" || mode == "forward"
+			if got := readOnlyCallbackParameters(fn); got != want {
+				t.Fatalf("read-only callback parameter = %t, want %t", got, want)
+			}
+			if call.Fun != wrapper.OClosure || wrapper.Body[0] != inner || wrapper.ClosureVars[0] != capture {
+				t.Fatal("snapshot proof changed the ordinary source body")
+			}
+		})
+	}
+}
 
 func TestClosedParameterProof(t *testing.T) {
 	prepareLowerTest(t)
