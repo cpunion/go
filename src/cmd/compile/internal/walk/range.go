@@ -143,6 +143,12 @@ func walkRange(nrange *ir.RangeStmt) ir.Node {
 			body = []ir.Node{rangeAssign2(nrange, hv1, tmp)}
 			break
 		}
+		if t.IsPtr() && t.Elem().NumElem() == 0 {
+			// No element can be visited. In particular, do not turn a nil
+			// pointer to an empty array into a slice: that would introduce
+			// a nil check even though the loop never reads an element.
+			break
+		}
 
 		// Slice to iterate over
 		var hs ir.Node

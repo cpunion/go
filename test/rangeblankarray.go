@@ -21,6 +21,18 @@ func pointer() *[3]int {
 }
 
 func main() {
+	// A zero-length array pointer never loads an element, including when
+	// the element is zero-sized or uses a pointer induction variable.
+	var empty *[0]struct{}
+	for i, v := range empty {
+		_, _ = i, v
+		panic("empty struct array iteration")
+	}
+	var emptyLarge *[0][257]byte
+	for i, v := range emptyLarge {
+		_, _ = i, v
+		panic("empty large array iteration")
+	}
 	var p *[3]int
 	sum := 0
 	for i, _ := range *p {

@@ -53,6 +53,8 @@ func keyCalls(values [3]int) int {
 func initialized(values [3]int) int {a:=snapshot(values);sum:=0;for _,v:=range a {runtime.Gosched();sum+=v};return sum}
 func received(ch chan *[3]int) int {sum:=0;for i:=range <-ch {runtime.Gosched();sum+=i};return sum}
 func zero(p *[0]int) int {n:=0;for i,v:=range p {runtime.Gosched();n+=i+v};return n}
+func zeroStruct(p *[0]struct{}) int {n:=0;for i,v:=range p {runtime.Gosched();_ = v;n+=i};return n}
+func zeroLarge(p *[0]large) int {n:=0;for i,v:=range p {runtime.Gosched();_ = v;n+=i};return n}
 func converted(values *[3]int) int {
  var i,v any;sum:=0;for i,v=range values {runtime.Gosched();sum+=i.(int)+v.(int)};return sum
 }
@@ -103,7 +105,7 @@ func main(){
  if named(numbers{1,2,3},arrayPointer(&numbers{4,5,6}))!=21 {panic("named array")}
  if evaluated([3]int{1,2,3})!=6||calls!=1 {panic("array expression evaluation")}
  if keyOnly(nil)!=15||keyCalls([3]int{})!=6||calls!=3||initialized([3]int{1,2,3})!=6||calls!=4 {panic("constant versus nonconstant range length")}
- ch:=make(chan *[3]int,1);ch<-nil;if received(ch)!=3||len(ch)!=0||zero(nil)!=0 {panic("receive or zero-length nil array")}
+ ch:=make(chan *[3]int,1);ch<-nil;if received(ch)!=3||len(ch)!=0||zero(nil)!=0||zeroStruct(nil)!=0||zeroLarge(nil)!=0 {panic("receive or zero-length nil array")}
  if converted(&[3]int{1,2,3})!=9||assignment([3]int{7,8,9})!=3 {panic("array assignment")}
  k,v:=alias();if k!=0||v!=9 {panic("key aliases pointer element")}
  ready,release:=make(chan struct{}),make(chan struct{})
@@ -117,7 +119,7 @@ func main(){
 }`
 	testSwitchReturnProgram(t, source,
 		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}},
-		[]string{"array", "pointer", "named", "evaluated", "keyCalls", "initialized", "keyOnly", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
+		[]string{"array", "pointer", "named", "evaluated", "keyCalls", "initialized", "keyOnly", "zero", "zeroStruct", "zeroLarge", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
 }
 
 func TestArrayRangeBoundaries(t *testing.T) {
