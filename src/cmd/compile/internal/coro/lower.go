@@ -696,6 +696,19 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("unsupported range loop")
 				}
 				rangeType := typecheck.RangeExprType(stmt.X.Type())
+				if rangeType.IsArray() && ir.Any(stmt.X, func(node ir.Node) bool {
+					switch node.(type) {
+					case *ir.CallExpr, *ir.InlinedCallExpr:
+						return true
+					}
+					return false
+				}) {
+					// Calling an ordinary function can materialize its array
+					// arguments or result on the nosplit resume stack after
+					// frame planning. Keep the original body until these
+					// header calls have typed frame-owned destinations.
+					return fmt.Errorf("call in array range expression")
+				}
 				if (rangeType.IsSlice() || rangeType.IsArray()) && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
 					(rangeType.Elem().IsStruct() || rangeType.Elem().IsArray()) {
 					_, simpleKey := stmt.Key.(*ir.Name)

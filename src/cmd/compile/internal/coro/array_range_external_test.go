@@ -115,8 +115,22 @@ func main(){
  println("switch-return-ok")
 }`
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}},
-		[]string{"array", "pointer", "named", "evaluated", "keyOnly", "keyCalls", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
+		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}, {"evaluated", "call in array range expression"}, {"keyCalls", "call in array range expression"}},
+		[]string{"array", "pointer", "named", "keyOnly", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
+}
+
+func TestArrayRangeBoundaries(t *testing.T) {
+	const source = `package main
+import "runtime"
+type item struct {p *int;pad [257]byte}
+var calls int
+func values() [3]item {calls++;return [3]item{{p:new(int)},{p:new(int)},{p:new(int)}}}
+func byValue() int {n:=0;for i,v:=range values() {runtime.Gosched();n+=i+int(v.pad[256])};return n}
+func byKey() int {n:=0;for i:=range values() {runtime.Gosched();n+=i};return n}
+func main(){if byValue()!=3||byKey()!=3||calls!=2 {panic("large array header fallback")};println("switch-return-ok")}
+`
+	testSwitchReturnProgram(t, source,
+		[]switchFallback{{"byValue", "call in array range expression"}, {"byKey", "call in array range expression"}}, nil)
 }
 
 func TestArrayRangeTerminal(t *testing.T) {
