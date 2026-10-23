@@ -208,6 +208,7 @@ func readOnlyCallbackParameters(fn *ir.Func) bool {
 	if len(parameters) == 0 {
 		return false
 	}
+	operandWrappers := goDeferOperandWrappers(fn)
 	valid := true
 	write := func(node ir.Node) {
 		if name, ok := node.(*ir.Name); ok && parameters[name.Canonical()] {
@@ -228,6 +229,9 @@ func readOnlyCallbackParameters(fn *ir.Func) bool {
 		case *ir.AddrExpr:
 			write(node.X)
 		case *ir.ClosureExpr:
+			if operandWrappers[node.Func] {
+				break
+			}
 			for _, name := range node.Func.ClosureVars {
 				write(name.Canonical())
 			}

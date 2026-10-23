@@ -134,18 +134,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 		}
 	}
 	for _, fn := range funcs {
-		operandWrappers := make(map[*ir.Func]bool)
-		ir.Visit(fn, func(node ir.Node) {
-			stmt, ok := node.(*ir.GoDeferStmt)
-			if !ok {
-				return
-			}
-			if call, ok := stmt.Call.(*ir.CallExpr); ok {
-				if (stmt.Op() == ir.OGO || stmt.Op() == ir.ODEFER) && unwrapGoCall(call) != call {
-					operandWrappers[call.Fun.(*ir.ClosureExpr).Func] = true
-				}
-			}
-		})
+		operandWrappers := goDeferOperandWrappers(fn)
 		localWrite := func(lhs, rhs ir.Node) {
 			if name, ok := lhs.(*ir.Name); ok {
 				if _, tracked := locals[fn][name]; tracked {
