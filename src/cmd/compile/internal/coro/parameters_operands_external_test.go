@@ -5,9 +5,11 @@
 package coro_test
 
 import (
+	"internal/platform"
 	"internal/testenv"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -178,6 +180,9 @@ func TestThread(t *testing.T) {for range 1 {runtime.LockOSThread();defer runtime
 				flags = "-l " + flags
 			}
 			if mode == "race" {
+				if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
+					t.Skip("race detector is not supported")
+				}
 				testenv.MustHaveCGO(t)
 				args = append(args, "-race")
 			}
