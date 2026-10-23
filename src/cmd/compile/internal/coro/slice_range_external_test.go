@@ -15,11 +15,16 @@ import (
 
 func TestSliceRange(t *testing.T) {
 	const source = `package main
-import "runtime"
+import ("runtime";"unsafe")
 type number int
 type numbers []number
 var calls int
 func snapshot(v []int) []int {calls++;return v}
+func alias() (int,int) {
+ key:=9;values:=unsafe.Slice(&key,1);var value int
+ for key,value=range values {runtime.Gosched()}
+ return key,value
+}
 func frozen(values []int) int {
  sum:=0
  for i,v:=range snapshot(values) {
@@ -113,6 +118,7 @@ func aggregateArray(values [][257]byte) byte {
 func main(){
  values:=[]large{{p:new(int)},{p:new(int)},{p:new(int)}};*values[0].p=1;*values[1].p=2;*values[2].p=3
  if aggregateAssign(values)!=6 || aggregateKey(values)!=5 || aggregateArray([][257]byte{{256:7}})!=7 {panic("aggregate destination fallback")}
+ key,value:=alias();if key!=0 || value!=9 {panic("range key/element alias ordering")}
  if frozen([]int{1,2,3})!=43 || calls!=1 {panic("frozen header, length or element load")}
  if frozen(nil)!=0 || frozen([]int{})!=0 || calls!=3 {panic("empty source evaluation")}
  if named(numbers{2,3})!=5 || converted([]int{2,3})!=6 || assignment([]int{7,8,9})!=3 {panic("iteration assignment")}
@@ -130,7 +136,7 @@ func main(){
 }`
 	testSwitchReturnProgram(t, source,
 		[]switchFallback{{"captured", "range variable captured by closure"}, {"array", "unsupported range loop"}, {"aggregateAssign", "aggregate range value with complex destination"}, {"aggregateKey", "aggregate range value with complex destination"}, {"aggregateArray", "aggregate range value with complex destination"}},
-		[]string{"frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
+		[]string{"alias", "frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
 }
 
 func TestSliceRangeTerminal(t *testing.T) {

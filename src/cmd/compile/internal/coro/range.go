@@ -78,11 +78,19 @@ func sliceRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 		_, simpleKey := stmt.Key.(*ir.Name)
 		_, simpleValue := stmt.Value.(*ir.Name)
 		if simpleKey && simpleValue {
-			// Neither destination can affect the hidden header or counter.
-			// Separate stores avoid copying a large element through an OAS2
-			// stack temporary in a nosplit resume.
-			body.Prepend(ir.NewAssignStmt(pos, stmt.Key, keyValue),
-				ir.NewAssignStmt(pos, stmt.Value, elementValue))
+			if ir.IsBlank(stmt.Key) {
+				body.Prepend(ir.NewAssignStmt(pos, stmt.Value, elementValue))
+			} else {
+				// Freeze the element before storing the key: the key's
+				// storage can alias a backing-array element. Keep this
+				// temporary in the typed frame rather than an OAS2 stack
+				// temporary, which can overflow a nosplit resume.
+				snapshot := typecheck.TempAt(pos, fn, stmt.Value.Type())
+				init.Append(ir.NewDecl(pos, ir.ODCL, snapshot))
+				body.Prepend(ir.NewAssignStmt(pos, snapshot, elementValue),
+					ir.NewAssignStmt(pos, stmt.Key, keyValue),
+					ir.NewAssignStmt(pos, stmt.Value, snapshot))
+			}
 		} else {
 			// A parallel assignment preserves operands such as i, a[i].
 			body.Prepend(ir.NewAssignListStmt(pos, ir.OAS2,
