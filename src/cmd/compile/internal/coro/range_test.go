@@ -120,6 +120,8 @@ func TestLowerIntegerRange(t *testing.T) {
 
 func TestLowerSliceRange(t *testing.T) { testLowerIndexedRange(t, "slice") }
 
+func TestLowerStringRange(t *testing.T) { testLowerIndexedRange(t, "string") }
+
 func TestLowerArrayRange(t *testing.T) {
 	for _, kind := range []string{"array", "pointer"} {
 		t.Run(kind, func(t *testing.T) { testLowerIndexedRange(t, kind) })
@@ -155,11 +157,14 @@ func testLowerIndexedRange(t *testing.T, kind string) {
 			call := newLowerTestCall(op)
 			key := typecheck.TempAt(src.NoXPos, fn, types.Types[types.TINT])
 			typ := types.NewSlice(types.Types[types.TINT])
-			if kind != "slice" {
+			if kind == "array" || kind == "pointer" {
 				typ = types.NewArray(types.Types[types.TINT], 3)
 			}
 			if kind == "pointer" {
 				typ = types.NewPtr(typ)
+			}
+			if kind == "string" {
+				typ = types.Types[types.TSTRING]
 			}
 			values := typecheck.TempAt(src.NoXPos, fn, typ)
 			loop := ir.NewRangeStmt(src.NoXPos, key, nil,
