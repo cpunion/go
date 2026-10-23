@@ -693,7 +693,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
 					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() &&
-						!stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
+						!stmt.X.Type().IsString() && !stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
 					return fmt.Errorf("unsupported range loop")
 				}
 				rangeType := typecheck.RangeExprType(stmt.X.Type())
@@ -2373,11 +2373,13 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		for _, stmt := range list {
 			if stmtRange, ok := stmt.(*ir.RangeStmt); ok {
 				// A run-to-completion candidate cannot contain a channel
-				// receive. Integer and indexed ranges use ordinary loop rewrites.
-				if !stmtRange.X.Type().IsInteger() {
-					stmt = indexedRangeLoop(stmtRange, factory)
-				} else {
+				// receive. Other admitted ranges use ordinary loop rewrites.
+				if stmtRange.X.Type().IsInteger() {
 					stmt = integerRangeLoop(stmtRange, factory)
+				} else if stmtRange.X.Type().IsString() {
+					stmt = stringRangeLoop(stmtRange, factory)
+				} else {
+					stmt = indexedRangeLoop(stmtRange, factory)
 				}
 			}
 			switch stmt := stmt.(type) {
@@ -3100,6 +3102,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.RangeStmt:
 			if stmt.X.Type().IsInteger() {
 				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
+			}
+			if stmt.X.Type().IsString() {
+				return lowerLoop(stmt, stringRangeLoop(stmt, factory), next)
 			}
 			if stmt.X.Type().IsSlice() || typecheck.RangeExprType(stmt.X.Type()).IsArray() {
 				return lowerLoop(stmt, indexedRangeLoop(stmt, factory), next)

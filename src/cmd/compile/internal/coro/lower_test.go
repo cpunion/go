@@ -7484,10 +7484,11 @@ func TestLowerRejectsUnsupportedChannels(t *testing.T) {
 			want: "labeled range loop",
 		},
 		{
-			name: "string-range",
-			make: func(_ *ir.Func, _ *ir.Name) (ir.Nodes, ir.Node) {
+			name: "map-range",
+			make: func(fn *ir.Func, _ *ir.Name) (ir.Nodes, ir.Node) {
+				values := typecheck.TempAt(src.NoXPos, fn, types.NewMap(types.Types[types.TINT], types.Types[types.TINT]))
 				loop := ir.NewRangeStmt(src.NoXPos, nil, nil,
-					ir.NewString(src.NoXPos, "abc"), nil, false)
+					values, nil, false)
 				return ir.Nodes{loop}, loop
 			},
 			want: "unsupported range loop",

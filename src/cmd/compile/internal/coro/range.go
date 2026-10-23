@@ -8,6 +8,7 @@ import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"unicode/utf8"
 )
 
 // integerRangeLoop exposes an integer range's counter and frozen bound to
@@ -112,6 +113,54 @@ func indexedRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 			convert(stmt.Key, index, stmt.KeyTypeWord, stmt.KeySrcRType)))
 	}
 	loop := ir.NewForStmt(pos, nil, condition, post, body, false)
+	loop.SetInit(init)
+	loop.Label = stmt.Label
+	return loop
+}
+
+// stringRangeLoop follows walkRange's UTF-8 decoding while keeping the string
+// and byte offsets in typed frame storage across suspensions. Advance the hidden
+// offset before the source body so continue resumes at the next rune, even when
+// an invalid encoding consumes just one byte. The exposed key is the old offset.
+func stringRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
+	pos := stmt.Pos()
+	text := typecheck.TempAt(pos, fn, types.Types[types.TSTRING])
+	index := typecheck.TempAt(pos, fn, types.Types[types.TINT])
+	key := typecheck.TempAt(pos, fn, types.Types[types.TINT])
+	value := typecheck.TempAt(pos, fn, types.RuneType)
+	init := append(ir.Nodes(nil), stmt.Init()...)
+	for _, name := range []*ir.Name{text, index, key, value} {
+		init.Append(ir.NewDecl(pos, ir.ODCL, name))
+	}
+	init.Append(ir.NewAssignStmt(pos, text, typecheck.Conv(stmt.X, types.Types[types.TSTRING])),
+		ir.NewAssignStmt(pos, index, nil))
+	condition := ir.NewBinaryExpr(pos, ir.OLT, index, ir.NewUnaryExpr(pos, ir.OLEN, text))
+	byteValue := ir.NewIndexExpr(pos, text, index)
+	byteValue.SetBounded(true)
+	decode := typecheck.Call(pos, typecheck.LookupRuntime("decoderune"), ir.Nodes{text, index}, false)
+	step := ir.NewIfStmt(pos,
+		ir.NewBinaryExpr(pos, ir.OLE, value, ir.NewInt(pos, utf8.RuneSelf-1)),
+		ir.Nodes{ir.NewAssignStmt(pos, index, ir.NewBinaryExpr(pos, ir.OADD, index, ir.NewInt(pos, 1)))},
+		ir.Nodes{ir.NewAssignListStmt(pos, ir.OAS2, ir.Nodes{value, index}, ir.Nodes{decode})})
+	body := ir.Nodes{ir.NewAssignStmt(pos, key, index),
+		ir.NewAssignStmt(pos, value, typecheck.Conv(byteValue, types.RuneType)), step}
+	convert := func(dst, src, typeWord, srcRType ir.Node) ir.Node {
+		if dst.Type().Kind() == types.TBLANK || types.Identical(dst.Type(), src.Type()) {
+			return src
+		}
+		conversion := ir.NewConvExpr(pos, ir.OCONV, dst.Type(), src)
+		conversion.TypeWord, conversion.SrcRType = typeWord, srcRType
+		return conversion
+	}
+	if stmt.Value != nil && !ir.IsBlank(stmt.Value) {
+		body.Append(ir.NewAssignListStmt(pos, ir.OAS2, ir.Nodes{stmt.Key, stmt.Value}, ir.Nodes{
+			convert(stmt.Key, key, stmt.KeyTypeWord, stmt.KeySrcRType),
+			convert(stmt.Value, value, stmt.ValueTypeWord, stmt.ValueSrcRType)}))
+	} else if stmt.Key != nil && !ir.IsBlank(stmt.Key) {
+		body.Append(ir.NewAssignStmt(pos, stmt.Key, convert(stmt.Key, key, stmt.KeyTypeWord, stmt.KeySrcRType)))
+	}
+	body.Append(stmt.Body...)
+	loop := ir.NewForStmt(pos, nil, condition, nil, body, false)
 	loop.SetInit(init)
 	loop.Label = stmt.Label
 	return loop
