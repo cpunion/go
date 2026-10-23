@@ -118,6 +118,30 @@ func main(){complexKey(map[[256]byte]int{{1}:2});complexValue(map[int][256]byte{
 `
 	testSwitchReturnProgram(t, source, []switchFallback{{"complexKey", "aggregate map range operand with complex destination"}, {"complexValue", "aggregate map range operand with complex destination"}}, nil)
 }
+
+// A map range must not admit a resume with large late assertion temporaries.
+// Large interface conversions remain native when assertions run in the caller.
+func TestMapRangeAssertions(t *testing.T) {
+	const source = `package main
+import "runtime"
+type key [8192]byte
+type value [16384]byte
+func large(m map[key]value) int {var k,v any;n:=0;for k,v=range m {runtime.Gosched();a,b:=k.(key),v.(value);n+=int(a[8191])+int(b[16383])};return n}
+func converted(m map[key]value,out chan [2]any) {var k,v any;for k,v=range m {runtime.Gosched();out<-[2]any{k,v}};close(out)}
+func small(m map[[16]byte][32]byte) int {var k,v any;n:=0;for k,v=range m {runtime.Gosched();a,b:=k.([16]byte),v.([32]byte);n+=int(a[15])+int(b[31])};return n}
+func boundary(m map[int]any) int {n:=0;for _,v:=range m {runtime.Gosched();a:=v.([100]byte);n+=int(a[99])};return n}
+func beyond(m map[int]any) int {n:=0;for _,v:=range m {runtime.Gosched();a:=v.([101]byte);n+=int(a[100])};return n}
+func combined(m map[int]any) int {n:=0;for _,v:=range m {runtime.Gosched();a,b:=v.([64]byte),v.([64]byte);n+=int(a[63])+int(b[63])};return n}
+func commaOK(m map[int]any) int {n:=0;for _,v:=range m {runtime.Gosched();a,ok:=v.([128]byte);if ok {n+=int(a[127])}};return n}
+func structure(m map[int]any) int {n:=0;for _,v:=range m {runtime.Gosched();a:=v.(struct{pad [128]byte});n+=int(a.pad[127])};return n}
+func main(){var k key;var v value;k[8191]=3;v[16383]=7;m:=map[key]value{k:v};if large(m)!=10 {panic("large assertion fallback")};out:=make(chan [2]any);go converted(m,out);n:=0;for pair:=range out {a,b:=pair[0].(key),pair[1].(value);n+=int(a[8191])+int(b[16383])};if n!=10 {panic("large conversion")}
+ var a [16]byte;var b [32]byte;a[15]=3;b[31]=7;if small(map[[16]byte][32]byte{a:b})!=10 {panic("small native assertions")}
+ var c [100]byte;var d [101]byte;var e [64]byte;var f [128]byte;c[99]=1;d[100]=2;e[63]=3;f[127]=4
+ if boundary(map[int]any{0:c})!=1||beyond(map[int]any{0:d})!=2||combined(map[int]any{0:e})!=6||commaOK(map[int]any{0:f,1:1})!=4||structure(map[int]any{0:struct{pad [128]byte}{pad:f}})!=4 {panic("aggregate assertion bounds")};println("switch-return-ok")}
+`
+	testSwitchReturnProgram(t, source, []switchFallback{{"large", "aggregate type assertion exceeds stack transfer budget"}, {"beyond", "aggregate type assertion exceeds stack transfer budget"}, {"combined", "aggregate type assertion exceeds stack transfer budget"}, {"commaOK", "aggregate type assertion exceeds stack transfer budget"}, {"structure", "aggregate type assertion exceeds stack transfer budget"}}, []string{"converted", "small", "boundary"})
+}
+
 func TestMapRangeImported(t *testing.T) {
 	files := map[string]string{
 		"go.mod": "module example.com/maprange\n\ngo 1.28\n",

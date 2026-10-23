@@ -1196,8 +1196,20 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// calls already have frame-owned transfers. This does not prove arbitrary
 	// callees' fixed-stack requirements.
 	const aggregateTransferBudget = abi.StackNosplitBase / 8
-	var aggregateBytes int64
+	var aggregateBytes, assertionBytes int64
 	ir.Visit(fn, func(node ir.Node) {
+		// Walk/SSA may materialize aggregate assertion results on the
+		// stack after typed frame planning, including parallel and
+		// comma-ok assertions. Keep their combined size bounded too.
+		switch node.Op() {
+		case ir.ODOTTYPE, ir.ODOTTYPE2, ir.ODYNAMICDOTTYPE, ir.ODYNAMICDOTTYPE2:
+			if typ := node.Type(); assertionBytes <= aggregateTransferBudget &&
+				(typ.IsArray() || typ.IsStruct()) {
+				types.CalcSize(typ)
+				assertionBytes += typ.Size()
+			}
+		}
+
 		call, ok := node.(*ir.CallExpr)
 		if !ok || candidate.transitions[call] != SiteInvalid ||
 			call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
@@ -1221,6 +1233,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	})
 	if aggregateBytes > aggregateTransferBudget {
 		return nil, fmt.Errorf("ordinary aggregate call exceeds stack transfer budget")
+	}
+	if assertionBytes > aggregateTransferBudget {
+		return nil, fmt.Errorf("aggregate type assertion exceeds stack transfer budget")
 	}
 	return candidate, nil
 }
