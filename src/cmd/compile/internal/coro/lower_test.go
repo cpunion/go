@@ -7189,47 +7189,61 @@ func TestTransformedRangeVariable(t *testing.T) {
 	variable := fn.NewLocal(src.NoXPos, pkg.Lookup("variable"),
 		types.Types[types.TINT])
 
-	if got := transformedRangeVariable(nil); got != nil {
-		t.Fatalf("transformedRangeVariable(nil) = %v, want nil", got)
+	if got := transformedRangeVariable(nil, nil); got != nil {
+		t.Fatalf("transformedRangeVariable(nil, nil) = %v, want nil", got)
 	}
 	loop := ir.NewRangeStmt(src.NoXPos, key, nil, nil, nil, false)
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("empty range variable = %v, want nil", got)
 	}
 	loop.Body = ir.Nodes{ir.NewInt(src.NoXPos, 1)}
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("non-assignment range variable = %v, want nil", got)
 	}
 
 	assignment := ir.NewAssignStmt(src.NoXPos, variable, key)
 	loop.Body = ir.Nodes{assignment}
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("non-defining range variable = %v, want nil", got)
 	}
 	assignment.Def = true
 	assignment.Y = ir.NewInt(src.NoXPos, 1)
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("unrelated range variable = %v, want nil", got)
 	}
 	assignment.Y = key
 	assignment.X = ir.NewIndexExpr(src.NoXPos, variable,
 		ir.NewInt(src.NoXPos, 0))
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("non-name range variable = %v, want nil", got)
 	}
 	assignment.X = variable
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("undeclared range variable = %v, want nil", got)
 	}
 	assignment.SetInit(ir.Nodes{ir.NewBlockStmt(src.NoXPos, nil)})
-	if got := transformedRangeVariable(loop); got != nil {
+	if got := transformedRangeVariable(loop, key); got != nil {
 		t.Fatalf("unmatched range declaration = %v, want nil", got)
 	}
 	assignment.SetInit(ir.Nodes{
 		ir.NewDecl(src.NoXPos, ir.ODCL, variable),
 	})
-	if got := transformedRangeVariable(loop); got != variable {
+	if got := transformedRangeVariable(loop, key); got != variable {
 		t.Fatalf("transformed range variable = %v, want %v", got, variable)
+	}
+	value := typecheck.TempAt(src.NoXPos, fn, types.Types[types.TINT])
+	valueVariable := fn.NewLocal(src.NoXPos, pkg.Lookup("value"), types.Types[types.TINT])
+	valueAssignment := ir.NewAssignStmt(src.NoXPos, valueVariable, value)
+	valueAssignment.Def = true
+	valueAssignment.SetInit(ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, valueVariable)})
+	loop.Value = value
+	loop.Body.Prepend(valueAssignment)
+	if transformedRangeVariable(loop, key) != variable || transformedRangeVariable(loop, value) != valueVariable {
+		t.Fatal("range with both transformed key and value lost an iteration cell")
+	}
+	loop.Body.Prepend(ir.NewBlockStmt(src.NoXPos, nil))
+	if transformedRangeVariable(loop, key) != nil {
+		t.Fatal("unrelated later body declaration was treated as a range variable")
 	}
 }
 

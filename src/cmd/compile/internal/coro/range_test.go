@@ -117,3 +117,62 @@ func TestLowerIntegerRange(t *testing.T) {
 		})
 	}
 }
+
+func TestLowerSliceRange(t *testing.T) {
+	prepareLowerTest(t)
+	for _, foreign := range []bool{false, true} {
+		name := "suspending"
+		if foreign {
+			name = "foreign"
+		}
+		t.Run(name, func(t *testing.T) {
+			oldTarget, oldLocalPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+			t.Cleanup(func() { typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldLocalPkg, oldCurFunc })
+			typecheck.Target = new(ir.Package)
+			pkg := types.NewPkg("example.com/coro/slicerange/"+name, name)
+			types.LocalPkg = pkg
+			fn := newLowerTestFunc(pkg, "loop")
+			var op *ir.Func
+			functions := []*ir.Func{fn}
+			var directives [][]string
+			if foreign {
+				op = newLowerTestFunc(pkg, "_Cfunc_step")
+				direct := newLowerTestFunc(pkg, "_Cdirect_step")
+				functions = append(functions, op, direct)
+				directives = [][]string{{"cgo_direct", "v1", "_Cfunc_step", "_Cdirect_step", "step", "mayblock", "-", "void", "-"}}
+			} else {
+				op = ir.NewFunc(src.NoXPos, src.NoXPos, ir.Pkgs.Runtime.Lookup("Gosched"), types.NewSignature(nil, nil, nil))
+				op.DeclareParams(true)
+			}
+			call := newLowerTestCall(op)
+			key := typecheck.TempAt(src.NoXPos, fn, types.Types[types.TINT])
+			values := typecheck.TempAt(src.NoXPos, fn, types.NewSlice(types.Types[types.TINT]))
+			loop := ir.NewRangeStmt(src.NoXPos, key, nil,
+				values, ir.Nodes{call}, false)
+			loop.SetTypecheck(1)
+			fn.Body = ir.Nodes{ir.NewDecl(src.NoXPos, ir.ODCL, values), ir.NewDecl(src.NoXPos, ir.ODCL, key), loop, newLowerTestReturn()}
+			plan, err := Analyze(functions, directives)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate, err := newLowerCandidate(plan, plan.Functions[fn])
+			if err != nil || canLowerRunToCompletion(candidate) != foreign {
+				t.Fatalf("range candidate: %v", err)
+			}
+			result, err := Lower(plan, nil)
+			if err != nil || result.Lowered != 1 {
+				t.Fatalf("Lower = %+v, %v", result, err)
+			}
+			for _, generated := range typecheck.Target.Funcs {
+				if generated == fn || generated == op {
+					continue
+				}
+				ir.VisitList(generated.Body, func(node ir.Node) {
+					if node.Op() == ir.ORANGE {
+						t.Fatal("native entry retained an opaque slice range")
+					}
+				})
+			}
+		})
+	}
+}
