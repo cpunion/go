@@ -42,13 +42,24 @@ func integerRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	return loop
 }
 
-// sliceRangeLoop keeps a typed snapshot of the slice header across resumes.
+// indexedRangeLoop keeps a typed snapshot of an array, array pointer or slice
+// header across resumes. Array values are copied; pointers and slice headers
+// retain the original backing array.
 // The hidden counter and length are independent of assignments in the body;
-// element loads still observe writes to the original backing array. Use an
+// element loads still observe writes to the snapshot's backing array. Use an
 // ordinary index rather than walkRange's transient uintptr induction variable,
 // since any body may suspend while the garbage collector runs.
-func sliceRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
+func indexedRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	pos := stmt.Pos()
+	if typ := typecheck.RangeExprType(stmt.X.Type()); typ.IsArray() &&
+		(stmt.Value == nil || ir.IsBlank(stmt.Value)) {
+		// The frontend has already rewritten constant-length key-only
+		// ranges to integer ranges. Evaluate the remaining expression
+		// once for its length without copying or reading its elements.
+		copy := *stmt
+		copy.X = typecheck.Expr(ir.NewUnaryExpr(pos, ir.OLEN, stmt.X))
+		return integerRangeLoop(&copy, fn)
+	}
 	values := typecheck.TempAt(pos, fn, stmt.X.Type())
 	index := typecheck.TempAt(pos, fn, types.Types[types.TINT])
 	limit := typecheck.TempAt(pos, fn, types.Types[types.TINT])

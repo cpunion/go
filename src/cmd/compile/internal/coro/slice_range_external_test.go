@@ -148,8 +148,8 @@ func main(){
  println("switch-return-ok")
 }`
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"captured", "range variable captured by closure"}, {"array", "unsupported range loop"}, {"aggregateAssign", "aggregate range value with complex destination"}, {"aggregateKey", "aggregate range value with complex destination"}, {"aggregateArray", "aggregate range value with complex destination"}},
-		[]string{"lhsMutation", "mapMutation", "alias", "frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
+		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregateAssign", "aggregate range value with complex destination"}, {"aggregateKey", "aggregate range value with complex destination"}, {"aggregateArray", "aggregate range value with complex destination"}},
+		[]string{"array", "lhsMutation", "mapMutation", "alias", "frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
 }
 
 func TestSliceRangeTerminal(t *testing.T) {

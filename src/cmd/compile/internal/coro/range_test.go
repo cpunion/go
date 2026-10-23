@@ -118,7 +118,15 @@ func TestLowerIntegerRange(t *testing.T) {
 	}
 }
 
-func TestLowerSliceRange(t *testing.T) {
+func TestLowerSliceRange(t *testing.T) { testLowerIndexedRange(t, "slice") }
+
+func TestLowerArrayRange(t *testing.T) {
+	for _, kind := range []string{"array", "pointer"} {
+		t.Run(kind, func(t *testing.T) { testLowerIndexedRange(t, kind) })
+	}
+}
+
+func testLowerIndexedRange(t *testing.T, kind string) {
 	prepareLowerTest(t)
 	for _, foreign := range []bool{false, true} {
 		name := "suspending"
@@ -146,7 +154,14 @@ func TestLowerSliceRange(t *testing.T) {
 			}
 			call := newLowerTestCall(op)
 			key := typecheck.TempAt(src.NoXPos, fn, types.Types[types.TINT])
-			values := typecheck.TempAt(src.NoXPos, fn, types.NewSlice(types.Types[types.TINT]))
+			typ := types.NewSlice(types.Types[types.TINT])
+			if kind != "slice" {
+				typ = types.NewArray(types.Types[types.TINT], 3)
+			}
+			if kind == "pointer" {
+				typ = types.NewPtr(typ)
+			}
+			values := typecheck.TempAt(src.NoXPos, fn, typ)
 			loop := ir.NewRangeStmt(src.NoXPos, key, nil,
 				values, ir.Nodes{call}, false)
 			loop.SetTypecheck(1)
@@ -169,7 +184,7 @@ func TestLowerSliceRange(t *testing.T) {
 				}
 				ir.VisitList(generated.Body, func(node ir.Node) {
 					if node.Op() == ir.ORANGE {
-						t.Fatal("native entry retained an opaque slice range")
+						t.Fatal("native entry retained an opaque indexed range")
 					}
 				})
 			}

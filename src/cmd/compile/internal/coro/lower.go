@@ -13,6 +13,7 @@ import (
 	"cmd/internal/src"
 	"fmt"
 	"go/constant"
+	"internal/abi"
 	"internal/runtime/gc"
 	"slices"
 	"strings"
@@ -691,11 +692,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("labeled range loop")
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
-					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() && !stmt.X.Type().IsSlice()) {
+					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() &&
+						!stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
 					return fmt.Errorf("unsupported range loop")
 				}
-				if stmt.X.Type().IsSlice() && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
-					(stmt.X.Type().Elem().IsStruct() || stmt.X.Type().Elem().IsArray()) {
+				rangeType := typecheck.RangeExprType(stmt.X.Type())
+				if (rangeType.IsSlice() || rangeType.IsArray()) && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
+					(rangeType.Elem().IsStruct() || rangeType.Elem().IsArray()) {
 					_, simpleKey := stmt.Key.(*ir.Name)
 					_, simpleValue := stmt.Value.(*ir.Name)
 					if !simpleKey || !simpleValue {
@@ -1168,6 +1171,38 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				candidate.deferDeps[terminal.target] = true
 			}
 		}
+	}
+	// Ordinary aggregate calls can introduce ABI temporaries after frame
+	// planning, including before a range or inside its body. Bound their
+	// combined transfer size conservatively; native factory and typed foreign
+	// calls already have frame-owned transfers. This does not prove arbitrary
+	// callees' fixed-stack requirements.
+	const aggregateTransferBudget = abi.StackNosplitBase / 8
+	var aggregateBytes int64
+	ir.Visit(fn, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok || candidate.transitions[call] != SiteInvalid ||
+			call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
+			return
+		}
+		if _, foreign := candidate.foreignCalls[call]; foreign {
+			return
+		}
+		signature := call.Fun.Type()
+		for _, fields := range [][]*types.Field{signature.RecvParams(), signature.Results()} {
+			for _, field := range fields {
+				if aggregateBytes > aggregateTransferBudget {
+					return
+				}
+				if typ := field.Type; typ.IsArray() || typ.IsStruct() {
+					types.CalcSize(typ)
+					aggregateBytes += typ.Size()
+				}
+			}
+		}
+	})
+	if aggregateBytes > aggregateTransferBudget {
+		return nil, fmt.Errorf("ordinary aggregate call exceeds stack transfer budget")
 	}
 	return candidate, nil
 }
@@ -2338,9 +2373,9 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 		for _, stmt := range list {
 			if stmtRange, ok := stmt.(*ir.RangeStmt); ok {
 				// A run-to-completion candidate cannot contain a channel
-				// receive. Integer and slice ranges use ordinary loop rewrites.
-				if stmtRange.X.Type().IsSlice() {
-					stmt = sliceRangeLoop(stmtRange, factory)
+				// receive. Integer and indexed ranges use ordinary loop rewrites.
+				if !stmtRange.X.Type().IsInteger() {
+					stmt = indexedRangeLoop(stmtRange, factory)
 				} else {
 					stmt = integerRangeLoop(stmtRange, factory)
 				}
@@ -3066,8 +3101,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if stmt.X.Type().IsInteger() {
 				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
 			}
-			if stmt.X.Type().IsSlice() {
-				return lowerLoop(stmt, sliceRangeLoop(stmt, factory), next)
+			if stmt.X.Type().IsSlice() || typecheck.RangeExprType(stmt.X.Type()).IsArray() {
+				return lowerLoop(stmt, indexedRangeLoop(stmt, factory), next)
 			}
 			channel := candidate.channels[stmt]
 			if channel == nil || channel.rangeStmt != stmt {

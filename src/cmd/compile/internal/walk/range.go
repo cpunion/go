@@ -136,7 +136,10 @@ func walkRange(nrange *ir.RangeStmt) ir.Node {
 		}
 
 		// for v1, v2 := range ha { body }
-		if cheapComputableIndex(elem.Size()) {
+		// An empty array pointer must not be sliced: converting a nil
+		// pointer to a slice would panic before this empty loop. Keep the
+		// ordinary iteration assignments inside its unreachable body.
+		if cheapComputableIndex(elem.Size()) || t.IsPtr() && t.Elem().NumElem() == 0 {
 			// v1, v2 = hv1, ha[hv1]
 			tmp := ir.NewIndexExpr(base.Pos, ha, hv1)
 			tmp.SetBounded(true)
