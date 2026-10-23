@@ -50,6 +50,7 @@ func keyCalls(values [3]int) int {
  sum:=0;for i:=range snapshot(values) {runtime.Gosched();sum+=i}
  for range snapshot(values) {runtime.Gosched();sum++};return sum
 }
+func initialized(values [3]int) int {a:=snapshot(values);sum:=0;for _,v:=range a {runtime.Gosched();sum+=v};return sum}
 func received(ch chan *[3]int) int {sum:=0;for i:=range <-ch {runtime.Gosched();sum+=i};return sum}
 func zero(p *[0]int) int {n:=0;for i,v:=range p {runtime.Gosched();n+=i+v};return n}
 func converted(values *[3]int) int {
@@ -101,7 +102,7 @@ func main(){
  if array(&[3]int{1,2,3})!=36||pointer(&[3]int{1,2,3})!=124 {panic("array copy versus pointer snapshot")}
  if named(numbers{1,2,3},arrayPointer(&numbers{4,5,6}))!=21 {panic("named array")}
  if evaluated([3]int{1,2,3})!=6||calls!=1 {panic("array expression evaluation")}
- if keyOnly(nil)!=15||keyCalls([3]int{})!=6||calls!=3 {panic("constant versus nonconstant range length")}
+ if keyOnly(nil)!=15||keyCalls([3]int{})!=6||calls!=3||initialized([3]int{1,2,3})!=6||calls!=4 {panic("constant versus nonconstant range length")}
  ch:=make(chan *[3]int,1);ch<-nil;if received(ch)!=3||len(ch)!=0||zero(nil)!=0 {panic("receive or zero-length nil array")}
  if converted(&[3]int{1,2,3})!=9||assignment([3]int{7,8,9})!=3 {panic("array assignment")}
  k,v:=alias();if k!=0||v!=9 {panic("key aliases pointer element")}
@@ -115,8 +116,8 @@ func main(){
  println("switch-return-ok")
 }`
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}, {"evaluated", "call in array range expression"}, {"keyCalls", "call in array range expression"}},
-		[]string{"array", "pointer", "named", "keyOnly", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
+		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}},
+		[]string{"array", "pointer", "named", "evaluated", "keyCalls", "initialized", "keyOnly", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
 }
 
 func TestArrayRangeBoundaries(t *testing.T) {
@@ -127,10 +128,17 @@ var calls int
 func values() [3]item {calls++;return [3]item{{p:new(int)},{p:new(int)},{p:new(int)}}}
 func byValue() int {n:=0;for i,v:=range values() {runtime.Gosched();n+=i+int(v.pad[256])};return n}
 func byKey() int {n:=0;for i:=range values() {runtime.Gosched();n+=i};return n}
-func main(){if byValue()!=3||byKey()!=3||calls!=2 {panic("large array header fallback")};println("switch-return-ok")}
+func initialized() int {a:=values();n:=0;for i,v:=range a {runtime.Gosched();n+=i+int(v.pad[256])};return n}
+func keyInitialized() int {a:=values();n:=0;for i:=range a {runtime.Gosched();n+=i};return n}
+func consume(a [3]item) int {return len(a)}
+func argument() int {a:=[3]item{};n:=0;for range a {runtime.Gosched();n+=consume(a)};return n}
+func nativeValues() [3]item {runtime.Gosched();return [3]item{{p:new(int)},{p:new(int)},{p:new(int)}}}
+func nativeInitialized() int {a:=nativeValues();n:=0;for i,v:=range a {runtime.Gosched();n+=i+int(v.pad[256])};return n}
+func main(){if byValue()!=3||byKey()!=3||initialized()!=3||keyInitialized()!=3||argument()!=9||nativeInitialized()!=3||calls!=4 {panic("large array transfer")};println("switch-return-ok")}
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"byValue", "call in array range expression"}, {"byKey", "call in array range expression"}}, nil)
+		[]switchFallback{{"byValue", "ordinary aggregate call exceeds stack transfer budget"}, {"byKey", "ordinary aggregate call exceeds stack transfer budget"}, {"initialized", "ordinary aggregate call exceeds stack transfer budget"}, {"keyInitialized", "ordinary aggregate call exceeds stack transfer budget"}, {"argument", "ordinary aggregate call exceeds stack transfer budget"}},
+		[]string{"nativeValues", "nativeInitialized"})
 }
 
 func TestArrayRangeTerminal(t *testing.T) {

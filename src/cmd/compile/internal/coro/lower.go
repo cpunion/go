@@ -13,6 +13,7 @@ import (
 	"cmd/internal/src"
 	"fmt"
 	"go/constant"
+	"internal/abi"
 	"internal/runtime/gc"
 	"slices"
 	"strings"
@@ -696,19 +697,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("unsupported range loop")
 				}
 				rangeType := typecheck.RangeExprType(stmt.X.Type())
-				if rangeType.IsArray() && ir.Any(stmt.X, func(node ir.Node) bool {
-					switch node.(type) {
-					case *ir.CallExpr, *ir.InlinedCallExpr:
-						return true
-					}
-					return false
-				}) {
-					// Calling an ordinary function can materialize its array
-					// arguments or result on the nosplit resume stack after
-					// frame planning. Keep the original body until these
-					// header calls have typed frame-owned destinations.
-					return fmt.Errorf("call in array range expression")
-				}
 				if (rangeType.IsSlice() || rangeType.IsArray()) && stmt.Value != nil && !ir.IsBlank(stmt.Value) &&
 					(rangeType.Elem().IsStruct() || rangeType.Elem().IsArray()) {
 					_, simpleKey := stmt.Key.(*ir.Name)
@@ -1183,6 +1171,38 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				candidate.deferDeps[terminal.target] = true
 			}
 		}
+	}
+	// Ordinary aggregate calls can introduce ABI temporaries after frame
+	// planning, including before a range or inside its body. Bound their
+	// combined transfer size conservatively; native factory and typed foreign
+	// calls already have frame-owned transfers. This does not prove arbitrary
+	// callees' fixed-stack requirements.
+	const aggregateTransferBudget = abi.StackNosplitBase / 8
+	var aggregateBytes int64
+	ir.Visit(fn, func(node ir.Node) {
+		call, ok := node.(*ir.CallExpr)
+		if !ok || candidate.transitions[call] != SiteInvalid ||
+			call.Fun == nil || call.Fun.Type() == nil || !call.Fun.Type().IsFunc() {
+			return
+		}
+		if _, foreign := candidate.foreignCalls[call]; foreign {
+			return
+		}
+		signature := call.Fun.Type()
+		for _, fields := range [][]*types.Field{signature.RecvParams(), signature.Results()} {
+			for _, field := range fields {
+				if aggregateBytes > aggregateTransferBudget {
+					return
+				}
+				if typ := field.Type; typ.IsArray() || typ.IsStruct() {
+					types.CalcSize(typ)
+					aggregateBytes += typ.Size()
+				}
+			}
+		}
+	})
+	if aggregateBytes > aggregateTransferBudget {
+		return nil, fmt.Errorf("ordinary aggregate call exceeds stack transfer budget")
 	}
 	return candidate, nil
 }
