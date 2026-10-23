@@ -693,7 +693,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				if stmt.X == nil || stmt.X.Type() == nil ||
 					(!stmt.X.Type().IsChan() && !stmt.X.Type().IsInteger() &&
-						!stmt.X.Type().IsString() && !stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
+						!stmt.X.Type().IsString() && !stmt.X.Type().IsMap() && !stmt.X.Type().IsSlice() && !typecheck.RangeExprType(stmt.X.Type()).IsArray()) {
 					return fmt.Errorf("unsupported range loop")
 				}
 				rangeType := typecheck.RangeExprType(stmt.X.Type())
@@ -705,6 +705,24 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						// Ordering a parallel aggregate assignment may introduce
 						// a large stack temporary after resume frame planning.
 						return fmt.Errorf("aggregate range value with complex destination")
+					}
+				}
+				if rangeType.IsMap() {
+					complex, aggregate := false, false
+					for i, dst := range []ir.Node{stmt.Key, stmt.Value} {
+						if dst == nil || ir.IsBlank(dst) {
+							continue
+						}
+						typ := rangeType.Key()
+						if i == 1 {
+							typ = rangeType.Elem()
+						}
+						_, simple := dst.(*ir.Name)
+						complex = complex || !simple
+						aggregate = aggregate || typ.IsStruct() || typ.IsArray()
+					}
+					if complex && aggregate {
+						return fmt.Errorf("aggregate map range operand with complex destination")
 					}
 				}
 				for _, operand := range []ir.Node{stmt.Key, stmt.Value} {
@@ -2376,6 +2394,8 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 				// receive. Other admitted ranges use ordinary loop rewrites.
 				if stmtRange.X.Type().IsInteger() {
 					stmt = integerRangeLoop(stmtRange, factory)
+				} else if stmtRange.X.Type().IsMap() {
+					stmt = mapRangeLoop(stmtRange, factory)
 				} else if stmtRange.X.Type().IsString() {
 					stmt = stringRangeLoop(stmtRange, factory)
 				} else {
@@ -3102,6 +3122,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.RangeStmt:
 			if stmt.X.Type().IsInteger() {
 				return lowerLoop(stmt, integerRangeLoop(stmt, factory), next)
+			}
+			if stmt.X.Type().IsMap() {
+				return lowerLoop(stmt, mapRangeLoop(stmt, factory), next)
 			}
 			if stmt.X.Type().IsString() {
 				return lowerLoop(stmt, stringRangeLoop(stmt, factory), next)

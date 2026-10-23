@@ -120,6 +120,8 @@ func TestLowerIntegerRange(t *testing.T) {
 
 func TestLowerSliceRange(t *testing.T) { testLowerIndexedRange(t, "slice") }
 
+func TestLowerMapRange(t *testing.T) { testLowerIndexedRange(t, "map") }
+
 func TestLowerStringRange(t *testing.T) { testLowerIndexedRange(t, "string") }
 
 func TestLowerArrayRange(t *testing.T) {
@@ -162,6 +164,9 @@ func testLowerIndexedRange(t *testing.T, kind string) {
 			}
 			if kind == "pointer" {
 				typ = types.NewPtr(typ)
+			}
+			if kind == "map" {
+				typ = types.NewMap(types.Types[types.TINT], types.Types[types.TINT])
 			}
 			if kind == "string" {
 				typ = types.Types[types.TSTRING]

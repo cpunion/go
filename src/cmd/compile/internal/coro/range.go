@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"unicode/utf8"
@@ -161,6 +162,73 @@ func stringRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 	}
 	body.Append(stmt.Body...)
 	loop := ir.NewForStmt(pos, nil, condition, nil, body, false)
+	loop.SetInit(init)
+	loop.Label = stmt.Label
+	return loop
+}
+
+// mapRangeLoop uses the ordinary map iterator in typed frame storage. Its
+// pointers keep the map, tables and current entry alive while the body parks.
+// Initialize the same storage afresh on every entry, including empty maps;
+// never copy an initialized iterator or restart it after a suspension.
+func mapRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
+	pos := stmt.Pos()
+	typ := stmt.X.Type()
+	iterType := reflectdata.MapIterType()
+	iter := typecheck.TempAt(pos, fn, iterType)
+	init := append(ir.Nodes(nil), stmt.Init()...)
+	init.Append(ir.NewDecl(pos, ir.ODCL, iter), ir.NewAssignStmt(pos, iter, nil),
+		typecheck.Call(pos, typecheck.LookupRuntime("mapIterStart", typ.Key(), typ.Elem(), iterType),
+			ir.Nodes{reflectdata.RangeMapRType(pos, stmt), stmt.X, typecheck.NodAddr(iter)}, false))
+	key := ir.NewSelectorExpr(pos, ir.ODOT, iter, iterType.Field(0).Sym)
+	condition := ir.NewBinaryExpr(pos, ir.ONE, key, typecheck.NodNil())
+	post := typecheck.Call(pos, typecheck.LookupRuntime("mapIterNext", iterType), ir.Nodes{typecheck.NodAddr(iter)}, false)
+	var body, destinations, values ir.Nodes
+	simple := true
+	for i, dst := range []ir.Node{stmt.Key, stmt.Value} {
+		if dst == nil || ir.IsBlank(dst) {
+			continue
+		}
+		operandType := typ.Key()
+		word, rtype := stmt.KeyTypeWord, stmt.KeySrcRType
+		if i == 1 {
+			operandType = typ.Elem()
+			word, rtype = stmt.ValueTypeWord, stmt.ValueSrcRType
+		}
+		pointer := ir.NewSelectorExpr(pos, ir.ODOT, iter, iterType.Field(i).Sym)
+		var value ir.Node = ir.NewStarExpr(pos, typecheck.ConvNop(pointer, types.NewPtr(operandType)))
+		value = typecheck.Expr(value)
+		if !types.Identical(dst.Type(), operandType) {
+			conversion := ir.NewConvExpr(pos, ir.OCONV, dst.Type(), value)
+			conversion.TypeWord, conversion.SrcRType = word, rtype
+			value = conversion
+		}
+		_, name := dst.(*ir.Name)
+		simple = simple && name
+		destinations.Append(dst)
+		values.Append(value)
+	}
+	if simple {
+		// Freeze both operands before either destination store, using
+		// frame temporaries even for large indirect map keys and values.
+		for i, dst := range destinations {
+			snapshot := typecheck.TempAt(pos, fn, dst.Type())
+			init.Append(ir.NewDecl(pos, ir.ODCL, snapshot))
+			body.Append(ir.NewAssignStmt(pos, snapshot, values[i]))
+			values[i] = snapshot
+		}
+		for i, dst := range destinations {
+			body.Append(ir.NewAssignStmt(pos, dst, values[i]))
+		}
+	} else if len(destinations) == 2 {
+		// Keep operand evaluation in the ordinary assignment order,
+		// including side effects in indexed destinations.
+		body.Append(ir.NewAssignListStmt(pos, ir.OAS2, destinations, values))
+	} else {
+		body.Append(ir.NewAssignStmt(pos, destinations[0], values[0]))
+	}
+	body.Append(stmt.Body...)
+	loop := ir.NewForStmt(pos, nil, condition, post, body, false)
 	loop.SetInit(init)
 	loop.Label = stmt.Label
 	return loop
