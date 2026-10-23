@@ -496,7 +496,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if sig.HasShape() {
 		return nil, fmt.Errorf("generic shape")
 	}
-	if len(function.Sites) == 0 {
+	// A sealed helper may only register callback cleanup. It still needs a
+	// typed factory to preserve its own defer scope during the outer unwind.
+	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
 	statementCalls := make(map[*ir.CallExpr]bool)

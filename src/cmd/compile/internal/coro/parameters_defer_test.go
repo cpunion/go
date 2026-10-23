@@ -13,7 +13,7 @@ import (
 
 func TestClosedParameterDeferContract(t *testing.T) {
 	prepareLowerTest(t)
-	for _, mode := range []string{"plain", "panic", "recover", "exit", "missing", "unsealed", "writable", "suspending", "exec", "local-exec", "callback-suspend", "callback-exec", "callback-recover", "unknown", "spawn", "defer", "operation"} {
+	for _, mode := range []string{"plain", "panic", "recover", "exit", "missing", "unsealed", "writable", "suspending", "exec", "local-exec", "callback-suspend", "callback-exec", "callback-recover", "unknown", "spawn", "defer", "defer-recover", "defer-suspend", "defer-exec", "defer-unknown", "operation"} {
 		t.Run(mode, func(t *testing.T) {
 			pkg := types.NewPkg("example.com/coro/parameterdefer/"+mode, "p")
 			callback := types.NewSignature(nil, nil, nil)
@@ -31,7 +31,7 @@ func TestClosedParameterDeferContract(t *testing.T) {
 			}
 			function := plan.Functions[fn]
 			edge := &function.Edges[0]
-			want := mode == "plain" || mode == "panic" || mode == "recover" || mode == "exit"
+			want := mode == "plain" || mode == "panic" || mode == "recover" || mode == "exit" || mode == "defer" || mode == "defer-recover"
 			switch mode {
 			case "panic":
 				function.Terminal = MayPanic
@@ -61,8 +61,18 @@ func TestClosedParameterDeferContract(t *testing.T) {
 				edge.Targets, edge.Unknown = nil, true
 			case "spawn":
 				edge.Kind = GoCall
-			case "defer":
+			case "defer", "defer-recover", "defer-suspend", "defer-exec", "defer-unknown":
 				edge.Kind = DeferCall
+				switch mode {
+				case "defer-recover":
+					plan.Functions[leaf].Terminal = UsesRecover
+				case "defer-suspend":
+					plan.Functions[leaf].Effect = MaySuspend
+				case "defer-exec":
+					plan.Functions[leaf].Exec = NeedsTaskContext
+				case "defer-unknown":
+					edge.Targets, edge.Unknown = nil, true
+				}
 			case "operation":
 				edge.Recipe.Kind = SiteSemaphore
 			}

@@ -19,16 +19,17 @@ func canPlanParameterDeferTarget(plan *Plan, fn *ir.Func) bool {
 	}
 	sealed := false
 	for _, edge := range function.Edges {
-		// Detached children, nested cleanup and task-dependent callees need
-		// their own lifetime proof. In particular, a callback's recover is
-		// indirect with respect to the function being deferred.
-		if edge.Kind != DirectCall ||
+		// Nested cleanup runs under the same restricted defer ABI. Its
+		// concrete targets and factory dependencies are checked by lowering
+		// and the defer-factory fixed point. Detached children cannot share
+		// this run-to-completion lifetime.
+		if edge.Kind != DirectCall && edge.Kind != DeferCall ||
 			edge.Recipe.Kind != SiteInvalid && edge.Recipe.Kind != SiteGoexit {
 			return false
 		}
 		summary, known := plan.edgeSummary(edge)
 		if !known || summary.Effect != NoSuspend || summary.Exec != 0 ||
-			summary.Terminal&UsesRecover != 0 {
+			edge.Kind == DirectCall && summary.Terminal&UsesRecover != 0 {
 			return false
 		}
 		sealed = sealed || edge.FactoryRequired
