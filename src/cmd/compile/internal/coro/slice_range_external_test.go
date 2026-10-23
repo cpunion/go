@@ -25,6 +25,18 @@ func alias() (int,int) {
  for key,value=range values {runtime.Gosched()}
  return key,value
 }
+var backing []int
+func lhsIndex() int {backing[0]=50;return 0}
+func lhsMutation() int {
+ backing=[]int{9};out:=[]int{0};var value int
+ for out[lhsIndex()],value=range backing {runtime.Gosched()}
+ return value
+}
+func mapMutation() int {
+ backing=[]int{9};out:=make(map[int]int);var key int
+ for key,out[lhsIndex()]=range backing {runtime.Gosched()}
+ return key+out[0]
+}
 func frozen(values []int) int {
  sum:=0
  for i,v:=range snapshot(values) {
@@ -113,12 +125,13 @@ func aggregateKey(values []large) int {
 func aggregateArray(values [][257]byte) byte {
  index:=0;out:=make([][257]byte,1)
  for index,out[0]=range values {runtime.Gosched()}
- return out[0][256]
+ return out[0][256]+byte(index)
 }
 func main(){
  values:=[]large{{p:new(int)},{p:new(int)},{p:new(int)}};*values[0].p=1;*values[1].p=2;*values[2].p=3
  if aggregateAssign(values)!=6 || aggregateKey(values)!=5 || aggregateArray([][257]byte{{256:7}})!=7 {panic("aggregate destination fallback")}
  key,value:=alias();if key!=0 || value!=9 {panic("range key/element alias ordering")}
+ if lhsMutation()!=50 || mapMutation()!=50 {panic("range destination evaluation order")}
  if frozen([]int{1,2,3})!=43 || calls!=1 {panic("frozen header, length or element load")}
  if frozen(nil)!=0 || frozen([]int{})!=0 || calls!=3 {panic("empty source evaluation")}
  if named(numbers{2,3})!=5 || converted([]int{2,3})!=6 || assignment([]int{7,8,9})!=3 {panic("iteration assignment")}
@@ -136,7 +149,7 @@ func main(){
 }`
 	testSwitchReturnProgram(t, source,
 		[]switchFallback{{"captured", "range variable captured by closure"}, {"array", "unsupported range loop"}, {"aggregateAssign", "aggregate range value with complex destination"}, {"aggregateKey", "aggregate range value with complex destination"}, {"aggregateArray", "aggregate range value with complex destination"}},
-		[]string{"alias", "frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
+		[]string{"lhsMutation", "mapMutation", "alias", "frozen", "named", "converted", "assignment", "empty", "control", "pointers", "valuePointers", "held", "zero"})
 }
 
 func TestSliceRangeTerminal(t *testing.T) {
