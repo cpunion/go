@@ -1182,7 +1182,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	ir.Visit(fn, func(node ir.Node) {
 		call, ok := node.(*ir.CallExpr)
 		if !ok || candidate.transitions[call] != SiteInvalid ||
-			call.Fun == nil || call.Fun.Type() == nil || !call.Fun.Type().IsFunc() {
+			call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
 			return
 		}
 		if _, foreign := candidate.foreignCalls[call]; foreign {
