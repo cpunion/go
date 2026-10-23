@@ -34,7 +34,9 @@ func (check *Checker) rangeStmt(inner stmtContext, rangeStmt *syntax.ForStmt, no
 	check.hasCallOrRecv = false
 	check.expr(nil, &x, rangeVar)
 
-	if isTypes2 && x.isValid() && sValue == nil && !check.hasCallOrRecv {
+	// A trailing blank iteration variable is equivalent to omitting it.
+	ident, _ := syntax.Unparen(sValue).(*syntax.Name)
+	if isTypes2 && x.isValid() && (sValue == nil || ident != nil && ident.Value == "_") && !check.hasCallOrRecv {
 		if t, ok := arrayPtrDeref(x.typ().Underlying()).(*Array); ok {
 			for {
 				// Put constant info on the thing inside parentheses.

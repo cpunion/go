@@ -115,8 +115,8 @@ func main(){
  println("switch-return-ok")
 }`
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}},
-		[]string{"array", "pointer", "named", "evaluated", "keyOnly", "keyCalls", "received", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
+		[]switchFallback{{"captured", "range variable captured by closure"}, {"aggregate", "aggregate range value with complex destination"}, {"received", "channel site 1: nested receive in range"}},
+		[]string{"array", "pointer", "named", "evaluated", "keyOnly", "keyCalls", "zero", "converted", "assignment", "alias", "cells", "held", "heldPointer", "control"})
 }
 
 func TestArrayRangeTerminal(t *testing.T) {
