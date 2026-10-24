@@ -1117,11 +1117,13 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := 15 * ptrSize
-	wantChannel := uintptr(232)
+	want := 12 * ptrSize
+	wantChannel := uintptr(208)
+	wantIO := uintptr(184)
 	if ptrSize == 4 {
-		want = 19 * ptrSize
-		wantChannel = 144
+		want = 13 * ptrSize
+		wantChannel = 120
+		wantIO = 108
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine operation size = %d, want %d", got, want)
@@ -1129,6 +1131,9 @@ func TestStacklessCoroOperationSize(t *testing.T) {
 	if got := runtime.StacklessCoroChannelOperationSizeForTest(); got != wantChannel {
 		t.Fatalf("stackless coroutine channel operation size = %d, want %d",
 			got, wantChannel)
+	}
+	if got := runtime.StacklessCoroIOOperationSizeForTest(); got != wantIO {
+		t.Fatalf("stackless coroutine IO operation size = %d, want %d", got, wantIO)
 	}
 	var token unsafe.Pointer
 	if got := testing.AllocsPerRun(100, func() {

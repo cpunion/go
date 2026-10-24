@@ -30,8 +30,8 @@ func StacklessCoroNetpollReadyAccountingForTest(mode int32, state int) (delta in
 	pd := &stacklessCoroAccountingPollDescForTest
 	pd.rg.Store(pdNil)
 	pd.wg.Store(pdNil)
-	readOp := Escape(new(stacklessCoroOperation))
-	writeOp := Escape(new(stacklessCoroOperation))
+	readOp := Escape(newStacklessCoroIOOperation())
+	writeOp := Escape(newStacklessCoroIOOperation())
 	if mode == 'r' || mode == 'r'+'w' {
 		if waiting, err := netpollCoroArm(pd, readOp, 'r'); !waiting || err != pollNoError {
 			throw("runtime: failed to arm accounting probe read")

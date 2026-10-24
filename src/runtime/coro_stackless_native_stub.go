@@ -44,6 +44,6 @@ func stacklessCoroNativeSchedulerFor(*g) *stacklessCoroScheduler {
 }
 
 func stacklessCoroDeferSleep(*stacklessCoroScheduler,
-	*stacklessCoroOperation) bool {
+	*stacklessCoroOperation, int64) bool {
 	return false
 }

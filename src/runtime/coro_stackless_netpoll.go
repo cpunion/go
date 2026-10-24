@@ -137,7 +137,7 @@ func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 				return nil
 			}
 			scanned++
-			if op.scheduler != s || op.task == exclude ||
+			if op.stacklessCoroIOState == nil || op.scheduler != s || op.task == exclude ||
 				op.task == previous || op.async ||
 				op.packet[stacklessCoroPollDescWord] == 0 {
 				continue

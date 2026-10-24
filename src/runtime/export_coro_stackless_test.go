@@ -542,6 +542,10 @@ func StacklessCoroChannelOperationSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroChannelOperation{})
 }
 
+func StacklessCoroIOOperationSizeForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroIOOperation{})
+}
+
 func NewStacklessCoroChannelOperationForTest() unsafe.Pointer {
 	return unsafe.Pointer(newStacklessCoroChannelOperation())
 }
@@ -604,7 +608,9 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
 		op.stacklessCoroIOState == storage && storage != nil &&
 		op.buffer == nil && op.call == nil && op.n == nil &&
-		op.errno == nil && op.valueOut == nil && op.workNext == nil
+		op.errno == nil && op.valueOut == nil && op.workNext == nil &&
+		op.packet == [2]uint64{} && op.fd == 0 && !op.async &&
+		!op.ownsPollDesc && !op.pollWrite
 	recycle(op)
 	GC()
 
@@ -1275,7 +1281,7 @@ func StacklessCoroPollWaitCountForTest() int {
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
 		for op := registry.buckets[index]; op != nil; op = op.next {
-			if op.async || op.packet[stacklessCoroPollDescWord] == 0 {
+			if op.stacklessCoroIOState == nil || op.async || op.packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
 			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
@@ -1863,9 +1869,12 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 			unlock(&stacklessCoroOperations.lock)
 		}
 		op := new(stacklessCoroOperation)
+		if i&1 != 0 {
+			op = newStacklessCoroIOOperation()
+			op.async = true
+		}
 		op.scheduler = s
 		op.task = new(stacklessCoroTask)
-		op.async = true
 		operations[i] = op
 		ids[i] = registerStacklessCoroOperation(op)
 	}

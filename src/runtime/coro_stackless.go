@@ -341,6 +341,18 @@ type stacklessCoroIOState struct {
 	errno    *uintptr
 	valueOut *uint64
 	workNext *stacklessCoroOperation
+	// Only IO operations use descriptor and asynchronous-reply storage.
+	// Keep it beside the IO payload so channel waiters do not pay for it.
+	// packet holds an asynchronous C reply, or a socket poll descriptor and
+	// completion link. The operation registry roots linked socket operations.
+	packet [2]uint64
+	fd     int32
+	async  bool
+	// ownsPollDesc distinguishes the explicit raw-descriptor adapter from
+	// descriptors borrowed under their library owner's lifetime locks.
+	ownsPollDesc bool
+	// pollWrite selects a borrowed poll descriptor's write semaphore.
+	pollWrite bool
 }
 
 type stacklessCoroOperationKind uint8
@@ -396,18 +408,7 @@ type stacklessCoroOperationState struct {
 	// waiterActive keeps the retained waiter rooted by waiter while it is
 	// also linked from a channel queue.
 	waiterActive bool
-	fd           int32
-	// packet holds a deferred-sleep deadline, an asynchronous C reply, or a
-	// socket operation's pointer-free poll descriptor and completion link. The
-	// operation registry remains the GC root for a linked socket operation.
-	packet [2]uint64
-	async  bool
-	// ownsPollDesc distinguishes the explicit raw-descriptor adapter from a
-	// descriptor borrowed under its library owner's lifetime locks.
-	ownsPollDesc bool
-	// pollWrite selects the write semaphore of a borrowed poll descriptor.
-	pollWrite bool
-	next      *stacklessCoroOperation
+	next         *stacklessCoroOperation
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
@@ -3296,8 +3297,7 @@ func startStacklessCoroSleep(ctx unsafe.Pointer, ns int64) {
 	s := op.scheduler
 	when := stacklessCoroTimerWhen(ns)
 	op.id = stacklessCoroDeferredSleepOperationID
-	op.packet[0] = uint64(when)
-	if stacklessCoroIsPullComparison(s) || !stacklessCoroDeferSleep(s, op) {
+	if stacklessCoroIsPullComparison(s) || !stacklessCoroDeferSleep(s, op, when) {
 		armStacklessCoroTimerAt(op, when)
 	}
 }
