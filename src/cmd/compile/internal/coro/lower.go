@@ -4756,6 +4756,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	} else if candidate.fusedResume && !candidate.fusedSelf {
 		frameFields = explicitFusedFrameFieldsWithPadding(frameFields, fields,
 			packedState, fusedResumeField)
+	} else if selfOnly {
+		frameFields = explicitSelfFrameFieldsWithPadding(frameFields, fields,
+			replacements[candidate.resumePC])
 	}
 	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)

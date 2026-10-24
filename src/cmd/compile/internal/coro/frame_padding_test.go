@@ -238,3 +238,66 @@ func TestExplicitFusedFramePaddingFallback(t *testing.T) {
 		})
 	}
 }
+
+func TestExplicitSelfFrameFieldsWithPadding(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/selfpadding", "selfpadding")
+	u8, u32 := types.Types[types.TUINT8], types.Types[types.TUINT32]
+	ptr := types.NewPtr(types.Types[types.TINT])
+	for _, test := range []struct {
+		name          string
+		types         []*types.Type
+		before, after int64
+	}{
+		{"plain-self", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], types.Types[types.TINT]}, 56, 56},
+		{"bool-self", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], types.Types[types.TINT], ptr, ptr, u8, u8, u8}, 80, 72},
+		// The full eight-frame allocation falls from768 to704B even though
+		// the relative heterogeneous admission proof changes from true to false.
+		{"self-proof-change", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], ptr, ptr, u8, u8, u8, types.Types[types.TINT], u8}, 88, 80},
+		{"limit", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], types.Types[types.TINT], ptr, ptr, u8, u8, u8, types.NewArray(u8, 48)}, 128, 120},
+		{"over-limit", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], types.Types[types.TINT], ptr, ptr, u8, u8, u8, types.NewArray(u8, 56)}, 136, 136},
+		{"no-size-saving", []*types.Type{ptr, types.Types[types.TINT], types.Types[types.TINT], types.Types[types.TINT], u8, u8, u8, u8}, 64, 64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := types.NewField(src.NoXPos, pkg.Lookup("state"), u32)
+			captured := []*types.Field{state}
+			for i, typ := range test.types {
+				captured = append(captured, types.NewField(src.NoXPos, pkg.Lookup(fmt.Sprintf("F%d", i)), typ))
+			}
+			fields := []*types.Field{
+				types.NewField(src.NoXPos, pkg.Lookup("parent"), types.Types[types.TUNSAFEPTR]),
+				types.NewField(src.NoXPos, pkg.Lookup("owner"), types.Types[types.TUNSAFEPTR]),
+				types.NewField(src.NoXPos, pkg.Lookup("marker"), u8),
+			}
+			fields = append(fields, captured...)
+			original := types.NewStruct(fields)
+			types.CalcSize(original)
+			if original.Size() != test.before {
+				t.Fatalf("fixture=%d, want%d", original.Size(), test.before)
+			}
+			layout := explicitSelfFrameFieldsWithPadding(fields, captured, state)
+			frame := types.NewStruct(layout)
+			types.CalcSize(frame)
+			if frame.Size() != test.after || fields[0].Offset != 0 || fields[1].Offset != 8 || fields[2].Offset != 16 || state.Offset != 20 {
+				t.Fatalf("frame=%d, header=%d/%d/%d/%d", frame.Size(), fields[0].Offset, fields[1].Offset, fields[2].Offset, state.Offset)
+			}
+			if len(layout) != len(fields) {
+				t.Fatal("field count changed")
+			}
+			for _, field := range fields {
+				count := 0
+				for _, got := range layout {
+					if got == field {
+						count++
+					}
+				}
+				if count != 1 {
+					t.Fatalf("field %v occurs%d times", field, count)
+				}
+			}
+		})
+	}
+	if got := explicitSelfFrameFieldsWithPadding(nil, nil, nil); got != nil {
+		t.Fatal("missing header was packed")
+	}
+}

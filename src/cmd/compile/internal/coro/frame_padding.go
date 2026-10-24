@@ -99,14 +99,41 @@ func explicitFrameFieldsWithStatePadding(fields []*types.Field, state *types.Fie
 // caches charge allocation classes and release idle payload after a GC epoch.
 func explicitFusedFrameFieldsWithPadding(fields, captured []*types.Field,
 	state, savedResume *types.Field) []*types.Field {
-	if types.PtrSize != 8 || state == nil || savedResume == nil ||
-		len(fields) < 5 || fields[3] != state || fields[4] != savedResume {
+	return explicitFrameFieldsWithHeaderPadding(fields, captured, state,
+		savedResume, explicitLargeFrameChunkSize, true)
+}
+
+// explicitSelfFrameFieldsWithPadding fills the same gap for a small,
+// homogeneous frame. Its eight-frame chunks use the native allocator-class
+// budget. Chunk width stays fixed, so reducing payload cannot increase the
+// full chunk's allocator class. Homogeneous chunking does not use the
+// heterogeneous admission proof.
+func explicitSelfFrameFieldsWithPadding(fields, captured []*types.Field,
+	state *types.Field) []*types.Field {
+	if len(fields) < 4 {
+		return fields
+	}
+	original := types.NewStruct(fields)
+	types.CalcSize(original)
+	// At most 128B per frame, the 256-task limit bounds cached prefix
+	// holders. Packing cannot increase their count under the 32 KiB budget.
+	if original.Size() > 128 {
+		return fields
+	}
+	return explicitFrameFieldsWithHeaderPadding(fields, captured, state, nil,
+		explicitFrameChunkSize, false)
+}
+
+func explicitFrameFieldsWithHeaderPadding(fields, captured []*types.Field,
+	state, savedResume *types.Field, chunkLength int64, preserveChunkProof bool) []*types.Field {
+	if types.PtrSize != 8 || state == nil || len(fields) < 4 || fields[3] != state ||
+		savedResume != nil && (len(fields) < 5 || fields[4] != savedResume) {
 		return fields
 	}
 	original := types.NewStruct(fields)
 	types.CalcSize(original)
 	originalSize := original.Size()
-	if state.Offset != 20 || savedResume.Offset != 24 {
+	if state.Offset != 20 || savedResume != nil && savedResume.Offset != 24 {
 		return fields
 	}
 	packed := explicitFramePaddingFields(captured, state, 17, 20)
@@ -123,9 +150,10 @@ func explicitFusedFrameFieldsWithPadding(fields, captured []*types.Field,
 	}
 	candidate := types.NewStruct(layout)
 	types.CalcSize(candidate)
-	if candidate.Size() >= originalSize || state.Offset != 20 || savedResume.Offset != 24 ||
-		explicitFrameChunkFitsAllocation(originalSize, explicitLargeFrameChunkSize) &&
-			!explicitFrameChunkFitsAllocation(candidate.Size(), explicitLargeFrameChunkSize) {
+	if candidate.Size() >= originalSize || state.Offset != 20 ||
+		savedResume != nil && savedResume.Offset != 24 ||
+		preserveChunkProof && explicitFrameChunkFitsAllocation(originalSize, chunkLength) &&
+			!explicitFrameChunkFitsAllocation(candidate.Size(), chunkLength) {
 		return fields
 	}
 	return layout
