@@ -149,9 +149,9 @@ func main() {
 }
 `
 	for _, test := range []struct{ array, frame int }{
-		{432, 512}, // Packing must not enable a new chunk cache.
-		{440, 520}, // Packing must not disable an existing chunk proof.
-		{448, 528}, // Packing must not change cached chunk counts.
+		{432, 504}, // Header padding enables equal-cost typed chunks.
+		{440, 520}, // Preserve an existing proof across the 512-byte cliff.
+		{448, 520}, // Both layouts admit chunks in the same allocator class.
 	} {
 		t.Run(strconv.Itoa(test.array), func(t *testing.T) {
 			program := main
@@ -172,7 +172,7 @@ func main() {
 			}
 			// The type descriptor starts with its byte size on both supported
 			// little-endian native targets. Inspect the actual emitted frame,
-			// so plain-frame packing cannot alter fused chunking or retention.
+			// so header packing preserves the selected allocation-boundary policy.
 			lines := strings.Split(string(assembly), "\n")
 			found := 0
 			for i, line := range lines {

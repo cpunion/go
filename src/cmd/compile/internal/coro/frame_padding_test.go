@@ -148,3 +148,93 @@ func TestExplicitFrameFieldsWithStatePadding(t *testing.T) {
 		})
 	}
 }
+
+func TestExplicitFusedFrameFieldsWithPadding(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/fusedpadding", "fusedpadding")
+	u8, u16, u32 := types.Types[types.TUINT8], types.Types[types.TUINT16], types.Types[types.TUINT32]
+	ptr := types.NewPtr(types.Types[types.TINT])
+	for _, test := range []struct{ array, before, after int64 }{
+		{440, 512, 504}, {448, 520, 520}, {456, 528, 520},
+	} {
+		t.Run(fmt.Sprint(test.before), func(t *testing.T) {
+			state := types.NewField(src.NoXPos, pkg.Lookup("state"), u32)
+			resume := types.NewField(src.NoXPos, pkg.Lookup("resume"), types.Types[types.TUNSAFEPTR])
+			captured := []*types.Field{state}
+			for i, typ := range []*types.Type{u16, u8, ptr, types.Types[types.TINT], types.Types[types.TINT], ptr, types.NewArray(u8, test.array)} {
+				captured = append(captured, types.NewField(src.NoXPos, pkg.Lookup(fmt.Sprintf("F%d", i)), typ))
+			}
+			fields := []*types.Field{
+				types.NewField(src.NoXPos, pkg.Lookup("parent"), types.Types[types.TUNSAFEPTR]),
+				types.NewField(src.NoXPos, pkg.Lookup("owner"), types.Types[types.TUNSAFEPTR]),
+				types.NewField(src.NoXPos, pkg.Lookup("marker"), u8), state, resume,
+			}
+			fields = append(fields, captured[1:]...)
+			original := types.NewStruct(fields)
+			types.CalcSize(original)
+			if original.Size() != test.before {
+				t.Fatalf("fixture size=%d, want %d", original.Size(), test.before)
+			}
+			layout := explicitFusedFrameFieldsWithPadding(fields, captured, state, resume)
+			frame := types.NewStruct(layout)
+			types.CalcSize(frame)
+			if frame.Size() != test.after || state.Offset != 20 || resume.Offset != 24 || fields[2].Offset != 16 {
+				t.Fatalf("frame=%d, state/resume/marker=%d/%d/%d, want %d and 20/24/16",
+					frame.Size(), state.Offset, resume.Offset, fields[2].Offset, test.after)
+			}
+			if len(layout) != len(fields) {
+				t.Fatal("packing changed field count")
+			}
+			for _, field := range fields {
+				count := 0
+				for _, got := range layout {
+					if got == field {
+						count++
+					}
+				}
+				if count != 1 {
+					t.Fatalf("field %v occurs %d times", field, count)
+				}
+			}
+		})
+	}
+}
+
+func TestExplicitFusedFramePaddingFallback(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/fusedpaddingfallback", "fusedpaddingfallback")
+	field := func(name string, typ *types.Type) *types.Field {
+		return types.NewField(src.NoXPos, pkg.Lookup(name), typ)
+	}
+	state := field("state", types.Types[types.TUINT32])
+	resume := field("resume", types.Types[types.TUNSAFEPTR])
+	prefix := []*types.Field{field("parent", types.Types[types.TUNSAFEPTR]),
+		field("owner", types.Types[types.TUNSAFEPTR]), field("marker", types.Types[types.TUINT8]), state, resume}
+	for _, test := range []struct {
+		name             string
+		fields, captured []*types.Field
+		state, resume    *types.Field
+	}{
+		{"missing-state", prefix, nil, nil, resume},
+		{"missing-resume", prefix, nil, state, nil},
+		{"missing-header", nil, nil, state, resume},
+		{"no-payload", prefix, []*types.Field{state}, state, resume},
+		{"changed-header", append([]*types.Field{field("wide-parent", types.NewArray(types.Types[types.TUINT64], 2))}, prefix[1:]...), nil, state, resume},
+		// Three of four trailing bytes fit in the header, leaving the same
+		// aligned frame size after moving them.
+		{"no-size-saving", append(slices.Clone(prefix), field("b0", types.Types[types.TUINT8]),
+			field("b1", types.Types[types.TUINT8]), field("b2", types.Types[types.TUINT8]),
+			field("b3", types.Types[types.TUINT8])), nil, state, resume},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			captured := test.captured
+			if test.name == "no-size-saving" {
+				captured = test.fields[5:]
+			}
+			layout := explicitFusedFrameFieldsWithPadding(test.fields, captured, test.state, test.resume)
+			if !slices.Equal(layout, test.fields) {
+				t.Fatal("unsupported layout was packed")
+			}
+		})
+	}
+}

@@ -92,3 +92,41 @@ func explicitFrameFieldsWithStatePadding(fields []*types.Field, state *types.Fie
 	}
 	return layout
 }
+
+// explicitFusedFrameFieldsWithPadding fills the three-byte gap before state
+// in a heterogeneous frame. Preserve the runtime header and never disable an
+// existing four-frame chunk proof by crossing an allocator boundary. Native chunk
+// caches charge allocation classes and release idle payload after a GC epoch.
+func explicitFusedFrameFieldsWithPadding(fields, captured []*types.Field,
+	state, savedResume *types.Field) []*types.Field {
+	if types.PtrSize != 8 || state == nil || savedResume == nil ||
+		len(fields) < 5 || fields[3] != state || fields[4] != savedResume {
+		return fields
+	}
+	original := types.NewStruct(fields)
+	types.CalcSize(original)
+	originalSize := original.Size()
+	if state.Offset != 20 || savedResume.Offset != 24 {
+		return fields
+	}
+	packed := explicitFramePaddingFields(captured, state, 17, 20)
+	if len(packed) == 0 {
+		return fields
+	}
+	layout := make([]*types.Field, 0, len(fields))
+	layout = append(layout, fields[:3]...)
+	layout = append(layout, packed...)
+	for _, field := range fields[3:] {
+		if !slices.Contains(packed, field) {
+			layout = append(layout, field)
+		}
+	}
+	candidate := types.NewStruct(layout)
+	types.CalcSize(candidate)
+	if candidate.Size() >= originalSize || state.Offset != 20 || savedResume.Offset != 24 ||
+		explicitFrameChunkFitsAllocation(originalSize, explicitLargeFrameChunkSize) &&
+			!explicitFrameChunkFitsAllocation(candidate.Size(), explicitLargeFrameChunkSize) {
+		return fields
+	}
+	return layout
+}
