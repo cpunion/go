@@ -2423,6 +2423,47 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 		throw("runtime: invalid stackless coroutine fused-frame await")
 	}
 	s := context.scheduler
+	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		parent.flags&stacklessCoroTaskCompletionMask ==
+			stacklessCoroTaskFusedFrames|stacklessCoroTaskFusedPending|stacklessCoroTaskFusedChunk &&
+		parent.state == stacklessCoroTaskRunning && parent.resuming &&
+		!parent.readyPending && !parent.goexit &&
+		parent.terminal == stacklessCoroTerminalNone && parent.resume != nil {
+		parentHeader := (*stacklessCoroFusedFrameHeader)(context.frame)
+		allocation := parentHeader.marker & stacklessCoroFusedFrameAllocationMask
+		if parentHeader.owner == nil && parentHeader.parent != nil &&
+			allocation != 0 && validStacklessCoroFusedFrameMarker(parentHeader.marker) &&
+			parentHeader.marker&stacklessCoroFusedFrameChunkValidated != 0 &&
+			stacklessCoroResumeIdentity(parent.resume) != stacklessCoroResumeIdentity(child) {
+			// Pending|Chunk without Requested proves that take reserved an
+			// uncached, compatible heterogeneous frame. A cached reservation
+			// has Pending alone and must consume its shared holder under lock.
+			header := (*stacklessCoroFusedResumeFrameHeader)(frame)
+			if header.parent == nil && header.owner == nil && header.marker == 0 && header.resume == nil {
+				next := allocation + 1
+				if allocation == stacklessCoroFusedFrameDirectLast ||
+					allocation == stacklessCoroFusedFrameChunkLastFor(parentHeader.marker) {
+					next = stacklessCoroFusedFrameChunkFirst
+				}
+				header.resume = stacklessCoroResumeIdentity(parent.resume)
+				header.marker = next | stacklessCoroFusedFrameParent |
+					stacklessCoroFusedFrameResume |
+					parentHeader.marker&(stacklessCoroFusedFrameChunkValidated|
+						stacklessCoroFusedFrameShortChunk)
+				header.parent = context.frame
+				context.frame = frame
+				parent.resume = child
+				parent.flags &^= stacklessCoroTaskFusedPending | stacklessCoroTaskFusedChunk
+				// The executing task owns these links. Match local self-await and
+				// fused completion's fairness snapshot without reading the queue.
+				if s.runnableState.Load() == 0 {
+					parent.setFlag(stacklessCoroTaskSwitchPending, true)
+					return stacklessCoroActionSwitch
+				}
+				return stacklessCoroActionYield
+			}
+		}
+	}
 	lock(&s.lock)
 	transitionFlags := parent.flags & stacklessCoroTaskFusedTransitionMask
 	if transitionFlags&stacklessCoroTaskFusedRequested != 0 {
