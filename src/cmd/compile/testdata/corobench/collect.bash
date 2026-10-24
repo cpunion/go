@@ -130,6 +130,7 @@ hash() {
 regular_names=(YieldBatch YieldEntry RecursiveYield64 RecursiveYield256
 	RecursiveYield262 RecursiveYield264 RecursiveYield267 RecursiveYield4096
 	RecursiveLargeFrame512 MutualYield64 MutualYield4096 AlternatingDeepFrames
+	MutualAfterSelf4096 SelfAfterMutual4096 SelfAfterIdleGC
 	HeterogeneousFrameCacheReplacement DeferYield RecoverYield TaskSequence
 	TaskBurst100 TaskBurst1000 TaskBurst100000 TaskPark100 TaskPark1000 TaskPark100000
 	MixedParkScalarFirst100000 MixedParkPointerFirst100000

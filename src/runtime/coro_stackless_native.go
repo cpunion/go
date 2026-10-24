@@ -10,6 +10,7 @@ import (
 	"internal/abi"
 	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -40,6 +41,13 @@ type stacklessCoroNativeContext struct {
 	cachedFrameBytes    uint16
 	selfFrameChunkCount uint16
 	selfFrameCount      uint8
+	cacheIdleCycle      uint32
+	selfFrameMissResume *funcval
+	selfFrameMissType   *_type
+	selfFrameMissSize   uintptr
+	selfFrameMissRoots  uint8
+	selfFrameMissedRoot bool
+	selfFrameCacheUsed  bool
 	schedulerG          *g
 	executor            *g
 	caller              *g
@@ -220,6 +228,8 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 		slot := &stacklessCoroNativePool.slots[i]
 		ctx := slot.Load()
 		if ctx != nil && slot.CompareAndSwap(ctx, nil) {
+			ctx.selfFrameMissedRoot = false
+			ctx.selfFrameCacheUsed = false
 			return ctx
 		}
 	}
@@ -239,6 +249,18 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	if ctx.deferredSleep != nil {
 		throw("runtime: releasing native context with deferred sleep")
 	}
+	// Replace an unused cache only after two consecutive roots requested the
+	// same new chunk family. A single interleaved root keeps the old working
+	// set; no identity is changed while this executor is running a lineage.
+	if ctx.selfFrameMissedRoot && !ctx.selfFrameCacheUsed {
+		ctx.selfFrameMissRoots++
+		if ctx.selfFrameMissRoots >= 2 {
+			clearStacklessCoroNativePayloadCache(ctx)
+		}
+	} else {
+		ctx.selfFrameMissRoots = 0
+	}
+	ctx.cacheIdleCycle = work.cycles.Load()
 	for i := range stacklessCoroNativePool.slots {
 		if stacklessCoroNativePool.slots[i].CompareAndSwap(nil, ctx) {
 			return
@@ -246,6 +268,16 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	}
 	// Only the bounded warm pool retains task caches. The overflow list may
 	// grow with peak root concurrency and must not retain one cache per peak.
+	clearStacklessCoroNativePayloadCache(ctx)
+	lock(&stacklessCoroNativePool.lock)
+	ctx.poolNext = stacklessCoroNativePool.overflow
+	stacklessCoroNativePool.overflow = ctx
+	unlock(&stacklessCoroNativePool.lock)
+}
+
+// clearStacklessCoroNativePayloadCache drops only idle typed storage. The
+// native executor identity and its fixed scheduler stack remain reusable.
+func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 	ctx.freeTasks = nil
 	ctx.freePlainTaskCount = 0
 	ctx.freeFrameBytes = 0
@@ -259,16 +291,32 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	ctx.selfFrameChunkSize = 0
 	ctx.selfFrameChunkCount = 0
 	ctx.selfFrameCount = 0
-	lock(&stacklessCoroNativePool.lock)
-	ctx.poolNext = stacklessCoroNativePool.overflow
-	stacklessCoroNativePool.overflow = ctx
-	unlock(&stacklessCoroNativePool.lock)
+	ctx.selfFrameMissResume = nil
+	ctx.selfFrameMissType = nil
+	ctx.selfFrameMissSize = 0
+	ctx.selfFrameMissRoots = 0
+	ctx.selfFrameMissedRoot = false
+	ctx.selfFrameCacheUsed = false
+}
+
+// clearStacklessCoroNativeCaches runs with the world stopped, before the GC
+// cycle number advances. Only contexts in idle pool slots can be examined.
+// Keep recently used storage for one collection, then drop payload caches
+// that remained idle for a complete GC generation.
+func clearStacklessCoroNativeCaches() {
+	cycle := work.cycles.Load()
+	for i := range stacklessCoroNativePool.slots {
+		ctx := stacklessCoroNativePool.slots[i].Load()
+		if ctx != nil && cycle-ctx.cacheIdleCycle >= 1 {
+			clearStacklessCoroNativePayloadCache(ctx)
+		}
+	}
 }
 
 // takeStacklessCoroNativeFusedChunk opportunistically reuses compatible chunks
-// without replacing an established cache identity. In particular, alternating
-// deep self and mutual recursion must not discard the self-recursive working
-// set. A non-nil identity can also describe storage still in active use.
+// without replacing an established cache identity during a running lineage.
+// Record repeated misses for phase replacement after the executor is idle;
+// alternating deep self and mutual roots preserve the self working set.
 func takeStacklessCoroNativeFusedChunk(resume stacklessCoroResume,
 	frameSize uintptr, chunkType *_type) unsafe.Pointer {
 	gp := getg()
@@ -279,6 +327,17 @@ func takeStacklessCoroNativeFusedChunk(resume stacklessCoroResume,
 	if ctx.selfFrameResume != nil &&
 		(ctx.selfFrameResume != stacklessCoroResumeIdentity(resume) ||
 			ctx.selfFrameSize != frameSize || ctx.selfFrameChunkType != chunkType) {
+		if !ctx.selfFrameMissedRoot {
+			identity := stacklessCoroResumeIdentity(resume)
+			if ctx.selfFrameMissResume != identity ||
+				ctx.selfFrameMissType != chunkType || ctx.selfFrameMissSize != frameSize {
+				ctx.selfFrameMissResume = identity
+				ctx.selfFrameMissType = chunkType
+				ctx.selfFrameMissSize = frameSize
+				ctx.selfFrameMissRoots = 0
+			}
+			ctx.selfFrameMissedRoot = true
+		}
 		return nil
 	}
 	return takeStacklessCoroNativeSelfFrame(resume, frameSize, chunkType, true)
@@ -309,7 +368,12 @@ func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		ctx.selfFrameResume = identity
 		ctx.selfFrameChunkType = chunkType
 		ctx.selfFrameSize = frameSize
-		ctx.selfFrameChunkSize = chunkSize
+		// Charge the allocator class, including its malloc header, rather
+		// than payload bytes. Packing a frame must not expand this budget.
+		ctx.selfFrameChunkSize = roundupsize(chunkSize, false)
+		if chunkSize > gc.MinSizeForMallocHeader {
+			ctx.selfFrameChunkSize += gc.MallocHeaderSize
+		}
 		ctx.selfFrameChunkCount = 0
 		ctx.selfFrameCount = 0
 		return nil
@@ -327,6 +391,7 @@ func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		}
 		return nil
 	}
+	ctx.selfFrameCacheUsed = true
 	header := (*stacklessCoroFusedFrameHeader)(frame)
 	*link = header.parent
 	header.parent = nil

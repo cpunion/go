@@ -1460,6 +1460,18 @@ resumeActive:
 		}
 		goto resumeActive
 	}
+	if action == stacklessCoroActionSwitch {
+		idlePollSkip = nil
+		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
+			task.state != stacklessCoroTaskRunning || !task.resuming ||
+			task.readyPending {
+			throw("runtime: invalid stackless coroutine frame switch")
+		}
+		task.setFlag(stacklessCoroTaskSwitchPending, false)
+		// A validated frame switch keeps this running task on the same
+		// executor. Retain its scheduler link as for private yields.
+		goto resumeActive
+	}
 	task.context.scheduler = nil
 
 	switch action {
@@ -1515,15 +1527,6 @@ resumeActive:
 	case stacklessCoroActionGoexit:
 		idlePollSkip = nil
 		s.goexit(task)
-	case stacklessCoroActionSwitch:
-		idlePollSkip = nil
-		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
-			task.state != stacklessCoroTaskRunning || !task.resuming ||
-			task.readyPending {
-			throw("runtime: invalid stackless coroutine frame switch")
-		}
-		task.setFlag(stacklessCoroTaskSwitchPending, false)
-		goto resume
 	default:
 		throw("runtime: invalid stackless coroutine action")
 	}
