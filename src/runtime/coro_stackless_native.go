@@ -60,7 +60,8 @@ type stacklessCoroNativeContext struct {
 	poolNext            *stacklessCoroNativeContext
 	// deferredSleep is owned by the driver between adjacent fixed-stack
 	// episodes. Keeping it here avoids growing the shared logical scheduler.
-	deferredSleep *stacklessCoroOperation
+	deferredSleep     *stacklessCoroOperation
+	deferredSleepWhen int64
 }
 
 // stacklessCoroNativeDriver owns one native context across the fixed-stack
@@ -157,8 +158,9 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 	if op == nil {
 		return s.waitForWork()
 	}
-	when := int64(op.packet[0])
+	when := ctx.deferredSleepWhen
 	ctx.deferredSleep = nil
+	ctx.deferredSleepWhen = 0
 
 	if when > nanotime() {
 		armStacklessCoroTimerAt(op, when)
@@ -246,7 +248,7 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
-	if ctx.deferredSleep != nil {
+	if ctx.deferredSleep != nil || ctx.deferredSleepWhen != 0 {
 		throw("runtime: releasing native context with deferred sleep")
 	}
 	// Replace an unused cache only after two consecutive roots requested the
@@ -676,7 +678,7 @@ func stacklessCoroNativeSchedulerFor(gp *g) *stacklessCoroScheduler {
 }
 
 func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
-	op *stacklessCoroOperation) bool {
+	op *stacklessCoroOperation, when int64) bool {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
 	if ctx == nil || ctx.executor != gp || ctx.scheduler != s ||
@@ -688,6 +690,7 @@ func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
 		s.head == nil && s.tail == nil && s.runnableState.Load() == 0
 	if deferSleep {
 		ctx.deferredSleep = op
+		ctx.deferredSleepWhen = when
 	}
 	unlock(&s.lock)
 	return deferSleep

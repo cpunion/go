@@ -32,7 +32,11 @@ func StacklessCoroNativePoolForTest() (count int) {
 }
 
 func StacklessCoroDeferSleepOutsideExecutorForTest() bool {
-	return stacklessCoroDeferSleep(nil, nil)
+	return stacklessCoroDeferSleep(nil, nil, 0)
+}
+
+func StacklessCoroNativeContextAllocationSizeForTest() uintptr {
+	return roundupsize(unsafe.Sizeof(stacklessCoroNativeContext{}), false)
 }
 
 func StacklessCoroNativePoolTaskCacheForTest() (warm, overflow int) {

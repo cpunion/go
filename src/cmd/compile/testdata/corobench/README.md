@@ -2527,3 +2527,25 @@ chunk-admission boundaries from actual memory savings. `collect.bash` includes
 all of these controls and the original retention probes. Retention diagnostic
 ns/op values are excluded from throughput comparisons, and heap/Go-stack values
 do not include native OS-thread stacks or total RSS.
+
+#### Channel operation storage
+
+Descriptor fields, asynchronous reply words and poll flags belong to optional
+IO storage. A channel-only operation keeps the scheduler, channel and waiter
+state without allocating that storage. On 64-bit targets the operation and
+paired waiter occupy 208 bytes together, down from a 232-byte object in the
+240-byte allocation class. The combined IO operation still occupies 184 bytes
+in the 192-byte class. Cache entry limits do not change.
+
+A native driver owns a deferred sleep deadline between stack episodes. Keeping
+the deadline there also removes it from channel operation storage, while the
+driver context remains in its preceding 208-byte allocation class. Idle IO
+polling skips registry entries without IO storage, and completion clears all
+descriptor, reply and poll fields before the operation can change source kind.
+The operation address remains the base of paired storage for channel and poll
+identities.
+
+Compare cold single-task memory, large park/wake workloads, timers, IO, and
+mixed source-kind reuse together. Readiness heap, allocation traffic and RSS
+measure different costs; smaller channel objects do not establish an overall
+performance advantage over ordinary Go.

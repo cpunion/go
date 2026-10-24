@@ -19,6 +19,14 @@ func TestStacklessCoroSleepDeferralRequiresExecutor(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroSleepStorage(t *testing.T) {
+	// Moving a deferred deadline into the driver must not grow its allocator
+	// class. The preceding 200-byte context already occupied this 208B class.
+	if got := runtime.StacklessCoroNativeContextAllocationSizeForTest(); got > 208 {
+		t.Fatalf("native context allocation = %d bytes, want at most 208", got)
+	}
+}
+
 func TestStacklessCoroSleepHostProgress(t *testing.T) {
 	const (
 		delay     = time.Nanosecond
