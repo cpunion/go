@@ -132,6 +132,17 @@ if ! "$coro_goroot/bin/go" test -a -run '^$' -count=1 \
 fi
 
 expected=(
+	packedWorker
+	packedTasks
+	packedSelf
+	packedMutualA
+	packedMutualB
+	packedBoundary432A
+	packedBoundary432B
+	packedBoundary440A
+	packedBoundary440B
+	packedBoundary448A
+	packedBoundary448B
 	yieldLoop
 	yieldEntry
 	recursiveYield

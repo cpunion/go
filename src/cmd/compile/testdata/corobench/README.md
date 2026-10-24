@@ -2498,3 +2498,32 @@ overall process-memory comparison or a leak proof. Collection occurred under
 correctness-test load: all default ns/op, B/op and allocs/op fields are excluded.
 Only the custom pre/post-call counters and signed GC-stage snapshots are used;
 no timing, statistical speedup or universal improvement is claimed.
+
+
+#### Small plain-frame state padding
+
+The compiler can place small pointer-free fields in the existing four-byte gap
+following a plain continuation's state word. It preserves field types and the
+original factory initialization order. The optimization requires a 64-bit
+frame, an existing eight-byte-aligned field after the state, and an unpacked
+size at most 128 bytes. This is the runtime's 32 KiB / 256 cached-task threshold;
+larger frames and all fused recursive frames keep their previous layouts.
+Shrinking a fused frame can change chunk admission or the number of chunks
+retained under a fixed byte budget, even when individual allocations shrink.
+
+The `Packed*` probes keep mixed small fields and pointers alive across suspension.
+`PackedTasks100000` measures park/wake throughput; `PackedFootprint1`,
+`PackedFootprint1000`, and `PackedFootprint100000` measure readiness-stage memory
+in fresh processes with automatic GC disabled. Readiness is published before
+the final receive, as in the other footprint probes, and the snapshot includes
+setup allocations and uncollected temporaries. It is not an exact live-set or
+RSS measurement. Single-task cold cost must be reported separately.
+
+`PackedSelf4096`, `PackedMutual4096`, and the three `PackedBoundary*` probes are
+recursive controls. Their corresponding `PackedRetained*` diagnostics report
+call allocation counters and returned/GC1/GC2/GC4 heap, object, and Go-stack
+deltas in independent processes. The 432/440/448-byte local arrays distinguish
+chunk-admission boundaries from actual memory savings. `collect.bash` includes
+all of these controls and the original retention probes. Retention diagnostic
+ns/op values are excluded from throughput comparisons, and heap/Go-stack values
+do not include native OS-thread stacks or total RSS.
