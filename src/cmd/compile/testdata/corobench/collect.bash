@@ -136,12 +136,17 @@ regular_names=(YieldBatch YieldEntry RecursiveYield64 RecursiveYield256
 	ChannelRoundTrip ReadyChannelPair ReadySelect BlockedSelect
 	SleepZero SleepNanosecond SleepMicrosecond FileRead TCPRead FileWrite TCPWrite
 	FileBlockingProgress TCPBlockingProgress CScalar CAggregate CErrno CLibm
-	CBlockingHandoff CBlockingGroup3)
+	CBlockingHandoff CBlockingGroup3
+	PackedTasks100000 PackedSelf4096 PackedMutual4096
+	PackedBoundary432 PackedBoundary440 PackedBoundary448)
 regular="^Benchmark($(IFS='|'; echo "${regular_names[*]}"))$"
 footprints=(LiveTaskFootprint1 LiveTaskFootprint256 LiveTaskFootprint264
 	LiveTaskFootprint265 LiveTaskFootprint266 LiveTaskFootprint267
 	LiveTaskFootprint268 LiveTaskFootprint1000 LiveTaskFootprint100000
-	MixedScalarFirst1000 MixedScalarFirst100000 MixedPointerFirst1000 MixedPointerFirst100000)
+	MixedScalarFirst1000 MixedScalarFirst100000 MixedPointerFirst1000 MixedPointerFirst100000
+	PackedFootprint1 PackedFootprint1000 PackedFootprint100000)
+retention=(RetainedControl RetainedSelf4096 RetainedMutual4096 RetainedLarge512
+	PackedRetainedSelf PackedRetainedMutual PackedRetained432 PackedRetained440 PackedRetained448)
 run() {
 	local mode=$1 prefix=$2 probes=$3 duration=$4 cpus=$5
 	local expected=${6:-1}
@@ -193,6 +198,15 @@ for ((round = 1; round <= footprint_samples; round++)); do
 	if ((round % 2 == 0)); then order='coro baseline'; fi
 	for probe in "${footprints[@]}"; do
 		for mode in $order; do run "$mode" "footprint.$probe.$round" "^Benchmark${probe}$" 1x 1; done
+	done
+done
+# Retention snapshots have a different metric set from live task footprints.
+# Run each diagnostic in a fresh process and never treat its ns/op as throughput.
+for ((round = 1; round <= footprint_samples; round++)); do
+	order='baseline coro'
+	if ((round % 2 == 0)); then order='coro baseline'; fi
+	for probe in "${retention[@]}"; do
+		for mode in $order; do run "$mode" "retention.$probe.$round" "^Benchmark${probe}$" 1x 1; done
 	done
 done
 for root in "$baseline" "$coro" "$source_root"; do

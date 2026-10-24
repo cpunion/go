@@ -4751,6 +4751,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			}
 		}
 	}
+	if !fusedFrame {
+		frameFields = explicitFrameFieldsWithStatePadding(fields, replacements[candidate.resumePC])
+	}
 	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)
 	types.CalcSize(frameType)
