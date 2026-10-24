@@ -15,6 +15,16 @@ type retainedFrameSnapshot struct {
 	heapBytes, objects, stackBytes int64
 }
 
+type retainedFrameSamples struct {
+	before  runtime.MemStats
+	samples [4]runtime.MemStats
+}
+
+//go:noinline
+func newRetainedFrameSamples() *retainedFrameSamples {
+	return new(retainedFrameSamples)
+}
+
 func retainedFrameDelta(before, after *runtime.MemStats) retainedFrameSnapshot {
 	return retainedFrameSnapshot{
 		int64(after.HeapAlloc) - int64(before.HeapAlloc),
@@ -49,12 +59,13 @@ func benchmarkRetainedFrames(b *testing.B, kind string) {
 	for range 1 {
 		oldProcs := runtime.GOMAXPROCS(1)
 		defer runtime.GOMAXPROCS(oldProcs)
+		// Allocate observer snapshots before priming and measuring. Keeping
+		// MemStats on this controller stack prevents Go stack shrinkage.
+		record := newRetainedFrameSamples()
 		intSink = yieldEntry()
 		runtime.GC()
 		runtime.GC()
-		var before runtime.MemStats
-		var samples [4]runtime.MemStats
-		runtime.ReadMemStats(&before)
+		runtime.ReadMemStats(&record.before)
 		want := 4097
 		switch kind {
 		case "control":
@@ -71,27 +82,27 @@ func benchmarkRetainedFrames(b *testing.B, kind string) {
 		if intSink != want {
 			b.Fatal("incorrect recursive result")
 		}
-		runtime.ReadMemStats(&samples[0])
+		runtime.ReadMemStats(&record.samples[0])
 		for cycle := 1; cycle <= 4; cycle++ {
 			runtime.GC()
 			switch cycle {
 			case 1:
-				runtime.ReadMemStats(&samples[1])
+				runtime.ReadMemStats(&record.samples[1])
 			case 2:
-				runtime.ReadMemStats(&samples[2])
+				runtime.ReadMemStats(&record.samples[2])
 			case 4:
-				runtime.ReadMemStats(&samples[3])
+				runtime.ReadMemStats(&record.samples[3])
 			}
 		}
 		// Finish every snapshot before ReportMetric can allocate maps or labels.
 		for i, stage := range [...]string{"returned", "gc1", "gc2", "gc4"} {
-			delta := retainedFrameDelta(&before, &samples[i])
+			delta := retainedFrameDelta(&record.before, &record.samples[i])
 			b.ReportMetric(float64(delta.heapBytes), stage+"-heap-B")
 			b.ReportMetric(float64(delta.objects), stage+"-objects")
 			b.ReportMetric(float64(delta.stackBytes), stage+"-Go-stack-B")
 		}
-		b.ReportMetric(float64(samples[0].TotalAlloc-before.TotalAlloc), "call-total-B")
-		b.ReportMetric(float64(samples[0].Mallocs-before.Mallocs), "call-allocs")
+		b.ReportMetric(float64(record.samples[0].TotalAlloc-record.before.TotalAlloc), "call-total-B")
+		b.ReportMetric(float64(record.samples[0].Mallocs-record.before.Mallocs), "call-allocs")
 	}
 }
 

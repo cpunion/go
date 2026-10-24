@@ -4753,6 +4753,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	if !fusedFrame {
 		frameFields = explicitFrameFieldsWithStatePadding(fields, replacements[candidate.resumePC])
+	} else if candidate.fusedResume && !candidate.fusedSelf {
+		frameFields = explicitFusedFrameFieldsWithPadding(frameFields, fields,
+			packedState, fusedResumeField)
+	} else if selfOnly {
+		frameFields = explicitSelfFrameFieldsWithPadding(frameFields, fields,
+			replacements[candidate.resumePC])
 	}
 	frameType := types.NewStruct(frameFields)
 	frameType.SetNoalg(true)
@@ -4811,8 +4817,8 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				var needsClear ir.Node = typecheck.Call(ret.Pos(),
 					typecheck.LookupRuntime("coroFrameNeedsClear"),
 					ir.Nodes{resume.Dcl[0]}, false)
-				if selfOnly {
-					// A parented self frame is retained by its fused lineage.
+				if fusedFrame {
+					// A parented fused frame is retained by its lineage.
 					// Only a root needs the runtime's retention query.
 					parent := explicitFrameField(ret.Pos(), frame, fusedParentField)
 					hasParent := ir.NewBinaryExpr(ret.Pos(), ir.ONE, parent,
