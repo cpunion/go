@@ -37,6 +37,41 @@ func StacklessCoroNativePoolForTest() (count int) {
 	return
 }
 
+func StacklessCoroNativePoolSchedulerStacksForTest() (warm, overflow, idle int) {
+	for i := range stacklessCoroNativePool.slots {
+		slot := &stacklessCoroNativePool.slots[i]
+		for {
+			ctx := slot.Load()
+			if ctx == nil {
+				break
+			}
+			if !slot.CompareAndSwap(ctx, nil) {
+				continue
+			}
+			if ctx.schedulerG != nil {
+				warm++
+			}
+			if !slot.CompareAndSwap(nil, ctx) {
+				releaseStacklessCoroNativeContext(ctx)
+			}
+			break
+		}
+	}
+	lock(&stacklessCoroNativePool.lock)
+	for ctx := stacklessCoroNativePool.overflow; ctx != nil; ctx = ctx.poolNext {
+		if ctx.schedulerG != nil {
+			overflow++
+		}
+	}
+	unlock(&stacklessCoroNativePool.lock)
+	for i := range stacklessCoroNativeSchedulerStacks {
+		if stacklessCoroNativeSchedulerStacks[i].Load() != nil {
+			idle++
+		}
+	}
+	return
+}
+
 func StacklessCoroDeferSleepOutsideExecutorForTest() bool {
 	return stacklessCoroDeferSleep(nil, nil, 0)
 }
