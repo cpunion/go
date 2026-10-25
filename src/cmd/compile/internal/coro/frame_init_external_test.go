@@ -67,12 +67,66 @@ func pointers(p *int) int {
 	return *values[0]
 }
 
+// Check both chunk widths, including slots first reached after a shorter
+// traversal returned a partially used chunk to the cache.
+//go:noinline
+func sumSmall(p *[1024]byte) int {
+	n := 0
+	for _, v := range p { n += int(v) }
+	return n
+}
+
+func small(n int) int {
+	var data [1024]byte
+	if sumSmall(&data) != 0 { panic("small reused bytes") }
+	data[0], data[len(data)-1] = byte(n), byte(n+1)
+	want := int(byte(n)) + int(byte(n+1))
+	got := 0
+	if n == 0 { runtime.Gosched() } else { got = small(n-1) }
+	if sumSmall(&data) != want { panic("small live bytes") }
+	return got + want
+}
+
+//go:noinline
+func pointerSum(p *[256]*int) int {
+	n := 0
+	for _, v := range p { if v != nil { n += *v } }
+	return n
+}
+
+func pointerRecursive(n int) int {
+	var values [256]*int
+	if pointerSum(&values) != 0 { panic("reused pointers") }
+	p := new(int)
+	*p = n+1
+	values[0], values[255] = p, p
+	got := 0
+	if n == 0 {
+		runtime.Gosched()
+		gcRequest <- true
+		<-gcDone
+	} else { got = pointerRecursive(n-1) }
+	if pointerSum(&values) != 2*(n+1) { panic("live pointers") }
+	return got + 2*(n+1)
+}
+
+func largeArgument(seed [1024]byte) int {
+	runtime.Gosched()
+	return int(seed[0]) + int(seed[1023])
+}
+
 func main() {
 	go collect()
 	for i := 0; i < 20; i++ {
 		if recursive(64) != 4225 { panic("recursive result") }
 		if argument([16]int{7: i}) != i { panic("array argument") }
 		if pointers(&i) != i { panic("pointer result") }
+	}
+	for _, n := range []int{37, 38, 44, 49, 91, 17, 96, 38, 91} {
+		if recursive(n) != (n+1)*(n+1) { panic("large tail result") }
+		if small(n) != (n+1)*(n+1) { panic("small tail result") }
+		if pointerRecursive(n) != (n+1)*(n+2) { panic("pointer tail result") }
+		if largeArgument([1024]byte{0: byte(n), 1023: 7}) != n+7 { panic("large array argument") }
 	}
 	close(gcRequest)
 	println("frame-zero-ok")

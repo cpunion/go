@@ -4918,6 +4918,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	declarations = initializedDeclarations
 	zeroLocals := zeroInitializedFrameLocals(declarations)
+	var zeroBytes int64
+	for _, variable := range closureVars {
+		if zeroLocals[variable.Outer.Canonical()] && variable.Type().IsArray() {
+			zeroBytes += variable.Type().Size()
+		}
+	}
 
 	factoryFrame := typecheck.TempAt(pos, factory, framePointerType)
 	declarations = append(declarations, ir.NewDecl(pos, ir.ODCL, factoryFrame))
@@ -4974,11 +4980,31 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(),
 		ir.Nodes{rootAssignment}, ir.Nodes{takeChildFrame}))
+	var needsArrayZero *ir.Name
+	if zeroBytes >= abi.CoroFrameZeroMinBytes {
+		needsArrayZero = typecheck.TempAt(pos, factory, types.Types[types.TBOOL])
+		declarations = append(declarations,
+			ir.NewDecl(pos, ir.ODCL, needsArrayZero),
+			ir.NewAssignStmt(pos, needsArrayZero, ir.NewBinaryExpr(pos, ir.ONE,
+				factoryFrame, ir.NewNilExpr(pos, framePointerType))))
+	}
 	missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
 		ir.NewNilExpr(pos, framePointerType))
 	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
 		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
 			typedNew(pos, frameType))}, nil))
+	if needsArrayZero != nil && selfOnly {
+		// Only homogeneous child chunks carry the transient fresh bit.
+		// Roots and other reused frames retain their normal initialization.
+		marker := explicitFrameField(pos, factoryFrame, fusedMarkerField)
+		fresh := ir.NewBinaryExpr(pos, ir.OAND, marker,
+			typedInt(pos, types.Types[types.TUINT8], int64(abi.CoroFrameFresh)))
+		used := ir.NewBinaryExpr(pos, ir.OEQ, fresh,
+			typedInt(pos, types.Types[types.TUINT8], 0))
+		needsZero := ir.NewLogicalExpr(pos, ir.OOROR, isRootFactory(), used)
+		declarations = append(declarations, ir.NewAssignStmt(pos, needsArrayZero,
+			ir.NewLogicalExpr(pos, ir.OANDAND, needsArrayZero, needsZero)))
+	}
 	if fusedFrame {
 		declarations = append(declarations,
 			ir.NewAssignStmt(pos,
@@ -5004,8 +5030,14 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			if zeroLocals[variable.Outer.Canonical()] {
 				value = ir.NewZero(pos, fields[i].Type)
 			}
-			declarations = append(declarations,
-				ir.NewAssignStmt(pos, target, value))
+			initialize := ir.NewAssignStmt(pos, target, value)
+			if needsArrayZero != nil && zeroLocals[variable.Outer.Canonical()] &&
+				fields[i].Type.IsArray() {
+				declarations = append(declarations,
+					ir.NewIfStmt(pos, needsArrayZero, ir.Nodes{initialize}, nil))
+			} else {
+				declarations = append(declarations, initialize)
+			}
 			continue
 		}
 		selfTarget := typecheck.NodAddr(explicitFrameField(variable.Pos(),
