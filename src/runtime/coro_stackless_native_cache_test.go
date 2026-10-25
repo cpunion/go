@@ -186,3 +186,83 @@ func TestStacklessCoroNativeBurstParkedRoot(t *testing.T) {
 		t.Fatalf("native context grew to %d allocator bytes", got)
 	}
 }
+
+func TestStacklessCoroNativeParkedCacheIdleGC(t *testing.T) {
+	previous := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	ready, release, done := make(chan uintptr, 8), make(chan struct{}), make(chan bool, 8)
+	for range 8 {
+		go runtime.StacklessCoroNativeRegisteredCacheForTest(ready, release, done)
+	}
+	overflow := 0
+	for range 8 {
+		if <-ready == 0 {
+			overflow++
+		}
+	}
+	count, before := runtime.StacklessCoroNativeParkedCacheForTest()
+	if count != 4 || overflow != 4 || before == 0 {
+		t.Fatalf("registered=%d overflow=%d bytes=%d", count, overflow, before)
+	}
+	runtime.GC()
+	count, first := runtime.StacklessCoroNativeParkedCacheForTest()
+	if count != 4 || first != before {
+		t.Fatalf("first GC count=%d bytes=%d want %d", count, first, before)
+	}
+	runtime.GC()
+	count, second := runtime.StacklessCoroNativeParkedCacheForTest()
+	if count != 4 || second != 0 {
+		t.Fatalf("second GC count=%d bytes=%d", count, second)
+	}
+	runtime.GC()
+	close(release)
+	for range 8 {
+		if !<-done {
+			t.Fatal("expiry changed live driver state")
+		}
+	}
+	if count, _ := runtime.StacklessCoroNativeParkedCacheForTest(); count != 0 {
+		t.Fatalf("waiters left %d slots", count)
+	}
+	runStacklessCoroLargeSelfFrames(512, new(stacklessCoroLargeSelfFrameTracker))
+	stacklessCoroLargeSelfFrameActive = nil
+}
+
+func TestStacklessCoroNativeParkedCacheNoAlloc(t *testing.T) {
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	wait := runtime.StacklessCoroNativeParkRoundTripForTest()
+	defer wait.Close()
+	if n := testing.AllocsPerRun(100, wait.Wait); n != 0 {
+		t.Fatalf("cached wait allocated %v objects", n)
+	}
+	if count, _ := runtime.StacklessCoroNativeParkedCacheForTest(); count != 0 {
+		t.Fatalf("ready wait leaked %d slots", count)
+	}
+}
+
+func TestStacklessCoroNativeBurstAdmission(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	defer runtime.StacklessCoroClearNativeTaskCachesForTest()
+	defer func() { stacklessCoroLargeSelfFrameActive = nil }()
+	runStacklessCoroLargeSelfFrames(16, new(stacklessCoroLargeSelfFrameTracker))
+	if n := runtime.StacklessCoroNativeBurstReservationsForTest(); n != 0 {
+		t.Fatalf("shallow root reserved %d burst slots", n)
+	}
+	runStacklessCoroLargeSelfFrames(512, new(stacklessCoroLargeSelfFrameTracker))
+	if n := runtime.StacklessCoroNativeBurstReservationsForTest(); n != 1 {
+		t.Fatalf("large cache reserved %d burst slots", n)
+	}
+	runtime.GC()
+	if n := runtime.StacklessCoroNativeBurstReservationsForTest(); n != 0 {
+		t.Fatalf("idle GC kept %d burst slots", n)
+	}
+}

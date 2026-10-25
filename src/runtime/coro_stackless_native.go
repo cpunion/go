@@ -22,6 +22,7 @@ const (
 	// trims this to the ordinary budget; the second drops all idle payload.
 	// A global quota also bounds bursts on active contexts. Parking a root
 	// immediately trims its completed chunks and returns its reservation.
+	// Bounded parked-cache slots let GC expire storage during longer waits.
 	stacklessCoroSelfFrameBurstCacheSize = 4 << 20
 	stacklessCoroSelfFrameBurstMinSize   = 1024
 
@@ -82,6 +83,11 @@ type stacklessCoroNativeDriver struct {
 // At most four contexts, active or idle, may exceed the ordinary chunk budget.
 // Other active contexts retain the existing256KiB limit.
 var stacklessCoroNativeBurstContexts atomic.Uint32
+
+// Registered contexts have no running native episode. Their ordinary driver
+// removes them before resuming native work. Only this bounded set retains
+// completed frame storage across a wait; the GC can age it as idle storage.
+var stacklessCoroNativeParkedCaches [stacklessCoroWarmExecutorCount]atomic.Pointer[stacklessCoroNativeContext]
 
 var stacklessCoroNativePool struct {
 	lock  mutex
@@ -171,6 +177,37 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		trimStacklessCoroNativeSelfFrameChunks(ctx)
 		releaseStacklessCoroNativeBurst(ctx)
 	}
+	if ctx.selfFrames != nil || ctx.selfFrameChunks != nil {
+		return d.waitWithCachedFrames(s)
+	}
+	return d.waitForOperation(s)
+}
+
+// A context is published only after its native episode has ended, and is
+// unpublished before the next episode can mutate its cache. GC may clear its
+// unused storage while the ordinary driver waits. It must keep the slot itself
+// intact until that driver removes it. Overflow drops storage immediately.
+func registerStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) *atomic.Pointer[stacklessCoroNativeContext] {
+	ctx.cacheIdleCycle = work.cycles.Load()
+	for i := range stacklessCoroNativeParkedCaches {
+		slot := &stacklessCoroNativeParkedCaches[i]
+		if slot.CompareAndSwap(nil, ctx) {
+			return slot
+		}
+	}
+	clearStacklessCoroNativePayloadCache(ctx)
+	return nil
+}
+
+func (d *stacklessCoroNativeDriver) waitWithCachedFrames(s *stacklessCoroScheduler) bool {
+	if slot := registerStacklessCoroNativeParkedCache(d.context); slot != nil {
+		defer slot.Store(nil)
+	}
+	return d.waitForOperation(s)
+}
+
+func (d *stacklessCoroNativeDriver) waitForOperation(s *stacklessCoroScheduler) bool {
+	ctx := d.context
 	op := ctx.deferredSleep
 	if op == nil {
 		return s.waitForWork()
@@ -320,7 +357,8 @@ func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 }
 
 // clearStacklessCoroNativeCaches runs with the world stopped, before the GC
-// cycle number advances. Only contexts in idle pool slots can be examined.
+// cycle number advances. Idle pool and registered parked contexts have no
+// running native episode, so their unused cache storage can be examined.
 // Trim recently used chunks to the ordinary budget for one collection, then
 // drop payload caches that remained idle for a complete GC generation.
 func clearStacklessCoroNativeCaches() {
@@ -335,6 +373,12 @@ func clearStacklessCoroNativeCaches() {
 		} else {
 			trimStacklessCoroNativeSelfFrameChunks(ctx)
 			releaseStacklessCoroNativeBurst(ctx)
+		}
+	}
+	for i := range stacklessCoroNativeParkedCaches {
+		ctx := stacklessCoroNativeParkedCaches[i].Load()
+		if ctx != nil && cycle-ctx.cacheIdleCycle >= 1 {
+			clearStacklessCoroNativePayloadCache(ctx)
 		}
 	}
 }
@@ -459,9 +503,6 @@ func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		chunkSize > stacklessCoroSelfFrameBurstCacheSize {
 		return nil
 	}
-	if frameSize >= stacklessCoroSelfFrameBurstMinSize {
-		takeStacklessCoroNativeBurst(ctx)
-	}
 	identity := stacklessCoroResumeIdentity(resume)
 	if ctx.selfFrameResume != identity || ctx.selfFrameSize != frameSize ||
 		ctx.selfFrameChunkType != chunkType {
@@ -541,6 +582,13 @@ func cacheStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		ctx.selfFrames = frame
 		ctx.selfFrameCount++
 	case allocation == stacklessCoroFusedFrameChunkFirst:
+		// Reserve extra capacity only when completed chunks actually exceed
+		// the ordinary bound. Shallow live lineages must not hold a quota.
+		if ctx.selfFrameSize >= stacklessCoroSelfFrameBurstMinSize &&
+			!ctx.selfFrameBurst && uintptr(ctx.selfFrameChunkCount) >=
+			stacklessCoroSelfFrameChunkCacheSize/ctx.selfFrameChunkSize {
+			takeStacklessCoroNativeBurst(ctx)
+		}
 		if uintptr(ctx.selfFrameChunkCount) >=
 			stacklessCoroSelfFrameChunkBudget(ctx)/ctx.selfFrameChunkSize {
 			return
