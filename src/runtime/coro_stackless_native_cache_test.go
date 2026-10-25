@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"testing"
+	"unsafe"
 )
 
 func TestStacklessCoroNativeIdleCacheGC(t *testing.T) {
@@ -85,4 +86,103 @@ func TestStacklessCoroNativeCachePhaseReplacement(t *testing.T) {
 	self()
 	mutual()
 	self()
+}
+
+// A burst must be reusable between roots, without retaining its peak storage
+// through the first idle collection or keeping stale links after a trim.
+func TestStacklessCoroNativeBurstCacheGC(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	defer func() { stacklessCoroLargeSelfFrameActive = nil }()
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	defer runtime.StacklessCoroClearNativeTaskCachesForTest()
+	run := func() {
+		tracker := new(stacklessCoroLargeSelfFrameTracker)
+		runStacklessCoroLargeSelfFrames(2048, tracker)
+		if tracker.total != 2049 {
+			t.Fatalf("completed %d frames, want 2049", tracker.total)
+		}
+	}
+	run()
+	burst, overflow, _, ordinary := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	direct := uintptr(runtime.StacklessCoroFrameChunkDirectCount) * unsafe.Sizeof(runtime.StacklessCoroLargeSelfFrameForTest{})
+	if burst <= ordinary || burst > (4<<20)+direct || overflow != 0 {
+		t.Fatalf("burst cache=(%d,%d), want >%d and <=4 MiB plus direct frames", burst, overflow, ordinary)
+	}
+	// A smaller whole root should reuse the retained chunks with only the
+	// ordinary root/controller allocations, rather than hundreds of refills.
+	small := func() {
+		tracker := new(stacklessCoroLargeSelfFrameTracker)
+		runStacklessCoroLargeSelfFrames(512, tracker)
+		if tracker.total != 513 {
+			t.Fatalf("completed %d frames", tracker.total)
+		}
+	}
+	if n := testing.AllocsPerRun(3, small); n > 32 {
+		t.Fatalf("warm burst allocated %.0f objects, want <=32", n)
+	}
+	contexts := runtime.StacklessCoroNativePoolForTest()
+	runtime.GC()
+	first, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if first == 0 || first > ordinary+direct || first >= burst || overflow != 0 {
+		t.Fatalf("first idle GC cache=(%d,%d), want within %d", first, overflow, ordinary+direct)
+	}
+	// Reuse the shortened linked list and refill it before checking expiry.
+	small()
+	runtime.GC()
+	runtime.GC()
+	second, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if second != 0 || overflow != 0 {
+		t.Fatalf("second idle GC cache=(%d,%d)", second, overflow)
+	}
+	if runtime.StacklessCoroNativePoolForTest() != contexts {
+		t.Fatal("GC replaced native executors")
+	}
+	small()
+}
+
+func TestStacklessCoroNativeBurstCacheContexts(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	for _, oversized := range []bool{false, true} {
+		before, first, second, overflow, limit, active, reserved, afterTrim := runtime.StacklessCoroNativeBurstContextsForTest(oversized)
+		if active > 8*(256<<10)+4*((4<<20)-(256<<10)) || reserved != 4 || afterTrim != 0 {
+			t.Fatalf("active=%d reserved=%d afterTrim=%d", active, reserved, afterTrim)
+		}
+		if before <= limit || before > 4*(4<<20) || first > limit || second != 0 || overflow != 0 {
+			t.Fatalf("oversized=%t: caches before=%d first=%d second=%d overflow=%d, idle limit=%d", oversized, before, first, second, overflow, limit)
+		}
+	}
+}
+
+func TestStacklessCoroNativeBurstReservationContention(t *testing.T) {
+	previous := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	for range 3 {
+		held, granted, remaining := runtime.StacklessCoroNativeBurstContendForTest()
+		if held != 4 || granted != 4 || remaining != 0 {
+			t.Fatalf("held=%d granted=%d remaining=%d", held, granted, remaining)
+		}
+	}
+}
+
+func TestStacklessCoroNativeBurstParkedRoot(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	before, after, reserved := runtime.StacklessCoroNativeBurstParkForTest()
+	if before <= 256<<10 || after > 256<<10 || reserved != 0 {
+		t.Fatalf("parked cache before=%d after=%d reservations=%d", before, after, reserved)
+	}
+	if got := runtime.StacklessCoroNativeContextAllocationSizeForTest(); got > 208 {
+		t.Fatalf("native context grew to %d allocator bytes", got)
+	}
 }

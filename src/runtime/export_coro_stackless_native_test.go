@@ -7,6 +7,8 @@
 package runtime
 
 import (
+	"internal/abi"
+	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -73,9 +75,9 @@ func stacklessCoroNativeSelfFrameCacheBytes(ctx *stacklessCoroNativeContext) uin
 func StacklessCoroNativePoolSelfFrameCacheForTest() (warm, overflow,
 	perContextLimit, chunkLimit uintptr) {
 	chunkLimit = stacklessCoroSelfFrameChunkCacheSize
-	perContextLimit = stacklessCoroSelfFrameChunkCacheSize +
+	perContextLimit = stacklessCoroSelfFrameBurstCacheSize +
 		stacklessCoroFrameChunkDirectCount*
-			(stacklessCoroSelfFrameChunkCacheSize/stacklessCoroLargeFrameChunkSize)
+			(stacklessCoroSelfFrameBurstCacheSize/stacklessCoroLargeFrameChunkSize)
 	for i := range stacklessCoroNativePool.slots {
 		slot := &stacklessCoroNativePool.slots[i]
 		for {
@@ -126,6 +128,7 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 			ctx.selfFrameChunkSize = 0
 			ctx.selfFrameChunkCount = 0
 			ctx.selfFrameCount = 0
+			releaseStacklessCoroNativeBurst(ctx)
 			if !slot.CompareAndSwap(nil, ctx) {
 				releaseStacklessCoroNativeContext(ctx)
 			}
@@ -183,4 +186,120 @@ func stacklessCoroTaskListLen(task *stacklessCoroTask) int {
 
 func WriteStacklessCoroNativeForTest(fd int, value byte) int {
 	return int(write(uintptr(fd), unsafe.Pointer(&value), 1))
+}
+
+// Construct typed idle caches on eight independently acquired executors. This
+// exercises the real warm/overflow release and GC hooks without scheduler
+// timing determining how many roots happen to overlap.
+func StacklessCoroNativeBurstContextsForTest(oversized bool) (before, first, second, overflow, limit, active uintptr, reserved, afterTrim uint32) {
+	StacklessCoroClearNativeTaskCachesForTest()
+	contexts := [2 * stacklessCoroWarmExecutorCount]*stacklessCoroNativeContext{}
+	for i := range contexts {
+		contexts[i] = acquireStacklessCoroNativeContext()
+	}
+	for _, ctx := range contexts {
+		var typ *_type
+		var frameSize uintptr
+		if oversized {
+			typ = abi.TypeFor[[4]struct {
+				Header stacklessCoroFusedFrameHeader
+				Data   [70000]byte
+			}]()
+		} else {
+			typ = abi.TypeFor[[4]struct {
+				Header stacklessCoroFusedFrameHeader
+				Data   [5120]byte
+			}]()
+		}
+		frameSize = typ.Size_ / 4
+		class := roundupsize(typ.Size_, false)
+		if typ.Size_ > gc.MinSizeForMallocHeader {
+			class += gc.MallocHeaderSize
+		}
+		ctx.selfFrameSize = frameSize
+		ctx.selfFrameChunkSize = class
+		ctx.selfFrameChunkType = typ
+		takeStacklessCoroNativeBurst(ctx)
+		for n := uintptr(0); n < stacklessCoroSelfFrameChunkBudget(ctx)/class; n++ {
+			p := mallocgc(typ.Size_, typ, true)
+			(*stacklessCoroFusedFrameHeader)(p).parent = ctx.selfFrameChunks
+			ctx.selfFrameChunks = p
+			ctx.selfFrameChunkCount++
+		}
+	}
+	for _, ctx := range contexts {
+		active += stacklessCoroNativeSelfFrameCacheBytes(ctx)
+	}
+	reserved = stacklessCoroNativeBurstContexts.Load()
+	for _, ctx := range contexts {
+		releaseStacklessCoroNativeContext(ctx)
+	}
+	contexts = [2 * stacklessCoroWarmExecutorCount]*stacklessCoroNativeContext{}
+	before, overflow, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	GC()
+	first, _, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	afterTrim = stacklessCoroNativeBurstContexts.Load()
+	GC()
+	second, _, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	limit = stacklessCoroWarmExecutorCount * stacklessCoroSelfFrameChunkCacheSize
+	return
+}
+
+func StacklessCoroNativeBurstReservationsForTest() uint32 {
+	return stacklessCoroNativeBurstContexts.Load()
+}
+
+func StacklessCoroNativeBurstContendForTest() (held, granted, remaining uint32) {
+	const n = 64
+	results := make(chan bool, n)
+	release, done := make(chan struct{}), make(chan struct{}, n)
+	for range n {
+		go func() {
+			ctx := new(stacklessCoroNativeContext)
+			takeStacklessCoroNativeBurst(ctx)
+			results <- ctx.selfFrameBurst
+			<-release
+			releaseStacklessCoroNativeBurst(ctx)
+			done <- struct{}{}
+		}()
+	}
+	for range n {
+		if <-results {
+			granted++
+		}
+	}
+	held = stacklessCoroNativeBurstContexts.Load()
+	close(release)
+	for range n {
+		<-done
+	}
+	remaining = stacklessCoroNativeBurstContexts.Load()
+	return
+}
+
+// A parked public root keeps its driver. Its completed chunks must nevertheless
+// return to the ordinary budget and release the global burst reservation.
+func StacklessCoroNativeBurstParkForTest() (before, after uintptr, reserved uint32) {
+	StacklessCoroClearNativeTaskCachesForTest()
+	ctx := acquireStacklessCoroNativeContext()
+	defer releaseStacklessCoroNativeContext(ctx)
+	typ := abi.TypeFor[[stacklessCoroLargeFrameChunkSize]StacklessCoroLargeSelfFrameForTest]()
+	ctx.selfFrameSize = unsafe.Sizeof(StacklessCoroLargeSelfFrameForTest{})
+	ctx.selfFrameChunkType = typ
+	ctx.selfFrameChunkSize = roundupsize(typ.Size_, false) + gc.MallocHeaderSize
+	takeStacklessCoroNativeBurst(ctx)
+	for n := uintptr(0); n < stacklessCoroSelfFrameChunkBudget(ctx)/ctx.selfFrameChunkSize; n++ {
+		p := mallocgc(typ.Size_, typ, true)
+		(*stacklessCoroFusedFrameHeader)(p).parent = ctx.selfFrameChunks
+		ctx.selfFrameChunks = p
+		ctx.selfFrameChunkCount++
+	}
+	before = stacklessCoroNativeSelfFrameCacheBytes(ctx)
+	s := &stacklessCoroScheduler{wake: make(chan struct{}, 1)}
+	s.wake <- struct{}{}
+	driver := stacklessCoroNativeDriver{context: ctx}
+	driver.waitForWork(s)
+	after = stacklessCoroNativeSelfFrameCacheBytes(ctx)
+	reserved = stacklessCoroNativeBurstContexts.Load()
+	return
 }
