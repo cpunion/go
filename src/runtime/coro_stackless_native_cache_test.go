@@ -149,9 +149,40 @@ func TestStacklessCoroNativeBurstCacheContexts(t *testing.T) {
 	gcPercent := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(gcPercent)
 	for _, oversized := range []bool{false, true} {
-		before, first, second, overflow, limit := runtime.StacklessCoroNativeBurstContextsForTest(oversized)
+		before, first, second, overflow, limit, active, reserved, afterTrim := runtime.StacklessCoroNativeBurstContextsForTest(oversized)
+		if active > 8*(256<<10)+4*((4<<20)-(256<<10)) || reserved != 4 || afterTrim != 0 {
+			t.Fatalf("active=%d reserved=%d afterTrim=%d", active, reserved, afterTrim)
+		}
 		if before <= limit || before > 4*(4<<20) || first > limit || second != 0 || overflow != 0 {
 			t.Fatalf("oversized=%t: caches before=%d first=%d second=%d overflow=%d, idle limit=%d", oversized, before, first, second, overflow, limit)
 		}
+	}
+}
+
+func TestStacklessCoroNativeBurstReservationContention(t *testing.T) {
+	previous := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	for range 3 {
+		held, granted, remaining := runtime.StacklessCoroNativeBurstContendForTest()
+		if held != 4 || granted != 4 || remaining != 0 {
+			t.Fatalf("held=%d granted=%d remaining=%d", held, granted, remaining)
+		}
+	}
+}
+
+func TestStacklessCoroNativeBurstParkedRoot(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	before, after, reserved := runtime.StacklessCoroNativeBurstParkForTest()
+	if before <= 256<<10 || after > 256<<10 || reserved != 0 {
+		t.Fatalf("parked cache before=%d after=%d reservations=%d", before, after, reserved)
+	}
+	if got := runtime.StacklessCoroNativeContextAllocationSizeForTest(); got > 208 {
+		t.Fatalf("native context grew to %d allocator bytes", got)
 	}
 }
