@@ -280,6 +280,17 @@ native executor continues to borrow the OS thread stack. Allocator stack
 spans and caches can make `MemStats.StackInuse` larger than the requested
 stack bounds, especially for the first context.
 
+An inactive driver returns its replacement scheduler G to a bounded shared
+pool before an ordinary wait or host turn. Resumption borrows a scheduler G
+again; executor identity and heap continuations stay with the context. The
+stack is detached only after the caller has restored its original `m.g0`
+and cleared the scheduler G's M link. Concurrent native activations never
+share a scheduler G. Completed warm contexts keep their scheduler G to
+preserve the common entry path; overflow contexts retain none. At most four
+warm contexts and four shared idle slots retain replacement scheduler stacks.
+Additional idle stacks return to the runtime stack allocator on the current
+M's system stack, including instrumentation bookkeeping.
+
 When an initial private root must let ordinary goroutines run, it first queues
 its logical task and ends the native episode. The ordinary driver then calls
 `Gosched` after restoring the caller's thread state. Yielding the still-bound

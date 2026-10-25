@@ -134,23 +134,29 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	const roots = 16
 	run := func() int {
 		var wg sync.WaitGroup
-		started := make(chan struct{}, roots)
+		started := make(chan uintptr, roots)
 		gate := make(chan struct{})
 		wg.Add(roots)
 		for range roots {
 			go func() {
 				defer wg.Done()
 				runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
-					started <- struct{}{}
+					_, _, _, _, g0lo, _ := runtime.StacklessCoroNativeStackForTest()
+					started <- g0lo
 					<-gate
 					return runtime.StacklessCoroActionComplete
 				})
 			}()
 		}
 		watchdog := time.NewTimer(5 * time.Second)
+		stacks := make(map[uintptr]bool)
 		for range roots {
 			select {
-			case <-started:
+			case lo := <-started:
+				if lo == 0 || stacks[lo] {
+					t.Errorf("concurrent native scheduler stack reused at %#x", lo)
+				}
+				stacks[lo] = true
 			case <-watchdog.C:
 				close(gate)
 				wg.Wait()
@@ -161,6 +167,10 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 		count := runtime.StacklessCoroNativePoolForTest()
 		close(gate)
 		wg.Wait()
+		warm, overflow, idle := runtime.StacklessCoroNativePoolSchedulerStacksForTest()
+		if warm > 4 || overflow != 0 || idle > 4 {
+			t.Fatalf("idle scheduler stacks: warm=%d overflow=%d shared=%d", warm, overflow, idle)
+		}
 		return count
 	}
 

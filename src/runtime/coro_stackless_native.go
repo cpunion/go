@@ -89,6 +89,11 @@ var stacklessCoroNativeBurstContexts atomic.Uint32
 // completed frame storage across a wait; the GC can age it as idle storage.
 var stacklessCoroNativeParkedCaches [stacklessCoroWarmExecutorCount]atomic.Pointer[stacklessCoroNativeContext]
 
+// Parked contexts keep their executor identity, but need no scheduler stack.
+// Completed warm contexts retain their stack for the ordinary fast path; this
+// separate bounded pool serves contexts resuming after an ordinary wait.
+var stacklessCoroNativeSchedulerStacks [stacklessCoroWarmExecutorCount]atomic.Pointer[g]
+
 var stacklessCoroNativePool struct {
 	lock  mutex
 	count int
@@ -140,6 +145,9 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	if gp.param != nil {
 		throw("runtime: stackless coroutine caller has pending parameter")
 	}
+	if ctx.schedulerG == nil {
+		ctx.schedulerG = acquireStacklessCoroNativeSchedulerStack()
+	}
 
 	ctx.scheduler = s
 	ctx.caller = gp
@@ -171,6 +179,9 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 
 func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
 	ctx := d.context
+	// run restored m.g0 and detached this scheduler G before returning. No
+	// native activation or saved continuation can use its stack while we wait.
+	releaseStacklessCoroNativeSchedulerStack(ctx)
 	if ctx.deferredYield {
 		ctx.deferredYield = false
 		// The private root is already queued and signaled. Yield only after
@@ -332,6 +343,7 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	// Only the bounded warm pool retains task caches. The overflow list may
 	// grow with peak root concurrency and must not retain one cache per peak.
 	clearStacklessCoroNativePayloadCache(ctx)
+	releaseStacklessCoroNativeSchedulerStack(ctx)
 	lock(&stacklessCoroNativePool.lock)
 	ctx.poolNext = stacklessCoroNativePool.overflow
 	stacklessCoroNativePool.overflow = ctx
@@ -626,14 +638,7 @@ func cacheStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
 	ctx := new(stacklessCoroNativeContext)
 	ctx.gState.native = unsafe.Pointer(ctx)
-
-	// This stack runs g0 runtime work; the executor keeps the OS thread stack.
-	// Match allocm's Go-allocated g0 size, including its instrumentation guard.
-	schedulerG := malg(16384 * sys.StackGuardMultiplier)
-	schedulerG.stackguard1 = schedulerG.stackguard0
-	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
-	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
-	ctx.schedulerG = schedulerG
+	ctx.schedulerG = acquireStacklessCoroNativeSchedulerStack()
 
 	executor := malg(-1)
 	casgstatus(executor, _Gidle, _Gdead)
@@ -645,6 +650,50 @@ func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
 	sched.ngsys.Add(1)
 	ctx.executor = executor
 	return ctx
+}
+
+func acquireStacklessCoroNativeSchedulerStack() *g {
+	for i := range stacklessCoroNativeSchedulerStacks {
+		slot := &stacklessCoroNativeSchedulerStacks[i]
+		gp := slot.Load()
+		if gp != nil && slot.CompareAndSwap(gp, nil) {
+			return gp
+		}
+	}
+	// This stack runs g0 runtime work; the executor keeps the OS thread stack.
+	// Match allocm's Go-allocated g0 size, including its instrumentation guard.
+	schedulerG := malg(16384 * sys.StackGuardMultiplier)
+	schedulerG.stackguard1 = schedulerG.stackguard0
+	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
+	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
+	return schedulerG
+}
+
+func releaseStacklessCoroNativeSchedulerStack(ctx *stacklessCoroNativeContext) {
+	gp := ctx.schedulerG
+	if gp == nil {
+		return
+	}
+	if gp.m != nil {
+		throw("runtime: releasing active native scheduler stack")
+	}
+	ctx.schedulerG = nil
+	for i := range stacklessCoroNativeSchedulerStacks {
+		if stacklessCoroNativeSchedulerStacks[i].CompareAndSwap(nil, gp) {
+			return
+		}
+	}
+	// No running M or suspended native activation can refer to this G. The
+	// stack allocator requires the current M's system stack to free overflow.
+	systemstack(func() {
+		stackfree(gp.stack)
+		if valgrindenabled {
+			valgrindDeregisterStack(gp.valgrindStackID)
+		}
+		gp.stack = stack{}
+		gp.stackguard0 = 0
+		gp.stackguard1 = 0
+	})
 }
 
 // coroNativeStart is the mcall continuation that replaces the native g0
