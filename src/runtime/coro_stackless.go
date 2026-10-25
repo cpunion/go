@@ -1376,11 +1376,15 @@ func (scope *stacklessCoroRunScope) leave() {
 // G can use its P. Otherwise, the logical scheduler can continue running
 // ready tasks without a host-scheduler round trip.
 func stacklessCoroGoschedIfRunnable() {
-	gp := getg()
-	pp := gp.m.p.ptr()
-	if gp.preempt || pp == nil || !runqempty(pp) || !sched.runq.empty() {
+	if stacklessCoroHostRunnable() {
 		Gosched()
 	}
+}
+
+func stacklessCoroHostRunnable() bool {
+	gp := getg()
+	pp := gp.m.p.ptr()
+	return gp.preempt || pp == nil || !runqempty(pp) || !sched.runq.empty()
 }
 
 // runTasks drives the ready queue until this driver is done, one resume panics,
@@ -1457,7 +1461,11 @@ resumeActive:
 		s.initialRootPrivate {
 		hostYieldCheck++
 		if hostYieldCheck == 0 || getg().preempt {
-			stacklessCoroGoschedIfRunnable()
+			if stacklessCoroHostRunnable() {
+				if yieldStacklessCoroNativeRoot(s, task) {
+					return
+				}
+			}
 		}
 		goto resumeActive
 	}

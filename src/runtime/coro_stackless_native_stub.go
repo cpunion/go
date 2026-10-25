@@ -8,6 +8,11 @@ package runtime
 
 import "unsafe"
 
+func yieldStacklessCoroNativeRoot(*stacklessCoroScheduler, *stacklessCoroTask) bool {
+	Gosched()
+	return false
+}
+
 type stacklessCoroNativeDriver struct{}
 
 func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool, bool) *stacklessCoroScheduler {

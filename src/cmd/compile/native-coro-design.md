@@ -274,6 +274,20 @@ execution, it provides a separate internal scheduler stack for `g0`,
 associates the OS stack with the executor G, and switches between them at
 runtime scheduling boundaries.
 
+The replacement `g0` uses the same `16384 * sys.StackGuardMultiplier`
+allocation request as `allocm` uses for a Go-allocated scheduler stack. The
+native executor continues to borrow the OS thread stack. Allocator stack
+spans and caches can make `MemStats.StackInuse` larger than the requested
+stack bounds, especially for the first context.
+
+When an initial private root must let ordinary goroutines run, it first queues
+its logical task and ends the native episode. The ordinary driver then calls
+`Gosched` after restoring the caller's thread state. Yielding the still-bound
+native executor would otherwise require additional threads for a batch of
+runnable public roots. Explicit caller thread locks retain their ordinary Go
+behavior. The queued handoff preserves completed frame caches because it is a
+host scheduling turn, rather than an operation wait.
+
 The reason to prefer the OS stack is stronger than stack size alone. The
 current `asmcgocall` path documents that `g0` is expected to be an
 OS-allocated stack suitable for compiler-generated C code. Some libc,

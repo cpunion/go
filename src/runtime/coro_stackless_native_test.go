@@ -36,6 +36,9 @@ func TestStacklessCoroNativeStack(t *testing.T) {
 		if sp >= g0lo && sp < g0hi {
 			t.Fatalf("executor SP %#x is on g0 stack [%#x, %#x)", sp, g0lo, g0hi)
 		}
+		if got := g0hi - g0lo; got != 16<<10 {
+			t.Errorf("scheduler stack = %d bytes, want 16384", got)
+		}
 		if n := runtime.Stack(make([]byte, 32<<10), true); n == 0 {
 			t.Fatal("runtime.Stack returned an empty traceback")
 		}
@@ -56,6 +59,75 @@ func TestStacklessCoroNativeStack(t *testing.T) {
 			return runtime.StacklessCoroActionInvalid
 		}
 	})
+}
+
+func TestStacklessCoroNativeSchedulerRuntimeWork(t *testing.T) {
+	buffer := make([]byte, 32<<10)
+	memory := make([]runtime.MemProfileRecord, 64)
+	stacks := make([]runtime.StackRecord, 64)
+	payload := new([4096]byte)
+	payload[0] = 97
+	step := 0
+	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+		runtime.GC()
+		if n := runtime.Stack(buffer, true); n == 0 {
+			t.Fatal("empty native traceback")
+		}
+		runtime.MemProfile(memory, true)
+		if n, _ := runtime.GoroutineProfile(stacks); n == 0 {
+			t.Fatal("empty native goroutine profile")
+		}
+		if payload[0] != 97 {
+			t.Fatal("native payload lost across runtime work")
+		}
+		step++
+		if step < 4 {
+			return runtime.StacklessCoroActionYield
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+}
+
+func TestStacklessCoroNativeInitialYieldThreads(t *testing.T) {
+	const child = "GO_CORO_INITIAL_YIELD_THREADS"
+	if os.Getenv(child) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroNativeInitialYieldThreads$", "-test.count=1")
+		cmd.Env = append(os.Environ(), child+"=1", "GOMAXPROCS=1", "GOGC=100")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("initial yield child: %v\n%s", err, output)
+		}
+		return
+	}
+	if runtime.StacklessCoroNativeYieldUnsupportedForTest() {
+		t.Fatal("ordinary G accepted a native yield")
+	}
+	const roots = 64
+	before, _ := runtime.ThreadCreateProfile(nil)
+	var wg sync.WaitGroup
+	var native atomic.Int32
+	for range roots {
+		wg.Go(func() {
+			step := 0
+			runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+				if step == 0 {
+					if active, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest(); active {
+						native.Add(1)
+					}
+					step++
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
+			})
+		})
+	}
+	wg.Wait()
+	after, _ := runtime.ThreadCreateProfile(nil)
+	if got := native.Load(); got != roots {
+		t.Fatalf("native roots = %d, want %d", got, roots)
+	}
+	if delta := after - before; delta > 8 {
+		t.Fatalf("initial yields created %d thread records for %d roots", delta, roots)
+	}
 }
 
 func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
