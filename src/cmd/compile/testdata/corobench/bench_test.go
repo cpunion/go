@@ -517,6 +517,33 @@ func BenchmarkRecursiveLargeFrame512(b *testing.B) {
 	intSink = total
 }
 
+func BenchmarkRecursiveLargeFrame1(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveLargeFrame(1)
+	}
+	intSink = total
+}
+
+func BenchmarkRecursiveLargeFrame16(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveLargeFrame(16)
+	}
+	intSink = total
+}
+
+func BenchmarkRecursiveLargeFrame64(b *testing.B) {
+	b.ReportAllocs()
+	total := 0
+	for i := 0; i < b.N; i++ {
+		total += recursiveLargeFrame(64)
+	}
+	intSink = total
+}
+
 func BenchmarkMutualYield64(b *testing.B) {
 	b.ReportAllocs()
 	total := 0

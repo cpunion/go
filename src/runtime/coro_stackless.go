@@ -1854,7 +1854,16 @@ func allocateStacklessCoroSelfFrame(frame unsafe.Pointer, size uintptr,
 				return frame
 			}
 		}
-		return newobject(chunkType)
+		frame := newobject(chunkType)
+		if size >= abi.CoroFrameZeroMinBytes {
+			// Every slot is still allocator-zeroed. Unused tail slots keep
+			// this construction-only mark across chunk reuse, until their
+			// first factory consumes it. Completed slots lose the mark.
+			for offset := uintptr(0); offset < chunkType.Size_; offset += size {
+				(*stacklessCoroFusedFrameHeader)(add(frame, offset)).marker = abi.CoroFrameFresh
+			}
+		}
+		return frame
 	case allocation >= stacklessCoroFusedFrameChunkFirst &&
 		allocation < chunkLast:
 		return add(frame, size)
