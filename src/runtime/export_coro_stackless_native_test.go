@@ -303,3 +303,64 @@ func StacklessCoroNativeBurstParkForTest() (before, after uintptr, reserved uint
 	reserved = stacklessCoroNativeBurstContexts.Load()
 	return
 }
+
+// The caller disables automatic GC while taking these test-only snapshots.
+func StacklessCoroNativeParkedCacheForTest() (count int, bytes uintptr) {
+	for i := range stacklessCoroNativeParkedCaches {
+		if ctx := stacklessCoroNativeParkedCaches[i].Load(); ctx != nil {
+			count++
+			bytes += stacklessCoroNativeSelfFrameCacheBytes(ctx)
+		}
+	}
+	return
+}
+
+func StacklessCoroNativeRegisteredCacheForTest(ready chan<- uintptr, release <-chan struct{}, done chan<- bool) {
+	ctx := acquireStacklessCoroNativeContext()
+	typ := abi.TypeFor[[4]StacklessCoroLargeSelfFrameForTest]()
+	ctx.selfFrameSize = unsafe.Sizeof(StacklessCoroLargeSelfFrameForTest{})
+	ctx.selfFrameChunkType = typ
+	ctx.selfFrameChunkSize = roundupsize(typ.Size_, false) + gc.MallocHeaderSize
+	p := mallocgc(typ.Size_, typ, true)
+	ctx.selfFrameChunks = p
+	ctx.selfFrameChunkCount = 1
+	// Cache expiry must leave pending driver state intact.
+	sentinel := new(stacklessCoroOperation)
+	ctx.deferredSleep = sentinel
+	ctx.deferredSleepWhen = 7
+	slot := registerStacklessCoroNativeParkedCache(ctx)
+	ready <- stacklessCoroNativeSelfFrameCacheBytes(ctx)
+	<-release
+	if slot != nil {
+		slot.Store(nil)
+	}
+	valid := ctx.selfFrameChunks == nil && ctx.selfFrameChunkCount == 0 && ctx.deferredSleep == sentinel && ctx.deferredSleepWhen == 7 && ctx.gState.native == unsafe.Pointer(ctx)
+	ctx.deferredSleep = nil
+	ctx.deferredSleepWhen = 0
+	releaseStacklessCoroNativeContext(ctx)
+	done <- valid
+}
+
+type StacklessCoroNativeParkRoundTrip struct {
+	driver    stacklessCoroNativeDriver
+	scheduler *stacklessCoroScheduler
+}
+
+func StacklessCoroNativeParkRoundTripForTest() *StacklessCoroNativeParkRoundTrip {
+	ctx := acquireStacklessCoroNativeContext()
+	typ := abi.TypeFor[[4]StacklessCoroLargeSelfFrameForTest]()
+	ctx.selfFrameSize = unsafe.Sizeof(StacklessCoroLargeSelfFrameForTest{})
+	ctx.selfFrameChunkType = typ
+	ctx.selfFrameChunkSize = roundupsize(typ.Size_, false) + gc.MallocHeaderSize
+	ctx.selfFrameChunks = mallocgc(typ.Size_, typ, true)
+	ctx.selfFrameChunkCount = 1
+	return &StacklessCoroNativeParkRoundTrip{driver: stacklessCoroNativeDriver{context: ctx}, scheduler: &stacklessCoroScheduler{wake: make(chan struct{}, 1)}}
+}
+func (r *StacklessCoroNativeParkRoundTrip) Wait() {
+	r.scheduler.wake <- struct{}{}
+	r.driver.waitForWork(r.scheduler)
+}
+func (r *StacklessCoroNativeParkRoundTrip) Close() {
+	clearStacklessCoroNativePayloadCache(r.driver.context)
+	releaseStacklessCoroNativeContext(r.driver.context)
+}
