@@ -183,6 +183,83 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeSchedulerDescriptorReuse(t *testing.T) {
+	const child = "GO_CORO_SCHEDULER_DESCRIPTORS"
+	if os.Getenv(child) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroNativeSchedulerDescriptorReuse$", "-test.count=1")
+		procs := os.Getenv("GOMAXPROCS")
+		if procs == "" {
+			procs = "4"
+		}
+		cmd.Env = append(os.Environ(), child+"=1", "GOMAXPROCS="+procs)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("descriptor child: %v\n%s", err, output)
+		}
+		return
+	}
+	run := func(roots int) map[uintptr]bool {
+		started := make(chan uintptr, roots)
+		gate := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(roots)
+		for range roots {
+			go func() {
+				defer wg.Done()
+				runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+					native, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest()
+					if !native {
+						panic("descriptor test lost native execution")
+					}
+					started <- runtime.StacklessCoroNativeSchedulerIdentityForTest()
+					<-gate
+					return runtime.StacklessCoroActionComplete
+				})
+			}()
+		}
+		watchdog := time.NewTimer(10 * time.Second)
+		ids := make(map[uintptr]bool)
+		for range roots {
+			select {
+			case id := <-started:
+				if id == 0 || ids[id] {
+					t.Errorf("active scheduler descriptor aliases %#x", id)
+				}
+				ids[id] = true
+			case <-watchdog.C:
+				close(gate)
+				wg.Wait()
+				t.Fatal("native descriptor wave did not become active")
+			}
+		}
+		watchdog.Stop()
+		close(gate)
+		wg.Wait()
+		return ids
+	}
+	run(64)
+	cached, limit, dirty := runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
+	if len(cached) == 0 || len(cached) > limit || dirty {
+		t.Fatalf("empty descriptors: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
+	}
+	runtime.GC()
+	runtime.GC()
+	active := run(64)
+	for _, id := range cached {
+		if !active[id] {
+			t.Errorf("cached descriptor %#x was not reused", id)
+		}
+	}
+	run(96)
+	cached, limit, dirty = runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
+	if len(cached) != limit || dirty {
+		t.Fatalf("bounded descriptor overflow: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
+	}
+	warm, overflow, idle := runtime.StacklessCoroNativePoolSchedulerStacksForTest()
+	if warm > 4 || overflow != 0 || idle > 4 {
+		t.Fatalf("descriptor reuse retained stacks: warm=%d overflow=%d shared=%d", warm, overflow, idle)
+	}
+}
+
 func TestStacklessCoroNativeReplacementDrain(t *testing.T) {
 	runs, native := runtime.StacklessCoroNativeReplacementDrainForTest()
 	if runs != 2 || !native {

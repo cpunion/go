@@ -291,6 +291,14 @@ warm contexts and four shared idle slots retain replacement scheduler stacks.
 Additional idle stacks return to the runtime stack allocator on the current
 M's system stack, including instrumentation bookkeeping.
 
+Releasing an overflow stack may retain its empty scheduler G descriptor in a
+separate cache of at most 64 entries. These entries own no stack, M link, or
+saved registers. Resumption allocates a scheduler stack with the same size,
+guard, bottom-word initialization, and instrumentation registration as a fresh
+descriptor. This avoids allocating another G descriptor for each repeated
+concurrent wave without retaining a scheduler stack per peak context. The
+four warm-context and four shared idle-stack limits remain unchanged.
+
 When an initial private root must let ordinary goroutines run, it first queues
 its logical task and ends the native episode. The ordinary driver then calls
 `Gosched` after restoring the caller's thread state. Yielding the still-bound

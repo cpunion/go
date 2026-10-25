@@ -16,6 +16,10 @@ import (
 )
 
 const (
+	// Descriptors contain no stack or suspended activation. Bound their
+	// separate reuse cache without expanding the idle scheduler-stack budget.
+	stacklessCoroSchedulerDescriptorCacheSize = 64
+
 	stacklessCoroSelfFrameChunkCacheSize = 256 << 10
 	// Large frames may reuse a burst between collections. The first idle GC
 	// trims this to the ordinary budget; the second drops all idle payload.
@@ -94,6 +98,12 @@ var stacklessCoroNativeParkedCaches [stacklessCoroWarmExecutorCount]atomic.Point
 // separate bounded pool serves contexts resuming after an ordinary wait.
 var stacklessCoroNativeSchedulerStacks [stacklessCoroWarmExecutorCount]atomic.Pointer[g]
 
+var stacklessCoroNativeSchedulerDescriptors struct {
+	lock  mutex
+	count int
+	slots [stacklessCoroSchedulerDescriptorCacheSize]*g
+}
+
 var stacklessCoroNativePool struct {
 	lock  mutex
 	count int
@@ -105,6 +115,7 @@ var stacklessCoroNativePool struct {
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroNativeSchedulerDescriptors.lock, lockRankLeafRank)
 }
 
 // run drives one episode on a fixed portion of the current operating system
@@ -660,10 +671,31 @@ func acquireStacklessCoroNativeSchedulerStack() *g {
 			return gp
 		}
 	}
+	var schedulerG *g
+	lock(&stacklessCoroNativeSchedulerDescriptors.lock)
+	if stacklessCoroNativeSchedulerDescriptors.count != 0 {
+		stacklessCoroNativeSchedulerDescriptors.count--
+		slot := &stacklessCoroNativeSchedulerDescriptors.slots[stacklessCoroNativeSchedulerDescriptors.count]
+		schedulerG = *slot
+		*slot = nil
+	}
+	unlock(&stacklessCoroNativeSchedulerDescriptors.lock)
+	if schedulerG == nil {
+		schedulerG = new(g)
+	}
 	// This stack runs g0 runtime work; the executor keeps the OS thread stack.
-	// Match allocm's Go-allocated g0 size, including its instrumentation guard.
-	schedulerG := malg(16384 * sys.StackGuardMultiplier)
+	// Match malg's stack allocation and instrumentation for either a new or
+	// recycled descriptor, and allocm's Go-allocated scheduler-stack size.
+	stacksize := round2(stackSystem + 16384*sys.StackGuardMultiplier)
+	systemstack(func() {
+		schedulerG.stack = stackalloc(uint32(stacksize))
+		if valgrindenabled {
+			schedulerG.valgrindStackID = valgrindRegisterStack(unsafe.Pointer(schedulerG.stack.lo), unsafe.Pointer(schedulerG.stack.hi))
+		}
+	})
+	schedulerG.stackguard0 = schedulerG.stack.lo + stackGuard
 	schedulerG.stackguard1 = schedulerG.stackguard0
+	*(*uintptr)(unsafe.Pointer(schedulerG.stack.lo)) = 0
 	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
 	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
 	return schedulerG
@@ -689,11 +721,21 @@ func releaseStacklessCoroNativeSchedulerStack(ctx *stacklessCoroNativeContext) {
 		stackfree(gp.stack)
 		if valgrindenabled {
 			valgrindDeregisterStack(gp.valgrindStackID)
+			gp.valgrindStackID = 0
 		}
 		gp.stack = stack{}
 		gp.stackguard0 = 0
 		gp.stackguard1 = 0
 	})
+	// Keep no saved registers or heap funcval from the finished activation.
+	// The next borrower allocates a stack before installing this G as m.g0.
+	gp.sched = gobuf{}
+	lock(&stacklessCoroNativeSchedulerDescriptors.lock)
+	if stacklessCoroNativeSchedulerDescriptors.count < len(stacklessCoroNativeSchedulerDescriptors.slots) {
+		stacklessCoroNativeSchedulerDescriptors.slots[stacklessCoroNativeSchedulerDescriptors.count] = gp
+		stacklessCoroNativeSchedulerDescriptors.count++
+	}
+	unlock(&stacklessCoroNativeSchedulerDescriptors.lock)
 }
 
 // coroNativeStart is the mcall continuation that replaces the native g0
