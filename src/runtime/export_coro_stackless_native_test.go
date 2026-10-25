@@ -13,6 +13,10 @@ import (
 	"unsafe"
 )
 
+func StacklessCoroNativeYieldUnsupportedForTest() bool {
+	return yieldStacklessCoroNativeRoot(nil, nil)
+}
+
 func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {
 	gp := getg()
 	return gp.stackIsFixed(), sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi

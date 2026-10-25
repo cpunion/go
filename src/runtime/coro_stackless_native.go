@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	stacklessCoroSchedulerSize           = 64 << 10
 	stacklessCoroSelfFrameChunkCacheSize = 256 << 10
 	// Large frames may reuse a burst between collections. The first idle GC
 	// trims this to the ordinary budget; the second drops all idle payload.
@@ -65,6 +64,7 @@ type stacklessCoroNativeContext struct {
 	g0Accurate          bool
 	initialRoot         bool
 	public              bool
+	deferredYield       bool
 	poolNext            *stacklessCoroNativeContext
 	// deferredSleep is owned by the driver between adjacent fixed-stack
 	// episodes. Keeping it here avoids growing the shared logical scheduler.
@@ -171,6 +171,13 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 
 func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
 	ctx := d.context
+	if ctx.deferredYield {
+		ctx.deferredYield = false
+		// The private root is already queued and signaled. Yield only after
+		// restoring the ordinary caller and releasing the native thread lock.
+		Gosched()
+		return s.waitForWork()
+	}
 	// No native episode is running on this context while its driver waits.
 	// Do not retain a completed burst for the lifetime of a parked root.
 	if ctx.selfFrameBurst {
@@ -302,8 +309,8 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
-	if ctx.deferredSleep != nil || ctx.deferredSleepWhen != 0 {
-		throw("runtime: releasing native context with deferred sleep")
+	if ctx.deferredYield || ctx.deferredSleep != nil || ctx.deferredSleepWhen != 0 {
+		throw("runtime: releasing native context with deferred driver work")
 	}
 	// Replace an unused cache only after two consecutive roots requested the
 	// same new chunk family. A single interleaved root keeps the old working
@@ -329,6 +336,23 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	ctx.poolNext = stacklessCoroNativePool.overflow
 	stacklessCoroNativePool.overflow = ctx
 	unlock(&stacklessCoroNativePool.lock)
+}
+
+// yieldStacklessCoroNativeRoot ends an initial private episode before a host
+// yield. Yielding a thread-bound executor could otherwise require a new M for
+// every runnable public root. The ordinary driver consumes the queued wake.
+func yieldStacklessCoroNativeRoot(s *stacklessCoroScheduler, task *stacklessCoroTask) bool {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.executor != gp || !ctx.public {
+		Gosched()
+		return false
+	}
+	task.context.scheduler = nil
+	s.yield(task, false)
+	ctx.deferredYield = true
+	s.signal()
+	return true
 }
 
 // clearStacklessCoroNativePayloadCache drops only idle typed storage. The
@@ -603,7 +627,9 @@ func newStacklessCoroNativeContext() *stacklessCoroNativeContext {
 	ctx := new(stacklessCoroNativeContext)
 	ctx.gState.native = unsafe.Pointer(ctx)
 
-	schedulerG := malg(stacklessCoroSchedulerSize)
+	// This stack runs g0 runtime work; the executor keeps the OS thread stack.
+	// Match allocm's Go-allocated g0 size, including its instrumentation guard.
+	schedulerG := malg(16384 * sys.StackGuardMultiplier)
 	schedulerG.stackguard1 = schedulerG.stackguard0
 	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
 	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
