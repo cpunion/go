@@ -7,6 +7,8 @@
 package runtime
 
 import (
+	"internal/abi"
+	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -73,9 +75,9 @@ func stacklessCoroNativeSelfFrameCacheBytes(ctx *stacklessCoroNativeContext) uin
 func StacklessCoroNativePoolSelfFrameCacheForTest() (warm, overflow,
 	perContextLimit, chunkLimit uintptr) {
 	chunkLimit = stacklessCoroSelfFrameChunkCacheSize
-	perContextLimit = stacklessCoroSelfFrameChunkCacheSize +
+	perContextLimit = stacklessCoroSelfFrameBurstCacheSize +
 		stacklessCoroFrameChunkDirectCount*
-			(stacklessCoroSelfFrameChunkCacheSize/stacklessCoroLargeFrameChunkSize)
+			(stacklessCoroSelfFrameBurstCacheSize/stacklessCoroLargeFrameChunkSize)
 	for i := range stacklessCoroNativePool.slots {
 		slot := &stacklessCoroNativePool.slots[i]
 		for {
@@ -183,4 +185,53 @@ func stacklessCoroTaskListLen(task *stacklessCoroTask) int {
 
 func WriteStacklessCoroNativeForTest(fd int, value byte) int {
 	return int(write(uintptr(fd), unsafe.Pointer(&value), 1))
+}
+
+// Construct typed idle caches on eight independently acquired executors. This
+// exercises the real warm/overflow release and GC hooks without scheduler
+// timing determining how many roots happen to overlap.
+func StacklessCoroNativeBurstContextsForTest(oversized bool) (before, first, second, overflow, limit uintptr) {
+	StacklessCoroClearNativeTaskCachesForTest()
+	contexts := [2 * stacklessCoroWarmExecutorCount]*stacklessCoroNativeContext{}
+	for i := range contexts {
+		contexts[i] = acquireStacklessCoroNativeContext()
+	}
+	for _, ctx := range contexts {
+		var typ *_type
+		var frameSize uintptr
+		if oversized {
+			typ = abi.TypeFor[[4]struct {
+				Header stacklessCoroFusedFrameHeader
+				Data   [70000]byte
+			}]()
+		} else {
+			typ = abi.TypeFor[[4]struct {
+				Header stacklessCoroFusedFrameHeader
+				Data   [5120]byte
+			}]()
+		}
+		frameSize = typ.Size_ / 4
+		class := roundupsize(typ.Size_, false)
+		if typ.Size_ > gc.MinSizeForMallocHeader {
+			class += gc.MallocHeaderSize
+		}
+		ctx.selfFrameSize = frameSize
+		ctx.selfFrameChunkSize = class
+		ctx.selfFrameChunkType = typ
+		for n := uintptr(0); n < stacklessCoroSelfFrameChunkBudget(frameSize)/class; n++ {
+			p := mallocgc(typ.Size_, typ, true)
+			(*stacklessCoroFusedFrameHeader)(p).parent = ctx.selfFrameChunks
+			ctx.selfFrameChunks = p
+			ctx.selfFrameChunkCount++
+		}
+		releaseStacklessCoroNativeContext(ctx)
+	}
+	contexts = [2 * stacklessCoroWarmExecutorCount]*stacklessCoroNativeContext{}
+	before, overflow, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	GC()
+	first, _, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	GC()
+	second, _, _, _ = StacklessCoroNativePoolSelfFrameCacheForTest()
+	limit = stacklessCoroWarmExecutorCount * stacklessCoroSelfFrameChunkCacheSize
+	return
 }
