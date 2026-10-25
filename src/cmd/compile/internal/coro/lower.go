@@ -1192,11 +1192,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	// Ordinary aggregate calls can introduce ABI temporaries after frame
 	// planning, including before a range or inside its body. Bound their
-	// combined transfer size conservatively; native factory and typed foreign
-	// calls already have frame-owned transfers. This does not prove arbitrary
-	// callees' fixed-stack requirements.
+	// combined transfer size conservatively. Native factories also receive
+	// by-value arguments through the Go ABI, which can materialize aggregate
+	// temporaries in the caller's resume even though results are frame-owned.
+	// Typed foreign calls already have frame-owned transfers. This does not
+	// prove arbitrary callees' fixed-stack requirements.
 	const aggregateTransferBudget = abi.StackNosplitBase / 8
-	var aggregateBytes, assertionBytes int64
+	var aggregateBytes, nativeArgumentBytes, assertionBytes int64
 	ir.Visit(fn, func(node ir.Node) {
 		// Walk/SSA may materialize aggregate assertion results on the
 		// stack after typed frame planning, including parallel and
@@ -1211,28 +1213,36 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		}
 
 		call, ok := node.(*ir.CallExpr)
-		if !ok || candidate.transitions[call] != SiteInvalid ||
-			call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
+		if !ok || call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
 			return
 		}
 		if _, foreign := candidate.foreignCalls[call]; foreign {
 			return
 		}
 		signature := call.Fun.Type()
-		for _, fields := range [][]*types.Field{signature.RecvParams(), signature.Results()} {
+		transfers := [][]*types.Field{signature.RecvParams(), signature.Results()}
+		bytes := &aggregateBytes
+		if candidate.transitions[call] != SiteInvalid {
+			transfers = transfers[:1]
+			bytes = &nativeArgumentBytes
+		}
+		for _, fields := range transfers {
 			for _, field := range fields {
-				if aggregateBytes > aggregateTransferBudget {
+				if *bytes > aggregateTransferBudget {
 					return
 				}
 				if typ := field.Type; typ.IsArray() || typ.IsStruct() {
 					types.CalcSize(typ)
-					aggregateBytes += typ.Size()
+					*bytes += typ.Size()
 				}
 			}
 		}
 	})
 	if aggregateBytes > aggregateTransferBudget {
 		return nil, fmt.Errorf("ordinary aggregate call exceeds stack transfer budget")
+	}
+	if nativeArgumentBytes > aggregateTransferBudget-aggregateBytes {
+		return nil, fmt.Errorf("native aggregate call exceeds stack transfer budget")
 	}
 	if assertionBytes > aggregateTransferBudget {
 		return nil, fmt.Errorf("aggregate type assertion exceeds stack transfer budget")
