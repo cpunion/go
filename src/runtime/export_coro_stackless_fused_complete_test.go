@@ -16,8 +16,8 @@ func CheckStacklessCoroUncachedFusedCompletionForTest(runnable,
 	childResume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
 		return stacklessCoroActionComplete
 	})
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.resume = childResume
 	task.state = stacklessCoroTaskRunning

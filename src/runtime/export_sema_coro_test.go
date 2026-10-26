@@ -37,7 +37,7 @@ func SemacquireMutexStacklessCoroForTest(ctx unsafe.Pointer, addr *uint32,
 // ready acquisition so allocation measurements do not include root entry.
 func NewStacklessCoroSemaphoreContextForTest() unsafe.Pointer {
 	task := new(stacklessCoroTask)
-	task.context.scheduler = new(stacklessCoroScheduler)
+	task.context.scheduler = newStacklessCoroTestScheduler()
 	return unsafe.Pointer(&task.context)
 }
 

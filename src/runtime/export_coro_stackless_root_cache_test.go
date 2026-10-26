@@ -9,7 +9,7 @@ package runtime
 import "unsafe"
 
 func CheckStacklessCoroRootCacheOwnershipForTest() bool {
-	s := new(stacklessCoroScheduler)
+	s := newStacklessCoroTestScheduler()
 	s.root.setFlag(stacklessCoroTaskCacheFrame, true)
 	s.root.frameSize = 16
 	s.root.context.frame = unsafe.Pointer(new([16]byte))

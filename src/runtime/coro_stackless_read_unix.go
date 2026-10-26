@@ -22,7 +22,7 @@ var stacklessCoroReadPool struct {
 }
 
 func init() {
-	lockInit(&stacklessCoroReadPool.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroReadPool.lock, lockRankStacklessCoro)
 }
 
 func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {

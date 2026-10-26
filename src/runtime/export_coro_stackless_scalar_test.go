@@ -9,11 +9,12 @@ package runtime
 import "unsafe"
 
 func newScalarFrameSchedulerForTest() (*stacklessCoroScheduler, stacklessCoroResume) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		cachedFrameTasks: stacklessCoroTaskCacheSize,
 		cachedFrameBytes: 4 * stacklessCoroTaskCacheSize,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.context.scheduler = s
 	s.root.state = stacklessCoroTaskRunning
 	s.root.resuming = true

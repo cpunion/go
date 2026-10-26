@@ -10,8 +10,8 @@ import "unsafe"
 
 func CheckStacklessCoroLocalFusedRequestForTest(chunkCompatible,
 	fusedParent, runnable, locked bool) bool {
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.state = stacklessCoroTaskRunning
 	task.resuming = true

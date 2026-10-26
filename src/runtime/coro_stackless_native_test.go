@@ -699,6 +699,9 @@ func testStacklessCoroNativeBlockingProgress(t *testing.T, workers int) {
 }
 
 func TestStacklessCoroNativePreemption(t *testing.T) {
+	if runtime.StacklessCoroAsyncPreemptOffForTest() {
+		t.Skip("asynchronous preemption explicitly disabled")
+	}
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
 

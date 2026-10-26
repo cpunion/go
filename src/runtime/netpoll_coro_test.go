@@ -21,6 +21,12 @@ func TestStacklessCoroNetpollReadyAccounting(t *testing.T) {
 		cmd := testenv.CleanCmdEnv(testenv.Command(t, testenv.Executable(t),
 			"-test.run=^TestStacklessCoroNetpollReadyAccounting$"))
 		cmd.Env = append(cmd.Env, child+"=1")
+		// Keep explicitly requested runtime diagnostics in the isolated
+		// probe, including the preemption mode used by static lock ranking.
+		// CleanCmdEnv otherwise removes GODEBUG from the child.
+		if debug := os.Getenv("GODEBUG"); debug != "" {
+			cmd.Env = append(cmd.Env, "GODEBUG="+debug)
+		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("netpoll accounting subprocess: %v\n%s", err, out)
 		}

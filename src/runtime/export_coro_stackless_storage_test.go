@@ -10,10 +10,12 @@ import "unsafe"
 
 func CheckStacklessCoroPlainStorageForTest() bool {
 	op := new(stacklessCoroOperation)
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeOperations:     op,
 		freeOperationCount: 1,
 	}
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.context.scheduler = s
 	task.state = stacklessCoroTaskRunning

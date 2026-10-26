@@ -65,8 +65,8 @@ func CheckStacklessCoroLocalFusedTakeForTest(element int, shortChunk,
 	if shortChunk {
 		header.marker |= stacklessCoroFusedFrameShortChunk
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.resume = parentResume
 	task.state = stacklessCoroTaskRunning
