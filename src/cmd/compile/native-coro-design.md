@@ -1467,10 +1467,41 @@ reusing an I/O operation that has none. Completion balances timer-channel
 bookkeeping while the queued waiter's channel is still available, then clears
 its owner and channel before caching the operation; the common channel path
 has already cleared the element. Select waiters keep their existing per-case
-ownership and cleanup. Removing duplicate operation-state pointers reduces
+ownership and cleanup. Removing duplicate operation-state pointers reduced
 the measured 64-bit common/channel/I/O structures from 96/208/184 to
 80/192/168 bytes; task sizes, cache bounds, and continuation ABI remain
 unchanged.
+
+Ordinary 64-bit builds now keep the optional I/O, timer, and select pointers
+behind one typed resource-header pointer. A channel-only operation needs no
+resource header: its common record is 64 bytes and its coallocated waiter
+record is 176 bytes, down from 80 and 192. The first I/O allocation coallocates
+the header and payload beside the operation. Its logical size grows from 168
+to 176 bytes but its allocator class remains 176 bytes. A first timer or select
+payload similarly carries the header, preserving the ordinary first-use
+allocation count and total allocator classes. Source-kind changes retain the
+existing payload pointers and cleared storage. On 32-bit targets the three
+resource pointers remain inline; common/channel/I/O layouts remain 44/112/100
+bytes. Cache capacities, task layout, pointer typing, and continuation ABI are
+unchanged.
+
+Completion first validates that queue links and wait flags are empty, then
+clears the remaining source-owned fields. Optional I/O storage is loaded once
+and stays rooted while its payload is cleared. It does not recover a stable
+scheduler owner from the task's temporarily attached execution context.
+
+Timer generation wrap still creates a distinct timer, preserving full-width
+generations and rejecting old callbacks. If that timer originally shared an
+allocation with the retained resource header, replacement moves the header
+with the new timer and keeps its I/O and select pointers. A heap-allocation
+identity query is limited to this overflow path; pointers are not tagged.
+This prevents the operation from retaining the obsolete timer payload through
+its header. In ordinary 64-bit builds the replacement allocates 144 rather
+than 128 bytes in that rare case, while its retained operation/resource graph
+remains 208 bytes after old references are released. An I/O-origin header
+stays in place and the corresponding graph remains 304 bytes. Tests force
+repeated wrap for both header origins and check pointer identity, resource
+preservation, and GC behavior.
 
 A blocked logical select owns one operation record, one atomic arbitration
 bit, and one `sudog` per non-nil case. The waiters enter the existing channel
