@@ -222,11 +222,12 @@ func stacklessCoroNativeReplacementDrainResume(unsafe.Pointer) uint8 {
 }
 
 func StacklessCoroNativeReplacementDrainForTest() (runs int, native bool) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
 		liveSpawns: 2,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.state = stacklessCoroTaskWaiting
 	s.executorCount.Store(2)
 	s.executorState.Store(stacklessCoroExecutorStateRunning)
@@ -365,7 +366,9 @@ func StacklessCoroNativeBurstParkForTest() (before, after uintptr, reserved uint
 		ctx.selfFrameChunkCount++
 	}
 	before = stacklessCoroNativeSelfFrameCacheBytes(ctx)
-	s := &stacklessCoroScheduler{wake: make(chan struct{}, 1)}
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{wake: make(chan struct{}, 1)}
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.wake <- struct{}{}
 	driver := stacklessCoroNativeDriver{context: ctx}
 	driver.waitForWork(s)
@@ -424,7 +427,9 @@ func StacklessCoroNativeParkRoundTripForTest() *StacklessCoroNativeParkRoundTrip
 	ctx.selfFrameChunkSize = roundupsize(typ.Size_, false) + gc.MallocHeaderSize
 	ctx.selfFrameChunks = mallocgc(typ.Size_, typ, true)
 	ctx.selfFrameChunkCount = 1
-	return &StacklessCoroNativeParkRoundTrip{driver: stacklessCoroNativeDriver{context: ctx}, scheduler: &stacklessCoroScheduler{wake: make(chan struct{}, 1)}}
+	scheduler := newStacklessCoroTestScheduler()
+	scheduler.wake = make(chan struct{}, 1)
+	return &StacklessCoroNativeParkRoundTrip{driver: stacklessCoroNativeDriver{context: ctx}, scheduler: scheduler}
 }
 func (r *StacklessCoroNativeParkRoundTrip) Wait() {
 	r.scheduler.wake <- struct{}{}
@@ -433,4 +438,8 @@ func (r *StacklessCoroNativeParkRoundTrip) Wait() {
 func (r *StacklessCoroNativeParkRoundTrip) Close() {
 	clearStacklessCoroNativePayloadCache(r.driver.context)
 	releaseStacklessCoroNativeContext(r.driver.context)
+}
+
+func StacklessCoroAsyncPreemptOffForTest() bool {
+	return debug.asyncpreemptoff != 0
 }

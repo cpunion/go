@@ -29,7 +29,7 @@ jobs:
   focused:
     name: Focused (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -116,6 +116,24 @@ jobs:
           GO111MODULE: off
           GOEXPERIMENT: coro
         run: ./check.bash "$GITHUB_WORKSPACE" "$RUNNER_TEMP/corobench"
+
+      - name: Test coroutine heap-link lock ranks
+        env:
+          GOEXPERIMENT: coro,staticlockranking
+          GODEBUG: asyncpreemptoff=1
+          GOGC: 1
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/corobench/static-lockrank"
+          mkdir -p "$out"
+          ./bin/go test -c -o "$out/runtime.test" runtime
+          ./bin/go version -m "$out/runtime.test" > "$out/version.txt"
+          pattern='^TestStacklessCoro(WriteBarrierLockRanks|FrameCache|NetpollReadyAccounting|SchedulerSize|OperationSize|TaskSize|IOOriginImmediateChannel|ChannelImmediateWaiterCleanup|ChannelOperationRootingModes|Native(PoolGrowthAndReuse|SchedulerDescriptorReuse|SchedulerRuntimeWork))$'
+          for procs in 1 4; do
+            GOMAXPROCS=$procs "$out/runtime.test" -test.v -test.run="$pattern" \
+              -test.count=10 -test.timeout=10m > "$out/p$procs.log" 2>&1
+            cat "$out/p$procs.log"
+          done
 
       - name: Upload coroutine architecture probe audit
         if: always()

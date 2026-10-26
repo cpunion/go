@@ -1153,6 +1153,9 @@ func TestStacklessCoroSchedulerSize(t *testing.T) {
 	if ptrSize == 4 {
 		want = 124
 	}
+	// Static lock ranking adds diagnostic metadata to the mutex; the
+	// ordinary scheduler layout retains its separate fixed-size budget.
+	want += unsafe.Sizeof(runtime.Mutex{}) - ptrSize
 	if got := runtime.StacklessCoroSchedulerSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine scheduler size = %d, want %d", got, want)
 	}

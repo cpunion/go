@@ -25,8 +25,8 @@ func CheckStacklessCoroLocalFusedAwaitForTest(allocation uint8,
 		parent.marker |= stacklessCoroFusedFrameShortChunk
 	}
 	child := new(stacklessCoroFusedResumeFrameHeader)
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.resume = parentResume
 	task.state = stacklessCoroTaskRunning

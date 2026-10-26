@@ -118,7 +118,7 @@ var stacklessCoroNativePool struct {
 }
 
 func init() {
-	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroNativePool.lock, lockRankStacklessCoro)
 	stacklessCoroNativeSchedulerDescriptors.free.Store(^uint64(0))
 }
 

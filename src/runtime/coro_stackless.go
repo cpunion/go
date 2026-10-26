@@ -490,9 +490,9 @@ var stacklessCoroRootFrameCache struct {
 }
 
 func init() {
-	lockInit(&stacklessCoroOperations.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroOperations.lock, lockRankStacklessCoro)
 	stacklessCoroOperations.registry = new(stacklessCoroOperationRegistry)
-	lockInit(&stacklessCoroSharedOperations.lock, lockRankLeafRank)
+	lockInit(&stacklessCoroSharedOperations.lock, lockRankStacklessCoro)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
@@ -619,7 +619,7 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 		s.wake = acquireStacklessCoroWake()
 	}
 	s.executorCount.Store(1)
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	root := &s.root
 	root.resume = resume
 	root.context.frame = frame

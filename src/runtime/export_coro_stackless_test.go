@@ -130,10 +130,11 @@ func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 
 func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.resume = resume
 	s.root.context.frame = frame
 	s.ready(&s.root, false)
@@ -142,11 +143,12 @@ func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 }
 
 func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
 		liveSpawns: 1,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.resume = root
 	s.ready(&s.root, false)
 	s.ready(&stacklessCoroTask{resume: detached}, false)
@@ -340,8 +342,8 @@ func CheckStacklessCoroPlainParentFusedAwaitForTest() bool {
 	childResume := stacklessCoroResume(func(unsafe.Pointer) uint8 {
 		return stacklessCoroActionComplete
 	})
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	parent := &s.root
 	parent.resume = parentResume
 	parent.state = stacklessCoroTaskRunning
@@ -451,7 +453,7 @@ func StacklessCoroAdaptiveFrameChunkMarkersForTest() bool {
 	} {
 		parent := &stacklessCoroTask{resume: resume, frameSize: test.marker}
 		task := &stacklessCoroTask{resume: resume}
-		s := new(stacklessCoroScheduler)
+		s := newStacklessCoroTestScheduler()
 		s.markUncachedFrameLineageLocked(task, parent,
 			unsafe.Pointer(new(byte)))
 		if task.frameSize != test.want {
@@ -501,12 +503,14 @@ func DeferGoexitStacklessCoroForTest(token unsafe.Pointer) {
 func StacklessCoroDeferOutcomeErrorsForTest() []string {
 	check := func(state stacklessCoroTaskState,
 		terminal stacklessCoroTerminalKind, hasValue bool) string {
-		s := &stacklessCoroScheduler{
+		s := newStacklessCoroTestScheduler()
+		*s = stacklessCoroScheduler{
 			root: stacklessCoroTask{
 				state:    state,
 				terminal: terminal,
 			},
 		}
+		lockInit(&s.lock, lockRankStacklessCoro)
 		root := &s.root
 		if hasValue {
 			s.terminalValues = map[*stacklessCoroTask]any{root: "panic"}
@@ -577,7 +581,7 @@ func StacklessCoroChannelOperationClearedForTest(token unsafe.Pointer) bool {
 }
 
 func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
-	s := new(stacklessCoroScheduler)
+	s := newStacklessCoroTestScheduler()
 	task := &s.root
 	task.context.scheduler = s
 	start := func(kind stacklessCoroOperationKind) *stacklessCoroOperation {
@@ -737,7 +741,7 @@ func StacklessCoroFrameChunkMarkerIsolationForTest() bool {
 		resume: first, frameSize: stacklessCoroFrameChunkDirectFirst,
 	}
 	task := &stacklessCoroTask{resume: second}
-	s := new(stacklessCoroScheduler)
+	s := newStacklessCoroTestScheduler()
 	s.markUncachedFrameLineageLocked(task, parent,
 		unsafe.Pointer(new(byte)))
 	return task.frameSize == stacklessCoroUncachedFrameLineage
@@ -760,10 +764,11 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
 	first.next = second
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		reservedTasks: first, cachedFrameTasks: 2, cachedFrameBytes: 2,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	s.cancelReservedFrameTasksLocked(firstParent)
 	recycled := s.freeTasks == first && s.freePlainTaskCount == 1
@@ -791,11 +796,12 @@ func StacklessCoroPreferPlainTaskForTest() bool {
 	}
 	plain := new(stacklessCoroTask)
 	cached.next = plain
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks: cached, freePlainTaskCount: 1, freeFrameBytes: 1,
 		cachedFrameTasks: 1, cachedFrameBytes: 1,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	got := s.newTaskLocked(nil, resume, nil)
 	valid := got == plain && s.freeTasks == cached && cached.next == nil &&
@@ -810,10 +816,11 @@ func StacklessCoroUncachedTaskNotRecycledForTest() bool {
 		state:     stacklessCoroTaskComplete,
 		frameSize: stacklessCoroUncachedFrameLineage,
 	}
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		cachedFrameTasks: stacklessCoroTaskCacheSize - 1,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	s.recycleTaskLocked(task)
 	valid := s.freeTasks == nil && s.freePlainTaskCount == 0 &&
@@ -830,11 +837,12 @@ func StacklessCoroOverflowTaskIsolationForTest() bool {
 		flags:     stacklessCoroTaskFreeChunk,
 		frameSize: stacklessCoroFreeOverflowTask,
 	}
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks:          overflow,
 		overflowTaskCounts: 1 << stacklessCoroFreeOverflowTaskCountShift,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	task := s.newTaskLocked(nil, resume, nil)
 	valid := task != overflow && task.frameSize == 0 &&
@@ -869,14 +877,15 @@ func StacklessCoroOverflowTaskSelectionForTest() bool {
 	plain := new(stacklessCoroTask)
 	cached.next = overflow
 	overflow.next = plain
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks:          cached,
 		freePlainTaskCount: 1,
 		freeFrameBytes:     frameSize,
 		cachedFrameTasks:   1,
 		overflowTaskCounts: 1 << stacklessCoroFreeOverflowTaskCountShift,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	task := s.newTaskLocked(nil, resume, nil)
 	valid := task == plain && s.freeTasks == cached && cached.next == overflow &&
@@ -890,13 +899,14 @@ func StacklessCoroOverflowTaskSelectionForTest() bool {
 	cached = newCachedTask()
 	overflow = newOverflowTask()
 	cached.next = overflow
-	s = &stacklessCoroScheduler{
+	s = newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks:          cached,
 		freeFrameBytes:     frameSize,
 		cachedFrameTasks:   1,
 		overflowTaskCounts: 1 << stacklessCoroFreeOverflowTaskCountShift,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	parent := &stacklessCoroTask{frameSize: stacklessCoroUncachedFrameLineage}
 	frame := unsafe.Pointer(new(uintptr))
 	lock(&s.lock)
@@ -909,11 +919,12 @@ func StacklessCoroOverflowTaskSelectionForTest() bool {
 	}
 
 	overflow = newOverflowTask()
-	s = &stacklessCoroScheduler{
+	s = newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks:          overflow,
 		overflowTaskCounts: 1 << stacklessCoroFreeOverflowTaskCountShift,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	task = s.newTaskLocked(frame, resume, nil)
 	valid = task != overflow && task.context.frame == frame &&
@@ -942,14 +953,15 @@ func StacklessCoroBatchedTaskSelectionForTest() bool {
 	cached.next = overflow
 	overflow.next = batched
 	batched.next = plain
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks: cached, freePlainTaskCount: 1, freeFrameBytes: frameSize,
 		cachedFrameTasks: 1, cachedFrameBytes: frameSize,
 		overflowTaskCounts: 1<<stacklessCoroFreeOverflowTaskCountShift |
 			stacklessCoroFreeBatchedTaskPresent,
 		batchedTaskCounts: 1 << stacklessCoroFreeBatchedTaskCountShift,
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	lock(&s.lock)
 	first := s.newTaskLocked(nil, resume, nil)
 	second := s.newTaskLocked(nil, resume, nil)
@@ -978,12 +990,14 @@ func StacklessCoroDiscardBatchedTasksForTest() bool {
 	overflow.next = first
 	first.next = plain
 	plain.next = second
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		freeTasks: overflow, freePlainTaskCount: 1,
 		overflowTaskCounts: 1<<stacklessCoroFreeOverflowTaskCountShift |
 			stacklessCoroFreeBatchedTaskPresent,
 		batchedTaskCounts: 2 << stacklessCoroFreeBatchedTaskCountShift,
 	}
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.discardFreeBatchedTasks()
 	return s.freeTasks == overflow && overflow.next == plain && plain.next == nil &&
 		s.freePlainTaskCount == 1 &&
@@ -1044,8 +1058,8 @@ func CheckStacklessCoroSharedOperationPanicForTest() bool {
 	if raceenabled {
 		return true
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	operations := new([stacklessCoroOperationCacheSize]stacklessCoroOperation)
 	for i := range operations {
 		op := &operations[i]
@@ -1406,7 +1420,7 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 		throw("runtime: failed to open coroutine idle-retry descriptor")
 	}
 
-	s := new(stacklessCoroScheduler)
+	s := newStacklessCoroTestScheduler()
 	task := new(stacklessCoroTask)
 	buffer := make([]byte, 1)
 	op := newStacklessCoroIOOperation()
@@ -1719,10 +1733,11 @@ func RootEmbeddedStacklessCoroForTest(ctx unsafe.Pointer) bool {
 
 func newEarlyReadyStacklessCoroForTest() (*stacklessCoroScheduler,
 	*stacklessCoroTask, *stacklessCoroOperation) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root = stacklessCoroTask{
 		state:    stacklessCoroTaskRunning,
 		resuming: true,
@@ -1795,10 +1810,11 @@ func CheckDelayedReadySignalStacklessCoroForTest() bool {
 
 func CheckCompletionHandoffStacklessCoroForTest(parentResuming,
 	ready bool) (direct, pending, parentQueued, readyFirst bool) {
-	s := &stacklessCoroScheduler{
+	s := newStacklessCoroTestScheduler()
+	*s = stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
-	lockInit(&s.lock, lockRankLeafRank)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	parent := &s.root
 	parent.state = stacklessCoroTaskWaiting
 	parent.resuming = parentResuming
@@ -1860,7 +1876,7 @@ func CheckStacklessCoroOperationRegistryForTest() bool {
 }
 
 func CheckStacklessCoroOperationRegistryScanForTest() bool {
-	s := new(stacklessCoroScheduler)
+	s := newStacklessCoroTestScheduler()
 	operations := make([]*stacklessCoroOperation,
 		stacklessCoroIdlePollScanLimit+1)
 	ids := make([]uint64, len(operations))
@@ -1918,8 +1934,8 @@ func FailAsyncStacklessCoroForTest(ctx unsafe.Pointer, result *uint64, errno *ui
 }
 
 func StacklessCoroIOOriginImmediateChannelForTest(kind string) bool {
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankLeafRank)
+	s := newStacklessCoroTestScheduler()
+	lockInit(&s.lock, lockRankStacklessCoro)
 	task := &s.root
 	task.context.scheduler = s
 	task.state = stacklessCoroTaskRunning
@@ -1955,4 +1971,14 @@ func StacklessCoroIOOriginImmediateChannelForTest(kind string) bool {
 	}
 	KeepAlive(s)
 	return valid
+}
+
+// Runtime mutex addresses must stay stable across stack growth. These mock
+// schedulers do not always otherwise escape their test helper's stack.
+//
+//go:noinline
+func newStacklessCoroTestScheduler() *stacklessCoroScheduler {
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankStacklessCoro)
+	return s
 }

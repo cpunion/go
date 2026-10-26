@@ -43,6 +43,10 @@ NONE
 < sysmon
 < scavenge, forcegc, computeMaxProcs, updateMaxProcsG;
 
+# Stackless coroutine queues and pools retain typed heap pointers and may
+# allocate frames or flush write barriers while holding their private locks.
+# These are not leaf locks. They are not acquired by the allocator or GC.
+
 # Defer
 NONE < defer;
 
@@ -61,6 +65,7 @@ NONE < testR, testW;
 NONE < vgetrandom;
 
 NONE < timerSend;
+timerSend < stacklessCoro;
 
 # Scheduler, timers, netpoll
 NONE < allocmW, execW, cpuprof, pollCache, pollDesc, wakeableSleep;
@@ -132,6 +137,7 @@ scavenge
 traceBuf < traceStrings;
 
 # Malloc
+stacklessCoro,
 allg,
   allocmR,
   allp, # procresize
@@ -186,6 +192,7 @@ gscan < stackLarge;
 gscan < hchanLeaf;
 
 # Write barrier
+stacklessCoro,
 defer,
   gscan,
   mspanSpecial,
