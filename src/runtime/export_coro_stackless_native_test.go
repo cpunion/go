@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
@@ -76,12 +77,16 @@ func StacklessCoroNativeSchedulerIdentityForTest() uintptr {
 	return uintptr(unsafe.Pointer(getg().m.g0))
 }
 
+// The caller first quiesces all native-cache users.
 func StacklessCoroNativeSchedulerDescriptorsForTest() (ids []uintptr, limit int, dirty bool) {
 	limit = len(stacklessCoroNativeSchedulerDescriptors.slots)
 	ids = make([]uintptr, 0, limit)
-	lock(&stacklessCoroNativeSchedulerDescriptors.lock)
-	for i := 0; i < stacklessCoroNativeSchedulerDescriptors.count; i++ {
-		gp := stacklessCoroNativeSchedulerDescriptors.slots[i]
+	free := atomic.Load64(&stacklessCoroNativeSchedulerDescriptors.free)
+	for i := range stacklessCoroNativeSchedulerDescriptors.slots {
+		if free&(uint64(1)<<uint(i)) == 0 {
+			continue
+		}
+		gp := &stacklessCoroNativeSchedulerDescriptors.slots[i]
 		ids = append(ids, uintptr(unsafe.Pointer(gp)))
 		if gp.stack != (stack{}) || gp.m != nil || gp.stackguard0 != 0 ||
 			gp.stackguard1 != 0 || gp.sched != (gobuf{}) || gp.param != nil ||
@@ -89,8 +94,14 @@ func StacklessCoroNativeSchedulerDescriptorsForTest() (ids []uintptr, limit int,
 			dirty = true
 		}
 	}
-	unlock(&stacklessCoroNativeSchedulerDescriptors.lock)
 	return
+}
+func StacklessCoroNativeSchedulerDescriptorStaticForTest(id uintptr) bool {
+	base := uintptr(unsafe.Pointer(&stacklessCoroNativeSchedulerDescriptors.slots[0]))
+	return id >= base && id < base+unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots) && (id-base)%unsafe.Sizeof(g{}) == 0
+}
+func StacklessCoroNativeSchedulerDescriptorStorageForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots)
 }
 
 func StacklessCoroDeferSleepOutsideExecutorForTest() bool {

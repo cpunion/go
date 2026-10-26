@@ -291,13 +291,23 @@ warm contexts and four shared idle slots retain replacement scheduler stacks.
 Additional idle stacks return to the runtime stack allocator on the current
 M's system stack, including instrumentation bookkeeping.
 
-Releasing an overflow stack may retain its empty scheduler G descriptor in a
-separate cache of at most 64 entries. These entries own no stack, M link, or
-saved registers. Resumption allocates a scheduler stack with the same size,
-guard, bottom-word initialization, and instrumentation registration as a fresh
-descriptor. This avoids allocating another G descriptor for each repeated
-concurrent wave without retaining a scheduler stack per peak context. The
-four warm-context and four shared idle-stack limits remain unchanged.
+A typed global pool supplies up to 64 scheduler G descriptors, as the runtime's
+ordinary global `g0` does. A free bit claims one descriptor; active stacks and
+retained idle stacks consume slots from the same pool. When all slots are in
+use, construction uses an ordinary heap G descriptor. Returning an overflow
+stack clears its guards, instrumentation identifier, and saved `gobuf` before
+publishing a global descriptor's free bit; a heap descriptor is left to GC.
+Resumption initializes a stack with the same size, guards, bottom word, and
+instrumentation registration as a fresh descriptor.
+
+Fixed descriptor storage costs `64*sizeof(g)` even when no descriptor is in
+use (29 KiB on the measured Darwin/arm64 build). Go heap counters exclude this
+global storage, so allocation traffic, retained heap, fixed metadata, and
+process RSS must be reported separately. This avoids repeated descriptor
+allocation without retaining a scheduler stack per peak context. The four
+warm-context and four shared idle-stack limits remain unchanged. Empty global
+descriptors have no stack, M link, or saved registers, and active identities
+remain distinct even when a wave exceeds the fixed pool capacity.
 
 When an initial private root must let ordinary goroutines run, it first queues
 its logical task and ends the native episode. The ordinary driver then calls

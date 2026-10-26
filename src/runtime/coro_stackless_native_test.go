@@ -131,7 +131,7 @@ func TestStacklessCoroNativeInitialYieldThreads(t *testing.T) {
 }
 
 func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
-	const roots = 16
+	const roots = 96
 	run := func() int {
 		var wg sync.WaitGroup
 		started := make(chan uintptr, roots)
@@ -236,7 +236,13 @@ func TestStacklessCoroNativeSchedulerDescriptorReuse(t *testing.T) {
 		wg.Wait()
 		return ids
 	}
-	run(64)
+	first := run(64)
+	for id := range first {
+		if !runtime.StacklessCoroNativeSchedulerDescriptorStaticForTest(id) {
+			t.Fatalf("64 active episodes used heap descriptor %#x", id)
+		}
+	}
+	t.Logf("fixed descriptor storage=%d bytes", runtime.StacklessCoroNativeSchedulerDescriptorStorageForTest())
 	cached, limit, dirty := runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
 	if len(cached) == 0 || len(cached) > limit || dirty {
 		t.Fatalf("empty descriptors: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
@@ -249,9 +255,18 @@ func TestStacklessCoroNativeSchedulerDescriptorReuse(t *testing.T) {
 			t.Errorf("cached descriptor %#x was not reused", id)
 		}
 	}
-	run(96)
+	overflowIDs := run(96)
+	static := 0
+	for id := range overflowIDs {
+		if runtime.StacklessCoroNativeSchedulerDescriptorStaticForTest(id) {
+			static++
+		}
+	}
+	if static != 64 {
+		t.Fatalf("96 active episodes used %d fixed descriptors, want64", static)
+	}
 	cached, limit, dirty = runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
-	if len(cached) != limit || dirty {
+	if len(cached) < limit-8 || len(cached) > limit || dirty {
 		t.Fatalf("bounded descriptor overflow: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
 	}
 	warm, overflow, idle := runtime.StacklessCoroNativePoolSchedulerStacksForTest()

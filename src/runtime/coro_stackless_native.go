@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	// Descriptors contain no stack or suspended activation. Bound their
-	// separate reuse cache without expanding the idle scheduler-stack budget.
+	// Bound total fixed descriptor storage. Active and idle-stack holders
+	// consume slots from the same pool; overflow descriptors are heap allocated.
 	stacklessCoroSchedulerDescriptorCacheSize = 64
 
 	stacklessCoroSelfFrameChunkCacheSize = 256 << 10
@@ -98,10 +98,14 @@ var stacklessCoroNativeParkedCaches [stacklessCoroWarmExecutorCount]atomic.Point
 // separate bounded pool serves contexts resuming after an ordinary wait.
 var stacklessCoroNativeSchedulerStacks [stacklessCoroWarmExecutorCount]atomic.Pointer[g]
 
+// Native scheduler Gs carry no goroutine activation while free. As with
+// runtime's global g0, fixed descriptor storage is a typed global GC root.
+// The64 descriptors serve active and retained idle stacks as well as empty
+// slots; overflow uses ordinary heap descriptors. A free bit owns its G until
+// stack initialization, and is published only after all saved state is cleared.
 var stacklessCoroNativeSchedulerDescriptors struct {
-	lock  mutex
-	count int
-	slots [stacklessCoroSchedulerDescriptorCacheSize]*g
+	free  uint64
+	slots [stacklessCoroSchedulerDescriptorCacheSize]g
 }
 
 var stacklessCoroNativePool struct {
@@ -115,7 +119,7 @@ var stacklessCoroNativePool struct {
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
-	lockInit(&stacklessCoroNativeSchedulerDescriptors.lock, lockRankLeafRank)
+	atomic.Store64(&stacklessCoroNativeSchedulerDescriptors.free, ^uint64(0))
 }
 
 // run drives one episode on a fixed portion of the current operating system
@@ -671,15 +675,24 @@ func acquireStacklessCoroNativeSchedulerStack() *g {
 			return gp
 		}
 	}
+	return newStacklessCoroNativeSchedulerStack()
+}
+
+// Keep empty-descriptor acquisition and stack initialization off the shared-stack fast path.
+func newStacklessCoroNativeSchedulerStack() *g {
 	var schedulerG *g
-	lock(&stacklessCoroNativeSchedulerDescriptors.lock)
-	if stacklessCoroNativeSchedulerDescriptors.count != 0 {
-		stacklessCoroNativeSchedulerDescriptors.count--
-		slot := &stacklessCoroNativeSchedulerDescriptors.slots[stacklessCoroNativeSchedulerDescriptors.count]
-		schedulerG = *slot
-		*slot = nil
+	for {
+		free := atomic.Load64(&stacklessCoroNativeSchedulerDescriptors.free)
+		if free == 0 {
+			break
+		}
+		i := sys.TrailingZeros64(free)
+		bit := uint64(1) << uint(i)
+		if atomic.Cas64(&stacklessCoroNativeSchedulerDescriptors.free, free, free&^bit) {
+			schedulerG = &stacklessCoroNativeSchedulerDescriptors.slots[i]
+			break
+		}
 	}
-	unlock(&stacklessCoroNativeSchedulerDescriptors.lock)
 	if schedulerG == nil {
 		schedulerG = new(g)
 	}
@@ -730,12 +743,13 @@ func releaseStacklessCoroNativeSchedulerStack(ctx *stacklessCoroNativeContext) {
 	// Keep no saved registers or heap funcval from the finished activation.
 	// The next borrower allocates a stack before installing this G as m.g0.
 	gp.sched = gobuf{}
-	lock(&stacklessCoroNativeSchedulerDescriptors.lock)
-	if stacklessCoroNativeSchedulerDescriptors.count < len(stacklessCoroNativeSchedulerDescriptors.slots) {
-		stacklessCoroNativeSchedulerDescriptors.slots[stacklessCoroNativeSchedulerDescriptors.count] = gp
-		stacklessCoroNativeSchedulerDescriptors.count++
+	base := uintptr(unsafe.Pointer(&stacklessCoroNativeSchedulerDescriptors.slots[0]))
+	addr := uintptr(unsafe.Pointer(gp))
+	if addr >= base && addr < base+unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots) {
+		i := (addr - base) / unsafe.Sizeof(g{})
+		atomic.Or64(&stacklessCoroNativeSchedulerDescriptors.free, uint64(1)<<uint(i))
 	}
-	unlock(&stacklessCoroNativeSchedulerDescriptors.lock)
+
 }
 
 // coroNativeStart is the mcall continuation that replaces the native g0
