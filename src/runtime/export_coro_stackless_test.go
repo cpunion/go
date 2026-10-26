@@ -560,14 +560,14 @@ func NewStacklessCoroIOOperationForTest() unsafe.Pointer {
 
 func StacklessCoroIOOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
-	return op != nil && op.stacklessCoroIOState != nil && op.waiter == nil &&
-		unsafe.Pointer(op.stacklessCoroIOState) == add(token,
+	return op != nil && op.ioState() != nil && op.waiter == nil &&
+		unsafe.Pointer(op.ioState()) == add(token,
 			unsafe.Offsetof(stacklessCoroIOOperation{}.io))
 }
 
 func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
-	return op != nil && op.stacklessCoroIOState == nil &&
+	return op != nil && op.ioState() == nil &&
 		validReleasedStacklessCoroSudog(op.waiter) &&
 		unsafe.Pointer(op.waiter) == add(token,
 			unsafe.Offsetof(stacklessCoroChannelOperation{}.waiter))
@@ -603,7 +603,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 
 	op = start(stacklessCoroOperationIO)
 	reused = op == first
-	storage := op.stacklessCoroIOState
+	storage := op.ioState()
 	op.id = 1
 	op.fd = 7
 	op.buffer = make([]byte, 8)
@@ -617,7 +617,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	op.pollWrite = true
 	clearStacklessCoroOperation(op)
 	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
-		op.stacklessCoroIOState == storage && storage != nil &&
+		op.ioState() == storage && storage != nil &&
 		op.buffer == nil && op.call == nil && op.n == nil &&
 		op.errno == nil && op.valueOut == nil && op.workNext == nil &&
 		op.packet == [2]uint64{} && op.fd == 0 && !op.async &&
@@ -628,10 +628,10 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	op = start(stacklessCoroOperationPlain)
 	if !raceenabled {
 		reused = reused && op == first
-		cleared = cleared && op.stacklessCoroIOState == storage
+		cleared = cleared && op.ioState() == storage
 	} else {
 		reused = reused || op == first
-		cleared = cleared && op.stacklessCoroIOState == nil
+		cleared = cleared && op.ioState() == nil
 	}
 	op.id = 1
 	clearStacklessCoroOperation(op)
@@ -640,7 +640,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	op = start(stacklessCoroOperationChannel)
 	if !raceenabled {
 		reused = reused && op == first && op.waiter == waiter &&
-			op.stacklessCoroIOState == storage
+			op.ioState() == storage
 	} else {
 		reused = reused || op == first
 	}
@@ -1302,7 +1302,7 @@ func StacklessCoroPollWaitCountForTest() int {
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
 		for op := registry.buckets[index]; op != nil; op = op.next {
-			if op.stacklessCoroIOState == nil || op.async || op.packet[stacklessCoroPollDescWord] == 0 {
+			if op.ioState() == nil || op.async || op.packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
 			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
@@ -1503,16 +1503,60 @@ func StacklessCoroTimerOwnerForTest(token StacklessCoroTimerTokenForTest) unsafe
 	return unsafe.Pointer(token.timer)
 }
 
-func CheckStacklessCoroTimerWrapForTest() bool {
-	op := new(stacklessCoroOperation)
-	first, sequence := op.nextTimer()
-	if sequence != 1 {
-		return false
+//go:noinline
+func newStacklessCoroTimerWrapOperationForTest(ioFirst bool) *stacklessCoroOperation {
+	if ioFirst {
+		return newStacklessCoroIOOperation()
 	}
-	first.sequence = ^uintptr(0)
-	second, sequence := op.nextTimer()
-	return second != first && sequence == 1 && second.operation == op &&
-		op.timer == second
+	return new(stacklessCoroOperation)
+}
+
+func CheckStacklessCoroTimerWrapForTest() bool {
+	for _, ioFirst := range []bool{false, true} {
+		op := newStacklessCoroTimerWrapOperationForTest(ioFirst)
+		first, sequence := op.nextTimer()
+		if sequence != 1 {
+			return false
+		}
+		io := op.ioState()
+		if io == nil {
+			io = new(stacklessCoroIOState)
+			op.stacklessCoroIOState = io
+		}
+		io.buffer = []byte{17}
+		io.valueOut = new(uint64)
+		*io.valueOut = 23
+		selection := new(stacklessCoroSelect)
+		op.selection = selection
+		for round := 0; round < 3; round++ {
+			resources := op.resources()
+			base, _, _ := findObject(uintptr(unsafe.Pointer(first)), 0, 0)
+			if base == 0 {
+				return false
+			}
+			ownsHeader := base == uintptr(unsafe.Pointer(resources))
+			first.sequence = ^uintptr(0)
+			second, sequence := op.nextTimer()
+			if second == first || sequence != 1 || second.operation != op ||
+				op.timer != second || op.ioState() != io || op.selection != selection {
+				return false
+			}
+			if ownsHeader {
+				base, _, _ = findObject(uintptr(unsafe.Pointer(second)), 0, 0)
+				if op.resources() == resources || base != uintptr(unsafe.Pointer(op.resources())) {
+					return false
+				}
+			} else if op.resources() != resources {
+				return false
+			}
+			first = second
+			GC()
+			if io.buffer[0] != 17 || *io.valueOut != 23 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {

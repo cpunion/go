@@ -103,7 +103,7 @@ func (selection *stacklessCoroSelect) clear() {
 // The winning producer finishes the operation after dropping channel locks.
 func stacklessCoroSelectTry(owner unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(owner)
-	if op == nil || !op.selection.active() {
+	if op == nil || !(op.hasResources() && op.selection.active()) {
 		throw("runtime: invalid stackless coroutine select waiter")
 	}
 	return op.selection.done.CompareAndSwap(0, 1)
@@ -206,9 +206,15 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		pollOrder[j] = uint16(i)
 	}
 	op := stacklessCoroStartOperation(ctx, "select")
-	selection := op.selection
+	selection := op.retainedSelection()
 	if selection == nil {
-		selection = new(stacklessCoroSelect)
+		if !op.hasResources() {
+			storage := new(stacklessCoroSelectResources)
+			op.setResources(&storage.resources)
+			selection = &storage.selection
+		} else {
+			selection = new(stacklessCoroSelect)
+		}
 		op.selection = selection
 	}
 	selection.prepare(cases, len(pollOrder), ncases,
@@ -413,12 +419,12 @@ func sortStacklessCoroSelectLocks(cases []scase, pollOrder, lockOrder []uint16) 
 
 func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 	success bool) {
-	if op == nil || winner == nil || !op.selection.active() ||
+	if op == nil || winner == nil || !(op.hasResources() && op.selection.active()) ||
 		op.selection.done.Load() != 1 ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid stackless coroutine select completion")
 	}
-	selection := op.selection
+	selection := op.retainedSelection()
 	chosen := -1
 	for i, waiter := range selection.waiters {
 		if waiter == winner {
@@ -470,7 +476,7 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 
 func completeStacklessCoroSelect(op *stacklessCoroOperation, chosen int,
 	recvOK, sendClosed bool) {
-	if op == nil || !op.selection.active() ||
+	if op == nil || !(op.hasResources() && op.selection.active()) ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid immediate stackless coroutine select completion")
 	}

@@ -320,15 +320,34 @@ type stacklessCoroScheduler struct {
 	foreignReturners atomic.Uint32
 }
 
-// A stacklessCoroOperation retains reusable resources after clearing the state
+// stacklessCoroOperationResources retains reusable resources after clearing the state
 // owned by a completed source. Keeping those resources outside state avoids a
 // transient unrooted pointer while a native executor clears the operation.
-type stacklessCoroOperation struct {
-	stacklessCoroOperationState
+type stacklessCoroOperationResources struct {
 	*stacklessCoroIOState
 	timer     *stacklessCoroTimer
-	waiter    *sudog
 	selection *stacklessCoroSelect
+}
+
+func (op *stacklessCoroOperation) ioState() *stacklessCoroIOState {
+	if !op.hasResources() {
+		return nil
+	}
+	return op.stacklessCoroIOState
+}
+
+func (op *stacklessCoroOperation) retainedTimer() *stacklessCoroTimer {
+	if !op.hasResources() {
+		return nil
+	}
+	return op.timer
+}
+
+func (op *stacklessCoroOperation) retainedSelection() *stacklessCoroSelect {
+	if !op.hasResources() {
+		return nil
+	}
+	return op.selection
 }
 
 // stacklessCoroIOState keeps IO-only fields out of cold channel allocations.
@@ -367,14 +386,48 @@ const (
 // storage without a second heap allocation.
 type stacklessCoroIOOperation struct {
 	operation stacklessCoroOperation
+	resources [stacklessCoroExtraResources]stacklessCoroOperationResources
 	io        stacklessCoroIOState
 }
 
 func newStacklessCoroIOOperation() *stacklessCoroOperation {
 	storage := new(stacklessCoroIOOperation)
 	op := &storage.operation
+	if !op.hasResources() {
+		op.setResources(&storage.resources[:][0])
+	}
 	op.stacklessCoroIOState = &storage.io
 	return op
+}
+
+// A source-kind change adds its first resource header beside the new payload,
+// keeping the allocation count and total allocator classes unchanged.
+type stacklessCoroIOResources struct {
+	resources stacklessCoroOperationResources
+	io        stacklessCoroIOState
+}
+
+func (op *stacklessCoroOperation) ensureIOState() {
+	if op.ioState() != nil {
+		return
+	}
+	if !op.hasResources() {
+		storage := new(stacklessCoroIOResources)
+		op.setResources(&storage.resources)
+		op.stacklessCoroIOState = &storage.io
+	} else {
+		op.stacklessCoroIOState = new(stacklessCoroIOState)
+	}
+}
+
+type stacklessCoroTimerResources struct {
+	resources stacklessCoroOperationResources
+	timer     stacklessCoroTimer
+}
+
+type stacklessCoroSelectResources struct {
+	resources stacklessCoroOperationResources
+	selection stacklessCoroSelect
 }
 
 // stacklessCoroChannelOperation gives a new channel operation its first waiter
@@ -3380,7 +3433,7 @@ func stacklessCoroChannelWaiterRooted(channel *hchan) bool {
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
 	op := (*stacklessCoroOperation)(owner)
-	if op != nil && op.selection.active() {
+	if op != nil && (op.hasResources() && op.selection.active()) {
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
@@ -3448,17 +3501,42 @@ func scheduleStacklessCoroTimer(op *stacklessCoroOperation,
 }
 
 func (op *stacklessCoroOperation) nextTimer() (*stacklessCoroTimer, uintptr) {
-	t := op.timer
+	t := op.retainedTimer()
 	if t != nil && (t.operation != op || t.active.Load() != 0) {
 		throw("runtime: invalid stackless coroutine timer reuse")
 	}
 	if t == nil || t.sequence == ^uintptr(0) {
-		t = &stacklessCoroTimer{operation: op}
+		if t != nil {
+			t = op.replacementTimer(t)
+		} else if !op.hasResources() {
+			storage := new(stacklessCoroTimerResources)
+			op.setResources(&storage.resources)
+			t = &storage.timer
+		} else {
+			t = new(stacklessCoroTimer)
+		}
+		t.operation = op
 		t.timer.init(stacklessCoroTimerReady, t)
 		op.timer = t
 	}
 	t.sequence++
 	return t, t.sequence
+}
+
+func (op *stacklessCoroOperation) replacementTimer(previous *stacklessCoroTimer) *stacklessCoroTimer {
+	resources := op.resources()
+	base, _, _ := findObject(uintptr(unsafe.Pointer(previous)), 0, 0)
+	if base != 0 && base == uintptr(unsafe.Pointer(resources)) {
+		// The first timer owns this header. Move both together so retaining
+		// the header cannot pin a superseded timer after generation wrap.
+		// Allocation identity is queried only on this rare overflow path;
+		// pointers and the full-width timer generation remain unchanged.
+		storage := new(stacklessCoroTimerResources)
+		storage.resources = *resources
+		op.setResources(&storage.resources)
+		return &storage.timer
+	}
+	return new(stacklessCoroTimer)
 }
 
 func cancelStacklessCoroTimer(token stacklessCoroTimerToken) bool {
@@ -3468,7 +3546,7 @@ func cancelStacklessCoroTimer(token stacklessCoroTimerToken) bool {
 		return false
 	}
 	op := t.operation
-	if op == nil || op.timer != t || op.id != uint64(token.sequence) {
+	if op == nil || op.retainedTimer() != t || op.id != uint64(token.sequence) {
 		throw("runtime: canceled stackless coroutine operation is not a timer")
 	}
 	t.timer.stop()
@@ -3711,8 +3789,8 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 			}
 		}
 	}
-	if kind == stacklessCoroOperationIO && op.stacklessCoroIOState == nil {
-		op.stacklessCoroIOState = new(stacklessCoroIOState)
+	if kind == stacklessCoroOperationIO {
+		op.ensureIOState()
 	}
 	op.scheduler = s
 	op.task = task
@@ -3729,17 +3807,31 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 }
 
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
-	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil ||
-		(op.timer != nil && op.timer.active.Load() != 0) ||
-		op.timerWait || op.waiterActive || op.next != nil ||
-		(op.stacklessCoroIOState != nil && op.workNext != nil) {
+	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil {
+		throw("runtime: invalid completed stackless coroutine operation")
+	}
+	var io *stacklessCoroIOState
+	if resources := op.resources(); resources != nil {
+		if resources.timer != nil && resources.timer.active.Load() != 0 {
+			throw("runtime: invalid completed stackless coroutine operation")
+		}
+		io = resources.stacklessCoroIOState
+	}
+	if op.timerWait || op.waiterActive || op.next != nil ||
+		(io != nil && io.workNext != nil) {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	s := op.scheduler
 	task := op.task
-	op.stacklessCoroOperationState = stacklessCoroOperationState{}
-	if op.stacklessCoroIOState != nil {
-		*op.stacklessCoroIOState = stacklessCoroIOState{}
+	// The links and wait flags were validated above. Clear only source
+	// fields that can still be populated, leaving retained resources rooted.
+	op.id = 0
+	op.scheduler = nil
+	op.task = nil
+	op.received = nil
+	op.send = false
+	if io != nil {
+		*io = stacklessCoroIOState{}
 	}
 	return s, task
 }
@@ -4408,7 +4500,7 @@ func stacklessCoroTimerReady(arg any, sequence uintptr, _ int64) {
 		return
 	}
 	op := t.operation
-	if op == nil || op.timer != t || op.id != uint64(sequence) {
+	if op == nil || op.retainedTimer() != t || op.id != uint64(sequence) {
 		throw("runtime: invalid stackless coroutine timer completion")
 	}
 	completeStacklessCoroOperation(op)

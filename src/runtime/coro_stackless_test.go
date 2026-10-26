@@ -1117,9 +1117,9 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := 10 * ptrSize
-	wantChannel := uintptr(192)
-	wantIO := uintptr(168)
+	want := 8 * ptrSize
+	wantChannel := uintptr(176)
+	wantIO := uintptr(176)
 	if ptrSize == 4 {
 		want = 11 * ptrSize
 		wantChannel = 112
