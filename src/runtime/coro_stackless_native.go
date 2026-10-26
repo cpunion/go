@@ -104,7 +104,7 @@ var stacklessCoroNativeSchedulerStacks [stacklessCoroWarmExecutorCount]atomic.Po
 // slots; overflow uses ordinary heap descriptors. A free bit owns its G until
 // stack initialization, and is published only after all saved state is cleared.
 var stacklessCoroNativeSchedulerDescriptors struct {
-	free  uint64
+	free  atomic.Uint64
 	slots [stacklessCoroSchedulerDescriptorCacheSize]g
 }
 
@@ -119,7 +119,7 @@ var stacklessCoroNativePool struct {
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
-	atomic.Store64(&stacklessCoroNativeSchedulerDescriptors.free, ^uint64(0))
+	stacklessCoroNativeSchedulerDescriptors.free.Store(^uint64(0))
 }
 
 // run drives one episode on a fixed portion of the current operating system
@@ -682,13 +682,13 @@ func acquireStacklessCoroNativeSchedulerStack() *g {
 func newStacklessCoroNativeSchedulerStack() *g {
 	var schedulerG *g
 	for {
-		free := atomic.Load64(&stacklessCoroNativeSchedulerDescriptors.free)
+		free := stacklessCoroNativeSchedulerDescriptors.free.Load()
 		if free == 0 {
 			break
 		}
 		i := sys.TrailingZeros64(free)
 		bit := uint64(1) << uint(i)
-		if atomic.Cas64(&stacklessCoroNativeSchedulerDescriptors.free, free, free&^bit) {
+		if stacklessCoroNativeSchedulerDescriptors.free.CompareAndSwap(free, free&^bit) {
 			schedulerG = &stacklessCoroNativeSchedulerDescriptors.slots[i]
 			break
 		}
@@ -747,7 +747,9 @@ func releaseStacklessCoroNativeSchedulerStack(ctx *stacklessCoroNativeContext) {
 	addr := uintptr(unsafe.Pointer(gp))
 	if addr >= base && addr < base+unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots) {
 		i := (addr - base) / unsafe.Sizeof(g{})
-		atomic.Or64(&stacklessCoroNativeSchedulerDescriptors.free, uint64(1)<<uint(i))
+		// Exclusive ownership keeps this bit zero until release, so addition
+		// sets only this bit without carry, including the wrapping high bit.
+		stacklessCoroNativeSchedulerDescriptors.free.Add(int64(uint64(1) << uint(i)))
 	}
 
 }

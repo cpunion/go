@@ -8,7 +8,6 @@ package runtime
 
 import (
 	"internal/abi"
-	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
@@ -81,7 +80,7 @@ func StacklessCoroNativeSchedulerIdentityForTest() uintptr {
 func StacklessCoroNativeSchedulerDescriptorsForTest() (ids []uintptr, limit int, dirty bool) {
 	limit = len(stacklessCoroNativeSchedulerDescriptors.slots)
 	ids = make([]uintptr, 0, limit)
-	free := atomic.Load64(&stacklessCoroNativeSchedulerDescriptors.free)
+	free := stacklessCoroNativeSchedulerDescriptors.free.Load()
 	for i := range stacklessCoroNativeSchedulerDescriptors.slots {
 		if free&(uint64(1)<<uint(i)) == 0 {
 			continue
