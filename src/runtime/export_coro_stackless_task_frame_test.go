@@ -124,6 +124,16 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 	if probe.done.Load() != uint64(root.count) {
 		return stacklessCoroActionYield
 	}
+	// A child publishes its result before its resume call returns. Observe
+	// retirement under the scheduler lock before inspecting task headers;
+	// root completion alone does not join still-retiring spawned tasks.
+	s := (*stacklessCoroContext)(ctx).scheduler
+	lock(&s.lock)
+	live := s.liveSpawns
+	unlock(&s.lock)
+	if live != 0 {
+		return stacklessCoroActionYield
+	}
 	return stacklessCoroActionComplete
 }
 
