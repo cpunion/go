@@ -1459,6 +1459,19 @@ native executor never carries a waiter as its only transient GC root. The
 non-experiment `sudog` extension has zero size and leaves the 64-bit structure
 at 104 bytes; the experiment-only owner pointer makes it 112 bytes.
 
+An ordinary logical channel operation passes its channel and element as
+tracked function arguments through the initial channel decision. It initializes
+its retained waiter's tracked pointers only when queue insertion is necessary;
+ready and closed-channel decisions do not require a waiter, including when
+reusing an I/O operation that has none. Completion balances timer-channel
+bookkeeping while the queued waiter's channel is still available, then clears
+its owner and channel before caching the operation; the common channel path
+has already cleared the element. Select waiters keep their existing per-case
+ownership and cleanup. Removing duplicate operation-state pointers reduces
+the measured 64-bit common/channel/I/O structures from 96/208/184 to
+80/192/168 bytes; task sizes, cache bounds, and continuation ABI remain
+unchanged.
+
 A blocked logical select owns one operation record, one atomic arbitration
 bit, and one `sudog` per non-nil case. The waiters enter the existing channel
 queues in channel-address lock order. The first producer that removes a waiter

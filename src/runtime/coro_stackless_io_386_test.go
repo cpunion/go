@@ -11,10 +11,10 @@ import "unsafe"
 // Check the 32-bit layout even when the test binary can only be cross-compiled.
 // Both bounds must be non-negative, so the sizes must match exactly.
 var (
-	_ [52 - unsafe.Sizeof(stacklessCoroOperation{})]byte
-	_ [unsafe.Sizeof(stacklessCoroOperation{}) - 52]byte
-	_ [120 - unsafe.Sizeof(stacklessCoroChannelOperation{})]byte
-	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - 120]byte
-	_ [108 - unsafe.Sizeof(stacklessCoroIOOperation{})]byte
-	_ [unsafe.Sizeof(stacklessCoroIOOperation{}) - 108]byte
+	_ [44 - unsafe.Sizeof(stacklessCoroOperation{})]byte
+	_ [unsafe.Sizeof(stacklessCoroOperation{}) - 44]byte
+	_ [112 - unsafe.Sizeof(stacklessCoroChannelOperation{})]byte
+	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - 112]byte
+	_ [100 - unsafe.Sizeof(stacklessCoroIOOperation{})]byte
+	_ [unsafe.Sizeof(stacklessCoroIOOperation{}) - 100]byte
 )

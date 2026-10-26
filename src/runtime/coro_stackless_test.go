@@ -1117,13 +1117,13 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := 12 * ptrSize
-	wantChannel := uintptr(208)
-	wantIO := uintptr(184)
+	want := 10 * ptrSize
+	wantChannel := uintptr(192)
+	wantIO := uintptr(168)
 	if ptrSize == 4 {
-		want = 13 * ptrSize
-		wantChannel = 120
-		wantIO = 108
+		want = 11 * ptrSize
+		wantChannel = 112
+		wantIO = 100
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
 		t.Fatalf("stackless coroutine operation size = %d, want %d", got, want)
@@ -4561,6 +4561,54 @@ func TestStacklessCoroChannelOperationRoot(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroChannelImmediateWaiterCleanup(t *testing.T) {
+	for _, kind := range []string{"send", "receive", "closed-receive"} {
+		t.Run(kind, func(t *testing.T) {
+			channel := make(chan int, 1)
+			value, received := 71, false
+			switch kind {
+			case "receive":
+				channel <- 37
+			case "closed-receive":
+				close(channel)
+			}
+			var token unsafe.Pointer
+			state := 0
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				if state == 0 {
+					state++
+					// Bypass the nonblocking fast path to exercise a retained
+					// waiter whose operation completes before queue insertion.
+					if kind == "send" {
+						token = runtime.StartStacklessCoroSendIntForTest(ctx, channel, &value)
+					} else {
+						token = runtime.StartStacklessCoroRecvIntForTest(ctx, channel, &value, &received)
+					}
+					return runtime.StacklessCoroActionWait
+				}
+				if !runtime.StacklessCoroChannelOperationClearedForTest(token) {
+					t.Fatal("immediate operation retained source pointers or active waiter state")
+				}
+				return runtime.StacklessCoroActionComplete
+			})
+			switch kind {
+			case "send":
+				if got := <-channel; got != 71 {
+					t.Fatalf("sent value=%d, want71", got)
+				}
+			case "receive":
+				if value != 37 || !received {
+					t.Fatalf("receive=(%d,%t), want(37,true)", value, received)
+				}
+			case "closed-receive":
+				if value != 0 || received {
+					t.Fatalf("closed receive=(%d,%t), want(0,false)", value, received)
+				}
+			}
+		})
+	}
+}
+
 func TestStacklessCoroChannelOperationRootingModes(t *testing.T) {
 	run := func(t *testing.T, channel any, element unsafe.Pointer,
 		wantRegistered bool, release func()) {
@@ -4570,16 +4618,20 @@ func TestStacklessCoroChannelOperationRootingModes(t *testing.T) {
 		baselineOperations := runtime.StacklessCoroOperationCountForTest()
 		go func() {
 			state := 0
+			var token unsafe.Pointer
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 				switch state {
 				case 0:
 					state = 1
-					runtime.StartStacklessCoroSendForTest(ctx, channel,
+					token = runtime.StartStacklessCoroSendForTest(ctx, channel,
 						element)
 					close(started)
 					return runtime.StacklessCoroActionWait
 				case 1:
 					state = 2
+					if !runtime.StacklessCoroChannelOperationClearedForTest(token) {
+						t.Error("queued operation retained source pointers or active waiter state")
+					}
 					return runtime.StacklessCoroActionComplete
 				default:
 					return runtime.StacklessCoroActionInvalid
@@ -7756,4 +7808,17 @@ func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string, b
 		}
 	}()
 	return done
+}
+
+func TestStacklessCoroIOOriginImmediateChannel(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds do not reuse operation identities")
+	}
+	for _, kind := range []string{"send", "receive", "closed-receive"} {
+		t.Run(kind, func(t *testing.T) {
+			if !runtime.StacklessCoroIOOriginImmediateChannelForTest(kind) {
+				t.Fatal("IO-origin immediate channel lost reuse, payload, cleanup or allocated a waiter")
+			}
+		})
+	}
 }

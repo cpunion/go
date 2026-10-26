@@ -400,8 +400,6 @@ type stacklessCoroOperationState struct {
 	id        uint64
 	scheduler *stacklessCoroScheduler
 	task      *stacklessCoroTask
-	channel   *hchan
-	element   unsafe.Pointer
 	received  *bool
 	send      bool
 	timerWait bool
@@ -3355,8 +3353,6 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
 	op := stacklessCoroStartChannelOperation(ctx)
-	op.channel = channel
-	op.element = element
 	op.received = received
 	op.send = send
 	// A scanned channel retains a queued waiter and its operation directly.
@@ -3367,9 +3363,9 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 		registerStacklessCoroOperation(op)
 	}
 	if send {
-		chansendStackless(op)
+		chansendStackless(op, channel, element)
 	} else {
-		chanrecvStackless(op)
+		chanrecvStackless(op, channel, element)
 	}
 	return op
 }
@@ -3395,14 +3391,16 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid registered stackless coroutine channel completion")
 	}
+	if op.timerWait {
+		// Only a queued timer-channel receive sets timerWait; its producer
+		// passes the retained waiter before its channel pointer is cleared.
+		unblockTimerChan(waiter.c.get())
+		op.timerWait = false
+	}
 	if waiter != nil {
 		waiter.coro.clear()
 		waiter.c.set(nil)
 		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
-	}
-	if op.timerWait {
-		unblockTimerChan(op.channel)
-		op.timerWait = false
 	}
 	send := op.send
 	if !send && op.received != nil {

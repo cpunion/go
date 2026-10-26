@@ -123,8 +123,7 @@ func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
 }
 
 // chansendStackless starts op without parking the executor goroutine.
-func chansendStackless(op *stacklessCoroOperation) {
-	c := op.channel
+func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Pointer) {
 	if c == nil {
 		return
 	}
@@ -144,7 +143,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 		return
 	}
 	if sg := c.recvq.dequeue(); sg != nil {
-		send(c, sg, op.element, func() { unlock(&c.lock) }, 3)
+		send(c, sg, element, func() { unlock(&c.lock) }, 3)
 		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
@@ -153,7 +152,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 		if raceenabled {
 			racenotify(c, c.sendx, nil)
 		}
-		typedmemmove(c.elemtype, qp, op.element)
+		typedmemmove(c.elemtype, qp, element)
 		c.sendx++
 		if c.sendx == c.dataqsiz {
 			c.sendx = 0
@@ -166,7 +165,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 
 	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
-	sg.elem.set(op.element)
+	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
@@ -179,8 +178,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 }
 
 // chanrecvStackless starts op without parking the executor goroutine.
-func chanrecvStackless(op *stacklessCoroOperation) {
-	c := op.channel
+func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Pointer) {
 	if c == nil {
 		return
 	}
@@ -199,14 +197,14 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 				raceacquire(c.raceaddr())
 			}
 			unlock(&c.lock)
-			if op.element != nil {
-				typedmemclr(c.elemtype, op.element)
+			if element != nil {
+				typedmemclr(c.elemtype, element)
 			}
 			finishStacklessCoroChannel(unsafe.Pointer(op), nil, false)
 			return
 		}
 	} else if sg := c.sendq.dequeue(); sg != nil {
-		recv(c, sg, op.element, func() { unlock(&c.lock) }, 3)
+		recv(c, sg, element, func() { unlock(&c.lock) }, 3)
 		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
 	}
@@ -215,8 +213,8 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 		if raceenabled {
 			racenotify(c, c.recvx, nil)
 		}
-		if op.element != nil {
-			typedmemmove(c.elemtype, op.element, qp)
+		if element != nil {
+			typedmemmove(c.elemtype, element, qp)
 		}
 		typedmemclr(c.elemtype, qp)
 		c.recvx++
@@ -231,7 +229,7 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 
 	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
-	sg.elem.set(op.element)
+	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
