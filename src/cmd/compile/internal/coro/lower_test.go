@@ -357,7 +357,7 @@ func TestLowerMethodReceiver(t *testing.T) {
 			return
 		}
 		switch symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) {
-		case "runtime.coroTakeFrame":
+		case "runtime.coroTakeFrame", "runtime.coroTakeTypedTaskFrame":
 			takeFrames++
 		case "runtime.coroTakeRootFrame":
 			takeRootFrames++

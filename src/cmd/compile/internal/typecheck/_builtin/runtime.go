@@ -356,6 +356,7 @@ func coroTerminalAction(unsafe.Pointer) uint8
 
 // stackless coroutine frame factory
 func coroTakeFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr) unsafe.Pointer
+func coroTakeTypedTaskFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeFrameChunk(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeSelfFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeFusedFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte, bool) unsafe.Pointer
