@@ -4582,7 +4582,11 @@ race mode, and frame sizes outside the fitting small allocation classes keep
 the existing paths.
 
 The runtime preserves the ordinary cached-frame prefix and only combines a
-cache-full reservation when no reusable task is available. This allocation
+cache-full reservation when no reusable task is available and the prefix's
+charged frame bytes match the requested frame size times the task limit.
+Mixed-size prefixes keep their existing task-chunk sequence, including its
+shared scalar storage, rather than paying unused scalar slots for pointer
+frames. This allocation
 uses the existing uncached-lineage marker, so neither its task nor its frame
 can enter an idle cache. One task/frame pair per object avoids sibling-frame
 retention after partial completion. In particular a 48-byte task plus a

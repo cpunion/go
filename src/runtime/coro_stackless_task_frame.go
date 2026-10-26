@@ -58,7 +58,11 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
 		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+			uintptr(s.cachedFrameBytes) == uintptr(stacklessCoroTaskCacheSize)*size &&
 			s.freeFrameBytes == 0 && s.freeTasks == nil {
+			// Preserve the ordinary allocation sequence for mixed-size cache
+			// prefixes. In particular, scalar task chunks can otherwise replace
+			// plain task chunks and charge unused scalar storage to pointer frames.
 			if !validStacklessCoroTaskFrameType(allocationType, size) {
 				unlock(&s.lock)
 				throw("runtime: invalid stackless coroutine task-frame allocation type")
