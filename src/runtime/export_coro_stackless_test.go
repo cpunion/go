@@ -569,6 +569,13 @@ func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
 			unsafe.Offsetof(stacklessCoroChannelOperation{}.waiter))
 }
 
+func StacklessCoroChannelOperationClearedForTest(token unsafe.Pointer) bool {
+	op := (*stacklessCoroOperation)(token)
+	return op != nil &&
+		op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
+		validReleasedStacklessCoroSudog(op.waiter)
+}
+
 func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	s := new(stacklessCoroScheduler)
 	task := &s.root
@@ -1097,15 +1104,15 @@ func StartStacklessCoroSendIntForTest(ctx unsafe.Pointer, channel chan<- int, va
 }
 
 func StartStacklessCoroSendForTest(ctx unsafe.Pointer, channel any,
-	value unsafe.Pointer) {
-	startStacklessCoroChannel(ctx, (*hchan)(efaceOf(&channel).data),
-		value, nil, true)
+	value unsafe.Pointer) unsafe.Pointer {
+	return unsafe.Pointer(startStacklessCoroChannel(ctx, (*hchan)(efaceOf(&channel).data),
+		value, nil, true))
 }
 
 func StartStacklessCoroRecvIntForTest(ctx unsafe.Pointer, channel <-chan int,
-	value *int, received *bool) {
-	startStacklessCoroChannel(ctx, *(**hchan)(unsafe.Pointer(&channel)),
-		unsafe.Pointer(value), received, false)
+	value *int, received *bool) unsafe.Pointer {
+	return unsafe.Pointer(startStacklessCoroChannel(ctx, *(**hchan)(unsafe.Pointer(&channel)),
+		unsafe.Pointer(value), received, false))
 }
 
 func StartStacklessCoroRecvForTest(ctx unsafe.Pointer, channel any,
