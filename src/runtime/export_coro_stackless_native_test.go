@@ -72,6 +72,37 @@ func StacklessCoroNativePoolSchedulerStacksForTest() (warm, overflow, idle int) 
 	return
 }
 
+func StacklessCoroNativeSchedulerIdentityForTest() uintptr {
+	return uintptr(unsafe.Pointer(getg().m.g0))
+}
+
+// The caller first quiesces all native-cache users.
+func StacklessCoroNativeSchedulerDescriptorsForTest() (ids []uintptr, limit int, dirty bool) {
+	limit = len(stacklessCoroNativeSchedulerDescriptors.slots)
+	ids = make([]uintptr, 0, limit)
+	free := stacklessCoroNativeSchedulerDescriptors.free.Load()
+	for i := range stacklessCoroNativeSchedulerDescriptors.slots {
+		if free&(uint64(1)<<uint(i)) == 0 {
+			continue
+		}
+		gp := &stacklessCoroNativeSchedulerDescriptors.slots[i]
+		ids = append(ids, uintptr(unsafe.Pointer(gp)))
+		if gp.stack != (stack{}) || gp.m != nil || gp.stackguard0 != 0 ||
+			gp.stackguard1 != 0 || gp.sched != (gobuf{}) || gp.param != nil ||
+			gp._panic != nil || gp._defer != nil || gp.valgrindStackID != 0 {
+			dirty = true
+		}
+	}
+	return
+}
+func StacklessCoroNativeSchedulerDescriptorStaticForTest(id uintptr) bool {
+	base := uintptr(unsafe.Pointer(&stacklessCoroNativeSchedulerDescriptors.slots[0]))
+	return id >= base && id < base+unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots) && (id-base)%unsafe.Sizeof(g{}) == 0
+}
+func StacklessCoroNativeSchedulerDescriptorStorageForTest() uintptr {
+	return unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots)
+}
+
 func StacklessCoroDeferSleepOutsideExecutorForTest() bool {
 	return stacklessCoroDeferSleep(nil, nil, 0)
 }

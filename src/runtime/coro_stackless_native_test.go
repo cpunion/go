@@ -131,7 +131,7 @@ func TestStacklessCoroNativeInitialYieldThreads(t *testing.T) {
 }
 
 func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
-	const roots = 16
+	const roots = 96
 	run := func() int {
 		var wg sync.WaitGroup
 		started := make(chan uintptr, roots)
@@ -180,6 +180,98 @@ func TestStacklessCoroNativePoolGrowthAndReuse(t *testing.T) {
 	}
 	if reused := run(); reused != grown {
 		t.Fatalf("native executor count after reuse = %d, want %d", reused, grown)
+	}
+}
+
+func TestStacklessCoroNativeSchedulerDescriptorReuse(t *testing.T) {
+	const child = "GO_CORO_SCHEDULER_DESCRIPTORS"
+	if os.Getenv(child) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroNativeSchedulerDescriptorReuse$", "-test.count=1")
+		procs := os.Getenv("GOMAXPROCS")
+		if procs == "" {
+			procs = "4"
+		}
+		cmd.Env = append(os.Environ(), child+"=1", "GOMAXPROCS="+procs)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("descriptor child: %v\n%s", err, output)
+		}
+		return
+	}
+	run := func(roots int) map[uintptr]bool {
+		started := make(chan uintptr, roots)
+		gate := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(roots)
+		for range roots {
+			go func() {
+				defer wg.Done()
+				runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+					native, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest()
+					if !native {
+						panic("descriptor test lost native execution")
+					}
+					started <- runtime.StacklessCoroNativeSchedulerIdentityForTest()
+					<-gate
+					return runtime.StacklessCoroActionComplete
+				})
+			}()
+		}
+		watchdog := time.NewTimer(10 * time.Second)
+		ids := make(map[uintptr]bool)
+		for range roots {
+			select {
+			case id := <-started:
+				if id == 0 || ids[id] {
+					t.Errorf("active scheduler descriptor aliases %#x", id)
+				}
+				ids[id] = true
+			case <-watchdog.C:
+				close(gate)
+				wg.Wait()
+				t.Fatal("native descriptor wave did not become active")
+			}
+		}
+		watchdog.Stop()
+		close(gate)
+		wg.Wait()
+		return ids
+	}
+	first := run(64)
+	for id := range first {
+		if !runtime.StacklessCoroNativeSchedulerDescriptorStaticForTest(id) {
+			t.Fatalf("64 active episodes used heap descriptor %#x", id)
+		}
+	}
+	t.Logf("fixed descriptor storage=%d bytes", runtime.StacklessCoroNativeSchedulerDescriptorStorageForTest())
+	cached, limit, dirty := runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
+	if len(cached) == 0 || len(cached) > limit || dirty {
+		t.Fatalf("empty descriptors: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
+	}
+	runtime.GC()
+	runtime.GC()
+	active := run(64)
+	for _, id := range cached {
+		if !active[id] {
+			t.Errorf("cached descriptor %#x was not reused", id)
+		}
+	}
+	overflowIDs := run(96)
+	static := 0
+	for id := range overflowIDs {
+		if runtime.StacklessCoroNativeSchedulerDescriptorStaticForTest(id) {
+			static++
+		}
+	}
+	if static != 64 {
+		t.Fatalf("96 active episodes used %d fixed descriptors, want64", static)
+	}
+	cached, limit, dirty = runtime.StacklessCoroNativeSchedulerDescriptorsForTest()
+	if len(cached) < limit-8 || len(cached) > limit || dirty {
+		t.Fatalf("bounded descriptor overflow: count=%d limit=%d dirty=%t", len(cached), limit, dirty)
+	}
+	warm, overflow, idle := runtime.StacklessCoroNativePoolSchedulerStacksForTest()
+	if warm > 4 || overflow != 0 || idle > 4 {
+		t.Fatalf("descriptor reuse retained stacks: warm=%d overflow=%d shared=%d", warm, overflow, idle)
 	}
 }
 

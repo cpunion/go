@@ -16,6 +16,10 @@ import (
 )
 
 const (
+	// Bound total fixed descriptor storage. Active and idle-stack holders
+	// consume slots from the same pool; overflow descriptors are heap allocated.
+	stacklessCoroSchedulerDescriptorCacheSize = 64
+
 	stacklessCoroSelfFrameChunkCacheSize = 256 << 10
 	// Large frames may reuse a burst between collections. The first idle GC
 	// trims this to the ordinary budget; the second drops all idle payload.
@@ -94,6 +98,16 @@ var stacklessCoroNativeParkedCaches [stacklessCoroWarmExecutorCount]atomic.Point
 // separate bounded pool serves contexts resuming after an ordinary wait.
 var stacklessCoroNativeSchedulerStacks [stacklessCoroWarmExecutorCount]atomic.Pointer[g]
 
+// Native scheduler Gs carry no goroutine activation while free. As with
+// runtime's global g0, fixed descriptor storage is a typed global GC root.
+// The64 descriptors serve active and retained idle stacks as well as empty
+// slots; overflow uses ordinary heap descriptors. A free bit owns its G until
+// stack initialization, and is published only after all saved state is cleared.
+var stacklessCoroNativeSchedulerDescriptors struct {
+	free  atomic.Uint64
+	slots [stacklessCoroSchedulerDescriptorCacheSize]g
+}
+
 var stacklessCoroNativePool struct {
 	lock  mutex
 	count int
@@ -105,6 +119,7 @@ var stacklessCoroNativePool struct {
 
 func init() {
 	lockInit(&stacklessCoroNativePool.lock, lockRankLeafRank)
+	stacklessCoroNativeSchedulerDescriptors.free.Store(^uint64(0))
 }
 
 // run drives one episode on a fixed portion of the current operating system
@@ -660,10 +675,40 @@ func acquireStacklessCoroNativeSchedulerStack() *g {
 			return gp
 		}
 	}
+	return newStacklessCoroNativeSchedulerStack()
+}
+
+// Keep empty-descriptor acquisition and stack initialization off the shared-stack fast path.
+func newStacklessCoroNativeSchedulerStack() *g {
+	var schedulerG *g
+	for {
+		free := stacklessCoroNativeSchedulerDescriptors.free.Load()
+		if free == 0 {
+			break
+		}
+		i := sys.TrailingZeros64(free)
+		bit := uint64(1) << uint(i)
+		if stacklessCoroNativeSchedulerDescriptors.free.CompareAndSwap(free, free&^bit) {
+			schedulerG = &stacklessCoroNativeSchedulerDescriptors.slots[i]
+			break
+		}
+	}
+	if schedulerG == nil {
+		schedulerG = new(g)
+	}
 	// This stack runs g0 runtime work; the executor keeps the OS thread stack.
-	// Match allocm's Go-allocated g0 size, including its instrumentation guard.
-	schedulerG := malg(16384 * sys.StackGuardMultiplier)
+	// Match malg's stack allocation and instrumentation for either a new or
+	// recycled descriptor, and allocm's Go-allocated scheduler-stack size.
+	stacksize := round2(stackSystem + 16384*sys.StackGuardMultiplier)
+	systemstack(func() {
+		schedulerG.stack = stackalloc(uint32(stacksize))
+		if valgrindenabled {
+			schedulerG.valgrindStackID = valgrindRegisterStack(unsafe.Pointer(schedulerG.stack.lo), unsafe.Pointer(schedulerG.stack.hi))
+		}
+	})
+	schedulerG.stackguard0 = schedulerG.stack.lo + stackGuard
 	schedulerG.stackguard1 = schedulerG.stackguard0
+	*(*uintptr)(unsafe.Pointer(schedulerG.stack.lo)) = 0
 	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
 	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
 	return schedulerG
@@ -689,11 +734,24 @@ func releaseStacklessCoroNativeSchedulerStack(ctx *stacklessCoroNativeContext) {
 		stackfree(gp.stack)
 		if valgrindenabled {
 			valgrindDeregisterStack(gp.valgrindStackID)
+			gp.valgrindStackID = 0
 		}
 		gp.stack = stack{}
 		gp.stackguard0 = 0
 		gp.stackguard1 = 0
 	})
+	// Keep no saved registers or heap funcval from the finished activation.
+	// The next borrower allocates a stack before installing this G as m.g0.
+	gp.sched = gobuf{}
+	base := uintptr(unsafe.Pointer(&stacklessCoroNativeSchedulerDescriptors.slots[0]))
+	addr := uintptr(unsafe.Pointer(gp))
+	if addr >= base && addr < base+unsafe.Sizeof(stacklessCoroNativeSchedulerDescriptors.slots) {
+		i := (addr - base) / unsafe.Sizeof(g{})
+		// Exclusive ownership keeps this bit zero until release, so addition
+		// sets only this bit without carry, including the wrapping high bit.
+		stacklessCoroNativeSchedulerDescriptors.free.Add(int64(uint64(1) << uint(i)))
+	}
+
 }
 
 // coroNativeStart is the mcall continuation that replaces the native g0
