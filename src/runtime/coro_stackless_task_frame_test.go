@@ -22,23 +22,24 @@ func TestStacklessCoroTypedTaskFrames(t *testing.T) {
 		t.Fatal("combined task/frame pointer map or rejected-layout contract failed")
 	}
 	for _, tc := range []struct {
-		name                           string
-		varyPrefix, cancelReservations bool
+		name                                        string
+		varyPrefix, cancelReservations, phaseSwitch bool
 	}{
 		{name: "matching-prefix"},
 		{name: "mixed-prefix", varyPrefix: true},
 		{name: "panic-cancels-reservations", cancelReservations: true},
+		{name: "typed-to-scalar-phase", phaseSwitch: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testStacklessCoroTypedTaskFrames(t, tc.varyPrefix, tc.cancelReservations)
+			testStacklessCoroTypedTaskFrames(t, tc.varyPrefix, tc.cancelReservations, tc.phaseSwitch)
 		})
 	}
 }
 
-func testStacklessCoroTypedTaskFrames(t *testing.T, varyPrefix, cancelReservations bool) {
+func testStacklessCoroTypedTaskFrames(t *testing.T, varyPrefix, cancelReservations, phaseSwitch bool) {
 	t.Helper()
 	const count = 513
-	valid, combined, finalizerToken := runtime.CheckStacklessCoroTypedTaskFramesForTest(count, varyPrefix, cancelReservations)
+	valid, combined, finalizerToken := runtime.CheckStacklessCoroTypedTaskFramesForTest(count, varyPrefix, cancelReservations, phaseSwitch)
 	t.Logf("combined task/frame allocations = %d of %d", combined, count)
 	if !valid {
 		t.Fatal("combined task/frame payload, completion or clearing contract failed")

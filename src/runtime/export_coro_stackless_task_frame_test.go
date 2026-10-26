@@ -44,6 +44,19 @@ type stacklessCoroSmallTaskFrameTestAllocation struct {
 	frame stacklessCoroSmallTaskFrameTestFrame
 }
 
+func stacklessCoroScalarTaskFrameTestResume(ctx unsafe.Pointer) uint8 {
+	context := (*stacklessCoroContext)(ctx)
+	root := (*stacklessCoroTaskFrameTestRoot)(context.scheduler.root.context.frame)
+	probe := root.probe
+	if probe.release.Load() == 0 {
+		return stacklessCoroActionYield
+	}
+	index := *(*uint32)(coroFrame(ctx))
+	probe.sum.Add(int64(index) + 17)
+	probe.done.Add(1)
+	return stacklessCoroActionComplete
+}
+
 func stacklessCoroSmallTaskFrameTestResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroSmallTaskFrameTestFrame)(coroFrame(ctx))
 	probe := frame.probe
@@ -108,6 +121,7 @@ type stacklessCoroTaskFrameTestRoot struct {
 	started            bool
 	varyPrefix         bool
 	cancelReservations bool
+	phaseSwitch        bool
 	invalidType        bool
 }
 
@@ -121,6 +135,26 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 	if !root.started {
 		root.started = true
 		for i := 0; i < root.count; i++ {
+			if root.phaseSwitch && i >= stacklessCoroTaskCacheSize && i%4 == 3 {
+				frame := (*uint32)(coroTakeFrame(ctx, stacklessCoroScalarTaskFrameTestResume, 4))
+				if frame == nil {
+					frame = new(uint32)
+				}
+				*frame = uint32(i)
+				s := (*stacklessCoroContext)(ctx).scheduler
+				if unsafe.Sizeof(uintptr(0)) == 8 && !raceenabled {
+					task := s.reservedTasks
+					base, span, _ := findObject(uintptr(unsafe.Pointer(task)), 0, 0)
+					if base != uintptr(unsafe.Pointer(task)) || span.elemsize != unsafe.Sizeof(stacklessCoroTask{}) {
+						probe.failed.Add(1)
+					}
+				}
+				payload := &stacklessCoroTaskFramePayload{value: uint64(i) + 17, probe: probe}
+				SetFinalizer(payload, stacklessCoroTaskFrameTestFinalize)
+				root.kept = append(root.kept, unsafe.Pointer(payload))
+				coroSpawnFrame(ctx, unsafe.Pointer(frame), stacklessCoroScalarTaskFrameTestResume)
+				continue
+			}
 			if root.varyPrefix && i < stacklessCoroTaskCacheSize && i%2 != 0 {
 				frame := (*stacklessCoroSmallTaskFrameTestFrame)(coroTakeTypedTaskFrame(ctx,
 					stacklessCoroSmallTaskFrameTestResume, unsafe.Sizeof(stacklessCoroSmallTaskFrameTestFrame{}),
@@ -208,10 +242,10 @@ func stacklessCoroTaskFrameTestRun(root *stacklessCoroTaskFrameTestRoot) (caught
 
 // Exercise the real reservation/spawn/completion paths beyond the cache
 // prefix, with precise pointer maps and payloads surviving both GC and yield.
-func CheckStacklessCoroTypedTaskFramesForTest(count int, varyPrefix, cancelReservations bool) (bool, int, unsafe.Pointer) {
+func CheckStacklessCoroTypedTaskFramesForTest(count int, varyPrefix, cancelReservations, phaseSwitch bool) (bool, int, unsafe.Pointer) {
 	StacklessCoroClearNativeTaskCachesForTest()
 	probe := new(stacklessCoroTaskFrameProbe)
-	root := &stacklessCoroTaskFrameTestRoot{probe: probe, count: count, varyPrefix: varyPrefix, cancelReservations: cancelReservations}
+	root := &stacklessCoroTaskFrameTestRoot{probe: probe, count: count, varyPrefix: varyPrefix, cancelReservations: cancelReservations, phaseSwitch: phaseSwitch}
 	caught := stacklessCoroTaskFrameTestRun(root)
 	wantDone, wantSum := uint64(count), uint64(count*(count-1)/2+17*count)
 	if cancelReservations {

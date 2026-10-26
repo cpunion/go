@@ -4584,9 +4584,14 @@ the existing paths.
 The runtime preserves the ordinary cached-frame prefix and only combines a
 cache-full reservation when no reusable task is available and the prefix's
 charged frame bytes match the requested frame size times the task limit.
-Mixed-size prefixes keep their existing task-chunk sequence, including its
-shared scalar storage, rather than paying unused scalar slots for pointer
-frames. This allocation
+Prefixes with a different mean frame size keep the existing task-chunk
+sequence. Once a combined allocation is used, a reserved low-nibble mode in
+the existing task-batch counter makes later scalar reservations allocate one
+48-byte task plus an independently packed tiny frame. This preserves scalar
+byte charges across a later mixed phase without retaining unused scalar
+slots in plain pointer-task storage. The task and scheduler sizes, free-slot
+count bits, cache limits and ordinary direct-prefix path remain unchanged.
+This allocation
 uses the existing uncached-lineage marker, so neither its task nor its frame
 can enter an idle cache. One task/frame pair per object avoids sibling-frame
 retention after partial completion. In particular a 48-byte task plus a
