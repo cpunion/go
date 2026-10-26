@@ -7809,3 +7809,16 @@ func stacklessCoroProgressWrite(fd int, progress <-chan struct{}, data string, b
 	}()
 	return done
 }
+
+func TestStacklessCoroIOOriginImmediateChannel(t *testing.T) {
+	if race.Enabled {
+		t.Skip("race builds do not reuse operation identities")
+	}
+	for _, kind := range []string{"send", "receive", "closed-receive"} {
+		t.Run(kind, func(t *testing.T) {
+			if !runtime.StacklessCoroIOOriginImmediateChannelForTest(kind) {
+				t.Fatal("IO-origin immediate channel lost reuse, payload, cleanup or allocated a waiter")
+			}
+		})
+	}
+}

@@ -573,7 +573,7 @@ func StacklessCoroChannelOperationClearedForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
 	return op != nil &&
 		op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
-		validReleasedStacklessCoroSudog(op.waiter)
+		(op.waiter == nil || validReleasedStacklessCoroSudog(op.waiter))
 }
 
 func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
@@ -1915,4 +1915,44 @@ func AsyncReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, result *uint64, e
 func FailAsyncStacklessCoroForTest(ctx unsafe.Pointer, result *uint64, errno *uintptr, submitErr uintptr) {
 	op := startStacklessCoroAsync(ctx, -1, result, errno)
 	failStacklessCoroAsync(op.id, submitErr)
+}
+
+func StacklessCoroIOOriginImmediateChannelForTest(kind string) bool {
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankLeafRank)
+	task := &s.root
+	task.context.scheduler = s
+	task.state = stacklessCoroTaskRunning
+	task.resuming = true
+	first := newStacklessCoroIOOperation()
+	first.id = 1
+	first.scheduler = s
+	first.task = task
+	clearStacklessCoroOperation(first)
+	lock(&s.lock)
+	s.recycleOperationLocked(first)
+	unlock(&s.lock)
+	channel := make(chan int, 1)
+	value, received := new(int), new(bool)
+	*value = 71
+	if kind == "receive" {
+		channel <- 37
+	} else if kind == "closed-receive" {
+		close(channel)
+	}
+	op := startStacklessCoroChannel(unsafe.Pointer(&task.context), *(**hchan)(unsafe.Pointer(&channel)), unsafe.Pointer(value), received, kind == "send")
+	valid := op == first && op.waiter == nil && op.stacklessCoroOperationState == (stacklessCoroOperationState{})
+	GC()
+	switch kind {
+	case "send":
+		valid = valid && <-channel == 71
+	case "receive":
+		valid = valid && *value == 37 && *received
+	case "closed-receive":
+		valid = valid && *value == 0 && !*received
+	default:
+		return false
+	}
+	KeepAlive(s)
+	return valid
 }

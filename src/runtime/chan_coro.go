@@ -123,9 +123,7 @@ func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
 }
 
 // chansendStackless starts op without parking the executor goroutine.
-func chansendStackless(op *stacklessCoroOperation) {
-	c := op.waiter.c.get()
-	element := op.waiter.elem.get()
+func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Pointer) {
 	if c == nil {
 		return
 	}
@@ -165,11 +163,13 @@ func chansendStackless(op *stacklessCoroOperation) {
 		return
 	}
 
-	sg := op.waiter
+	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
+	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
+	sg.c.set(c)
 	c.sendq.enqueue(sg)
 	if raceenabled {
 		racerelease(unsafe.Pointer(op))
@@ -178,9 +178,7 @@ func chansendStackless(op *stacklessCoroOperation) {
 }
 
 // chanrecvStackless starts op without parking the executor goroutine.
-func chanrecvStackless(op *stacklessCoroOperation) {
-	c := op.waiter.c.get()
-	element := op.waiter.elem.get()
+func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Pointer) {
 	if c == nil {
 		return
 	}
@@ -229,11 +227,13 @@ func chanrecvStackless(op *stacklessCoroOperation) {
 		return
 	}
 
-	sg := op.waiter
+	sg := newStacklessCoroSudog(op, nil)
 	sg.releasetime = 0
+	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
+	sg.c.set(c)
 	c.recvq.enqueue(sg)
 	if c.timer != nil {
 		blockTimerChan(c)
