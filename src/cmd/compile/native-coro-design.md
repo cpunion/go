@@ -4640,3 +4640,27 @@ separate from throughput, lifetime RSS and live heap observations. Complete
 frozen-source acceptance and every adverse result are recorded with the dated
 performance artifacts; these changes do not establish universal superiority
 over the official Go implementation.
+
+
+### Reuse detached channel links (2026-10-27)
+
+After a channel waiter is dequeued, its `next` link is no longer owned by the
+channel queue. Channel close uses that link for the list of native completions
+and clears it before publishing each result. A select winner has already won
+the selection before joining this list; losing waiters remain subject to their
+normal queue removal. The full-only `waitlink` now follows the goroutine,
+profiling and semaphore-tree fields. Native channel and select paths never
+access it, including after the owner is cleared.
+
+This leaves a 64-byte shared channel prefix plus the unchanged 64-byte
+operation on 64-bit targets, an actual 128-byte allocation. Full waiters remain
+112 bytes and race builds retain their 176-byte operation-first allocation.
+The 32-bit compact object is 80 bytes, while full race storage stays112 bytes.
+No ID truncation, pointer tagging, extra resource header, cache-capacity change
+or unscanned pointer is introduced. The disabled-experiment waiter is unchanged.
+
+Existing base-only/interior-only GC-root, payload-finalizer and select winner
+contracts remain. Dedicated compact variants seed the retained waiter before
+batch receive/send close and duplicate-case select close; a forced GC runs
+while those waiters are queued. Complete frozen-source timing, allocation,
+live/retained memory and RSS observations determine acceptance separately.

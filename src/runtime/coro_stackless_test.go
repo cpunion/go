@@ -1118,11 +1118,11 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := 8 * ptrSize
-	wantChannel := uintptr(136)
+	wantChannel := uintptr(128)
 	wantIO := uintptr(176)
 	if ptrSize == 4 {
 		want = 11 * ptrSize
-		wantChannel = 84
+		wantChannel = 80
 		wantIO = 100
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
@@ -5483,7 +5483,11 @@ func TestStacklessCoroSelectTimer(t *testing.T) {
 	})
 }
 
-func TestStacklessCoroSelectClose(t *testing.T) {
+func TestStacklessCoroSelectClose(t *testing.T) { testStacklessCoroSelectClose(t, false) }
+
+func TestStacklessCoroCompactSelectClose(t *testing.T) { testStacklessCoroSelectClose(t, true) }
+
+func testStacklessCoroSelectClose(t *testing.T, compact bool) {
 	first := make(chan int)
 	second := make(chan int)
 	value := -1
@@ -5504,11 +5508,17 @@ func TestStacklessCoroSelectClose(t *testing.T) {
 			_, secondRecv, _ :=
 				runtime.StacklessCoroChannelWaitersForTest(second)
 			if firstRecv == 2 && secondRecv == 1 {
+				if compact {
+					runtime.GC()
+				}
 				close(first)
 				return
 			}
 			if time.Now().After(deadline) {
 				t.Error("select close waiters were not queued")
+				if compact {
+					runtime.GC()
+				}
 				close(first)
 				return
 			}
@@ -5520,6 +5530,9 @@ func TestStacklessCoroSelectClose(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
+			if compact {
+				runtime.SeedStacklessCoroCompactOperationForTest(ctx)
+			}
 			state = 1
 			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
 				&chosen, &received)
@@ -6182,8 +6195,14 @@ func TestStacklessCoroChannelCloseWaiter(t *testing.T) {
 	})
 }
 
-func TestStacklessCoroChannelCloseMany(t *testing.T) {
-	const waiters = 4
+func TestStacklessCoroChannelCloseMany(t *testing.T) { testStacklessCoroChannelCloseMany(t, false) }
+
+func TestStacklessCoroCompactChannelCloseMany(t *testing.T) {
+	testStacklessCoroChannelCloseMany(t, true)
+}
+
+func testStacklessCoroChannelCloseMany(t *testing.T, compact bool) {
+	const waiters = 16
 
 	type result struct {
 		value     int
@@ -6230,6 +6249,9 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 				runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 					switch state {
 					case 0:
+						if compact {
+							runtime.SeedStacklessCoroCompactOperationForTest(ctx)
+						}
 						state = 1
 						runtime.StartStacklessCoroRecvIntForTest(ctx, channel,
 							&value, &received)
@@ -6246,6 +6268,9 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 			}()
 		}
 		waitForQueue(t, channel, 0, &queued)
+		if compact {
+			runtime.GC()
+		}
 		close(channel)
 		for range waiters {
 			got := <-results
@@ -6276,6 +6301,9 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 						}
 						switch state {
 						case 0:
+							if compact {
+								runtime.SeedStacklessCoroCompactOperationForTest(ctx)
+							}
 							state = 1
 							runtime.StartStacklessCoroSendIntForTest(ctx, channel,
 								&value)
@@ -6290,6 +6318,9 @@ func TestStacklessCoroChannelCloseMany(t *testing.T) {
 			}(i)
 		}
 		waitForQueue(t, channel, waiters, &queued)
+		if compact {
+			runtime.GC()
+		}
 		close(channel)
 		for range waiters {
 			got := <-results
@@ -7831,9 +7862,9 @@ func TestStacklessCoroCompactChannelOperation(t *testing.T) {
 	if !valid {
 		t.Fatalf("compact prefix layout: full=%d prefix=%d storage=%d charged=%d", full, prefix, storage, charged)
 	}
-	want := uintptr(144)
+	want := uintptr(128)
 	if unsafe.Sizeof(uintptr(0)) == 4 {
-		want = 96
+		want = 80
 	}
 	if race.Enabled {
 		want = 176

@@ -447,6 +447,8 @@ func closechan(c *hchan) {
 	c.closed = 1
 
 	var glist gList
+	// dequeue has detached each native winner from its channel queue. Reuse
+	// next for the completion list and clear it before waking the operation.
 	var corohead, corotail *sudog
 
 	// release all readers
@@ -471,7 +473,7 @@ func closechan(c *hchan) {
 			if corotail == nil {
 				corohead = sg
 			} else {
-				corotail.waitlink = sg
+				corotail.next = sg
 			}
 			corotail = sg
 			continue
@@ -504,7 +506,7 @@ func closechan(c *hchan) {
 			if corotail == nil {
 				corohead = sg
 			} else {
-				corotail.waitlink = sg
+				corotail.next = sg
 			}
 			corotail = sg
 			continue
@@ -527,8 +529,8 @@ func closechan(c *hchan) {
 	}
 	for corohead != nil {
 		sg := corohead
-		corohead = sg.waitlink
-		sg.waitlink = nil
+		corohead = sg.next
+		sg.next = nil
 		op := sg.coro.get()
 		finishStacklessCoroChannel(op, sg, false)
 	}

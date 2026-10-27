@@ -84,9 +84,9 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
 func validReleasedStacklessCoroSudog(op *stacklessCoroOperation, sg *sudog) bool {
 	// A compact view has no g or profiling tail. Its operation occupies that
 	// space, so only full waiters may inspect g, including after owner clears.
-	return sg != nil && (isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) || sg.g == nil) && sg.elem.get() == nil &&
+	return sg != nil && (isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) || (sg.g == nil && sg.waitlink == nil)) && sg.elem.get() == nil &&
 		sg.coro.get() == nil && sg.next == nil && sg.prev == nil &&
-		sg.waitlink == nil && sg.c.get() == nil && !sg.isSelect
+		sg.c.get() == nil && !sg.isSelect
 }
 
 // tryStacklessCoroChanSend completes a ready send on the current executor.
@@ -167,7 +167,6 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 
 	sg := newStacklessCoroSudog(op, nil)
 	sg.elem.set(element)
-	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)
@@ -230,7 +229,6 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 
 	sg := newStacklessCoroSudog(op, nil)
 	sg.elem.set(element)
-	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
 	sg.isSelect = false
 	sg.c.set(c)
