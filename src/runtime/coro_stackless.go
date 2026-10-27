@@ -2014,6 +2014,13 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			throw("runtime: invalid stackless coroutine local self-frame reservation")
 		}
 		parent.setFlag(stacklessCoroTaskFusedPending, true)
+		allocation := header.marker & stacklessCoroFusedFrameAllocationMask
+		if allocation >= stacklessCoroFusedFrameChunkFirst &&
+			allocation < stacklessCoroFusedFrameChunkLastFor(header.marker) {
+			// The validated chunk already owns its next element. Keep this
+			// common step out of the allocation and cache-boundary helper.
+			return add(context.frame, size)
+		}
 		return allocateStacklessCoroSelfFrame(context.frame, size,
 			chunkType, child, header.marker, true)
 	}
@@ -2125,7 +2132,17 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 			throw("runtime: invalid initialized stackless coroutine local self frame")
 		}
 		parent.setFlag(stacklessCoroTaskFusedPending, false)
-		childHeader.marker = nextStacklessCoroSelfFrameMarker(parentHeader.marker)
+		// The checks above establish a validated, nonzero allocation marker.
+		// Direct slots and chunk interiors advance by one; only a chunk's
+		// last element wraps back to the first. The locked path also handles
+		// an initial zero marker and retains the general transition helper.
+		next := parentHeader.marker + 1
+		if parentHeader.marker&stacklessCoroFusedFrameAllocationMask ==
+			stacklessCoroFusedFrameChunkLastFor(parentHeader.marker) {
+			next = parentHeader.marker&^stacklessCoroFusedFrameAllocationMask |
+				stacklessCoroFusedFrameChunkFirst
+		}
+		childHeader.marker = next
 		childHeader.parent = context.frame
 		context.frame = frame
 		parent.setFlag(stacklessCoroTaskFusedFrames, true)
