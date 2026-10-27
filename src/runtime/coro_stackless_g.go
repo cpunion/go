@@ -79,8 +79,9 @@ func stacklessCoroExitsyscallDone(gp *g) {
 	}
 }
 
-// Channel operations access only this prefix. The semaphore tree, goroutine and
-// block-profile fields remain in full sudogs. A compact channel allocation
+// Channel operations access only this prefix. Detached close completions reuse
+// next after dequeue, so waitlink remains in the full-only tail. The semaphore
+// tree, goroutine and block-profile fields remain in full sudogs. A compact channel allocation
 // puts its operation immediately after the prefix, keeping the complete
 // allocation large enough for a sudog view while rooting both parts precisely.
 type stacklessCoroChannelWaiter struct {
@@ -89,7 +90,6 @@ type stacklessCoroChannelWaiter struct {
 	prev     *sudog
 	elem     maybeTraceablePtr
 	c        maybeTraceableChan
-	waitlink *sudog
 	ticket   uint32
 	isSelect bool
 	success  bool
@@ -103,7 +103,6 @@ type sudog struct {
 	prev        *sudog
 	elem        maybeTraceablePtr
 	c           maybeTraceableChan
-	waitlink    *sudog
 	ticket      uint32
 	isSelect    bool
 	success     bool
@@ -113,6 +112,7 @@ type sudog struct {
 	releasetime int64
 	parent      *sudog
 	waittail    *sudog
+	waitlink    *sudog
 }
 
 func isCompactStacklessCoroSudog(sg *sudog, owner unsafe.Pointer) bool {
@@ -128,7 +128,6 @@ const stacklessCoroChannelWaiterOffsetMismatch = (unsafe.Offsetof(sudog{}.coro) 
 	(unsafe.Offsetof(sudog{}.prev) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)) |
 	(unsafe.Offsetof(sudog{}.elem) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)) |
 	(unsafe.Offsetof(sudog{}.c) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)) |
-	(unsafe.Offsetof(sudog{}.waitlink) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.waitlink)) |
 	(unsafe.Offsetof(sudog{}.ticket) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)) |
 	(unsafe.Offsetof(sudog{}.isSelect) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)) |
 	(unsafe.Offsetof(sudog{}.success) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)) |

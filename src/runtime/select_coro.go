@@ -275,7 +275,6 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		c = cas.c
 		sg = newStacklessCoroSudog(op, &selection.waiters[casi])
 		sg.elem.set(cas.elem)
-		sg.waitlink = nil
 		sg.coro.set(unsafe.Pointer(op))
 		sg.isSelect = true
 		sg.c.set(c)
@@ -458,7 +457,6 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 		waiter.elem.set(nil)
 		waiter.coro.clear()
 		waiter.c.set(nil)
-		waiter.waitlink = nil
 	}
 	selunlock(selection.cases, selection.lockOrder)
 	for _, casei := range selection.lockOrder {

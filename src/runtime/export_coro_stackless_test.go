@@ -2039,7 +2039,6 @@ func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged 
 		{unsafe.Offsetof(sudog{}.prev), unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)},
 		{unsafe.Offsetof(sudog{}.elem), unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)},
 		{unsafe.Offsetof(sudog{}.c), unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)},
-		{unsafe.Offsetof(sudog{}.waitlink), unsafe.Offsetof(stacklessCoroChannelWaiter{}.waitlink)},
 		{unsafe.Offsetof(sudog{}.ticket), unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)},
 		{unsafe.Offsetof(sudog{}.isSelect), unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)},
 		{unsafe.Offsetof(sudog{}.success), unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)},
