@@ -93,6 +93,14 @@ jobs:
           internal/buildcfg
           runtime
 
+      - name: Compile coroutine 386 layout contracts
+        env:
+          GOEXPERIMENT: coro
+          GOOS: linux
+          GOARCH: '386'
+          CGO_ENABLED: '0'
+        run: ./bin/go test -c -o "$RUNNER_TEMP/runtime-linux386.test" runtime
+
       - name: Test host fairness without asynchronous preemption
         env:
           GOEXPERIMENT: coro
@@ -128,7 +136,7 @@ jobs:
           mkdir -p "$out"
           ./bin/go test -c -o "$out/runtime.test" runtime
           ./bin/go version -m "$out/runtime.test" > "$out/version.txt"
-          pattern='^TestStacklessCoro(WriteBarrierLockRanks|TypedTaskFrames|TypedTaskFrameInvalidType|FrameCache|NetpollReadyAccounting|SchedulerSize|OperationSize|TaskSize|IOOriginImmediateChannel|TimerOwnerReuse|SelectStorageCache|SelectOperationReuse|OperationReuse|ChannelImmediateWaiterCleanup|ChannelOperationRootingModes|Native(PoolGrowthAndReuse|SchedulerDescriptorReuse|SchedulerRuntimeWork))$'
+          pattern='^TestStacklessCoro(WriteBarrierLockRanks|Compact.*|TypedTaskFrames|TypedTaskFrameInvalidType|FrameCache|NetpollReadyAccounting|SchedulerSize|OperationSize|TaskSize|IOOriginImmediateChannel|TimerOwnerReuse|SelectStorageCache|SelectOperationReuse|OperationReuse|ChannelImmediateWaiterCleanup|ChannelOperationRootingModes|Native(PoolGrowthAndReuse|SchedulerDescriptorReuse|SchedulerRuntimeWork))$'
           for procs in 1 4; do
             GOMAXPROCS=$procs "$out/runtime.test" -test.v -test.run="$pattern" \
               -test.count=10 -test.timeout=10m > "$out/p$procs.log" 2>&1

@@ -4603,3 +4603,40 @@ measurement; this layout does not imply a universal memory or latency gain.
 Mixed prefixes also preserve this scalar allocation mode. A prefix of small
 frames can therefore be followed by larger eligible frames, up to 208 bytes,
 without changing cache bounds or creating partially used scalar-task chunks.
+
+
+### Compact channel waiter storage (2026-10-27)
+
+Native channel allocations keep only the common channel fields of `sudog`
+beside their operation. On 64-bit targets the prefix is 72 bytes and the
+operation remains 64 bytes: the 136-byte object uses the 144-byte allocator
+class, instead of 176 bytes. The complete 112-byte `sudog` stays available for
+ordinary goroutines, semaphores, notification waiters and extra select cases.
+The non-experiment build retains the original flat definition and field order.
+
+The waiter view starts at the allocation base; the operation is an interior
+pointer immediately after the prefix. Either pointer keeps the precisely typed
+whole object live. Compile-time guards and runtime tests check every shared
+field offset, pointer bitmap and the containing-object extent. The prefix and
+full view keep direct members because linker DWARF substitution expects
+`sudog.elem`. Channel code must dispatch by native owner before inspecting the
+full waiter's goroutine or profiling tail. Those tail bytes belong to the
+operation in compact storage. The constructor's pointer relation identifies
+compact storage even after the active owner clears; no pointer tags or ID bits
+encode that relation.
+
+Race builds retain the original full allocation with the operation at the
+base, preserving the existing synchronization identity. The operation registry,
+full-width IDs, cache bounds, timer/select/I/O resource reuse and factory ABI3
+are unchanged. Tests force compact waiters through both select outcomes and
+loser removal, keep either view as the only GC root, and require both separately
+rooted payload finalizers after release. Ordinary channel and semaphore tests
+also run with the experiment disabled.
+
+Exploratory fixed-work comparisons found a 3,200,000-byte cold allocation
+reduction for 100,000 channel operations, unchanged allocation counts, and a
+6,144-byte reduction after four GCs for the 192-record shared cache. Those are
+separate from throughput, lifetime RSS and live heap observations. Complete
+frozen-source acceptance and every adverse result are recorded with the dated
+performance artifacts; these changes do not establish universal superiority
+over the official Go implementation.

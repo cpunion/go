@@ -434,18 +434,29 @@ type stacklessCoroSelectResources struct {
 	selection stacklessCoroSelect
 }
 
-// stacklessCoroChannelOperation gives a new channel operation its first waiter
-// without a second heap object. The operation is first so its address remains
-// the allocation base used as the channel and race synchronization identity.
+// A channel waiter needs neither a parked goroutine nor a semaphore tree.
+// Both the waiter prefix and operation are part of one precisely typed object.
+// The operation is an interior pointer; the waiter view starts at the base.
 type stacklessCoroChannelOperation struct {
+	waiter    stacklessCoroChannelWaiter
+	operation stacklessCoroOperation
+}
+
+// Race synchronization identities keep the existing allocation-base layout.
+type stacklessCoroFullChannelOperation struct {
 	operation stacklessCoroOperation
 	waiter    sudog
 }
 
 func newStacklessCoroChannelOperation() *stacklessCoroOperation {
+	if raceenabled {
+		storage := new(stacklessCoroFullChannelOperation)
+		storage.operation.waiter = &storage.waiter
+		return &storage.operation
+	}
 	storage := new(stacklessCoroChannelOperation)
 	op := &storage.operation
-	op.waiter = &storage.waiter
+	op.waiter = (*sudog)(unsafe.Pointer(storage))
 	return op
 }
 

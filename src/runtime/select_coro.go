@@ -274,7 +274,6 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		cas = &cases[casi]
 		c = cas.c
 		sg = newStacklessCoroSudog(op, &selection.waiters[casi])
-		sg.releasetime = 0
 		sg.elem.set(cas.elem)
 		sg.waitlink = nil
 		sg.coro.set(unsafe.Pointer(op))

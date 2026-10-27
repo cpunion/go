@@ -319,7 +319,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		fatal("send on synctest channel from outside bubble")
 	}
 	op := sg.coro.get()
-	if op != nil && sg.g != nil {
+	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
 		unlockf()
 		throw("runtime: channel waiter has both g and coroutine")
 	}
@@ -459,11 +459,11 @@ func closechan(c *hchan) {
 			typedmemclr(c.elemtype, sg.elem.get())
 			sg.elem.set(nil)
 		}
-		if sg.releasetime != 0 {
+		if sg.coro.get() == nil && sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
 		if sg.coro.get() != nil {
-			if sg.g != nil {
+			if !isCompactStacklessCoroSudog(sg, sg.coro.get()) && sg.g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
 			}
@@ -492,11 +492,11 @@ func closechan(c *hchan) {
 			break
 		}
 		sg.elem.set(nil)
-		if sg.releasetime != 0 {
+		if sg.coro.get() == nil && sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
 		if sg.coro.get() != nil {
-			if sg.g != nil {
+			if !isCompactStacklessCoroSudog(sg, sg.coro.get()) && sg.g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
 			}
@@ -754,7 +754,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		fatal("receive on synctest channel from outside bubble")
 	}
 	op := sg.coro.get()
-	if op != nil && sg.g != nil {
+	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
 		unlockf()
 		throw("runtime: channel waiter has both g and coroutine")
 	}
@@ -959,10 +959,13 @@ func (q *waitq) dequeue() *sudog {
 		// hasn't removed itself from the queue yet.
 		if sgp.isSelect {
 			won := false
-			if sgp.g != nil {
-				won = sgp.g.selectDone.CompareAndSwap(0, 1)
-			} else if owner := sgp.coro.get(); owner != nil {
+			if owner := sgp.coro.get(); owner != nil {
+				if !isCompactStacklessCoroSudog(sgp, owner) && sgp.g != nil {
+					throw("runtime: channel waiter has both g and coroutine")
+				}
 				won = stacklessCoroSelectTry(owner)
+			} else if sgp.g != nil {
+				won = sgp.g.selectDone.CompareAndSwap(0, 1)
 			} else {
 				throw("runtime: select waiter has no owner")
 			}

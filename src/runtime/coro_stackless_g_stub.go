@@ -52,3 +52,68 @@ func stacklessCoroExitsyscallNoP(*g) bool {
 
 //go:nosplit
 func stacklessCoroExitsyscallDone(*g) {}
+
+// sudog (pseudo-g) represents a g in a wait list, such as for sending/receiving
+// on a channel.
+//
+// sudog is necessary because the g ↔ synchronization object relation
+// is many-to-many. A g can be on many wait lists, so there may be
+// many sudogs for one g; and many gs may be waiting on the same
+// synchronization object, so there may be many sudogs for one object.
+//
+// sudogs are ordinarily allocated from a special pool. Use acquireSudog and
+// releaseSudog to allocate and free them. Stackless coroutine channel
+// operations retain their own bounded waiter; see newStacklessCoroSudog.
+// Stackless semaphore operations retain a waiter until acquisition succeeds.
+// Stackless notification operations retain a waiter until its ticket is notified.
+type sudog struct {
+	// The following fields are protected by the hchan.lock of the
+	// channel this sudog is blocking on. shrinkstack depends on
+	// this for sudogs involved in channel ops.
+
+	g *g
+
+	// coro holds an owner only for a stackless coroutine waiter.
+	// Such a waiter has no parked g; synchronization completion publishes the
+	// operation to its logical scheduler instead. The field has zero size
+	// when the coroutine experiment is disabled.
+	coro stacklessCoroSudog
+
+	next *sudog
+	prev *sudog
+
+	elem maybeTraceablePtr // data element (may point to stack)
+
+	// The following fields are never accessed concurrently.
+	// For channels, waitlink is only accessed by g.
+	// For semaphores, all fields (including the ones above)
+	// are only accessed when holding a semaRoot lock.
+
+	acquiretime int64
+	releasetime int64
+	ticket      uint32
+
+	// isSelect indicates g is participating in a select, so
+	// g.selectDone must be CAS'd to win the wake-up race.
+	isSelect bool
+
+	// success indicates whether communication over channel c
+	// succeeded. It is true if the goroutine was awoken because a
+	// value was delivered over channel c, and false if awoken
+	// because c was closed.
+	success bool
+
+	// waiters is a count of semaRoot waiting list other than head of list,
+	// clamped to a uint16 to fit in unused space.
+	// Only meaningful at the head of the list.
+	// (If we wanted to be overly clever, we could store a high 16 bits
+	// in the second entry in the list.)
+	waiters uint16
+
+	parent   *sudog             // semaRoot binary tree
+	waitlink *sudog             // g.waiting list or semaRoot
+	waittail *sudog             // semaRoot
+	c        maybeTraceableChan // channel
+}
+
+func isCompactStacklessCoroSudog(*sudog, unsafe.Pointer) bool { return false }

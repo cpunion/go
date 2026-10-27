@@ -31,7 +31,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
 	if !op.waiterActive {
 		op.waiterActive = true
 		if sg := op.waiter; sg != nil {
-			if !validReleasedStacklessCoroSudog(sg) {
+			if !validReleasedStacklessCoroSudog(op, sg) {
 				throw("runtime: invalid cached stackless coroutine channel waiter")
 			}
 			if slot != nil {
@@ -70,7 +70,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
 // waiters become garbage after their selection descriptor is cleared.
 func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
 	op := (*stacklessCoroOperation)(owner)
-	if op == nil || !validReleasedStacklessCoroSudog(sg) {
+	if op == nil || !validReleasedStacklessCoroSudog(op, sg) {
 		throw("runtime: invalid released stackless coroutine channel waiter")
 	}
 	if op.waiter == sg {
@@ -81,8 +81,10 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
 	}
 }
 
-func validReleasedStacklessCoroSudog(sg *sudog) bool {
-	return sg != nil && sg.g == nil && sg.elem.get() == nil &&
+func validReleasedStacklessCoroSudog(op *stacklessCoroOperation, sg *sudog) bool {
+	// A compact view has no g or profiling tail. Its operation occupies that
+	// space, so only full waiters may inspect g, including after owner clears.
+	return sg != nil && (isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) || sg.g == nil) && sg.elem.get() == nil &&
 		sg.coro.get() == nil && sg.next == nil && sg.prev == nil &&
 		sg.waitlink == nil && sg.c.get() == nil && !sg.isSelect
 }
@@ -164,7 +166,6 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	}
 
 	sg := newStacklessCoroSudog(op, nil)
-	sg.releasetime = 0
 	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))
@@ -228,7 +229,6 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	}
 
 	sg := newStacklessCoroSudog(op, nil)
-	sg.releasetime = 0
 	sg.elem.set(element)
 	sg.waitlink = nil
 	sg.coro.set(unsafe.Pointer(op))

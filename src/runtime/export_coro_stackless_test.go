@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -568,16 +569,17 @@ func StacklessCoroIOOperationValidForTest(token unsafe.Pointer) bool {
 func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
 	return op != nil && op.ioState() == nil &&
-		validReleasedStacklessCoroSudog(op.waiter) &&
-		unsafe.Pointer(op.waiter) == add(token,
-			unsafe.Offsetof(stacklessCoroChannelOperation{}.waiter))
+		validReleasedStacklessCoroSudog(op, op.waiter) &&
+		(isCompactStacklessCoroSudog(op.waiter, token) ||
+			unsafe.Pointer(op.waiter) == add(token,
+				unsafe.Offsetof(stacklessCoroFullChannelOperation{}.waiter)))
 }
 
 func StacklessCoroChannelOperationClearedForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
 	return op != nil &&
 		op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
-		(op.waiter == nil || validReleasedStacklessCoroSudog(op.waiter))
+		(op.waiter == nil || validReleasedStacklessCoroSudog(op, op.waiter))
 }
 
 func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
@@ -1185,7 +1187,7 @@ func (cache *StacklessCoroChannelWaiterCacheForTest) CycleAcrossGC() {
 }
 
 func (cache *StacklessCoroChannelWaiterCacheForTest) Valid() bool {
-	return validReleasedStacklessCoroSudog(cache.operation.waiter)
+	return validReleasedStacklessCoroSudog(&cache.operation, cache.operation.waiter)
 }
 
 type StacklessCoroSelectCasesForTest struct {
@@ -2025,4 +2027,147 @@ func newStacklessCoroTestScheduler() *stacklessCoroScheduler {
 	s := new(stacklessCoroScheduler)
 	lockInit(&s.lock, lockRankStacklessCoro)
 	return s
+}
+
+func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged uintptr, valid bool) {
+	full = unsafe.Sizeof(sudog{})
+	prefix = unsafe.Sizeof(stacklessCoroChannelWaiter{})
+	storage = unsafe.Sizeof(stacklessCoroChannelOperation{})
+	offsets := [...]struct{ full, prefix uintptr }{
+		{unsafe.Offsetof(sudog{}.coro), unsafe.Offsetof(stacklessCoroChannelWaiter{}.coro)},
+		{unsafe.Offsetof(sudog{}.next), unsafe.Offsetof(stacklessCoroChannelWaiter{}.next)},
+		{unsafe.Offsetof(sudog{}.prev), unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)},
+		{unsafe.Offsetof(sudog{}.elem), unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)},
+		{unsafe.Offsetof(sudog{}.c), unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)},
+		{unsafe.Offsetof(sudog{}.waitlink), unsafe.Offsetof(stacklessCoroChannelWaiter{}.waitlink)},
+		{unsafe.Offsetof(sudog{}.ticket), unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)},
+		{unsafe.Offsetof(sudog{}.isSelect), unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)},
+		{unsafe.Offsetof(sudog{}.success), unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)},
+		{unsafe.Offsetof(sudog{}.waiters), unsafe.Offsetof(stacklessCoroChannelWaiter{}.waiters)},
+	}
+	valid = full <= storage && unsafe.Offsetof(stacklessCoroChannelOperation{}.operation) == prefix
+	for _, o := range offsets {
+		valid = valid && o.full == o.prefix
+	}
+	prefixType := abi.TypeFor[stacklessCoroChannelWaiter]()
+	fullType := abi.TypeFor[sudog]()
+	allocationType := abi.TypeFor[stacklessCoroChannelOperation]()
+	for word := uintptr(0); word < prefix/unsafe.Sizeof(uintptr(0)); word++ {
+		pointer := stacklessCoroCompactPointerBitForTest(prefixType, word)
+		valid = valid && pointer == stacklessCoroCompactPointerBitForTest(fullType, word) &&
+			pointer == stacklessCoroCompactPointerBitForTest(allocationType, word)
+	}
+	// The full sudog's g slot is the compact allocation's scalar, full-width ID.
+	valid = valid && !stacklessCoroCompactPointerBitForTest(allocationType,
+		prefix/unsafe.Sizeof(uintptr(0)))
+	operationType := abi.TypeFor[stacklessCoroOperation]()
+	for word := uintptr(0); word < unsafe.Sizeof(stacklessCoroOperation{})/unsafe.Sizeof(uintptr(0)); word++ {
+		valid = valid && stacklessCoroCompactPointerBitForTest(operationType, word) ==
+			stacklessCoroCompactPointerBitForTest(allocationType,
+				prefix/unsafe.Sizeof(uintptr(0))+word)
+	}
+	op := newStacklessCoroChannelOperation()
+	base, span, _ := findObject(uintptr(unsafe.Pointer(op)), 0, 0)
+	if span == nil {
+		return full, prefix, storage, 0, false
+	}
+	charged = span.elemsize
+	if raceenabled {
+		valid = valid && base == uintptr(unsafe.Pointer(op)) && !isCompactStacklessCoroSudog(op.waiter, unsafe.Pointer(op))
+	} else {
+		valid = valid && base == uintptr(unsafe.Pointer(op.waiter)) && isCompactStacklessCoroSudog(op.waiter, unsafe.Pointer(op))
+	}
+	return
+}
+
+func stacklessCoroCompactPointerBitForTest(typ *_type, word uintptr) bool {
+	if word*unsafe.Sizeof(uintptr(0)) >= typ.PtrBytes {
+		return false
+	}
+	if typ.GCData == nil || typ.TFlag&abi.TFlagGCMaskOnDemand != 0 {
+		throw("runtime: unexpected compact waiter test pointer mask")
+	}
+	bits := *(*byte)(add(unsafe.Pointer(typ.GCData), word/8))
+	return bits&(1<<(word%8)) != 0
+}
+
+type stacklessCoroCompactPayloadForTest struct {
+	ok        bool
+	value     uint64
+	pad       [64]byte
+	finalized *atomic.Uint32
+}
+
+func stacklessCoroCompactFinalizeForTest(payload *stacklessCoroCompactPayloadForTest) {
+	payload.finalized.Add(1)
+}
+
+//go:noinline
+func stacklessCoroCompactRootForTest(waiterView bool, finalized *atomic.Uint32) unsafe.Pointer {
+	op := newStacklessCoroChannelOperation()
+	waiterPayload := &stacklessCoroCompactPayloadForTest{ok: true, value: 0x1122334455667788, finalized: finalized}
+	operationPayload := &stacklessCoroCompactPayloadForTest{ok: true, value: 0x8877665544332211, finalized: finalized}
+	SetFinalizer(waiterPayload, stacklessCoroCompactFinalizeForTest)
+	SetFinalizer(operationPayload, stacklessCoroCompactFinalizeForTest)
+	op.id = ^uint64(0) - 123
+	op.received = &operationPayload.ok
+	op.waiter.elem.set(unsafe.Pointer(waiterPayload))
+	channel := make(chan *stacklessCoroCompactPayloadForTest, 1)
+	channel <- waiterPayload
+	op.waiter.c.set(*(**hchan)(unsafe.Pointer(&channel)))
+	op.waiter.coro.set(unsafe.Pointer(op))
+	if waiterView {
+		return unsafe.Pointer(op.waiter)
+	}
+	return unsafe.Pointer(op)
+}
+
+func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer) {
+	finalized := new(atomic.Uint32)
+	token := stacklessCoroCompactRootForTest(waiterView, finalized)
+	GC()
+	GC()
+	GC()
+	op := (*stacklessCoroOperation)(token)
+	if waiterView {
+		op = (*stacklessCoroOperation)((*sudog)(token).coro.get())
+	}
+	valid := op != nil && op.id == ^uint64(0)-123 && finalized.Load() == 0
+	if !valid {
+		return false, unsafe.Pointer(finalized)
+	}
+	sg := op.waiter
+	payload := (*stacklessCoroCompactPayloadForTest)(sg.elem.get())
+	operationPayload := (*stacklessCoroCompactPayloadForTest)(unsafe.Pointer(op.received))
+	channelPointer := sg.c.get()
+	channel := *(*chan *stacklessCoroCompactPayloadForTest)(unsafe.Pointer(&channelPointer))
+	valid = payload != nil && payload.ok && payload.value == 0x1122334455667788 &&
+		operationPayload != nil && operationPayload.ok && operationPayload.value == 0x8877665544332211 &&
+		channel != nil && (<-channel) == payload
+	sg.elem.set(nil)
+	sg.c.set(nil)
+	sg.coro.clear()
+	// The full-width ID still occupies the tail where a full sudog has g.
+	valid = valid && validReleasedStacklessCoroSudog(op, sg)
+	op.received = nil
+	op.id = 0
+	return valid, unsafe.Pointer(finalized)
+}
+
+func StacklessCoroCompactChannelFinalizedForTest(token unsafe.Pointer) uint32 {
+	return (*atomic.Uint32)(token).Load()
+}
+
+func SeedStacklessCoroCompactOperationForTest(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	s := context.scheduler
+	op := newStacklessCoroChannelOperation()
+	lock(&s.lock)
+	if s.freeOperations != nil || s.freeOperationCount != 0 {
+		unlock(&s.lock)
+		throw("runtime: compact test cache already populated")
+	}
+	s.freeOperations = op
+	s.freeOperationCount = 1
+	unlock(&s.lock)
 }
