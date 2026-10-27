@@ -93,6 +93,14 @@ jobs:
           internal/buildcfg
           runtime
 
+      - name: Compile coroutine 386 layout contracts
+        env:
+          GOEXPERIMENT: coro
+          GOOS: linux
+          GOARCH: '386'
+          CGO_ENABLED: '0'
+        run: ./bin/go test -c -o "$RUNNER_TEMP/runtime-linux386.test" runtime
+
       - name: Test host fairness without asynchronous preemption
         env:
           GOEXPERIMENT: coro
