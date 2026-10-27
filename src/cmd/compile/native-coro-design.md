@@ -4582,10 +4582,11 @@ race mode, and frame sizes outside the fitting small allocation classes keep
 the existing paths.
 
 The runtime preserves the ordinary cached-frame prefix and only combines a
-cache-full reservation when no reusable task is available and the prefix's
-charged frame bytes match the requested frame size times the task limit.
-Prefixes with a different mean frame size keep the existing task-chunk
-sequence. Once a combined allocation is used, a reserved low-nibble mode in
+cache-full reservation when no reusable task or cached frame is available.
+The cache's 256 frames can have different sizes: each eligible combined
+allocation has the same allocator-class byte charge as its 48-byte task share
+and separate frame. The byte budget alone does not enable this path before
+all 256 cache slots are used. Once a combined allocation is used, a reserved low-nibble mode in
 the existing task-batch counter makes later scalar reservations allocate one
 48-byte task plus an independently packed tiny frame. This preserves scalar
 byte charges across a later mixed phase without retaining unused scalar
@@ -4599,3 +4600,6 @@ retention after partial completion. In particular a 48-byte task plus a
 and separate frame, while removing one task-chunk allocation per four such
 workers. Actual workload benefits and fixed metadata costs require separate
 measurement; this layout does not imply a universal memory or latency gain.
+Mixed prefixes also preserve this scalar allocation mode. A prefix of small
+frames can therefore be followed by larger eligible frames, up to 208 bytes,
+without changing cache bounds or creating partially used scalar-task chunks.
