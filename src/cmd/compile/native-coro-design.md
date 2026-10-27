@@ -4664,3 +4664,20 @@ contracts remain. Dedicated compact variants seed the retained waiter before
 batch receive/send close and duplicate-case select close; a forced GC runs
 while those waiters are queued. Complete frozen-source timing, allocation,
 live/retained memory and RSS observations determine acceptance separately.
+
+### Advance validated self-frame chunks locally (2026-10-27)
+
+An uncached homogeneous lineage already validates its chunk class and marker
+before taking the next frame. For an interior element, reservation computes
+the adjacent address directly. Allocation, cache lookup and chunk boundaries
+continue through the existing helper. After initialization, local await
+advances the validated marker by one, wrapping only the last chunk element;
+the locked entry path still handles zero markers with the general transition
+helper. Both four-element and eight-element chunks follow this rule.
+
+All existing running-task, ownership, initialized-child and fairness checks
+remain at their original boundaries. This changes neither frame storage nor
+the number or lifetime of allocations. Deep and shallow recursion, large
+frames, panic/Goexit cleanup, queued siblings, race fallback and pull comparison
+remain separate validation controls. Timing and instruction changes do not
+imply an allocation or retained-memory reduction.
