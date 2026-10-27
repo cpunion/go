@@ -292,6 +292,7 @@ var runtimeDecls = [...]struct {
 	{"coroGoexit", funcTag, 144},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 190},
+	{"coroTakeTypedTaskFrame", funcTag, 191},
 	{"coroTakeFrameChunk", funcTag, 191},
 	{"coroTakeSelfFrame", funcTag, 191},
 	{"coroTakeFusedFrame", funcTag, 192},

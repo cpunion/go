@@ -4569,3 +4569,33 @@ The second risk is foreign state. A direct call can remove wrapper and stack
 switch overhead, but nonblocking, blocking, and async calls require different
 scheduler and preemption protocols. Combining them into one generic
 `uintptr`-based call would lose both safety and the intended performance.
+
+
+### Typed task and frame allocation after cache saturation
+
+For eligible 64-bit pointer-bearing frames, the compiler can describe one
+private task header followed by the exact typed frame. The header contains
+five GC pointers and one scalar word; the runtime validates its size, frame
+offset and pointer bitmap before allocation. The factory/resume ABI remains
+ABI 3. Pointer-free frames, address-taken frame variables, 32-bit targets,
+race mode, and frame sizes outside the fitting small allocation classes keep
+the existing paths.
+
+The runtime preserves the ordinary cached-frame prefix and only combines a
+cache-full reservation when no reusable task is available and the prefix's
+charged frame bytes match the requested frame size times the task limit.
+Prefixes with a different mean frame size keep the existing task-chunk
+sequence. Once a combined allocation is used, a reserved low-nibble mode in
+the existing task-batch counter makes later scalar reservations allocate one
+48-byte task plus an independently packed tiny frame. This preserves scalar
+byte charges across a later mixed phase without retaining unused scalar
+slots in plain pointer-task storage. The task and scheduler sizes, free-slot
+count bits, cache limits and ordinary direct-prefix path remain unchanged.
+This allocation
+uses the existing uncached-lineage marker, so neither its task nor its frame
+can enter an idle cache. One task/frame pair per object avoids sibling-frame
+retention after partial completion. In particular a 48-byte task plus a
+32-byte frame fits the same 80 allocated bytes as the prior task-chunk share
+and separate frame, while removing one task-chunk allocation per four such
+workers. Actual workload benefits and fixed metadata costs require separate
+measurement; this layout does not imply a universal memory or latency gain.

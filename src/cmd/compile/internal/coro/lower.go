@@ -4977,10 +4977,14 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))
 	} else {
+		helper := "coroTakeFrame"
+		args := ir.Nodes{factoryCtx, factoryResume, frameSize()}
+		if allocation := explicitTaskFrameAllocationType(pos, frameType, closureVars); allocation != nil {
+			helper = "coroTakeTypedTaskFrame"
+			args = append(args, reflectdata.TypePtrAt(pos, allocation))
+		}
 		takeFrame := typecheck.Call(pos,
-			typecheck.LookupRuntime("coroTakeFrame"), ir.Nodes{
-				factoryCtx, factoryResume, frameSize(),
-			}, false)
+			typecheck.LookupRuntime(helper), args, false)
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))
 	}

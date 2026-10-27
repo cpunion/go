@@ -58,6 +58,10 @@ const (
 // allocation without changing task size or identity.
 const stacklessCoroDirectBatchedTaskCount = 8
 
+// The ninth low-nibble state records typed task/frame allocation in this lifetime.
+// Later scalar reservations keep exact individual task plus tiny-frame charges.
+const stacklessCoroTypedTaskFrameAllocationMode = stacklessCoroDirectBatchedTaskCount + 1
+
 // Start typed-frame chunks two tasks after the task-chunk boundary. The
 // stagger keeps their first-element allocation charges from occurring at the
 // same recursive depth.
@@ -279,7 +283,7 @@ type stacklessCoroScheduler struct {
 	// low three bits, ordinary-slot presence in the next bit, and free
 	// recursive slots in its high nibble.
 	overflowTaskCounts uint8
-	// batchedTaskCounts stores the ordinary direct-allocation prefix in its
+	// batchedTaskCounts stores the ordinary prefix or typed-allocation mode in its
 	// low nibble and never-used task-chunk slots in its high nibble.
 	batchedTaskCounts uint8
 	// initialRootPrivate is cleared once by the initial driver, under the
@@ -957,6 +961,9 @@ func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
 //
 //go:noinline
 func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoroTask {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode {
+		return new(stacklessCoroTask)
+	}
 	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask <
 		stacklessCoroDirectBatchedTaskCount {
 		return s.allocateBatchedTaskLocked()
