@@ -34,6 +34,16 @@ type stacklessCoroTaskFrameTestAllocation struct {
 	frame stacklessCoroTaskFrameTestFrame
 }
 
+type stacklessCoroLargeTaskFrameTestFrame struct {
+	stacklessCoroTaskFrameTestFrame
+	pad [176]byte
+}
+
+type stacklessCoroLargeTaskFrameTestAllocation struct {
+	task  stacklessCoroTask
+	frame stacklessCoroLargeTaskFrameTestFrame
+}
+
 type stacklessCoroSmallTaskFrameTestFrame struct {
 	payload *stacklessCoroTaskFramePayload
 	probe   *stacklessCoroTaskFrameProbe
@@ -122,6 +132,7 @@ type stacklessCoroTaskFrameTestRoot struct {
 	varyPrefix         bool
 	cancelReservations bool
 	phaseSwitch        bool
+	largeFrame         bool
 	invalidType        bool
 }
 
@@ -165,10 +176,20 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 				payload := &stacklessCoroTaskFramePayload{value: uint64(i) + 17, probe: probe}
 				SetFinalizer(payload, stacklessCoroTaskFrameTestFinalize)
 				frame.payload, frame.probe = payload, probe
+				if root.cancelReservations {
+					root.kept = append(root.kept, unsafe.Pointer(frame))
+					continue
+				}
 				coroSpawnFrame(ctx, unsafe.Pointer(frame), stacklessCoroSmallTaskFrameTestResume)
 				continue
 			}
 			allocationType := abi.TypeFor[stacklessCoroTaskFrameTestAllocation]()
+			frameSize := unsafe.Sizeof(stacklessCoroTaskFrameTestFrame{})
+			large := root.largeFrame && i >= stacklessCoroTaskCacheSize
+			if large {
+				allocationType = abi.TypeFor[stacklessCoroLargeTaskFrameTestAllocation]()
+				frameSize = unsafe.Sizeof(stacklessCoroLargeTaskFrameTestFrame{})
+			}
 			if root.invalidType && i == stacklessCoroTaskCacheSize {
 				allocationType = abi.TypeFor[struct {
 					header [6]unsafe.Pointer
@@ -176,15 +197,19 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 				}]()
 			}
 			frame := (*stacklessCoroTaskFrameTestFrame)(coroTakeTypedTaskFrame(ctx,
-				stacklessCoroTaskFrameTestResume, unsafe.Sizeof(stacklessCoroTaskFrameTestFrame{}),
+				stacklessCoroTaskFrameTestResume, frameSize,
 				allocationType))
 			if frame == nil {
-				frame = new(stacklessCoroTaskFrameTestFrame)
+				if large {
+					frame = &new(stacklessCoroLargeTaskFrameTestFrame).stacklessCoroTaskFrameTestFrame
+				} else {
+					frame = new(stacklessCoroTaskFrameTestFrame)
+				}
 			} else {
 				task := (*stacklessCoroContext)(ctx).scheduler.reservedTasks
 				base, span, _ := findObject(uintptr(unsafe.Pointer(frame)), 0, 0)
 				if base == uintptr(unsafe.Pointer(task)) {
-					if span.elemsize != unsafe.Sizeof(stacklessCoroTaskFrameTestAllocation{}) || task.frameSize != stacklessCoroUncachedFrameLineage {
+					if span.elemsize != unsafe.Sizeof(stacklessCoroTask{})+frameSize || task.frameSize != stacklessCoroUncachedFrameLineage {
 						probe.failed.Add(1)
 					}
 					root.combined = append(root.combined, task)
@@ -243,9 +268,17 @@ func stacklessCoroTaskFrameTestRun(root *stacklessCoroTaskFrameTestRoot) (caught
 // Exercise the real reservation/spawn/completion paths beyond the cache
 // prefix, with precise pointer maps and payloads surviving both GC and yield.
 func CheckStacklessCoroTypedTaskFramesForTest(count int, varyPrefix, cancelReservations, phaseSwitch bool) (bool, int, unsafe.Pointer) {
+	return checkStacklessCoroTypedTaskFrames(count, varyPrefix, cancelReservations, phaseSwitch, false)
+}
+
+func CheckStacklessCoroLargeTaskFramesForTest(count int, varyPrefix, cancelReservations, phaseSwitch bool) (bool, int, unsafe.Pointer) {
+	return checkStacklessCoroTypedTaskFrames(count, varyPrefix, cancelReservations, phaseSwitch, true)
+}
+
+func checkStacklessCoroTypedTaskFrames(count int, varyPrefix, cancelReservations, phaseSwitch, largeFrame bool) (bool, int, unsafe.Pointer) {
 	StacklessCoroClearNativeTaskCachesForTest()
 	probe := new(stacklessCoroTaskFrameProbe)
-	root := &stacklessCoroTaskFrameTestRoot{probe: probe, count: count, varyPrefix: varyPrefix, cancelReservations: cancelReservations, phaseSwitch: phaseSwitch}
+	root := &stacklessCoroTaskFrameTestRoot{probe: probe, count: count, varyPrefix: varyPrefix, cancelReservations: cancelReservations, phaseSwitch: phaseSwitch, largeFrame: largeFrame}
 	caught := stacklessCoroTaskFrameTestRun(root)
 	wantDone, wantSum := uint64(count), uint64(count*(count-1)/2+17*count)
 	if cancelReservations {

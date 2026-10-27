@@ -133,7 +133,7 @@ regular_names=(YieldBatch YieldEntry RecursiveYield64 RecursiveYield256
 	MutualAfterSelf4096 SelfAfterMutual4096 SelfAfterIdleGC
 	HeterogeneousFrameCacheReplacement DeferYield RecoverYield TaskSequence
 	TaskBurst100 TaskBurst1000 TaskBurst100000 TaskPark100 TaskPark1000 TaskPark100000
-	MixedParkScalarFirst100000 MixedParkPointerFirst100000
+	MixedParkScalarFirst100000 MixedParkPointerFirst100000 AlternatingTyped100000
 	ChannelRoundTrip ReadyChannelPair ReadySelect BlockedSelect
 	SleepZero SleepNanosecond SleepMicrosecond FileRead TCPRead FileWrite TCPWrite
 	FileBlockingProgress TCPBlockingProgress CScalar CAggregate CErrno CLibm

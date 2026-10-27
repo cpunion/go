@@ -158,6 +158,8 @@ expected=(
 	taskParkBursts
 	taskParkUntilReleased
 	mixedPointerWorker
+	wideMixedWorker
+	alternatingTypedTasks
 	mixedTaskParkUntilReleased
 	mixedTaskParkBursts
 	parallelSpawnWorker

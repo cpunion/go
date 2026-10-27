@@ -24,30 +24,45 @@ func TestStacklessCoroTypedTaskFrames(t *testing.T) {
 	for _, tc := range []struct {
 		name                                        string
 		varyPrefix, cancelReservations, phaseSwitch bool
+		largeFrame                                  bool
 	}{
 		{name: "matching-prefix"},
 		{name: "mixed-prefix", varyPrefix: true},
 		{name: "panic-cancels-reservations", cancelReservations: true},
 		{name: "typed-to-scalar-phase", phaseSwitch: true},
+		{name: "mixed-prefix-to-scalar-phase", varyPrefix: true, phaseSwitch: true},
+		{name: "small-prefix-largest-frame", largeFrame: true},
+		{name: "mixed-prefix-largest-frame-cancel", varyPrefix: true, largeFrame: true, cancelReservations: true},
+		{name: "mixed-prefix-largest-frame-to-scalar", varyPrefix: true, largeFrame: true, phaseSwitch: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testStacklessCoroTypedTaskFrames(t, tc.varyPrefix, tc.cancelReservations, tc.phaseSwitch)
+			testStacklessCoroTypedTaskFrames(t, tc.varyPrefix, tc.cancelReservations, tc.phaseSwitch, tc.largeFrame)
 		})
 	}
 }
 
-func testStacklessCoroTypedTaskFrames(t *testing.T, varyPrefix, cancelReservations, phaseSwitch bool) {
+func testStacklessCoroTypedTaskFrames(t *testing.T, varyPrefix, cancelReservations, phaseSwitch, largeFrame bool) {
 	t.Helper()
 	const count = 513
-	valid, combined, finalizerToken := runtime.CheckStacklessCoroTypedTaskFramesForTest(count, varyPrefix, cancelReservations, phaseSwitch)
+	check := runtime.CheckStacklessCoroTypedTaskFramesForTest
+	if largeFrame {
+		check = runtime.CheckStacklessCoroLargeTaskFramesForTest
+	}
+	valid, combined, finalizerToken := check(count, varyPrefix, cancelReservations, phaseSwitch)
 	t.Logf("combined task/frame allocations = %d of %d", combined, count)
 	if !valid {
 		t.Fatal("combined task/frame payload, completion or clearing contract failed")
 	}
-	if unsafe.Sizeof(uintptr(0)) == 8 && !race.Enabled && !varyPrefix && combined == 0 {
-		t.Fatal("no actual combined allocation beyond the cache prefix")
+	if unsafe.Sizeof(uintptr(0)) == 8 && !race.Enabled {
+		want := count - 256
+		if phaseSwitch {
+			want -= (count - 256) / 4
+		}
+		if combined != want {
+			t.Fatalf("combined allocations = %d, want %d beyond the full mixed cache prefix", combined, want)
+		}
 	}
-	if (unsafe.Sizeof(uintptr(0)) != 8 || race.Enabled || varyPrefix) && combined != 0 {
+	if (unsafe.Sizeof(uintptr(0)) != 8 || race.Enabled) && combined != 0 {
 		t.Fatal("combined allocation used on an excluded target/mode")
 	}
 	deadline := time.Now().Add(10 * time.Second)
