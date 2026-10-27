@@ -1118,11 +1118,11 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := 8 * ptrSize
-	wantChannel := uintptr(176)
+	wantChannel := uintptr(136)
 	wantIO := uintptr(176)
 	if ptrSize == 4 {
 		want = 11 * ptrSize
-		wantChannel = 112
+		wantChannel = 84
 		wantIO = 100
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
@@ -7823,5 +7823,185 @@ func TestStacklessCoroIOOriginImmediateChannel(t *testing.T) {
 				t.Fatal("IO-origin immediate channel lost reuse, payload, cleanup or allocated a waiter")
 			}
 		})
+	}
+}
+
+func TestStacklessCoroCompactChannelOperation(t *testing.T) {
+	full, prefix, storage, charged, valid := runtime.StacklessCoroCompactChannelLayoutForTest()
+	if !valid {
+		t.Fatalf("compact prefix layout: full=%d prefix=%d storage=%d charged=%d", full, prefix, storage, charged)
+	}
+	want := uintptr(144)
+	if unsafe.Sizeof(uintptr(0)) == 4 {
+		want = 96
+	}
+	if race.Enabled {
+		want = 176
+		if unsafe.Sizeof(uintptr(0)) == 4 {
+			want = 112
+		}
+	}
+	if charged != want {
+		t.Fatalf("channel allocation charge=%d,want %d", charged, want)
+	}
+	for _, view := range []bool{false, true} {
+		valid, token := runtime.StacklessCoroCompactChannelGCForTest(view)
+		if !valid {
+			t.Fatalf("compact channel GC/root clearing failed,waiterView=%v", view)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for runtime.StacklessCoroCompactChannelFinalizedForTest(token) != 2 && time.Now().Before(deadline) {
+			runtime.GC()
+			time.Sleep(time.Millisecond)
+		}
+		if n := runtime.StacklessCoroCompactChannelFinalizedForTest(token); n != 2 {
+			t.Fatalf("compact payload finalizers=%d,want2,waiterView=%v", n, view)
+		}
+	}
+}
+
+func TestStacklessCoroCompactSelectBlockedSecond(t *testing.T) {
+	first := make(chan int)
+	second := make(chan int)
+	var disabled chan int
+	value := -1
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{first, disabled, second},
+		[]unsafe.Pointer{
+			unsafe.Pointer(&value), unsafe.Pointer(&value), unsafe.Pointer(&value),
+		}, 0)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			firstSend, firstRecv, firstLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(first)
+			secondSend, secondRecv, secondLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if firstSend == 0 && firstRecv == 1 && firstLogical == 1 &&
+				secondSend == 0 && secondRecv == 1 && secondLogical == 1 {
+				second <- 61
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("select waiters were not queued: first=(%d,%d,%d) second=(%d,%d,%d)",
+					firstSend, firstRecv, firstLogical,
+					secondSend, secondRecv, secondLogical)
+				close(first)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			runtime.SeedStacklessCoroCompactOperationForTest(ctx)
+			state = 1
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 2 || !received || value != 61 {
+				t.Fatalf("blocked select = (%d, %t, %d), want (2, true, 61)",
+					chosen, received, value)
+			}
+			for _, channel := range []chan int{first, second} {
+				send, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if send != 0 || recv != 0 || logical != 0 {
+					t.Fatalf("select loser remained queued: (%d, %d, %d)",
+						send, recv, logical)
+				}
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	<-peerDone
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
+	}
+}
+
+func TestStacklessCoroCompactSelectBlockedFirst(t *testing.T) {
+	first := make(chan int)
+	second := make(chan int)
+	var disabled chan int
+	value := -1
+	chosen := -1
+	received := false
+	cases := runtime.NewStacklessCoroSelectCasesForTest(
+		[]any{first, disabled, second},
+		[]unsafe.Pointer{
+			unsafe.Pointer(&value), unsafe.Pointer(&value), unsafe.Pointer(&value),
+		}, 0)
+	baselineOperations := runtime.StacklessCoroOperationCountForTest()
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			firstSend, firstRecv, firstLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(first)
+			secondSend, secondRecv, secondLogical :=
+				runtime.StacklessCoroChannelWaitersForTest(second)
+			if firstSend == 0 && firstRecv == 1 && firstLogical == 1 &&
+				secondSend == 0 && secondRecv == 1 && secondLogical == 1 {
+				first <- 61
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("select waiters were not queued: first=(%d,%d,%d) second=(%d,%d,%d)",
+					firstSend, firstRecv, firstLogical,
+					secondSend, secondRecv, secondLogical)
+				close(first)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	state := 0
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		switch state {
+		case 0:
+			runtime.SeedStacklessCoroCompactOperationForTest(ctx)
+			state = 1
+			runtime.StartStacklessCoroSelectForTest(ctx, cases, true,
+				&chosen, &received)
+			return runtime.StacklessCoroActionWait
+		case 1:
+			if chosen != 0 || !received || value != 61 {
+				t.Fatalf("blocked select = (%d, %t, %d), want (0, true, 61)",
+					chosen, received, value)
+			}
+			for _, channel := range []chan int{first, second} {
+				send, recv, logical :=
+					runtime.StacklessCoroChannelWaitersForTest(channel)
+				if send != 0 || recv != 0 || logical != 0 {
+					t.Fatalf("select loser remained queued: (%d, %d, %d)",
+						send, recv, logical)
+				}
+			}
+			state = 2
+			return runtime.StacklessCoroActionComplete
+		default:
+			return runtime.StacklessCoroActionInvalid
+		}
+	})
+	<-peerDone
+	if operations := runtime.StacklessCoroOperationCountForTest(); operations != baselineOperations {
+		t.Fatalf("operation count = %d, want %d",
+			operations, baselineOperations)
 	}
 }
