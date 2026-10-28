@@ -13,8 +13,8 @@ import "unsafe"
 var (
 	_ [44 - unsafe.Sizeof(stacklessCoroOperation{})]byte
 	_ [unsafe.Sizeof(stacklessCoroOperation{}) - 44]byte
-	_ [80 - unsafe.Sizeof(stacklessCoroChannelOperation{})]byte
-	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - 80]byte
+	_ [72 - unsafe.Sizeof(stacklessCoroChannelOperation{})]byte
+	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - 72]byte
 	_ [112 - unsafe.Sizeof(stacklessCoroFullChannelOperation{})]byte
 	_ [unsafe.Sizeof(stacklessCoroFullChannelOperation{}) - 112]byte
 	_ [100 - unsafe.Sizeof(stacklessCoroIOOperation{})]byte

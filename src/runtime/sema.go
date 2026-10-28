@@ -326,7 +326,7 @@ func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
 		// from the blocked goroutine when checking for goroutine leaks.
 		s.g.waiting = s
 	}
-	s.elem.set(unsafe.Pointer(addr))
+	s.setFullElem(unsafe.Pointer(addr))
 	s.next = nil
 	s.prev = nil
 	s.waiters = 0
@@ -334,7 +334,7 @@ func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
 	var last *sudog
 	pt := &root.treap
 	for t := *pt; t != nil; t = *pt {
-		if uintptr(unsafe.Pointer(addr)) == t.elem.uintptr() {
+		if uintptr(unsafe.Pointer(addr)) == t.elemUintptr() {
 			// Already have addr in list.
 			if lifo {
 				// Substitute s in t's place in treap.
@@ -380,7 +380,7 @@ func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
 			return
 		}
 		last = t
-		if uintptr(unsafe.Pointer(addr)) < t.elem.uintptr() {
+		if uintptr(unsafe.Pointer(addr)) < t.elemUintptr() {
 			pt = &t.prev
 		} else {
 			pt = &t.next
@@ -427,11 +427,11 @@ func (root *semaRoot) dequeue(addr *uint32) (found *sudog, now, tailtime int64) 
 	s := *ps
 
 	for ; s != nil; s = *ps {
-		if uintptr(unsafe.Pointer(addr)) == s.elem.uintptr() {
+		if uintptr(unsafe.Pointer(addr)) == s.elemUintptr() {
 			goto Found
 		}
 
-		if uintptr(unsafe.Pointer(addr)) < s.elem.uintptr() {
+		if uintptr(unsafe.Pointer(addr)) < s.elemUintptr() {
 			ps = &s.prev
 		} else {
 			ps = &s.next
@@ -500,7 +500,7 @@ Found:
 		s.g.waiting = nil
 	}
 	s.parent = nil
-	s.elem.set(nil)
+	s.setFullElem(nil)
 	s.next = nil
 	s.prev = nil
 	s.ticket = 0
@@ -621,7 +621,7 @@ func notifyListWait(l *notifyList, t uint32) {
 	s.g = getg()
 	// Storing this pointer so that we can trace the condvar address
 	// from the blocked goroutine when checking for goroutine leaks.
-	s.elem.set(unsafe.Pointer(l))
+	s.setFullElem(unsafe.Pointer(l))
 	s.g.waiting = s
 	s.ticket = t
 	s.releasetime = 0
@@ -643,7 +643,7 @@ func notifyListWait(l *notifyList, t uint32) {
 	// Goroutine is no longer blocked. Clear up its waiting pointer,
 	// and clean up the sudog before releasing it.
 	s.g.waiting = nil
-	s.elem.set(nil)
+	s.setFullElem(nil)
 	releaseSudog(s)
 }
 

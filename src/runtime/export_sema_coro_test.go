@@ -48,7 +48,7 @@ func SemaphoreWaitersStacklessCoroForTest(addr *uint32) (ordinary, logical int) 
 	lockWithRank(&root.lock, lockRankRoot)
 	defer unlock(&root.lock)
 	for s := root.treap; s != nil; {
-		if s.elem.get() == unsafe.Pointer(addr) {
+		if s.getElem() == unsafe.Pointer(addr) {
 			for ; s != nil; s = s.waitlink {
 				if s.coro.get() == nil {
 					ordinary++
@@ -61,7 +61,7 @@ func SemaphoreWaitersStacklessCoroForTest(addr *uint32) (ordinary, logical int) 
 			}
 			return
 		}
-		if uintptr(unsafe.Pointer(addr)) < s.elem.uintptr() {
+		if uintptr(unsafe.Pointer(addr)) < s.elemUintptr() {
 			s = s.prev
 		} else {
 			s = s.next

@@ -117,3 +117,64 @@ type sudog struct {
 }
 
 func isCompactStacklessCoroSudog(*sudog, unsafe.Pointer) bool { return false }
+
+func adjustsudogs(gp *g, adjinfo *adjustinfo) {
+	// the data elements pointed to by a SudoG structure
+	// might be in the stack.
+	for s := gp.waiting; s != nil; s = s.waitlink {
+		adjustpointer(adjinfo, unsafe.Pointer(&s.elem.vu))
+		adjustpointer(adjinfo, unsafe.Pointer(&s.elem.vp))
+	}
+}
+
+// The disabled experiment keeps the original conditional-pointer layout and
+// the same inlinable accesses to its stored addresses.
+//
+//go:nosplit
+func (sg *sudog) getElem() unsafe.Pointer { return sg.elem.get() }
+
+//go:nosplit
+func (sg *sudog) setElem(v unsafe.Pointer) { sg.elem.set(v) }
+
+//go:nosplit
+func (sg *sudog) getChannel() *hchan { return sg.c.get() }
+
+//go:nosplit
+func (sg *sudog) setChannel(c *hchan) { sg.c.set(c) }
+
+//go:nosplit
+func (sg *sudog) elemUintptr() uintptr { return sg.elem.uintptr() }
+
+//go:nosplit
+func (sg *sudog) channelUintptr() uintptr { return sg.c.uintptr() }
+
+//go:nosplit
+func (sg *sudog) setElemUntraceable() { sg.elem.setUntraceable() }
+
+//go:nosplit
+func (sg *sudog) setElemTraceable() { sg.elem.setTraceable() }
+
+//go:nosplit
+func (sg *sudog) setChannelUntraceable() { sg.c.setUntraceable() }
+
+//go:nosplit
+func (sg *sudog) setChannelTraceable() { sg.c.setTraceable() }
+
+// Full-only accesses are used where the caller already owns a complete sudog.
+// Native channel accesses are used only with a live coroutine owner; channel
+// waiters never enter g.waiting and never need untraceable address mirrors.
+//
+//go:nosplit
+func (sg *sudog) getFullElem() unsafe.Pointer { return sg.elem.get() }
+
+//go:nosplit
+func (sg *sudog) setFullElem(v unsafe.Pointer) { sg.elem.set(v) }
+
+//go:nosplit
+func (sg *sudog) getNativeElem() unsafe.Pointer { return sg.elem.get() }
+
+//go:nosplit
+func (sg *sudog) setNativeElem(v unsafe.Pointer) { sg.elem.set(v) }
+
+//go:nosplit
+func (sg *sudog) setNativeChannel(c *hchan) { sg.c.set(c) }

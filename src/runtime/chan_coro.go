@@ -82,11 +82,15 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
 }
 
 func validReleasedStacklessCoroSudog(op *stacklessCoroOperation, sg *sudog) bool {
-	// A compact view has no g or profiling tail. Its operation occupies that
-	// space, so only full waiters may inspect g, including after owner clears.
-	return sg != nil && (isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) || (sg.g == nil && sg.waitlink == nil)) && sg.elem.get() == nil &&
-		sg.coro.get() == nil && sg.next == nil && sg.prev == nil &&
-		sg.c.get() == nil && !sg.isSelect
+	if sg == nil || sg.coro.get() != nil || sg.next != nil || sg.prev != nil || sg.isSelect || sg.elem != nil || sg.c != nil {
+		return false
+	}
+	// The explicit operation identifies compact storage even after owner clears.
+	// In that case, inspect only the prefix; full address mirrors overlap op.
+	if isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) {
+		return true
+	}
+	return sg.g == nil && sg.waitlink == nil && sg.elemAddr == 0 && sg.chanAddr == 0
 }
 
 // tryStacklessCoroChanSend completes a ready send on the current executor.
@@ -166,10 +170,10 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	}
 
 	sg := newStacklessCoroSudog(op, nil)
-	sg.elem.set(element)
 	sg.coro.set(unsafe.Pointer(op))
+	sg.setNativeElem(element)
 	sg.isSelect = false
-	sg.c.set(c)
+	sg.setNativeChannel(c)
 	c.sendq.enqueue(sg)
 	if raceenabled {
 		racerelease(unsafe.Pointer(op))
@@ -228,10 +232,10 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	}
 
 	sg := newStacklessCoroSudog(op, nil)
-	sg.elem.set(element)
 	sg.coro.set(unsafe.Pointer(op))
+	sg.setNativeElem(element)
 	sg.isSelect = false
-	sg.c.set(c)
+	sg.setNativeChannel(c)
 	c.recvq.enqueue(sg)
 	if c.timer != nil {
 		blockTimerChan(c)

@@ -37,7 +37,7 @@ func coroNotifyListWait(ctx, list unsafe.Pointer, t uint32, state *unsafe.Pointe
 	w := (*stacklessCoroNotifyWaiter)(*state)
 	if w != nil {
 		if w.scheduler != s || w.task != task || w.list != l || w.waiter.ticket != t ||
-			w.waiter.g != nil || w.waiter.next != nil || w.waiter.elem.get() != nil ||
+			w.waiter.g != nil || w.waiter.next != nil || w.waiter.getElem() != nil ||
 			w.waiter.coro.get() != unsafe.Pointer(w) || !less(t, atomic.Load(&l.notify)) {
 			throw("runtime: invalid resumed stackless coroutine notification wait")
 		}
@@ -84,7 +84,7 @@ func (w *stacklessCoroNotifyWaiter) park(state *unsafe.Pointer) bool {
 		w.finish(state)
 		return false
 	}
-	w.waiter.elem.set(unsafe.Pointer(l))
+	w.waiter.setElem(unsafe.Pointer(l))
 	if l.tail == nil {
 		l.head = &w.waiter
 	} else {
@@ -118,7 +118,7 @@ func readyStacklessCoroNotify(sg *sudog) {
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
-	sg.elem.set(nil)
+	sg.setElem(nil)
 	s, task := w.scheduler, w.task
 	wake := s.wake
 	lock(&s.lock)

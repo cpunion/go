@@ -2110,11 +2110,11 @@ func stacklessCoroCompactRootForTest(waiterView bool, finalized *atomic.Uint32) 
 	SetFinalizer(operationPayload, stacklessCoroCompactFinalizeForTest)
 	op.id = ^uint64(0) - 123
 	op.received = &operationPayload.ok
-	op.waiter.elem.set(unsafe.Pointer(waiterPayload))
+	op.waiter.coro.set(unsafe.Pointer(op))
+	op.waiter.setNativeElem(unsafe.Pointer(waiterPayload))
 	channel := make(chan *stacklessCoroCompactPayloadForTest, 1)
 	channel <- waiterPayload
-	op.waiter.c.set(*(**hchan)(unsafe.Pointer(&channel)))
-	op.waiter.coro.set(unsafe.Pointer(op))
+	op.waiter.setNativeChannel(*(**hchan)(unsafe.Pointer(&channel)))
 	if waiterView {
 		return unsafe.Pointer(op.waiter)
 	}
@@ -2136,15 +2136,17 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 		return false, unsafe.Pointer(finalized)
 	}
 	sg := op.waiter
-	payload := (*stacklessCoroCompactPayloadForTest)(sg.elem.get())
+	// A live owner must never be accepted as a released, reusable waiter.
+	valid = valid && !validReleasedStacklessCoroSudog(op, sg)
+	payload := (*stacklessCoroCompactPayloadForTest)(sg.getElem())
 	operationPayload := (*stacklessCoroCompactPayloadForTest)(unsafe.Pointer(op.received))
-	channelPointer := sg.c.get()
+	channelPointer := sg.getChannel()
 	channel := *(*chan *stacklessCoroCompactPayloadForTest)(unsafe.Pointer(&channelPointer))
 	valid = payload != nil && payload.ok && payload.value == 0x1122334455667788 &&
 		operationPayload != nil && operationPayload.ok && operationPayload.value == 0x8877665544332211 &&
 		channel != nil && (<-channel) == payload
-	sg.elem.set(nil)
-	sg.c.set(nil)
+	sg.setNativeElem(nil)
+	sg.setNativeChannel(nil)
 	sg.coro.clear()
 	// The full-width ID still occupies the tail where a full sudog has g.
 	valid = valid && validReleasedStacklessCoroSudog(op, sg)
