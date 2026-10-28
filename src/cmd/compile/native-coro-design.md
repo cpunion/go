@@ -4727,3 +4727,21 @@ Queued-frame GC and terminal cleanup retain their existing pointer and header
 initialization. Frame layout, allocation classes, fresh-slot markers, ownership,
 cache capacity and fallback budgets remain unchanged. This removes redundant
 writes without reducing frame extent or allocation counts.
+
+### Bound declared invocation-local storage (2026-10-28)
+
+Locals confined to one resume invocation can remain on its native stack.
+Their combined declared storage now has a conservative budget of one quarter
+of StackNosplitBase, including pointer-width alignment for each local. Larger
+functions retain their ordinary Go body before any native frame rewriting;
+unsupported dependencies propagate through the existing factory proof.
+
+This prevents large suffix arrays, structs, combined locals and inlined locals
+from reaching the linker as oversized nosplit resumes. Small suffix locals
+still use their existing stack representation. Source locals retained in the
+persistent frame, including address-taken storage, are excluded from this
+budget. The run-to-completion foreign path also keeps its existing storage.
+The independent aggregate-call and assertion budgets remain in force. This
+bounds declared invocation locals; it does not prove arbitrary callees' stack
+requirements or all temporaries introduced later by Walk/SSA. Outlining or
+rematerializing large arrays must preserve these separate stack constraints.
