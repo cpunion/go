@@ -116,6 +116,7 @@ type lowerCandidate struct {
 	frameType        *types.Type
 	resumePC         *ir.Name
 	frameChunkLength int64
+	entryZeroed      map[*ir.Name]bool
 	selfAwait        bool
 	selfSpawn        bool
 	heapLocals       map[*ir.Name]bool
@@ -3493,6 +3494,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		panic(fmt.Sprintf("unexpected coroutine lowering boundary %s", stmt.Op()))
 	}
 	entryState := lowerStatements(fn.Body, completeState)
+	candidate.entryZeroed = entryZeroedFrameLocals(states[entryState].body)
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
 		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
@@ -4930,7 +4932,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	zeroLocals := zeroInitializedFrameLocals(declarations)
 	var zeroBytes int64
 	for _, variable := range closureVars {
-		if zeroLocals[variable.Outer.Canonical()] && variable.Type().IsArray() {
+		outer := variable.Outer.Canonical()
+		if zeroLocals[outer] && variable.Type().IsArray() &&
+			(!candidate.entryZeroed[outer] || rootResultValueFields[outerFields[outer]]) {
 			zeroBytes += variable.Type().Size()
 		}
 	}
@@ -5040,6 +5044,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
 		resultField := rootResultTargets[variable.Outer.Canonical()]
 		if resultField == nil {
+			if !rootResultValueFields[fields[i]] && zeroLocals[variable.Outer.Canonical()] && candidate.entryZeroed[variable.Outer.Canonical()] {
+				// The initial resume state clears this pointer-free array
+				// before any other work. Keep that source clear and avoid
+				// repeating it when the factory obtains reused storage.
+				continue
+			}
 			value := ir.Node(variable.Outer)
 			if zeroLocals[variable.Outer.Canonical()] {
 				value = ir.NewZero(pos, fields[i].Type)

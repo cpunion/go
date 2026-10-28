@@ -115,12 +115,55 @@ func largeArgument(seed [1024]byte) int {
 	return int(seed[0]) + int(seed[1023])
 }
 
+// These keep factory initialization: their first array clear is outside the
+// initial straight-line state, or its initializer performs other work.
+func afterBoundary(n int) int {
+	runtime.Gosched()
+	var data [5120]byte
+	if sum(&data) != 0 { panic("late zero") }
+	data[0] = byte(n)
+	runtime.Gosched()
+	return sum(&data)
+}
+
+func inBranch(n int) int {
+	if n >= 0 {
+		var data [5120]byte
+		if sum(&data) != 0 { panic("branch zero") }
+		data[0] = byte(n)
+		runtime.Gosched()
+		return sum(&data)
+	}
+	return -1
+}
+
+var zeroCalls int
+func zeroByte() byte { zeroCalls++; return 0 }
+func effectful(n int) int {
+	var data = [5120]byte{zeroByte()}
+	if sum(&data) != 0 || zeroCalls != n { panic("effectful zero") }
+	data[0] = byte(n)
+	runtime.Gosched()
+	return sum(&data)
+}
+
+func arrayResult(n int) (out [5120]byte) {
+	runtime.Gosched()
+	if sum(&out) != 0 { panic("array result zero") }
+	out[0] = byte(n)
+	return
+}
+
 func main() {
 	go collect()
 	for i := 0; i < 20; i++ {
 		if recursive(64) != 4225 { panic("recursive result") }
 		if argument([16]int{7: i}) != i { panic("array argument") }
 		if pointers(&i) != i { panic("pointer result") }
+		if afterBoundary(i) != i || inBranch(i) != i { panic("fallback local") }
+		if effectful(i+1) != i+1 { panic("initializer effect") }
+		result := arrayResult(i)
+		if result[0] != byte(i) || result[5119] != 0 { panic("array result") }
 	}
 	for _, n := range []int{37, 38, 44, 49, 91, 17, 96, 38, 91} {
 		if recursive(n) != (n+1)*(n+1) { panic("large tail result") }

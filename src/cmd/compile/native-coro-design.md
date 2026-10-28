@@ -4709,3 +4709,21 @@ base/interior-root, payload-finalizer and live-owner rejection checks protect
 both layouts. Complete fixed-source comparisons retain throughput, instruction,
 allocation, live/returned/GC-retained heap, Go-stack and process-RSS observations
 separately; a smaller object does not establish a universal performance gain.
+
+### Avoid duplicate entry array clears (2026-10-28)
+
+A factory may omit clearing a pointer-free local array when the initial resume
+state already clears it in its straight-line prefix. The proof accepts only
+zero assignments to automatic locals, with optional declaration markers for
+the same variable. Any other initializer, read, address publication, call,
+branch, partial write or nonzero assignment ends the proof. It does not infer
+dominance across states or control-flow joins.
+
+The existing factory-local analysis must also prove that construction needs
+only the zero value. Parameters, result storage and arrays containing pointers
+retain factory initialization. Pointer-free fields may contain reused bytes
+until first resume; the original source clear remains before any observation.
+Queued-frame GC and terminal cleanup retain their existing pointer and header
+initialization. Frame layout, allocation classes, fresh-slot markers, ownership,
+cache capacity and fallback budgets remain unchanged. This removes redundant
+writes without reducing frame extent or allocation counts.

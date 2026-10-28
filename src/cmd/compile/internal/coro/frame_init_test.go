@@ -57,6 +57,64 @@ func TestZeroInitializedFrameLocals(t *testing.T) {
 	}
 }
 
+func TestEntryZeroedFrameLocals(t *testing.T) {
+	prepareLowerTest(t)
+	for _, mode := range []string{"zero", "implicit-zero", "declaration-init", "other-declaration", "second-zero", "pointer", "scalar", "parameter", "read", "partial-write", "address", "branch", "call", "init", "rhs-init", "nonzero", "late-zero"} {
+		t.Run(mode, func(t *testing.T) {
+			fn := testFunc("entryFrameLocals")
+			fn.DeclareParams(true)
+			typ := types.NewArray(types.Types[types.TUINT8], 5120)
+			if mode == "pointer" {
+				typ = types.NewArray(types.NewPtr(types.Types[types.TINT]), 4)
+			}
+			if mode == "scalar" {
+				typ = types.Types[types.TINT]
+			}
+			local := typecheck.TempAt(src.NoXPos, fn, typ)
+			if mode == "parameter" {
+				local.Class = ir.PPARAM
+			}
+			other := typecheck.TempAt(src.NoXPos, fn, typ)
+			zero := ir.NewAssignStmt(src.NoXPos, local, ir.NewZero(src.NoXPos, typ))
+			body := ir.Nodes{zero}
+			switch mode {
+			case "implicit-zero":
+				zero.Y = nil
+			case "declaration-init":
+				zero.PtrInit().Append(ir.NewDecl(src.NoXPos, ir.ODCL, local))
+			case "other-declaration":
+				zero.PtrInit().Append(ir.NewDecl(src.NoXPos, ir.ODCL, other))
+			case "second-zero":
+				body = append(ir.Nodes{ir.NewAssignStmt(src.NoXPos, other, ir.NewZero(src.NoXPos, typ))}, body...)
+			case "read":
+				body = append(ir.Nodes{ir.NewAssignStmt(src.NoXPos, other, local)}, body...)
+			case "partial-write":
+				index := ir.NewIndexExpr(src.NoXPos, local, ir.NewInt(src.NoXPos, 0))
+				body = append(ir.Nodes{ir.NewAssignStmt(src.NoXPos, index, ir.NewInt(src.NoXPos, 0))}, body...)
+			case "address":
+				pointer := typecheck.TempAt(src.NoXPos, fn, types.NewPtr(typ))
+				body = append(ir.Nodes{ir.NewAssignStmt(src.NoXPos, pointer, typecheck.NodAddr(local))}, body...)
+			case "branch":
+				body = ir.Nodes{ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), body, nil)}
+			case "call":
+				body = append(ir.Nodes{newLowerTestCall(fn)}, body...)
+			case "init":
+				zero.PtrInit().Append(ir.NewAssignStmt(src.NoXPos, other, local))
+			case "rhs-init":
+				zero.Y.(ir.InitNode).PtrInit().Append(ir.NewAssignStmt(src.NoXPos, other, local))
+			case "nonzero":
+				zero.Y = other
+			case "late-zero":
+				body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, other, local), zero}
+			}
+			want := mode == "zero" || mode == "implicit-zero" || mode == "declaration-init" || mode == "second-zero"
+			if got := entryZeroedFrameLocals(body)[local]; got != want {
+				t.Fatalf("entryZeroedFrameLocals includes local = %t, want %t", got, want)
+			}
+		})
+	}
+}
+
 func TestExplicitFrameArrayInitializer(t *testing.T) {
 	prepareLowerTest(t)
 	oldTarget, oldLocalPkg := typecheck.Target, types.LocalPkg
@@ -106,7 +164,22 @@ func TestExplicitFrameArrayInitializer(t *testing.T) {
 			}
 		})
 	}
-	if initializers != 1 {
-		t.Fatalf("direct array field zero initializers = %d, want 1", initializers)
+	if initializers != 0 {
+		t.Fatalf("direct array field zero initializers = %d, want 0 before the source entry clear", initializers)
+	}
+	resumeZeros := 0
+	for _, resume := range typecheck.Target.Funcs {
+		if resume.ClosureParent == nil || resume.ClosureParent.Sym() != resumeFactorySymbol(fn) {
+			continue
+		}
+		ir.VisitList(resume.Body, func(node ir.Node) {
+			if assignment, ok := node.(*ir.AssignStmt); ok &&
+				assignment.X.Type().IsArray() && assignment.Y != nil && ir.IsZero(assignment.Y) {
+				resumeZeros++
+			}
+		})
+	}
+	if resumeZeros != 1 {
+		t.Fatalf("source resume array clears = %d, want 1", resumeZeros)
 	}
 }
