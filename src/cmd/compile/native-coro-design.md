@@ -4780,3 +4780,20 @@ dispatch costs. Smaller frames can admit more individually cached tasks before
 chunking, so cold allocation events may increase even when cold bytes and warm
 allocation traffic decrease. Performance and retained memory require separate
 measurements.
+
+### Prefer a task boundary for callers of readonly array lineages (2026-10-28)
+
+When an admitted readonly array function also has a native caller, that incoming
+call uses an ordinary task boundary. Its serial self-awaits can then use the
+small-frame loop and one complete typed array root. Every incoming heterogeneous
+fused await and its matching frame request must be removed together; the public
+array factory deliberately does not consume a fused request. Other caller
+transitions, the callee's self-awaits and the public ABI3 remain unchanged.
+
+This trades an ordinary task entry for avoiding one full array per recursive
+invocation. It requires the same conservative array proof, no deferred cleanup
+and no self-spawn. Each independent task still owns its own complete root; this
+does not batch independent task lifetimes or broaden the array proof. Imported,
+ordinary, race and synctest callers retain their existing entry and fallback
+semantics. Cold allocation event counts and extra entry cost remain separate
+from byte savings, warm throughput and retained memory.

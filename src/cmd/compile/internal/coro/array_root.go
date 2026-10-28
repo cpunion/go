@@ -33,6 +33,36 @@ type rootArrayLowering struct {
 	snapshot *ir.Name
 }
 
+// preferRootArrayFrames chooses an ordinary task boundary when entering a
+// qualifying serial array lineage from another function. That boundary lets
+// all of its self-awaits use small frames instead of keeping an entire array
+// in every heterogeneous fused frame. Remove the caller's request as well as
+// its fused await: the public full-root factory does not consume a fusion
+// request. Exported factories and imported callers retain the ordinary ABI3
+// task path.
+func preferRootArrayFrames(candidates map[*ir.Func]*lowerCandidate) {
+	roots := make(map[*ir.Func]bool)
+	for fn, candidate := range candidates {
+		if candidate.factoryABI == FactoryABI3 && candidate.fusedSelf &&
+			candidate.fusedResume && len(candidate.defers) == 0 && !candidate.selfSpawn &&
+			planRootArray(candidate.function) != nil {
+			roots[fn] = true
+		}
+	}
+	for parentFn, parent := range candidates {
+		for call := range parent.fusedAwaits {
+			child := edgeForCall(parent.function, call).Callee
+			if child != parentFn && roots[child] {
+				delete(parent.fusedAwaits, call)
+				delete(parent.fusedRequests, call)
+			}
+		}
+	}
+	for fn := range roots {
+		candidates[fn].fusedResume = false
+	}
+}
+
 func prepareRootArray(candidate *lowerCandidate) {
 	if !candidate.localSelfFrameLoop() || candidate.selfSpawn {
 		return

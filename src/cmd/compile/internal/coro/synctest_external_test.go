@@ -48,7 +48,7 @@ func TestSynctestFallback(t *testing.T) {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			native := config.experiment == "coro" && config.name != "race"
-			names := []string{"sleep", "send", "exchange", "recursive", "arrayRootRecursive", "variadic", "recoverValue", "counter.result", "exit"}
+			names := []string{"sleep", "send", "exchange", "recursive", "arrayRootRecursive", "arrayRootCaller", "variadic", "recoverValue", "counter.result", "exit"}
 			if testenv.HasCGO() {
 				names = append(names, "foreign")
 			}
