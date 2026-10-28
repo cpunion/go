@@ -4681,3 +4681,31 @@ the number or lifetime of allocations. Deep and shallow recursion, large
 frames, panic/Goexit cleanup, queued siblings, race fallback and pull comparison
 remain separate validation controls. Timing and instruction changes do not
 imply an allocation or retained-memory reduction.
+
+### Keep native channel payloads in the compact prefix (2026-10-28)
+
+The channel prefix stores one traced element pointer and one traced channel
+pointer. Full-only raw address mirrors move to the full sudog tail. The shared
+prefix is 48 bytes on 64-bit targets; adding the unchanged 64-byte operation
+uses the exact 112-byte allocator class. Full waiters remain 112 bytes, race
+storage remains 176 bytes, and the disabled experiment retains its original
+104-byte full waiter layout. On 32-bit targets the compact object is 72 bytes
+but still uses the 80-byte allocator class; no 32-bit allocation saving follows.
+
+Ordinary goroutines retain raw addresses as the source of truth while leak
+profiling temporarily hides traced references. Stack copying adjusts both the
+raw and traced element addresses. Full semaphore queues also retain their raw
+address ordering. Native channel waiters never enter g.waiting and access only
+the traced prefix, using the channel code's existing native-owner dispatch.
+Enqueue installs the owner before writing the payload; completion and select
+cleanup clear payloads before clearing the owner. No persistent kind flag,
+pointer tag, truncated identity or new cache capacity is needed.
+
+Released validation checks both traced payloads and uses the explicit operation
+relation before inspecting a full tail. The full-only fallback compares the raw
+address mirrors directly. Keeping this small guard inline avoids repeated calls
+in waiter acquisition and release. Shared-offset, allocation-extent, pointer-map,
+base/interior-root, payload-finalizer and live-owner rejection checks protect
+both layouts. Complete fixed-source comparisons retain throughput, instruction,
+allocation, live/returned/GC-retained heap, Go-stack and process-RSS observations
+separately; a smaller object does not establish a universal performance gain.

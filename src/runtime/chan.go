@@ -261,11 +261,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	// No stack splits between assigning elem and enqueuing mysg
 	// on gp.waiting where copystack can find it.
-	mysg.elem.set(ep)
+	mysg.setFullElem(ep)
 	mysg.waitlink = nil
 	mysg.g = gp
 	mysg.isSelect = false
-	mysg.c.set(c)
+	mysg.setChannel(c)
 	gp.waiting = mysg
 	gp.param = nil
 	c.sendq.enqueue(mysg)
@@ -296,7 +296,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if mysg.releasetime > 0 {
 		blockevent(mysg.releasetime-t0, 2)
 	}
-	mysg.c.set(nil)
+	mysg.setChannel(nil)
 	releaseSudog(mysg)
 	if closed {
 		if c.closed == 0 {
@@ -339,19 +339,19 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 		}
 	}
-	if sg.elem.get() != nil {
-		if op != nil {
-			typedmemmove(c.elemtype, sg.elem.get(), ep)
-		} else {
-			sendDirect(c.elemtype, sg, ep)
-		}
-		sg.elem.set(nil)
-	}
 	if op != nil {
+		if elem := sg.getNativeElem(); elem != nil {
+			typedmemmove(c.elemtype, elem, ep)
+			sg.setNativeElem(nil)
+		}
 		sg.success = true
 		unlockf()
 		finishStacklessCoroChannel(op, sg, true)
 		return
+	}
+	if sg.getFullElem() != nil {
+		sendDirect(c.elemtype, sg, ep)
+		sg.setFullElem(nil)
 	}
 	gp := sg.g
 	unlockf()
@@ -408,7 +408,7 @@ func sendDirect(t *_type, sg *sudog, src unsafe.Pointer) {
 	// Once we read sg.elem out of sg, it will no longer
 	// be updated if the destination's stack gets copied (shrunk).
 	// So make sure that no preemption points can happen between read & use.
-	dst := sg.elem.get()
+	dst := sg.getFullElem()
 	typeBitsBulkBarrier(t, uintptr(dst), uintptr(src), t.Size_)
 	// No need for cgo write barrier checks because dst is always
 	// Go memory.
@@ -419,7 +419,7 @@ func recvDirect(t *_type, sg *sudog, dst unsafe.Pointer) {
 	// dst is on our stack or the heap, src is on another stack.
 	// The channel is locked, so src will not move during this
 	// operation.
-	src := sg.elem.get()
+	src := sg.getFullElem()
 	typeBitsBulkBarrier(t, uintptr(dst), uintptr(src), t.Size_)
 	memmove(dst, src, t.Size_)
 }
@@ -457,17 +457,14 @@ func closechan(c *hchan) {
 		if sg == nil {
 			break
 		}
-		if sg.elem.get() != nil {
-			typedmemclr(c.elemtype, sg.elem.get())
-			sg.elem.set(nil)
-		}
-		if sg.coro.get() == nil && sg.releasetime != 0 {
-			sg.releasetime = cputicks()
-		}
-		if sg.coro.get() != nil {
-			if !isCompactStacklessCoroSudog(sg, sg.coro.get()) && sg.g != nil {
+		if op := sg.coro.get(); op != nil {
+			if !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
+			}
+			if elem := sg.getNativeElem(); elem != nil {
+				typedmemclr(c.elemtype, elem)
+				sg.setNativeElem(nil)
 			}
 			sg.success = false
 			if corotail == nil {
@@ -477,6 +474,13 @@ func closechan(c *hchan) {
 			}
 			corotail = sg
 			continue
+		}
+		if elem := sg.getFullElem(); elem != nil {
+			typedmemclr(c.elemtype, elem)
+			sg.setFullElem(nil)
+		}
+		if sg.releasetime != 0 {
+			sg.releasetime = cputicks()
 		}
 		gp := sg.g
 		gp.param = unsafe.Pointer(sg)
@@ -493,15 +497,12 @@ func closechan(c *hchan) {
 		if sg == nil {
 			break
 		}
-		sg.elem.set(nil)
-		if sg.coro.get() == nil && sg.releasetime != 0 {
-			sg.releasetime = cputicks()
-		}
-		if sg.coro.get() != nil {
-			if !isCompactStacklessCoroSudog(sg, sg.coro.get()) && sg.g != nil {
+		if op := sg.coro.get(); op != nil {
+			if !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
 			}
+			sg.setNativeElem(nil)
 			sg.success = false
 			if corotail == nil {
 				corohead = sg
@@ -510,6 +511,10 @@ func closechan(c *hchan) {
 			}
 			corotail = sg
 			continue
+		}
+		sg.setFullElem(nil)
+		if sg.releasetime != 0 {
+			sg.releasetime = cputicks()
 		}
 		gp := sg.g
 		gp.param = unsafe.Pointer(sg)
@@ -693,13 +698,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 	// No stack splits between assigning elem and enqueuing mysg
 	// on gp.waiting where copystack can find it.
-	mysg.elem.set(ep)
+	mysg.setFullElem(ep)
 	mysg.waitlink = nil
 	gp.waiting = mysg
 
 	mysg.g = gp
 	mysg.isSelect = false
-	mysg.c.set(c)
+	mysg.setChannel(c)
 	gp.param = nil
 	c.recvq.enqueue(mysg)
 	if c.timer != nil {
@@ -731,7 +736,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 	success := mysg.success
 	gp.param = nil
-	mysg.c.set(nil)
+	mysg.setChannel(nil)
 	releaseSudog(mysg)
 	return true, success
 }
@@ -767,7 +772,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		if ep != nil {
 			// copy data from sender
 			if op != nil {
-				typedmemmove(c.elemtype, ep, sg.elem.get())
+				typedmemmove(c.elemtype, ep, sg.getNativeElem())
 			} else {
 				recvDirect(c.elemtype, sg, ep)
 			}
@@ -787,20 +792,21 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			typedmemmove(c.elemtype, ep, qp)
 		}
 		// copy data from sender to queue
-		typedmemmove(c.elemtype, qp, sg.elem.get())
+		typedmemmove(c.elemtype, qp, sg.getElem())
 		c.recvx++
 		if c.recvx == c.dataqsiz {
 			c.recvx = 0
 		}
 		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 	}
-	sg.elem.set(nil)
 	if op != nil {
+		sg.setNativeElem(nil)
 		sg.success = true
 		unlockf()
 		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
+	sg.setFullElem(nil)
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)

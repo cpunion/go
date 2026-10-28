@@ -3482,12 +3482,12 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success boo
 	if op.timerWait {
 		// Only a queued timer-channel receive sets timerWait; its producer
 		// passes the retained waiter before its channel pointer is cleared.
-		unblockTimerChan(waiter.c.get())
+		unblockTimerChan(waiter.getChannel())
 		op.timerWait = false
 	}
 	if waiter != nil {
+		waiter.setNativeChannel(nil)
 		waiter.coro.clear()
-		waiter.c.set(nil)
 		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
 	}
 	send := op.send

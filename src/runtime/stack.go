@@ -846,15 +846,6 @@ func adjustpanics(gp *g, adjinfo *adjustinfo) {
 	adjustpointer(adjinfo, unsafe.Pointer(&gp._panic))
 }
 
-func adjustsudogs(gp *g, adjinfo *adjustinfo) {
-	// the data elements pointed to by a SudoG structure
-	// might be in the stack.
-	for s := gp.waiting; s != nil; s = s.waitlink {
-		adjustpointer(adjinfo, unsafe.Pointer(&s.elem.vu))
-		adjustpointer(adjinfo, unsafe.Pointer(&s.elem.vp))
-	}
-}
-
 func fillstack(stk stack, b byte) {
 	for p := stk.lo; p < stk.hi; p++ {
 		*(*byte)(unsafe.Pointer(p)) = b
@@ -864,7 +855,7 @@ func fillstack(stk stack, b byte) {
 func findsghi(gp *g, stk stack) uintptr {
 	var sghi uintptr
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-		p := sg.elem.uintptr() + uintptr(sg.c.get().elemsize)
+		p := sg.elemUintptr() + uintptr(sg.getChannel().elemsize)
 		if stk.lo <= p && p < stk.hi && p > sghi {
 			sghi = p
 		}
@@ -883,7 +874,7 @@ func syncadjustsudogs(gp *g, used uintptr, adjinfo *adjustinfo) uintptr {
 	// Lock channels to prevent concurrent send/receive.
 	var lastc *hchan
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-		if sg.c.get() != lastc {
+		if sg.getChannel() != lastc {
 			// There is a ranking cycle here between gscan bit and
 			// hchan locks. Normally, we only allow acquiring hchan
 			// locks and then getting a gscan bit. In this case, we
@@ -893,9 +884,9 @@ func syncadjustsudogs(gp *g, used uintptr, adjinfo *adjustinfo) uintptr {
 			// suspended. So, we get a special hchan lock rank here
 			// that is lower than gscan, but doesn't allow acquiring
 			// any other locks other than hchan.
-			lockWithRank(&sg.c.get().lock, lockRankHchanLeaf)
+			lockWithRank(&sg.getChannel().lock, lockRankHchanLeaf)
 		}
-		lastc = sg.c.get()
+		lastc = sg.getChannel()
 	}
 
 	// Adjust sudogs.
@@ -915,10 +906,10 @@ func syncadjustsudogs(gp *g, used uintptr, adjinfo *adjustinfo) uintptr {
 	// Unlock channels.
 	lastc = nil
 	for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-		if sg.c.get() != lastc {
-			unlock(&sg.c.get().lock)
+		if sg.getChannel() != lastc {
+			unlock(&sg.getChannel().lock)
 		}
-		lastc = sg.c.get()
+		lastc = sg.getChannel()
 	}
 
 	return sgsize

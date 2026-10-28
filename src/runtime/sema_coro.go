@@ -84,7 +84,7 @@ func coroSemacquire1(ctx unsafe.Pointer, addr *uint32, lifo bool,
 	} else {
 		if w.scheduler != s || w.task != task || w.addr != addr ||
 			w.lifo != lifo || w.skipframes != skipframes || w.profile != uint8(profile) ||
-			w.waiter.elem.get() != nil || w.waiter.g != nil ||
+			w.waiter.getElem() != nil || w.waiter.g != nil ||
 			w.waiter.coro.get() != unsafe.Pointer(w) {
 			throw("runtime: invalid resumed stackless coroutine semaphore")
 		}

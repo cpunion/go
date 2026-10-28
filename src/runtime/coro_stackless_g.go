@@ -79,17 +79,19 @@ func stacklessCoroExitsyscallDone(gp *g) {
 	}
 }
 
-// Channel operations access only this prefix. Detached close completions reuse
-// next after dequeue, so waitlink remains in the full-only tail. The semaphore
-// tree, goroutine and block-profile fields remain in full sudogs. A compact channel allocation
+// Channel operations access only this prefix. Full-only raw address
+// mirrors live in the full tail; active compact waiters keep traced pointers.
+// Detached close completions reuse next after dequeue, so waitlink remains
+// in the full-only tail. The semaphore tree, goroutine and block-profile fields
+// remain in full sudogs. A compact allocation
 // puts its operation immediately after the prefix, keeping the complete
 // allocation large enough for a sudog view while rooting both parts precisely.
 type stacklessCoroChannelWaiter struct {
 	coro     stacklessCoroSudog
 	next     *sudog
 	prev     *sudog
-	elem     maybeTraceablePtr
-	c        maybeTraceableChan
+	elem     unsafe.Pointer
+	c        *hchan
 	ticket   uint32
 	isSelect bool
 	success  bool
@@ -101,8 +103,8 @@ type sudog struct {
 	coro        stacklessCoroSudog
 	next        *sudog
 	prev        *sudog
-	elem        maybeTraceablePtr
-	c           maybeTraceableChan
+	elem        unsafe.Pointer
+	c           *hchan
 	ticket      uint32
 	isSelect    bool
 	success     bool
@@ -113,6 +115,8 @@ type sudog struct {
 	parent      *sudog
 	waittail    *sudog
 	waitlink    *sudog
+	elemAddr    uintptr
+	chanAddr    uintptr
 }
 
 func isCompactStacklessCoroSudog(sg *sudog, owner unsafe.Pointer) bool {
@@ -137,3 +141,90 @@ var (
 	_ [-int(stacklessCoroChannelWaiterOffsetMismatch)]byte
 	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - unsafe.Sizeof(sudog{})]byte
 )
+
+// Native owners use traced pointers, including full semaphore and notification
+// waiters; they never enter g.waiting or hide these pointers from the collector.
+// A released compact waiter must be inspected with its explicit operation,
+// because its full-only address mirrors overlap that operation's storage.
+//
+//go:nosplit
+func (sg *sudog) getElem() unsafe.Pointer {
+	if sg.coro.get() != nil {
+		return sg.elem
+	}
+	return unsafe.Pointer(sg.elemAddr)
+}
+
+//go:nosplit
+func (sg *sudog) setElem(v unsafe.Pointer) {
+	sg.elem = v
+	if !isCompactStacklessCoroSudog(sg, sg.coro.get()) {
+		sg.elemAddr = uintptr(v)
+	}
+}
+
+//go:nosplit
+func (sg *sudog) getChannel() *hchan {
+	if sg.coro.get() != nil {
+		return sg.c
+	}
+	return (*hchan)(unsafe.Pointer(sg.chanAddr))
+}
+
+//go:nosplit
+func (sg *sudog) setChannel(c *hchan) {
+	sg.c = c
+	if !isCompactStacklessCoroSudog(sg, sg.coro.get()) {
+		sg.chanAddr = uintptr(unsafe.Pointer(c))
+	}
+}
+
+// Only full waiters are linked from g.waiting. Preserve the raw address while
+// temporarily hiding its traced pointer during goroutine leak detection.
+//
+//go:nosplit
+func (sg *sudog) elemUintptr() uintptr { return sg.elemAddr }
+
+//go:nosplit
+func (sg *sudog) channelUintptr() uintptr { return sg.chanAddr }
+
+//go:nosplit
+func (sg *sudog) setElemUntraceable() { sg.elem = nil }
+
+//go:nosplit
+func (sg *sudog) setElemTraceable() { sg.elem = unsafe.Pointer(sg.elemAddr) }
+
+//go:nosplit
+func (sg *sudog) setChannelUntraceable() { sg.c = nil }
+
+//go:nosplit
+func (sg *sudog) setChannelTraceable() { sg.c = (*hchan)(unsafe.Pointer(sg.chanAddr)) }
+
+func adjustsudogs(gp *g, adjinfo *adjustinfo) {
+	for s := gp.waiting; s != nil; s = s.waitlink {
+		adjustpointer(adjinfo, unsafe.Pointer(&s.elemAddr))
+		adjustpointer(adjinfo, unsafe.Pointer(&s.elem))
+	}
+}
+
+// Full-only accesses are used where the caller already owns a complete sudog.
+// Native channel accesses are used only with a live coroutine owner; channel
+// waiters never enter g.waiting and never need untraceable address mirrors.
+//
+//go:nosplit
+func (sg *sudog) getFullElem() unsafe.Pointer { return unsafe.Pointer(sg.elemAddr) }
+
+//go:nosplit
+func (sg *sudog) setFullElem(v unsafe.Pointer) {
+	sg.elem = v
+	sg.elemAddr = uintptr(v)
+}
+
+//go:nosplit
+func (sg *sudog) getNativeElem() unsafe.Pointer { return sg.elem }
+
+//go:nosplit
+func (sg *sudog) setNativeElem(v unsafe.Pointer) { sg.elem = v }
+
+//go:nosplit
+func (sg *sudog) setNativeChannel(c *hchan) { sg.c = c }

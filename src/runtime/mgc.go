@@ -1179,7 +1179,7 @@ func (gp *g) isMaybeRunnable() bool {
 		// Cycle all through all *sudog to check whether
 		// the goroutine is waiting on a marked channel.
 		for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-			if isMarkedOrNotInHeap(unsafe.Pointer(sg.c.get())) {
+			if isMarkedOrNotInHeap(unsafe.Pointer(sg.getChannel())) {
 				return true
 			}
 		}
@@ -1192,7 +1192,7 @@ func (gp *g) isMaybeRunnable() bool {
 		// If waiting on mutexes, wait groups, or condition variables,
 		// check if the synchronization primitive attached to the sudog is marked.
 		if gp.waiting != nil {
-			return isMarkedOrNotInHeap(gp.waiting.elem.get())
+			return isMarkedOrNotInHeap(gp.waiting.getElem())
 		}
 	}
 	return true
@@ -1247,12 +1247,12 @@ func setSyncObjectsUntraceable() {
 			// Synchronization primitives are reachable from the *sudog via
 			// via the elem field.
 			for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-				sg.elem.setUntraceable()
+				sg.setElemUntraceable()
 			}
 		case gp.waitreason.isChanWait():
 			// Channels and select statements are reachable from the *sudog via the c field.
 			for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-				sg.c.setUntraceable()
+				sg.setChannelUntraceable()
 			}
 		}
 	})
@@ -1265,8 +1265,8 @@ func gcRestoreSyncObjects() {
 
 	forEachGRace(func(gp *g) {
 		for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-			sg.elem.setTraceable()
-			sg.c.setTraceable()
+			sg.setElemTraceable()
+			sg.setChannelTraceable()
 		}
 	})
 }
@@ -1307,11 +1307,11 @@ func findGoroutineLeaks() bool {
 		switch {
 		case gp.waitreason.isChanWait():
 			for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-				shade(sg.c.uintptr())
+				shade(sg.channelUintptr())
 			}
 		case gp.waitreason.isSyncWait():
 			for sg := gp.waiting; sg != nil; sg = sg.waitlink {
-				shade(sg.elem.uintptr())
+				shade(sg.elemUintptr())
 			}
 		}
 	}

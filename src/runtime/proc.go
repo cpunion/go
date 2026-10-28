@@ -527,7 +527,7 @@ func acquireSudog() *sudog {
 	s := pp.sudogcache[n-1]
 	pp.sudogcache[n-1] = nil
 	pp.sudogcache = pp.sudogcache[:n-1]
-	if s.elem.get() != nil {
+	if s.getElem() != nil {
 		throw("acquireSudog: found s.elem != nil in cache")
 	}
 	releasem(mp)
@@ -536,7 +536,7 @@ func acquireSudog() *sudog {
 
 //go:nosplit
 func releaseSudog(s *sudog) {
-	if s.elem.get() != nil {
+	if s.getElem() != nil {
 		throw("runtime: sudog with non-nil elem")
 	}
 	if s.isSelect {
@@ -551,7 +551,7 @@ func releaseSudog(s *sudog) {
 	if s.waitlink != nil {
 		throw("runtime: sudog with non-nil waitlink")
 	}
-	if s.c.get() != nil {
+	if s.getChannel() != nil {
 		throw("runtime: sudog with non-nil c")
 	}
 	gp := getg()

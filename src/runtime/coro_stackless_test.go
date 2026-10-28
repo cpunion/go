@@ -1118,11 +1118,11 @@ func TestStacklessCoroTaskSize(t *testing.T) {
 func TestStacklessCoroOperationSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := 8 * ptrSize
-	wantChannel := uintptr(128)
+	wantChannel := uintptr(112)
 	wantIO := uintptr(176)
 	if ptrSize == 4 {
 		want = 11 * ptrSize
-		wantChannel = 80
+		wantChannel = 72
 		wantIO = 100
 	}
 	if got := runtime.StacklessCoroOperationSizeForTest(); got != want {
@@ -7862,7 +7862,7 @@ func TestStacklessCoroCompactChannelOperation(t *testing.T) {
 	if !valid {
 		t.Fatalf("compact prefix layout: full=%d prefix=%d storage=%d charged=%d", full, prefix, storage, charged)
 	}
-	want := uintptr(128)
+	want := uintptr(112)
 	if unsafe.Sizeof(uintptr(0)) == 4 {
 		want = 80
 	}

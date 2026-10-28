@@ -274,10 +274,10 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		cas = &cases[casi]
 		c = cas.c
 		sg = newStacklessCoroSudog(op, &selection.waiters[casi])
-		sg.elem.set(cas.elem)
 		sg.coro.set(unsafe.Pointer(op))
+		sg.setNativeElem(cas.elem)
 		sg.isSelect = true
-		sg.c.set(c)
+		sg.setNativeChannel(c)
 		if casi < nsends {
 			c.sendq.enqueue(sg)
 		} else {
@@ -454,9 +454,9 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 			}
 		}
 		waiter.isSelect = false
-		waiter.elem.set(nil)
+		waiter.setNativeElem(nil)
+		waiter.setNativeChannel(nil)
 		waiter.coro.clear()
-		waiter.c.set(nil)
 	}
 	selunlock(selection.cases, selection.lockOrder)
 	for _, casei := range selection.lockOrder {
