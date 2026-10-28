@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
+	"go/constant"
 	"testing"
 )
 
@@ -18,7 +19,7 @@ func TestAffineReturnHiddenEffects(t *testing.T) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
-	for _, where := range []string{"pure", "condition", "zero", "subtract", "one", "add", "step", "call", "yield", "branch", "base", "return"} {
+	for _, where := range []string{"pure", "condition", "zero", "subtract", "one", "add", "step", "call", "yield", "branch", "base", "return", "nil-function", "ordinary", "pragma", "missing-input", "not-if", "else", "base-body", "not-condition", "wrong-input", "nonzero", "noninteger", "not-yield", "yield-args", "not-gosched", "not-base-return", "base-results", "base-expression", "not-return", "return-results", "not-add", "no-call", "commuted", "variable-step", "call-args", "dynamic-target", "missing-target", "not-subtraction", "decrement-two", "no-ordinary", "rejected-candidate"} {
 		t.Run(where, func(t *testing.T) {
 			pos := src.NoXPos
 			pkg := types.NewPkg("example.com/affine/"+where, "affine")
@@ -32,22 +33,106 @@ func TestAffineReturnHiddenEffects(t *testing.T) {
 			n := fn.Type().Param(0).Nname.(*ir.Name)
 			zero, one, step := typedInt(pos, integer, 0), typedInt(pos, integer, 1), typedInt(pos, integer, 7)
 			condition := ir.NewBinaryExpr(pos, ir.OLE, n, zero)
+			condition.SetType(types.Types[types.TBOOL])
+			condition.SetTypecheck(1)
 			sub := ir.NewBinaryExpr(pos, ir.OSUB, n, one)
 			call := ir.NewCallExpr(pos, ir.OCALLFUNC, fn.Nname, ir.Nodes{sub})
 			add := ir.NewBinaryExpr(pos, ir.OADD, call, step)
 			gosched := ir.NewFunc(pos, pos, types.NewPkg("runtime", "runtime").Lookup("Gosched"), types.NewSignature(nil, nil, nil))
 			yield := ir.NewCallExpr(pos, ir.OCALLFUNC, gosched.Nname, nil)
+			yield.SetTypecheck(1)
 			base := ir.NewReturnStmt(pos, ir.Nodes{typedInt(pos, integer, 3)})
 			branch := ir.NewIfStmt(pos, condition, ir.Nodes{yield, base}, nil)
 			ret := ir.NewReturnStmt(pos, ir.Nodes{add})
 			fn.Body = ir.Nodes{branch, ret}
 			nodes := map[string]ir.Node{"condition": condition, "zero": zero, "subtract": sub, "one": one, "add": add, "step": step, "call": call, "yield": yield, "branch": branch, "base": base, "return": ret}
-			if where != "pure" {
-				nodes[where].(ir.InitNode).SetInit(ir.Nodes{ir.NewAssignStmt(pos, n, typedInt(pos, integer, 99))})
+
+			function := &Function{Func: fn, Primary: CoroPrimary}
+			if node := nodes[where]; node != nil {
+				node.(ir.InitNode).SetInit(ir.Nodes{ir.NewAssignStmt(pos, n, typedInt(pos, integer, 99))})
 			}
-			p := planAffineReturn(&Function{Func: fn, Primary: CoroPrimary})
-			if (p != nil) != (where == "pure") {
+			switch where {
+			case "nil-function":
+				function = nil
+			case "ordinary":
+				function.Primary = PlainPrimary
+			case "pragma":
+				fn.Pragma = ir.Noinline
+			case "missing-input":
+				fn.Type().Param(0).Nname = nil
+			case "not-if":
+				fn.Body[0] = base
+			case "else":
+				branch.Else = ir.Nodes{base}
+			case "base-body":
+				branch.Body = ir.Nodes{yield}
+			case "not-condition":
+				branch.Cond = n
+			case "wrong-input":
+				condition.X = zero
+			case "nonzero":
+				condition.Y = one
+			case "noninteger":
+				condition.Y = ir.NewBasicLit(pos, types.Types[types.TSTRING], constant.MakeString("zero"))
+			case "not-yield":
+				branch.Body[0] = base
+			case "yield-args":
+				yield.Args = ir.Nodes{n}
+			case "not-gosched":
+				yield.Fun = fn.Nname
+			case "not-base-return":
+				branch.Body[1] = yield
+			case "base-results":
+				base.Results = nil
+			case "base-expression":
+				base.Results = ir.Nodes{n}
+			case "not-return":
+				fn.Body[1] = branch
+			case "return-results":
+				ret.Results = nil
+			case "not-add":
+				ret.Results[0] = n
+			case "no-call":
+				add.X = zero
+			case "commuted":
+				add.X, add.Y = step, call
+			case "variable-step":
+				add.Y = n
+			case "call-args":
+				call.Args = nil
+			case "dynamic-target":
+				call.Fun = n
+			case "missing-target":
+				fn.Nname.Defn = nil
+			case "not-subtraction":
+				call.Args = ir.Nodes{n}
+			case "decrement-two":
+				sub.Y = typedInt(pos, integer, 2)
+			}
+			p := planAffineReturn(function)
+			want := where == "pure" || where == "commuted" || where == "no-ordinary" || where == "rejected-candidate"
+			if (p != nil) != want {
 				t.Fatalf("effect at %s: admitted=%v", where, p != nil)
+			}
+
+			if where == "no-ordinary" || where == "rejected-candidate" {
+				before := append(ir.Nodes(nil), fn.Body...)
+				old := &lowerCandidate{function: &Function{Func: fn, Primary: CoroPrimary, Edges: []Edge{{Node: yield}}}}
+				if where == "rejected-candidate" {
+					old.ordinary = &ir.Func{}
+					fn.SetNeedctxt(true)
+				}
+				if got := applyAffineReturn(nil, old, p); got != old {
+					t.Fatal("failed proof/rebuild replaced candidate")
+				}
+				if len(fn.Body) != len(before) {
+					t.Fatal("rejected transform changed source body")
+				}
+				for i, n := range before {
+					if fn.Body[i] != n {
+						t.Fatal("rejected transform lost original body")
+					}
+				}
 			}
 		})
 	}
