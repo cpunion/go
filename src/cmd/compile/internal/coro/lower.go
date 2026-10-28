@@ -120,6 +120,7 @@ type lowerCandidate struct {
 	selfAwait        bool
 	selfSpawn        bool
 	heapLocals       map[*ir.Name]bool
+	rootArray        *rootArrayLowering
 }
 
 type lowerDirectCall struct {
@@ -433,6 +434,11 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 	}
 	markFusedFrameCandidates(candidates)
+	for _, function := range functions {
+		if candidate := candidates[function.Func]; candidate != nil {
+			prepareRootArray(candidate)
+		}
+	}
 	for _, function := range functions {
 		candidate := candidates[function.Func]
 		if candidate == nil {
@@ -2683,6 +2689,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resumeType := stacklessResumeType()
 	pos := fn.Pos()
 	localVariables := invocationLocals(function)
+	if candidate.rootArray != nil {
+		delete(localVariables, candidate.rootArray.snapshot)
+	}
 	var resumeLocals []*ir.Name
 
 	var declarations []ir.Node
@@ -2693,6 +2702,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			declared[name] = true
 			declarations = append(declarations, decl)
 		}
+	}
+	if candidate.rootArray != nil {
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, candidate.rootArray.buffer))
 	}
 
 	captureCells := make(map[*ir.Name]*ir.Name)
@@ -3567,6 +3579,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				target = temp
 			}
 			args = append(args, typecheck.NodAddr(edit(target)))
+		}
+		if candidate.rootArray != nil && edge.Callee == fn && edge.Kind != GoCall {
+			child = candidate.factory
+			args = append(args, ir.NewBool(call.Pos(), false))
 		}
 		factoryCall := typecheck.Call(call.Pos(), child.Nname, args, false)
 		if child.Type().NumResults() == 1 {
@@ -4792,6 +4808,19 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	types.CalcSize(frameType)
 	candidate.frameType = frameType
 	framePointerType := types.NewPtr(frameType)
+	rootType := frameType
+	var rootArrayField *types.Field
+	if array := candidate.rootArray; array != nil {
+		// The complete array belongs to the physical root allocation. The
+		// small prefix is the same typed frame used by self-await children.
+		// Cache sizes and GC descriptors must describe the complete root.
+		rootArrayField = types.NewField(pos, typecheck.Lookup(".array"), array.plan.array.Type())
+		rootType = types.NewStruct([]*types.Field{
+			types.NewField(pos, typecheck.Lookup(".frame"), frameType), rootArrayField,
+		})
+		rootType.SetNoalg(true)
+		types.CalcSize(rootType)
+	}
 	frame := typecheck.TempAt(pos, resume, framePointerType)
 
 	var rewrite func(ir.Node) ir.Node
@@ -4964,9 +4993,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	frameSize := func() ir.Node {
 		return typedInt(pos, types.Types[types.TUINTPTR], frameType.Size())
 	}
+	rootSize := func() ir.Node {
+		return typedInt(pos, types.Types[types.TUINTPTR], rootType.Size())
+	}
 	takeRootFrame := typecheck.Call(pos,
 		typecheck.LookupRuntime("coroTakeRootFrame"), ir.Nodes{
-			factoryResume, frameSize(),
+			factoryResume, rootSize(),
 		}, false)
 	rootAssignment := ir.NewAssignStmt(pos, factoryFrame,
 		typecheck.ConvNop(takeRootFrame, framePointerType))
@@ -5007,6 +5039,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		takeChildFrame = ir.NewAssignStmt(pos, factoryFrame,
 			typecheck.ConvNop(takeFrame, framePointerType))
 	}
+	if array := candidate.rootArray; array != nil {
+		publicFrame := typecheck.Call(pos, typecheck.LookupRuntime("coroTakeFrame"),
+			ir.Nodes{factoryCtx, factoryResume, rootSize()}, false)
+		takeChildFrame = ir.NewIfStmt(pos, array.root, ir.Nodes{
+			ir.NewAssignStmt(pos, factoryFrame, typecheck.ConvNop(publicFrame, framePointerType)),
+		}, ir.Nodes{takeChildFrame})
+	}
 	isRootFactory := func() ir.Node {
 		return ir.NewBinaryExpr(pos, ir.OEQ, factoryCtx,
 			ir.NewNilExpr(pos, factoryCtx.Type()))
@@ -5023,9 +5062,14 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
 		ir.NewNilExpr(pos, framePointerType))
-	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame,
-		ir.Nodes{ir.NewAssignStmt(pos, factoryFrame,
-			typedNew(pos, frameType))}, nil))
+	allocation := ir.Node(ir.NewAssignStmt(pos, factoryFrame, typedNew(pos, frameType)))
+	if array := candidate.rootArray; array != nil {
+		rootAllocation := typecheck.ConvNop(typecheck.ConvNop(typedNew(pos, rootType), unsafePointerType), framePointerType)
+		allocation = ir.NewIfStmt(pos, array.root, ir.Nodes{
+			ir.NewAssignStmt(pos, factoryFrame, rootAllocation),
+		}, ir.Nodes{allocation})
+	}
+	declarations = append(declarations, ir.NewIfStmt(pos, missingFrame, ir.Nodes{allocation}, nil))
 	if needsArrayZero != nil && selfOnly {
 		// Only homogeneous child chunks carry the transient fresh bit.
 		// Roots and other reused frames retain their normal initialization.
@@ -5057,6 +5101,20 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	for i, variable := range closureVars {
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
+		if array := candidate.rootArray; array != nil && variable.Outer.Canonical() == array.buffer {
+			// Public factories start independent lineages, including a go
+			// statement with nonnil ctx. Only a known serial self-await may
+			// borrow its parent's privately owned, fully typed array.
+			packet := typecheck.ConvNop(factoryCtx, types.NewPtr(unsafePointerType))
+			parent := typecheck.ConvNop(typedDeref(pos, packet, unsafePointerType), framePointerType)
+			inherited := explicitFrameField(pos, parent, fields[i])
+			rootFrame := typecheck.ConvNop(typecheck.ConvNop(factoryFrame, unsafePointerType), types.NewPtr(rootType))
+			rootBuffer := typecheck.NodAddr(explicitFrameField(pos, rootFrame, rootArrayField))
+			declarations = append(declarations, ir.NewIfStmt(pos, array.root,
+				ir.Nodes{ir.NewAssignStmt(pos, target, rootBuffer)},
+				ir.Nodes{ir.NewAssignStmt(pos, target, inherited)}))
+			continue
+		}
 		resultField := rootResultTargets[variable.Outer.Canonical()]
 		if resultField == nil {
 			if !rootResultValueFields[fields[i]] && zeroLocals[variable.Outer.Canonical()] && candidate.entryZeroed[variable.Outer.Canonical()] {
@@ -5114,11 +5172,15 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	newFrame := typecheck.TempAt(pos, fn, unsafePointerType)
 	newResume := typecheck.TempAt(pos, fn, stacklessResumeType())
 	quiescentRoot := typecheck.TempAt(pos, fn, types.Types[types.TBOOL])
-	makeFrame := typecheck.Call(pos, factory.Nname, args, false)
+	entryFactory := factory
+	if candidate.rootArray != nil {
+		entryFactory = candidate.rootArray.public
+	}
+	makeFrame := typecheck.Call(pos, entryFactory.Nname, args, false)
 	assignFrame := ir.NewAssignListStmt(pos, ir.OAS2,
 		ir.Nodes{newFrame, newResume}, ir.Nodes{makeFrame})
 	run := typecheck.Call(pos, typecheck.LookupRuntime("coroRunFrame"),
-		ir.Nodes{newFrame, newResume, frameSize()}, false)
+		ir.Nodes{newFrame, newResume, rootSize()}, false)
 	runFrame := ir.NewAssignStmt(pos, quiescentRoot, run)
 	copyResults := make(ir.Nodes, 0, len(resultValueFields))
 	var clearResultPointers ir.Nodes
@@ -5137,7 +5199,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 	releaseFrame := typecheck.Call(pos,
 		typecheck.LookupRuntime("coroReleaseRootFrame"), ir.Nodes{
-			newFrame, newResume, frameSize(),
+			newFrame, newResume, rootSize(),
 		}, false)
 	fn.Body = []ir.Node{
 		ir.NewDecl(pos, ir.ODCL, newFrame),
