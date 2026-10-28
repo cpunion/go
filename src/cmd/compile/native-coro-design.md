@@ -4745,3 +4745,38 @@ The independent aggregate-call and assertion budgets remain in force. This
 bounds declared invocation locals; it does not prove arbitrary callees' stack
 requirements or all temporaries introduced later by Walk/SSA. Outlining or
 rematerializing large arrays must preserve these separate stack constraints.
+
+### Reconstruct private byte arrays along serial self-awaits (2026-10-28)
+
+A conservative entry proof can replace a persistent byte array with a traced
+buffer pointer and one byte snapshot. It requires an entry-zeroed 512..8192-byte
+array, one pure constant-index write, and subsequent address uses confined to
+local leaf functions whose complete bodies only read constant elements and
+return integer arithmetic. Address identity, publication, mutation, closures,
+go/defer statements, and other array uses prevent this optimization. The initial
+implementation also bounds source parameters to four register-sized values and
+requires one integer result.
+
+Each public factory creates an independent physical root containing the small
+frame prefix followed by the complete original array. Serial self-await children
+inherit a traced pointer into that root and store their own converted byte value
+at the original source write point. Before each original readonly leaf call,
+the generated code restores that invocation's byte. All other array elements
+remain zero, including across cache reuse; the original leaf and its complete
+array type remain unchanged. No full array moves onto a native stack.
+
+The public ABI3 factory is unchanged. A private implementation selector
+distinguishes public roots from known self-awaits: nonnil ctx alone cannot
+distinguish an independently spawned goroutine from a recursive child. Root
+allocations, reservations, and cache charges use the complete physical root
+size; child chunks retain the small frame type and its exact GC pointer map.
+Existing pointer clearing and ownership paths remain responsible for completed
+and cancelled frames. Cache capacities and runtime ABIs are unchanged.
+
+This reduces storage from approximately depth*array-size to array-size plus
+depth*small-frame-size for admitted functions. It does not eliminate the array,
+replace its helper, fuse arbitrary recursion, or reduce ordinary small-frame
+dispatch costs. Smaller frames can admit more individually cached tasks before
+chunking, so cold allocation events may increase even when cold bytes and warm
+allocation traffic decrease. Performance and retained memory require separate
+measurements.

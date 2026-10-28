@@ -48,7 +48,7 @@ func TestSynctestFallback(t *testing.T) {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			native := config.experiment == "coro" && config.name != "race"
-			names := []string{"sleep", "send", "exchange", "recursive", "variadic", "recoverValue", "counter.result", "exit"}
+			names := []string{"sleep", "send", "exchange", "recursive", "arrayRootRecursive", "variadic", "recoverValue", "counter.result", "exit"}
 			if testenv.HasCGO() {
 				names = append(names, "foreign")
 			}
@@ -56,6 +56,9 @@ func TestSynctestFallback(t *testing.T) {
 				if got := strings.Contains(string(symbols), pkg+"."+name+".coro"); got != native {
 					t.Errorf("%s native factory = %v, want %v\n%s", name, got, native, out)
 				}
+			}
+			if got := strings.Contains(string(symbols), pkg+".arrayRootRecursive.coro.array"); got != native {
+				t.Errorf("array root implementation = %v, want %v\n%s", got, native, out)
 			}
 			for _, procs := range []int{1, 4} {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
