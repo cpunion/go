@@ -261,6 +261,12 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	slices.SortFunc(functions, func(a, b *Function) int {
 		return strings.Compare(ir.PkgFuncName(a.Func), ir.PkgFuncName(b.Func))
 	})
+	affinePlans := make(map[*ir.Func]*affineReturnPlan)
+	for _, function := range functions {
+		if p := planAffineReturn(function); p != nil {
+			affinePlans[function.Func] = p
+		}
+	}
 	for _, function := range functions {
 		normalizeSingleResultCalls(function)
 	}
@@ -398,6 +404,10 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			if candidate.ordinary == nil {
 				return result, fmt.Errorf("%s: missing admitted ordinary body", ir.PkgFuncName(function.Func))
 			}
+		}
+		if p := affinePlans[function.Func]; p != nil && affineReturnClosed(p, affinePlans, candidates) {
+			candidate = applyAffineReturn(plan, candidate, p)
+			candidates[function.Func] = candidate
 		}
 		candidate.factoryABI = FactoryABI1
 		if explicitFrameFactorySupported(candidate) {
