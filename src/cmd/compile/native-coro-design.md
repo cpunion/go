@@ -4797,3 +4797,19 @@ does not batch independent task lifetimes or broaden the array proof. Imported,
 ordinary, race and synctest callers retain their existing entry and fallback
 semantics. Cold allocation event counts and extra entry cost remain separate
 from byte savings, warm throughput and retained memory.
+
+### Exact scalar affine returns
+
+For a closed local graph of plain `func(int) int` coroutine functions,
+`if n <= 0 { runtime.Gosched(); return B }; return target(n-1) + K`
+can use one base yield followed by `B+n*K` for positive inputs. All reachable
+functions must have the same literal B and K; negative/zero inputs keep B.
+Same-width integer overflow matches the source sequence of additions.
+The proof rejects every nested IR Init effect, helpers, other operations,
+closures, shapes, pragmas, defers, spawns and non-int signatures. Unequal
+base/step graphs and variable additions retain normal lowering.
+
+Only the native working body is rewritten, after the independent ordinary
+fallback body has been read. The public fallback remains recursive; public
+ABI, runtime allocation/cache policy and pointer lifetimes are unchanged.
+This rule does not erase array/helper work or summarize general recursion.
