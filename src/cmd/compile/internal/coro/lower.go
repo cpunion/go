@@ -434,6 +434,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 	}
 	markFusedFrameCandidates(candidates)
+	preferRootArrayFrames(candidates)
 	for _, function := range functions {
 		if candidate := candidates[function.Func]; candidate != nil {
 			prepareRootArray(candidate)

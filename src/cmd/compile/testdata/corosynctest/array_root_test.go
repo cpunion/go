@@ -25,6 +25,13 @@ func arrayRootRecursive(depth, seed int) int {
 	return got + arrayRootRead(&data)
 }
 
+func arrayRootCaller(depth, seed int) int {
+	a := arrayRootRecursive(depth, seed)
+	b := arrayRootRecursive(depth, seed+3)
+	runtime.Gosched()
+	return a + b
+}
+
 func TestArrayRootFallback(t *testing.T) {
 	check := func(t *testing.T) {
 		for _, depth := range []int{0, 1, 32, 513} {
@@ -34,6 +41,12 @@ func TestArrayRootFallback(t *testing.T) {
 			}
 			if got := arrayRootRecursive(depth, 19); got != want {
 				t.Fatalf("depth %d: got %d, want %d", depth, got, want)
+			}
+			for i := 0; i <= depth; i++ {
+				want += int(byte(22 + 7*i))
+			}
+			if got := arrayRootCaller(depth, 19); got != want {
+				t.Fatalf("caller depth %d: got %d, want %d", depth, got, want)
 			}
 		}
 	}
