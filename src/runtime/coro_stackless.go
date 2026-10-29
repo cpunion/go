@@ -3346,13 +3346,14 @@ func coroDeferRecover(token unsafe.Pointer) any {
 	return value
 }
 
-// coroSpawn enqueues an independent logical goroutine. The current task keeps
-// running until it returns its next scheduler action.
-func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) {
-	coroSpawnFrame(ctx, nil, child)
+// coroSpawn enqueues an independent logical goroutine. Its result is a hint
+// that a resumable producer may yield after publishing the child. Callers
+// without a continuation boundary may discard it and keep running.
+func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) bool {
+	return coroSpawnFrame(ctx, nil, child)
 }
 
-func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
+func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || parent == nil ||
@@ -3379,10 +3380,19 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	}
 	s.liveSpawns++
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
-	s.readyLocked(task)
+	runnable := s.readyLocked(task)
+	// Give ready children an execution opportunity before a producer grows
+	// an unbounded queue. Parked children leave this queue, so this hint
+	// never caps the live set or waits for child completion. Once more than
+	// the reusable task capacity remains live, repeated pressure yields are
+	// unlikely to replenish that cache; let the producer reach its next
+	// source suspension instead. Completing ready children keep this count low.
+	yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
+		s.liveSpawns <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	s.wakeReplacementExecutor()
+	return yield
 }
 
 // coroSleep starts a timer operation for the current logical goroutine and

@@ -4820,3 +4820,23 @@ root scheduler or frame. This public entry optimization does not execute a
 native continuation. Native callers still use the generated factory/resume,
 and locked-thread/synctest callers retain the original recursive source body.
 Performance records must distinguish the public entry and native caller paths.
+
+
+Explicit ABI3 producers that already contain a `Gosched` may also yield after
+publishing a native `go` call when the ready queue reaches half the existing
+task-cache limit. The next continuation PC is stored before returning the
+yield action. Receiver/argument/Init evaluation and the child publication each
+occur once, before this checkpoint. The ordinary source body and NoSuspend
+adapters retain their previous execution paths.
+
+The private `coroSpawn`/`coroSpawnFrame` builtins return this scheduling hint;
+callers without a resumable boundary discard it. The hint uses the existing
+ready count under the scheduler lock. It adds no scheduler/task/frame storage,
+cache capacity, lifetime batching, or early channel evaluation. A checkpoint
+only gives queued work an execution opportunity: it never waits for child
+completion or limits the live set, because children may depend on later parent
+work. Fully blocked child sets still require their independent live states.
+
+Ready queue checkpoints cover both ABI3 explicit frames and ABI1 closure resumes when the producer already has an explicit yield. The original ready/blocked/mixed benchmark producers use closure resumes; the explicit-frame-only prototype ad42 did not improve their allocation traffic and is retained as an unaccepted trial. The nested-loop zero-argument worker fixture separately requires progress and checks round-local capture across pressure yields.
+
+The ready-pressure hint also requires the existing live-spawn count to remain within the fixed256task reuse capacity. A completely blocked producer gets at most its initial two128task pressure opportunities, then continues publishing until its original suspension; it never waits for completion or caps the live set. This avoids repeated checkpoints that cannot replenish the task cache. Ready workers that finish in a few scheduler episodes keep the live set small and retain the allocation benefit. The hint uses readyLocked's existing returned runnable count, avoiding an extra atomic load. Arbitrary long-lived or repeatedly yielding worker graphs have no universal bounded-live-set guarantee. Source32b4d51's confirmed ready gains and consistent15percent fully-blocked slowdown remain an unaccepted, byte-recovered trial.
