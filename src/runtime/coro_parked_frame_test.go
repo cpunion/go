@@ -93,6 +93,8 @@ func TestStacklessCoroNativeIdleSchedulerStackGC(t *testing.T) {
 	defer runtime.GOMAXPROCS(previous)
 	gcPercent := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(gcPercent)
+	runtime.GC()
+	runtime.GC()
 	run := func() {
 		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
 			if active, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest(); !active {
