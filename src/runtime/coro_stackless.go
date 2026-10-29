@@ -2952,6 +2952,31 @@ func (s *stacklessCoroScheduler) discardFreeCachedFrameTaskLocked() bool {
 	return false
 }
 
+// discardIdleFrameTasks drops completed typed holders from an exclusively
+// owned scheduler. A registered parked native root has no running episode or
+// replacement executors, so GC can expire these holders without taking a lock
+// that a stopped G might own. Live frames and factory reservations remain
+// charged to cachedFrameTasks/cachedFrameBytes and keep their storage.
+func (s *stacklessCoroScheduler) discardIdleFrameTasks() {
+	link := &s.freeTasks
+	for *link != nil {
+		task := *link
+		if !task.hasFlag(stacklessCoroTaskCacheFrame) {
+			link = &task.next
+			continue
+		}
+		if task.state != stacklessCoroTaskNew || task.parent != nil ||
+			task.context.scheduler != nil || task.context.frame == nil ||
+			task.frameSize == 0 || s.freeFrameBytes < task.frameSize {
+			throw("runtime: invalid stackless coroutine idle frame")
+		}
+		*link = task.next
+		task.next = nil
+		s.freeFrameBytes -= task.frameSize
+		s.discardCachedFrameTaskLocked(task)
+	}
+}
+
 func (s *stacklessCoroScheduler) takeReservedFrameTaskLocked(
 	parent *stacklessCoroTask, frame unsafe.Pointer,
 	resume stacklessCoroResume) *stacklessCoroTask {
