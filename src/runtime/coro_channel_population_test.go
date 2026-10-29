@@ -35,7 +35,6 @@ func channelPopulationRound(t *testing.T, tokens []unsafe.Pointer) {
 					if childStep == 0 {
 						childStep++
 						runtime.RecvIntStacklessCoroForTest(child, channel, &value, &ok)
-						tokens[i] = runtime.StacklessCoroOperationTokenForTest(child)
 						started.Add(1)
 						return runtime.StacklessCoroActionWait
 					}
@@ -50,6 +49,9 @@ func channelPopulationRound(t *testing.T, tokens []unsafe.Pointer) {
 		case 1:
 			if int(started.Load()) != len(tokens) {
 				return runtime.StacklessCoroActionYield
+			}
+			if got := runtime.StacklessCoroChannelPopulationForTest(channel, tokens); got != len(tokens) {
+				t.Fatalf("queued channel operations = %d, want %d", got, len(tokens))
 			}
 			step++
 			close(channel)
