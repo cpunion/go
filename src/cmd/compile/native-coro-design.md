@@ -4813,3 +4813,10 @@ Only the native working body is rewritten, after the independent ordinary
 fallback body has been read. The public fallback remains recursive; public
 ABI, runtime allocation/cache policy and pointer lifetimes are unchanged.
 This rule does not erase array/helper work or summarize general recursion.
+
+The same proof also permits the public entry on an ordinary Go stack to call
+its single `Gosched` and return the scalar expression without constructing a
+root scheduler or frame. This public entry optimization does not execute a
+native continuation. Native callers still use the generated factory/resume,
+and locked-thread/synctest callers retain the original recursive source body.
+Performance records must distinguish the public entry and native caller paths.
