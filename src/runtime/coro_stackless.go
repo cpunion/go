@@ -3380,12 +3380,15 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	}
 	s.liveSpawns++
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
-	s.readyLocked(task)
+	runnable := s.readyLocked(task)
 	// Give ready children an execution opportunity before a producer grows
 	// an unbounded queue. Parked children leave this queue, so this hint
-	// never caps the live set or waits for child completion.
-	yield := s.runnableState.Load()&^stacklessCoroForeignReturnerBit >=
-		stacklessCoroTaskCacheSize/2
+	// never caps the live set or waits for child completion. Once more than
+	// the reusable task capacity remains live, repeated pressure yields are
+	// unlikely to replenish that cache; let the producer reach its next
+	// source suspension instead. Completing ready children keep this count low.
+	yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
+		s.liveSpawns <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	s.wakeReplacementExecutor()
