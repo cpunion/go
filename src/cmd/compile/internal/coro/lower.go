@@ -215,6 +215,7 @@ type lowerIO struct {
 
 type lowerState struct {
 	body       []ir.Node
+	spawnYield bool
 	transition SiteKind
 	call       *ir.CallExpr
 	channel    *lowerChannel
@@ -2693,6 +2694,10 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	// Keep NoSuspend adapters and legacy factories unchanged. Spawn sites
+	// already participate in conservative invocation-local capture analysis.
+	spawnYield := candidate.factoryABI == FactoryABI3 &&
+		slices.ContainsFunc(function.Sites, func(site Site) bool { return site.Kind == SiteYield })
 	for _, deferred := range candidate.defers {
 		if len(deferred.terminalTargets) != 0 {
 			prepareDynamicDeferWrapper(deferred, fn)
@@ -3074,6 +3079,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		if call := transitionCall(stmt, candidate.transitions); call != nil {
 			switch candidate.transitions[call] {
+			case SiteSpawn:
+				return spawnYield
 			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
 				SiteGoexit:
 				return true
@@ -3482,7 +3489,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				// A go statement can become a boundary when evaluating its
 				// arguments suspends. Its Init has already been detached;
 				// emit the spawn only after those states have completed.
-				return newBodyState(ir.Nodes{stmt}, next)
+				index := newBodyState(ir.Nodes{stmt}, next)
+				states[index].spawnYield = spawnYield
+				return index
 			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
 				SiteGoexit:
 				stateNext := next
@@ -4061,8 +4070,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						name = "coroSpawnFrame"
 						args = ir.Nodes{ctx, child.frame, child.resume}
 					}
-					spawn := typecheck.Call(goStmt.Pos(),
+					var spawn ir.Node = typecheck.Call(goStmt.Pos(),
 						typecheck.LookupRuntime(name), args, false)
+					if state.spawnYield {
+						spawn = ir.NewIfStmt(goStmt.Pos(), spawn, ir.Nodes{
+							assignResumePC(state.next),
+							ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{
+								typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionYield)),
+							}),
+						}, nil)
+					}
 					if child.spawnGuard != nil {
 						invoke := append(child.spawnSetup, spawn)
 						body = append(body, ir.NewIfStmt(goStmt.Pos(), child.spawnGuard,

@@ -4820,3 +4820,19 @@ root scheduler or frame. This public entry optimization does not execute a
 native continuation. Native callers still use the generated factory/resume,
 and locked-thread/synctest callers retain the original recursive source body.
 Performance records must distinguish the public entry and native caller paths.
+
+
+Explicit ABI3 producers that already contain a `Gosched` may also yield after
+publishing a native `go` call when the ready queue reaches half the existing
+task-cache limit. The next continuation PC is stored before returning the
+yield action. Receiver/argument/Init evaluation and the child publication each
+occur once, before this checkpoint. The ordinary source body and NoSuspend
+adapters retain their previous execution paths.
+
+The private `coroSpawn`/`coroSpawnFrame` builtins return this scheduling hint;
+callers without a resumable boundary discard it. The hint uses the existing
+ready count under the scheduler lock. It adds no scheduler/task/frame storage,
+cache capacity, lifetime batching, or early channel evaluation. A checkpoint
+only gives queued work an execution opportunity: it never waits for child
+completion or limits the live set, because children may depend on later parent
+work. Fully blocked child sets still require their independent live states.
