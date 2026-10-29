@@ -1559,11 +1559,16 @@ resumeActive:
 		resumeDirectly, foreignReturner := s.yield(task, native)
 		if resumeDirectly {
 			// The logical queue is empty, but an ordinary goroutine may be
-			// runnable on the host scheduler. Retain task ownership while
-			// honoring the source Gosched operation at that boundary.
+			// runnable on the host scheduler. A public structured lineage
+			// must leave its thread-bound episode before the caller yields.
+			// Other drivers retain task ownership across the host yield.
 			hostYieldCheck++
 			if action == stacklessCoroActionHandoff || hostYieldCheck == 0 || getg().preempt {
-				stacklessCoroGoschedIfRunnable()
+				if stacklessCoroHostRunnable() {
+					if yieldStacklessCoroNativeRoot(s, task) {
+						return
+					}
+				}
 			}
 			goto resume
 		}
