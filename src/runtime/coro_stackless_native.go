@@ -459,7 +459,8 @@ func clearStacklessCoroNativeCaches() {
 		}
 	}
 	for i := range stacklessCoroNativeSchedulerStacks {
-		if gp := stacklessCoroNativeSchedulerStacks[i].Swap(nil); gp != nil {
+		slot := &stacklessCoroNativeSchedulerStacks[i]
+		if gp := slot.Load(); gp != nil && slot.CompareAndSwap(gp, nil) {
 			freeStacklessCoroNativeSchedulerStack(gp)
 		}
 	}
