@@ -189,7 +189,7 @@ func lowerAffineRootEntry(candidate *lowerCandidate) {
 	integer := types.Types[types.TINT]
 	input := fn.Type().Param(0).Nname.(*ir.Name)
 	literal := func(n int64) ir.Node { return typedInt(pos, integer, n) }
-	yield := func() ir.Node { return ir.NewCallExpr(pos, ir.OCALLFUNC, p.yield.Fun, nil) }
+	yield := func() ir.Node { return ir.Copy(p.yield) }
 	condition := ir.NewBinaryExpr(pos, ir.OLE, input, literal(0))
 	product := ir.NewBinaryExpr(pos, ir.OMUL, input, literal(p.step))
 	sum := ir.NewBinaryExpr(pos, ir.OADD, literal(p.base), product)
