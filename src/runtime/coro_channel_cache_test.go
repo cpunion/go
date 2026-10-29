@@ -114,7 +114,7 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 				if !runtime.CancelSleepStacklessCoroForTest(timer) {
 					t.Fatal("timer cancellation failed")
 				}
-				return runtime.StacklessCoroActionYield
+				return runtime.StacklessCoroActionWait
 			}
 			return runtime.StacklessCoroActionComplete
 		})
