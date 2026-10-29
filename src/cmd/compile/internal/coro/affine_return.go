@@ -169,5 +169,33 @@ func applyAffineReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) *lo
 	}
 	candidate.ordinary = old.ordinary
 	candidate.heapLocals = old.heapLocals
+	candidate.affineRoot = p
 	return candidate
+}
+
+// A public entry runs on an ordinary Go stack. The exact single-yield proof
+// lets it execute its Gosched and scalar result directly, avoiding a root
+// scheduler and frame. Native callers still use the generated factory/resume;
+// addOrdinaryBody subsequently installs the independent source fallback for
+// locked-thread and synctest callers. This is an entry optimization, not an
+// execution of a native continuation by the public caller.
+func lowerAffineRootEntry(candidate *lowerCandidate) {
+	p := candidate.affineRoot
+	if p == nil || candidate.ordinary == nil || candidate.factoryABI != FactoryABI3 {
+		return
+	}
+	fn := candidate.function.Func
+	pos := fn.Pos()
+	integer := types.Types[types.TINT]
+	input := fn.Type().Param(0).Nname.(*ir.Name)
+	literal := func(n int64) ir.Node { return typedInt(pos, integer, n) }
+	yield := func() ir.Node { return ir.Copy(p.yield) }
+	condition := ir.NewBinaryExpr(pos, ir.OLE, input, literal(0))
+	product := ir.NewBinaryExpr(pos, ir.OMUL, input, literal(p.step))
+	sum := ir.NewBinaryExpr(pos, ir.OADD, literal(p.base), product)
+	fn.Body = ir.Nodes{
+		ir.NewIfStmt(pos, condition, ir.Nodes{yield(), ir.NewReturnStmt(pos, ir.Nodes{literal(p.base)})}, nil),
+		yield(), ir.NewReturnStmt(pos, ir.Nodes{sum}),
+	}
+	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
 }

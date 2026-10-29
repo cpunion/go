@@ -121,6 +121,7 @@ type lowerCandidate struct {
 	selfSpawn        bool
 	heapLocals       map[*ir.Name]bool
 	rootArray        *rootArrayLowering
+	affineRoot       *affineReturnPlan
 }
 
 type lowerDirectCall struct {
@@ -464,6 +465,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		if err != nil {
 			return result, err
 		}
+		lowerAffineRootEntry(candidate)
 		if candidate.ordinary != nil {
 			addOrdinaryBody(function.Func, candidate.ordinary)
 		}
