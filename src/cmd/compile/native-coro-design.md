@@ -4836,3 +4836,5 @@ cache capacity, lifetime batching, or early channel evaluation. A checkpoint
 only gives queued work an execution opportunity: it never waits for child
 completion or limits the live set, because children may depend on later parent
 work. Fully blocked child sets still require their independent live states.
+
+Ready queue checkpoints cover both ABI3 explicit frames and ABI1 closure resumes when the producer already has an explicit yield. The original ready/blocked/mixed benchmark producers use closure resumes; the explicit-frame-only prototype ad42 did not improve their allocation traffic and is retained as an unaccepted trial. The nested-loop zero-argument worker fixture separately requires progress and checks round-local capture across pressure yields.

@@ -2694,10 +2694,11 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
-	// Keep NoSuspend adapters and legacy factories unchanged. Spawn sites
-	// already participate in conservative invocation-local capture analysis.
-	spawnYield := candidate.factoryABI == FactoryABI3 &&
-		slices.ContainsFunc(function.Sites, func(site Site) bool { return site.Kind == SiteYield })
+	// Keep NoSuspend adapters unchanged. Both explicit frames and closure
+	// resumes capture invocation locals across their existing yield sites.
+	spawnYield := slices.ContainsFunc(function.Sites, func(site Site) bool {
+		return site.Kind == SiteYield
+	})
 	for _, deferred := range candidate.defers {
 		if len(deferred.terminalTargets) != 0 {
 			prepareDynamicDeferWrapper(deferred, fn)

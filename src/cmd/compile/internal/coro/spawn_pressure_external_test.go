@@ -47,6 +47,23 @@ func produce(n int, progress bool) int {
  for atomic.LoadUint64(&completed)<uint64(n) { runtime.Gosched() }
  return total
 }
+var closureDone uint64
+func closureWorker() { runtime.Gosched(); atomic.AddUint64(&closureDone, 1) }
+func closureProduce(rounds, tasks int, progress bool) uint64 {
+ var total uint64
+ for round:=0; round<rounds; round++ {
+  atomic.StoreUint64(&closureDone,0)
+  for task:=0; task<tasks; task++ {
+   go closureWorker()
+   if progress && tasks>=1024 && task==tasks/2 && atomic.LoadUint64(&closureDone)==0 {
+    panic("closure ready children made no progress during production")
+   }
+  }
+  for atomic.LoadUint64(&closureDone)<uint64(tasks) { runtime.Gosched() }
+  total+=atomic.LoadUint64(&closureDone)
+ }
+ return total
+}
 func argumentPanic() {
  defer func(){if recover()!=42 {panic("argument panic cleanup")}}()
  produce(1000,false)
@@ -71,6 +88,9 @@ func main() {
   if produce(n,os.Getenv("EXPECT_PROGRESS")=="1")!=want || arguments!=n || atomic.LoadUint64(&sum)!=uint64(want) {
    panic("spawn values or continuation locals")
   }
+ }
+ for _,n:=range []int{0,1,127,128,129,255,256,1000,10000} {
+  if closureProduce(3,n,os.Getenv("EXPECT_PROGRESS")=="1")!=uint64(3*n) {panic("closure continuation locals")}
  }
  arguments=0;atomic.StoreUint64(&completed,0);atomic.StoreUint64(&sum,0)
  panicAt=300;argumentPanic();panicAt=-1
