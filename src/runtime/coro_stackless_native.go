@@ -201,7 +201,7 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 	releaseStacklessCoroNativeSchedulerStack(ctx)
 	if ctx.deferredYield {
 		ctx.deferredYield = false
-		// The private root is already queued and signaled. Yield only after
+		// The public lineage is already queued and signaled. Yield only after
 		// restoring the ordinary caller and releasing the native thread lock.
 		Gosched()
 		return s.waitForWork()
@@ -387,13 +387,15 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	unlock(&stacklessCoroNativePool.lock)
 }
 
-// yieldStacklessCoroNativeRoot ends an initial private episode before a host
-// yield. Yielding a thread-bound executor could otherwise require a new M for
-// every runnable public root. The ordinary driver consumes the queued wake.
+// yieldStacklessCoroNativeRoot ends a public episode before a host yield,
+// including structured children of its root. Yielding a thread-bound executor
+// could otherwise require a new M for every runnable public root. Keep spawned
+// roots on their existing handoff: their public driver closes without waiting
+// and cannot consume deferred work. The ordinary driver consumes the queued wake.
 func yieldStacklessCoroNativeRoot(s *stacklessCoroScheduler, task *stacklessCoroTask) bool {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
-	if ctx == nil || ctx.executor != gp || !ctx.public {
+	if ctx == nil || ctx.executor != gp || !ctx.public || s.publicDriverDone() {
 		Gosched()
 		return false
 	}
