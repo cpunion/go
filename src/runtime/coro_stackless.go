@@ -512,12 +512,6 @@ var stacklessCoroSharedOperations struct {
 	lock  mutex
 	head  *stacklessCoroOperation
 	count uint8
-	// Only cleared, resource-free compact channel allocations enter these
-	// generations. They share the mutex, not the general resource budget.
-	channels [2]struct {
-		head  *stacklessCoroOperation
-		count uint32
-	}
 }
 
 // The bounded wake pool retains channels for nested schedulers only after

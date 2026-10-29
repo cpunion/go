@@ -62,7 +62,7 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 	check := func() runtime.StacklessCoroChannelCacheStateForTest {
 		t.Helper()
 		s := runtime.StacklessCoroChannelCacheForTest()
-		if s.Invalid || s.Charge != 112 || s.Limit != 16<<20 || uintptr(s.Young+s.Old)*s.Charge > s.Limit {
+		if s.Invalid || s.Charge != 112 || s.Limit != 16<<20 || uintptr(s.Young+s.Old)*s.Charge+s.Metadata > s.Limit || s.Young+s.Old > s.Capacity {
 			t.Fatalf("invalid actual channel cache: %+v", s)
 		}
 		return s
@@ -70,6 +70,9 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 	switch mode {
 	case "idle":
 		refs, keeper := channelCacheWeakPopulation(t)
+		// Retain an interior entry as well as the newest group head. A stale
+		// producer must not keep the entire expired population alive.
+		interior := runtime.StacklessCoroReleasedOperationNextForTest(keeper)
 		before := check()
 		if before.Young < 3000 || before.Old != 0 || keeper == nil {
 			t.Fatalf("completed actual channel population not cached: %+v", before)
@@ -88,12 +91,13 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 			t.Fatalf("one retained operation pinned expired population: %d alive", alive)
 		}
 		runtime.KeepAlive(keeper)
+		runtime.KeepAlive(interior)
 	case "bound":
 		before := check()
-		tokens := make([]unsafe.Pointer, int(before.Limit/before.Charge)+1024)
+		tokens := make([]unsafe.Pointer, int(before.Capacity)+1024)
 		channelPopulationRound(t, tokens)
 		after := check()
-		if uintptr(after.Young+after.Old) != after.Limit/after.Charge {
+		if after.Young+after.Old != after.Capacity {
 			t.Fatalf("actual population did not exercise byte cap: %+v", after)
 		}
 		runtime.GC()

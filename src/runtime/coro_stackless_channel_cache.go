@@ -11,9 +11,24 @@ import (
 	"unsafe"
 )
 
-// Charge both generations together. This retains existing, individually
-// allocated dead objects; it never combines independently live lifetimes.
-const stacklessCoroChannelCacheBudget = 16 << 20
+const (
+	stacklessCoroChannelCacheBudget    = 16 << 20
+	stacklessCoroChannelCacheGroups    = 2048
+	stacklessCoroChannelCacheGroupSize = 64
+)
+
+// Protected by stacklessCoroSharedOperations.lock. Short independently
+// rooted lists bound both the GC mark dependency chain and the work needed
+// to retire an idle generation. No live operations share an allocation.
+type stacklessCoroChannelCacheGeneration struct {
+	heads [stacklessCoroChannelCacheGroups]*stacklessCoroOperation
+	count uint32
+}
+
+var stacklessCoroChannelCache struct {
+	generations [2]stacklessCoroChannelCacheGeneration
+	young       uint8
+}
 
 func stacklessCoroChannelCacheCharge() uintptr {
 	size := unsafe.Sizeof(stacklessCoroChannelOperation{})
@@ -24,13 +39,30 @@ func stacklessCoroChannelCacheCharge() uintptr {
 	return charge
 }
 
+func stacklessCoroChannelCacheCapacity() uint32 {
+	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache)) / stacklessCoroChannelCacheCharge())
+	return min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+}
+
+func validStacklessCoroChannelCacheGeneration(g *stacklessCoroChannelCacheGeneration) bool {
+	if g.count > stacklessCoroChannelCacheCapacity() {
+		return false
+	}
+	if g.count == 0 {
+		return g.heads[0] == nil
+	}
+	last := (g.count - 1) / stacklessCoroChannelCacheGroupSize
+	return g.heads[0] != nil && g.heads[last] != nil &&
+		(last+1 == stacklessCoroChannelCacheGroups || g.heads[last+1] == nil)
+}
+
 func validStacklessCoroChannelCacheLocked() bool {
-	young := &stacklessCoroSharedOperations.channels[0]
-	old := &stacklessCoroSharedOperations.channels[1]
-	limit := uint32(stacklessCoroChannelCacheBudget / stacklessCoroChannelCacheCharge())
-	return (young.head == nil) == (young.count == 0) &&
-		(old.head == nil) == (old.count == 0) &&
-		young.count <= limit && old.count <= limit && young.count+old.count <= limit
+	a := &stacklessCoroChannelCache.generations[0]
+	b := &stacklessCoroChannelCache.generations[1]
+	limit := stacklessCoroChannelCacheCapacity()
+	return stacklessCoroChannelCache.young <= 1 &&
+		validStacklessCoroChannelCacheGeneration(a) && validStacklessCoroChannelCacheGeneration(b) &&
+		a.count+b.count <= limit
 }
 
 func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
@@ -52,10 +84,12 @@ func takeStacklessCoroChannelCacheLocked() *stacklessCoroOperation {
 	if !validStacklessCoroChannelCacheLocked() {
 		throw("runtime: invalid stackless coroutine channel cache")
 	}
-	for i := range stacklessCoroSharedOperations.channels {
-		g := &stacklessCoroSharedOperations.channels[i]
-		if op := g.head; op != nil {
-			g.head = op.next
+	for age := uint8(0); age < 2; age++ {
+		g := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^age]
+		if g.count != 0 {
+			index := (g.count - 1) / stacklessCoroChannelCacheGroupSize
+			op := g.heads[index]
+			g.heads[index] = op.next
 			g.count--
 			op.next = nil
 			return op
@@ -71,22 +105,22 @@ func cacheStacklessCoroChannelLocked(op *stacklessCoroOperation) {
 	if !validStacklessCoroChannelCacheLocked() {
 		throw("runtime: invalid stackless coroutine channel cache")
 	}
-	young := &stacklessCoroSharedOperations.channels[0]
-	old := &stacklessCoroSharedOperations.channels[1]
-	limit := uint32(stacklessCoroChannelCacheBudget / stacklessCoroChannelCacheCharge())
-	if young.count+old.count == limit {
+	young := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young]
+	old := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^1]
+	if young.count+old.count == stacklessCoroChannelCacheCapacity() {
 		return
 	}
-	op.next = young.head
-	young.head = op
+	index := young.count / stacklessCoroChannelCacheGroupSize
+	op.next = young.heads[index]
+	young.heads[index] = op
 	young.count++
 }
 
-// Called by clearpools with the world stopped, before marking begins. The
-// same mutex also excludes completion producers. As with the central sudog
-// pool, disconnect every discarded link so one retained operation cannot
-// keep an entire expired generation alive. Work is bounded by the byte cap.
-// Freshly cached objects survive one GC; unused objects expire at the next.
+// Called by clearpools with the world stopped, before marking begins.
+// Recently used operations survive one GC, then expire after an idle cycle.
+// Retiring a generation touches at most 2048 heads, not every allocation.
+// A stale interior operation can retain at most 63 other cleared objects;
+// it cannot pin the entire expired population. Clear each head's link too.
 func clearStacklessCoroChannelCache() {
 	if raceenabled {
 		return
@@ -95,22 +129,17 @@ func clearStacklessCoroChannelCache() {
 	if !validStacklessCoroChannelCacheLocked() {
 		throw("runtime: invalid stackless coroutine channel cache")
 	}
-	young := &stacklessCoroSharedOperations.channels[0]
-	old := &stacklessCoroSharedOperations.channels[1]
-	op := old.head
-	for remaining := old.count; remaining != 0; remaining-- {
+	old := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^1]
+	groups := (old.count + stacklessCoroChannelCacheGroupSize - 1) / stacklessCoroChannelCacheGroupSize
+	for i := uint32(0); i < groups; i++ {
+		op := old.heads[i]
 		if op == nil {
 			throw("runtime: truncated stackless coroutine channel cache")
 		}
-		next := op.next
 		op.next = nil
-		op = next
+		old.heads[i] = nil
 	}
-	if op != nil {
-		throw("runtime: oversized stackless coroutine channel cache")
-	}
-	*old = *young
-	young.head = nil
-	young.count = 0
+	old.count = 0
+	stacklessCoroChannelCache.young ^= 1
 	unlock(&stacklessCoroSharedOperations.lock)
 }
