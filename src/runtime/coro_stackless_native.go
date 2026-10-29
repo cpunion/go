@@ -210,7 +210,8 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		trimStacklessCoroNativeSelfFrameChunks(ctx)
 		releaseStacklessCoroNativeBurst(ctx)
 	}
-	if ctx.selfFrames != nil || ctx.selfFrameChunks != nil {
+	if ctx.selfFrames != nil || ctx.selfFrameChunks != nil ||
+		(d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0) {
 		return d.waitWithCachedFrames(s)
 	}
 	return d.waitForOperation(s)
@@ -228,15 +229,34 @@ func registerStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) *at
 			return slot
 		}
 	}
-	clearStacklessCoroNativePayloadCache(ctx)
+	clearStacklessCoroNativeParkedCache(ctx)
 	return nil
 }
 
 func (d *stacklessCoroNativeDriver) waitWithCachedFrames(s *stacklessCoroScheduler) bool {
+	ctx := d.context
+	if d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0 {
+		// Reuse the inactive episode link as an exclusive parked-cache lease.
+		// No other driver can start an episode on this scheduler while we wait.
+		// Unpublish the registry slot before clearing the lease and resuming.
+		ctx.scheduler = s
+		defer func() { ctx.scheduler = nil }()
+	}
 	if slot := registerStacklessCoroNativeParkedCache(d.context); slot != nil {
 		defer slot.Store(nil)
 	}
 	return d.waitForOperation(s)
+}
+
+func clearStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) {
+	if s := ctx.scheduler; s != nil {
+		if ctx.schedulerG != nil || ctx.caller != nil ||
+			s.executorState.Load() != stacklessCoroExecutorStateOff {
+			throw("runtime: invalid parked stackless coroutine cache lease")
+		}
+		s.discardIdleFrameTasks()
+	}
+	clearStacklessCoroNativePayloadCache(ctx)
 }
 
 func (d *stacklessCoroNativeDriver) waitForOperation(s *stacklessCoroScheduler) bool {
@@ -429,7 +449,7 @@ func clearStacklessCoroNativeCaches() {
 	for i := range stacklessCoroNativeParkedCaches {
 		ctx := stacklessCoroNativeParkedCaches[i].Load()
 		if ctx != nil && cycle-ctx.cacheIdleCycle >= 1 {
-			clearStacklessCoroNativePayloadCache(ctx)
+			clearStacklessCoroNativeParkedCache(ctx)
 		}
 	}
 }
