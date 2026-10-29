@@ -135,12 +135,15 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 		return nil
 	}
 	if d.context == nil {
-		// A newly created root is the only scheduler that is both off and has
-		// one executor. Replacement executors are prepared before they start.
+		// A private public driver has one executor and no replacements.
+		// It may acquire another context after returning one before a wait.
 		d.root = s.executorState.Load() == stacklessCoroExecutorStateOff &&
 			s.executorCount.Load() == 1
 		d.context = acquireStacklessCoroNativeContext()
-		if d.root && d.context.freeTasks != nil {
+		// Only a new scheduler can inherit the context's task cache. A
+		// resumed scheduler still owns plain slots and active/reserved frame
+		// charges, even if its previous context was returned to the pool.
+		if initial && d.root && d.context.freeTasks != nil {
 			s.freeTasks = d.context.freeTasks
 			s.freePlainTaskCount = d.context.freePlainTaskCount
 			s.freeFrameBytes = d.context.freeFrameBytes
@@ -203,6 +206,10 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		ctx.deferredYield = false
 		// The public lineage is already queued and signaled. Yield only after
 		// restoring the ordinary caller and releasing the native thread lock.
+		// A private root also returns its inactive context before yielding;
+		// otherwise concurrent runnable roots each retain an executor identity
+		// before any of them reaches its channel wait.
+		d.releasePrivateWaitContext(s)
 		Gosched()
 		return s.waitForWork()
 	}
@@ -216,7 +223,26 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		(d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0) {
 		return d.waitWithCachedFrames(s)
 	}
+	if d.releasePrivateWaitContext(s) {
+		return s.waitForWork()
+	}
 	return d.waitForOperation(s)
+}
+
+// releasePrivateWaitContext returns an inactive context whose public root can
+// wait without it. Deferred work and shared/foreign executors keep their
+// existing driver. No caller or defer may touch ctx after this succeeds.
+func (d *stacklessCoroNativeDriver) releasePrivateWaitContext(s *stacklessCoroScheduler) bool {
+	ctx := d.context
+	if !d.root || !ctx.public ||
+		s.executorState.Load() != stacklessCoroExecutorStateOff ||
+		ctx.deferredYield || ctx.deferredSleep != nil {
+		return false
+	}
+	ctx.scheduler = nil
+	d.context = nil
+	releaseStacklessCoroNativeContext(ctx)
+	return true
 }
 
 // A context is published only after its native episode has ended, and is
@@ -237,14 +263,24 @@ func registerStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) *at
 
 func (d *stacklessCoroNativeDriver) waitWithCachedFrames(s *stacklessCoroScheduler) bool {
 	ctx := d.context
-	if d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0 {
+	leased := d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0
+	if leased {
 		// Reuse the inactive episode link as an exclusive parked-cache lease.
 		// No other driver can start an episode on this scheduler while we wait.
 		// Unpublish the registry slot before clearing the lease and resuming.
 		ctx.scheduler = s
+	}
+	slot := registerStacklessCoroNativeParkedCache(ctx)
+	if slot == nil && d.releasePrivateWaitContext(s) {
+		// Overflow already dropped the idle cache. Clear its lease before
+		// pooling, and install no defer that could clear a later borrower's
+		// scheduler link through the released context pointer.
+		return s.waitForWork()
+	}
+	if leased {
 		defer func() { ctx.scheduler = nil }()
 	}
-	if slot := registerStacklessCoroNativeParkedCache(d.context); slot != nil {
+	if slot != nil {
 		defer slot.Store(nil)
 	}
 	return d.waitForOperation(s)
