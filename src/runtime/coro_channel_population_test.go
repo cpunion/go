@@ -28,7 +28,7 @@ func channelPopulationRound(t *testing.T, tokens []unsafe.Pointer) {
 		switch step {
 		case 0:
 			step++
-			for i := range tokens {
+			for range tokens {
 				childStep, value := 0, 0
 				var ok bool
 				runtime.SpawnStacklessCoroForTest(ctx, func(child unsafe.Pointer) uint8 {
