@@ -230,11 +230,45 @@ if ! "$coro_goroot/bin/go" test -c -o "$test_binary" \
 fi
 "$coro_goroot/bin/go" tool nm "$test_binary" >"$symbols_output"
 for function in "${expected[@]}"; do
+	case "$function" in
+		recursiveYield|mutualYieldA|mutualYieldB)
+			# These proven scalar public entries do not construct a native
+			# root. The linker may remove their unreferenced private factories.
+			# Keep the coroutine classification checks above and verify the
+			# physical public entry rather than requiring a dead symbol.
+			disassembly="$output_dir/$function-public-entry.objdump"
+			"$coro_goroot/bin/go" tool objdump -s "\\.${function}$" \
+				"$test_binary" >"$disassembly"
+			target=$function
+			case "$function" in
+				mutualYieldA) target=mutualYieldB ;;
+				mutualYieldB) target=mutualYieldA ;;
+			esac
+			if ! grep -Fq 'runtime.coroUseOrdinary' "$disassembly" ||
+				! grep -Fq 'runtime.Gosched' "$disassembly" ||
+				! grep -Eq "CALL .*\\.${target}\\(SB\\)" "$disassembly" ||
+				grep -Fq 'runtime.coroRunFrame' "$disassembly" ||
+				grep -Fq 'runtime.coroTakeRootFrame' "$disassembly"; then
+				echo "$function lost its direct public yield or original recursive fallback" >&2
+				exit 1
+			fi
+			continue
+			;;
+	esac
 	if ! grep -Eq "\\.${function}\\.coro$" "$symbols_output"; then
 		echo "missing lowered coroutine symbol for $function" >&2
 		exit 1
 	fi
 done
+# Independently execute real native callers of these functions. Their private
+# factories/resumes must remain available even when the public benchmark entry
+# no longer references them. This does not change any benchmark workload.
+if ! "$coro_goroot/bin/go" test -count=1 cmd/compile/internal/coro \
+	-run '^TestAffineReturnNativeAndOrdinaryBodies$' \
+	>"$output_dir/affine-native-caller.txt" 2>&1; then
+	cat "$output_dir/affine-native-caller.txt" >&2
+	exit 1
+fi
 # Like testing.AllocsPerRun, measure reuse with one P so scheduler startup on
 # other Ps is not charged to steady-state frame allocation.
 if ! "$test_binary" -test.run '^$' \
