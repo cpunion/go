@@ -206,6 +206,10 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		ctx.deferredYield = false
 		// The public lineage is already queued and signaled. Yield only after
 		// restoring the ordinary caller and releasing the native thread lock.
+		// A private root also returns its inactive context before yielding;
+		// otherwise concurrent runnable roots each retain an executor identity
+		// before any of them reaches its channel wait.
+		d.releasePrivateWaitContext(s)
 		Gosched()
 		return s.waitForWork()
 	}
