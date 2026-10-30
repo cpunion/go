@@ -46,3 +46,13 @@ func TestStacklessCoroDrainedCacheOwnership(t *testing.T) {
 		runtime.KeepAlive(keeper)
 	}
 }
+
+func TestStacklessCoroDrainedCacheOperations(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gc := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gc)
+	if !runtime.CheckStacklessCoroDrainedOperationsForTest() {
+		t.Fatal("operation cache retired before the last child, after drainage, or after the idle GC")
+	}
+}

@@ -1727,6 +1727,9 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 	}
 	if s.rootComplete() && s.liveSpawns == 0 {
 		s.drainCacheAge.complete()
+		if !raceenabled && s.spawned() {
+			s.cacheDrainedOperationsLocked()
+		}
 		s.lifetime.Or(stacklessCoroLifetimeDrained)
 	}
 }
@@ -3991,6 +3994,23 @@ func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperati
 	s.freeOperations = op
 	s.freeOperationCount++
 	return true
+}
+
+// Every source cleared and cached its operation under this lock before its
+// task could finish. Publish the bounded idle list before drainage/rootDone,
+// so a delayed owner cannot give these operations a new GC generation. A
+// producer may still signal the immutable scheduler wake after unlocking, as
+// it already may for an operation returned through the shared overflow path.
+func (s *stacklessCoroScheduler) cacheDrainedOperationsLocked() {
+	op := s.freeOperations
+	s.freeOperations = nil
+	s.freeOperationCount = 0
+	for op != nil {
+		next := op.next
+		op.next = nil
+		cacheStacklessCoroSharedOperation(op)
+		op = next
+	}
 }
 
 // takeStacklessCoroSharedOperation removes one operation from the overflow
