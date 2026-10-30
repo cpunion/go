@@ -4469,6 +4469,12 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 }
 
 func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
+	// Spawn calls this for every child, but preparation happens only once
+	// during a scheduler lifetime. Avoid an atomic read-modify-write after
+	// another caller has started preparing or running the executors.
+	if s.executorState.Load() != stacklessCoroExecutorStateOff {
+		return
+	}
 	if !s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}

@@ -48,6 +48,13 @@ func CheckStacklessCoroMixedScalarSlotsForTest() bool {
 	s.freePlainTaskCount = 1
 	valid = valid && !s.onlyUnusedScalarFrameTasksLocked()
 	s.freePlainTaskCount = 0
+	counts := s.batchedTaskCounts
+	for _, count := range [2]uint8{0, stacklessCoroTaskChunkSize} {
+		s.batchedTaskCounts = stacklessCoroTypedTaskFrameAllocationMode |
+			count<<stacklessCoroFreeBatchedTaskCountShift
+		valid = valid && !s.onlyUnusedScalarFrameTasksLocked()
+	}
+	s.batchedTaskCounts = counts
 	s.root.context.scheduler = s
 	s.root.state = stacklessCoroTaskRunning
 	s.root.resuming = true
