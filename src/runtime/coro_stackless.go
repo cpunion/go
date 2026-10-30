@@ -559,6 +559,7 @@ var stacklessCoroRootFrameCache struct {
 }
 
 func init() {
+	initStacklessCoroPayloadCache()
 	lockInit(&stacklessCoroOperations.lock, lockRankStacklessCoro)
 	stacklessCoroOperations.registry = new(stacklessCoroOperationRegistry)
 	lockInit(&stacklessCoroSharedOperations.lock, lockRankStacklessCoroCache)

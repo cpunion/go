@@ -28,20 +28,29 @@ type stacklessCoroChannelCacheGeneration struct {
 var stacklessCoroChannelCache struct {
 	generations [2]stacklessCoroChannelCacheGeneration
 	young       uint8
+	charge      uint16
+	capacity    uint32
 }
 
-func stacklessCoroChannelCacheCharge() uintptr {
+// Allocation class and capacity are invariant after runtime initialization.
+// Keep them in the existing scalar padding beside the generation selector.
+func initStacklessCoroPayloadCache() {
 	size := unsafe.Sizeof(stacklessCoroChannelOperation{})
 	charge := roundupsize(size, false)
 	if size > gc.MinSizeForMallocHeader && size <= maxSmallSize-gc.MallocHeaderSize {
 		charge += gc.MallocHeaderSize
 	}
-	return charge
+	stacklessCoroChannelCache.charge = uint16(charge)
+	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache) - stacklessCoroTaskCacheMetadata()) / charge)
+	stacklessCoroChannelCache.capacity = min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+}
+
+func stacklessCoroChannelCacheCharge() uintptr {
+	return uintptr(stacklessCoroChannelCache.charge)
 }
 
 func stacklessCoroChannelCacheCapacity() uint32 {
-	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache) - stacklessCoroTaskCacheMetadata()) / stacklessCoroChannelCacheCharge())
-	return min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+	return stacklessCoroChannelCache.capacity
 }
 
 func stacklessCoroSharedPayloadCacheBytes() uintptr {

@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -60,6 +61,8 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 	if raceenabled {
 		return true
 	}
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	for bitmap, typ := range completedTaskCacheTypesForTest() {
 		if !validStacklessCoroTaskFrameType(typ, 16) || int(*typ.GCData>>6) != bitmap {
 			return false
@@ -72,12 +75,16 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 			if *payload != [2]uintptr{} {
 				return false
 			}
-			cacheStacklessCoroCompletedTask(task)
+			lock(&s.lock)
+			s.recycleTaskLocked(task)
+			unlock(&s.lock)
 			tasks[i] = task
 		}
 		for round := 0; round < 3; round++ {
 			for i := range tasks {
+				lock(&s.lock)
 				task, marker := takeStacklessCoroCompletedTask(typ, 16)
+				unlock(&s.lock)
 				if task == nil || task.next != nil || task.frameSize != marker || marker != stacklessCoroTypedTaskCacheFirst-uint16(bitmap) {
 					return false
 				}
@@ -122,4 +129,81 @@ func StacklessCoroSharedPayloadCacheBytesForTest() uintptr {
 	n := stacklessCoroSharedPayloadCacheBytes()
 	unlock(&stacklessCoroSharedOperations.lock)
 	return n
+}
+
+func StacklessCoroCompletedTaskCachePayloadForTest() unsafe.Pointer {
+	task := completedTaskCacheNewForTest(abi.TypeFor[completedTaskLastPointer](), 2)
+	payload := new([128]byte)
+	*(*unsafe.Pointer)(add(task.context.frame, 8)) = unsafe.Pointer(payload)
+	clearStacklessCoroTaskFrame(task)
+	cacheStacklessCoroCompletedTask(task)
+	return unsafe.Pointer(payload)
+}
+
+func StacklessCoroCompletedTaskCacheFillForTest(count int) (uint32, uintptr) {
+	typ := abi.TypeFor[completedTaskLastPointer]()
+	for range count {
+		task := completedTaskCacheNewForTest(typ, 2)
+		clearStacklessCoroTaskFrame(task)
+		cacheStacklessCoroCompletedTask(task)
+	}
+	lock(&stacklessCoroSharedOperations.lock)
+	counted := stacklessCoroCompletedTasks.generations[0].count + stacklessCoroCompletedTasks.generations[1].count
+	bytes := stacklessCoroSharedPayloadCacheBytes()
+	unlock(&stacklessCoroSharedOperations.lock)
+	return counted, bytes
+}
+
+func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
+	var ownership mutex
+	lockInit(&ownership, lockRankStacklessCoro)
+	active := make(map[*stacklessCoroTask]bool)
+	var failed atomic.Uint32
+	done := make(chan struct{}, 4)
+	types := completedTaskCacheTypesForTest()
+	for worker := range 4 {
+		go func() {
+			s := new(stacklessCoroScheduler)
+			lockInit(&s.lock, lockRankStacklessCoro)
+			for i := range 2000 {
+				bitmap := (i + worker) % 4
+				lock(&s.lock)
+				task, marker := takeStacklessCoroCompletedTask(types[bitmap], 16)
+				unlock(&s.lock)
+				if task == nil {
+					task = (*stacklessCoroTask)(newobject(types[bitmap]))
+				}
+				lock(&ownership)
+				if active[task] {
+					failed.Add(1)
+				}
+				active[task] = true
+				unlock(&ownership)
+				frame := add(unsafe.Pointer(task), unsafe.Sizeof(*task))
+				if *(*[2]uintptr)(frame) != [2]uintptr{} {
+					failed.Add(1)
+				}
+				Gosched()
+				task.context.frame = frame
+				task.frameSize = marker
+				task.flags = stacklessCoroTaskTypedSpawn
+				task.state = stacklessCoroTaskComplete
+				clearStacklessCoroTaskFrame(task)
+				lock(&ownership)
+				delete(active, task)
+				unlock(&ownership)
+				lock(&s.lock)
+				s.recycleTaskLocked(task)
+				unlock(&s.lock)
+			}
+			done <- struct{}{}
+		}()
+	}
+	for range 20 {
+		GC()
+	}
+	for range 4 {
+		<-done
+	}
+	return failed.Load() == 0 && len(active) == 0 && StacklessCoroSharedPayloadCacheBytesForTest() <= 16<<20
 }
