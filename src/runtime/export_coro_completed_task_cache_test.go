@@ -95,8 +95,10 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 				cacheStacklessCoroCompletedTask(task)
 			}
 		}
-		for _, kind := range []int{0, 1, 2} {
+		for _, kind := range []int{0, 1, 2, 3} {
 			task := completedTaskCacheNewForTest(typ, bitmap)
+			embedded := add(unsafe.Pointer(task), unsafe.Sizeof(*task))
+			embeddedBefore := *(*[2]uintptr)(embedded)
 			switch kind {
 			case 0:
 				task.parent = new(stacklessCoroTask)
@@ -104,11 +106,13 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 				task.flags = 0
 			case 2:
 				task.goexit = true
+			case 3:
+				task.context.frame = unsafe.Pointer(new([2]uintptr))
 			}
 			before := *(*[2]uintptr)(task.context.frame)
 			frame := task.context.frame
 			clearStacklessCoroTaskFrame(task)
-			if task.frameSize != stacklessCoroUncachedFrameLineage || *(*[2]uintptr)(frame) != before {
+			if task.frameSize != stacklessCoroUncachedFrameLineage || *(*[2]uintptr)(frame) != before || *(*[2]uintptr)(embedded) != embeddedBefore {
 				return false
 			}
 		}
@@ -209,4 +213,36 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 		<-done
 	}
 	return probe.failed.Load() == 0 && len(probe.active) == 0 && StacklessCoroSharedPayloadCacheBytesForTest() <= 16<<20
+}
+
+func CheckStacklessCoroCompletedTaskCacheRaceNoopForTest() bool {
+	if !raceenabled {
+		return false
+	}
+	task, marker := takeStacklessCoroCompletedTask(abi.TypeFor[completedTaskLastPointer](), 16)
+	return task == nil && marker == stacklessCoroUncachedFrameLineage
+}
+
+func StacklessCoroCompletedTaskCacheFatalForTest(mode string) {
+	typ := abi.TypeFor[completedTaskLastPointer]()
+	task := completedTaskCacheNewForTest(typ, 2)
+	clearStacklessCoroTaskFrame(task)
+	if mode == "admission" {
+		task.state = stacklessCoroTaskRunning
+		cacheStacklessCoroCompletedTask(task)
+		return
+	}
+	cacheStacklessCoroCompletedTask(task)
+	lock(&stacklessCoroSharedOperations.lock)
+	g := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young]
+	switch mode {
+	case "index":
+		g.tops[2] = stacklessCoroTaskCacheGroups + 1
+	case "head":
+		g.groups[g.tops[2]].head = nil
+	case "bitmap":
+		g.groups[g.tops[2]].head.frameSize = stacklessCoroTypedTaskCacheFirst
+	}
+	unlock(&stacklessCoroSharedOperations.lock)
+	takeStacklessCoroCompletedTask(typ, 16)
 }

@@ -1262,11 +1262,13 @@ func (s *stacklessCoroScheduler) discardFreeBatchedTasks() {
 func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
 	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
 		if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parent == nil &&
-			task.terminal == stacklessCoroTerminalNone && !task.goexit {
+			task.terminal == stacklessCoroTerminalNone && !task.goexit &&
+			task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
 			memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), 16)
 		} else {
 			// Await results and unpublished reservations can still be read
-			// through a caller's frame pointer. Never pool or clear them.
+			// through a caller's frame pointer. A switched frame also keeps
+			// its existing lifetime. Never pool or clear these allocations.
 			task.frameSize = stacklessCoroUncachedFrameLineage
 		}
 	}

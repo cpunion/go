@@ -128,8 +128,8 @@ func cacheStacklessCoroCompletedTask(task *stacklessCoroTask) {
 }
 
 // Called before the shared young index rotates, with the world stopped and
-// the shared pool lock held. Retiring a generation touches at most2048heads.
-// A stale interior entry can retain at most63other fully cleared tasks.
+// the shared pool lock held. Retiring a generation touches at most 2048 heads.
+// A stale interior entry can retain at most 63 other fully cleared tasks.
 func clearStacklessCoroCompletedTasksLocked() {
 	old := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young^1]
 	for i := uint16(1); i <= old.used; i++ {

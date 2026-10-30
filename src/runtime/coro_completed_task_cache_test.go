@@ -7,7 +7,10 @@
 package runtime_test
 
 import (
+	"bytes"
 	"internal/race"
+	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"testing"
@@ -39,6 +42,8 @@ func TestStacklessCoroCompletedTaskCacheGC(t *testing.T) {
 	if race.Enabled {
 		t.Skip("task cache is excluded under race")
 	}
+	old := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(old)
 	runtime.GC()
 	runtime.GC()
 	token := completedTaskCacheWeakToken()
@@ -61,6 +66,8 @@ func TestStacklessCoroCompletedTaskCachePayload(t *testing.T) {
 	if race.Enabled {
 		t.Skip("task cache is excluded under race")
 	}
+	old := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(old)
 	runtime.GC()
 	runtime.GC()
 	payload := completedTaskCacheWeakPayload()
@@ -97,5 +104,40 @@ func TestStacklessCoroCompletedTaskCacheConcurrent(t *testing.T) {
 	}
 	if !runtime.CheckStacklessCoroCompletedTaskCacheConcurrentForTest() {
 		t.Fatal("concurrent task leases, clearing, or budget failed across GC")
+	}
+}
+
+func TestStacklessCoroCompletedTaskCacheRaceNoop(t *testing.T) {
+	if !race.Enabled {
+		t.Skip("race fallback probe")
+	}
+	if !runtime.CheckStacklessCoroCompletedTaskCacheRaceNoopForTest() {
+		t.Fatal("completed allocation cache changed race fallback")
+	}
+}
+
+func TestStacklessCoroCompletedTaskCacheFatal(t *testing.T) {
+	if race.Enabled {
+		t.Skip("task cache is excluded under race")
+	}
+	if mode := os.Getenv("GO_CORO_TASK_CACHE_FATAL"); mode != "" {
+		runtime.StacklessCoroCompletedTaskCacheFatalForTest(mode)
+		return
+	}
+	for _, tc := range []struct{ mode, message string }{
+		{"index", "completed-task group"},
+		{"head", "completed-task cache"},
+		{"bitmap", "completed-task cache"},
+		{"admission", "completed-task admission"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroCompletedTaskCacheFatal$", "-test.count=1")
+			cmd.Env = append(os.Environ(), "GO_CORO_TASK_CACHE_FATAL="+tc.mode, "GOGC=off")
+			out, err := cmd.CombinedOutput()
+			exit, ok := err.(*exec.ExitError)
+			if !ok || exit.ExitCode() != 2 || !bytes.Contains(out, []byte("runtime: invalid stackless coroutine "+tc.message)) {
+				t.Fatalf("invalid cache %s: err=%v output=%s", tc.mode, err, out)
+			}
+		})
 	}
 }
