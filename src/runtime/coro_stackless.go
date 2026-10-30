@@ -965,7 +965,10 @@ func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
 	if frame != nil {
 		*(*uint32)(frame) = 0
 	}
-	return initializeStacklessCoroTask(task, frame, resume, parent)
+	marker := stacklessCoroScalarTaskFrameMarker(task, frame)
+	task = initializeStacklessCoroTask(task, frame, resume, parent)
+	task.frameSize = marker
+	return task
 }
 
 // allocateScalarFrameTasksLocked preserves the ordinary direct prefix and
@@ -981,7 +984,10 @@ func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoro
 		stacklessCoroDirectBatchedTaskCount {
 		return s.allocateBatchedTaskLocked()
 	}
-	chunk := new(stacklessCoroScalarTaskChunk)
+	chunk := takeStacklessCoroCompletedScalarTaskChunk()
+	if chunk == nil {
+		chunk = new(stacklessCoroScalarTaskChunk)
+	}
 	first := &chunk.tasks[0]
 	first.context.frame = unsafe.Pointer(&chunk.frames[0])
 	for i := 1; i < len(chunk.tasks); i++ {
@@ -1260,6 +1266,9 @@ func (s *stacklessCoroScheduler) discardFreeBatchedTasks() {
 }
 
 func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
+	if isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
+		clearStacklessCoroScalarTaskFrame(task)
+	}
 	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
 		if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parent == nil &&
 			task.terminal == stacklessCoroTerminalNone && !task.goexit &&
@@ -1323,6 +1332,10 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
 	if uncachedLineage {
+		if isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
+			cacheStacklessCoroCompletedScalarTaskChunk(task)
+			return
+		}
 		if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
 			cacheStacklessCoroCompletedTask(task)
 			return
@@ -1745,7 +1758,7 @@ func stacklessCoroFusedFrameChunkLastFor(marker uint8) uint8 {
 func isStacklessCoroUncachedFrameLineage(marker uint16) bool {
 	return marker == stacklessCoroUncachedFrameLineage ||
 		marker <= stacklessCoroFrameChunkDirectFirst &&
-			marker >= stacklessCoroTypedTaskCacheLast
+			marker >= stacklessCoroScalarTaskCacheLast
 }
 
 func isStacklessCoroFrameChunkElement(marker uint16) bool {
@@ -1805,7 +1818,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			s.cachedFrameTasks++
 			s.cachedFrameBytes += uint16(size)
 		} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
-			s.freeFrameBytes == 0 {
+			s.freeFrameBytes == 0 && !isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
 			task.frameSize = stacklessCoroUncachedFrameLineage
 		}
 	} else {
@@ -3426,7 +3439,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	if s.liveSpawns == ^uint64(0) {
 		throw("runtime: stackless coroutine spawn count overflow")
 	}
-	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) || isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
 		task.setFlag(stacklessCoroTaskTypedSpawn, true)
 	}
 	s.liveSpawns++
