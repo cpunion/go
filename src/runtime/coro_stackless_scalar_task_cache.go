@@ -101,10 +101,19 @@ func cacheStacklessCoroCompletedScalarTaskChunk(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine scalar-task admission")
 	}
 	chunk, _ := stacklessCoroScalarTaskChunkFor(task)
+	// Most callbacks retire one member while a sibling is still live. Reject
+	// those blocks using only their membership and state words; validate the
+	// cleared pointer/header fields once, at the final completion.
 	for i := range chunk.tasks {
 		member := &chunk.tasks[i]
 		if member.frameSize != stacklessCoroScalarTaskCacheFirst-uint16(i) ||
-			member.state != stacklessCoroTaskComplete || member.resume != nil || member.parent != nil ||
+			member.state != stacklessCoroTaskComplete {
+			return
+		}
+	}
+	for i := range chunk.tasks {
+		member := &chunk.tasks[i]
+		if member.resume != nil || member.parent != nil ||
 			member.next != nil || member.terminal != stacklessCoroTerminalNone || member.goexit ||
 			member.resuming || member.readyPending || member.flags != 0 ||
 			member.context.frame != nil || member.context.scheduler != nil {
