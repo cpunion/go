@@ -66,6 +66,7 @@ NONE < vgetrandom;
 
 NONE < timerSend;
 timerSend < stacklessCoro;
+stacklessCoro < stacklessCoroCache;
 
 # Scheduler, timers, netpoll
 NONE < allocmW, execW, cpuprof, pollCache, pollDesc, wakeableSleep;
@@ -137,7 +138,7 @@ scavenge
 traceBuf < traceStrings;
 
 # Malloc
-stacklessCoro,
+stacklessCoroCache,
 allg,
   allocmR,
   allp, # procresize
@@ -192,7 +193,7 @@ gscan < stackLarge;
 gscan < hchanLeaf;
 
 # Write barrier
-stacklessCoro,
+stacklessCoroCache,
 defer,
   gscan,
   mspanSpecial,

@@ -40,8 +40,14 @@ func stacklessCoroChannelCacheCharge() uintptr {
 }
 
 func stacklessCoroChannelCacheCapacity() uint32 {
-	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache)) / stacklessCoroChannelCacheCharge())
+	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache) - stacklessCoroTaskCacheMetadata()) / stacklessCoroChannelCacheCharge())
 	return min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+}
+
+func stacklessCoroSharedPayloadCacheBytes() uintptr {
+	return unsafe.Sizeof(stacklessCoroChannelCache) + stacklessCoroTaskCacheMetadata() +
+		uintptr(stacklessCoroChannelCache.generations[0].count+stacklessCoroChannelCache.generations[1].count)*stacklessCoroChannelCacheCharge() +
+		stacklessCoroTaskCachePayloadBytes()
 }
 
 func validStacklessCoroChannelCacheGeneration(g *stacklessCoroChannelCacheGeneration) bool {
@@ -62,7 +68,7 @@ func validStacklessCoroChannelCacheLocked() bool {
 	limit := stacklessCoroChannelCacheCapacity()
 	return stacklessCoroChannelCache.young <= 1 &&
 		validStacklessCoroChannelCacheGeneration(a) && validStacklessCoroChannelCacheGeneration(b) &&
-		a.count+b.count <= limit
+		a.count+b.count <= limit && stacklessCoroSharedPayloadCacheBytes() <= stacklessCoroChannelCacheBudget
 }
 
 func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
@@ -107,7 +113,8 @@ func cacheStacklessCoroChannelLocked(op *stacklessCoroOperation) {
 	}
 	young := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young]
 	old := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^1]
-	if young.count+old.count == stacklessCoroChannelCacheCapacity() {
+	if young.count+old.count == stacklessCoroChannelCacheCapacity() ||
+		stacklessCoroSharedPayloadCacheBytes()+stacklessCoroChannelCacheCharge() > stacklessCoroChannelCacheBudget {
 		return
 	}
 	index := young.count / stacklessCoroChannelCacheGroupSize
@@ -140,6 +147,7 @@ func clearStacklessCoroChannelCache() {
 		old.heads[i] = nil
 	}
 	old.count = 0
+	clearStacklessCoroCompletedTasksLocked()
 	stacklessCoroChannelCache.young ^= 1
 	unlock(&stacklessCoroSharedOperations.lock)
 }
