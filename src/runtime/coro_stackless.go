@@ -3852,7 +3852,7 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 	task.state = stacklessCoroTaskWaiting
 	unlock(&s.lock)
 	if op == nil {
-		op = takeStacklessCoroSharedOperation()
+		op = takeStacklessCoroSharedOperation(kind)
 		if op == nil {
 			switch kind {
 			case stacklessCoroOperationChannel:
@@ -3933,7 +3933,7 @@ func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperati
 
 // takeStacklessCoroSharedOperation removes one operation from the overflow
 // shared by scheduler-local caches.
-func takeStacklessCoroSharedOperation() *stacklessCoroOperation {
+func takeStacklessCoroSharedOperation(kind stacklessCoroOperationKind) *stacklessCoroOperation {
 	if raceenabled {
 		return nil
 	}
@@ -3948,6 +3948,8 @@ func takeStacklessCoroSharedOperation() *stacklessCoroOperation {
 		stacklessCoroSharedOperations.head = op.next
 		stacklessCoroSharedOperations.count--
 		op.next = nil
+	} else if kind == stacklessCoroOperationChannel {
+		op = takeStacklessCoroChannelCacheLocked()
 	}
 	unlock(&stacklessCoroSharedOperations.lock)
 	return op
@@ -3974,6 +3976,7 @@ func cacheStacklessCoroSharedOperation(op *stacklessCoroOperation) {
 		throw("runtime: invalid shared stackless coroutine operation cache")
 	}
 	if int(stacklessCoroSharedOperations.count) == stacklessCoroSharedOperationCacheSize {
+		cacheStacklessCoroChannelLocked(op)
 		unlock(&stacklessCoroSharedOperations.lock)
 		return
 	}

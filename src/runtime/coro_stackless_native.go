@@ -473,6 +473,7 @@ func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 // Trim recently used chunks to the ordinary budget for one collection, then
 // drop payload caches that remained idle for a complete GC generation.
 func clearStacklessCoroNativeCaches() {
+	clearStacklessCoroChannelCache()
 	cycle := work.cycles.Load()
 	for i := range stacklessCoroNativePool.slots {
 		ctx := stacklessCoroNativePool.slots[i].Load()
