@@ -21,6 +21,8 @@ func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool, bool) *stac
 
 func (*stacklessCoroNativeDriver) close(*stacklessCoroScheduler, bool) {}
 
+func cacheStacklessCoroDrainedTasks(*stacklessCoroScheduler) {}
+
 func (*stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool {
 	return s.waitForWork()
 }

@@ -598,6 +598,7 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 		return false
 	}
 	s.stopReplacementExecutors()
+	releaseStacklessCoroDrainedCaches(s)
 	return finishStacklessCoroRootScheduler(s)
 }
 
@@ -647,9 +648,38 @@ func (s *stacklessCoroScheduler) runOwner() {
 	}
 	native.close(s, false)
 	s.stopReplacementExecutors()
+	releaseStacklessCoroDrainedCaches(s)
 	// Do not detach wake or reuse this scheduler. An operation producer can
 	// still be about to signal it after its last task has already completed.
 	// The owner, public caller, and remaining producers release it through GC.
+}
+
+// Called by the sole remaining owner after every logical task and replacement
+// executor has stopped. Late operation producers may still signal s.wake, but
+// have already cleared their operation and published their task under s.lock.
+// Return only the detached idle payload; keep the scheduler and wake on their
+// original allocation lifetime.
+func releaseStacklessCoroDrainedCaches(s *stacklessCoroScheduler) {
+	if raceenabled || !s.spawned() || !s.drained() {
+		return
+	}
+	cacheStacklessCoroDrainedTasks(s)
+	op := s.freeOperations
+	count := s.freeOperationCount
+	s.freeOperations = nil
+	s.freeOperationCount = 0
+	for range count {
+		if op == nil {
+			throw("runtime: truncated drained stackless coroutine operation cache")
+		}
+		next := op.next
+		op.next = nil
+		cacheStacklessCoroSharedOperation(op)
+		op = next
+	}
+	if op != nil {
+		throw("runtime: invalid drained stackless coroutine operation cache count")
+	}
 }
 
 func newStacklessCoroScheduler(frame unsafe.Pointer,

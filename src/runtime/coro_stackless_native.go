@@ -357,6 +357,33 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 	d.root = false
 }
 
+// Spawned schedulers cannot give their cache to the public driver when it
+// hands off to the owner: detached children may still be using it. Once the
+// owner has joined all replacements, the same bounded native pool can retain
+// its completed holders. No native activation or saved continuation is moved.
+func cacheStacklessCoroDrainedTasks(s *stacklessCoroScheduler) {
+	if s.freeTasks == nil {
+		return
+	}
+	s.discardFreeOverflowTasks()
+	s.discardFreeBatchedTasks()
+	if s.freeTasks == nil {
+		return
+	}
+	ctx := acquireStacklessCoroNativeContext()
+	ctx.freeTasks = s.freeTasks
+	ctx.freePlainTaskCount = s.freePlainTaskCount
+	ctx.freeFrameBytes = s.freeFrameBytes
+	ctx.cachedFrameTasks = s.cachedFrameTasks
+	ctx.cachedFrameBytes = s.cachedFrameBytes
+	s.freeTasks = nil
+	s.freePlainTaskCount = 0
+	s.freeFrameBytes = 0
+	s.cachedFrameTasks = 0
+	s.cachedFrameBytes = 0
+	releaseStacklessCoroNativeContext(ctx)
+}
+
 // coroRunOnNativeStack drives one replacement episode with a short-lived
 // driver. Public roots keep their driver across idle episodes instead.
 func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
