@@ -28,20 +28,35 @@ type stacklessCoroChannelCacheGeneration struct {
 var stacklessCoroChannelCache struct {
 	generations [2]stacklessCoroChannelCacheGeneration
 	young       uint8
+	charge      uint16
+	capacity    uint32
 }
 
-func stacklessCoroChannelCacheCharge() uintptr {
+// Allocation class and capacity are invariant after runtime initialization.
+// Keep them in the existing scalar padding beside the generation selector.
+func initStacklessCoroPayloadCache() {
 	size := unsafe.Sizeof(stacklessCoroChannelOperation{})
 	charge := roundupsize(size, false)
 	if size > gc.MinSizeForMallocHeader && size <= maxSmallSize-gc.MallocHeaderSize {
 		charge += gc.MallocHeaderSize
 	}
-	return charge
+	stacklessCoroChannelCache.charge = uint16(charge)
+	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache) - stacklessCoroTaskCacheMetadata()) / charge)
+	stacklessCoroChannelCache.capacity = min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+}
+
+func stacklessCoroChannelCacheCharge() uintptr {
+	return uintptr(stacklessCoroChannelCache.charge)
 }
 
 func stacklessCoroChannelCacheCapacity() uint32 {
-	limit := uint32((stacklessCoroChannelCacheBudget - unsafe.Sizeof(stacklessCoroChannelCache)) / stacklessCoroChannelCacheCharge())
-	return min(limit, stacklessCoroChannelCacheGroups*stacklessCoroChannelCacheGroupSize)
+	return stacklessCoroChannelCache.capacity
+}
+
+func stacklessCoroSharedPayloadCacheBytes() uintptr {
+	return unsafe.Sizeof(stacklessCoroChannelCache) + stacklessCoroTaskCacheMetadata() +
+		uintptr(stacklessCoroChannelCache.generations[0].count+stacklessCoroChannelCache.generations[1].count)*stacklessCoroChannelCacheCharge() +
+		stacklessCoroTaskCachePayloadBytes()
 }
 
 func validStacklessCoroChannelCacheGeneration(g *stacklessCoroChannelCacheGeneration) bool {
@@ -62,7 +77,7 @@ func validStacklessCoroChannelCacheLocked() bool {
 	limit := stacklessCoroChannelCacheCapacity()
 	return stacklessCoroChannelCache.young <= 1 &&
 		validStacklessCoroChannelCacheGeneration(a) && validStacklessCoroChannelCacheGeneration(b) &&
-		a.count+b.count <= limit
+		a.count+b.count <= limit && stacklessCoroSharedPayloadCacheBytes() <= stacklessCoroChannelCacheBudget
 }
 
 func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
@@ -107,7 +122,8 @@ func cacheStacklessCoroChannelLocked(op *stacklessCoroOperation) {
 	}
 	young := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young]
 	old := &stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^1]
-	if young.count+old.count == stacklessCoroChannelCacheCapacity() {
+	if young.count+old.count == stacklessCoroChannelCacheCapacity() ||
+		stacklessCoroSharedPayloadCacheBytes()+stacklessCoroChannelCacheCharge() > stacklessCoroChannelCacheBudget {
 		return
 	}
 	index := young.count / stacklessCoroChannelCacheGroupSize
@@ -140,6 +156,7 @@ func clearStacklessCoroChannelCache() {
 		old.heads[i] = nil
 	}
 	old.count = 0
+	clearStacklessCoroCompletedTasksLocked()
 	stacklessCoroChannelCache.young ^= 1
 	unlock(&stacklessCoroSharedOperations.lock)
 }

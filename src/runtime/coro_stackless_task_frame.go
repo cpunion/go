@@ -11,6 +11,18 @@ import (
 	"unsafe"
 )
 
+// These four markers identify the complete GC bitmap of an individual
+// sixteen-byte frame. They remain uncached-lineage markers while active;
+// only a completed independent spawn may retain its cleared storage.
+const (
+	stacklessCoroTypedTaskCacheFirst = stacklessCoroShortFrameChunkLast - 1
+	stacklessCoroTypedTaskCacheLast  = stacklessCoroTypedTaskCacheFirst - 3
+)
+
+func isStacklessCoroTypedTaskCacheMarker(marker uint16) bool {
+	return marker <= stacklessCoroTypedTaskCacheFirst && marker >= stacklessCoroTypedTaskCacheLast
+}
+
 func validStacklessCoroTaskFrameType(typ *_type, size uintptr) bool {
 	headerSize := unsafe.Sizeof(stacklessCoroTask{})
 	if unsafe.Sizeof(uintptr(0)) != 8 ||
@@ -32,8 +44,8 @@ func validStacklessCoroTaskFrameType(typ *_type, size uintptr) bool {
 
 // coroTakeTypedTaskFrame preserves the normal frame reservation/cache prefix.
 // Only a cache-full reservation with no reusable task receives a combined
-// allocation. Its existing uncached-lineage marker prevents either task or
-// frame from entering an idle cache after completion.
+// allocation. Only eligible two-word frames can reuse cleared allocations
+// from completed independent spawns; structured results retain their lifetime.
 func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, allocationType *_type) unsafe.Pointer {
 	if ctx == nil || raceenabled || unsafe.Sizeof(uintptr(0)) != 8 ||
@@ -67,11 +79,15 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 				unlock(&s.lock)
 				throw("runtime: invalid stackless coroutine task-frame allocation type")
 			}
-			storage := newobject(allocationType)
+			cached, marker := takeStacklessCoroCompletedTask(allocationType, size)
+			storage := unsafe.Pointer(cached)
+			if storage == nil {
+				storage = newobject(allocationType)
+			}
 			s.batchedTaskCounts = s.batchedTaskCounts&^stacklessCoroDirectBatchedTaskCountMask | stacklessCoroTypedTaskFrameAllocationMode
 			task = initializeStacklessCoroTask((*stacklessCoroTask)(storage),
 				add(storage, unsafe.Sizeof(stacklessCoroTask{})), child, parent)
-			task.frameSize = stacklessCoroUncachedFrameLineage
+			task.frameSize = marker
 		} else {
 			task = s.newFrameReservationTaskLocked(child, parent, size)
 			if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&

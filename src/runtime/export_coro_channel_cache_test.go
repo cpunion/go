@@ -21,7 +21,7 @@ func StacklessCoroChannelCacheForTest() StacklessCoroChannelCacheStateForTest {
 		Young:  stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young].count,
 		Old:    stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young^1].count,
 		Charge: stacklessCoroChannelCacheCharge(), Limit: stacklessCoroChannelCacheBudget,
-		Metadata: unsafe.Sizeof(stacklessCoroChannelCache), Capacity: stacklessCoroChannelCacheCapacity(),
+		Metadata: unsafe.Sizeof(stacklessCoroChannelCache) + stacklessCoroTaskCacheMetadata(), Capacity: stacklessCoroChannelCacheCapacity(),
 		Invalid: !validStacklessCoroChannelCacheLocked(),
 	}
 	for gi := range stacklessCoroChannelCache.generations {

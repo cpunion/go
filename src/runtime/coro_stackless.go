@@ -175,6 +175,7 @@ const (
 	stacklessCoroTaskFusedChunk
 	stacklessCoroTaskSwitchPending
 	stacklessCoroTaskFreeChunk
+	stacklessCoroTaskTypedSpawn
 	stacklessCoroTaskFusedTransitionMask = stacklessCoroTaskFusedRequested |
 		stacklessCoroTaskFusedPending | stacklessCoroTaskFusedChunk
 	stacklessCoroTaskCompletionMask = stacklessCoroTaskFusedFrames |
@@ -558,9 +559,10 @@ var stacklessCoroRootFrameCache struct {
 }
 
 func init() {
+	initStacklessCoroPayloadCache()
 	lockInit(&stacklessCoroOperations.lock, lockRankStacklessCoro)
 	stacklessCoroOperations.registry = new(stacklessCoroOperationRegistry)
-	lockInit(&stacklessCoroSharedOperations.lock, lockRankStacklessCoro)
+	lockInit(&stacklessCoroSharedOperations.lock, lockRankStacklessCoroCache)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
 
@@ -1258,6 +1260,18 @@ func (s *stacklessCoroScheduler) discardFreeBatchedTasks() {
 }
 
 func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
+	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+		if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parent == nil &&
+			task.terminal == stacklessCoroTerminalNone && !task.goexit &&
+			task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
+			memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), 16)
+		} else {
+			// Await results and unpublished reservations can still be read
+			// through a caller's frame pointer. A switched frame also keeps
+			// its existing lifetime. Never pool or clear these allocations.
+			task.frameSize = stacklessCoroUncachedFrameLineage
+		}
+	}
 	uncachedLineage := isStacklessCoroUncachedFrameLineage(task.frameSize)
 	task.resume = nil
 	task.context.frame = nil
@@ -1309,6 +1323,10 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
 	if uncachedLineage {
+		if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+			cacheStacklessCoroCompletedTask(task)
+			return
+		}
 		task.frameSize = 0
 		return
 	}
@@ -1727,7 +1745,7 @@ func stacklessCoroFusedFrameChunkLastFor(marker uint8) uint8 {
 func isStacklessCoroUncachedFrameLineage(marker uint16) bool {
 	return marker == stacklessCoroUncachedFrameLineage ||
 		marker <= stacklessCoroFrameChunkDirectFirst &&
-			marker >= stacklessCoroShortFrameChunkLast
+			marker >= stacklessCoroTypedTaskCacheLast
 }
 
 func isStacklessCoroFrameChunkElement(marker uint16) bool {
@@ -3407,6 +3425,9 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	s.markUncachedFrameLineageLocked(task, parent, frame)
 	if s.liveSpawns == ^uint64(0) {
 		throw("runtime: stackless coroutine spawn count overflow")
+	}
+	if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+		task.setFlag(stacklessCoroTaskTypedSpawn, true)
 	}
 	s.liveSpawns++
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
