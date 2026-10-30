@@ -26,14 +26,14 @@ func StacklessCoroDrainedCacheForTest(drained bool) (unsafe.Pointer, unsafe.Poin
 	s.freeFrameBytes, s.cachedFrameBytes, s.cachedFrameTasks = 8, 8, 1
 	op := newStacklessCoroChannelOperation()
 	s.freeOperations, s.freeOperationCount = op, 1
-	releaseStacklessCoroDrainedCaches(s)
+	cacheStacklessCoroDrainedTasks(s)
 	valid := s.wake == wake && s.lifetime.Load() == lifetime
 	if !drained {
 		valid = valid && s.freeTasks == task && s.freeOperations == op &&
 			s.freeOperationCount == 1 && s.freeFrameBytes == 8 && s.cachedFrameTasks == 1
 	} else {
-		valid = valid && s.freeTasks == nil && s.freeOperations == nil &&
-			s.freeOperationCount == 0 && s.freePlainTaskCount == 0 &&
+		valid = valid && s.freeTasks == nil && s.freeOperations == op &&
+			s.freeOperationCount == 1 && s.freePlainTaskCount == 0 &&
 			s.freeFrameBytes == 0 && s.cachedFrameBytes == 0 && s.cachedFrameTasks == 0
 		ctx := acquireStacklessCoroNativeContext()
 		valid = valid && ctx.freeTasks == task && ctx.cachedFrameTasks == 1 &&
@@ -53,5 +53,5 @@ func drainedCacheResumeForTest(unsafe.Pointer) uint8 { return stacklessCoroActio
 func StacklessCoroDrainedCacheSignalForTest(token unsafe.Pointer) bool {
 	s := (*stacklessCoroScheduler)(token)
 	s.signal()
-	return s.freeTasks == nil && s.freeOperations == nil && s.wake != nil
+	return s.freeTasks == nil && s.freeOperationCount == 1 && s.freeOperations != nil && s.wake != nil
 }

@@ -362,7 +362,7 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 // owner has joined all replacements, the same bounded native pool can retain
 // its completed holders. No native activation or saved continuation is moved.
 func cacheStacklessCoroDrainedTasks(s *stacklessCoroScheduler) {
-	if s.freeTasks == nil {
+	if raceenabled || !s.spawned() || !s.drained() || s.freeTasks == nil {
 		return
 	}
 	s.discardFreeOverflowTasks()
