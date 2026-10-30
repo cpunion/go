@@ -322,6 +322,7 @@ type stacklessCoroScheduler struct {
 	// runnableState stores the runnable count in its low 31 bits. The high
 	// bit asks a native executor to yield its P to a returning foreign call.
 	runnableState    atomic.Uint32
+	drainCacheAge    stacklessCoroDrainCacheAge
 	foreignReturners atomic.Uint32
 }
 
@@ -1725,6 +1726,7 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 		s.liveSpawns--
 	}
 	if s.rootComplete() && s.liveSpawns == 0 {
+		s.drainCacheAge.complete()
 		s.lifetime.Or(stacklessCoroLifetimeDrained)
 	}
 }

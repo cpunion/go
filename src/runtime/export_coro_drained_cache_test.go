@@ -9,13 +9,14 @@ package runtime
 import "unsafe"
 
 //go:noinline
-func StacklessCoroDrainedCacheForTest(drained bool) (unsafe.Pointer, unsafe.Pointer, bool) {
+func StacklessCoroDrainedCacheForTest(drained bool, delayGC int) (unsafe.Pointer, unsafe.Pointer, bool) {
 	s := newStacklessCoroTestScheduler()
 	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
 	wake := s.wake
 	lifetime := stacklessCoroLifetimeRootComplete | stacklessCoroLifetimeSpawned |
 		stacklessCoroLifetimeOperationStarted
 	if drained {
+		s.drainCacheAge.complete()
 		lifetime |= stacklessCoroLifetimeDrained
 	}
 	s.lifetime.Store(lifetime)
@@ -26,6 +27,9 @@ func StacklessCoroDrainedCacheForTest(drained bool) (unsafe.Pointer, unsafe.Poin
 	s.freeFrameBytes, s.cachedFrameBytes, s.cachedFrameTasks = 8, 8, 1
 	op := newStacklessCoroChannelOperation()
 	s.freeOperations, s.freeOperationCount = op, 1
+	for range delayGC {
+		GC()
+	}
 	cacheStacklessCoroDrainedTasks(s)
 	valid := s.wake == wake && s.lifetime.Load() == lifetime
 	if !drained {
@@ -35,11 +39,14 @@ func StacklessCoroDrainedCacheForTest(drained bool) (unsafe.Pointer, unsafe.Poin
 		valid = valid && s.freeTasks == nil && s.freeOperations == op &&
 			s.freeOperationCount == 1 && s.freePlainTaskCount == 0 &&
 			s.freeFrameBytes == 0 && s.cachedFrameBytes == 0 && s.cachedFrameTasks == 0
-		ctx := acquireStacklessCoroNativeContext()
-		valid = valid && ctx.freeTasks == task && ctx.cachedFrameTasks == 1 &&
-			ctx.freeFrameBytes == 8 && ctx.cachedFrameBytes == 8 &&
-			task.context.frame != nil && task.resume != nil && task.next == nil
-		releaseStacklessCoroNativeContext(ctx)
+		if delayGC < 2 {
+			ctx := acquireStacklessCoroNativeContext()
+			valid = valid && ctx.freeTasks == task && ctx.cachedFrameTasks == 1 &&
+				ctx.freeFrameBytes == 8 && ctx.cachedFrameBytes == 8 &&
+				task.context.frame != nil && task.resume != nil && task.next == nil
+			// Observation must not reset the generation it is checking.
+			releaseStacklessCoroNativeContextAt(ctx, s.drainCacheAge.cycle)
+		}
 	}
 	// A producer that retained the old scheduler may still signal its original
 	// wake. It must neither touch the detached cache nor see a reused scheduler.

@@ -20,25 +20,29 @@ func TestStacklessCoroDrainedCacheOwnership(t *testing.T) {
 	defer debug.SetGCPercent(gc)
 	runtime.StacklessCoroClearNativeTaskCachesForTest()
 	defer runtime.StacklessCoroClearNativeTaskCachesForTest()
-	if _, _, valid := runtime.StacklessCoroDrainedCacheForTest(false); !valid {
+	if _, _, valid := runtime.StacklessCoroDrainedCacheForTest(false, 0); !valid {
 		t.Fatal("root completion detached a cache while children remained live")
 	}
-	keeper, token, valid := runtime.StacklessCoroDrainedCacheForTest(true)
-	if !valid {
-		t.Fatal("drained cache transfer changed ownership, frame charges or wake lifetime")
+	for _, delay := range []int{0, 1, 2} {
+		keeper, token, valid := runtime.StacklessCoroDrainedCacheForTest(true, delay)
+		if !valid {
+			t.Fatalf("delay=%d: transfer changed ownership, frame charges or wake lifetime", delay)
+		}
+		ref := weak.Make((*byte)(token))
+		token = nil
+		if delay == 0 {
+			runtime.GC()
+			if ref.Value() == nil {
+				t.Fatal("recently used task cache did not survive its first idle GC")
+			}
+		}
+		runtime.GC()
+		if ref.Value() != nil {
+			t.Fatalf("delay=%d: old scheduler or late admission pinned an expired cache", delay)
+		}
+		if !runtime.StacklessCoroDrainedCacheSignalForTest(keeper) {
+			t.Fatal("late producer lost its original scheduler wake")
+		}
+		runtime.KeepAlive(keeper)
 	}
-	ref := weak.Make((*byte)(token))
-	token = nil
-	runtime.GC()
-	if ref.Value() == nil {
-		t.Fatal("recently used task cache did not survive its first idle GC")
-	}
-	runtime.GC()
-	if ref.Value() != nil {
-		t.Fatal("a retained old scheduler pinned an expired task cache")
-	}
-	if !runtime.StacklessCoroDrainedCacheSignalForTest(keeper) {
-		t.Fatal("late producer lost its original scheduler wake")
-	}
-	runtime.KeepAlive(keeper)
 }
