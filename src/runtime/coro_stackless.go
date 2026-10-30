@@ -1022,14 +1022,11 @@ func (s *stacklessCoroScheduler) onlyUnusedScalarFrameTasksLocked() bool {
 		return false
 	}
 	task := s.freeTasks
-	for ; count != 0; count-- {
-		if task == nil || task.flags != stacklessCoroTaskFreeChunk ||
-			task.frameSize != stacklessCoroFreeBatchedTask || task.context.frame == nil {
-			return false
-		}
-		task = task.next
-	}
-	return task == nil
+	// A new chunk is allocated only after all pending chunk slots have been
+	// consumed. With ordinary cached tasks and overflow slots excluded above,
+	// the remaining slots all belong to the chunk identified by the head.
+	return task != nil && task.flags == stacklessCoroTaskFreeChunk &&
+		task.frameSize == stacklessCoroFreeBatchedTask && task.context.frame != nil
 }
 
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,

@@ -142,7 +142,10 @@ func cacheStacklessCoroCompletedScalarTaskChunk(task *stacklessCoroTask) {
 		g.tops[stacklessCoroScalarTaskCacheClass] = index
 	}
 	for i := range chunk.tasks {
-		chunk.tasks[i] = stacklessCoroTask{}
+		// Admission checked every other field above. Only the completed state
+		// and scalar origin marker remain to clear before caching the chunk.
+		chunk.tasks[i].state = stacklessCoroTaskNew
+		chunk.tasks[i].frameSize = 0
 	}
 	head := &chunk.tasks[0]
 	head.frameSize = stacklessCoroScalarTaskCacheFirst
