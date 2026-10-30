@@ -134,3 +134,16 @@ func TestStacklessCoroScalarTaskCacheFatal(t *testing.T) {
 		})
 	}
 }
+
+func TestStacklessCoroScalarTaskCacheMixed(t *testing.T) {
+	if race.Enabled {
+		t.Skip("scalar chunk cache excluded under race")
+	}
+	old := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(old)
+	runtime.GC()
+	runtime.GC()
+	if !runtime.CheckStacklessCoroMixedScalarSlotsForTest() {
+		t.Fatal("mixed scalar boundary, slot isolation, independent typed frame or mode preservation failed")
+	}
+}

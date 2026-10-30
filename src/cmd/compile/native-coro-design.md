@@ -4866,3 +4866,12 @@ The active chunk layout, task header, scheduler descriptor and factory ABI do
 not grow. This reuses already existing scalar allocations, without batching
 new independent pointer-bearing frames. Hot-allocation savings, first-GC
 retention/scan cost and cold memory require separate fixed observations.
+
+Mixed populations retain individual scalar task/tiny-frame allocations until
+live independent spawns exceed the local task cache plus its direct prefix.
+Larger populations may use the same existing four-member scalar blocks.
+A typed frame may bypass a list consisting solely of the block's unused scalar
+slots, preserving those slots for scalar reservations. Typed frames remain
+independent precisely typed allocations; active pointer-bearing frames do not
+share new storage. The shared16MiB budget, one-GC survival, two-idle-GC expiry,
+whole-block completion checks and all exceptional fallback rules remain in force.

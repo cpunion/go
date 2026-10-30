@@ -977,7 +977,11 @@ func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
 //
 //go:noinline
 func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoroTask {
-	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode &&
+		s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
+		// Short mixed populations keep their exact individual task/tiny-frame
+		// charge. Beyond the local cache and direct prefix, the existing scalar
+		// block can serve a sustained population without growing either header.
 		return new(stacklessCoroTask)
 	}
 	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask <
@@ -1002,6 +1006,30 @@ func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoro
 		stacklessCoroFreeBatchedTaskCountShift
 	s.overflowTaskCounts |= stacklessCoroFreeBatchedTaskPresent
 	return first
+}
+
+// onlyUnusedScalarFrameTasksLocked distinguishes pending scalar slots from
+// reusable ordinary tasks. A typed frame must not consume a four-byte slot:
+// preserving it lets the original scalar block complete and be reused whole.
+func (s *stacklessCoroScheduler) onlyUnusedScalarFrameTasksLocked() bool {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask != stacklessCoroTypedTaskFrameAllocationMode ||
+		s.freePlainTaskCount != 0 || s.freeFrameBytes != 0 ||
+		s.overflowTaskCounts&stacklessCoroFreeTaskChunkMask != stacklessCoroFreeBatchedTaskPresent {
+		return false
+	}
+	count := s.batchedTaskCounts >> stacklessCoroFreeBatchedTaskCountShift
+	if count == 0 || count >= stacklessCoroTaskChunkSize {
+		return false
+	}
+	task := s.freeTasks
+	for ; count != 0; count-- {
+		if task == nil || task.flags != stacklessCoroTaskFreeChunk ||
+			task.frameSize != stacklessCoroFreeBatchedTask || task.context.frame == nil {
+			return false
+		}
+		task = task.next
+	}
+	return task == nil
 }
 
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
