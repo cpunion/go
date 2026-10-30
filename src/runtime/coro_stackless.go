@@ -977,7 +977,11 @@ func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
 //
 //go:noinline
 func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoroTask {
-	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode &&
+		s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
+		// Short mixed populations keep their exact individual task/tiny-frame
+		// charge. Beyond the local cache and direct prefix, the existing scalar
+		// block can serve a sustained population without growing either header.
 		return new(stacklessCoroTask)
 	}
 	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask <
@@ -1002,6 +1006,27 @@ func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoro
 		stacklessCoroFreeBatchedTaskCountShift
 	s.overflowTaskCounts |= stacklessCoroFreeBatchedTaskPresent
 	return first
+}
+
+// onlyUnusedScalarFrameTasksLocked distinguishes pending scalar slots from
+// reusable ordinary tasks. A typed frame must not consume a four-byte slot:
+// preserving it lets the original scalar block complete and be reused whole.
+func (s *stacklessCoroScheduler) onlyUnusedScalarFrameTasksLocked() bool {
+	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask != stacklessCoroTypedTaskFrameAllocationMode ||
+		s.freePlainTaskCount != 0 || s.freeFrameBytes != 0 ||
+		s.overflowTaskCounts&stacklessCoroFreeTaskChunkMask != stacklessCoroFreeBatchedTaskPresent {
+		return false
+	}
+	count := s.batchedTaskCounts >> stacklessCoroFreeBatchedTaskCountShift
+	if count == 0 || count >= stacklessCoroTaskChunkSize {
+		return false
+	}
+	task := s.freeTasks
+	// A new chunk is allocated only after all pending chunk slots have been
+	// consumed. With ordinary cached tasks and overflow slots excluded above,
+	// the remaining slots all belong to the chunk identified by the head.
+	return task != nil && task.flags == stacklessCoroTaskFreeChunk &&
+		task.frameSize == stacklessCoroFreeBatchedTask && task.context.frame != nil
 }
 
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
@@ -4444,7 +4469,11 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 }
 
 func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
-	if !s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
+	// Spawn calls this for every child, but preparation happens only once
+	// during a scheduler lifetime. Avoid an atomic read-modify-write after
+	// another caller has started preparing or running the executors.
+	if s.executorState.Load() != stacklessCoroExecutorStateOff ||
+		!s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}
 
