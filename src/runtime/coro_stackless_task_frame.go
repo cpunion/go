@@ -21,6 +21,11 @@ const (
 	stacklessCoroScalarTaskCacheLast  = stacklessCoroScalarTaskCacheFirst - (stacklessCoroTaskChunkSize - 1)
 )
 
+// Both completed-cache classes occupy one contiguous marker range.
+func isStacklessCoroCompletedTaskCacheMarker(marker uint16) bool {
+	return marker >= stacklessCoroScalarTaskCacheLast && marker <= stacklessCoroTypedTaskCacheFirst
+}
+
 func isStacklessCoroTypedTaskCacheMarker(marker uint16) bool {
 	return marker <= stacklessCoroTypedTaskCacheFirst && marker >= stacklessCoroTypedTaskCacheLast
 }
