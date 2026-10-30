@@ -157,7 +157,8 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 					task := s.reservedTasks
 					base, span, _ := findObject(uintptr(unsafe.Pointer(task)), 0, 0)
 					if isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
-						chunk, index := stacklessCoroScalarTaskChunkFor(task)
+						index := uintptr(stacklessCoroScalarTaskCacheFirst - task.frameSize)
+						chunk := (*stacklessCoroScalarTaskChunk)(unsafe.Add(unsafe.Pointer(task), -int(index*unsafe.Sizeof(*task))))
 						if s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount ||
 							base != uintptr(unsafe.Pointer(chunk)) || span.elemsize != unsafe.Sizeof(*chunk) ||
 							unsafe.Pointer(frame) != unsafe.Pointer(&chunk.frames[index]) {
