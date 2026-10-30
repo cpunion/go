@@ -155,10 +155,13 @@ func StacklessCoroCompletedTaskCacheFillForTest(count int) (uint32, uintptr) {
 }
 
 func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
-	var ownership mutex
-	lockInit(&ownership, lockRankStacklessCoro)
-	active := make(map[*stacklessCoroTask]bool)
-	var failed atomic.Uint32
+	probe := new(struct {
+		ownership mutex
+		active    map[*stacklessCoroTask]bool
+		failed    atomic.Uint32
+	})
+	lockInit(&probe.ownership, lockRankStacklessCoro)
+	probe.active = make(map[*stacklessCoroTask]bool)
 	done := make(chan struct{}, 4)
 	types := completedTaskCacheTypesForTest()
 	for worker := range 4 {
@@ -173,15 +176,15 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 				if task == nil {
 					task = (*stacklessCoroTask)(newobject(types[bitmap]))
 				}
-				lock(&ownership)
-				if active[task] {
-					failed.Add(1)
+				lock(&probe.ownership)
+				if probe.active[task] {
+					probe.failed.Add(1)
 				}
-				active[task] = true
-				unlock(&ownership)
+				probe.active[task] = true
+				unlock(&probe.ownership)
 				frame := add(unsafe.Pointer(task), unsafe.Sizeof(*task))
 				if *(*[2]uintptr)(frame) != [2]uintptr{} {
-					failed.Add(1)
+					probe.failed.Add(1)
 				}
 				Gosched()
 				task.context.frame = frame
@@ -189,9 +192,9 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 				task.flags = stacklessCoroTaskTypedSpawn
 				task.state = stacklessCoroTaskComplete
 				clearStacklessCoroTaskFrame(task)
-				lock(&ownership)
-				delete(active, task)
-				unlock(&ownership)
+				lock(&probe.ownership)
+				delete(probe.active, task)
+				unlock(&probe.ownership)
 				lock(&s.lock)
 				s.recycleTaskLocked(task)
 				unlock(&s.lock)
@@ -205,5 +208,5 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 	for range 4 {
 		<-done
 	}
-	return failed.Load() == 0 && len(active) == 0 && StacklessCoroSharedPayloadCacheBytesForTest() <= 16<<20
+	return probe.failed.Load() == 0 && len(probe.active) == 0 && StacklessCoroSharedPayloadCacheBytesForTest() <= 16<<20
 }
