@@ -4592,10 +4592,12 @@ the existing task-batch counter makes later scalar reservations allocate one
 byte charges across a later mixed phase without retaining unused scalar
 slots in plain pointer-task storage. The task and scheduler sizes, free-slot
 count bits, cache limits and ordinary direct-prefix path remain unchanged.
-This allocation
-uses the existing uncached-lineage marker, so neither its task nor its frame
-can enter an idle cache. One task/frame pair per object avoids sibling-frame
-retention after partial completion. In particular a 48-byte task plus a
+These allocations retain uncached-lineage behavior while active. Normally
+completed independent16-byte private frames can enter the bounded completed-task
+cache, separated by all four complete frame GC bitmaps; await results, unpublished
+reservations, switched frames, exceptional exits and race keep their prior
+lifetime. Wider private frames remain uncached. One task/frame pair per object
+avoids sibling-frame retention after partial completion. In particular a 48-byte task plus a
 32-byte frame fits the same 80 allocated bytes as the prior task-chunk share
 and separate frame, while removing one task-chunk allocation per four such
 workers. Actual workload benefits and fixed metadata costs require separate
@@ -4840,3 +4842,27 @@ work. Fully blocked child sets still require their independent live states.
 Ready queue checkpoints cover both ABI3 explicit frames and ABI1 closure resumes when the producer already has an explicit yield. The original ready/blocked/mixed benchmark producers use closure resumes; the explicit-frame-only prototype ad42 did not improve their allocation traffic and is retained as an unaccepted trial. The nested-loop zero-argument worker fixture separately requires progress and checks round-local capture across pressure yields.
 
 The ready-pressure hint also requires the existing live-spawn count to remain within the fixed256task reuse capacity. A completely blocked producer gets at most its initial two128task pressure opportunities, then continues publishing until its original suspension; it never waits for completion or caps the live set. This avoids repeated checkpoints that cannot replenish the task cache. Ready workers that finish in a few scheduler episodes keep the live set small and retain the allocation benefit. The hint uses readyLocked's existing returned runnable count, avoiding an extra atomic load. Arbitrary long-lived or repeatedly yielding worker graphs have no universal bounded-live-set guarantee. Source32b4d51's confirmed ready gains and consistent15percent fully-blocked slowdown remain an unaccepted, byte-recovered trial.
+
+
+### Completed scalar task chunks (2026-10-30)
+
+The existing scalar allocator pairs four48-byte tasks with four pointer-free
+uint32 frames in one208-byte allocation. After the direct and local-cache
+prefixes, native targets can reuse this same allocation when all four members
+have completed normal independent spawns. Each member carries its proven chunk
+index in existing uncached-lineage markers. The final completion checks all
+members under their original scheduler lock before clearing every header and
+publishing the whole chunk; no partial chunk or live member crosses schedulers.
+A non-scalar slot consumer, structured await, unpublished reservation, switched
+frame, exceptional exit or race leaves the block on its original fallback.
+
+Scalar chunks occupy a fifth class in the existing completed-task pool, with
+16chunks per group so a stale interior reference retains at most63other cleared
+tasks. The shared sixteen-MiB budget includes both generations of scalar chunks,
+independent typed tasks, compact channels and all group metadata. Payload byte
+counts are updated at admission and take. Recently used chunks survive one GC
+and expire after a second idle collection using the same pool rotation.
+The active chunk layout, task header, scheduler descriptor and factory ABI do
+not grow. This reuses already existing scalar allocations, without batching
+new independent pointer-bearing frames. Hot-allocation savings, first-GC
+retention/scan cost and cold memory require separate fixed observations.

@@ -46,3 +46,19 @@ func StacklessCoroNativeIdleStackBytesForTest() (warm, shared uintptr) {
 	}
 	return
 }
+
+// Stop the world while inspecting context ownership: a registry slot may be
+// unpublished and its context reused by another driver between ordinary loads.
+func StacklessCoroParkedFramesRegisteredForTest(pointer unsafe.Pointer) bool {
+	world := stopTheWorld(stwForTestResetDebugLog)
+	found := false
+	for i := range stacklessCoroNativeParkedCaches {
+		if ctx := stacklessCoroNativeParkedCaches[i].Load(); ctx != nil &&
+			ctx.scheduler == (*stacklessCoroScheduler)(pointer) {
+			found = true
+			break
+		}
+	}
+	startTheWorld(world)
+	return found
+}

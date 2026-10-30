@@ -12,13 +12,15 @@ const (
 	stacklessCoroTaskCacheGroups     = 2048
 	stacklessCoroTaskCacheGroupSize  = 64
 	stacklessCoroTaskCacheFrameBytes = 16
+	stacklessCoroTaskCacheCharge     = unsafe.Sizeof(stacklessCoroTask{}) + stacklessCoroTaskCacheFrameBytes
 )
 
 // Only independently allocated six-word tasks followed by a two-word frame
 // enter this pool. The four lists distinguish every possible frame pointer
 // bitmap. Compiler eligibility excludes addresses into these private frames.
 // Each reused allocation therefore retains its original precise GC layout.
-// Active tasks never share storage.
+// These four classes keep active tasks independent. A fifth class retains only
+// fully completed, already existing four-member scalar chunks.
 type stacklessCoroTaskCacheGroup struct {
 	head  *stacklessCoroTask
 	next  uint16
@@ -27,10 +29,11 @@ type stacklessCoroTaskCacheGroup struct {
 
 type stacklessCoroTaskCacheGeneration struct {
 	groups [stacklessCoroTaskCacheGroups + 1]stacklessCoroTaskCacheGroup
-	tops   [4]uint16
+	tops   [5]uint16
 	used   uint16
 	free   uint16
 	count  uint32
+	bytes  uint32
 }
 
 // Protected by stacklessCoroSharedOperations.lock. Metadata and both task
@@ -44,9 +47,8 @@ func stacklessCoroTaskCacheMetadata() uintptr {
 }
 
 func stacklessCoroTaskCachePayloadBytes() uintptr {
-	return uintptr(stacklessCoroCompletedTasks.generations[0].count+
-		stacklessCoroCompletedTasks.generations[1].count) *
-		(unsafe.Sizeof(stacklessCoroTask{}) + stacklessCoroTaskCacheFrameBytes)
+	return uintptr(stacklessCoroCompletedTasks.generations[0].bytes +
+		stacklessCoroCompletedTasks.generations[1].bytes)
 }
 
 func takeStacklessCoroCompletedTask(typ *_type, size uintptr) (*stacklessCoroTask, uint16) {
@@ -68,13 +70,14 @@ func takeStacklessCoroCompletedTask(typ *_type, size uintptr) (*stacklessCoroTas
 		group := &g.groups[index]
 		task := group.head
 		if task == nil || group.count == 0 || group.count > stacklessCoroTaskCacheGroupSize ||
-			g.count == 0 || task.frameSize != marker {
+			g.count == 0 || g.bytes < uint32(stacklessCoroTaskCacheCharge) || task.frameSize != marker {
 			throw("runtime: invalid stackless coroutine completed-task cache")
 		}
 		group.head = task.next
 		task.next = nil
 		group.count--
 		g.count--
+		g.bytes -= uint32(stacklessCoroTaskCacheCharge)
 		if group.count == 0 {
 			g.tops[bitmap] = group.next
 			group.next = g.free
@@ -124,6 +127,7 @@ func cacheStacklessCoroCompletedTask(task *stacklessCoroTask) {
 	group.head = task
 	group.count++
 	g.count++
+	g.bytes += uint32(stacklessCoroTaskCacheCharge)
 	unlock(&stacklessCoroSharedOperations.lock)
 }
 
@@ -139,6 +143,7 @@ func clearStacklessCoroCompletedTasksLocked() {
 		}
 		*group = stacklessCoroTaskCacheGroup{}
 	}
-	old.tops = [4]uint16{}
+	old.tops = [5]uint16{}
 	old.count, old.used, old.free = 0, 0, 0
+	old.bytes = 0
 }

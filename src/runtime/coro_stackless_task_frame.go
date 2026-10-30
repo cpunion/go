@@ -15,12 +15,23 @@ import (
 // sixteen-byte frame. They remain uncached-lineage markers while active;
 // only a completed independent spawn may retain its cleared storage.
 const (
-	stacklessCoroTypedTaskCacheFirst = stacklessCoroShortFrameChunkLast - 1
-	stacklessCoroTypedTaskCacheLast  = stacklessCoroTypedTaskCacheFirst - 3
+	stacklessCoroTypedTaskCacheFirst  = stacklessCoroShortFrameChunkLast - 1
+	stacklessCoroTypedTaskCacheLast   = stacklessCoroTypedTaskCacheFirst - 3
+	stacklessCoroScalarTaskCacheFirst = stacklessCoroTypedTaskCacheLast - 1
+	stacklessCoroScalarTaskCacheLast  = stacklessCoroScalarTaskCacheFirst - (stacklessCoroTaskChunkSize - 1)
 )
+
+// Both completed-cache classes occupy one contiguous marker range.
+func isStacklessCoroCompletedTaskCacheMarker(marker uint16) bool {
+	return marker >= stacklessCoroScalarTaskCacheLast && marker <= stacklessCoroTypedTaskCacheFirst
+}
 
 func isStacklessCoroTypedTaskCacheMarker(marker uint16) bool {
 	return marker <= stacklessCoroTypedTaskCacheFirst && marker >= stacklessCoroTypedTaskCacheLast
+}
+
+func isStacklessCoroScalarTaskCacheMarker(marker uint16) bool {
+	return marker <= stacklessCoroScalarTaskCacheFirst && marker >= stacklessCoroScalarTaskCacheLast
 }
 
 func validStacklessCoroTaskFrameType(typ *_type, size uintptr) bool {
