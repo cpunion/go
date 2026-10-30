@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -19,6 +20,9 @@ func TestStacklessCoroNativeParkedFrameOwnership(t *testing.T) {
 	defer runtime.GOMAXPROCS(previous)
 	gcPercent := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(gcPercent)
+	// Finish any collection started before automatic GC was disabled.
+	runtime.GC()
+	runtime.GC()
 	runtime.StacklessCoroClearNativeTaskCachesForTest()
 	ready := make(chan unsafe.Pointer, 1)
 	release := make(chan int)
@@ -65,6 +69,16 @@ func TestStacklessCoroNativeParkedFrameOwnership(t *testing.T) {
 			t.Errorf("reserved frame resumed with total %d, want 137", total)
 		}
 	}()
+	// The callback sends ready before its native episode returns and the
+	// ordinary driver publishes its parked-cache lease. Wait for that exact
+	// root to register before counting its two idle collections.
+	deadline := time.Now().Add(10 * time.Second)
+	for !runtime.StacklessCoroParkedFramesRegisteredForTest(scheduler) {
+		if time.Now().After(deadline) {
+			t.Fatal("root did not publish its parked-cache lease")
+		}
+		runtime.Gosched()
+	}
 	before := runtime.StacklessCoroParkedFramesForTest(scheduler)
 	warm, shared := runtime.StacklessCoroNativeIdleStackBytesForTest()
 	t.Logf("parked before GC: %+v; idle stack bytes warm=%d shared=%d", before, warm, shared)
