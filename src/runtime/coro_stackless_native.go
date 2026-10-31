@@ -525,8 +525,14 @@ func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 // running native episode, so their unused cache storage can be examined.
 // Trim recently used chunks to the ordinary budget for one collection, then
 // drop payload caches that remained idle for a complete GC generation.
-func clearStacklessCoroNativeCaches() {
-	clearStacklessCoroChannelCache()
+// A user GC that first waited on an automatic mark phase coalesces only the
+// shared, fully cleared payload cache's two aging steps. This can retain its
+// existing bounded payload through one extra collection; other caches age as
+// usual, and a subsequent idle user request expires the shared old generation.
+func clearStacklessCoroNativeCaches(coalescePayload bool) {
+	if !coalescePayload {
+		clearStacklessCoroChannelCache()
+	}
 	cycle := work.cycles.Load()
 	for i := range stacklessCoroNativePool.slots {
 		ctx := stacklessCoroNativePool.slots[i].Load()

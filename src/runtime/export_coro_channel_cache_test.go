@@ -8,6 +8,24 @@ package runtime
 
 import "unsafe"
 
+// Start a real automatic or forced mark phase on one P, then immediately
+// request a complete user GC. No mark worker can finish between these calls.
+func StacklessCoroPendingGCForTest(automatic bool) (pending bool, cycles uint32) {
+	procs := GOMAXPROCS(1)
+	defer GOMAXPROCS(procs)
+	prior := setGCPercent(100)
+	defer setGCPercent(prior)
+	start := work.cycles.Load()
+	if automatic {
+		gcStart(gcTrigger{kind: gcTriggerTime, now: nanotime() + forcegcperiod + 1})
+	} else {
+		gcStart(gcTrigger{kind: gcTriggerCycle, n: start + 1})
+	}
+	pending = gcphase == _GCmark
+	GC()
+	return pending, work.cycles.Load() - start
+}
+
 type StacklessCoroChannelCacheStateForTest struct {
 	Young, Old              uint32
 	Charge, Limit, Metadata uintptr

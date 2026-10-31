@@ -547,12 +547,17 @@ func GC() {
 	// Wait until the current sweep termination, mark, and mark
 	// termination complete.
 	n := work.cycles.Load()
-	gcWaitOnMark(n)
+	kind := gcTriggerCycle
+	if gcWaitOnMark(n) && goexperiment.Coro {
+		// One call can finish an automatic cycle and then force a fresh
+		// cycle. Age the cleared coroutine payload cache once for this pair.
+		kind = gcTriggerCycleCoroCache
+	}
 
 	// We're now in sweep N or later. Trigger GC cycle N+1, which
 	// will first finish sweep N if necessary and then enter sweep
 	// termination N+1.
-	gcStart(gcTrigger{kind: gcTriggerCycle, n: n + 1})
+	gcStart(gcTrigger{kind: kind, n: n + 1})
 
 	// Wait for mark termination N+1 to complete.
 	gcWaitOnMark(n + 1)
@@ -641,8 +646,9 @@ func goroutineLeakGC() {
 }
 
 // gcWaitOnMark blocks until GC finishes the Nth mark phase. If GC has
-// already completed this mark phase, it returns immediately.
-func gcWaitOnMark(n uint32) {
+// already completed this mark phase, it returns immediately. In the coroutine
+// experiment it reports whether the caller waited on an automatic cycle.
+func gcWaitOnMark(n uint32) (waitedAutomatic bool) {
 	for {
 		// Disable phase transitions.
 		lock(&work.sweepWaiters.lock)
@@ -654,11 +660,14 @@ func gcWaitOnMark(n uint32) {
 		if nMarks > n {
 			// We're done.
 			unlock(&work.sweepWaiters.lock)
-			return
+			return waitedAutomatic
 		}
 
 		// Wait until sweep termination, mark, and mark
 		// termination of cycle N complete.
+		if goexperiment.Coro && gcphase == _GCmark && !work.userForced {
+			waitedAutomatic = true
+		}
 		work.sweepWaiters.list.push(getg())
 		goparkunlock(&work.sweepWaiters.lock, waitReasonWaitForGCCycle, traceBlockUntilGCEnds, 1)
 	}
@@ -698,6 +707,11 @@ const (
 	// we have not yet started cycle number gcTrigger.n (relative
 	// to work.cycles).
 	gcTriggerCycle
+
+	// gcTriggerCycleCoroCache requests the same full forced cycle as
+	// gcTriggerCycle, after this GC call waited on an automatic mark phase.
+	// gcStart consumes the annotation before testing or starting the cycle.
+	gcTriggerCycleCoroCache
 )
 
 // test reports whether the trigger condition is satisfied, meaning
@@ -731,6 +745,11 @@ func (t gcTrigger) test() bool {
 // This may return without performing this transition in some cases,
 // such as when called on a system stack or with locks held.
 func gcStart(trigger gcTrigger) {
+	coalesceCoroCache := false
+	if goexperiment.Coro && trigger.kind == gcTriggerCycleCoroCache {
+		trigger.kind = gcTriggerCycle
+		coalesceCoroCache = true
+	}
 	// Since this is called from malloc and malloc is called in
 	// the guts of a number of libraries that might be holding
 	// locks, don't attempt to start GC in non-preemptible or
@@ -854,7 +873,7 @@ func gcStart(trigger gcTrigger) {
 
 	// clearpools before we start the GC. If we wait the memory will not be
 	// reclaimed until the next GC cycle.
-	clearpools()
+	clearpools(coalesceCoroCache)
 
 	work.cycles.Add(1)
 
@@ -2172,8 +2191,8 @@ func boring_registerCache(p unsafe.Pointer) {
 	boringCaches = append(boringCaches, p)
 }
 
-func clearpools() {
-	clearStacklessCoroNativeCaches()
+func clearpools(coalesceCoroCache bool) {
+	clearStacklessCoroNativeCaches(coalesceCoroCache)
 
 	// clear sync.Pools
 	if poolcleanup != nil {

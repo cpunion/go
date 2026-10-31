@@ -44,7 +44,7 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 	const child = "GO_CORO_CHANNEL_CACHE_LIFECYCLE"
 	mode := os.Getenv(child)
 	if mode == "" {
-		for _, mode := range []string{"idle", "bound", "kinds", "concurrent"} {
+		for _, mode := range []string{"idle", "coalesced", "forced-pair", "bound", "kinds", "concurrent"} {
 			t.Run(mode, func(t *testing.T) {
 				cmd := exec.Command(os.Args[0], "-test.run=^TestStacklessCoroNativeChannelCacheLifecycle$", "-test.count=1", "-test.timeout=3m")
 				cmd.Env = append(os.Environ(), child+"="+mode, "GOMAXPROCS=1", "GOGC=off")
@@ -68,6 +68,33 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 		return s
 	}
 	switch mode {
+	case "coalesced", "forced-pair":
+		// Establish a completed cycle for the real time-based automatic
+		// trigger, then populate an independently rooted completed cache.
+		runtime.GC()
+		refs, keeper := channelCacheWeakPopulation(t)
+		before := check()
+		if before.Young < 3000 || before.Old != 0 {
+			t.Fatalf("missing cached population before pending GC: %+v", before)
+		}
+		pending, cycles := runtime.StacklessCoroPendingGCForTest(mode == "coalesced")
+		if !pending || cycles != 2 {
+			t.Fatalf("pending mark/full request = (%t, %d cycles), want (true, 2)", pending, cycles)
+		}
+		first := check()
+		if mode == "coalesced" {
+			if first.Young != 0 || first.Old != before.Young || channelCacheWeakAlive(refs) < int(first.Old) {
+				t.Fatalf("one user request aged the automatic/forced pair twice: before=%+v after=%+v", before, first)
+			}
+			runtime.GC()
+		}
+		if after := check(); after.Young != 0 || after.Old != 0 {
+			t.Fatalf("consecutive user requests did not expire cache: %+v", after)
+		}
+		if alive := channelCacheWeakAlive(refs); alive > 512 {
+			t.Fatalf("expired pending-GC population stayed rooted: %d", alive)
+		}
+		runtime.KeepAlive(keeper)
 	case "idle":
 		refs, keeper := channelCacheWeakPopulation(t)
 		// Retain an interior entry as well as the newest group head. A stale

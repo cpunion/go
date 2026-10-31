@@ -6,4 +6,4 @@
 
 package runtime
 
-func clearStacklessCoroNativeCaches() {}
+func clearStacklessCoroNativeCaches(bool) {}
