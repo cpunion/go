@@ -4518,7 +4518,9 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 	}
 
 	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
-	s.executorDone = make(chan bool)
+	// The initial replacements and manager can all report completion without
+	// parking. Growth beyond the warm set retains the ordinary join fallback.
+	s.executorDone = make(chan bool, stacklessCoroWarmExecutorCount)
 	s.executorGrow = make(chan struct{}, 1)
 	s.executorStop = make(chan struct{})
 	s.rootDone = make(chan struct{})

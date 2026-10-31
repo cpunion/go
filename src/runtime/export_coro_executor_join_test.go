@@ -11,9 +11,9 @@ type StacklessCoroExecutorJoinTest struct {
 }
 
 // NewStacklessCoroExecutorJoinForTest supplies controlled completion producers.
-func NewStacklessCoroExecutorJoinForTest() *StacklessCoroExecutorJoinTest {
+func NewStacklessCoroExecutorJoinForTest(capacity int) *StacklessCoroExecutorJoinTest {
 	j := new(StacklessCoroExecutorJoinTest)
-	j.s.executorDone = make(chan bool)
+	j.s.executorDone = make(chan bool, capacity)
 	j.s.executorState.Store(stacklessCoroExecutorStateStopping)
 	j.s.executorCount.Store(4) // One driver and three replacements.
 	return j
