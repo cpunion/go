@@ -84,6 +84,12 @@ type stacklessCoroNativeDriver struct {
 	root    bool
 }
 
+// This stamp occupies the scheduler's existing scalar padding. Completion,
+// rather than delayed owner teardown, starts the idle cache generation.
+type stacklessCoroDrainCacheAge struct{ cycle uint32 }
+
+func (age *stacklessCoroDrainCacheAge) complete() { age.cycle = work.cycles.Load() }
+
 // At most four contexts, active or idle, may exceed the ordinary chunk budget.
 // Other active contexts retain the existing256KiB limit.
 var stacklessCoroNativeBurstContexts atomic.Uint32
@@ -338,6 +344,7 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 	}
 	if d.root && rootComplete &&
 		s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.reservedTasks == nil && s.freeFrameBytes == s.cachedFrameBytes &&
 		s.freeTasks != nil {
 		s.discardFreeOverflowTasks()
 		s.discardFreeBatchedTasks()
@@ -355,6 +362,48 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 	releaseStacklessCoroNativeContext(ctx)
 	d.context = nil
 	d.root = false
+}
+
+// Spawned schedulers cannot give their cache to the public driver when it
+// hands off to the owner: detached children may still be using it. Once the
+// owner has joined all replacements, the same bounded native pool can retain
+// its completed holders. No native activation or saved continuation is moved.
+func cacheStacklessCoroDrainedTasks(s *stacklessCoroScheduler) {
+	if raceenabled || !s.spawned() || !s.drained() || s.freeTasks == nil ||
+		s.reservedTasks != nil || s.freeFrameBytes != s.cachedFrameBytes {
+		return
+	}
+	s.discardFreeOverflowTasks()
+	s.discardFreeBatchedTasks()
+	if s.freeTasks == nil {
+		return
+	}
+	ctx := acquireStacklessCoroNativeContext()
+	// GC may run between drainage, joining the replacements and acquiring a
+	// context. Do not rejuvenate the completed holders at publication. Keep
+	// the final age check and cache publication in one non-preemptible region;
+	// the release path does not allocate, including on a full warm pool.
+	mp := acquirem()
+	cycle := work.cycles.Load()
+	age := s.drainCacheAge.cycle
+	if cycle-age < 2 {
+		ctx.freeTasks = s.freeTasks
+		ctx.freePlainTaskCount = s.freePlainTaskCount
+		ctx.freeFrameBytes = s.freeFrameBytes
+		ctx.cachedFrameTasks = s.cachedFrameTasks
+		ctx.cachedFrameBytes = s.cachedFrameBytes
+	} else {
+		// The completed prefix has already spent its two idle collections on
+		// the old scheduler. Preserve any cache the borrowed context had.
+		age = cycle
+	}
+	s.freeTasks = nil
+	s.freePlainTaskCount = 0
+	s.freeFrameBytes = 0
+	s.cachedFrameTasks = 0
+	s.cachedFrameBytes = 0
+	releaseStacklessCoroNativeContextAt(ctx, age)
+	releasem(mp)
 }
 
 // coroRunOnNativeStack drives one replacement episode with a short-lived
@@ -393,6 +442,10 @@ func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
 }
 
 func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
+	releaseStacklessCoroNativeContextAt(ctx, work.cycles.Load())
+}
+
+func releaseStacklessCoroNativeContextAt(ctx *stacklessCoroNativeContext, idleCycle uint32) {
 	if ctx.deferredYield || ctx.deferredSleep != nil || ctx.deferredSleepWhen != 0 {
 		throw("runtime: releasing native context with deferred driver work")
 	}
@@ -407,7 +460,7 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 	} else {
 		ctx.selfFrameMissRoots = 0
 	}
-	ctx.cacheIdleCycle = work.cycles.Load()
+	ctx.cacheIdleCycle = idleCycle
 	for i := range stacklessCoroNativePool.slots {
 		if stacklessCoroNativePool.slots[i].CompareAndSwap(nil, ctx) {
 			return

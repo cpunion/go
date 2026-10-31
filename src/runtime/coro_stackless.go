@@ -322,6 +322,7 @@ type stacklessCoroScheduler struct {
 	// runnableState stores the runnable count in its low 31 bits. The high
 	// bit asks a native executor to yield its P to a returning foreign call.
 	runnableState    atomic.Uint32
+	drainCacheAge    stacklessCoroDrainCacheAge
 	foreignReturners atomic.Uint32
 }
 
@@ -598,6 +599,7 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 		return false
 	}
 	s.stopReplacementExecutors()
+	cacheStacklessCoroDrainedTasks(s)
 	return finishStacklessCoroRootScheduler(s)
 }
 
@@ -647,6 +649,7 @@ func (s *stacklessCoroScheduler) runOwner() {
 	}
 	native.close(s, false)
 	s.stopReplacementExecutors()
+	cacheStacklessCoroDrainedTasks(s)
 	// Do not detach wake or reuse this scheduler. An operation producer can
 	// still be about to signal it after its last task has already completed.
 	// The owner, public caller, and remaining producers release it through GC.
@@ -1723,6 +1726,10 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 		s.liveSpawns--
 	}
 	if s.rootComplete() && s.liveSpawns == 0 {
+		s.drainCacheAge.complete()
+		if !raceenabled && s.spawned() {
+			s.cacheDrainedOperationsLocked()
+		}
 		s.lifetime.Or(stacklessCoroLifetimeDrained)
 	}
 }
@@ -2954,6 +2961,9 @@ func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 
 func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 	resume stacklessCoroResume, size uint16) *stacklessCoroTask {
+	if s.freeTasks == nil {
+		return nil
+	}
 	identity := stacklessCoroResumeIdentity(resume)
 	var previous *stacklessCoroTask
 	for task := s.freeTasks; task != nil; task = task.next {
@@ -2976,6 +2986,18 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 		s.freeFrameBytes -= task.frameSize
 		task.next = nil
 		return task
+	}
+	// A different warm family may fill the byte budget with smaller frames.
+	// Retiring just the holder used by the next reservation need not make room
+	// for its larger frame. Evict only idle holders until that family can be
+	// admitted; active frames and reservations retain their existing charges.
+	if s.freeFrameBytes != 0 {
+		for s.cachedFrameTasks == stacklessCoroTaskCacheSize ||
+			uintptr(s.cachedFrameBytes)+uintptr(size) > stacklessCoroFrameCacheSize {
+			if !s.discardFreeCachedFrameTaskLocked() {
+				break
+			}
+		}
 	}
 	return nil
 }
@@ -3987,6 +4009,23 @@ func (s *stacklessCoroScheduler) recycleOperationLocked(op *stacklessCoroOperati
 	s.freeOperations = op
 	s.freeOperationCount++
 	return true
+}
+
+// Every source cleared and cached its operation under this lock before its
+// task could finish. Publish the bounded idle list before drainage/rootDone,
+// so a delayed owner cannot give these operations a new GC generation. A
+// producer may still signal the immutable scheduler wake after unlocking, as
+// it already may for an operation returned through the shared overflow path.
+func (s *stacklessCoroScheduler) cacheDrainedOperationsLocked() {
+	op := s.freeOperations
+	s.freeOperations = nil
+	s.freeOperationCount = 0
+	for op != nil {
+		next := op.next
+		op.next = nil
+		cacheStacklessCoroSharedOperation(op)
+		op = next
+	}
 }
 
 // takeStacklessCoroSharedOperation removes one operation from the overflow
