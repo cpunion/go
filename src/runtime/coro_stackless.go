@@ -2961,6 +2961,9 @@ func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 
 func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 	resume stacklessCoroResume, size uint16) *stacklessCoroTask {
+	if s.freeTasks == nil {
+		return nil
+	}
 	identity := stacklessCoroResumeIdentity(resume)
 	var previous *stacklessCoroTask
 	for task := s.freeTasks; task != nil; task = task.next {
@@ -2983,6 +2986,18 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 		s.freeFrameBytes -= task.frameSize
 		task.next = nil
 		return task
+	}
+	// A different warm family may fill the byte budget with smaller frames.
+	// Retiring just the holder used by the next reservation need not make room
+	// for its larger frame. Evict only idle holders until that family can be
+	// admitted; active frames and reservations retain their existing charges.
+	if s.freeFrameBytes != 0 {
+		for s.cachedFrameTasks == stacklessCoroTaskCacheSize ||
+			uintptr(s.cachedFrameBytes)+uintptr(size) > stacklessCoroFrameCacheSize {
+			if !s.discardFreeCachedFrameTaskLocked() {
+				break
+			}
+		}
 	}
 	return nil
 }

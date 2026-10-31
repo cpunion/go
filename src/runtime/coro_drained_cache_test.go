@@ -56,3 +56,13 @@ func TestStacklessCoroDrainedCacheOperations(t *testing.T) {
 		t.Fatal("operation cache retired before the last child, after drainage, or after the idle GC")
 	}
 }
+
+func TestStacklessCoroDrainedCacheFrameBudgetReplacement(t *testing.T) {
+	for _, typed := range []bool{false, true} {
+		for _, active := range []bool{false, true} {
+			if !runtime.CheckStacklessCoroFrameBudgetReplacementForTest(typed, active) {
+				t.Fatalf("typed=%t active=%t: warm-family replacement lost reuse, evicted active charges, or exceeded bounds", typed, active)
+			}
+		}
+	}
+}

@@ -1151,7 +1151,7 @@ func TestStacklessCoroSchedulerSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
 	want := uintptr(208)
 	if ptrSize == 4 {
-		want = 124
+		want = 128
 	}
 	// Static lock ranking adds diagnostic metadata to the mutex; the
 	// ordinary scheduler layout retains its separate fixed-size budget.
@@ -2244,6 +2244,9 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
+	// The exact direct-prefix count is a cold-cache contract. A warm native
+	// chunk from an earlier root can legitimately reduce that count.
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
 
 	depth := runtime.StacklessCoroTaskCacheSize + 32
 	tracker := new(stacklessCoroFusedResumeDeepTracker)

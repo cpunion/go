@@ -6,7 +6,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
 
 //go:noinline
 func StacklessCoroDrainedCacheForTest(drained bool, delayGC int) (unsafe.Pointer, unsafe.Pointer, bool) {
@@ -90,4 +93,72 @@ func CheckStacklessCoroDrainedOperationsForTest() bool {
 	valid = valid && before == stacklessCoroChannelCache.generations[stacklessCoroChannelCache.young].count
 	s.signal()
 	return valid && len(s.wake) == 1
+}
+
+type drainedBudgetAllocationForTest struct {
+	task  stacklessCoroTask
+	frame [4]uintptr
+}
+
+func drainedBudgetOldResumeForTest(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+func drainedBudgetNewResumeForTest(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+
+func CheckStacklessCoroFrameBudgetReplacementForTest(typed, active bool) bool {
+	s := newStacklessCoroTestScheduler()
+	s.root.state = stacklessCoroTaskRunning
+	s.root.resuming = true
+	s.root.context.scheduler = s
+	for range stacklessCoroTaskCacheSize {
+		task := &stacklessCoroTask{state: stacklessCoroTaskNew, frameSize: 16,
+			flags: stacklessCoroTaskCacheFrame, resume: drainedBudgetOldResumeForTest}
+		task.context.frame = unsafe.Pointer(new([2]uintptr))
+		if !active {
+			task.next = s.freeTasks
+			s.freeTasks = task
+			s.freeFrameBytes += 16
+		}
+		s.cachedFrameTasks++
+		s.cachedFrameBytes += 16
+	}
+	size := uintptr(24)
+	if typed {
+		size = 32
+	}
+	take := func() unsafe.Pointer {
+		if typed {
+			return coroTakeTypedTaskFrame(unsafe.Pointer(&s.root.context), drainedBudgetNewResumeForTest,
+				size, abi.TypeFor[drainedBudgetAllocationForTest]())
+		}
+		return coroTakeFrame(unsafe.Pointer(&s.root.context), drainedBudgetNewResumeForTest, size)
+	}
+	first := take()
+	if active {
+		return s.cachedFrameTasks == stacklessCoroTaskCacheSize && s.cachedFrameBytes == stacklessCoroFrameCacheSize &&
+			s.freeFrameBytes == 0 && s.freeTasks == nil && s.reservedTasks != nil &&
+			!s.reservedTasks.hasFlag(stacklessCoroTaskCacheFrame)
+	}
+	if first != nil || s.reservedTasks == nil || !s.reservedTasks.hasFlag(stacklessCoroTaskCacheFrame) ||
+		s.cachedFrameBytes > stacklessCoroFrameCacheSize || s.cachedFrameTasks+s.freePlainTaskCount > stacklessCoroTaskCacheSize {
+		return false
+	}
+	var frame unsafe.Pointer
+	if typed {
+		frame = unsafe.Pointer(new([4]uintptr))
+	} else {
+		frame = unsafe.Pointer(new([3]uintptr))
+	}
+	*(*uintptr)(frame) = 0x789abc
+	lock(&s.lock)
+	task := s.takeReservedFrameTaskLocked(&s.root, frame, drainedBudgetNewResumeForTest)
+	if task == nil {
+		unlock(&s.lock)
+		return false
+	}
+	task.parent = nil
+	task.state = stacklessCoroTaskComplete
+	s.recycleTaskLocked(task)
+	unlock(&s.lock)
+	second := take()
+	return second == frame && *(*uintptr)(second) == 0x789abc &&
+		s.cachedFrameBytes <= stacklessCoroFrameCacheSize && s.cachedFrameTasks+s.freePlainTaskCount <= stacklessCoroTaskCacheSize
 }
