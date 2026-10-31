@@ -62,7 +62,7 @@ func TestStacklessCoroNativeChannelCacheLifecycle(t *testing.T) {
 	check := func() runtime.StacklessCoroChannelCacheStateForTest {
 		t.Helper()
 		s := runtime.StacklessCoroChannelCacheForTest()
-		if s.Invalid || s.Charge != 112 || s.Limit != 16<<20 || uintptr(s.Young+s.Old)*s.Charge+s.Metadata > s.Limit || s.Young+s.Old > s.Capacity {
+		if s.Invalid || s.Charge != 96 || s.Limit != 16<<20 || uintptr(s.Young+s.Old)*s.Charge+s.Metadata > s.Limit || s.Young+s.Old > s.Capacity {
 			t.Fatalf("invalid actual channel cache: %+v", s)
 		}
 		return s

@@ -32,11 +32,11 @@ func StacklessCoroChannelCacheForTest() StacklessCoroChannelCacheStateForTest {
 			for op := head; op != nil && groupCount <= stacklessCoroChannelCacheGroupSize; op = op.next {
 				groupCount++
 				count++
-				if op.hasResources() || op.waiter == nil ||
-					!isCompactStacklessCoroSudog(op.waiter, unsafe.Pointer(op)) ||
+				if op.hasResources() || op.retainedWaiter() == nil ||
+					!isCompactStacklessCoroSudog(op.retainedWaiter(), unsafe.Pointer(op)) ||
 					op.id != 0 || op.scheduler != nil || op.task != nil || op.received != nil ||
 					op.send || op.timerWait || op.waiterActive ||
-					!validReleasedStacklessCoroSudog(op, op.waiter) {
+					!validReleasedStacklessCoroSudog(op, op.retainedWaiter()) {
 					state.Invalid = true
 				}
 			}

@@ -30,7 +30,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **channelWaiter) *ch
 	}
 	if !op.waiterActive {
 		op.waiterActive = true
-		if sg := op.waiter; sg != nil {
+		if sg := op.retainedWaiter(); sg != nil {
 			if !validReleasedStacklessCoroSudog(op, sg) {
 				throw("runtime: invalid cached stackless coroutine channel waiter")
 			}
@@ -44,8 +44,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **channelWaiter) *ch
 		// lock, so prevent new from starting a collection that needs a sudog
 		// itself. Install both possible heap roots before releasing the M.
 		mp := acquirem()
-		sg := new(sudog).channelWaiter()
-		op.waiter = sg
+		sg := op.newRetainedWaiter()
 		if slot != nil {
 			*slot = sg
 		}
@@ -73,7 +72,7 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *channelWaiter) {
 	if op == nil || !validReleasedStacklessCoroSudog(op, sg) {
 		throw("runtime: invalid released stackless coroutine channel waiter")
 	}
-	if op.waiter == sg {
+	if op.retainedWaiter() == sg {
 		if !op.waiterActive {
 			throw("runtime: duplicate released stackless coroutine channel waiter")
 		}

@@ -6,7 +6,10 @@
 
 package runtime
 
-import "internal/goarch"
+import (
+	"internal/goarch"
+	"unsafe"
+)
 
 var (
 	_ [goarch.PtrSize - 8]byte
@@ -18,7 +21,6 @@ var (
 type stacklessCoroOperation struct {
 	stacklessCoroOperationState
 	*stacklessCoroOperationResources
-	waiter *channelWaiter
 }
 
 const stacklessCoroExtraResources = 1
@@ -36,3 +38,50 @@ func (op *stacklessCoroOperation) setResources(resources *stacklessCoroOperation
 }
 
 const stacklessCoroChannelWaiterPadding = 0
+
+// Direct IO keeps its original 176-byte combined allocation: 56+32+88.
+type stacklessCoroOperationResources struct {
+	stacklessCoroOperationResourceState
+	fullWaiter *channelWaiter
+}
+
+type stacklessCoroWaiterResources struct {
+	resources stacklessCoroOperationResources
+	waiter    sudog
+}
+
+// The allocation kind is immutable. Both derived addresses stay within the
+// original precisely typed allocation; no neighbouring object is inspected.
+//
+//go:nosplit
+func (op *stacklessCoroOperation) retainedWaiter() *channelWaiter {
+	switch op.waiterState & stacklessCoroWaiterStorageMask {
+	case stacklessCoroWaiterCompact:
+		return (*channelWaiter)(unsafe.Add(unsafe.Pointer(op), -int(unsafe.Offsetof(stacklessCoroChannelOperation{}.operation))))
+	case stacklessCoroWaiterFull:
+		return (*channelWaiter)(add(unsafe.Pointer(op), unsafe.Offsetof(stacklessCoroFullChannelOperation{}.waiter)))
+	}
+	if resources := op.resources(); resources != nil {
+		return resources.fullWaiter
+	}
+	return nil
+}
+
+func (op *stacklessCoroOperation) initializeWaiter(waiter *channelWaiter) {
+	if op.retainedWaiter() != waiter {
+		throw("runtime: invalid inline channel waiter")
+	}
+}
+
+// Called with an M held, like acquireSudog. Publish the complete typed object
+// before the caller can release its M or publish an external channel source.
+func (op *stacklessCoroOperation) newRetainedWaiter() *channelWaiter {
+	if !op.hasResources() {
+		storage := new(stacklessCoroWaiterResources)
+		storage.resources.fullWaiter = storage.waiter.channelWaiter()
+		op.setResources(&storage.resources)
+	} else {
+		op.fullWaiter = new(sudog).channelWaiter()
+	}
+	return op.fullWaiter
+}

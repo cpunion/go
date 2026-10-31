@@ -34,3 +34,13 @@ func (op *stacklessCoroOperation) setResources(resources *stacklessCoroOperation
 }
 
 const stacklessCoroChannelWaiterPadding = 8
+
+// Keep the existing 32-bit inline resources and retained pointer layout.
+type stacklessCoroOperationResources = stacklessCoroOperationResourceState
+
+func (op *stacklessCoroOperation) retainedWaiter() *channelWaiter         { return op.waiter }
+func (op *stacklessCoroOperation) initializeWaiter(waiter *channelWaiter) { op.waiter = waiter }
+func (op *stacklessCoroOperation) newRetainedWaiter() *channelWaiter {
+	op.waiter = new(sudog).channelWaiter()
+	return op.waiter
+}

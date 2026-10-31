@@ -21,5 +21,5 @@ func CheckStacklessCoroPlainStorageForTest() bool {
 	task.state = stacklessCoroTaskRunning
 	task.resuming = true
 	got := stacklessCoroStartOperation(unsafe.Pointer(&task.context), "plain storage test")
-	return got == op && got.ioState() == nil && got.waiter == nil
+	return got == op && got.ioState() == nil && got.retainedWaiter() == nil
 }

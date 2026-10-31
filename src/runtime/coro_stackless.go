@@ -330,7 +330,7 @@ type stacklessCoroScheduler struct {
 // stacklessCoroOperationResources retains reusable resources after clearing the state
 // owned by a completed source. Keeping those resources outside state avoids a
 // transient unrooted pointer while a native executor clears the operation.
-type stacklessCoroOperationResources struct {
+type stacklessCoroOperationResourceState struct {
 	*stacklessCoroIOState
 	timer     *stacklessCoroTimer
 	selection *stacklessCoroSelect
@@ -455,12 +455,14 @@ type stacklessCoroFullChannelOperation struct {
 func newStacklessCoroChannelOperation() *stacklessCoroOperation {
 	if raceenabled {
 		storage := new(stacklessCoroFullChannelOperation)
-		storage.operation.waiter = storage.waiter.channelWaiter()
+		storage.operation.waiterState = stacklessCoroWaiterFull
+		storage.operation.initializeWaiter(storage.waiter.channelWaiter())
 		return &storage.operation
 	}
 	storage := new(stacklessCoroChannelOperation)
 	op := &storage.operation
-	op.waiter = &storage.waiter
+	op.waiterState = stacklessCoroWaiterCompact
+	op.initializeWaiter(&storage.waiter)
 	return op
 }
 
@@ -468,7 +470,12 @@ func newStacklessCoroChannelOperation() *stacklessCoroOperation {
 // publishes a terminal fact. Registered sources carry only id. Timers use a
 // stable owner and generation so a late callback cannot complete a reused
 // operation.
-const stacklessCoroWaiterSelect = uint8(4)
+const (
+	stacklessCoroWaiterStorageMask = uint8(3)
+	stacklessCoroWaiterCompact     = uint8(1)
+	stacklessCoroWaiterFull        = uint8(2)
+	stacklessCoroWaiterSelect      = uint8(4)
+)
 
 type stacklessCoroOperationState struct {
 	id        uint64
@@ -477,8 +484,8 @@ type stacklessCoroOperationState struct {
 	received  *bool
 	send      bool
 	timerWait bool
-	// waiterActive keeps the retained waiter rooted by waiter while it is
-	// also linked from a channel queue.
+	// waiterActive prevents reuse while the retained waiter is queued. Its
+	// typed storage or resource header remains rooted by the operation.
 	waiterActive bool
 	// waiterState keeps compact select state and immutable allocation provenance
 	// in existing scalar padding. Completion preserves the allocation bits.
