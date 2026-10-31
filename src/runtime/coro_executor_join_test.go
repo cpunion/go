@@ -18,22 +18,22 @@ func TestStacklessCoroExecutorJoinGrowth(t *testing.T) {
 	// join must include growth even if the original replacements finish first.
 	for _, beforeManager := range []int{0, 2, 5} {
 		t.Run(fmt.Sprint(beforeManager), func(t *testing.T) {
-			grow, complete, join := runtime.StacklessCoroExecutorJoinForTest()
+			join := runtime.NewStacklessCoroExecutorJoinForTest()
 			done := make(chan struct{})
 			go func() {
-				join()
+				join.Join()
 				close(done)
 			}()
 			for range min(beforeManager, 3) {
-				complete(false)
+				join.Complete(false)
 			}
-			grow()
+			join.Grow()
 			for i := 3; i < beforeManager; i++ {
-				complete(false)
+				join.Complete(false)
 			}
-			complete(true)
+			join.Complete(true)
 			for i := beforeManager; i < 4; i++ {
-				complete(false)
+				join.Complete(false)
 			}
 			if beforeManager < 5 {
 				select {
@@ -41,7 +41,7 @@ func TestStacklessCoroExecutorJoinGrowth(t *testing.T) {
 					t.Fatal("join returned while a replacement remained live")
 				case <-time.After(10 * time.Millisecond):
 				}
-				complete(false)
+				join.Complete(false)
 			}
 			select {
 			case <-done:

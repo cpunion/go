@@ -6,13 +6,22 @@
 
 package runtime
 
-// StacklessCoroExecutorJoinForTest supplies controlled completion producers.
-// Increments precede the manager's completion, as in the production manager.
-func StacklessCoroExecutorJoinForTest() (grow func(), complete func(bool), join func()) {
-	s := &stacklessCoroScheduler{executorDone: make(chan bool)}
-	s.executorState.Store(stacklessCoroExecutorStateStopping)
-	s.executorCount.Store(4) // One driver and three replacements.
-	return func() { s.executorCount.Add(2) },
-		func(manager bool) { s.executorDone <- manager },
-		s.stopReplacementExecutors
+type StacklessCoroExecutorJoinTest struct {
+	s stacklessCoroScheduler
 }
+
+// NewStacklessCoroExecutorJoinForTest supplies controlled completion producers.
+func NewStacklessCoroExecutorJoinForTest() *StacklessCoroExecutorJoinTest {
+	j := new(StacklessCoroExecutorJoinTest)
+	j.s.executorDone = make(chan bool)
+	j.s.executorState.Store(stacklessCoroExecutorStateStopping)
+	j.s.executorCount.Store(4) // One driver and three replacements.
+	return j
+}
+
+// Increments precede the manager's completion, as in the production manager.
+func (j *StacklessCoroExecutorJoinTest) Grow() { j.s.executorCount.Add(2) }
+
+func (j *StacklessCoroExecutorJoinTest) Complete(manager bool) { j.s.executorDone <- manager }
+
+func (j *StacklessCoroExecutorJoinTest) Join() { j.s.stopReplacementExecutors() }
