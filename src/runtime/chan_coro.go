@@ -24,7 +24,7 @@ import (
 // in slot before allocation can reach a GC safe point.
 //
 //go:nosplit
-func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
+func newStacklessCoroSudog(op *stacklessCoroOperation, slot **channelWaiter) *channelWaiter {
 	if op == nil {
 		throw("runtime: nil stackless coroutine channel waiter owner")
 	}
@@ -44,7 +44,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
 		// lock, so prevent new from starting a collection that needs a sudog
 		// itself. Install both possible heap roots before releasing the M.
 		mp := acquirem()
-		sg := new(sudog)
+		sg := new(sudog).channelWaiter()
 		op.waiter = sg
 		if slot != nil {
 			*slot = sg
@@ -59,7 +59,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
 	// A select may need more than the one waiter retained by its operation.
 	// Publish each additional waiter in the selection before releasing the M.
 	mp := acquirem()
-	sg := new(sudog)
+	sg := new(sudog).channelWaiter()
 	*slot = sg
 	releasem(mp)
 	return sg
@@ -68,7 +68,7 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **sudog) *sudog {
 // releaseStacklessCoroSudog checks that the waiter no longer retains channel
 // state. Each cached operation retains at most one waiter; extra select
 // waiters become garbage after their selection descriptor is cleared.
-func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
+func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *channelWaiter) {
 	op := (*stacklessCoroOperation)(owner)
 	if op == nil || !validReleasedStacklessCoroSudog(op, sg) {
 		throw("runtime: invalid released stackless coroutine channel waiter")
@@ -81,16 +81,17 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *sudog) {
 	}
 }
 
-func validReleasedStacklessCoroSudog(op *stacklessCoroOperation, sg *sudog) bool {
-	if sg == nil || sg.coro.get() != nil || sg.next != nil || sg.prev != nil || sg.isSelect || sg.elem != nil || sg.c != nil {
+func validReleasedStacklessCoroSudog(op *stacklessCoroOperation, sg *channelWaiter) bool {
+	if sg == nil || sg.coro.get() != nil || sg.next != nil || sg.prev != nil || sg.elem != nil || sg.c != nil {
 		return false
 	}
 	// The explicit operation identifies compact storage even after owner clears.
 	// In that case, inspect only the prefix; full address mirrors overlap op.
 	if isCompactStacklessCoroSudog(sg, unsafe.Pointer(op)) {
-		return true
+		return op.waiterState&stacklessCoroWaiterSelect == 0
 	}
-	return sg.g == nil && sg.waitlink == nil && sg.elemAddr == 0 && sg.chanAddr == 0
+	full := sg.fullSudog()
+	return !full.isSelect && full.g == nil && full.waitlink == nil && full.elemAddr == 0 && full.chanAddr == 0
 }
 
 // tryStacklessCoroChanSend completes a ready send on the current executor.
@@ -172,7 +173,7 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	sg := newStacklessCoroSudog(op, nil)
 	sg.coro.set(unsafe.Pointer(op))
 	sg.setNativeElem(element)
-	sg.isSelect = false
+	sg.setChannelSelect(false)
 	sg.setNativeChannel(c)
 	c.sendq.enqueue(sg)
 	if raceenabled {
@@ -234,7 +235,7 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	sg := newStacklessCoroSudog(op, nil)
 	sg.coro.set(unsafe.Pointer(op))
 	sg.setNativeElem(element)
-	sg.isSelect = false
+	sg.setChannelSelect(false)
 	sg.setNativeChannel(c)
 	c.recvq.enqueue(sg)
 	if c.timer != nil {

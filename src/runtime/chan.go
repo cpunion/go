@@ -55,8 +55,8 @@ type hchan struct {
 }
 
 type waitq struct {
-	first *sudog
-	last  *sudog
+	first *channelWaiter
+	last  *channelWaiter
 }
 
 //go:linkname reflect_makechan reflect.makechan
@@ -268,7 +268,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.setChannel(c)
 	gp.waiting = mysg
 	gp.param = nil
-	c.sendq.enqueue(mysg)
+	c.sendq.enqueue(mysg.channelWaiter())
 	// Signal to anyone trying to shrink our stack that we're about
 	// to park on a channel. The window between when this G's status
 	// changes and when we set gp.activeStackChans is not safe for
@@ -313,13 +313,13 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 // Channel c must be empty and locked.  send unlocks c with unlockf.
 // sg must already be dequeued from c.
 // ep must be non-nil and point to the heap or the caller's stack.
-func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+func send(c *hchan, sg *channelWaiter, ep unsafe.Pointer, unlockf func(), skip int) {
 	if c.bubble != nil && getg().bubble != c.bubble {
 		unlockf()
 		fatal("send on synctest channel from outside bubble")
 	}
 	op := sg.coro.get()
-	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
+	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.fullSudog().g != nil {
 		unlockf()
 		throw("runtime: channel waiter has both g and coroutine")
 	}
@@ -344,21 +344,20 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			typedmemmove(c.elemtype, elem, ep)
 			sg.setNativeElem(nil)
 		}
-		sg.success = true
 		unlockf()
 		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
 	if sg.getFullElem() != nil {
-		sendDirect(c.elemtype, sg, ep)
+		sendDirect(c.elemtype, sg.fullSudog(), ep)
 		sg.setFullElem(nil)
 	}
-	gp := sg.g
+	gp := sg.fullSudog().g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
-	sg.success = true
-	if sg.releasetime != 0 {
-		sg.releasetime = cputicks()
+	sg.fullSudog().success = true
+	if sg.fullSudog().releasetime != 0 {
+		sg.fullSudog().releasetime = cputicks()
 	}
 	goready(gp, skip+1)
 }
@@ -449,7 +448,7 @@ func closechan(c *hchan) {
 	var glist gList
 	// dequeue has detached each native winner from its channel queue. Reuse
 	// next for the completion list and clear it before waking the operation.
-	var corohead, corotail *sudog
+	var corohead, corotail *channelWaiter
 
 	// release all readers
 	for {
@@ -458,7 +457,7 @@ func closechan(c *hchan) {
 			break
 		}
 		if op := sg.coro.get(); op != nil {
-			if !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
+			if !isCompactStacklessCoroSudog(sg, op) && sg.fullSudog().g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
 			}
@@ -466,7 +465,6 @@ func closechan(c *hchan) {
 				typedmemclr(c.elemtype, elem)
 				sg.setNativeElem(nil)
 			}
-			sg.success = false
 			if corotail == nil {
 				corohead = sg
 			} else {
@@ -479,12 +477,12 @@ func closechan(c *hchan) {
 			typedmemclr(c.elemtype, elem)
 			sg.setFullElem(nil)
 		}
-		if sg.releasetime != 0 {
-			sg.releasetime = cputicks()
+		if sg.fullSudog().releasetime != 0 {
+			sg.fullSudog().releasetime = cputicks()
 		}
-		gp := sg.g
+		gp := sg.fullSudog().g
 		gp.param = unsafe.Pointer(sg)
-		sg.success = false
+		sg.fullSudog().success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -498,12 +496,11 @@ func closechan(c *hchan) {
 			break
 		}
 		if op := sg.coro.get(); op != nil {
-			if !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
+			if !isCompactStacklessCoroSudog(sg, op) && sg.fullSudog().g != nil {
 				unlock(&c.lock)
 				throw("runtime: channel waiter has both g and coroutine")
 			}
 			sg.setNativeElem(nil)
-			sg.success = false
 			if corotail == nil {
 				corohead = sg
 			} else {
@@ -513,12 +510,12 @@ func closechan(c *hchan) {
 			continue
 		}
 		sg.setFullElem(nil)
-		if sg.releasetime != 0 {
-			sg.releasetime = cputicks()
+		if sg.fullSudog().releasetime != 0 {
+			sg.fullSudog().releasetime = cputicks()
 		}
-		gp := sg.g
+		gp := sg.fullSudog().g
 		gp.param = unsafe.Pointer(sg)
-		sg.success = false
+		sg.fullSudog().success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -706,7 +703,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	mysg.isSelect = false
 	mysg.setChannel(c)
 	gp.param = nil
-	c.recvq.enqueue(mysg)
+	c.recvq.enqueue(mysg.channelWaiter())
 	if c.timer != nil {
 		blockTimerChan(c)
 	}
@@ -755,13 +752,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 // Channel c must be full and locked. recv unlocks c with unlockf.
 // sg must already be dequeued from c.
 // A non-nil ep must point to the heap or the caller's stack.
-func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+func recv(c *hchan, sg *channelWaiter, ep unsafe.Pointer, unlockf func(), skip int) {
 	if c.bubble != nil && getg().bubble != c.bubble {
 		unlockf()
 		fatal("receive on synctest channel from outside bubble")
 	}
 	op := sg.coro.get()
-	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.g != nil {
+	if op != nil && !isCompactStacklessCoroSudog(sg, op) && sg.fullSudog().g != nil {
 		unlockf()
 		throw("runtime: channel waiter has both g and coroutine")
 	}
@@ -774,7 +771,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			if op != nil {
 				typedmemmove(c.elemtype, ep, sg.getNativeElem())
 			} else {
-				recvDirect(c.elemtype, sg, ep)
+				recvDirect(c.elemtype, sg.fullSudog(), ep)
 			}
 		}
 	} else {
@@ -801,18 +798,17 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	}
 	if op != nil {
 		sg.setNativeElem(nil)
-		sg.success = true
 		unlockf()
 		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
 	sg.setFullElem(nil)
-	gp := sg.g
+	gp := sg.fullSudog().g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
-	sg.success = true
-	if sg.releasetime != 0 {
-		sg.releasetime = cputicks()
+	sg.fullSudog().success = true
+	if sg.fullSudog().releasetime != 0 {
+		sg.fullSudog().releasetime = cputicks()
 	}
 	goready(gp, skip+1)
 }
@@ -927,7 +923,7 @@ func reflect_chanclose(c *hchan) {
 	closechan(c)
 }
 
-func (q *waitq) enqueue(sgp *sudog) {
+func (q *waitq) enqueue(sgp *channelWaiter) {
 	sgp.next = nil
 	x := q.last
 	if x == nil {
@@ -941,7 +937,7 @@ func (q *waitq) enqueue(sgp *sudog) {
 	q.last = sgp
 }
 
-func (q *waitq) dequeue() *sudog {
+func (q *waitq) dequeue() *channelWaiter {
 	for {
 		sgp := q.first
 		if sgp == nil {
@@ -965,15 +961,15 @@ func (q *waitq) dequeue() *sudog {
 		// We use a flag in the G struct to tell us when someone
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
-		if sgp.isSelect {
+		if sgp.channelSelect() {
 			won := false
 			if owner := sgp.coro.get(); owner != nil {
-				if !isCompactStacklessCoroSudog(sgp, owner) && sgp.g != nil {
+				if !isCompactStacklessCoroSudog(sgp, owner) && sgp.fullSudog().g != nil {
 					throw("runtime: channel waiter has both g and coroutine")
 				}
 				won = stacklessCoroSelectTry(owner)
-			} else if sgp.g != nil {
-				won = sgp.g.selectDone.CompareAndSwap(0, 1)
+			} else if sgp.fullSudog().g != nil {
+				won = sgp.fullSudog().g.selectDone.CompareAndSwap(0, 1)
 			} else {
 				throw("runtime: select waiter has no owner")
 			}
@@ -996,13 +992,13 @@ func (c *hchan) raceaddr() unsafe.Pointer {
 	return unsafe.Pointer(&c.buf)
 }
 
-func racesync(c *hchan, sg *sudog) {
+func racesync(c *hchan, sg *channelWaiter) {
 	racerelease(chanbuf(c, 0))
 	if owner := sg.coro.get(); owner != nil {
 		raceacquire(owner)
 	} else {
-		raceacquireg(sg.g, chanbuf(c, 0))
-		racereleaseg(sg.g, chanbuf(c, 0))
+		raceacquireg(sg.fullSudog().g, chanbuf(c, 0))
+		racereleaseg(sg.fullSudog().g, chanbuf(c, 0))
 	}
 	raceacquire(chanbuf(c, 0))
 }
@@ -1010,7 +1006,7 @@ func racesync(c *hchan, sg *sudog) {
 // Notify the race detector of a send or receive involving buffer entry idx
 // and a channel c or its communicating partner sg.
 // This function handles the special case of c.elemsize==0.
-func racenotify(c *hchan, idx uint, sg *sudog) {
+func racenotify(c *hchan, idx uint, sg *channelWaiter) {
 	// We could have passed the unsafe.Pointer corresponding to entry idx
 	// instead of idx itself.  However, in a future version of this function,
 	// we can use idx to better handle the case of elemsize==0.
@@ -1045,14 +1041,14 @@ func racenotify(c *hchan, idx uint, sg *sudog) {
 			raceacquire(qp)
 			racerelease(qp)
 		} else {
-			raceacquireg(sg.g, qp)
-			racereleaseg(sg.g, qp)
+			raceacquireg(sg.fullSudog().g, qp)
+			racereleaseg(sg.fullSudog().g, qp)
 		}
 	} else {
 		if sg == nil {
 			racereleaseacquire(qp)
 		} else {
-			racereleaseacquireg(sg.g, qp)
+			racereleaseacquireg(sg.fullSudog().g, qp)
 		}
 	}
 }

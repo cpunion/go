@@ -252,7 +252,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	sellock(scases, lockorder)
 
 	var (
-		sg     *sudog
+		sg     *channelWaiter
 		c      *hchan
 		k      *scase
 		sglist *sudog
@@ -331,9 +331,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		nextp = &sg.waitlink
 
 		if casi < nsends {
-			c.sendq.enqueue(sg)
+			c.sendq.enqueue(sg.channelWaiter())
 		} else {
-			c.recvq.enqueue(sg)
+			c.recvq.enqueue(sg.channelWaiter())
 		}
 
 		if c.timer != nil {
@@ -354,7 +354,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	sellock(scases, lockorder)
 
 	gp.selectDone.Store(0)
-	sg = (*sudog)(gp.param)
+	sg = (*channelWaiter)(gp.param)
 	gp.param = nil
 
 	// pass 3 - dequeue from unsuccessful chans
@@ -378,7 +378,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		if k.c.timer != nil {
 			unblockTimerChan(k.c)
 		}
-		if sg == sglist {
+		if sg == sglist.channelWaiter() {
 			// sg has already been dequeued by the G that woke us up.
 			casi = int(casei)
 			cas = k
@@ -389,9 +389,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		} else {
 			c = k.c
 			if int(casei) < nsends {
-				c.sendq.dequeueSudoG(sglist)
+				c.sendq.dequeueSudoG(sglist.channelWaiter())
 			} else {
-				c.recvq.dequeueSudoG(sglist)
+				c.recvq.dequeueSudoG(sglist.channelWaiter())
 			}
 		}
 		sgnext = sglist.waitlink
@@ -624,7 +624,7 @@ func reflect_rselect(cases []runtimeSelect) (int, bool) {
 	return chosen, recvOK
 }
 
-func (q *waitq) dequeueSudoG(sgp *sudog) {
+func (q *waitq) dequeueSudoG(sgp *channelWaiter) {
 	x := sgp.prev
 	y := sgp.next
 	if x != nil {

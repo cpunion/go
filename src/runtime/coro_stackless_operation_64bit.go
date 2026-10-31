@@ -18,7 +18,7 @@ var (
 type stacklessCoroOperation struct {
 	stacklessCoroOperationState
 	*stacklessCoroOperationResources
-	waiter *sudog
+	waiter *channelWaiter
 }
 
 const stacklessCoroExtraResources = 1
@@ -34,3 +34,5 @@ func (op *stacklessCoroOperation) resources() *stacklessCoroOperationResources {
 func (op *stacklessCoroOperation) setResources(resources *stacklessCoroOperationResources) {
 	op.stacklessCoroOperationResources = resources
 }
+
+const stacklessCoroChannelWaiterPadding = 0

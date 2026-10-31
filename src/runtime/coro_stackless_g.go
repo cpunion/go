@@ -79,24 +79,96 @@ func stacklessCoroExitsyscallDone(gp *g) {
 	}
 }
 
-// Channel operations access only this prefix. Full-only raw address
-// mirrors live in the full tail; active compact waiters keep traced pointers.
-// Detached close completions reuse next after dequeue, so waitlink remains
-// in the full-only tail. The semaphore tree, goroutine and block-profile fields
-// remain in full sudogs. A compact allocation
-// puts its operation immediately after the prefix, keeping the complete
-// allocation large enough for a sudog view while rooting both parts precisely.
+// Channels use only this view. Full-only fields are never accessed through a
+// compact allocation. Full waiters keep the same flat prefix for semaphore
+// trees, goroutine stack adjustment, and DWARF substitution.
+type channelWaiter = stacklessCoroChannelWaiter
+
 type stacklessCoroChannelWaiter struct {
-	coro     stacklessCoroSudog
-	next     *sudog
-	prev     *sudog
-	elem     unsafe.Pointer
-	c        *hchan
-	ticket   uint32
-	isSelect bool
-	success  bool
-	waiters  uint16
+	coro stacklessCoroSudog
+	next *channelWaiter
+	prev *channelWaiter
+	elem unsafe.Pointer
+	c    *hchan
 }
+
+//go:nosplit
+func (sg *sudog) channelWaiter() *channelWaiter {
+	return (*channelWaiter)(unsafe.Pointer(sg))
+}
+
+// fullSudog is used only for an ordinary queued G or a separately allocated
+// full native waiter. Queued compact owners are rejected. A cleared compact
+// waiter is inspected only with its explicit operation in validReleased.
+//
+//go:nosplit
+func (sg *channelWaiter) fullSudog() *sudog {
+	if sg.compactOwner() != nil {
+		throw("runtime: full view of compact channel waiter")
+	}
+	return (*sudog)(unsafe.Pointer(sg))
+}
+
+//go:nosplit
+func (sg *channelWaiter) compactOwner() *stacklessCoroOperation {
+	owner := sg.coro.get()
+	if isCompactStacklessCoroSudog(sg, owner) {
+		return (*stacklessCoroOperation)(owner)
+	}
+	return nil
+}
+
+//go:nosplit
+func (sg *channelWaiter) channelSelect() bool {
+	if op := sg.compactOwner(); op != nil {
+		return op.waiterState&stacklessCoroWaiterSelect != 0
+	}
+	return sg.fullSudog().isSelect
+}
+
+//go:nosplit
+func (sg *channelWaiter) setChannelSelect(v bool) {
+	if op := sg.compactOwner(); op != nil {
+		if v {
+			op.waiterState |= stacklessCoroWaiterSelect
+		} else {
+			op.waiterState &^= stacklessCoroWaiterSelect
+		}
+		return
+	}
+	sg.fullSudog().isSelect = v
+}
+
+//go:nosplit
+func (sg *channelWaiter) getElem() unsafe.Pointer {
+	if sg.coro.get() != nil {
+		return sg.elem
+	}
+	return sg.fullSudog().getFullElem()
+}
+
+//go:nosplit
+func (sg *channelWaiter) getChannel() *hchan {
+	if sg.coro.get() != nil {
+		return sg.c
+	}
+	return sg.fullSudog().getChannel()
+}
+
+//go:nosplit
+func (sg *channelWaiter) getFullElem() unsafe.Pointer { return sg.fullSudog().getFullElem() }
+
+//go:nosplit
+func (sg *channelWaiter) setFullElem(v unsafe.Pointer) { sg.fullSudog().setFullElem(v) }
+
+//go:nosplit
+func (sg *channelWaiter) getNativeElem() unsafe.Pointer { return sg.elem }
+
+//go:nosplit
+func (sg *channelWaiter) setNativeElem(v unsafe.Pointer) { sg.elem = v }
+
+//go:nosplit
+func (sg *channelWaiter) setNativeChannel(c *hchan) { sg.c = c }
 
 // Keep these members flat: linker DWARF substitution looks up sudog.elem.
 type sudog struct {
@@ -119,28 +191,21 @@ type sudog struct {
 	chanAddr    uintptr
 }
 
-func isCompactStacklessCoroSudog(sg *sudog, owner unsafe.Pointer) bool {
+func isCompactStacklessCoroSudog(sg *channelWaiter, owner unsafe.Pointer) bool {
 	// The relation is stable even after coro.owner is cleared. A separate full
 	// sudog cannot contain its operation, and race storage puts the operation
 	// before its full waiter. No pointer bits or operation IDs encode the kind.
-	return owner != nil && owner == add(unsafe.Pointer(sg), unsafe.Sizeof(stacklessCoroChannelWaiter{}))
+	return owner != nil && owner == add(unsafe.Pointer(sg), unsafe.Offsetof(stacklessCoroChannelOperation{}.operation))
 }
 
 // Reject drift between the two channel prefixes at compile time.
-const stacklessCoroChannelWaiterOffsetMismatch = (unsafe.Offsetof(sudog{}.coro) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.coro)) |
-	(unsafe.Offsetof(sudog{}.next) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.next)) |
-	(unsafe.Offsetof(sudog{}.prev) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)) |
-	(unsafe.Offsetof(sudog{}.elem) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)) |
-	(unsafe.Offsetof(sudog{}.c) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)) |
-	(unsafe.Offsetof(sudog{}.ticket) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)) |
-	(unsafe.Offsetof(sudog{}.isSelect) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)) |
-	(unsafe.Offsetof(sudog{}.success) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)) |
-	(unsafe.Offsetof(sudog{}.waiters) ^ unsafe.Offsetof(stacklessCoroChannelWaiter{}.waiters))
+const stacklessCoroChannelWaiterOffsetMismatch = (unsafe.Offsetof(sudog{}.coro) ^ unsafe.Offsetof(channelWaiter{}.coro)) |
+	(unsafe.Offsetof(sudog{}.next) ^ unsafe.Offsetof(channelWaiter{}.next)) |
+	(unsafe.Offsetof(sudog{}.prev) ^ unsafe.Offsetof(channelWaiter{}.prev)) |
+	(unsafe.Offsetof(sudog{}.elem) ^ unsafe.Offsetof(channelWaiter{}.elem)) |
+	(unsafe.Offsetof(sudog{}.c) ^ unsafe.Offsetof(channelWaiter{}.c))
 
-var (
-	_ [-int(stacklessCoroChannelWaiterOffsetMismatch)]byte
-	_ [unsafe.Sizeof(stacklessCoroChannelOperation{}) - unsafe.Sizeof(sudog{})]byte
-)
+var _ [-int(stacklessCoroChannelWaiterOffsetMismatch)]byte
 
 // Native owners use traced pointers, including full semaphore and notification
 // waiters; they never enter g.waiting or hide these pointers from the collector.
@@ -158,9 +223,7 @@ func (sg *sudog) getElem() unsafe.Pointer {
 //go:nosplit
 func (sg *sudog) setElem(v unsafe.Pointer) {
 	sg.elem = v
-	if !isCompactStacklessCoroSudog(sg, sg.coro.get()) {
-		sg.elemAddr = uintptr(v)
-	}
+	sg.elemAddr = uintptr(v)
 }
 
 //go:nosplit
@@ -174,9 +237,7 @@ func (sg *sudog) getChannel() *hchan {
 //go:nosplit
 func (sg *sudog) setChannel(c *hchan) {
 	sg.c = c
-	if !isCompactStacklessCoroSudog(sg, sg.coro.get()) {
-		sg.chanAddr = uintptr(unsafe.Pointer(c))
-	}
+	sg.chanAddr = uintptr(unsafe.Pointer(c))
 }
 
 // Only full waiters are linked from g.waiting. Preserve the raw address while

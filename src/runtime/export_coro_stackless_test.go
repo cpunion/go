@@ -1168,7 +1168,7 @@ func NewStacklessCoroChannelWaiterCacheForTest() *StacklessCoroChannelWaiterCach
 }
 
 func (cache *StacklessCoroChannelWaiterCacheForTest) Cycle() {
-	var slot *sudog
+	var slot *channelWaiter
 	sg := newStacklessCoroSudog(&cache.operation, &slot)
 	if sg != slot {
 		throw("runtime: lost stackless coroutine test waiter root")
@@ -2039,12 +2039,9 @@ func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged 
 		{unsafe.Offsetof(sudog{}.prev), unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)},
 		{unsafe.Offsetof(sudog{}.elem), unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)},
 		{unsafe.Offsetof(sudog{}.c), unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)},
-		{unsafe.Offsetof(sudog{}.ticket), unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)},
-		{unsafe.Offsetof(sudog{}.isSelect), unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)},
-		{unsafe.Offsetof(sudog{}.success), unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)},
-		{unsafe.Offsetof(sudog{}.waiters), unsafe.Offsetof(stacklessCoroChannelWaiter{}.waiters)},
 	}
-	valid = full <= storage && unsafe.Offsetof(stacklessCoroChannelOperation{}.operation) == prefix
+	operationOffset := unsafe.Offsetof(stacklessCoroChannelOperation{}.operation)
+	valid = prefix <= full && operationOffset == prefix+stacklessCoroChannelWaiterPadding
 	for _, o := range offsets {
 		valid = valid && o.full == o.prefix
 	}
@@ -2058,12 +2055,12 @@ func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged 
 	}
 	// The full sudog's g slot is the compact allocation's scalar, full-width ID.
 	valid = valid && !stacklessCoroCompactPointerBitForTest(allocationType,
-		prefix/unsafe.Sizeof(uintptr(0)))
+		operationOffset/unsafe.Sizeof(uintptr(0)))
 	operationType := abi.TypeFor[stacklessCoroOperation]()
 	for word := uintptr(0); word < unsafe.Sizeof(stacklessCoroOperation{})/unsafe.Sizeof(uintptr(0)); word++ {
 		valid = valid && stacklessCoroCompactPointerBitForTest(operationType, word) ==
 			stacklessCoroCompactPointerBitForTest(allocationType,
-				prefix/unsafe.Sizeof(uintptr(0))+word)
+				operationOffset/unsafe.Sizeof(uintptr(0))+word)
 	}
 	op := newStacklessCoroChannelOperation()
 	base, span, _ := findObject(uintptr(unsafe.Pointer(op)), 0, 0)
@@ -2129,7 +2126,7 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 	GC()
 	op := (*stacklessCoroOperation)(token)
 	if waiterView {
-		op = (*stacklessCoroOperation)((*sudog)(token).coro.get())
+		op = (*stacklessCoroOperation)((*channelWaiter)(token).coro.get())
 	}
 	valid := op != nil && op.id == ^uint64(0)-123 && finalized.Load() == 0
 	if !valid {
