@@ -608,23 +608,23 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	reused = op == first
 	storage := op.ioState()
 	op.id = 1
-	op.fd = 7
-	op.buffer = make([]byte, 8)
-	op.call = func() {}
-	op.n = new(int)
-	op.errno = new(uintptr)
-	op.valueOut = new(uint64)
-	op.packet = [2]uint64{1, 2}
-	op.async = true
-	op.ownsPollDesc = true
-	op.pollWrite = true
+	op.resourceState().fd = 7
+	op.resourceState().buffer = make([]byte, 8)
+	op.resourceState().call = func() {}
+	op.resourceState().n = new(int)
+	op.resourceState().errno = new(uintptr)
+	op.resourceState().valueOut = new(uint64)
+	op.resourceState().packet = [2]uint64{1, 2}
+	op.resourceState().async = true
+	op.resourceState().ownsPollDesc = true
+	op.resourceState().pollWrite = true
 	clearStacklessCoroOperation(op)
 	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{waiterState: op.waiterState & stacklessCoroWaiterStorageMask}) &&
 		op.ioState() == storage && storage != nil &&
-		op.buffer == nil && op.call == nil && op.n == nil &&
-		op.errno == nil && op.valueOut == nil && op.workNext == nil &&
-		op.packet == [2]uint64{} && op.fd == 0 && !op.async &&
-		!op.ownsPollDesc && !op.pollWrite
+		op.resourceState().buffer == nil && op.resourceState().call == nil && op.resourceState().n == nil &&
+		op.resourceState().errno == nil && op.resourceState().valueOut == nil && op.resourceState().workNext == nil &&
+		op.resourceState().packet == [2]uint64{} && op.resourceState().fd == 0 && !op.resourceState().async &&
+		!op.resourceState().ownsPollDesc && !op.resourceState().pollWrite
 	recycle(op)
 	GC()
 
@@ -1071,11 +1071,11 @@ func CheckStacklessCoroSharedOperationPanicForTest() bool {
 		s.freeOperationCount++
 	}
 	task := &stacklessCoroTask{state: stacklessCoroTaskWaiting}
+	task.context.scheduler = s
 	op := &stacklessCoroOperation{
 		stacklessCoroOperationState: stacklessCoroOperationState{
-			id:        1,
-			scheduler: s,
-			task:      task,
+			id:   1,
+			task: task,
 		},
 	}
 	value := plainError("shared operation panic")
@@ -1305,12 +1305,12 @@ func StacklessCoroPollWaitCountForTest() int {
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
 		for op := registry.buckets[index]; op != nil; op = op.next {
-			if op.ioState() == nil || op.async || op.packet[stacklessCoroPollDescWord] == 0 {
+			if op.ioState() == nil || op.resourceState().async || op.resourceState().packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
-			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
+			pd := (*pollDesc)(unsafe.Pointer(uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
 			token := pd.rg.Load()
-			if op.pollWrite {
+			if op.resourceState().pollWrite {
 				token = pd.wg.Load()
 			}
 			if token&netpollCoroTagMask == netpollCoroTag &&
@@ -1427,11 +1427,11 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 	task := new(stacklessCoroTask)
 	buffer := make([]byte, 1)
 	op := newStacklessCoroIOOperation()
-	op.scheduler = s
 	op.task = task
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	task.context.scheduler = s
+	op.resourceState().fd = int32(fd)
+	op.resourceState().buffer = buffer
+	op.resourceState().packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	id := registerStacklessCoroOperation(op)
 	waiting, waitErr := netpollCoroReadArm(pd, op)
 	if !waiting || waitErr != pollNoError {
@@ -1452,7 +1452,7 @@ func StacklessCoroPollIdleRetryForTest(fd int) (skipped, claimed, rearmed bool) 
 	if takeStacklessCoroOperation(id) != op {
 		throw("runtime: lost coroutine idle-retry operation")
 	}
-	op.packet[stacklessCoroPollDescWord] = 0
+	op.resourceState().packet[stacklessCoroPollDescWord] = 0
 	poll_runtime_pollUnblock(pd)
 	poll_runtime_pollClose(pd)
 	return
@@ -1468,7 +1468,7 @@ func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
 		for op := registry.buckets[index]; op != nil; op = op.next {
-			if op.scheduler == context.scheduler && op.task == context.task() {
+			if op.scheduler() == context.scheduler && op.task == context.task() {
 				if found != nil {
 					unlock(&stacklessCoroOperations.lock)
 					throw("runtime: multiple stackless coroutine operations for one task")
@@ -1524,13 +1524,13 @@ func CheckStacklessCoroTimerWrapForTest() bool {
 		io := op.ioState()
 		if io == nil {
 			io = new(stacklessCoroIOState)
-			op.stacklessCoroIOState = io
+			op.resourceState().stacklessCoroIOState = io
 		}
 		io.buffer = []byte{17}
 		io.valueOut = new(uint64)
 		*io.valueOut = 23
 		selection := new(stacklessCoroSelect)
-		op.selection = selection
+		op.resourceState().selection = selection
 		for round := 0; round < 3; round++ {
 			resources := op.resources()
 			base, _, _ := findObject(uintptr(unsafe.Pointer(first)), 0, 0)
@@ -1541,7 +1541,7 @@ func CheckStacklessCoroTimerWrapForTest() bool {
 			first.sequence = ^uintptr(0)
 			second, sequence := op.nextTimer()
 			if second == first || sequence != 1 || second.operation != op ||
-				op.timer != second || op.ioState() != io || op.selection != selection {
+				op.resourceState().timer != second || op.ioState() != io || op.resourceState().selection != selection {
 				return false
 			}
 			if ownsHeader {
@@ -1590,9 +1590,9 @@ func StacklessCoroWriteResultForTest(size, written int, count int32) (int, uintp
 	})
 	result.n = written
 	op := newStacklessCoroIOOperation()
-	op.buffer = make([]byte, size)
-	op.n = &result.n
-	op.errno = &result.status
+	op.resourceState().buffer = make([]byte, size)
+	op.resourceState().n = &result.n
+	op.resourceState().errno = &result.status
 	done := stacklessCoroWriteResult(op, count)
 	return result.n, result.status, done
 }
@@ -1634,11 +1634,11 @@ func StacklessCoroReadLengthForTest(length int) int32 {
 
 func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
 	op := stacklessCoroStartIOOperation(ctx, "expired read")
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.n = n
-	op.errno = errno
-	op.ownsPollDesc = true
+	op.resourceState().fd = int32(fd)
+	op.resourceState().buffer = buffer
+	op.resourceState().n = n
+	op.resourceState().errno = errno
+	op.resourceState().ownsPollDesc = true
 	netpollGenericInit()
 	pd, openErr := poll_runtime_pollOpen(uintptr(fd))
 	if openErr != 0 {
@@ -1646,7 +1646,7 @@ func SocketReadExpiredStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []
 		stacklessCoroSocketReadFinish(op, -1, uintptr(openErr))
 		return
 	}
-	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	op.resourceState().packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	registerStacklessCoroOperation(op)
 	lock(&pd.lock)
 	pd.rd = -1
@@ -1794,7 +1794,6 @@ func newEarlyReadyStacklessCoroForTest() (*stacklessCoroScheduler,
 	op := stacklessCoroStartOperation(
 		unsafe.Pointer(&task.context), "early ready test")
 	op.id = 1
-	task.context.scheduler = nil
 	return s, task, op
 }
 
@@ -1941,10 +1940,10 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 		op := new(stacklessCoroOperation)
 		if i&1 != 0 {
 			op = newStacklessCoroIOOperation()
-			op.async = true
+			op.resourceState().async = true
 		}
-		op.scheduler = s
 		op.task = new(stacklessCoroTask)
+		op.task.context.scheduler = s
 		operations[i] = op
 		ids[i] = registerStacklessCoroOperation(op)
 	}
@@ -1989,7 +1988,6 @@ func StacklessCoroIOOriginImmediateChannelForTest(kind string) bool {
 	task.resuming = true
 	first := newStacklessCoroIOOperation()
 	first.id = 1
-	first.scheduler = s
 	first.task = task
 	clearStacklessCoroOperation(first)
 	lock(&s.lock)
@@ -2109,7 +2107,7 @@ func stacklessCoroCompactRootForTest(waiterView bool, finalized *atomic.Uint32) 
 	SetFinalizer(waiterPayload, stacklessCoroCompactFinalizeForTest)
 	SetFinalizer(operationPayload, stacklessCoroCompactFinalizeForTest)
 	op.id = ^uint64(0) - 123
-	op.received = &operationPayload.ok
+	op.setReceived(&operationPayload.ok)
 	op.retainedWaiter().coro.set(unsafe.Pointer(op))
 	op.retainedWaiter().setNativeElem(unsafe.Pointer(waiterPayload))
 	channel := make(chan *stacklessCoroCompactPayloadForTest, 1)
@@ -2139,7 +2137,7 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 	// A live owner must never be accepted as a released, reusable waiter.
 	valid = valid && !validReleasedStacklessCoroSudog(op, sg)
 	payload := (*stacklessCoroCompactPayloadForTest)(sg.getElem())
-	operationPayload := (*stacklessCoroCompactPayloadForTest)(unsafe.Pointer(op.received))
+	operationPayload := (*stacklessCoroCompactPayloadForTest)(unsafe.Pointer(op.receivedResult()))
 	channelPointer := sg.getChannel()
 	channel := *(*chan *stacklessCoroCompactPayloadForTest)(unsafe.Pointer(&channelPointer))
 	valid = payload != nil && payload.ok && payload.value == 0x1122334455667788 &&
@@ -2150,7 +2148,7 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 	sg.coro.clear()
 	// The full-width ID remains a scalar after clearing the prefix owner.
 	valid = valid && validReleasedStacklessCoroSudog(op, sg)
-	op.received = nil
+	op.setReceived(nil)
 	op.id = 0
 	return valid, unsafe.Pointer(finalized)
 }

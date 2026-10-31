@@ -227,7 +227,9 @@ const (
 
 type stacklessCoroContext struct {
 	// frame stays first so compiler-generated resume functions can use the
-	// context as the stable frame-bearing resume packet.
+	// context as the stable frame-bearing resume packet. A suspended source
+	// keeps scheduler live until the task resumes; completion clears it before
+	// caching. The resuming flag, not this owner link, identifies active code.
 	frame     unsafe.Pointer
 	scheduler *stacklessCoroScheduler
 }
@@ -334,27 +336,30 @@ type stacklessCoroOperationResourceState struct {
 	*stacklessCoroIOState
 	timer     *stacklessCoroTimer
 	selection *stacklessCoroSelect
+	// Receive results share the operation extra slot until another resource
+	// needs it. Resourced operations retain the original typed result here.
+	received *bool
 }
 
 func (op *stacklessCoroOperation) ioState() *stacklessCoroIOState {
 	if !op.hasResources() {
 		return nil
 	}
-	return op.stacklessCoroIOState
+	return op.resourceState().stacklessCoroIOState
 }
 
 func (op *stacklessCoroOperation) retainedTimer() *stacklessCoroTimer {
 	if !op.hasResources() {
 		return nil
 	}
-	return op.timer
+	return op.resourceState().timer
 }
 
 func (op *stacklessCoroOperation) retainedSelection() *stacklessCoroSelect {
 	if !op.hasResources() {
 		return nil
 	}
-	return op.selection
+	return op.resourceState().selection
 }
 
 // stacklessCoroIOState keeps IO-only fields out of cold channel allocations.
@@ -403,7 +408,7 @@ func newStacklessCoroIOOperation() *stacklessCoroOperation {
 	if !op.hasResources() {
 		op.setResources(&storage.resources[:][0])
 	}
-	op.stacklessCoroIOState = &storage.io
+	op.resourceState().stacklessCoroIOState = &storage.io
 	return op
 }
 
@@ -421,9 +426,9 @@ func (op *stacklessCoroOperation) ensureIOState() {
 	if !op.hasResources() {
 		storage := new(stacklessCoroIOResources)
 		op.setResources(&storage.resources)
-		op.stacklessCoroIOState = &storage.io
+		op.resourceState().stacklessCoroIOState = &storage.io
 	} else {
-		op.stacklessCoroIOState = new(stacklessCoroIOState)
+		op.resourceState().stacklessCoroIOState = new(stacklessCoroIOState)
 	}
 }
 
@@ -475,6 +480,7 @@ const (
 	stacklessCoroWaiterCompact     = uint8(1)
 	stacklessCoroWaiterFull        = uint8(2)
 	stacklessCoroWaiterSelect      = uint8(4)
+	stacklessCoroDirectReceived    = uint8(8)
 )
 
 type stacklessCoroOperationState struct {
@@ -488,11 +494,17 @@ type stacklessCoroOperationState struct {
 	// waiterState keeps native select state and immutable allocation provenance
 	// in existing scalar padding. Completion preserves the allocation bits.
 	waiterState uint8
+	_           uint32 // Preserve the existing32bit operation allocation classes.
 	id          uint64
-	scheduler   *stacklessCoroScheduler
 	task        *stacklessCoroTask
-	received    *bool
 	next        *stacklessCoroOperation
+}
+
+func (op *stacklessCoroOperation) scheduler() *stacklessCoroScheduler {
+	if op.task == nil {
+		return nil
+	}
+	return op.task.context.scheduler
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
@@ -1543,7 +1555,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) {
 	// logical yields apart. A pending preemption bypasses that delay.
 	hostYieldCheck := ^uint8(0)
 	defer func() {
-		if task == nil || task.context.scheduler != s {
+		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
 		}
 		p := getg()._panic
@@ -1624,7 +1636,12 @@ resumeActive:
 		// executor. Retain its scheduler link as for private yields.
 		goto resumeActive
 	}
-	task.context.scheduler = nil
+	// A waiting source retains its scheduler through this context. The
+	// source owns task until completion, then the ready queue owns it until
+	// its next resume. Non-wait actions keep the active-context cleanup.
+	if action != stacklessCoroActionWait {
+		task.context.scheduler = nil
+	}
 
 	switch action {
 	case stacklessCoroActionYield, stacklessCoroActionHandoff:
@@ -3533,7 +3550,7 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 
 func startStacklessCoroSleep(ctx unsafe.Pointer, ns int64) {
 	op := stacklessCoroStartOperation(ctx, "sleep")
-	s := op.scheduler
+	s := op.scheduler()
 	when := stacklessCoroTimerWhen(ns)
 	op.id = stacklessCoroDeferredSleepOperationID
 	if stacklessCoroIsPullComparison(s) || !stacklessCoroDeferSleep(s, op, when) {
@@ -3577,7 +3594,9 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
 	op := stacklessCoroStartChannelOperation(ctx)
-	op.received = received
+	if received != nil {
+		op.setReceived(received)
+	}
 	op.send = send
 	// A scanned channel retains a queued waiter and its operation directly.
 	// Noscan buffered scalar channels and nil channels use the registry.
@@ -3604,7 +3623,7 @@ func stacklessCoroChannelWaiterRooted(channel *hchan) bool {
 
 func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *channelWaiter, success bool) {
 	op := (*stacklessCoroOperation)(owner)
-	if op != nil && (op.hasResources() && op.selection.active()) {
+	if op != nil && (op.hasResources() && op.resourceState().selection.active()) {
 		finishStacklessCoroSelect(op, waiter, success)
 		return
 	}
@@ -3627,8 +3646,10 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *channelWaiter, suc
 		releaseStacklessCoroSudog(unsafe.Pointer(op), waiter)
 	}
 	send := op.send
-	if !send && op.received != nil {
-		*op.received = success
+	if !send {
+		if received := op.receivedResult(); received != nil {
+			*received = success
+		}
 	}
 	if send && !success {
 		panicStacklessCoroOperation(op, plainError("send on closed channel"))
@@ -3688,7 +3709,7 @@ func (op *stacklessCoroOperation) nextTimer() (*stacklessCoroTimer, uintptr) {
 		}
 		t.operation = op
 		t.timer.init(stacklessCoroTimerReady, t)
-		op.timer = t
+		op.resourceState().timer = t
 	}
 	t.sequence++
 	return t, t.sequence
@@ -3963,7 +3984,6 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 	if kind == stacklessCoroOperationIO {
 		op.ensureIOState()
 	}
-	op.scheduler = s
 	op.task = task
 	return op
 }
@@ -3978,7 +3998,7 @@ func (s *stacklessCoroScheduler) ready(task *stacklessCoroTask, signal bool) {
 }
 
 func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroScheduler, *stacklessCoroTask) {
-	if op == nil || op.id == 0 || op.scheduler == nil || op.task == nil {
+	if op == nil || op.id == 0 || op.scheduler() == nil || op.task == nil {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
 	var io *stacklessCoroIOState
@@ -3992,14 +4012,13 @@ func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroSche
 		(io != nil && io.workNext != nil) {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
-	s := op.scheduler
+	s := op.scheduler()
 	task := op.task
 	// The links and wait flags were validated above. Clear only source
 	// fields that can still be populated, leaving retained resources rooted.
 	op.id = 0
-	op.scheduler = nil
 	op.task = nil
-	op.received = nil
+	op.clearReceived()
 	op.send = false
 	if io != nil {
 		*io = stacklessCoroIOState{}

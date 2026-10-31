@@ -88,8 +88,8 @@ func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
 	// Immutable constructor provenance excludes separately allocated full
 	// waiters. Only now derive the pointer within that typed allocation.
 	waiter := op.retainedWaiter()
-	return op.id == 0 && op.scheduler == nil && op.task == nil &&
-		op.received == nil && !op.send && !op.timerWait && !op.waiterActive &&
+	return op.id == 0 && op.scheduler() == nil && op.task == nil &&
+		op.receivedResult() == nil && op.waiterState&stacklessCoroDirectReceived == 0 && !op.send && !op.timerWait && !op.waiterActive &&
 		op.next == nil && validReleasedStacklessCoroSudog(op, waiter)
 }
 

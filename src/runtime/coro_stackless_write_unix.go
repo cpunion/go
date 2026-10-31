@@ -19,10 +19,10 @@ const stacklessCoroWriteNoProgressTag = stacklessCoroPollErrorTag >> 1
 func newStacklessCoroWriteOperation(ctx unsafe.Pointer, fd int, buffer []byte,
 	n *int, status *uintptr) *stacklessCoroOperation {
 	op := stacklessCoroStartIOOperation(ctx, "write")
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.n = n
-	op.errno = status
+	op.resourceState().fd = int32(fd)
+	op.resourceState().buffer = buffer
+	op.resourceState().n = n
+	op.resourceState().errno = status
 	*n = 0
 	*status = 0
 	return op
@@ -59,14 +59,14 @@ func poll_runtime_coroSocketWrite(ctx unsafe.Pointer, descriptor uintptr,
 		throw("runtime: nil stackless coroutine write poll descriptor")
 	}
 	op := newStacklessCoroWriteOperation(ctx, fd, buffer, n, status)
-	op.pollWrite = true
-	op.packet[stacklessCoroPollDescWord] = uint64(descriptor)
+	op.resourceState().pollWrite = true
+	op.resourceState().packet[stacklessCoroPollDescWord] = uint64(descriptor)
 	registerStacklessCoroOperation(op)
 	stacklessCoroSocketWriteAttempt(op)
 }
 
 func stacklessCoroWriteBuffer(op *stacklessCoroOperation) []byte {
-	p := op.buffer[*op.n:]
+	p := op.resourceState().buffer[*op.resourceState().n:]
 	if len(p) > stacklessCoroMaxWrite {
 		p = p[:stacklessCoroMaxWrite]
 	}
@@ -77,49 +77,49 @@ func stacklessCoroWriteBuffer(op *stacklessCoroOperation) []byte {
 // the operation is complete. A failed syscall preserves earlier progress.
 func stacklessCoroWriteResult(op *stacklessCoroOperation, count int32) bool {
 	if count < 0 {
-		*op.errno = uintptr(-count)
+		*op.resourceState().errno = uintptr(-count)
 		return true
 	}
 	if int(count) > len(stacklessCoroWriteBuffer(op)) {
 		throw("runtime: invalid stackless coroutine write count")
 	}
-	*op.n += int(count)
-	if *op.n == len(op.buffer) {
+	*op.resourceState().n += int(count)
+	if *op.resourceState().n == len(op.resourceState().buffer) {
 		return true
 	}
 	if count == 0 {
-		*op.errno = stacklessCoroWriteNoProgressTag
+		*op.resourceState().errno = stacklessCoroWriteNoProgressTag
 		return true
 	}
 	return false
 }
 
 func stacklessCoroSocketWriteAttempt(op *stacklessCoroOperation) {
-	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
-	if pd == nil || !op.pollWrite {
+	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
+	if pd == nil || !op.resourceState().pollWrite {
 		throw("runtime: invalid stackless coroutine socket write")
 	}
 	if err := poll_runtime_pollReset(pd, 'w'); err != pollNoError {
-		stacklessCoroSocketFinish(op, *op.n, stacklessCoroPollErrorTag|uintptr(err))
+		stacklessCoroSocketFinish(op, *op.resourceState().n, stacklessCoroPollErrorTag|uintptr(err))
 		return
 	}
 	for {
 		p := stacklessCoroWriteBuffer(op)
-		count := write1(uintptr(op.fd), unsafe.Pointer(unsafe.SliceData(p)), int32(len(p)))
+		count := write1(uintptr(op.resourceState().fd), unsafe.Pointer(unsafe.SliceData(p)), int32(len(p)))
 		KeepAlive(p)
 		if count == -_EINTR {
 			continue
 		}
 		if count != -_EAGAIN {
 			if stacklessCoroWriteResult(op, count) {
-				stacklessCoroSocketFinish(op, *op.n, *op.errno)
+				stacklessCoroSocketFinish(op, *op.resourceState().n, *op.resourceState().errno)
 				return
 			}
 			continue
 		}
 		waiting, err := netpollCoroArm(pd, op, 'w')
 		if err != pollNoError {
-			stacklessCoroSocketFinish(op, *op.n, stacklessCoroPollErrorTag|uintptr(err))
+			stacklessCoroSocketFinish(op, *op.resourceState().n, stacklessCoroPollErrorTag|uintptr(err))
 			return
 		}
 		if waiting {

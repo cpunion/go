@@ -66,23 +66,23 @@ func poll_runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr,
 func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
 	buffer []byte, n *int, errno *uintptr) *stacklessCoroOperation {
 	op := stacklessCoroStartIOOperation(ctx, "read")
-	op.fd = int32(fd)
-	op.buffer = buffer
-	op.n = n
-	op.errno = errno
+	op.resourceState().fd = int32(fd)
+	op.resourceState().buffer = buffer
+	op.resourceState().n = n
+	op.resourceState().errno = errno
 	return op
 }
 
 func stacklessCoroSocketReadStart(op *stacklessCoroOperation, pd *pollDesc, ownsPollDesc bool) {
-	op.packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
-	op.ownsPollDesc = ownsPollDesc
+	op.resourceState().packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
+	op.resourceState().ownsPollDesc = ownsPollDesc
 	registerStacklessCoroOperation(op)
 	stacklessCoroSocketReadAttempt(op)
 }
 
 func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
-	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
-	if pd == nil || len(op.buffer) == 0 {
+	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
+	if pd == nil || len(op.resourceState().buffer) == 0 {
 		throw("runtime: invalid stackless coroutine socket read")
 	}
 	for {
@@ -90,10 +90,10 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 			stacklessCoroSocketReadPollFinish(op, resetErr)
 			return
 		}
-		count := read(op.fd, unsafe.Pointer(&op.buffer[0]),
-			stacklessCoroReadLength(len(op.buffer)))
-		KeepAlive(op.buffer)
-		if count == -_EINTR && !op.ownsPollDesc {
+		count := read(op.resourceState().fd, unsafe.Pointer(&op.resourceState().buffer[0]),
+			stacklessCoroReadLength(len(op.resourceState().buffer)))
+		KeepAlive(op.resourceState().buffer)
+		if count == -_EINTR && !op.resourceState().ownsPollDesc {
 			continue
 		}
 		if count != -_EAGAIN {
@@ -137,15 +137,15 @@ func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 				return nil
 			}
 			scanned++
-			if op.ioState() == nil || op.scheduler != s || op.task == exclude ||
-				op.task == previous || op.async ||
-				op.packet[stacklessCoroPollDescWord] == 0 {
+			if op.ioState() == nil || op.scheduler() != s || op.task == exclude ||
+				op.task == previous || op.resourceState().async ||
+				op.resourceState().packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
 			pd := (*pollDesc)(unsafe.Pointer(
-				uintptr(op.packet[stacklessCoroPollDescWord])))
+				uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
 			mode := int32('r')
-			if op.pollWrite {
+			if op.resourceState().pollWrite {
 				mode = 'w'
 			}
 			if !netpollCoroClaim(pd, op, mode) {
@@ -194,7 +194,7 @@ func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 
 func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
 	status := uintptr(pollErr)
-	if !op.ownsPollDesc {
+	if !op.resourceState().ownsPollDesc {
 		status |= stacklessCoroPollErrorTag
 	}
 	stacklessCoroSocketReadFinish(op, -1, status)
@@ -205,34 +205,34 @@ func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, read
 }
 
 func stacklessCoroSocketFinish(op *stacklessCoroOperation, count int, errno uintptr) {
-	if op.packet[stacklessCoroPollNextWord] != 0 {
+	if op.resourceState().packet[stacklessCoroPollNextWord] != 0 {
 		throw("runtime: queued stackless coroutine socket completion")
 	}
-	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.packet[stacklessCoroPollDescWord])))
+	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
 	completed := takeStacklessCoroOperation(op.id)
 	if completed != op {
 		throw("runtime: mismatched stackless coroutine socket completion")
 	}
-	op.packet[stacklessCoroPollDescWord] = 0
-	if pd != nil && op.ownsPollDesc {
+	op.resourceState().packet[stacklessCoroPollDescWord] = 0
+	if pd != nil && op.resourceState().ownsPollDesc {
 		poll_runtime_pollUnblock(pd)
 		poll_runtime_pollClose(pd)
 	}
-	if op.n != nil {
+	if op.resourceState().n != nil {
 		if count < 0 {
-			*op.n = -1
+			*op.resourceState().n = -1
 		} else {
-			*op.n = count
+			*op.resourceState().n = count
 		}
 	}
-	if op.errno != nil {
-		*op.errno = errno
+	if op.resourceState().errno != nil {
+		*op.resourceState().errno = errno
 	}
 	completeStacklessCoroOperation(op)
 }
 
 func stacklessCoroSocketAttempt(op *stacklessCoroOperation) {
-	if op.pollWrite {
+	if op.resourceState().pollWrite {
 		stacklessCoroSocketWriteAttempt(op)
 	} else {
 		stacklessCoroSocketReadAttempt(op)
@@ -252,7 +252,7 @@ func stacklessCoroNetpollInit() {
 func stacklessCoroNetpollReady(op *stacklessCoroOperation) *g {
 	for {
 		head := stacklessCoroNetpoll.head.Load()
-		op.packet[stacklessCoroPollNextWord] = uint64(head)
+		op.resourceState().packet[stacklessCoroPollNextWord] = uint64(head)
 		if stacklessCoroNetpoll.head.CompareAndSwap(head,
 			uintptr(unsafe.Pointer(op))) {
 			break
@@ -278,8 +278,8 @@ func stacklessCoroNetpollLoop() {
 		head := stacklessCoroNetpoll.head.Swap(0)
 		for head != 0 {
 			op := (*stacklessCoroOperation)(unsafe.Pointer(head))
-			head = uintptr(op.packet[stacklessCoroPollNextWord])
-			op.packet[stacklessCoroPollNextWord] = 0
+			head = uintptr(op.resourceState().packet[stacklessCoroPollNextWord])
+			op.resourceState().packet[stacklessCoroPollNextWord] = 0
 			if getg().stacklessCoro != nil || op.id == 0 ||
 				findStacklessCoroOperation(op.id) != op {
 				throw("runtime: invalid stackless coroutine poll completion")
