@@ -177,7 +177,10 @@ func CheckStacklessCoroDrainedCachePartialForTest(reserved, private bool) bool {
 	s.cachedFrameBytes = 16
 	if reserved {
 		s.reservedTasks = new(stacklessCoroTask)
+		s.cachedFrameTasks = 1
+		s.cachedFrameBytes = 8
 	}
+	beforeCount, beforeBytes := s.cachedFrameTasks, s.cachedFrameBytes
 	if private {
 		s.lifetime.Store(stacklessCoroLifetimeRootComplete | stacklessCoroLifetimeDrained)
 		d := stacklessCoroNativeDriver{context: acquireStacklessCoroNativeContext(), root: true}
@@ -185,5 +188,23 @@ func CheckStacklessCoroDrainedCachePartialForTest(reserved, private bool) bool {
 	} else {
 		cacheStacklessCoroDrainedTasks(s)
 	}
-	return s.freeTasks == task && s.cachedFrameTasks == 2 && s.freeFrameBytes == 8 && s.cachedFrameBytes == 16
+	return s.freeTasks == task && s.cachedFrameTasks == beforeCount && s.freeFrameBytes == 8 && s.cachedFrameBytes == beforeBytes
+}
+
+func CheckStacklessCoroFrameBudgetActiveRemainderForTest() bool {
+	s := newStacklessCoroTestScheduler()
+	s.root.state = stacklessCoroTaskRunning
+	s.root.resuming = true
+	s.root.context.scheduler = s
+	task := &stacklessCoroTask{state: stacklessCoroTaskNew, frameSize: 128,
+		flags: stacklessCoroTaskCacheFrame, resume: drainedBudgetOldResumeForTest}
+	task.context.frame = unsafe.Pointer(new([16]uintptr))
+	s.freeTasks = task
+	s.cachedFrameTasks = stacklessCoroTaskCacheSize
+	s.cachedFrameBytes = stacklessCoroFrameCacheSize
+	s.freeFrameBytes = 128
+	frame := coroTakeFrame(unsafe.Pointer(&s.root.context), drainedBudgetNewResumeForTest, stacklessCoroFrameCacheSize)
+	return frame == nil && s.freeTasks == nil && s.freeFrameBytes == 0 &&
+		s.cachedFrameTasks == stacklessCoroTaskCacheSize-1 && s.cachedFrameBytes == stacklessCoroFrameCacheSize-128 &&
+		s.reservedTasks != nil && !s.reservedTasks.hasFlag(stacklessCoroTaskCacheFrame)
 }

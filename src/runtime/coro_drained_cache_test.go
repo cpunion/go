@@ -65,6 +65,9 @@ func TestStacklessCoroDrainedCacheFrameBudgetReplacement(t *testing.T) {
 			}
 		}
 	}
+	if !runtime.CheckStacklessCoroFrameBudgetActiveRemainderForTest() {
+		t.Fatal("replacement consumed active charges after retiring the last idle holder")
+	}
 }
 
 func TestStacklessCoroDrainedCachePartialOwnership(t *testing.T) {
