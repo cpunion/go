@@ -103,32 +103,28 @@ func (sg *sudog) channelWaiter() *channelWaiter {
 //
 //go:nosplit
 func (sg *channelWaiter) fullSudog() *sudog {
-	if sg.compactOwner() != nil {
+	if sg.coro.get() == add(unsafe.Pointer(sg), unsafe.Offsetof(stacklessCoroChannelOperation{}.operation)) {
 		throw("runtime: full view of compact channel waiter")
 	}
 	return (*sudog)(unsafe.Pointer(sg))
 }
 
 //go:nosplit
-func (sg *channelWaiter) compactOwner() *stacklessCoroOperation {
-	owner := sg.coro.get()
-	if isCompactStacklessCoroSudog(sg, owner) {
-		return (*stacklessCoroOperation)(owner)
-	}
-	return nil
-}
-
-//go:nosplit
 func (sg *channelWaiter) channelSelect() bool {
-	if op := sg.compactOwner(); op != nil {
-		return op.waiterState&stacklessCoroWaiterSelect != 0
+	if owner := sg.coro.get(); owner != nil {
+		return (*stacklessCoroOperation)(owner).waiterState&stacklessCoroWaiterSelect != 0
 	}
-	return sg.fullSudog().isSelect
+	// Every queued compact waiter has a live owner. A nil owner here proves
+	// that the queue entry is a full ordinary goroutine waiter.
+	return (*sudog)(unsafe.Pointer(sg)).isSelect
 }
 
 //go:nosplit
 func (sg *channelWaiter) setChannelSelect(v bool) {
-	if op := sg.compactOwner(); op != nil {
+	// All native waiters of a select share this bit. Setup and cleanup hold
+	// every participating channel lock, so no dequeuer sees partial cleanup.
+	if owner := sg.coro.get(); owner != nil {
+		op := (*stacklessCoroOperation)(owner)
 		if v {
 			op.waiterState |= stacklessCoroWaiterSelect
 		} else {

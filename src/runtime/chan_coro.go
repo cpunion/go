@@ -172,7 +172,7 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	sg := newStacklessCoroSudog(op, nil)
 	sg.coro.set(unsafe.Pointer(op))
 	sg.setNativeElem(element)
-	sg.setChannelSelect(false)
+	// Acquisition validates a cleared waiter; only select sets its select bit.
 	sg.setNativeChannel(c)
 	c.sendq.enqueue(sg)
 	if raceenabled {
@@ -234,7 +234,6 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	sg := newStacklessCoroSudog(op, nil)
 	sg.coro.set(unsafe.Pointer(op))
 	sg.setNativeElem(element)
-	sg.setChannelSelect(false)
 	sg.setNativeChannel(c)
 	c.recvq.enqueue(sg)
 	if c.timer != nil {

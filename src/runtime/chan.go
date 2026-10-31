@@ -348,16 +348,17 @@ func send(c *hchan, sg *channelWaiter, ep unsafe.Pointer, unlockf func(), skip i
 		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
-	if sg.getFullElem() != nil {
-		sendDirect(c.elemtype, sg.fullSudog(), ep)
-		sg.setFullElem(nil)
+	full := sg.fullSudog()
+	if full.getFullElem() != nil {
+		sendDirect(c.elemtype, full, ep)
+		full.setFullElem(nil)
 	}
-	gp := sg.fullSudog().g
+	gp := full.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
-	sg.fullSudog().success = true
-	if sg.fullSudog().releasetime != 0 {
-		sg.fullSudog().releasetime = cputicks()
+	full.success = true
+	if full.releasetime != 0 {
+		full.releasetime = cputicks()
 	}
 	goready(gp, skip+1)
 }
@@ -473,16 +474,17 @@ func closechan(c *hchan) {
 			corotail = sg
 			continue
 		}
-		if elem := sg.getFullElem(); elem != nil {
+		full := sg.fullSudog()
+		if elem := full.getFullElem(); elem != nil {
 			typedmemclr(c.elemtype, elem)
-			sg.setFullElem(nil)
+			full.setFullElem(nil)
 		}
-		if sg.fullSudog().releasetime != 0 {
-			sg.fullSudog().releasetime = cputicks()
+		if full.releasetime != 0 {
+			full.releasetime = cputicks()
 		}
-		gp := sg.fullSudog().g
+		gp := full.g
 		gp.param = unsafe.Pointer(sg)
-		sg.fullSudog().success = false
+		full.success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -509,13 +511,14 @@ func closechan(c *hchan) {
 			corotail = sg
 			continue
 		}
-		sg.setFullElem(nil)
-		if sg.fullSudog().releasetime != 0 {
-			sg.fullSudog().releasetime = cputicks()
+		full := sg.fullSudog()
+		full.setFullElem(nil)
+		if full.releasetime != 0 {
+			full.releasetime = cputicks()
 		}
-		gp := sg.fullSudog().g
+		gp := full.g
 		gp.param = unsafe.Pointer(sg)
-		sg.fullSudog().success = false
+		full.success = false
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
 		}
@@ -802,13 +805,14 @@ func recv(c *hchan, sg *channelWaiter, ep unsafe.Pointer, unlockf func(), skip i
 		finishStacklessCoroChannel(op, sg, true)
 		return
 	}
-	sg.setFullElem(nil)
-	gp := sg.fullSudog().g
+	full := sg.fullSudog()
+	full.setFullElem(nil)
+	gp := full.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
-	sg.fullSudog().success = true
-	if sg.fullSudog().releasetime != 0 {
-		sg.fullSudog().releasetime = cputicks()
+	full.success = true
+	if full.releasetime != 0 {
+		full.releasetime = cputicks()
 	}
 	goready(gp, skip+1)
 }

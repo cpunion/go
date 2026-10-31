@@ -408,7 +408,7 @@ func newStacklessCoroIOOperation() *stacklessCoroOperation {
 }
 
 // A source-kind change adds its first resource header beside the new payload,
-// keeping the allocation count and total allocator classes unchanged.
+// so installing the header needs no separate allocation.
 type stacklessCoroIOResources struct {
 	resources stacklessCoroOperationResources
 	io        stacklessCoroIOState
@@ -487,7 +487,7 @@ type stacklessCoroOperationState struct {
 	// waiterActive prevents reuse while the retained waiter is queued. Its
 	// typed storage or resource header remains rooted by the operation.
 	waiterActive bool
-	// waiterState keeps compact select state and immutable allocation provenance
+	// waiterState keeps native select state and immutable allocation provenance
 	// in existing scalar padding. Completion preserves the allocation bits.
 	waiterState uint8
 	next        *stacklessCoroOperation
