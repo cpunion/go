@@ -209,6 +209,26 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 	return count
 }
 
+// Clear only this root's idle inherited storage before its first action.
+// A global pool sweep cannot make a cold-prefix assertion independent of a
+// previous spawned owner's delayed return to that pool.
+func StacklessCoroClearCurrentRootCacheForTest(ctx unsafe.Pointer) {
+	context := (*stacklessCoroContext)(ctx)
+	s := context.scheduler
+	if context.task() != &s.root || s.liveSpawns != 0 || s.reservedTasks != nil ||
+		s.freeFrameBytes != s.cachedFrameBytes {
+		throw("runtime: cold test root already owns active child frames")
+	}
+	s.freeTasks = nil
+	s.freePlainTaskCount = 0
+	s.freeFrameBytes = 0
+	s.cachedFrameTasks = 0
+	s.cachedFrameBytes = 0
+	if native := stacklessCoroNativeContextFor(getg()); native != nil {
+		clearStacklessCoroNativePayloadCache(native)
+	}
+}
+
 var stacklessCoroNativeReplacementDrainTest struct {
 	runs   int
 	native bool

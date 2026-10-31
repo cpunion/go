@@ -2132,6 +2132,7 @@ func TestStacklessCoroFusedFrameFallbacks(t *testing.T) {
 }
 
 type stacklessCoroFusedResumeDeepTracker struct {
+	coldStart     bool
 	completed     int
 	uncached      int
 	panicLeaf     bool
@@ -2208,6 +2209,9 @@ func stacklessCoroFusedResumeDeepRoot(ctx unsafe.Pointer) uint8 {
 		runtime.FrameStacklessCoroForTest(ctx))
 	switch frame.State {
 	case 0:
+		if tracker.coldStart {
+			runtime.StacklessCoroClearCurrentRootCacheForTest(ctx)
+		}
 		childPointer := runtime.TakeStacklessCoroFusedResumeFrameForTest(ctx,
 			stacklessCoroFusedResumeDeepA)
 		if childPointer == nil {
@@ -2246,10 +2250,9 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
 	// The exact direct-prefix count is a cold-cache contract. A warm native
 	// chunk from an earlier root can legitimately reduce that count.
-	runtime.StacklessCoroClearNativeTaskCachesForTest()
 
 	depth := runtime.StacklessCoroTaskCacheSize + 32
-	tracker := new(stacklessCoroFusedResumeDeepTracker)
+	tracker := &stacklessCoroFusedResumeDeepTracker{coldStart: true}
 	runStacklessCoroFusedResumeDeep(depth, tracker)
 	if tracker.completed != depth+1 {
 		t.Fatalf("completed frames = %d, want %d",
@@ -3288,10 +3291,12 @@ func TestStacklessCoroTaskReuse(t *testing.T) {
 			completed.Add(1)
 			return runtime.StacklessCoroActionComplete
 		}
-		var parentState int
+		var parentState, free int
+		badState := -1
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch parentState {
 			case 0:
+				runtime.StacklessCoroClearCurrentRootCacheForTest(ctx)
 				for range tasks {
 					runtime.SpawnStacklessCoroForTest(ctx, child)
 				}
@@ -3301,21 +3306,27 @@ func TestStacklessCoroTaskReuse(t *testing.T) {
 				if completed.Load() != tasks {
 					return runtime.StacklessCoroActionYield
 				}
-				want := runtime.StacklessCoroTaskCacheSize
-				if race.Enabled {
-					want = 0
-				}
-				if got := runtime.StacklessCoroFreeTaskCountForTest(ctx); got != want {
-					t.Fatalf("cached tasks = %d, want %d", got, want)
-				}
+				// Unused slots in the final chunk have not entered the completed cache.
+				unused, _ := runtime.StacklessCoroBatchedTaskCountsForTest(ctx)
+				free = runtime.StacklessCoroFreeTaskCountForTest(ctx) - unused
 				return runtime.StacklessCoroActionComplete
 			default:
-				t.Fatalf("unexpected parent state %d", parentState)
-				return runtime.StacklessCoroActionInvalid
+				badState = parentState
+				return runtime.StacklessCoroActionComplete
 			}
 		})
-	})
 
+		if badState != -1 {
+			t.Fatalf("unexpected parent state %d", badState)
+		}
+		want := runtime.StacklessCoroTaskCacheSize
+		if race.Enabled {
+			want = 0
+		}
+		if free != want {
+			t.Fatalf("cached tasks = %d, want %d", free, want)
+		}
+	})
 	t.Run("batched-allocation", func(t *testing.T) {
 		oldProcs := runtime.GOMAXPROCS(1)
 		defer runtime.GOMAXPROCS(oldProcs)
@@ -3330,25 +3341,16 @@ func TestStacklessCoroTaskReuse(t *testing.T) {
 			completed.Add(1)
 			return runtime.StacklessCoroActionComplete
 		}
-		var parentState int
+		var parentState, free, direct int
+		badState := -1
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			switch parentState {
 			case 0:
+				runtime.StacklessCoroClearCurrentRootCacheForTest(ctx)
 				for range tasks {
 					runtime.SpawnStacklessCoroForTest(ctx, child)
 				}
-				free, direct := runtime.StacklessCoroBatchedTaskCountsForTest(ctx)
-				if race.Enabled {
-					if free != 0 || direct != 0 {
-						t.Fatalf("race batched task counts = (%d, %d), want zero",
-							free, direct)
-					}
-				} else if wantFree := runtime.StacklessCoroTaskChunkSize - 2; free != wantFree ||
-					direct != runtime.StacklessCoroDirectBatchedTaskCount {
-					t.Fatalf("batched task counts = (%d, %d), want (%d, %d)",
-						free, direct, wantFree,
-						runtime.StacklessCoroDirectBatchedTaskCount)
-				}
+				free, direct = runtime.StacklessCoroBatchedTaskCountsForTest(ctx)
 				release.Store(true)
 				parentState = 1
 				return runtime.StacklessCoroActionYield
@@ -3358,10 +3360,23 @@ func TestStacklessCoroTaskReuse(t *testing.T) {
 				}
 				return runtime.StacklessCoroActionComplete
 			default:
-				t.Fatalf("unexpected batched task parent state %d", parentState)
-				return runtime.StacklessCoroActionInvalid
+				badState = parentState
+				release.Store(true)
+				return runtime.StacklessCoroActionComplete
 			}
 		})
+		if badState != -1 {
+			t.Fatalf("unexpected batched task parent state %d", badState)
+		}
+		if race.Enabled {
+			if free != 0 || direct != 0 {
+				t.Fatalf("race batched task counts = (%d, %d), want zero", free, direct)
+			}
+		} else if wantFree := runtime.StacklessCoroTaskChunkSize - 2; free != wantFree ||
+			direct != runtime.StacklessCoroDirectBatchedTaskCount {
+			t.Fatalf("batched task counts = (%d, %d), want (%d, %d)",
+				free, direct, wantFree, runtime.StacklessCoroDirectBatchedTaskCount)
+		}
 	})
 
 	t.Run("recovered-panic", func(t *testing.T) {
