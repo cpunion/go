@@ -53,7 +53,7 @@ func StacklessCoroChannelCacheForTest() StacklessCoroChannelCacheStateForTest {
 				if op.hasResources() || op.retainedWaiter() == nil ||
 					!isCompactStacklessCoroSudog(op.retainedWaiter(), unsafe.Pointer(op)) ||
 					op.id != 0 || op.scheduler() != nil || op.task != nil || op.receivedResult() != nil || op.waiterState&stacklessCoroDirectReceived != 0 ||
-					op.send || op.timerWait || op.waiterActive ||
+					op.send || op.timerWait || op.waiterActive || op.registeredIO ||
 					!validReleasedStacklessCoroSudog(op, op.retainedWaiter()) {
 					state.Invalid = true
 				}

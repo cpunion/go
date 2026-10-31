@@ -494,10 +494,14 @@ type stacklessCoroOperationState struct {
 	// waiterState keeps native select state and immutable allocation provenance
 	// in existing scalar padding. Completion preserves the allocation bits.
 	waiterState uint8
-	_           uint32 // Preserve the existing32bit operation allocation classes.
-	id          uint64
-	task        *stacklessCoroTask
-	next        *stacklessCoroOperation
+	// registeredIO is fixed while linked in the operation registry. Registry
+	// readers must not classify a channel's extra slot while it is promoted
+	// from a receive-result pointer to a retained waiter/resource header.
+	registeredIO bool
+	_            [3]byte // Preserve the existing32bit allocation classes.
+	id           uint64
+	task         *stacklessCoroTask
+	next         *stacklessCoroOperation
 }
 
 func (op *stacklessCoroOperation) scheduler() *stacklessCoroScheduler {
@@ -4018,6 +4022,7 @@ func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroSche
 	// fields that can still be populated, leaving retained resources rooted.
 	op.id = 0
 	op.task = nil
+	op.registeredIO = false
 	op.clearReceived()
 	op.send = false
 	if io != nil {
@@ -4691,6 +4696,11 @@ func (s *stacklessCoroScheduler) stopReplacementExecutors() {
 
 func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
 	lock(&stacklessCoroOperations.lock)
+	// The source has not yet been published. IO storage already exists for
+	// every IO source and remains stable until registry removal. A channel
+	// may add its first waiter resources later, but cannot become IO while
+	// this source is live. Snapshot this before readers can observe the slot.
+	op.registeredIO = op.ioState() != nil
 	stacklessCoroOperations.next++
 	if stacklessCoroOperations.next == 0 {
 		stacklessCoroOperations.next++
