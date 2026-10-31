@@ -4107,6 +4107,11 @@ func cacheStacklessCoroSharedOperation(op *stacklessCoroOperation) {
 		return
 	}
 	lock(&stacklessCoroSharedOperations.lock)
+	cacheStacklessCoroSharedOperationLocked(op)
+	unlock(&stacklessCoroSharedOperations.lock)
+}
+
+func cacheStacklessCoroSharedOperationLocked(op *stacklessCoroOperation) {
 	if !validStacklessCoroSharedOperationCache(
 		stacklessCoroSharedOperations.head,
 		stacklessCoroSharedOperations.count) {
@@ -4114,13 +4119,11 @@ func cacheStacklessCoroSharedOperation(op *stacklessCoroOperation) {
 	}
 	if int(stacklessCoroSharedOperations.count) == stacklessCoroSharedOperationCacheSize {
 		cacheStacklessCoroChannelLocked(op)
-		unlock(&stacklessCoroSharedOperations.lock)
 		return
 	}
 	op.next = stacklessCoroSharedOperations.head
 	stacklessCoroSharedOperations.head = op
 	stacklessCoroSharedOperations.count++
-	unlock(&stacklessCoroSharedOperations.lock)
 }
 
 func completeStacklessCoroOperation(op *stacklessCoroOperation) {
