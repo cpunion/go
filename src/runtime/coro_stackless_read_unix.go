@@ -48,9 +48,9 @@ func coroFileRead1(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uin
 	// This operation is completed directly below and is never registered.
 	// It still needs a nonzero identity for the common completion checks.
 	op.id = stacklessCoroDirectOperationID
-	op.buffer = buffer
-	op.n = n
-	op.errno = errno
+	op.resourceState().buffer = buffer
+	op.resourceState().n = n
+	op.resourceState().errno = errno
 
 	var count int32
 	var readErrno uintptr
@@ -70,15 +70,15 @@ func coroFileRead1(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uin
 	}
 	KeepAlive(buffer)
 
-	if op.n != nil {
+	if op.resourceState().n != nil {
 		if count < 0 {
-			*op.n = -1
+			*op.resourceState().n = -1
 		} else {
-			*op.n = int(count)
+			*op.resourceState().n = int(count)
 		}
 	}
-	if op.errno != nil {
-		*op.errno = readErrno
+	if op.resourceState().errno != nil {
+		*op.resourceState().errno = readErrno
 	}
 	completeStacklessCoroOperation(op)
 }
@@ -99,7 +99,7 @@ func coroCallRead(ctx unsafe.Pointer, call func()) {
 		throw("runtime: nil stackless coroutine read call")
 	}
 	op := stacklessCoroStartIOOperation(ctx, "read call")
-	op.call = call
+	op.resourceState().call = call
 	registerStacklessCoroOperation(op)
 	stacklessCoroReadEnqueue(op)
 }
@@ -121,10 +121,10 @@ func coroSubmit(id, value uint64, fd int32) int32
 
 func startStacklessCoroAsync(ctx unsafe.Pointer, readFD int, result *uint64, errno *uintptr) *stacklessCoroOperation {
 	op := stacklessCoroStartIOOperation(ctx, "async foreign call")
-	op.fd = int32(readFD)
-	op.errno = errno
-	op.valueOut = result
-	op.async = true
+	op.resourceState().fd = int32(readFD)
+	op.resourceState().errno = errno
+	op.resourceState().valueOut = result
+	op.resourceState().async = true
 	registerStacklessCoroOperation(op)
 	return op
 }
@@ -134,8 +134,8 @@ func failStacklessCoroAsync(id uint64, errno uintptr) {
 	if op == nil {
 		return
 	}
-	if op.errno != nil {
-		*op.errno = errno
+	if op.resourceState().errno != nil {
+		*op.resourceState().errno = errno
 	}
 	completeStacklessCoroOperation(op)
 }
@@ -143,11 +143,11 @@ func failStacklessCoroAsync(id uint64, errno uintptr) {
 func stacklessCoroReadEnqueue(op *stacklessCoroOperation) {
 	wake := stacklessCoroReadWake()
 	lock(&stacklessCoroReadPool.lock)
-	op.workNext = nil
+	op.resourceState().workNext = nil
 	if stacklessCoroReadPool.tail == nil {
 		stacklessCoroReadPool.head = op
 	} else {
-		stacklessCoroReadPool.tail.workNext = op
+		stacklessCoroReadPool.tail.resourceState().workNext = op
 	}
 	stacklessCoroReadPool.tail = op
 	unlock(&stacklessCoroReadPool.lock)
@@ -194,8 +194,8 @@ func stacklessCoroReadWorkerLoop() {
 		lock(&stacklessCoroReadPool.lock)
 		op := stacklessCoroReadPool.head
 		if op != nil {
-			stacklessCoroReadPool.head = op.workNext
-			op.workNext = nil
+			stacklessCoroReadPool.head = op.resourceState().workNext
+			op.resourceState().workNext = nil
 			if stacklessCoroReadPool.head == nil {
 				stacklessCoroReadPool.tail = nil
 			}
@@ -206,9 +206,9 @@ func stacklessCoroReadWorkerLoop() {
 			stacklessCoroReadSignal(wake)
 		}
 		if op != nil {
-			if op.call != nil {
+			if op.resourceState().call != nil {
 				stacklessCoroCallWorker(op.id)
-			} else if op.async {
+			} else if op.resourceState().async {
 				stacklessCoroAsyncWorker(op.id)
 			} else {
 				throw("runtime: invalid stackless coroutine worker operation")
@@ -222,7 +222,7 @@ func stacklessCoroCallWorker(id uint64) {
 	if op == nil {
 		return
 	}
-	op.call()
+	op.resourceState().call()
 
 	op = takeStacklessCoroOperation(id)
 	if op == nil {
@@ -236,22 +236,22 @@ func stacklessCoroAsyncWorker(id uint64) {
 	if op == nil {
 		return
 	}
-	n, errno := stacklessCoroPollRead(op.fd,
-		unsafe.Pointer(&op.packet[0]), int32(unsafe.Sizeof(op.packet)))
+	n, errno := stacklessCoroPollRead(op.resourceState().fd,
+		unsafe.Pointer(&op.resourceState().packet[0]), int32(unsafe.Sizeof(op.resourceState().packet)))
 
 	op = takeStacklessCoroOperation(id)
 	if op == nil {
 		return
 	}
-	if n != int32(unsafe.Sizeof(op.packet)) || op.packet[0] != id {
+	if n != int32(unsafe.Sizeof(op.resourceState().packet)) || op.resourceState().packet[0] != id {
 		if errno == 0 {
 			errno = stacklessCoroBadCompletion
 		}
-	} else if op.valueOut != nil {
-		*op.valueOut = op.packet[1]
+	} else if op.resourceState().valueOut != nil {
+		*op.resourceState().valueOut = op.resourceState().packet[1]
 	}
-	if op.errno != nil {
-		*op.errno = errno
+	if op.resourceState().errno != nil {
+		*op.resourceState().errno = errno
 	}
 	completeStacklessCoroOperation(op)
 }

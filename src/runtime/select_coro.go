@@ -103,10 +103,10 @@ func (selection *stacklessCoroSelect) clear() {
 // The winning producer finishes the operation after dropping channel locks.
 func stacklessCoroSelectTry(owner unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(owner)
-	if op == nil || !(op.hasResources() && op.selection.active()) {
+	if op == nil || !(op.hasResources() && op.resourceState().selection.active()) {
 		throw("runtime: invalid stackless coroutine select waiter")
 	}
-	return op.selection.done.CompareAndSwap(0, 1)
+	return op.resourceState().selection.done.CompareAndSwap(0, 1)
 }
 
 func stacklessCoroSelectCases(cases0 *scase, nsends, nrecvs int,
@@ -215,7 +215,7 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		} else {
 			selection = new(stacklessCoroSelect)
 		}
-		op.selection = selection
+		op.resourceState().selection = selection
 	}
 	selection.prepare(cases, len(pollOrder), ncases,
 		nsends, chosen, received)
@@ -417,8 +417,8 @@ func sortStacklessCoroSelectLocks(cases []scase, pollOrder, lockOrder []uint16) 
 
 func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *channelWaiter,
 	success bool) {
-	if op == nil || winner == nil || !(op.hasResources() && op.selection.active()) ||
-		op.selection.done.Load() != 1 ||
+	if op == nil || winner == nil || !(op.hasResources() && op.resourceState().selection.active()) ||
+		op.resourceState().selection.done.Load() != 1 ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid stackless coroutine select completion")
 	}
@@ -473,11 +473,11 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *channelWaiter
 
 func completeStacklessCoroSelect(op *stacklessCoroOperation, chosen int,
 	recvOK, sendClosed bool) {
-	if op == nil || !(op.hasResources() && op.selection.active()) ||
+	if op == nil || !(op.hasResources() && op.resourceState().selection.active()) ||
 		takeStacklessCoroOperation(op.id) != op {
 		throw("runtime: invalid immediate stackless coroutine select completion")
 	}
-	publishStacklessCoroSelect(op, op.selection, chosen, recvOK, sendClosed)
+	publishStacklessCoroSelect(op, op.resourceState().selection, chosen, recvOK, sendClosed)
 }
 
 func publishStacklessCoroSelect(op *stacklessCoroOperation,

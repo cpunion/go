@@ -57,7 +57,7 @@ func StacklessCoroNetpollReadyAccountingForTest(mode int32, state int) (delta in
 	queued = head == uintptr(unsafe.Pointer(readOp)) || head == uintptr(unsafe.Pointer(writeOp))
 	if mode == 'r'+'w' && queued {
 		first := (*stacklessCoroOperation)(unsafe.Pointer(head))
-		second := uintptr(first.packet[stacklessCoroPollNextWord])
+		second := uintptr(first.resourceState().packet[stacklessCoroPollNextWord])
 		queued = second != head && (second == uintptr(unsafe.Pointer(readOp)) || second == uintptr(unsafe.Pointer(writeOp)))
 	}
 	stacklessCoroNetpoll.wake.Store(pdNil)

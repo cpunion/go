@@ -44,3 +44,10 @@ func (op *stacklessCoroOperation) newRetainedWaiter() *channelWaiter {
 	op.waiter = new(sudog).channelWaiter()
 	return op.waiter
 }
+
+func (op *stacklessCoroOperation) resourceState() *stacklessCoroOperationResources {
+	return &op.stacklessCoroOperationResources
+}
+func (op *stacklessCoroOperation) setReceived(received *bool) { op.received = received }
+func (op *stacklessCoroOperation) receivedResult() *bool      { return op.received }
+func (op *stacklessCoroOperation) clearReceived()             { op.received = nil }
