@@ -478,10 +478,8 @@ const (
 )
 
 type stacklessCoroOperationState struct {
-	id        uint64
-	scheduler *stacklessCoroScheduler
-	task      *stacklessCoroTask
-	received  *bool
+	// Keep the hot waiter flags beside the compact channel prefix. Moving
+	// this scalar word before id preserves the layout size and uint64 ID.
 	send      bool
 	timerWait bool
 	// waiterActive prevents reuse while the retained waiter is queued. Its
@@ -490,6 +488,10 @@ type stacklessCoroOperationState struct {
 	// waiterState keeps native select state and immutable allocation provenance
 	// in existing scalar padding. Completion preserves the allocation bits.
 	waiterState uint8
+	id          uint64
+	scheduler   *stacklessCoroScheduler
+	task        *stacklessCoroTask
+	received    *bool
 	next        *stacklessCoroOperation
 }
 

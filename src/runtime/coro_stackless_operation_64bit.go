@@ -55,10 +55,12 @@ type stacklessCoroWaiterResources struct {
 //
 //go:nosplit
 func (op *stacklessCoroOperation) retainedWaiter() *channelWaiter {
-	switch op.waiterState & stacklessCoroWaiterStorageMask {
-	case stacklessCoroWaiterCompact:
+	// Constructors set at most one storage bit, and completion preserves it.
+	// Test the common compact bit directly instead of decoding an enum.
+	if op.waiterState&stacklessCoroWaiterCompact != 0 {
 		return (*channelWaiter)(unsafe.Add(unsafe.Pointer(op), -int(unsafe.Offsetof(stacklessCoroChannelOperation{}.operation))))
-	case stacklessCoroWaiterFull:
+	}
+	if op.waiterState&stacklessCoroWaiterFull != 0 {
 		return (*channelWaiter)(add(unsafe.Pointer(op), unsafe.Offsetof(stacklessCoroFullChannelOperation{}.waiter)))
 	}
 	if resources := op.resources(); resources != nil {

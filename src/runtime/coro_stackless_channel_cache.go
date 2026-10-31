@@ -81,15 +81,16 @@ func validStacklessCoroChannelCacheLocked() bool {
 }
 
 func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
-	if op == nil || op.hasResources() || op.retainedWaiter() == nil ||
-		!isCompactStacklessCoroSudog(op.retainedWaiter(), unsafe.Pointer(op)) {
+	if op == nil || op.hasResources() ||
+		op.waiterState&stacklessCoroWaiterStorageMask != stacklessCoroWaiterCompact {
 		return false
 	}
-	// A separately allocated full waiter is not a compact allocation, even
-	// when it is attached to an otherwise resource-free operation.
+	// Immutable constructor provenance excludes separately allocated full
+	// waiters. Only now derive the pointer within that typed allocation.
+	waiter := op.retainedWaiter()
 	return op.id == 0 && op.scheduler == nil && op.task == nil &&
 		op.received == nil && !op.send && !op.timerWait && !op.waiterActive &&
-		op.next == nil && validReleasedStacklessCoroSudog(op, op.retainedWaiter())
+		op.next == nil && validReleasedStacklessCoroSudog(op, waiter)
 }
 
 func takeStacklessCoroChannelCacheLocked() *stacklessCoroOperation {

@@ -72,7 +72,7 @@ func releaseStacklessCoroSudog(owner unsafe.Pointer, sg *channelWaiter) {
 	if op == nil || !validReleasedStacklessCoroSudog(op, sg) {
 		throw("runtime: invalid released stackless coroutine channel waiter")
 	}
-	if op.retainedWaiter() == sg {
+	if isCompactStacklessCoroSudog(sg, owner) || op.retainedWaiter() == sg {
 		if !op.waiterActive {
 			throw("runtime: duplicate released stackless coroutine channel waiter")
 		}
