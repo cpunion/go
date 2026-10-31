@@ -551,6 +551,7 @@ func StacklessCoroIOOperationSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroIOOperation{})
 }
 
+//go:noinline
 func NewStacklessCoroChannelOperationForTest() unsafe.Pointer {
 	return unsafe.Pointer(newStacklessCoroChannelOperation())
 }
@@ -561,7 +562,7 @@ func NewStacklessCoroIOOperationForTest() unsafe.Pointer {
 
 func StacklessCoroIOOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
-	return op != nil && op.ioState() != nil && op.waiter == nil &&
+	return op != nil && op.ioState() != nil && op.retainedWaiter() == nil &&
 		unsafe.Pointer(op.ioState()) == add(token,
 			unsafe.Offsetof(stacklessCoroIOOperation{}.io))
 }
@@ -569,17 +570,17 @@ func StacklessCoroIOOperationValidForTest(token unsafe.Pointer) bool {
 func StacklessCoroChannelOperationValidForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
 	return op != nil && op.ioState() == nil &&
-		validReleasedStacklessCoroSudog(op, op.waiter) &&
-		(isCompactStacklessCoroSudog(op.waiter, token) ||
-			unsafe.Pointer(op.waiter) == add(token,
+		validReleasedStacklessCoroSudog(op, op.retainedWaiter()) &&
+		(isCompactStacklessCoroSudog(op.retainedWaiter(), token) ||
+			unsafe.Pointer(op.retainedWaiter()) == add(token,
 				unsafe.Offsetof(stacklessCoroFullChannelOperation{}.waiter)))
 }
 
 func StacklessCoroChannelOperationClearedForTest(token unsafe.Pointer) bool {
 	op := (*stacklessCoroOperation)(token)
 	return op != nil &&
-		op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
-		(op.waiter == nil || validReleasedStacklessCoroSudog(op, op.waiter))
+		op.stacklessCoroOperationState == (stacklessCoroOperationState{waiterState: op.waiterState & stacklessCoroWaiterStorageMask}) &&
+		(op.retainedWaiter() == nil || validReleasedStacklessCoroSudog(op, op.retainedWaiter()))
 }
 
 func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
@@ -598,7 +599,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 		unlock(&s.lock)
 	}
 	op := start(stacklessCoroOperationChannel)
-	first, waiter := op, op.waiter
+	first, waiter := op, op.retainedWaiter()
 	op.id = stacklessCoroChannelOperationID
 	clearStacklessCoroOperation(op)
 	recycle(op)
@@ -618,7 +619,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 	op.ownsPollDesc = true
 	op.pollWrite = true
 	clearStacklessCoroOperation(op)
-	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{}) &&
+	cleared = op.stacklessCoroOperationState == (stacklessCoroOperationState{waiterState: op.waiterState & stacklessCoroWaiterStorageMask}) &&
 		op.ioState() == storage && storage != nil &&
 		op.buffer == nil && op.call == nil && op.n == nil &&
 		op.errno == nil && op.valueOut == nil && op.workNext == nil &&
@@ -641,7 +642,7 @@ func CheckStacklessCoroIOReuseForTest() (reused, cleared bool) {
 
 	op = start(stacklessCoroOperationChannel)
 	if !raceenabled {
-		reused = reused && op == first && op.waiter == waiter &&
+		reused = reused && op == first && op.retainedWaiter() == waiter &&
 			op.ioState() == storage
 	} else {
 		reused = reused || op == first
@@ -1168,7 +1169,7 @@ func NewStacklessCoroChannelWaiterCacheForTest() *StacklessCoroChannelWaiterCach
 }
 
 func (cache *StacklessCoroChannelWaiterCacheForTest) Cycle() {
-	var slot *sudog
+	var slot *channelWaiter
 	sg := newStacklessCoroSudog(&cache.operation, &slot)
 	if sg != slot {
 		throw("runtime: lost stackless coroutine test waiter root")
@@ -1179,7 +1180,7 @@ func (cache *StacklessCoroChannelWaiterCacheForTest) Cycle() {
 func (cache *StacklessCoroChannelWaiterCacheForTest) CycleAcrossGC() {
 	newStacklessCoroSudog(&cache.operation, nil)
 	GC()
-	sg := cache.operation.waiter
+	sg := cache.operation.retainedWaiter()
 	if sg == nil {
 		throw("runtime: lost active stackless coroutine test waiter")
 	}
@@ -1187,7 +1188,7 @@ func (cache *StacklessCoroChannelWaiterCacheForTest) CycleAcrossGC() {
 }
 
 func (cache *StacklessCoroChannelWaiterCacheForTest) Valid() bool {
-	return validReleasedStacklessCoroSudog(&cache.operation, cache.operation.waiter)
+	return validReleasedStacklessCoroSudog(&cache.operation, cache.operation.retainedWaiter())
 }
 
 type StacklessCoroSelectCasesForTest struct {
@@ -2003,7 +2004,7 @@ func StacklessCoroIOOriginImmediateChannelForTest(kind string) bool {
 		close(channel)
 	}
 	op := startStacklessCoroChannel(unsafe.Pointer(&task.context), *(**hchan)(unsafe.Pointer(&channel)), unsafe.Pointer(value), received, kind == "send")
-	valid := op == first && op.waiter == nil && op.stacklessCoroOperationState == (stacklessCoroOperationState{})
+	valid := op == first && op.retainedWaiter() == nil && op.stacklessCoroOperationState == (stacklessCoroOperationState{})
 	GC()
 	switch kind {
 	case "send":
@@ -2039,12 +2040,9 @@ func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged 
 		{unsafe.Offsetof(sudog{}.prev), unsafe.Offsetof(stacklessCoroChannelWaiter{}.prev)},
 		{unsafe.Offsetof(sudog{}.elem), unsafe.Offsetof(stacklessCoroChannelWaiter{}.elem)},
 		{unsafe.Offsetof(sudog{}.c), unsafe.Offsetof(stacklessCoroChannelWaiter{}.c)},
-		{unsafe.Offsetof(sudog{}.ticket), unsafe.Offsetof(stacklessCoroChannelWaiter{}.ticket)},
-		{unsafe.Offsetof(sudog{}.isSelect), unsafe.Offsetof(stacklessCoroChannelWaiter{}.isSelect)},
-		{unsafe.Offsetof(sudog{}.success), unsafe.Offsetof(stacklessCoroChannelWaiter{}.success)},
-		{unsafe.Offsetof(sudog{}.waiters), unsafe.Offsetof(stacklessCoroChannelWaiter{}.waiters)},
 	}
-	valid = full <= storage && unsafe.Offsetof(stacklessCoroChannelOperation{}.operation) == prefix
+	operationOffset := unsafe.Offsetof(stacklessCoroChannelOperation{}.operation)
+	valid = prefix <= full && operationOffset == prefix+stacklessCoroChannelWaiterPadding
 	for _, o := range offsets {
 		valid = valid && o.full == o.prefix
 	}
@@ -2056,25 +2054,27 @@ func StacklessCoroCompactChannelLayoutForTest() (full, prefix, storage, charged 
 		valid = valid && pointer == stacklessCoroCompactPointerBitForTest(fullType, word) &&
 			pointer == stacklessCoroCompactPointerBitForTest(allocationType, word)
 	}
-	// The full sudog's g slot is the compact allocation's scalar, full-width ID.
+	// Only the five-pointer channel prefix is shared with a full sudog.
 	valid = valid && !stacklessCoroCompactPointerBitForTest(allocationType,
-		prefix/unsafe.Sizeof(uintptr(0)))
+		operationOffset/unsafe.Sizeof(uintptr(0)))
 	operationType := abi.TypeFor[stacklessCoroOperation]()
 	for word := uintptr(0); word < unsafe.Sizeof(stacklessCoroOperation{})/unsafe.Sizeof(uintptr(0)); word++ {
 		valid = valid && stacklessCoroCompactPointerBitForTest(operationType, word) ==
 			stacklessCoroCompactPointerBitForTest(allocationType,
-				prefix/unsafe.Sizeof(uintptr(0))+word)
+				operationOffset/unsafe.Sizeof(uintptr(0))+word)
 	}
-	op := newStacklessCoroChannelOperation()
+	// The allocation-class probe needs an escaping object. The compact layout
+	// no longer has a self pointer that incidentally forces a heap allocation.
+	op := (*stacklessCoroOperation)(NewStacklessCoroChannelOperationForTest())
 	base, span, _ := findObject(uintptr(unsafe.Pointer(op)), 0, 0)
 	if span == nil {
 		return full, prefix, storage, 0, false
 	}
 	charged = span.elemsize
 	if raceenabled {
-		valid = valid && base == uintptr(unsafe.Pointer(op)) && !isCompactStacklessCoroSudog(op.waiter, unsafe.Pointer(op))
+		valid = valid && base == uintptr(unsafe.Pointer(op)) && !isCompactStacklessCoroSudog(op.retainedWaiter(), unsafe.Pointer(op))
 	} else {
-		valid = valid && base == uintptr(unsafe.Pointer(op.waiter)) && isCompactStacklessCoroSudog(op.waiter, unsafe.Pointer(op))
+		valid = valid && base == uintptr(unsafe.Pointer(op.retainedWaiter())) && isCompactStacklessCoroSudog(op.retainedWaiter(), unsafe.Pointer(op))
 	}
 	return
 }
@@ -2110,13 +2110,13 @@ func stacklessCoroCompactRootForTest(waiterView bool, finalized *atomic.Uint32) 
 	SetFinalizer(operationPayload, stacklessCoroCompactFinalizeForTest)
 	op.id = ^uint64(0) - 123
 	op.received = &operationPayload.ok
-	op.waiter.coro.set(unsafe.Pointer(op))
-	op.waiter.setNativeElem(unsafe.Pointer(waiterPayload))
+	op.retainedWaiter().coro.set(unsafe.Pointer(op))
+	op.retainedWaiter().setNativeElem(unsafe.Pointer(waiterPayload))
 	channel := make(chan *stacklessCoroCompactPayloadForTest, 1)
 	channel <- waiterPayload
-	op.waiter.setNativeChannel(*(**hchan)(unsafe.Pointer(&channel)))
+	op.retainedWaiter().setNativeChannel(*(**hchan)(unsafe.Pointer(&channel)))
 	if waiterView {
-		return unsafe.Pointer(op.waiter)
+		return unsafe.Pointer(op.retainedWaiter())
 	}
 	return unsafe.Pointer(op)
 }
@@ -2129,13 +2129,13 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 	GC()
 	op := (*stacklessCoroOperation)(token)
 	if waiterView {
-		op = (*stacklessCoroOperation)((*sudog)(token).coro.get())
+		op = (*stacklessCoroOperation)((*channelWaiter)(token).coro.get())
 	}
 	valid := op != nil && op.id == ^uint64(0)-123 && finalized.Load() == 0
 	if !valid {
 		return false, unsafe.Pointer(finalized)
 	}
-	sg := op.waiter
+	sg := op.retainedWaiter()
 	// A live owner must never be accepted as a released, reusable waiter.
 	valid = valid && !validReleasedStacklessCoroSudog(op, sg)
 	payload := (*stacklessCoroCompactPayloadForTest)(sg.getElem())
@@ -2148,7 +2148,7 @@ func StacklessCoroCompactChannelGCForTest(waiterView bool) (bool, unsafe.Pointer
 	sg.setNativeElem(nil)
 	sg.setNativeChannel(nil)
 	sg.coro.clear()
-	// The full-width ID still occupies the tail where a full sudog has g.
+	// The full-width ID remains a scalar after clearing the prefix owner.
 	valid = valid && validReleasedStacklessCoroSudog(op, sg)
 	op.received = nil
 	op.id = 0

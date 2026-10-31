@@ -178,3 +178,10 @@ func (sg *sudog) setNativeElem(v unsafe.Pointer) { sg.elem.set(v) }
 
 //go:nosplit
 func (sg *sudog) setNativeChannel(c *hchan) { sg.c.set(c) }
+
+// The disabled experiment uses the original sudog and field accesses.
+type channelWaiter = sudog
+
+func (sg *sudog) channelWaiter() *channelWaiter { return sg }
+func (sg *sudog) fullSudog() *sudog             { return sg }
+func (sg *sudog) channelSelect() bool           { return sg.isSelect }

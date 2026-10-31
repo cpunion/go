@@ -18,7 +18,7 @@ import (
 type stacklessCoroSelect struct {
 	cases     []scase
 	lockOrder []uint16
-	waiters   []*sudog
+	waiters   []*channelWaiter
 	chosen    *int
 	received  *bool
 	nsends    int
@@ -62,13 +62,13 @@ func (selection *stacklessCoroSelect) prepare(cases []scase,
 	}
 	if ncases <= stacklessCoroSelectCaseCacheSize {
 		if cap(selection.waiters) < ncases {
-			selection.waiters = make([]*sudog, ncases)
+			selection.waiters = make([]*channelWaiter, ncases)
 		} else {
 			selection.waiters = selection.waiters[:ncases]
 			clear(selection.waiters)
 		}
 	} else {
-		selection.waiters = make([]*sudog, ncases)
+		selection.waiters = make([]*channelWaiter, ncases)
 	}
 
 	selection.cases = cases
@@ -228,7 +228,7 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		casi int
 		cas  *scase
 		c    *hchan
-		sg   *sudog
+		sg   *channelWaiter
 		qp   unsafe.Pointer
 	)
 	for _, casei := range pollOrder {
@@ -276,7 +276,7 @@ func startStacklessCoroSelectCases(ctx unsafe.Pointer, cases []scase,
 		sg = newStacklessCoroSudog(op, &selection.waiters[casi])
 		sg.coro.set(unsafe.Pointer(op))
 		sg.setNativeElem(cas.elem)
-		sg.isSelect = true
+		sg.setChannelSelect(true)
 		sg.setNativeChannel(c)
 		if casi < nsends {
 			c.sendq.enqueue(sg)
@@ -415,7 +415,7 @@ func sortStacklessCoroSelectLocks(cases []scase, pollOrder, lockOrder []uint16) 
 	}
 }
 
-func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
+func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *channelWaiter,
 	success bool) {
 	if op == nil || winner == nil || !(op.hasResources() && op.selection.active()) ||
 		op.selection.done.Load() != 1 ||
@@ -453,7 +453,7 @@ func finishStacklessCoroSelect(op *stacklessCoroOperation, winner *sudog,
 				c.recvq.dequeueSudoG(waiter)
 			}
 		}
-		waiter.isSelect = false
+		waiter.setChannelSelect(false)
 		waiter.setNativeElem(nil)
 		waiter.setNativeChannel(nil)
 		waiter.coro.clear()

@@ -330,7 +330,7 @@ type stacklessCoroScheduler struct {
 // stacklessCoroOperationResources retains reusable resources after clearing the state
 // owned by a completed source. Keeping those resources outside state avoids a
 // transient unrooted pointer while a native executor clears the operation.
-type stacklessCoroOperationResources struct {
+type stacklessCoroOperationResourceState struct {
 	*stacklessCoroIOState
 	timer     *stacklessCoroTimer
 	selection *stacklessCoroSelect
@@ -408,7 +408,7 @@ func newStacklessCoroIOOperation() *stacklessCoroOperation {
 }
 
 // A source-kind change adds its first resource header beside the new payload,
-// keeping the allocation count and total allocator classes unchanged.
+// so installing the header needs no separate allocation.
 type stacklessCoroIOResources struct {
 	resources stacklessCoroOperationResources
 	io        stacklessCoroIOState
@@ -442,6 +442,7 @@ type stacklessCoroSelectResources struct {
 // The operation is an interior pointer; the waiter view starts at the base.
 type stacklessCoroChannelOperation struct {
 	waiter    stacklessCoroChannelWaiter
+	_         [stacklessCoroChannelWaiterPadding]byte
 	operation stacklessCoroOperation
 }
 
@@ -454,12 +455,14 @@ type stacklessCoroFullChannelOperation struct {
 func newStacklessCoroChannelOperation() *stacklessCoroOperation {
 	if raceenabled {
 		storage := new(stacklessCoroFullChannelOperation)
-		storage.operation.waiter = &storage.waiter
+		storage.operation.waiterState = stacklessCoroWaiterFull
+		storage.operation.initializeWaiter(storage.waiter.channelWaiter())
 		return &storage.operation
 	}
 	storage := new(stacklessCoroChannelOperation)
 	op := &storage.operation
-	op.waiter = (*sudog)(unsafe.Pointer(storage))
+	op.waiterState = stacklessCoroWaiterCompact
+	op.initializeWaiter(&storage.waiter)
 	return op
 }
 
@@ -467,17 +470,29 @@ func newStacklessCoroChannelOperation() *stacklessCoroOperation {
 // publishes a terminal fact. Registered sources carry only id. Timers use a
 // stable owner and generation so a late callback cannot complete a reused
 // operation.
+const (
+	stacklessCoroWaiterStorageMask = uint8(3)
+	stacklessCoroWaiterCompact     = uint8(1)
+	stacklessCoroWaiterFull        = uint8(2)
+	stacklessCoroWaiterSelect      = uint8(4)
+)
+
 type stacklessCoroOperationState struct {
-	id        uint64
-	scheduler *stacklessCoroScheduler
-	task      *stacklessCoroTask
-	received  *bool
+	// Keep the hot waiter flags beside the compact channel prefix. Moving
+	// this scalar word before id preserves the layout size and uint64 ID.
 	send      bool
 	timerWait bool
-	// waiterActive keeps the retained waiter rooted by waiter while it is
-	// also linked from a channel queue.
+	// waiterActive prevents reuse while the retained waiter is queued. Its
+	// typed storage or resource header remains rooted by the operation.
 	waiterActive bool
-	next         *stacklessCoroOperation
+	// waiterState keeps native select state and immutable allocation provenance
+	// in existing scalar padding. Completion preserves the allocation bits.
+	waiterState uint8
+	id          uint64
+	scheduler   *stacklessCoroScheduler
+	task        *stacklessCoroTask
+	received    *bool
+	next        *stacklessCoroOperation
 }
 
 // A stacklessCoroTimer keeps a runtime timer stable across operation reuse.
@@ -3587,7 +3602,7 @@ func stacklessCoroChannelWaiterRooted(channel *hchan) bool {
 		channel.dataqsiz == 0 || channel.elemtype.Pointers())
 }
 
-func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *sudog, success bool) {
+func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *channelWaiter, success bool) {
 	op := (*stacklessCoroOperation)(owner)
 	if op != nil && (op.hasResources() && op.selection.active()) {
 		finishStacklessCoroSelect(op, waiter, success)
@@ -3973,7 +3988,7 @@ func clearStacklessCoroOperation(op *stacklessCoroOperation) (*stacklessCoroSche
 		}
 		io = resources.stacklessCoroIOState
 	}
-	if op.timerWait || op.waiterActive || op.next != nil ||
+	if op.timerWait || op.waiterActive || op.waiterState&stacklessCoroWaiterSelect != 0 || op.next != nil ||
 		(io != nil && io.workNext != nil) {
 		throw("runtime: invalid completed stackless coroutine operation")
 	}
