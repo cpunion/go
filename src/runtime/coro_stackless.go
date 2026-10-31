@@ -308,12 +308,13 @@ type stacklessCoroScheduler struct {
 	// broadcasts scheduler drainage to every admitted or waiting replacement.
 	// These channels remain nil until a root first needs replacement
 	// executors.
-	executorWake        chan struct{}
-	executorDone        chan struct{}
-	executorGrow        chan struct{}
-	executorStop        chan struct{}
-	executorManagerDone chan struct{}
-	executorState       atomic.Uint32
+	executorWake chan struct{}
+	// executorDone reports false for a replacement and true for the manager.
+	// Receiving the manager's marker freezes executorCount for the final join.
+	executorDone  chan bool
+	executorGrow  chan struct{}
+	executorStop  chan struct{}
+	executorState atomic.Uint32
 	// executorCount includes the original driver. blockingExecutors counts
 	// drivers that entered a blocking native operation but have not yet
 	// returned with a P.
@@ -4517,10 +4518,9 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 	}
 
 	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
-	s.executorDone = make(chan struct{})
+	s.executorDone = make(chan bool)
 	s.executorGrow = make(chan struct{}, 1)
 	s.executorStop = make(chan struct{})
-	s.executorManagerDone = make(chan struct{})
 	s.rootDone = make(chan struct{})
 	s.executorCount.Store(stacklessCoroWarmExecutorCount)
 	for range stacklessCoroWarmExecutorCount - 1 {
@@ -4545,7 +4545,7 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 				go s.replacementExecutor(true)
 			}
 		case <-s.executorStop:
-			close(s.executorManagerDone)
+			s.executorDone <- true
 			return
 		}
 	}
@@ -4574,7 +4574,7 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 		case <-s.executorStop:
 		}
 	}
-	s.executorDone <- struct{}{}
+	s.executorDone <- false
 }
 
 // enterBlockingExecutor notifies replacement capacity and records an executor
@@ -4638,8 +4638,17 @@ func (s *stacklessCoroScheduler) stopReplacementExecutors() {
 		return
 	}
 	s.stopExecutorRuns()
-	<-s.executorManagerDone
-	for range s.executorCount.Load() - 1 {
+	// Replacements may finish before the manager stops growing the set. Count
+	// their notifications, but do not take the final count until the manager
+	// has published its last possible increment through the same channel.
+	var completed uint32
+	for {
+		if <-s.executorDone {
+			break
+		}
+		completed++
+	}
+	for ; completed < s.executorCount.Load()-1; completed++ {
 		<-s.executorDone
 	}
 }

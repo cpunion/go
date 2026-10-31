@@ -1149,9 +1149,9 @@ func TestStacklessCoroOperationSize(t *testing.T) {
 
 func TestStacklessCoroSchedulerSize(t *testing.T) {
 	ptrSize := unsafe.Sizeof(uintptr(0))
-	want := uintptr(208)
+	want := uintptr(200)
 	if ptrSize == 4 {
-		want = 128
+		want = 124
 	}
 	// Static lock ranking adds diagnostic metadata to the mutex; the
 	// ordinary scheduler layout retains its separate fixed-size budget.
