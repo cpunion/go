@@ -97,7 +97,7 @@ func CheckStacklessCoroDrainedOperationsForTest() bool {
 
 type drainedBudgetAllocationForTest struct {
 	task  stacklessCoroTask
-	frame [4]uintptr
+	frame [18]uintptr
 }
 
 func drainedBudgetOldResumeForTest(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
@@ -109,20 +109,20 @@ func CheckStacklessCoroFrameBudgetReplacementForTest(typed, active bool) bool {
 	s.root.resuming = true
 	s.root.context.scheduler = s
 	for range stacklessCoroTaskCacheSize {
-		task := &stacklessCoroTask{state: stacklessCoroTaskNew, frameSize: 16,
+		task := &stacklessCoroTask{state: stacklessCoroTaskNew, frameSize: 128,
 			flags: stacklessCoroTaskCacheFrame, resume: drainedBudgetOldResumeForTest}
-		task.context.frame = unsafe.Pointer(new([2]uintptr))
+		task.context.frame = unsafe.Pointer(new([16]uintptr))
 		if !active {
 			task.next = s.freeTasks
 			s.freeTasks = task
-			s.freeFrameBytes += 16
+			s.freeFrameBytes += 128
 		}
 		s.cachedFrameTasks++
-		s.cachedFrameBytes += 16
+		s.cachedFrameBytes += 128
 	}
-	size := uintptr(24)
+	size := uintptr(136)
 	if typed {
-		size = 32
+		size = 144
 	}
 	take := func() unsafe.Pointer {
 		if typed {
@@ -143,9 +143,9 @@ func CheckStacklessCoroFrameBudgetReplacementForTest(typed, active bool) bool {
 	}
 	var frame unsafe.Pointer
 	if typed {
-		frame = unsafe.Pointer(new([4]uintptr))
+		frame = unsafe.Pointer(new([18]uintptr))
 	} else {
-		frame = unsafe.Pointer(new([3]uintptr))
+		frame = unsafe.Pointer(new([17]uintptr))
 	}
 	*(*uintptr)(frame) = 0x789abc
 	lock(&s.lock)
@@ -161,4 +161,29 @@ func CheckStacklessCoroFrameBudgetReplacementForTest(typed, active bool) bool {
 	second := take()
 	return second == frame && *(*uintptr)(second) == 0x789abc &&
 		s.cachedFrameBytes <= stacklessCoroFrameCacheSize && s.cachedFrameTasks+s.freePlainTaskCount <= stacklessCoroTaskCacheSize
+}
+
+func CheckStacklessCoroDrainedCachePartialForTest(reserved, private bool) bool {
+	s := newStacklessCoroTestScheduler()
+	s.root.state = stacklessCoroTaskComplete
+	s.lifetime.Store(stacklessCoroLifetimeSpawned | stacklessCoroLifetimeRootComplete | stacklessCoroLifetimeDrained)
+	s.drainCacheAge.complete()
+	task := &stacklessCoroTask{state: stacklessCoroTaskNew, frameSize: 8,
+		flags: stacklessCoroTaskCacheFrame, resume: drainedCacheResumeForTest}
+	task.context.frame = unsafe.Pointer(new(uint64))
+	s.freeTasks = task
+	s.cachedFrameTasks = 2
+	s.freeFrameBytes = 8
+	s.cachedFrameBytes = 16
+	if reserved {
+		s.reservedTasks = new(stacklessCoroTask)
+	}
+	if private {
+		s.lifetime.Store(stacklessCoroLifetimeRootComplete | stacklessCoroLifetimeDrained)
+		d := stacklessCoroNativeDriver{context: acquireStacklessCoroNativeContext(), root: true}
+		d.close(s, true)
+	} else {
+		cacheStacklessCoroDrainedTasks(s)
+	}
+	return s.freeTasks == task && s.cachedFrameTasks == 2 && s.freeFrameBytes == 8 && s.cachedFrameBytes == 16
 }

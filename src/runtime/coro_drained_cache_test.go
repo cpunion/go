@@ -66,3 +66,13 @@ func TestStacklessCoroDrainedCacheFrameBudgetReplacement(t *testing.T) {
 		}
 	}
 }
+
+func TestStacklessCoroDrainedCachePartialOwnership(t *testing.T) {
+	for _, reserved := range []bool{false, true} {
+		for _, private := range []bool{false, true} {
+			if !runtime.CheckStacklessCoroDrainedCachePartialForTest(reserved, private) {
+				t.Fatalf("reserved=%t private=%t: partially owned frame charges moved to an unrelated context", reserved, private)
+			}
+		}
+	}
+}
