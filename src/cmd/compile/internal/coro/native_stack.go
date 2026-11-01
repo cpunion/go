@@ -10,6 +10,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"slices"
+	"strings"
 )
 
 // Each source entry has an independent linker-written gate. Its second word
@@ -63,5 +64,10 @@ func recordNativeStackMetadata(candidates map[*ir.Func]*lowerCandidate) {
 				recordNativeStackEntry(target.Func, gates)
 			}
 		}
+	}
+	// Shared cleanup entries may belong to several source factories. Stable
+	// metadata order is required for reproducible compiler and package builds.
+	for _, gates := range nativeStackGates {
+		slices.SortFunc(gates, func(a, b *ir.Name) int { return strings.Compare(a.Linksym().Name, b.Linksym().Name) })
 	}
 }

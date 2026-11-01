@@ -164,6 +164,7 @@ func (ctxt *Link) doCoroStackCheck() {
 		// Only this entry's flag changes. Its code-address word and relocations
 		// remain intact, so recovery can inspect the exact factory binding.
 		sb := ldr.MakeSymbolUpdater(gate)
+		sb.MakeWritable()
 		sb.SetUint(ctxt.Arch, 0, 1)
 	}
 	if *flagDebugCoroStack {

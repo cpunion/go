@@ -33,7 +33,7 @@ func addOrdinaryBody(fn, ordinary *ir.Func) {
 		ir.NewBinaryExpr(fn.Pos(), ir.ONE, gate, ir.NewInt(fn.Pos(), 0)))
 	// Separately loaded Go modules have no closed linked-image stack proof.
 	// Retain their factory ABI and summaries, while keeping public calls ordinary.
-	if *base.Flag.Dynlink || *base.Flag.LinkShared {
+	if base.Flag.Dynlink != nil && *base.Flag.Dynlink || base.Flag.LinkShared != nil && *base.Flag.LinkShared {
 		condition = ir.NewBool(fn.Pos(), true)
 	}
 	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
