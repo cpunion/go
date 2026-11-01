@@ -3847,7 +3847,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	edit = func(node ir.Node) ir.Node {
 		switch node := node.(type) {
 		case *ir.Decl:
-			if localVariables[node.X.Canonical()] {
+			if localVariables[node.X.Canonical()] || node.X.Curfn == resume {
 				return node
 			}
 			if allocation := captureCellAllocation(node.X); allocation != nil {
