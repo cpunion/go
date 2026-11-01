@@ -2091,6 +2091,13 @@ func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 		if !supported {
 			return
 		}
+		// Source closures need declaration-owned cells and capture
+		// reparenting. The general native lowering provides both; the
+		// structured foreign-call path does not own those declarations.
+		if _, closure := node.(*ir.ClosureExpr); closure {
+			supported = false
+			return
+		}
 		loop, ok := node.(*ir.ForStmt)
 		if !ok || loop.Post == nil {
 			return

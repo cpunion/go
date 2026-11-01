@@ -136,11 +136,11 @@ func main(){
 		[]switchFallback{
 			{"parameter", "dynamic await site"}, {"globalResult", "dynamic await site"},
 			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
-			{"closureResult", "dynamic await site"}, {"caseResult", "dynamic await site"},
+			{"caseResult", "dynamic await site"},
 			{"namedResult", "dynamic await site"},
 			{"lateUnknown", "dynamic await site"}, {"missingFactory", "unsupported coroutine dependency main.missing"},
 		},
-		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair", "multipleResult", "chooseMulti"})
+		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair", "multipleResult", "chooseMulti", "closureResult", "chooseClosure", "chooseClosure.func1"})
 }
 
 func TestDynamicReturnImported(t *testing.T) {

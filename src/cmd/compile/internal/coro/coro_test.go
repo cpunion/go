@@ -614,8 +614,10 @@ func main() {
 	if err != nil {
 		t.Fatalf("building lowered coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=20"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain %q\n%s", want, out)
+	for _, name := range []string{"child", "controlled", "fileReader", "machine", "multiResult", "nestedControl", "nestedReturn", "ordinaryFileDiscard", "ordinaryFileReader", "ordinarySocketReader", "parameterCaller", "parameterized", "parent", "resultCaller", "sleeper", "socketProgressor", "socketReader", "spawnedChild", "spawner", "yieldingValue"} {
+		if want := "coro: phase=pre-lower-ssa func=" + name + ".coro,"; !strings.Contains(out, want) {
+			t.Fatalf("required native factory missing: %s\n%s", name, out)
+		}
 	}
 
 	cmd = testenv.Command(t, exe)
