@@ -7714,3 +7714,27 @@ func TestCgoPointerResultPublication(t *testing.T) {
 		t.Fatal("complex pointer destination was admitted without an evaluation-order proof")
 	}
 }
+
+func TestCaptureFreeLiteralFactory(t *testing.T) {
+	prepareLowerTest(t)
+	pkg := types.NewPkg("example.com/coro/literal", "literal")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("literal"), types.NewSignature(nil, nil, nil))
+	fn.OClosure = &ir.ClosureExpr{Func: fn}
+	if !resumeFactorySupported(fn) {
+		t.Fatal("capture-free literal lost its context-free factory ABI")
+	}
+	fn.SetWrapper(true)
+	if resumeFactorySupported(fn) {
+		t.Fatal("frontend operand wrapper admitted as a source literal")
+	}
+	fn.SetWrapper(false)
+	fn.SetNeedctxt(true)
+	if resumeFactorySupported(fn) {
+		t.Fatal("hidden closure context admitted without a callable ABI")
+	}
+	fn.SetNeedctxt(false)
+	fn.ClosureVars = []*ir.Name{ir.NewDeclNameAt(src.NoXPos, ir.ONAME, pkg.Lookup("captured"))}
+	if resumeFactorySupported(fn) {
+		t.Fatal("captured variable admitted without an environment transfer")
+	}
+}

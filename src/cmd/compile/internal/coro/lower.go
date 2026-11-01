@@ -270,10 +270,35 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 	}
 	for _, function := range functions {
+		normalizeReceiveExpressions(function)
 		normalizeSingleResultCalls(function)
+	}
+	// Source defer literals use the existing in-place cleanup rewrite. Do not
+	// also replace their bodies with standalone entries: the cleanup rewrite
+	// must retain its own terminal-control and capture ownership.
+	deferredLiterals := make(map[*ir.Func]bool)
+	for _, function := range functions {
+		for _, edge := range function.Edges {
+			if edge.Kind != DeferCall {
+				continue
+			}
+			if edge.Callee != nil && edge.Callee.OClosure != nil {
+				deferredLiterals[edge.Callee] = true
+			}
+			for _, target := range edge.Targets {
+				if target.OClosure != nil {
+					deferredLiterals[target] = true
+				}
+			}
+		}
 	}
 	for _, function := range functions {
 		if function.Primary != CoroPrimary {
+			continue
+		}
+		if deferredLiterals[function.Func] {
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: literal uses defer cleanup entry", ir.PkgFuncName(function.Func)))
 			continue
 		}
 		candidate, err := newLowerCandidate(plan, function)
@@ -505,8 +530,11 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 
 func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) {
 	fn := function.Func
-	if fn == nil || fn.OClosure != nil {
-		return nil, fmt.Errorf("not a top-level function")
+	if fn == nil {
+		return nil, fmt.Errorf("missing function")
+	}
+	if fn.OClosure != nil && fn.Wrapper() {
+		return nil, fmt.Errorf("frontend operand wrapper")
 	}
 	// Method value wrappers have hidden receiver parameters even though
 	// they are not closure literals. The factory ABI carries only explicit
@@ -1700,7 +1728,10 @@ func stacklessResumeType() *types.Type {
 }
 
 func resumeFactorySupported(fn *ir.Func) bool {
-	if fn == nil || fn.OClosure != nil || fn.Type() == nil ||
+	// A function literal without captures uses the same calling convention
+	// as a named function. Hidden receiver and captured environments still
+	// require a separate callable ABI and keep their ordinary entry.
+	if fn == nil || fn.Type() == nil || fn.OClosure != nil && fn.Wrapper() ||
 		fn.Needctxt() || len(fn.ClosureVars) != 0 {
 		return false
 	}
@@ -2699,6 +2730,15 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	// Save validated wrapper operands before reparenting closures into resume.
+	// Dynamic callee snapshots belong to the source caller during validation;
+	// rechecking that relationship after reparenting would lose their arguments.
+	goCalls := make(map[*ir.CallExpr]*ir.CallExpr)
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			goCalls[edge.Node] = unwrapGoCall(edge.Node)
+		}
+	}
 	// Keep NoSuspend adapters unchanged. Both explicit frames and closure
 	// resumes capture invocation locals across their existing yield sites.
 	spawnYield := slices.ContainsFunc(function.Sites, func(site Site) bool {
@@ -3558,7 +3598,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		statement ir.Node, edge Edge, frozenArgs ir.Nodes) (lowerFactoryCall, error) {
 		sourceCall := call
 		if edge.Kind == GoCall {
-			sourceCall = unwrapGoCall(call)
+			sourceCall = goCalls[call]
+			if sourceCall == nil {
+				return lowerFactoryCall{}, fmt.Errorf("%s: missing validated go call", ir.PkgFuncName(fn))
+			}
 		}
 		child := factories[edge.Callee]
 		if child == nil {
@@ -3664,7 +3707,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		sourceCall := call
 		if edge.Kind == GoCall {
-			sourceCall = unwrapGoCall(call)
+			sourceCall = goCalls[call]
+			if sourceCall == nil {
+				return lowerFactoryCall{}, fmt.Errorf("%s: missing validated go call", ir.PkgFuncName(fn))
+			}
 		}
 		fun := freeze(edit(sourceCall.Fun))
 		args := make(ir.Nodes, len(sourceCall.Args))
