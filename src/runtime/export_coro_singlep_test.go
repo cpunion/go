@@ -23,6 +23,8 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 	s.head, s.tail = nil, nil
 	s.runnableState.Store(0)
 	s.executorCount.Store(1)
+	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
+	s.root.context.scheduler = s
 	s.lifetime.Store(stacklessCoroLifetimeSpawned)
 	s.prepareReplacementExecutors()
 	done := s.rootDone
