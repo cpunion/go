@@ -5607,6 +5607,10 @@ func rewriteCgoErrnoResult(stmt ir.Node, call *ir.CallExpr,
 	targetType := target.Type()
 	if outer, ok := stmt.(*ir.AssignListStmt); ok && outer != assignment {
 		target = outer.Lhs[index]
+		// The target may live in the heap frame. Even assigning nil can
+		// need a write barrier, which requires a P after blocking exit.
+		// Only the postlude may publish the interface result.
+		outer.Lhs[index] = ir.BlankNode
 		outer.Rhs[index] = ir.NewZero(call.Pos(), targetType)
 	}
 

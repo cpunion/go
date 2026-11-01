@@ -54,6 +54,26 @@ stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
 stderr 'coro: phase=lower lowered=5 skipped=0'
 exec ./program
 stderr '^42$'
+
+# Errno interface results must be published after blocking exit, including
+# nil assignments that can require a heap write barrier during concurrent GC.
+env GOGC=1
+env GOMAXPROCS=1
+exec ./program
+stderr '^42$'
+env GOMAXPROCS=4
+exec ./program
+stderr '^42$'
+env GODEBUG=asyncpreemptoff=1
+exec ./program
+stderr '^42$'
+env GOMAXPROCS=1
+exec ./program
+stderr '^42$'
+env GOGC=100
+env GODEBUG=
+env GOMAXPROCS=4
+
 go tool objdump -s 'main\._Cdirect_add_u64' program
 stdout '_Cdirect_add_u64'
 stdout 'add_u64'
