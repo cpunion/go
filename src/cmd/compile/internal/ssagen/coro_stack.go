@@ -24,9 +24,17 @@ func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 	info := base.Ctxt.Lookup(fn.LSym.Name + ".coro.stackinfo")
 	off := 0
 	for _, gate := range coro.NativeStackGates(fn) {
+		// Each pair binds one native activation to its owning source gate.
 		off = objw.SymPtrOff(info, off, gate.Linksym())
+		off = objw.SymPtrOff(info, off, fn.LSym)
+		for _, callee := range coro.NativeStackCallees(fn) {
+			off = objw.SymPtrOff(info, off, gate.Linksym())
+			off = objw.SymPtrOff(info, off, callee.Linksym())
+		}
 	}
-	objw.Global(info, int32(off), obj.RODATA|obj.DUPOK)
+	fn.LSym.Func().CoroStackInfo = info
+	info.Align = 4
+	info.Set(obj.AttrContentAddressable, true)
 	p := pp.Prog(obj.AFUNCDATA)
 	p.From.SetConst(abi.FUNCDATA_CoroStackGates)
 	p.To.Type = obj.TYPE_MEM

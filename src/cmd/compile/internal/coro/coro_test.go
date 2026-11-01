@@ -637,8 +637,11 @@ func main() {
 	if !strings.Contains(disassembly, ".coro.func") {
 		t.Fatalf("objdump did not find generated resume functions\n%s", disassembly)
 	}
-	if strings.Contains(disassembly, "runtime.morestack") {
-		t.Fatalf("generated resume function contains runtime.morestack\n%s", disassembly)
+	// Resumes retain ordinary prologues so a rejected large machine frame is
+	// still valid Go code. The linker gate, rather than NOSPLIT, proves that an
+	// admitted activation and its ordinary helper chain fit the native stack.
+	if !strings.Contains(disassembly, "runtime.morestack") {
+		t.Fatalf("generated resumes lack ordinary stack prologues\n%s", disassembly)
 	}
 	if !strings.Contains(disassembly, "runtime.coroTerminalAction") {
 		t.Fatalf("generated resume function does not check for a recovered panic\n%s",

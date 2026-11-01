@@ -72,22 +72,45 @@ func (ctxt *Link) doCoroStackCheck() {
 			continue
 		}
 		metadata := ldr.Relocs(fd[abi.FUNCDATA_CoroStackGates])
-		for i := 0; i < metadata.Count(); i++ {
-			r := metadata.At(i)
-			if r.Type() != objabi.R_ADDROFF || r.Siz() != 4 {
-				ctxt.Errorf(s, "malformed native stack gate metadata")
+		if metadata.Count() == 0 || metadata.Count()%2 != 0 {
+			ctxt.Errorf(s, "malformed native stack activation metadata")
+			continue
+		}
+		for i := 0; i < metadata.Count(); i += 2 {
+			r, code := metadata.At(i), metadata.At(i+1)
+			if r.Type() != objabi.R_ADDROFF || r.Siz() != 4 || code.Type() != objabi.R_ADDROFF || code.Siz() != 4 {
+				ctxt.Errorf(s, "malformed native stack activation metadata")
 				continue
 			}
-			gate := r.Sym()
-			roots[s] = append(roots[s], gate)
+			gate, entry := r.Sym(), code.Sym()
+			roots[entry] = append(roots[entry], gate)
 			gates[gate] = true
 		}
+	}
+	for entry := range roots {
 		proof.failure = 0
-		unsafe[s] = proof.height(s) > coroStackLimit || ctxt.DynlinkingGo()
-		if unsafe[s] && *flagDebugCoroStack {
-			fmt.Printf("coro-stack: ordinary fallback: %s exceeds %d bytes or module proof unavailable (at %s)\n", ldr.SymName(s), coroStackLimit, ldr.SymName(proof.failure))
+		unsafe[entry] = proof.height(entry) > coroStackLimit || ctxt.DynlinkingGo()
+		if unsafe[entry] && *flagDebugCoroStack {
+			fmt.Printf("coro-stack: ordinary fallback: %s exceeds %d bytes or module proof unavailable (at %s)\n", ldr.SymName(entry), coroStackLimit, ldr.SymName(proof.failure))
 		}
 	}
+	// A gate owns a factory, not every cleanup function shared with other gates.
+	// Only its factory inherits the gate's rejection; otherwise one unsafe caller
+	// would incorrectly reject an independent caller of the same safe cleanup.
+	factories := make(map[loader.Sym]loader.Sym)
+	for gate := range gates {
+		relocs := ldr.Relocs(gate)
+		for i := 0; i < relocs.Count(); i++ {
+			r := relocs.At(i)
+			if r.Type() == objabi.R_ADDR && r.Off() == int32(ctxt.Arch.PtrSize) {
+				factories[gate] = r.Sym()
+			}
+		}
+		if factories[gate] == 0 {
+			ctxt.Errorf(gate, "native stack gate has no factory")
+		}
+	}
+
 	// Factories and resumes execute in separate scheduler activations. Their
 	// stack heights do not add, but an unsafe child makes every native parent
 	// unsafe, including imported factories and address-taken cleanup entries.
@@ -135,9 +158,6 @@ func (ctxt *Link) doCoroStackCheck() {
 		changed = false
 		for root, group := range roots {
 			bad := unsafe[root]
-			for _, gate := range group {
-				bad = bad || unsafe[gate]
-			}
 			for _, child := range dependencies[root] {
 				bad = bad || unsafe[child]
 			}
@@ -154,7 +174,14 @@ func (ctxt *Link) doCoroStackCheck() {
 				}
 			}
 		}
+		for gate, factory := range factories {
+			if unsafe[gate] && !unsafe[factory] {
+				unsafe[factory] = true
+				changed = true
+			}
+		}
 	}
+
 	rejected := 0
 	for gate := range gates {
 		if !unsafe[gate] {

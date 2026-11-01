@@ -5,6 +5,7 @@
 package coro
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/objw"
 	"cmd/compile/internal/types"
@@ -19,10 +20,12 @@ import (
 // by the compiler. The code address is not a Go heap pointer.
 var nativeSourceGates = make(map[*ir.Func]*ir.Name)
 var nativeStackGates = make(map[*ir.Func][]*ir.Name)
+var nativeStackCallees = make(map[*ir.Func][]*ir.Func)
 
 // NativeStackEntry and NativeStackGates are read only by parallel backends.
-func NativeStackEntry(fn *ir.Func) bool       { return len(nativeStackGates[fn]) != 0 }
-func NativeStackGates(fn *ir.Func) []*ir.Name { return nativeStackGates[fn] }
+func NativeStackEntry(fn *ir.Func) bool         { return len(nativeStackGates[fn]) != 0 }
+func NativeStackGates(fn *ir.Func) []*ir.Name   { return nativeStackGates[fn] }
+func NativeStackCallees(fn *ir.Func) []*ir.Func { return nativeStackCallees[fn] }
 
 func newNativeStackGate(source, factory *ir.Func) {
 	typ := types.NewArray(types.Types[types.TUINTPTR], 2)
@@ -32,13 +35,15 @@ func newNativeStackGate(source, factory *ir.Func) {
 	gate.Class = ir.PEXTERN
 	sym.Def = gate
 	lsym := gate.Linksym()
-	objw.Uintptr(lsym, 0, 0)
-	objw.SymPtr(lsym, types.PtrSize, factory.Linksym(), 0)
-	flags := int16(obj.RODATA)
-	if source.Dupok() {
-		flags |= obj.DUPOK
-	}
-	objw.Global(lsym, int32(typ.Size()), flags)
+	base.Ctxt.LookupInit(lsym.Name, func(lsym *obj.LSym) {
+		objw.Uintptr(lsym, 0, 0)
+		objw.SymPtr(lsym, types.PtrSize, factory.Linksym(), 0)
+		flags := int16(obj.RODATA)
+		if source.Dupok() {
+			flags |= obj.DUPOK
+		}
+		objw.Global(lsym, int32(typ.Size()), flags)
+	})
 	nativeSourceGates[source] = gate
 	nativeStackGates[factory] = []*ir.Name{gate}
 }
@@ -51,23 +56,28 @@ func recordNativeStackEntry(fn *ir.Func, gates []*ir.Name) {
 	}
 }
 
-// Only the actual resume and registered cleanup entries execute natively.
-// Ordinary frontend go wrappers remain ordinary, even if their source parent
-// was moved into a factory. Root-array implementations share the public gate.
+// Each factory records the exact cleanup code it registers, including imported
+// named entries. Import declarations have no local backend invocation, so a
+// marker on the callee alone would silently omit their machine proof.
 func recordNativeStackMetadata(candidates map[*ir.Func]*lowerCandidate) {
-	for source, candidate := range candidates {
-		gates := []*ir.Name{nativeSourceGates[source]}
+	for _, candidate := range candidates {
 		for _, deferred := range candidate.defers {
+			var target *ir.Func
 			if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
-				recordNativeStackEntry(closure.Func, gates)
-			} else if target := ir.StaticCalleeName(deferred.call.Fun); target != nil && target.Func != nil {
-				recordNativeStackEntry(target.Func, gates)
+				target = closure.Func
+			} else if name := ir.StaticCalleeName(deferred.call.Fun); name != nil {
+				target = name.Func
+			}
+			if target != nil && !slices.Contains(nativeStackCallees[candidate.factory], target) {
+				nativeStackCallees[candidate.factory] = append(nativeStackCallees[candidate.factory], target)
 			}
 		}
 	}
-	// Shared cleanup entries may belong to several source factories. Stable
-	// metadata order is required for reproducible compiler and package builds.
+	// Stable ordering also covers cleanup entries shared by source factories.
 	for _, gates := range nativeStackGates {
 		slices.SortFunc(gates, func(a, b *ir.Name) int { return strings.Compare(a.Linksym().Name, b.Linksym().Name) })
+	}
+	for _, callees := range nativeStackCallees {
+		slices.SortFunc(callees, func(a, b *ir.Func) int { return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b)) })
 	}
 }

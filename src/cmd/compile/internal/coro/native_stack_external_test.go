@@ -150,3 +150,105 @@ func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println(
 		})
 	}
 }
+
+// An imported cleanup is not compiled by its caller's backend. Its actual
+// linked code must still be checked, and sharing a safe cleanup must not tie
+// the two callers' eligibility together.
+func TestLinkedNativeStackImportedCleanup(t *testing.T) {
+	if !buildcfg.Experiment.Coro {
+		t.Skip("requires coroutine experiment")
+	}
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native executor unavailable")
+	}
+	testenv.MustHaveGoBuild(t)
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "helper"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var helper strings.Builder
+	helper.WriteString("package helper\nvar Calls,Value int\n//go:noinline\nfunc Shared(){Calls++}\n//go:noinline\nfunc Deep(){Value=f0(1)}\n")
+	for i := 0; i < 64; i++ {
+		fmt.Fprintf(&helper, "//go:noinline\nfunc f%d(v int)int{return f%d(v)+1}\n", i, i+1)
+	}
+	helper.WriteString("//go:noinline\nfunc f64(v int)int{return v}\n")
+	for name, text := range map[string]string{
+		"go.mod":           "module example.com/cleanup\ngo 1.27\n",
+		"helper/helper.go": helper.String(),
+		"main.go": `package main
+import "example.com/cleanup/helper"
+func entry(c chan int)int {defer helper.Shared();defer helper.Deep();return <-c+1}
+func safe(c chan int)int {defer helper.Shared();return <-c+1}
+func main(){c:=make(chan int,1);c<-1;if entry(c)!=2{panic("entry")};c<-8;if safe(c)!=9{panic("safe")};if helper.Value!=65||helper.Calls!=2{panic("cleanup")};println("imported-cleanup-ok")}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	binary := filepath.Join(dir, "probe.exe")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-l -d=coro=4", "-ldflags=-debugcorostack", "-o", binary, ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOEXPERIMENT=coro", "CGO_ENABLED=0")
+	log, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build: %v\n%s", err, log)
+	}
+	if !linkedCoroStackUnsafe(t, binary, "main.entry.coro.stackgate") || linkedCoroStackUnsafe(t, binary, "main.safe.coro.stackgate") {
+		t.Fatalf("incorrect imported cleanup gates:\n%s", log)
+	}
+	for _, p := range []string{"1", "4"} {
+		run := exec.Command(binary)
+		run.Env = append(os.Environ(), "GOMAXPROCS="+p, "GOGC=1")
+		out, err := run.CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != "imported-cleanup-ok" {
+			t.Fatalf("P%s: %v\n%s", p, err, out)
+		}
+	}
+}
+
+func TestLinkedNativeStackParallelMetadata(t *testing.T) {
+	if !buildcfg.Experiment.Coro {
+		t.Skip("requires coroutine experiment")
+	}
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native executor unavailable")
+	}
+	testenv.MustHaveGoBuild(t)
+	var source strings.Builder
+	source.WriteString("package main\n")
+	for i := 0; i < 128; i++ {
+		fmt.Fprintf(&source, "//go:noinline\nfunc f%d(c chan int)int{return <-c+1}\n", i)
+	}
+	source.WriteString("func main(){c:=make(chan int,1);v:=0;")
+	for i := 0; i < 128; i++ {
+		fmt.Fprintf(&source, "c<-1;v+=f%d(c);", i)
+	}
+	source.WriteString("if v!=256{panic(\"result\")};println(\"parallel-metadata-ok\")}")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte(source.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, workers := range []string{"2", "4", "8"} {
+		binary := filepath.Join(dir, "parallel-"+workers+".exe")
+		cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-l -c="+workers+" -d=coro=4", "-o", binary, path)
+		cmd.Env = append(os.Environ(), "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOEXPERIMENT=coro", "CGO_ENABLED=0", "GOMAXPROCS=4")
+		log, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("workers %s: %v\n%s", workers, err, log)
+		}
+		for _, name := range []string{"main.f0", "main.f63", "main.f127"} {
+			if linkedCoroStackUnsafe(t, binary, name+".coro.stackgate") {
+				t.Fatalf("workers %s: safe %s fell back", workers, name)
+			}
+		}
+		for _, p := range []string{"1", "4"} {
+			run := exec.Command(binary)
+			run.Env = append(os.Environ(), "GOMAXPROCS="+p, "GOGC=1")
+			out, err := run.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != "parallel-metadata-ok" {
+				t.Fatalf("workers %s P%s: %v\n%s", workers, p, err, out)
+			}
+		}
+	}
+}
