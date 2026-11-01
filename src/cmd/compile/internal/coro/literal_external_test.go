@@ -22,11 +22,12 @@ func TestCaptureFreeLiteralEntries(t *testing.T) {
 	}
 	const source = `package main
 import "runtime"
-func direct(c chan int) int { result:=func(in chan int) int {return <-in}(c);return result }
-func local(c chan int) int { f:=func(in chan int) int {return <-in+1};g:=f;return g(c) }
-func nested(c chan int) int {result:=func(in chan int) int {f:=func(next chan int) int{return <-next+2};return f(in)}(c);return result}
+func direct(c chan int) int { result:=func(in chan int) int {value:=<-in;return value}(c);return result }
+func local(c chan int) int { f:=func(in chan int) int {value:=<-in;return value+1};g:=f;return g(c) }
+func nested(c chan int) int {result:=func(in chan int) int {f:=func(next chan int) int{value:=<-next;return value+2};return f(in)}(c);return result}
 func spawn(in,out chan int) {for range 64 {go func(src,dst chan int){value:=<-src;dst<-value}(in,out)}}
-func exitLiteral(done chan struct{}) {func(out chan struct{}) {defer close(out);runtime.Goexit()}(done)}
+func closeDone(out chan struct{}) {close(out)}
+func exitLiteral(done chan struct{}) {func(out chan struct{}) {defer closeDone(out);runtime.Goexit()}(done)}
 func capturing(c chan int) int {f:=func()int{return <-c};return f()}
 func main() {
  c:=make(chan int,4);c<-10;c<-20;c<-30;c<-40
