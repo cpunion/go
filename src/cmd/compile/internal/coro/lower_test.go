@@ -7718,7 +7718,7 @@ func TestCgoPointerResultPublication(t *testing.T) {
 func TestCaptureFreeLiteralFactory(t *testing.T) {
 	prepareLowerTest(t)
 	pkg := types.NewPkg("example.com/coro/literal", "literal")
-	fn := newLowerTestFunc(pkg, "literal")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("literal"), types.NewSignature(nil, nil, nil))
 	fn.OClosure = &ir.ClosureExpr{Func: fn}
 	if !resumeFactorySupported(fn) {
 		t.Fatal("capture-free literal lost its context-free factory ABI")
