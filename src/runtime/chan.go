@@ -532,12 +532,8 @@ func closechan(c *hchan) {
 		gp.schedlink = 0
 		goready(gp, 3)
 	}
-	for corohead != nil {
-		sg := corohead
-		corohead = sg.next
-		sg.next = nil
-		op := sg.coro.get()
-		finishStacklessCoroChannel(op, sg, false)
+	if corohead != nil {
+		finishStacklessCoroClose(corohead)
 	}
 }
 
