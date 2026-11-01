@@ -5620,6 +5620,9 @@ func TestCgoErrnoResultRewrite(t *testing.T) {
 		t.Fatalf("raw errno target = %v, want %v temporary",
 			inner.Lhs[1], errnoType)
 	}
+	if !ir.IsBlank(outer.Lhs[1]) {
+		t.Fatalf("outer errno target = %v, want discard until blocking exit", outer.Lhs[1])
+	}
 	if outer.Rhs[1].Op() != ir.ONIL || outer.Rhs[1].Type() != types.ErrorType {
 		t.Fatalf("outer errno projection = %v, want nil error", outer.Rhs[1])
 	}
