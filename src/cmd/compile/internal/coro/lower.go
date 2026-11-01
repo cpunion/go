@@ -4167,6 +4167,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
 						stack, appendCall))
 				} else {
+					for _, deferredCapture := range deferred.captures {
+						body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
+							deferredCapture.snapshot, deferredCapture.source))
+					}
 					if deferred.calleeSnapshot != nil {
 						body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
 							capture(deferred.calleeSnapshot), edit(deferred.call.Fun)))
