@@ -1065,6 +1065,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					function: edge.Direct,
 					errno:    edge.Recipe.Errno,
 				}
+				if cgoPointerResults(direct) {
+					if _, err := cgoPointerResultAssignment(call,
+						awaitStatements[call], direct); err != nil {
+						return nil, err
+					}
+				}
 				if direct.errno {
 					if err := validateCgoErrnoCall(call,
 						awaitStatements[call], direct); err != nil {
@@ -2592,12 +2598,11 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 				foreignCall.Args[i] = temp
 			}
 
-			post, err := rewriteCgoErrnoResult(stmt, foreignCall,
+			edited, post, err := rewriteCgoCallResult(stmt, foreignCall,
 				candidate.directCalls[foreignCall], resume, edit)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 			}
-			edited := edit(stmt)
 			switch foreign {
 			case DirectNoBlock:
 				body = append(body,
@@ -4098,12 +4103,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				body = append(body, before...)
 			}
-			post, err := rewriteCgoErrnoResult(stmt, foreignCall,
+			edited, post, err := rewriteCgoCallResult(stmt, foreignCall,
 				candidate.directCalls[foreignCall], resume, edit)
 			if err != nil {
 				return fmt.Errorf("%s: %v", ir.PkgFuncName(fn), err)
 			}
-			edited := edit(stmt)
 			switch foreign {
 			case NotForeign:
 				body = append(body, edited)
@@ -5587,6 +5591,123 @@ func cgoErrnoAssignment(call *ir.CallExpr, stmt ir.Node,
 		return nil, fmt.Errorf("direct cgo errno entry has a non-integer result")
 	}
 	return assignment, nil
+}
+
+// cgoPointerResults reports results whose publication to a captured frame may
+// need a write barrier. Blocking foreign calls have released their P, including
+// while the direct call returns, so all such stores must follow blocking exit.
+func cgoPointerResults(direct lowerDirectCall) bool {
+	if direct.function != nil {
+		for _, result := range direct.function.Type().Results() {
+			if result.Type.HasPointers() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cgoPointerResultAssignment finds the source result assignment without moving
+// any operand evaluation. Complex destinations stay ordinary: moving them past
+// the foreign call could change evaluation or panic order.
+func cgoPointerResultAssignment(call *ir.CallExpr, stmt ir.Node,
+	direct lowerDirectCall) (ir.Node, error) {
+	if call == nil || !cgoPointerResults(direct) {
+		return nil, fmt.Errorf("missing direct cgo pointer result")
+	}
+	count := direct.function.Type().NumResults()
+	if assignment, ok := stmt.(*ir.AssignStmt); ok &&
+		count == 1 && assignment.Y == call {
+		if assignment.X.Op() != ir.ONAME {
+			return nil, fmt.Errorf("direct cgo pointer result has a complex destination")
+		}
+		return assignment, nil
+	}
+	assignment, ok := stmt.(*ir.AssignListStmt)
+	if !ok || assignment.Op() != ir.OAS2FUNC || len(assignment.Rhs) != 1 ||
+		assignment.Rhs[0] != call {
+		assignment, ok = normalizedResultAssignment(call, stmt, count)
+	}
+	if !ok || len(assignment.Lhs) != count {
+		return nil, fmt.Errorf("direct cgo pointer result has no matching assignment")
+	}
+	for _, target := range assignment.Lhs {
+		if target.Op() != ir.ONAME {
+			return nil, fmt.Errorf("direct cgo pointer result has a complex destination")
+		}
+	}
+	if outer, ok := stmt.(*ir.AssignListStmt); ok && outer != assignment {
+		for _, target := range outer.Lhs {
+			if target.Op() != ir.ONAME {
+				return nil, fmt.Errorf("direct cgo pointer result has a complex destination")
+			}
+		}
+	}
+	return assignment, nil
+}
+
+// rewriteCgoCallResult separates a pointer-bearing direct result from its Go
+// publication. Only typed, resume-local temporaries are written inside the
+// blocking window. The original assignments and errno boxing execute after
+// exit, with the original argument snapshots and result order.
+func rewriteCgoCallResult(stmt ir.Node, call *ir.CallExpr,
+	direct lowerDirectCall, owner *ir.Func,
+	edit func(ir.Node) ir.Node) (ir.Node, ir.Nodes, error) {
+	var assignment ir.Node
+	if cgoPointerResults(direct) {
+		var err error
+		assignment, err = cgoPointerResultAssignment(call, stmt, direct)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if assignment == nil {
+		post, err := rewriteCgoErrnoResult(stmt, call, direct, owner, edit)
+		if err != nil {
+			return nil, nil, err
+		}
+		return edit(stmt), post, nil
+	}
+
+	pos := call.Pos()
+	temps := make(ir.Nodes, direct.function.Type().NumResults())
+	for i, result := range direct.function.Type().Results() {
+		temps[i] = typecheck.TempAt(pos, owner, result.Type)
+	}
+	raw := ir.NewCallExpr(pos, ir.OCALLFUNC, direct.function.Nname,
+		slices.Clone(call.Args))
+	setCgoDirectCallType(raw, direct.function.Type())
+	raw.SetTypecheck(1)
+	var foreign ir.Node
+	if len(temps) == 1 {
+		foreign = ir.NewAssignStmt(pos, temps[0], raw)
+	} else {
+		foreign = ir.NewAssignListStmt(pos, ir.OAS2FUNC, temps, ir.Nodes{raw})
+	}
+	foreign.SetTypecheck(1)
+	published := slices.Clone(temps)
+	var post ir.Nodes
+	if direct.errno {
+		// Finish the wrapper's conversion before publishing any source
+		// destination, preserving tuple evaluation and assignment order.
+		errno := temps[len(temps)-1]
+		errValue := typecheck.TempAt(pos, owner, types.ErrorType)
+		condition := ir.NewBinaryExpr(pos, ir.ONE, errno,
+			ir.NewZero(pos, errno.Type()))
+		nonzero := ir.NewAssignStmt(pos, errValue,
+			typecheck.AssignConv(errno, types.ErrorType, "cgo errno result"))
+		zero := ir.NewAssignStmt(pos, errValue, ir.NewZero(pos, types.ErrorType))
+		post = append(post, ir.NewIfStmt(pos, condition, ir.Nodes{nonzero}, ir.Nodes{zero}))
+		published[len(published)-1] = errValue
+	}
+	switch assignment := assignment.(type) {
+	case *ir.AssignStmt:
+		assignment.Y = published[0]
+	case *ir.AssignListStmt:
+		assignment.SetOp(ir.OAS2)
+		assignment.Rhs = published
+	}
+	return foreign, append(post, edit(stmt)), nil
 }
 
 // rewriteCgoErrnoResult keeps the raw errno value inside the foreign-call
