@@ -55,7 +55,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 			}
 		}
 		sig := fn.Type()
-		if !resumeFactorySupported(fn) || sig.NumRecvs() != 0 {
+		if !callableFactorySupported(fn) || sig.NumRecvs() != 0 {
 			continue
 		}
 		for i, field := range sig.Results() {
@@ -125,7 +125,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 			}
 		}
 		if callee == nil || callee.Func == nil ||
-			!resumeFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
+			!callableFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
 			invalid[destination] = true
 			return
 		}

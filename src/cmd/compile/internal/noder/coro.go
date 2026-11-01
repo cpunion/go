@@ -56,6 +56,9 @@ func ReadCoroBodyAs(fn *ir.Func, sym *types.Sym) *ir.Func {
 	body.SetDupok(fn.Dupok())
 	body.Pragma = fn.Pragma
 	body.Nname.Defn = body
+	for _, variable := range fn.ClosureVars {
+		ir.NewClosureVar(variable.Pos(), body, variable.Outer)
+	}
 	pri.funcBody(body)
 	readBodies(typecheck.Target, false, nil)
 	return body

@@ -86,42 +86,43 @@ type LowerResult struct {
 }
 
 type lowerCandidate struct {
-	function         *Function
-	ordinary         *ir.Func
-	transitions      map[*ir.CallExpr]SiteKind
-	foreignCalls     map[*ir.CallExpr]ForeignCallClass
-	directCalls      map[*ir.CallExpr]lowerDirectCall
-	dependencies     map[*ir.Func]bool
-	deferDeps        map[*ir.Func]bool
-	defers           []*lowerDefer
-	dynamicDefers    bool
-	channels         map[ir.Node]*lowerChannel
-	selects          map[*ir.SelectStmt]*lowerSelect
-	switches         map[*ir.SwitchStmt]bool
-	branches         map[*ir.BranchStmt]ir.Node
-	rangeVars        []*ir.Name
-	panics           map[*ir.UnaryExpr]bool
-	parameters       map[*ir.Name]*ir.Name
-	results          map[*ir.Name]*ir.Name
-	resultValues     []*ir.Name
-	resultPtrs       []*ir.Name
-	factory          *ir.Func
-	factoryABI       FactoryABI
-	fusedAwaits      map[*ir.CallExpr]bool
-	fusedRequests    map[*ir.CallExpr]bool
-	fusedChunkProofs map[*ir.CallExpr]ir.Node
-	fusedFrame       bool
-	fusedResume      bool
-	fusedSelf        bool
-	frameType        *types.Type
-	resumePC         *ir.Name
-	frameChunkLength int64
-	entryZeroed      map[*ir.Name]bool
-	selfAwait        bool
-	selfSpawn        bool
-	heapLocals       map[*ir.Name]bool
-	rootArray        *rootArrayLowering
-	affineRoot       *affineReturnPlan
+	function          *Function
+	ordinary          *ir.Func
+	transitions       map[*ir.CallExpr]SiteKind
+	foreignCalls      map[*ir.CallExpr]ForeignCallClass
+	directCalls       map[*ir.CallExpr]lowerDirectCall
+	dependencies      map[*ir.Func]bool
+	deferDeps         map[*ir.Func]bool
+	defers            []*lowerDefer
+	dynamicDefers     bool
+	channels          map[ir.Node]*lowerChannel
+	selects           map[*ir.SelectStmt]*lowerSelect
+	switches          map[*ir.SwitchStmt]bool
+	branches          map[*ir.BranchStmt]ir.Node
+	rangeVars         []*ir.Name
+	panics            map[*ir.UnaryExpr]bool
+	parameters        map[*ir.Name]*ir.Name
+	captureParameters map[*ir.Name]*ir.Name
+	results           map[*ir.Name]*ir.Name
+	resultValues      []*ir.Name
+	resultPtrs        []*ir.Name
+	factory           *ir.Func
+	factoryABI        FactoryABI
+	fusedAwaits       map[*ir.CallExpr]bool
+	fusedRequests     map[*ir.CallExpr]bool
+	fusedChunkProofs  map[*ir.CallExpr]ir.Node
+	fusedFrame        bool
+	fusedResume       bool
+	fusedSelf         bool
+	frameType         *types.Type
+	resumePC          *ir.Name
+	frameChunkLength  int64
+	entryZeroed       map[*ir.Name]bool
+	selfAwait         bool
+	selfSpawn         bool
+	heapLocals        map[*ir.Name]bool
+	rootArray         *rootArrayLowering
+	affineRoot        *affineReturnPlan
 }
 
 type lowerDirectCall struct {
@@ -444,12 +445,18 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			candidate.factoryABI)
 		factories[function.Func] = candidate.factory
 		candidate.parameters = make(map[*ir.Name]*ir.Name)
+		candidate.captureParameters = make(map[*ir.Name]*ir.Name)
 		candidate.results = make(map[*ir.Name]*ir.Name)
 		inputs := candidate.function.Func.Type().RecvParams()
 		paramOffset := 0
 		if candidate.factoryABI == FactoryABI3 {
 			paramOffset = 1
 		}
+		for i, variable := range candidate.function.Func.ClosureVars {
+			parameter := candidate.factory.Type().Param(paramOffset + i).Nname.(*ir.Name)
+			candidate.captureParameters[variable.Canonical()] = parameter
+		}
+		paramOffset += len(captureTypes(candidate.function.Func))
 		for i, field := range inputs {
 			source, _ := field.Nname.(*ir.Name)
 			target, _ := candidate.factory.Type().Param(paramOffset + i).Nname.(*ir.Name)
@@ -477,7 +484,19 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			prepareRootArray(candidate)
 		}
 	}
-	for _, function := range functions {
+	lowerOrder := slices.Clone(functions)
+	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
+		depth := func(fn *ir.Func) int {
+			n := 0
+			for fn.ClosureParent != nil {
+				n++
+				fn = fn.ClosureParent
+			}
+			return n
+		}
+		return depth(b.Func) - depth(a.Func)
+	})
+	for _, function := range lowerOrder {
 		candidate := candidates[function.Func]
 		if candidate == nil {
 			continue
@@ -540,7 +559,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// Method value wrappers have hidden receiver parameters even though
 	// they are not closure literals. The factory ABI carries only explicit
 	// receiver and function parameters, not a closure context.
-	if fn.Needctxt() || len(fn.ClosureVars) != 0 {
+	if (fn.Needctxt() || len(fn.ClosureVars) != 0) && !capturedFactorySupported(fn) {
 		return nil, fmt.Errorf("function requires closure context")
 	}
 	sig := fn.Type()
@@ -1753,11 +1772,16 @@ func resumeFactoryType(fn *ir.Func, abi FactoryABI) *types.Type {
 	if abi == FactoryABI3 {
 		paramOffset = 1
 	}
-	params := make([]*types.Field, paramOffset+len(inputs))
+	captures := captureTypes(fn)
+	params := make([]*types.Field, paramOffset+len(captures)+len(inputs))
 	if abi == FactoryABI3 {
 		params[0] = types.NewField(pos,
 			fn.Sym().Pkg.Lookup(".coroctx"), types.Types[types.TUNSAFEPTR])
 	}
+	for i, typ := range captures {
+		params[paramOffset+i] = types.NewField(pos, fn.Sym().Pkg.LookupNum(".corocapture", i), types.NewPtr(typ))
+	}
+	paramOffset += len(captures)
 	for i, field := range inputs {
 		// Type checking has normalized a variadic argument to its slice.
 		// Deliberately leave IsDDD unset on the factory parameter.
@@ -1777,6 +1801,7 @@ func resumeFactorySymbol(fn *ir.Func) *types.Sym {
 
 func newResumeFactory(fn *ir.Func, abi FactoryABI) *ir.Func {
 	pos := fn.Pos()
+	factoryCaptureTypes[fn] = captureTypes(fn)
 	typ := resumeFactoryType(fn, abi)
 	sym := resumeFactorySymbol(fn)
 	factory := ir.NewFunc(pos, pos, sym, typ)
@@ -1808,7 +1833,7 @@ func resumeFactoryABI(factory, fn *ir.Func) FactoryABI {
 	case 1:
 		return FactoryABI1
 	case 2:
-		params := len(fn.Type().RecvParams()) + fn.Type().NumResults()
+		params := len(captureTypes(fn)) + len(fn.Type().RecvParams()) + fn.Type().NumResults()
 		switch factory.Type().NumParams() {
 		case params:
 			return FactoryABI2
@@ -2456,6 +2481,9 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 			}
 		}
 		if name, ok := node.(*ir.Name); ok {
+			if parameter := candidate.captureParameters[name.Canonical()]; parameter != nil {
+				return typedDeref(name.Pos(), capture(parameter), name.Type())
+			}
 			if parameter := candidate.parameters[name.Canonical()]; parameter != nil {
 				return capture(parameter)
 			}
@@ -2703,8 +2731,20 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 			return
 		}
 		closure.Func.ClosureParent = resume
-		for _, variable := range closure.Func.ClosureVars {
-			outer, ok := edit(variable.Outer).(*ir.Name)
+		for _, variable := range slices.Clone(closure.Func.ClosureVars) {
+			value := edit(variable.Outer)
+			if deref, ok := value.(*ir.StarExpr); ok {
+				if cell, ok := deref.X.(*ir.Name); ok {
+					snapshot := typecheck.TempAt(variable.Pos(), resume, cell.Type())
+					assign := ir.NewAssignStmt(variable.Pos(), snapshot, cell)
+					assign.Def = true
+					snapshot.Defn = assign
+					closure.PtrInit().Append(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot), assign)
+					replaceCapturedCell(closure.Func, variable, snapshot)
+					continue
+				}
+			}
+			outer, ok := value.(*ir.Name)
 			if !ok {
 				captureErr = fmt.Errorf(
 					"%s: closure capture is not a variable",
@@ -2779,7 +2819,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	var captureCellInitializers ir.Nodes
 	addCaptureCell := func(variable *ir.Name) {
 		source := variable.Canonical()
-		if captureCells[source] != nil {
+		if captureCells[source] != nil || candidate.captureParameters[source] != nil {
 			return
 		}
 		storage := source
@@ -2812,6 +2852,19 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					parameter))
 		}
 	}
+	// A source declaration may execute repeatedly. Its cell is allocated at
+	// that declaration; each nested closure snapshots the cell pointer when
+	// created, rather than sharing the next iteration's pointer slot.
+	ir.Visit(fn, func(node ir.Node) {
+		if closure, ok := node.(*ir.ClosureExpr); ok {
+			for _, variable := range closure.Func.ClosureVars {
+				source := variable.Canonical()
+				if source.Curfn == fn && source.Sym().Name != typecheck.LocalDictName {
+					addCaptureCell(source)
+				}
+			}
+		}
+	})
 	for _, variable := range candidate.rangeVars {
 		addCaptureCell(variable)
 	}
@@ -2842,6 +2895,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	}
 	captureCell := func(name *ir.Name) *ir.Name {
+		if parameter := candidate.captureParameters[name.Canonical()]; parameter != nil {
+			return parameter
+		}
 		if cell := captureCells[name.Canonical()]; cell != nil {
 			return cell
 		}
@@ -3599,7 +3655,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	var edit func(ir.Node) ir.Node
 	staticFactoryCall := func(call *ir.CallExpr,
-		statement ir.Node, edge Edge, frozenArgs ir.Nodes) (lowerFactoryCall, error) {
+		statement ir.Node, edge Edge, frozenArgs ir.Nodes, frozenFun ir.Node) (lowerFactoryCall, error) {
 		sourceCall := call
 		if edge.Kind == GoCall {
 			sourceCall = goCalls[call]
@@ -3617,9 +3673,27 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return lowerFactoryCall{}, fmt.Errorf("%s: invalid factory for %s",
 				ir.PkgFuncName(fn), edge.CalleeName)
 		}
-		args := make(ir.Nodes, 0, len(sourceCall.Args)+1)
+		var setup ir.Nodes
+		captures := captureTypes(edge.Callee)
+		if len(captures) != 0 && frozenFun == nil {
+			freeze := func(value ir.Node) *ir.Name {
+				temp := typecheck.TempAt(call.Pos(), resume, value.Type())
+				setup = append(setup, ir.NewDecl(call.Pos(), ir.ODCL, temp),
+					ir.NewAssignStmt(call.Pos(), temp, value))
+				return temp
+			}
+			frozenFun = freeze(edit(sourceCall.Fun))
+			frozenArgs = make(ir.Nodes, len(sourceCall.Args))
+			for i, arg := range sourceCall.Args {
+				frozenArgs[i] = freeze(edit(arg))
+			}
+		}
+		args := make(ir.Nodes, 0, len(sourceCall.Args)+len(captures)+1)
 		if childABI == FactoryABI3 {
 			args = append(args, ctx)
+		}
+		if len(captures) != 0 {
+			args = append(args, callableCaptureArguments(call.Pos(), edge.Callee, frozenFun)...)
 		}
 		for i, arg := range sourceCall.Args {
 			if frozenArgs != nil {
@@ -3661,7 +3735,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		factoryCall := typecheck.Call(call.Pos(), child.Nname, args, false)
 		if child.Type().NumResults() == 1 {
-			return lowerFactoryCall{resume: factoryCall}, nil
+			return lowerFactoryCall{setup: setup, resume: factoryCall}, nil
 		}
 		frame := typecheck.TempAt(call.Pos(), resume,
 			types.Types[types.TUNSAFEPTR])
@@ -3669,10 +3743,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			stacklessResumeType())
 		assignment := ir.NewAssignListStmt(call.Pos(), ir.OAS2,
 			ir.Nodes{frame, childResume}, ir.Nodes{factoryCall})
-		setup := ir.Nodes{
+		setup = append(setup,
 			ir.NewDecl(call.Pos(), ir.ODCL, frame),
-			ir.NewDecl(call.Pos(), ir.ODCL, childResume),
-		}
+			ir.NewDecl(call.Pos(), ir.ODCL, childResume))
 		if candidate.fusedRequests[call] {
 			proof := ir.NewBool(call.Pos(), false)
 			request := typecheck.Call(call.Pos(),
@@ -3694,7 +3767,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		statement ir.Node) (lowerFactoryCall, error) {
 		edge := edgeForCall(function, call)
 		if len(edge.Targets) == 0 {
-			return staticFactoryCall(call, statement, edge, nil)
+			return staticFactoryCall(call, statement, edge, nil, nil)
 		}
 
 		// Evaluate the function value and every argument before inspecting the
@@ -3730,7 +3803,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		for i := len(edge.Targets) - 1; i >= 0; i-- {
 			target := edge.Targets[i]
 			selected := Edge{Kind: edge.Kind, Callee: target, CalleeName: ir.PkgFuncName(target)}
-			child, err := staticFactoryCall(call, statement, selected, args)
+			child, err := staticFactoryCall(call, statement, selected, args, fun)
 			if err != nil {
 				return lowerFactoryCall{}, err
 			}
@@ -4759,6 +4832,7 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 		result, _ := field.Nname.(ir.Node)
 		args = append(args, typecheck.NodAddr(result))
 	}
+	args = append(sourceCaptureArguments(fn), args...)
 	newResume := typecheck.Call(pos, factory.Nname, args, false)
 	run := typecheck.Call(pos, typecheck.LookupRuntime("coroRun"),
 		ir.Nodes{newResume}, false)
@@ -5247,6 +5321,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	if candidate.factoryABI == FactoryABI3 {
 		args = append(args, ir.NewNilExpr(pos, unsafePointerType))
 	}
+	args = append(args, sourceCaptureArguments(fn)...)
 	for _, field := range inputs {
 		argument, _ := field.Nname.(ir.Node)
 		args = append(args, argument)
