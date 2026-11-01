@@ -1153,31 +1153,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				// Repeated sites save it directly in the common defer stack.
 				deferred.snapshotCallee = true
 			}
-			if summary.Terminal != 0 {
-				for _, target := range edge.Targets {
-					targetSummary, _ := plan.funcSummary(target)
-					terminal := lowerDeferTerminal{target: target}
-					if targetSummary.Terminal != 0 {
-						var ok bool
-						terminal, ok = planDeferTerminal(plan, target, targetSummary)
-						if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
-							return nil, fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
-								ir.PkgFuncName(target), targetSummary.Terminal)
-						}
-					}
-					deferred.terminalTargets = append(deferred.terminalTargets, terminal)
-					deferred.namedRecover = deferred.namedRecover ||
-						!terminal.factory && targetSummary.Terminal&UsesRecover != 0
-					if terminal.factory {
-						candidate.dependencies[target] = true
-						candidate.deferDeps[target] = true
+			for _, target := range edge.Targets {
+				targetSummary, _ := plan.funcSummary(target)
+				terminal := lowerDeferTerminal{target: target}
+				if targetSummary.Terminal != 0 {
+					var ok bool
+					terminal, ok = planDeferTerminal(plan, target, targetSummary)
+					if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
+						return nil, fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
+							ir.PkgFuncName(target), targetSummary.Terminal)
 					}
 				}
+				deferred.terminalTargets = append(deferred.terminalTargets, terminal)
+				deferred.namedRecover = deferred.namedRecover ||
+					!terminal.factory && targetSummary.Terminal&UsesRecover != 0
+				if terminal.factory {
+					candidate.dependencies[target] = true
+					candidate.deferDeps[target] = true
+				}
 			}
-			// Keep the ordinary wrapper: normalization already froze its
-			// callee and arguments at registration. The existing defer stack
-			// snapshots repeated registrations and catches implicit panics,
-			// including a nil function called only during cleanup.
+			// Dispatch the frozen closed set directly during cleanup. This
+			// also binds plain targets for the machine-stack proof. Nil is
+			// still checked at invocation, after registration froze operands.
 			continue
 		}
 		closure, isClosure := deferred.call.Fun.(*ir.ClosureExpr)
@@ -4226,7 +4223,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				pop := ir.NewAssignStmt(pos, stack,
 					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
 						lastIndex(), nil))
-				call := ir.Node(typecheck.Call(pos, deferredCall, nil, false))
+				call := ir.Node(typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{deferredCall}, false))
 				if slices.ContainsFunc(candidate.defers,
 					func(deferred *lowerDefer) bool {
 						return deferred.namedRecover
@@ -4253,7 +4250,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						fun = capture(deferred.calleeSnapshot)
 					}
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
-						fun, nil, false))
+						typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{fun}, false))
 					if deferred.namedRecover {
 						call = typecheck.Call(deferred.call.Pos(),
 							typecheck.LookupRuntime("coroDeferCall"),

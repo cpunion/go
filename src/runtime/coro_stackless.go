@@ -3340,6 +3340,14 @@ func (scope *stacklessCoroDeferScope) leave() {
 	}
 }
 
+// coroDeferInvoke executes one compiler-registered cleanup activation. The
+// compiler binds every possible target to the owner's linker stack gate.
+// Keep this separate from coroDeferCall: an ordinary cleanup must not gain
+// the task-owned recover scope used by a direct named recover target.
+func coroDeferInvoke(deferred func()) {
+	deferred()
+}
+
 // coroDeferCall invokes a statically proven named defer target with access to
 // its task-owned panic. Ordinary native panics remain visible to gorecover
 // before this logical panic.

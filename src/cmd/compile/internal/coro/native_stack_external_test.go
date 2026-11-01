@@ -167,7 +167,7 @@ func TestLinkedNativeStackImportedCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	var helper strings.Builder
-	helper.WriteString("package helper\nvar Calls,Value int\n//go:noinline\nfunc Shared(){Calls++}\n//go:noinline\nfunc Deep(){Value=f0(1)}\n")
+	helper.WriteString("package helper\nvar Calls,Value int\nvar Seen any\n//go:noinline\nfunc Shared(){Calls++}\n//go:noinline\nfunc Deep(){Value=f0(1);Seen=recover()}\n")
 	for i := 0; i < 64; i++ {
 		fmt.Fprintf(&helper, "//go:noinline\nfunc f%d(v int)int{return f%d(v)+1}\n", i, i+1)
 	}

@@ -344,6 +344,7 @@ func KeepAlive(interface{})
 
 // stackless coroutine deferred terminal control
 func coroDeferToken(unsafe.Pointer) unsafe.Pointer
+func coroDeferInvoke(func())
 func coroDeferCall(unsafe.Pointer, func())
 func coroDeferRun(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroDeferGoexit(unsafe.Pointer)

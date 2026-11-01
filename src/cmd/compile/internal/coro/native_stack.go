@@ -5,7 +5,6 @@
 package coro
 
 import (
-	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/objw"
 	"cmd/compile/internal/types"
@@ -35,7 +34,7 @@ func newNativeStackGate(source, factory *ir.Func) {
 	gate.Class = ir.PEXTERN
 	sym.Def = gate
 	lsym := gate.Linksym()
-	base.Ctxt.LookupInit(lsym.Name, func(lsym *obj.LSym) {
+	if !lsym.OnList() {
 		objw.Uintptr(lsym, 0, 0)
 		objw.SymPtr(lsym, types.PtrSize, factory.Linksym(), 0)
 		flags := int16(obj.RODATA)
@@ -43,7 +42,7 @@ func newNativeStackGate(source, factory *ir.Func) {
 			flags |= obj.DUPOK
 		}
 		objw.Global(lsym, int32(typ.Size()), flags)
-	})
+	}
 	nativeSourceGates[source] = gate
 	nativeStackGates[factory] = []*ir.Name{gate}
 }
