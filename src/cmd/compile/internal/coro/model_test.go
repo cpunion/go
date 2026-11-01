@@ -29,6 +29,7 @@ func TestFuncSummaryPrimary(t *testing.T) {
 		{FuncSummary{Exec: NeedsPreempt}, CoroPrimary},
 		{FuncSummary{Exec: NeedsSystemABI}, CoroPrimary},
 		{FuncSummary{Exec: NeedsTaskContext}, CoroPrimary},
+		{FuncSummary{Exec: NeedsGoStack}, CoroPrimary},
 		{FuncSummary{Terminal: MayPanic}, CoroPrimary},
 		{FuncSummary{Terminal: MayGoexit}, CoroPrimary},
 		{FuncSummary{Terminal: UsesRecover}, PlainPrimary},

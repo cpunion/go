@@ -885,6 +885,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if err := collectStatements(fn.Body, false); err != nil {
 		return nil, err
 	}
+	if function.Exec&NeedsGoStack != 0 {
+		return nil, fmt.Errorf("ordinary helper requires growing Go stack")
+	}
 	if hasUnplannedTypeSwitch(fn.Body, switches) {
 		return nil, fmt.Errorf("type switch in unsupported expression")
 	}
