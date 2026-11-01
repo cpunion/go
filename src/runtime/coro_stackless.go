@@ -4557,6 +4557,14 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 	if gomaxprocs <= 1 {
 		return
 	}
+	// Spawn already checks the current P count here. Promote only after
+	// that guard, keeping repeated single-P preparation on its old fast path.
+	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
+		s.promoteSinglePExecutors()
+		if gomaxprocs <= 1 {
+			return
+		}
+	}
 	s.signal()
 	select {
 	case s.executorWake <- struct{}{}:
@@ -4568,14 +4576,7 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 	// Spawn calls this for every child, but preparation happens only once
 	// during a scheduler lifetime. Avoid an atomic read-modify-write after
 	// another caller has started preparing or running the executors.
-	state := s.executorState.Load()
-	if state == stacklessCoroExecutorStateSingleP {
-		if gomaxprocs > 1 {
-			s.promoteSinglePExecutors()
-		}
-		return
-	}
-	if state != stacklessCoroExecutorStateOff ||
+	if s.executorState.Load() != stacklessCoroExecutorStateOff ||
 		!s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}

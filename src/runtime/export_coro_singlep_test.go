@@ -41,6 +41,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 		previous := GOMAXPROCS(4)
 		defer GOMAXPROCS(previous)
 		s.prepareReplacementExecutors()
+		s.wakeReplacementExecutor()
 	}
 	if !lazy || mode != 0 {
 		valid = valid && s.executorState.Load() ==
