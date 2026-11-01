@@ -371,6 +371,19 @@ func analyze(funcs []*ir.Func, cgoDirectives [][]string, specializedTargets map[
 	// already requiring a constrained entry retain their execution flags.
 	needsContext := false
 	for _, function := range p.Functions {
+		// A plain helper is called through its ordinary Go ABI on the
+		// executor. Large locals and assertion temporaries in that body
+		// cannot grow the executor's stack. Propagate this independently
+		// of suspension, including through imported summaries and defers.
+		// Existing resumable bodies own their frame planning; recursive
+		// named helpers receive the resumable-entry constraint below.
+		if function.Effect == NoSuspend && function.Exec == 0 &&
+			len(function.Sites) == 0 &&
+			!(function.Recursive && function.Func.OClosure == nil) &&
+			ordinaryHelperNeedsGoStack(function.Func) {
+			function.LocalExec |= NeedsGoStack
+			needsContext = true
+		}
 		summary := FuncSummary{
 			Effect: function.Effect, Exec: function.Exec, Terminal: function.Terminal,
 		}

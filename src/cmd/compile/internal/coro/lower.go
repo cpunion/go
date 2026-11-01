@@ -533,6 +533,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if fn == nil {
 		return nil, fmt.Errorf("missing function")
 	}
+	if function.Exec&NeedsGoStack != 0 {
+		return nil, fmt.Errorf("ordinary helper requires growing Go stack")
+	}
 	if fn.OClosure != nil && fn.Wrapper() {
 		return nil, fmt.Errorf("frontend operand wrapper")
 	}
