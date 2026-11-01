@@ -57,6 +57,10 @@ const (
 
 	// FuncFlagAsm indicates that a function was implemented in assembly.
 	FuncFlagAsm
+
+	// FuncFlagCoroStack identifies compiler-owned entries that run on the
+	// fixed coroutine executor stack and require a final linked stack proof.
+	FuncFlagCoroStack
 )
 
 // A FuncID identifies particular functions that need to be treated

@@ -72,7 +72,6 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 	pos := fn.Pos()
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, stacklessResumeType(),
 		factory, typecheck.Target, 0)
-	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
 	inputs := len(fn.Type().RecvParams())
 	args := make(ir.Nodes, inputs)

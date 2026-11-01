@@ -524,6 +524,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			result.Skipped++
 		}
 	}
+	recordNativeStackMetadata(functions, factories)
 	result.Skipped -= result.Lowered
 	return result, nil
 }
@@ -2416,10 +2417,10 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
-	// A native executor stack is fixed and cannot satisfy morestack. Calls
-	// made by the resume function retain their own stack checks, so exhausting
-	// the executor budget fails in the runtime instead of copying the stack.
-	resume.Pragma |= ir.Nosplit
+	// The final linker proof selects the independent ordinary source body
+	// if this resume or an ordinary helper cannot fit the native stack.
+	// Keep a regular prologue so even rejected machine bodies remain valid
+	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
 	ctx := resume.Dcl[0]
 
@@ -2919,10 +2920,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
-	// A native executor stack is fixed and cannot satisfy morestack. Calls
-	// made by the resume function retain their own stack checks, so exhausting
-	// the executor budget fails in the runtime instead of copying the stack.
-	resume.Pragma |= ir.Nosplit
+	// The final linker proof selects the independent ordinary source body
+	// if this resume or an ordinary helper cannot fit the native stack.
+	// Keep a regular prologue so even rejected machine bodies remain valid
+	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
 	ctx := resume.Dcl[0]
 	var entryTerminalAction *ir.Name

@@ -606,9 +606,14 @@ func init() {
 // allocates frames or enters an executor. Native tasks do not participate in
 // synctest accounting or inherit the caller's thread lock. C callbacks also
 // hold a thread lock, so nested calls keep the ordinary cgo execution context.
+// coroStackUnsafe is set by the linker after inspecting actual machine
+// frames and ordinary call chains. All compiler entries retain an independent
+// source body, so an unproved native image remains an ordinary Go program.
+var coroStackUnsafe bool
+
 func coroUseOrdinary() bool {
 	gp := getg()
-	return gp.bubble != nil || gp.lockedm != 0
+	return coroStackUnsafe || gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0
 }
 
 // coroRun drives one stackless logical goroutine and its children. The

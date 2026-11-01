@@ -2117,14 +2117,14 @@ func TestLowerStateMachines(t *testing.T) {
 	if result.Lowered != 19 || result.Skipped != 0 {
 		t.Fatalf("Lower result = %+v, want 19 lowered and 0 skipped", result)
 	}
-	var noSplitResumes int
+	var nativeResumes int
 	for _, generated := range typecheck.Target.Funcs {
-		if generated.OClosure != nil && generated.Pragma&ir.Nosplit != 0 {
-			noSplitResumes++
+		if generated.OClosure != nil && NativeStackEntry(generated) {
+			nativeResumes++
 		}
 	}
-	if noSplitResumes != result.Lowered {
-		t.Fatalf("nosplit resume functions = %d, want %d", noSplitResumes, result.Lowered)
+	if nativeResumes != result.Lowered {
+		t.Fatalf("linked-stack resume entries = %d, want %d", nativeResumes, result.Lowered)
 	}
 	checksTerminal := func(fn *ir.Func) (bool, bool) {
 		for _, generated := range typecheck.Target.Funcs {
