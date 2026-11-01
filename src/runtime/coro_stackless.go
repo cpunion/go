@@ -4557,6 +4557,14 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 	if gomaxprocs <= 1 {
 		return
 	}
+	s.wakeMultiprocessorReplacementExecutor()
+}
+
+// Keep the single-P guard small enough to inline into every spawn. This
+// allocating admission work only runs after that existing guard succeeds.
+//
+//go:noinline
+func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor() {
 	// Spawn already checks the current P count here. Promote only after
 	// that guard, keeping repeated single-P preparation on its old fast path.
 	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
