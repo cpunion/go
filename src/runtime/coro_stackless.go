@@ -3814,11 +3814,8 @@ func coroEnterBlocking(ctx unsafe.Pointer) {
 	}
 	scheduler := context.scheduler
 	executorState := scheduler.executorState.Load()
-	if executorState == stacklessCoroExecutorStateSingleP {
-		scheduler.promoteSinglePExecutors()
-		executorState = scheduler.executorState.Load()
-	}
-	tracked := executorState == stacklessCoroExecutorStateRunning
+	tracked := executorState == stacklessCoroExecutorStateRunning ||
+		executorState == stacklessCoroExecutorStateSingleP
 	handoff := tracked && scheduler.enterBlockingExecutor()
 
 	// Keep this state transition in sync with coroEnterForeign. It is
@@ -3902,11 +3899,8 @@ func coroEnterSyscall(ctx unsafe.Pointer) {
 	}
 	scheduler := context.scheduler
 	executorState := scheduler.executorState.Load()
-	if executorState == stacklessCoroExecutorStateSingleP {
-		scheduler.promoteSinglePExecutors()
-		executorState = scheduler.executorState.Load()
-	}
-	tracked := executorState == stacklessCoroExecutorStateRunning
+	tracked := executorState == stacklessCoroExecutorStateRunning ||
+		executorState == stacklessCoroExecutorStateSingleP
 	handoff := tracked && scheduler.enterBlockingExecutor()
 
 	gp := getg()
@@ -4596,6 +4590,10 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 // Before promotion there is only the original driver. The active task keeps
 // the scheduler from draining while this driver publishes the replacement
 // channels. Keep rootDone: the public caller may already be waiting on it.
+// Keep the cold initialization out of the nosplit foreign-call entry frame.
+// Its callers must retain room for the existing syscall transition chain.
+//
+//go:noinline
 func (s *stacklessCoroScheduler) promoteSinglePExecutors() {
 	if s.executorState.CompareAndSwap(stacklessCoroExecutorStateSingleP,
 		stacklessCoroExecutorStatePreparing) {
@@ -4678,6 +4676,9 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 //go:noinline
 //go:nosplit
 func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
+	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
+		s.promoteSinglePExecutors()
+	}
 	blocked := s.blockingExecutors.Add(1)
 	shortage := blocked >= s.executorCount.Load()
 	if shortage {
