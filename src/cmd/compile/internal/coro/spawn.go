@@ -45,7 +45,7 @@ func plainSpawnFactorySupported(function *Function) bool {
 		return false
 	}
 	if typ := function.Func.Type(); typ.NumResults() != 0 {
-		// The nosplit adapter needs call and result-copy temporaries. Keep
+		// The adapter needs call and result-copy temporaries. Keep
 		// their source ABI footprint, plus the factory's result pointers,
 		// small until larger values can bypass the ordinary return ABI.
 		// This is not a bound on arbitrary source bodies or helper calls.
@@ -72,8 +72,8 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 	pos := fn.Pos()
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, stacklessResumeType(),
 		factory, typecheck.Target, 0)
-	resume.Pragma |= ir.Nosplit
 	resume.DeclareParams(true)
+	recordNativeStackEntry(resume, nativeStackGates[factory])
 	inputs := len(fn.Type().RecvParams())
 	args := make(ir.Nodes, inputs)
 	results := make(ir.Nodes, fn.Type().NumResults())

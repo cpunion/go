@@ -524,6 +524,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			result.Skipped++
 		}
 	}
+	recordNativeStackMetadata(candidates)
 	result.Skipped -= result.Lowered
 	return result, nil
 }
@@ -1152,31 +1153,28 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				// Repeated sites save it directly in the common defer stack.
 				deferred.snapshotCallee = true
 			}
-			if summary.Terminal != 0 {
-				for _, target := range edge.Targets {
-					targetSummary, _ := plan.funcSummary(target)
-					terminal := lowerDeferTerminal{target: target}
-					if targetSummary.Terminal != 0 {
-						var ok bool
-						terminal, ok = planDeferTerminal(plan, target, targetSummary)
-						if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
-							return nil, fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
-								ir.PkgFuncName(target), targetSummary.Terminal)
-						}
-					}
-					deferred.terminalTargets = append(deferred.terminalTargets, terminal)
-					deferred.namedRecover = deferred.namedRecover ||
-						!terminal.factory && targetSummary.Terminal&UsesRecover != 0
-					if terminal.factory {
-						candidate.dependencies[target] = true
-						candidate.deferDeps[target] = true
+			for _, target := range edge.Targets {
+				targetSummary, _ := plan.funcSummary(target)
+				terminal := lowerDeferTerminal{target: target}
+				if targetSummary.Terminal != 0 {
+					var ok bool
+					terminal, ok = planDeferTerminal(plan, target, targetSummary)
+					if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
+						return nil, fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
+							ir.PkgFuncName(target), targetSummary.Terminal)
 					}
 				}
+				deferred.terminalTargets = append(deferred.terminalTargets, terminal)
+				deferred.namedRecover = deferred.namedRecover ||
+					!terminal.factory && targetSummary.Terminal&UsesRecover != 0
+				if terminal.factory {
+					candidate.dependencies[target] = true
+					candidate.deferDeps[target] = true
+				}
 			}
-			// Keep the ordinary wrapper: normalization already froze its
-			// callee and arguments at registration. The existing defer stack
-			// snapshots repeated registrations and catches implicit panics,
-			// including a nil function called only during cleanup.
+			// Dispatch the frozen closed set directly during cleanup. This
+			// also binds plain targets for the machine-stack proof. Nil is
+			// still checked at invocation, after registration froze operands.
 			continue
 		}
 		closure, isClosure := deferred.call.Fun.(*ir.ClosureExpr)
@@ -1306,9 +1304,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		return nil, fmt.Errorf("aggregate type assertion exceeds stack transfer budget")
 	}
 	if !canLowerRunToCompletion(candidate) {
-		// These source locals stay on the nosplit resume's native stack.
+		// These source locals stay on the resume's native stack.
 		// Reserve room for generated temporaries, call transfers and runtime
-		// helpers; do not defer an oversized local to a linker stack failure.
+		// helpers; reject an oversized local before generating its factory.
 		const localBudget = abi.StackNosplitBase / 4
 		var localBytes int64
 		for name := range invocationLocals(function) {
@@ -1785,6 +1783,7 @@ func newResumeFactory(fn *ir.Func, abi FactoryABI) *ir.Func {
 	factory.SetDupok(fn.Dupok())
 	factory.Nname.Defn = factory
 	factory.DeclareParams(true)
+	newNativeStackGate(fn, factory)
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, factory)
 	return factory
 }
@@ -2416,11 +2415,12 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
-	// A native executor stack is fixed and cannot satisfy morestack. Calls
-	// made by the resume function retain their own stack checks, so exhausting
-	// the executor budget fails in the runtime instead of copying the stack.
-	resume.Pragma |= ir.Nosplit
+	// The final linker proof selects the independent ordinary source body
+	// if this resume or an ordinary helper cannot fit the native stack.
+	// Keep a regular prologue so even rejected machine bodies remain valid
+	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
+	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
 
 	captured := make(map[*ir.Name]*ir.Name)
@@ -2919,11 +2919,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	resume := ir.NewClosureFunc(pos, pos, ir.OCLOSURE, resumeType, factory,
 		typecheck.Target, 0)
-	// A native executor stack is fixed and cannot satisfy morestack. Calls
-	// made by the resume function retain their own stack checks, so exhausting
-	// the executor budget fails in the runtime instead of copying the stack.
-	resume.Pragma |= ir.Nosplit
+	// The final linker proof selects the independent ordinary source body
+	// if this resume or an ordinary helper cannot fit the native stack.
+	// Keep a regular prologue so even rejected machine bodies remain valid
+	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
+	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
 	var entryTerminalAction *ir.Name
 	if terminalAware && !localSelfFrames && candidate.stableTerminalAction() {
@@ -4222,7 +4223,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				pop := ir.NewAssignStmt(pos, stack,
 					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
 						lastIndex(), nil))
-				call := ir.Node(typecheck.Call(pos, deferredCall, nil, false))
+				call := ir.Node(typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{deferredCall}, false))
 				if slices.ContainsFunc(candidate.defers,
 					func(deferred *lowerDefer) bool {
 						return deferred.namedRecover
@@ -4249,7 +4250,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						fun = capture(deferred.calleeSnapshot)
 					}
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
-						fun, nil, false))
+						typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{fun}, false))
 					if deferred.namedRecover {
 						call = typecheck.Call(deferred.call.Pos(),
 							typecheck.LookupRuntime("coroDeferCall"),

@@ -608,7 +608,7 @@ func init() {
 // hold a thread lock, so nested calls keep the ordinary cgo execution context.
 func coroUseOrdinary() bool {
 	gp := getg()
-	return gp.bubble != nil || gp.lockedm != 0
+	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -3338,6 +3338,14 @@ func (scope *stacklessCoroDeferScope) leave() {
 	if scope.temporary {
 		scope.gp.stacklessCoro = nil
 	}
+}
+
+// coroDeferInvoke executes one compiler-registered cleanup activation. The
+// compiler binds every possible target to the owner's linker stack gate.
+// Keep this separate from coroDeferCall: an ordinary cleanup must not gain
+// the task-owned recover scope used by a direct named recover target.
+func coroDeferInvoke(deferred func()) {
+	deferred()
 }
 
 // coroDeferCall invokes a statically proven named defer target with access to

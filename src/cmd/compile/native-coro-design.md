@@ -4875,3 +4875,53 @@ slots, preserving those slots for scalar reservations. Typed frames remain
 independent precisely typed allocations; active pointer-bearing frames do not
 share new storage. The shared16MiB budget, one-GC survival, two-idle-GC expiry,
 whole-block completion checks and all exceptional fallback rules remain in force.
+
+
+### Linked machine stack eligibility (2026-11-02)
+
+Source aggregate budgets do not bound scalar argument spills or an acyclic
+chain of ordinary Go helpers. A genuine source-parent SDK can overflow its
+fixed native executor stack on a 4096-function scalar-only call chain, while
+the same program succeeds through ordinary Go. This observation is independent
+of the historical 6016 fatal-signal investigation and does not establish that
+older failure's cause.
+
+Each native source entry now reads a private two-word readonly stack gate
+before allocating a native frame. The linker writes its rejection word; the
+second word retains that entry's public factory code address. A rejected entry
+runs its independently read ordinary source body in place, preserving direct
+recover and source evaluation semantics. Generated resumes retain regular Go
+prologues so even a rejected large machine frame remains valid linkable code.
+
+Compiler-owned factories and actual resumes carry FuncFlagCoroStack and
+FUNCDATA_CoroStackGates (index 8). Each metadata pair binds an owning gate to
+one activation code symbol using section-relative R_ADDROFF relocations.
+Factories also bind the exact cleanup entries they register, including imported
+named cleanup functions whose backend is not invoked in the caller's package.
+Ordinary frontend go wrappers are not native activation roots. Root-array
+implementations share their public factory's gate.
+
+The linker follows final PCSP information and direct ordinary Go calls past
+split-stack prologues. It rejects machine recursion, oversized activations and
+unproved indirect application calls. Existing runtime operations, assembly
+nosplit contracts and direct foreign-call ABI boundaries remain trusted; this
+check does not prove their implementations or expand the foreign ABI. Factory
+and resume dependencies propagate rejection to native callers. Only a gate's
+own factory inherits its rejection, so two entries sharing a safe cleanup do
+not inherit each other's unrelated failures. Dynamically linked Go modules use
+ordinary public entries; a plugin-capable host also rejects native gates when
+a closed linked-image proof is unavailable.
+
+Registered cleanup invocation uses coroDeferInvoke without creating a recover
+scope. Direct named recover entries retain coroDeferCall and its task-owned
+scope. Frozen closed defer target sets dispatch directly, including plain
+targets, and check nil only when cleanup invokes them. This gives the linker
+exact cleanup code identities without accepting arbitrary indirect calls or
+changing registration-time operand snapshots and LIFO order.
+
+Parallel backends attach stack metadata to their function descriptors. The
+existing sequential addGCLocals phase emits the globals, avoiding concurrent
+updates to the object context's data-symbol list. Tests cover final frame
+spills, deep ordinary and native-child dependencies, independent safe entries,
+shared imported cleanup ownership and multiple parallel backend worker counts.
+Performance and memory comparison remains deferred.

@@ -5,6 +5,7 @@
 package coro
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
@@ -27,6 +28,14 @@ type BodyReader struct {
 func addOrdinaryBody(fn, ordinary *ir.Func) {
 	remapOrdinaryBody(fn, ordinary)
 	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
+	gate := ir.NewIndexExpr(fn.Pos(), nativeSourceGates[fn], ir.NewInt(fn.Pos(), 0))
+	condition = ir.NewLogicalExpr(fn.Pos(), ir.OOROR, condition,
+		ir.NewBinaryExpr(fn.Pos(), ir.ONE, gate, ir.NewInt(fn.Pos(), 0)))
+	// Separately loaded Go modules have no closed linked-image stack proof.
+	// Retain their factory ABI and summaries, while keeping public calls ordinary.
+	if base.Flag.Dynlink != nil && *base.Flag.Dynlink || base.Flag.LinkShared != nil && *base.Flag.LinkShared {
+		condition = ir.NewBool(fn.Pos(), true)
+	}
 	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
 	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
 }

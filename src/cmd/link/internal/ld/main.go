@@ -389,6 +389,9 @@ func Main(arch *sys.Arch, theArch Arch) {
 	bench.Start("callgraph")
 	ctxt.callgraph()
 
+	bench.Start("doCoroStackCheck")
+	ctxt.doCoroStackCheck()
+
 	bench.Start("doStackCheck")
 	ctxt.doStackCheck()
 

@@ -57,10 +57,11 @@ func TestOrdinaryBody(t *testing.T) {
 	}
 	nativeReturn := newLowerTestReturn()
 	fn.Body = ir.Nodes{nativeReturn}
+	newResumeFactory(fn, FactoryABI1)
 	addOrdinaryBody(fn, ordinary)
 	branch, ok := fn.Body[0].(*ir.IfStmt)
 	if !ok || len(branch.Else) != 1 || branch.Else[0] != nativeReturn ||
-		symbolName(ir.StaticCalleeName(branch.Cond.(*ir.CallExpr).Fun)) != "runtime.coroUseOrdinary" {
+		symbolName(ir.StaticCalleeName(branch.Cond.(*ir.LogicalExpr).X.(*ir.CallExpr).Fun)) != "runtime.coroUseOrdinary" {
 		t.Fatalf("public entry = %v, want context test and unchanged native branch", fn.Body)
 	}
 	if local.Curfn != fn || child.ClosureParent != fn || child.RangeParent != fn ||

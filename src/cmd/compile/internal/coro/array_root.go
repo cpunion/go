@@ -90,6 +90,7 @@ func prepareRootArray(candidate *lowerCandidate) {
 	implementation.SetDupok(fn.Dupok())
 	implementation.Nname.Defn = implementation
 	implementation.DeclareParams(true)
+	recordNativeStackEntry(implementation, nativeStackGates[public])
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, implementation)
 	remap := make(map[*ir.Name]*ir.Name)
 	var args ir.Nodes
