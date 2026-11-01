@@ -30,6 +30,22 @@ func closed(c chan int) int {
  first:=f(2);second:=f(4)
  return first*100+second
 }
+func choose(which bool,c chan int)int {
+ seed:=4;text:="ab"
+ f:=func(x int)int{v:=<-c;return seed+x+v}
+ if which {f=func(x int)int{runtime.Gosched();v:=<-c;return len(text)*10+x+v}}
+ return f(3)
+}
+func shared(gate,ready chan int)(func()int,func()) {
+ seed:=2
+ read:=func()int{ready<-1;v:=<-gate;return seed+v}
+ write:=func(){seed=30}
+ return read,write
+}
+func exits(done chan int) {
+ seed:=41
+ go func(){defer func(){done<-seed;close(done)}();runtime.Gosched();runtime.Goexit()}()
+}
 func counter(seed int,c chan int)func(int)int {
  return func(delta int)int {seed+=delta;runtime.Gosched();v:=<-c;seed+=v;return seed}
 }
@@ -52,18 +68,18 @@ func order(which bool)(result int) {
  var f func(int)int
  if which {f=func(x int)int{runtime.Gosched();return base+x}}
  defer func(){if recover()!=nil {if calls!=1 {panic("nil operand order")};result=91}}()
- arg:=func()int{calls++;runtime.Gosched();return 2}
+ arg:=func()int{calls++;base=19;runtime.Gosched();return 2}
  result=f(arg());return result
 }
 type object struct {data [2048]byte}
 func kept(gate chan int,ready chan int,dead chan int)func()int {
  p:=new(object);p.data[0]=23
  runtime.SetFinalizer(p,func(*object){dead<-1})
- return func()int{ready<-1;v:=<-gate;runtime.GC();return int(p.data[0])+v}
+ return func()int{ready<-1;v:=<-gate;return int(p.data[0])+v}
 }
 func main(){
  c:=make(chan int,16);for range 16 {c<-1}
- if closed(c)!=611 || instances(c)!=131 {panic("shared capture or instance isolation")}
+ if closed(c)!=611 || instances(c)!=131 || choose(false,c)!=8 || choose(true,c)!=24 {panic("shared capture or instance isolation")}
  gate,ready,done:=make(chan int),make(chan int),make(chan int)
  before:=runtime.NumGoroutine()
  spawn(gate,ready,done)
@@ -72,7 +88,12 @@ func main(){
  runtime.GC();for range 64 {gate<-5};for range 64 {if <-done!=12 {panic("captured spawn result")}}
  f:=recovery(20);if f()!=29 || f()!=30 {panic("captured direct recover")}
  first:=nesting(30);nested:=first();if nested()!=31 || nested()!=32 {panic("nested shared cell")}
- if order(false)!=91 || order(true)!=10 {panic("callee or operand snapshot")}
+ if order(false)!=91 || order(true)!=21 {panic("callee or operand snapshot")}
+ read,write:=shared(gate,ready)
+ go func(){done<-read()}();<-ready;runtime.GC();write();gate<-4
+ if <-done!=34 {panic("shared cell changed while parked")}
+ exited:=make(chan int);exits(exited);if <-exited!=41 {panic("captured Goexit cleanup")};if _,ok:=<-exited;ok {panic("captured Goexit close")}
+ locked:=counter(4,c);runtime.LockOSThread();if locked(1)!=6 {panic("captured locked ordinary body")};runtime.UnlockOSThread();if locked(1)!=8 {panic("captured unlocked native body")}
  dead:=make(chan int,1);fn:=kept(gate,ready,dead)
  go func(){<-ready;runtime.GC();select{case <-dead:panic("premature captured object collection");default:};gate<-4}()
  if fn()!=27 {panic("captured GC result")};fn=nil
@@ -101,7 +122,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"closed", "instances", "counter.func1", "spawn", "spawn.func1", "recovery.func1", "nesting.func1", "nesting.func1.1"} {
+				for _, name := range []string{"closed", "instances", "counter.func1", "spawn", "spawn.func1", "recovery.func1", "nesting.func1", "nesting.func1.1", "choose", "choose.func1", "choose.func2", "shared.func1", "exits", "exits.func1", "kept.func2"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission\n%s", name, out)
 					}

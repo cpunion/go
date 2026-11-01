@@ -2739,7 +2739,9 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 					assign := ir.NewAssignStmt(variable.Pos(), snapshot, cell)
 					assign.Def = true
 					snapshot.Defn = assign
-					closure.PtrInit().Append(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot), assign)
+					ir.WithFunc(resume, func() {
+						closure.PtrInit().Append(typecheck.Stmt(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot)), typecheck.Stmt(assign))
+					})
 					replaceCapturedCell(closure.Func, variable, snapshot)
 					continue
 				}
