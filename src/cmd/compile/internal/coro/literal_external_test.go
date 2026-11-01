@@ -17,7 +17,7 @@ import (
 
 func TestCaptureFreeLiteralEntries(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" || runtime.GOARCH != "arm64" && runtime.GOARCH != "amd64" {
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
 		t.Skip("native executor unavailable")
 	}
 	const source = `package main
