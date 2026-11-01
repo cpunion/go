@@ -3502,9 +3502,10 @@ func TestStacklessCoroLazyExecutorChannels(t *testing.T) {
 			runtime.SpawnStacklessCoroForTest(ctx, child)
 			wake, executorWake, executorDone =
 				runtime.ExecutorChannelsStacklessCoroForTest(ctx)
-			if !wake || !executorWake || !executorDone {
-				t.Fatalf("prepared channels = (%t, %t, %t), want (true, true, true)",
-					wake, executorWake, executorDone)
+			prepared := !runtime.StacklessCoroSinglePExecutorsForTest(ctx)
+			if !wake || executorWake != prepared || executorDone != prepared {
+				t.Fatalf("prepared channels = (%t, %t, %t), want (true, %t, %t)",
+					wake, executorWake, executorDone, prepared, prepared)
 			}
 			state = 1
 			return runtime.StacklessCoroActionYield

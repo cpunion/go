@@ -146,6 +146,9 @@ const (
 	stacklessCoroExecutorStatePreparing
 	stacklessCoroExecutorStateRunning
 	stacklessCoroExecutorStateStopping
+	// A single-P scheduler has published rootDone but has not needed a
+	// replacement. Blocking foreign calls promote it before releasing the P.
+	stacklessCoroExecutorStateSingleP
 )
 
 const (
@@ -774,6 +777,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 		len(s.terminalValues) == 0 && s.blockingExecutors.Load() == 0 &&
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
+			state == stacklessCoroExecutorStateSingleP ||
 			state == stacklessCoroExecutorStateStopping)
 	// A remaining runnable task or frame reservation belongs to the old root.
 	// Leave those schedulers on their existing allocation lifetime rather than
@@ -3809,7 +3813,9 @@ func coroEnterBlocking(ctx unsafe.Pointer) {
 		throw("runtime: invalid stackless coroutine blocking call")
 	}
 	scheduler := context.scheduler
-	tracked := scheduler.executorState.Load() == stacklessCoroExecutorStateRunning
+	executorState := scheduler.executorState.Load()
+	tracked := executorState == stacklessCoroExecutorStateRunning ||
+		executorState == stacklessCoroExecutorStateSingleP
 	handoff := tracked && scheduler.enterBlockingExecutor()
 
 	// Keep this state transition in sync with coroEnterForeign. It is
@@ -3892,7 +3898,9 @@ func coroEnterSyscall(ctx unsafe.Pointer) {
 		throw("runtime: invalid stackless coroutine syscall")
 	}
 	scheduler := context.scheduler
-	tracked := scheduler.executorState.Load() == stacklessCoroExecutorStateRunning
+	executorState := scheduler.executorState.Load()
+	tracked := executorState == stacklessCoroExecutorStateRunning ||
+		executorState == stacklessCoroExecutorStateSingleP
 	handoff := tracked && scheduler.enterBlockingExecutor()
 
 	gp := getg()
@@ -4549,6 +4557,22 @@ func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
 	if gomaxprocs <= 1 {
 		return
 	}
+	s.wakeMultiprocessorReplacementExecutor()
+}
+
+// Keep the single-P guard small enough to inline into every spawn. This
+// allocating admission work only runs after that existing guard succeeds.
+//
+//go:noinline
+func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor() {
+	// Spawn already checks the current P count here. Promote only after
+	// that guard, keeping repeated single-P preparation on its old fast path.
+	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
+		s.promoteSinglePExecutors()
+		if gomaxprocs <= 1 {
+			return
+		}
+	}
 	s.signal()
 	select {
 	case s.executorWake <- struct{}{}:
@@ -4564,14 +4588,35 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		!s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}
+	s.rootDone = make(chan struct{})
+	if !raceenabled && !stacklessCoroIsPullComparison(s) && gomaxprocs == 1 {
+		s.executorState.Store(stacklessCoroExecutorStateSingleP)
+		return
+	}
+	s.startReplacementExecutors()
+}
 
+// Before promotion there is only the original driver. The active task keeps
+// the scheduler from draining while this driver publishes the replacement
+// channels. Keep rootDone: the public caller may already be waiting on it.
+// Keep the cold initialization out of the nosplit foreign-call entry frame.
+// Its callers must retain room for the existing syscall transition chain.
+//
+//go:noinline
+func (s *stacklessCoroScheduler) promoteSinglePExecutors() {
+	if s.executorState.CompareAndSwap(stacklessCoroExecutorStateSingleP,
+		stacklessCoroExecutorStatePreparing) {
+		s.startReplacementExecutors()
+	}
+}
+
+func (s *stacklessCoroScheduler) startReplacementExecutors() {
 	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
 	// The initial replacements and manager can all report completion without
 	// parking. Growth beyond the warm set retains the ordinary join fallback.
 	s.executorDone = make(chan bool, stacklessCoroWarmExecutorCount)
 	s.executorGrow = make(chan struct{}, 1)
 	s.executorStop = make(chan struct{})
-	s.rootDone = make(chan struct{})
 	s.executorCount.Store(stacklessCoroWarmExecutorCount)
 	for range stacklessCoroWarmExecutorCount - 1 {
 		go s.replacementExecutor(false)
@@ -4640,6 +4685,9 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 //go:noinline
 //go:nosplit
 func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
+	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
+		s.promoteSinglePExecutors()
+	}
 	blocked := s.blockingExecutors.Add(1)
 	shortage := blocked >= s.executorCount.Load()
 	if shortage {
@@ -4671,7 +4719,7 @@ func (s *stacklessCoroScheduler) leaveBlockingExecutor() {
 
 func (s *stacklessCoroScheduler) stopExecutorRuns() {
 	state := s.executorState.Load()
-	if state == stacklessCoroExecutorStateOff {
+	if state == stacklessCoroExecutorStateOff || state == stacklessCoroExecutorStateSingleP {
 		return
 	}
 	if state == stacklessCoroExecutorStatePreparing {
@@ -4684,7 +4732,8 @@ func (s *stacklessCoroScheduler) stopExecutorRuns() {
 }
 
 func (s *stacklessCoroScheduler) stopReplacementExecutors() {
-	if s.executorState.Load() == stacklessCoroExecutorStateOff {
+	state := s.executorState.Load()
+	if state == stacklessCoroExecutorStateOff || state == stacklessCoroExecutorStateSingleP {
 		return
 	}
 	s.stopExecutorRuns()

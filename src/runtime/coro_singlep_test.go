@@ -1,0 +1,24 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+//go:build goexperiment.coro && (darwin || linux)
+
+package runtime_test
+
+import (
+	"runtime"
+	"testing"
+)
+
+func TestStacklessCoroSinglePExecutors(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	for mode, name := range []string{"drain", "blocking-promotion", "multiprocessor-promotion"} {
+		t.Run(name, func(t *testing.T) {
+			if !runtime.StacklessCoroSinglePPromotionForTest(mode) {
+				t.Fatal("single-P admission, root notification or executor join failed")
+			}
+		})
+	}
+}
