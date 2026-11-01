@@ -109,6 +109,9 @@ func prepareRootArray(candidate *lowerCandidate) {
 	for source, name := range candidate.parameters {
 		candidate.parameters[source] = remap[name]
 	}
+	for source, name := range candidate.captureParameters {
+		candidate.captureParameters[source] = remap[name]
+	}
 	for i, name := range candidate.resultPtrs {
 		candidate.resultPtrs[i] = remap[name]
 	}

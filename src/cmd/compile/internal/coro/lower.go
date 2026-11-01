@@ -4007,6 +4007,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		for _, variable := range closureVars {
 			outer := edit(variable.Outer)
+			if deref, ok := outer.(*ir.StarExpr); ok {
+				if cell, ok := deref.X.(*ir.Name); ok {
+					snapshot := typecheck.TempAt(variable.Pos(), resume, cell.Type())
+					deferred.captures = append(deferred.captures,
+						lowerDeferCapture{source: cell, snapshot: snapshot})
+					replaceCapturedCell(closure.Func, variable, snapshot)
+					continue
+				}
+			}
 			if candidate.dynamicDefers {
 				if outer == nil || outer.Type() == nil {
 					return fmt.Errorf("%s: defer capture has no type",

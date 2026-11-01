@@ -76,6 +76,9 @@ func main(){
  dead:=make(chan int,1);fn:=kept(gate,ready,dead)
  go func(){<-ready;runtime.GC();select{case <-dead:panic("premature captured object collection");default:};gate<-4}()
  if fn()!=27 {panic("captured GC result")};fn=nil
+ released:=false
+ for range 64 {runtime.GC();runtime.Gosched();select {case <-dead:released=true;default:};if released {break}}
+ if !released {panic("completed frame retained captured object")}
  println("captured-callables-ok")
 }
 `
