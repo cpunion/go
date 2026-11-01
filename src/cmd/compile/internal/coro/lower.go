@@ -272,8 +272,32 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	for _, function := range functions {
 		normalizeSingleResultCalls(function)
 	}
+	// Source defer literals use the existing in-place cleanup rewrite. Do not
+	// also replace their bodies with standalone entries: the cleanup rewrite
+	// must retain its own terminal-control and capture ownership.
+	deferredLiterals := make(map[*ir.Func]bool)
+	for _, function := range functions {
+		for _, edge := range function.Edges {
+			if edge.Kind != DeferCall {
+				continue
+			}
+			if edge.Callee != nil && edge.Callee.OClosure != nil {
+				deferredLiterals[edge.Callee] = true
+			}
+			for _, target := range edge.Targets {
+				if target.OClosure != nil {
+					deferredLiterals[target] = true
+				}
+			}
+		}
+	}
 	for _, function := range functions {
 		if function.Primary != CoroPrimary {
+			continue
+		}
+		if deferredLiterals[function.Func] {
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: literal uses defer cleanup entry", ir.PkgFuncName(function.Func)))
 			continue
 		}
 		candidate, err := newLowerCandidate(plan, function)
@@ -507,6 +531,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	fn := function.Func
 	if fn == nil {
 		return nil, fmt.Errorf("missing function")
+	}
+	if fn.OClosure != nil && fn.Wrapper() {
+		return nil, fmt.Errorf("frontend operand wrapper")
 	}
 	// Method value wrappers have hidden receiver parameters even though
 	// they are not closure literals. The factory ABI carries only explicit
@@ -1703,7 +1730,7 @@ func resumeFactorySupported(fn *ir.Func) bool {
 	// A function literal without captures uses the same calling convention
 	// as a named function. Hidden receiver and captured environments still
 	// require a separate callable ABI and keep their ordinary entry.
-	if fn == nil || fn.Type() == nil ||
+	if fn == nil || fn.Type() == nil || fn.OClosure != nil && fn.Wrapper() ||
 		fn.Needctxt() || len(fn.ClosureVars) != 0 {
 		return false
 	}

@@ -7723,6 +7723,11 @@ func TestCaptureFreeLiteralFactory(t *testing.T) {
 	if !resumeFactorySupported(fn) {
 		t.Fatal("capture-free literal lost its context-free factory ABI")
 	}
+	fn.SetWrapper(true)
+	if resumeFactorySupported(fn) {
+		t.Fatal("frontend operand wrapper admitted as a source literal")
+	}
+	fn.SetWrapper(false)
 	fn.SetNeedctxt(true)
 	if resumeFactorySupported(fn) {
 		t.Fatal("hidden closure context admitted without a callable ABI")

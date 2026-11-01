@@ -3611,7 +3611,7 @@ int32_t coro_submit_u64(uint64_t id, uint64_t value, int fd) {
 	if err != nil {
 		t.Fatalf("building direct fixture failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=4"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=5"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
