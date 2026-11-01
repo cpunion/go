@@ -1,0 +1,91 @@
+[!cgo] skip
+[!GOARCH:arm64] [!GOARCH:amd64] skip
+[!GOOS:darwin] [!GOOS:linux] skip
+
+env GOEXPERIMENT=coro
+go build -gcflags='-l -d=coro=4' -o program .
+stderr 'coro: phase=lower lowered=3 skipped=0'
+go build -o auditor ./audit
+exec ./auditor $GOROOT/bin/go program
+stdout '^pointer-window-ok$'
+env GOGC=1
+env GOMAXPROCS=1
+exec ./program
+stderr '^pointer-result-ok$'
+env GOMAXPROCS=4
+exec ./program
+stderr '^pointer-result-ok$'
+env GODEBUG=asyncpreemptoff=1
+exec ./program
+stderr '^pointer-result-ok$'
+env GOMAXPROCS=1
+exec ./program
+stderr '^pointer-result-ok$'
+env GOEXPERIMENT=nocoro
+go run .
+stderr '^pointer-result-ok$'
+
+-- go.mod --
+module example.com/pointerresults
+
+go 1.28
+-- main.go --
+package main
+/*
+#include <stdint.h>
+#include <errno.h>
+#cgo noescape pointer_value
+#cgo nocallback pointer_value
+#cgo noescape pointer_errno
+#cgo nocallback pointer_errno
+int64_t *pointer_value(int64_t *p) { return p; }
+int64_t *pointer_errno(int64_t *p, int code) { errno=code; return p; }
+*/
+import "C"
+import "syscall"
+
+//go:noinline
+func pointerCall(p *C.int64_t) *C.int64_t {
+ result := C.pointer_value(p)
+ return result
+}
+//go:noinline
+func pointerErrno(p *C.int64_t, code C.int) (*C.int64_t,error) {
+ result, err := C.pointer_errno(p, code)
+ return result, err
+}
+func main() {
+ var slot C.int64_t = 42
+ value := pointerCall(&slot)
+ withError, err := pointerErrno(&slot, C.EINVAL)
+ withNilError, nilErr := pointerErrno(&slot, 0)
+ nilValue := pointerCall(nil)
+ nilPair, nilPairErr := pointerErrno(nil, 0)
+ if value!=&slot || *value!=42 || withError!=&slot || err!=syscall.EINVAL ||
+  withNilError!=&slot || nilErr!=nil || nilValue!=nil || nilPair!=nil || nilPairErr!=nil {
+  panic("bad pointer result publication")
+ }
+ println("pointer-result-ok")
+}
+-- audit/main.go --
+package main
+import (
+ "fmt"
+ "os"
+ "os/exec"
+ "strings"
+)
+func main() {
+ data,err:=exec.Command(os.Args[1],"tool","objdump","-s",`^main\.(pointerCall|pointerErrno)\.coro\.func1$`,os.Args[2]).CombinedOutput()
+ if err!=nil { panic(string(data)) }
+ active:=false
+ calls:=0
+ for _,line:=range strings.Split(string(data),"\n") {
+  if strings.HasPrefix(line,"TEXT ") && active {panic("unterminated blocking window")}
+  if strings.Contains(line,"CALL runtime.coroEnterBlocking") {if active {panic("nested blocking window")};active=true;calls++}
+  if active && strings.Contains(line,"CALL runtime.gcWriteBarrier") {panic("pointer result write barrier before blocking exit: "+line)}
+  if strings.Contains(line,"CALL runtime.coroExitBlocking") {if !active {panic("unmatched blocking exit")};active=false}
+ }
+ if active || calls!=2 {panic(fmt.Sprintf("blocking call windows=%d active=%t: %s",calls,active,data))}
+ fmt.Println("pointer-window-ok")
+}

@@ -7675,3 +7675,42 @@ func TestNewLowerChannelRejectsMalformedIR(t *testing.T) {
 		})
 	}
 }
+
+func TestCgoPointerResultPublication(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldPkg, oldFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+	defer func() { typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldPkg, oldFunc }()
+	pkg := types.NewPkg("example.com/coro/cgopointer", "cgopointer")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	owner := newLowerTestFunc(pkg, "owner")
+	pointerType := types.Types[types.TUNSAFEPTR]
+	typ := types.NewSignature(nil, nil, []*types.Field{types.NewField(src.NoXPos, nil, pointerType)})
+	wrapper := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("wrapper"), typ)
+	direct := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("direct"), typ)
+	call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, wrapper.Nname, nil)
+	call.SetType(pointerType)
+	call.SetTypecheck(1)
+	target := owner.NewLocal(src.NoXPos, pkg.Lookup("result"), pointerType)
+	stmt := ir.NewAssignStmt(src.NoXPos, target, call)
+	stmt.SetTypecheck(1)
+	foreign, post, err := rewriteCgoCallResult(stmt, call,
+		lowerDirectCall{function: direct}, owner, func(n ir.Node) ir.Node { return n })
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment, ok := foreign.(*ir.AssignStmt)
+	if !ok || assignment.X == target || assignment.X.(*ir.Name).Curfn != owner {
+		t.Fatalf("foreign assignment = %v, want resume-local temporary", foreign)
+	}
+	if len(post) != 1 || post[0] != stmt || stmt.X != target || stmt.Y != assignment.X {
+		t.Fatalf("publication = %v, want original target after blocking exit", post)
+	}
+	if raw := assignment.Y.(*ir.CallExpr); raw.Fun != direct.Nname || raw.Type() != pointerType {
+		t.Fatalf("raw call = %v, want typed direct entry", raw)
+	}
+	complex := ir.NewAssignStmt(src.NoXPos, typedDeref(src.NoXPos,
+		typecheck.NodAddr(target), pointerType), call)
+	if _, err := cgoPointerResultAssignment(call, complex, lowerDirectCall{function: direct}); err == nil {
+		t.Fatal("complex pointer destination was admitted without an evaluation-order proof")
+	}
+}
