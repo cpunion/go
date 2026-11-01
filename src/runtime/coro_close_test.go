@@ -34,3 +34,13 @@ func TestStacklessCoroClosePublication(t *testing.T) {
 		}
 	}
 }
+
+func TestStacklessCoroCompletionWake(t *testing.T) {
+	for _, executors := range []bool{false, true} {
+		t.Run(fmt.Sprintf("executors%t", executors), func(t *testing.T) {
+			if !runtime.StacklessCoroCompletionWakeForTest(executors) {
+				t.Fatal("completion lost the public-root or final-drain wake")
+			}
+		})
+	}
+}

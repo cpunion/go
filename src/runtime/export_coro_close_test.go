@@ -127,3 +127,85 @@ func StacklessCoroClosePublicationForTest(count, schedulers int,
 	KeepAlive(states)
 	return *valid
 }
+
+func stacklessCoroWakeReceiverForTest(wake chan struct{}) bool {
+	c := *(**hchan)(unsafe.Pointer(&wake))
+	deadline := nanotime() + 5e9
+	for {
+		lock(&c.lock)
+		parked := c.recvq.first != nil
+		unlock(&c.lock)
+		if parked {
+			return true
+		}
+		if nanotime() >= deadline {
+			return false
+		}
+		Gosched()
+	}
+}
+
+// A public root may end while a detached task remains. Exercise actual
+// parked work drivers at both the root-return and final-drain boundaries,
+// with and without the separate executor-stop notification.
+func StacklessCoroCompletionWakeForTest(executors bool) bool {
+	s := newStacklessCoroTestScheduler()
+	s.wake = make(chan struct{})
+	s.rootDone = make(chan struct{})
+	s.lifetime.Store(stacklessCoroLifetimeSpawned)
+	s.liveSpawns = 2
+	s.root.state = stacklessCoroTaskRunning
+	s.root.resuming = true
+	if executors {
+		s.executorStop = make(chan struct{})
+		s.executorState.Store(stacklessCoroExecutorStateRunning)
+	}
+	first, last := new(stacklessCoroTask), new(stacklessCoroTask)
+	first.state, last.state = stacklessCoroTaskRunning, stacklessCoroTaskRunning
+	first.resuming, last.resuming = true, true
+	s.complete(first)
+	if s.liveSpawns != 1 || s.rootComplete() || s.drained() {
+		return false
+	}
+	events := make(chan uint8, 1)
+	again, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2; i++ {
+			woke := s.waitForWork()
+			var state uint8
+			if s.rootComplete() {
+				state |= 1
+			}
+			if s.drained() {
+				state |= 2
+			}
+			if woke {
+				state |= 4
+			}
+			events <- state
+			if i == 0 {
+				<-again
+			}
+		}
+	}()
+	if !stacklessCoroWakeReceiverForTest(s.wake) {
+		return false
+	}
+	s.complete(&s.root)
+	valid := <-events == 5
+	select {
+	case <-s.rootDone:
+	default:
+		valid = false
+	}
+	close(again)
+	if !stacklessCoroWakeReceiverForTest(s.wake) {
+		return false
+	}
+	s.complete(last)
+	state := <-events
+	valid = valid && state&3 == 3 && (executors || state&4 != 0)
+	<-done
+	return valid && s.drained() && s.liveSpawns == 0
+}

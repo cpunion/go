@@ -1777,6 +1777,12 @@ func (s *stacklessCoroScheduler) logicalTaskComplete(root bool) {
 	}
 	if s.drained() {
 		s.stopExecutorRuns()
+	} else if !root && !raceenabled && !stacklessCoroIsPullComparison(s) {
+		// An independent task has no waiting parent. Its completion changes
+		// only the lifetime count; operations that ready work notify their
+		// producers separately. Drivers need this broadcast when the public
+		// root ends or the final task drains, not for intermediate counts.
+		return
 	}
 	s.signalAll()
 }
