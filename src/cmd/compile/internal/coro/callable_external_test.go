@@ -42,9 +42,9 @@ func shared(gate,ready chan int)(func()int,func()) {
  write:=func(){seed=30}
  return read,write
 }
-func exits(done chan int) {
+func exits(done chan struct{},result *int) {
  seed:=41
- go func(){defer func(){done<-seed;close(done)}();runtime.Gosched();runtime.Goexit()}()
+ go func(){defer func(){*result=seed;close(done)}();runtime.Gosched();runtime.Goexit()}()
 }
 func counter(seed int,c chan int)func(int)int {
  return func(delta int)int {seed+=delta;runtime.Gosched();v:=<-c;seed+=v;return seed}
@@ -92,7 +92,7 @@ func main(){
  read,write:=shared(gate,ready)
  go func(){done<-read()}();<-ready;runtime.GC();write();gate<-4
  if <-done!=34 {panic("shared cell changed while parked")}
- exited:=make(chan int);exits(exited);if <-exited!=41 {panic("captured Goexit cleanup")};if _,ok:=<-exited;ok {panic("captured Goexit close")}
+ exited:=make(chan struct{});exitResult:=0;exits(exited,&exitResult);<-exited;if exitResult!=41 {panic("captured Goexit cleanup")}
  locked:=counter(4,c);runtime.LockOSThread();if locked(1)!=6 {panic("captured locked ordinary body")};runtime.UnlockOSThread();if locked(1)!=8 {panic("captured unlocked native body")}
  dead:=make(chan int,1);fn:=kept(gate,ready,dead)
  go func(){<-ready;runtime.GC();select{case <-dead:panic("premature captured object collection");default:};gate<-4}()
