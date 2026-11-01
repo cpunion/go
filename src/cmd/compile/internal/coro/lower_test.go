@@ -2119,7 +2119,10 @@ func TestLowerStateMachines(t *testing.T) {
 	}
 	var nativeResumes int
 	for _, generated := range typecheck.Target.Funcs {
-		if generated.OClosure != nil && NativeStackEntry(generated) {
+		if generated.OClosure != nil && NativeStackEntry(generated) &&
+			generated.Type().NumParams() == 1 && generated.Type().NumResults() == 1 &&
+			generated.Type().Param(0).Type.IsUnsafePtr() &&
+			generated.Type().Result(0).Type.Kind() == types.TUINT8 {
 			nativeResumes++
 		}
 	}

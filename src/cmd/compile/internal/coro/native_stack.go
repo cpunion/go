@@ -6,48 +6,61 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/objw"
+	"cmd/compile/internal/types"
+	"cmd/internal/obj"
+	"slices"
 )
 
-// NativeStackEntry identifies compiler-owned functions that can execute on a
-// native stack. The backend records this in FuncInfo after final SSA layout;
-// the linker then checks actual machine frames and ordinary helper chains.
-// An indirect machine call without a complete linked target proof rejects
-// native execution. A source-level union of callees is not a proof for an
-// arbitrary call introduced later by walk or SSA.
-var nativeStackEntries = make(map[*ir.Func]bool)
+// Each source entry has an independent linker-written gate. Its second word
+// retains the factory: an entry whose native body was otherwise inlined away
+// must still have its complete machine proof. Gate contents are never folded
+// by the compiler. The code address is not a Go heap pointer.
+var nativeSourceGates = make(map[*ir.Func]*ir.Name)
+var nativeStackGates = make(map[*ir.Func][]*ir.Name)
 
-// NativeStackEntry is read only during parallel backend compilation.
-func NativeStackEntry(fn *ir.Func) bool { return nativeStackEntries[fn] }
+// NativeStackEntry and NativeStackGates are read only by parallel backends.
+func NativeStackEntry(fn *ir.Func) bool       { return len(nativeStackGates[fn]) != 0 }
+func NativeStackGates(fn *ir.Func) []*ir.Name { return nativeStackGates[fn] }
 
-func recordNativeStackMetadata(functions []*Function, factories map[*ir.Func]*ir.Func) {
-	for _, factory := range factories {
-		nativeStackEntries[factory] = true
+func newNativeStackGate(source, factory *ir.Func) {
+	typ := types.NewArray(types.Types[types.TUINTPTR], 2)
+	types.CalcSize(typ)
+	sym := source.Sym().Pkg.Lookup(source.Sym().Name + ".coro.stackgate")
+	gate := ir.NewNameAt(source.Pos(), sym, typ)
+	gate.Class = ir.PEXTERN
+	sym.Def = gate
+	lsym := gate.Linksym()
+	objw.Uintptr(lsym, 0, 0)
+	objw.SymPtr(lsym, types.PtrSize, factory.Linksym(), 0)
+	flags := int16(obj.RODATA)
+	if source.Dupok() {
+		flags |= obj.DUPOK
 	}
-	for _, fn := range typecheck.Target.Funcs {
-		for parent := fn.ClosureParent; parent != nil; parent = parent.ClosureParent {
-			if nativeStackEntries[parent] {
-				nativeStackEntries[fn] = true
-				break
-			}
+	objw.Global(lsym, int32(typ.Size()), flags)
+	nativeSourceGates[source] = gate
+	nativeStackGates[factory] = []*ir.Name{gate}
+}
+
+func recordNativeStackEntry(fn *ir.Func, gates []*ir.Name) {
+	for _, gate := range gates {
+		if !slices.Contains(nativeStackGates[fn], gate) {
+			nativeStackGates[fn] = append(nativeStackGates[fn], gate)
 		}
 	}
-	// Source defer literals retain their in-place cleanup entry.
-	for _, function := range functions {
-		if factories[function.Func] == nil {
-			continue
-		}
-		for _, edge := range function.Edges {
-			if edge.Kind != DeferCall {
-				continue
-			}
-			if edge.Callee != nil && edge.Callee.OClosure != nil {
-				nativeStackEntries[edge.Callee] = true
-			}
-			for _, target := range edge.Targets {
-				if target.OClosure != nil {
-					nativeStackEntries[target] = true
-				}
+}
+
+// Only the actual resume and registered cleanup entries execute natively.
+// Ordinary frontend go wrappers remain ordinary, even if their source parent
+// was moved into a factory. Root-array implementations share the public gate.
+func recordNativeStackMetadata(candidates map[*ir.Func]*lowerCandidate) {
+	for source, candidate := range candidates {
+		gates := []*ir.Name{nativeSourceGates[source]}
+		for _, deferred := range candidate.defers {
+			if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
+				recordNativeStackEntry(closure.Func, gates)
+			} else if target := ir.StaticCalleeName(deferred.call.Fun); target != nil && target.Func != nil {
+				recordNativeStackEntry(target.Func, gates)
 			}
 		}
 	}

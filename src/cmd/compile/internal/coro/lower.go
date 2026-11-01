@@ -524,7 +524,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			result.Skipped++
 		}
 	}
-	recordNativeStackMetadata(functions, factories)
+	recordNativeStackMetadata(candidates)
 	result.Skipped -= result.Lowered
 	return result, nil
 }
@@ -1786,6 +1786,7 @@ func newResumeFactory(fn *ir.Func, abi FactoryABI) *ir.Func {
 	factory.SetDupok(fn.Dupok())
 	factory.Nname.Defn = factory
 	factory.DeclareParams(true)
+	newNativeStackGate(fn, factory)
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, factory)
 	return factory
 }
@@ -2422,6 +2423,7 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	// Keep a regular prologue so even rejected machine bodies remain valid
 	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
+	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
 
 	captured := make(map[*ir.Name]*ir.Name)
@@ -2925,6 +2927,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Keep a regular prologue so even rejected machine bodies remain valid
 	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
+	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
 	var entryTerminalAction *ir.Name
 	if terminalAware && !localSelfFrames && candidate.stableTerminalAction() {

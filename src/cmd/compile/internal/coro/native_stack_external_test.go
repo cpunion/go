@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-func linkedCoroStackUnsafe(t *testing.T, path string) bool {
+func linkedCoroStackUnsafe(t *testing.T, path, name string) bool {
 	t.Helper()
 	if f, err := elf.Open(path); err == nil {
 		defer f.Close()
@@ -27,7 +27,7 @@ func linkedCoroStackUnsafe(t *testing.T, path string) bool {
 			t.Fatal(err)
 		}
 		for _, symbol := range symbols {
-			if symbol.Name != "runtime.coroStackUnsafe" {
+			if symbol.Name != name {
 				continue
 			}
 			section := f.Sections[symbol.Section]
@@ -43,7 +43,7 @@ func linkedCoroStackUnsafe(t *testing.T, path string) bool {
 	} else if f, err := macho.Open(path); err == nil {
 		defer f.Close()
 		for _, symbol := range f.Symtab.Syms {
-			if strings.TrimPrefix(symbol.Name, "_") != "runtime.coroStackUnsafe" {
+			if strings.TrimPrefix(symbol.Name, "_") != name {
 				continue
 			}
 			for _, section := range f.Sections {
@@ -109,16 +109,18 @@ func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println(
 	indirect := `package main
 //go:noinline
 func leaf(v uint64)uint64{return v+1}
-func entry(c chan uint64)uint64{f:=[]func(uint64)uint64{leaf,leaf}[len(c)%2];v:=<-c;return f(v)}
+func other(v uint64)uint64{return v+1}
+func entry(c chan uint64)uint64{f:=leaf;if len(c)==0 {f=other};v:=<-c;return f(v)}
 func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println("linked-stack-ok")}`
 	for _, test := range []struct {
 		name, source string
 		unsafe       bool
-	}{{"small", small, false}, {"deep", deep.String(), true}, {"late-spills", large.String(), true}, {"unproved-indirect", indirect, true}} {
+	}{{"small", small, false}, {"deep", deep.String(), true}, {"native-child", strings.Replace(deep.String(), "func entry(c chan uint64)uint64", "func child(c chan uint64)uint64", 1) + "\nfunc entry(c chan uint64)uint64{return child(c)}", true}, {"late-spills", large.String(), true}, {"unproved-indirect", indirect, true}} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
 			source := filepath.Join(dir, "main.go")
-			if err := os.WriteFile(source, []byte(test.source), 0600); err != nil {
+			isolated := strings.Replace(test.source, "func main(){", "func safe(c chan uint64)uint64{return <-c+1}\nfunc main(){z:=make(chan uint64,1);z<-8;if safe(z)!=9{panic(\"safe\")};", 1)
+			if err := os.WriteFile(source, []byte(isolated), 0600); err != nil {
 				t.Fatal(err)
 			}
 			binary := filepath.Join(dir, "probe.exe")
@@ -128,8 +130,11 @@ func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println(
 			if err != nil {
 				t.Fatalf("build: %v\n%s", err, log)
 			}
-			if got := linkedCoroStackUnsafe(t, binary); got != test.unsafe {
+			if got := linkedCoroStackUnsafe(t, binary, "main.entry.coro.stackgate"); got != test.unsafe {
 				t.Fatalf("unsafe=%t want=%t\n%s", got, test.unsafe, log)
+			}
+			if linkedCoroStackUnsafe(t, binary, "main.safe.coro.stackgate") {
+				t.Fatalf("unrelated safe entry fell back:\n%s", log)
 			}
 			if test.unsafe != strings.Contains(string(log), "coro-stack: ordinary fallback:") {
 				t.Fatalf("incorrect proof diagnostic:\n%s", log)

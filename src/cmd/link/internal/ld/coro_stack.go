@@ -8,7 +8,6 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/link/internal/loader"
-	"cmd/link/internal/sym"
 	"flag"
 	"fmt"
 	"internal/abi"
@@ -34,36 +33,141 @@ type coroStackProof struct {
 	failure loader.Sym
 }
 
+// trustedCoroStackBoundary lists the existing runtime operation ABI. These
+// operations own their scheduler/system/foreign-stack protocols. Application
+// helpers, including those in other packages, still require a machine proof.
+func trustedCoroStackBoundary(name string) bool {
+	if strings.HasPrefix(name, "runtime.") {
+		return true
+	}
+	switch name {
+	case "os.(*File).coroReadStart", "os.(*File).coroReadFinish",
+		"os.(*File).coroWriteStart", "os.(*File).coroWriteFinish",
+		"net.(*conn).coroReadStart", "net.(*conn).coroReadFinish",
+		"net.(*conn).coroWriteStart", "net.(*conn).coroWriteFinish",
+		"net.(*TCPConn).coroReadStart", "net.(*TCPConn).coroReadFinish",
+		"net.(*TCPConn).coroWriteStart", "net.(*TCPConn).coroWriteFinish":
+		return true
+	}
+	return false
+}
+
 func (ctxt *Link) doCoroStackCheck() {
 	if !buildcfg.Experiment.Coro {
 		return
 	}
 	ldr := ctxt.loader
-	guard := ldr.Lookup("runtime.coroStackUnsafe", 0)
-	if guard == 0 || !ldr.AttrReachable(guard) {
-		return
-	}
 	proof := coroStackProof{ctxt: ctxt, ldr: ldr, nosplit: newStackCheck(ctxt, false), heights: make(map[loader.Sym]int), active: make(map[loader.Sym]bool)}
-	roots := 0
+	roots := make(map[loader.Sym][]loader.Sym)
+	gates := make(map[loader.Sym]bool)
+	unsafe := make(map[loader.Sym]bool)
 	for _, s := range ctxt.Textp {
 		info := ldr.FuncInfo(s)
 		if !info.Valid() || info.FuncFlag()&abi.FuncFlagCoroStack == 0 {
 			continue
 		}
-		roots++
-		if proof.height(s) > coroStackLimit {
-			sb := ldr.MakeSymbolUpdater(guard)
-			sb.SetType(sym.SNOPTRDATA)
-			sb.SetData([]byte{1})
-			sb.SetSize(1)
-			if *flagDebugCoroStack {
-				fmt.Printf("coro-stack: ordinary fallback: %s exceeds %d bytes (at %s)\n", ldr.SymName(s), coroStackLimit, ldr.SymName(proof.failure))
+		fd := ldr.Funcdata(s, nil)
+		if len(fd) <= abi.FUNCDATA_CoroStackGates || fd[abi.FUNCDATA_CoroStackGates] == 0 {
+			ctxt.Errorf(s, "native machine entry has no stack gates")
+			continue
+		}
+		metadata := ldr.Relocs(fd[abi.FUNCDATA_CoroStackGates])
+		for i := 0; i < metadata.Count(); i++ {
+			r := metadata.At(i)
+			if r.Type() != objabi.R_ADDROFF || r.Siz() != 4 {
+				ctxt.Errorf(s, "malformed native stack gate metadata")
+				continue
 			}
-			return
+			gate := r.Sym()
+			roots[s] = append(roots[s], gate)
+			gates[gate] = true
+		}
+		proof.failure = 0
+		unsafe[s] = proof.height(s) > coroStackLimit || ctxt.DynlinkingGo()
+		if unsafe[s] && *flagDebugCoroStack {
+			fmt.Printf("coro-stack: ordinary fallback: %s exceeds %d bytes or module proof unavailable (at %s)\n", ldr.SymName(s), coroStackLimit, ldr.SymName(proof.failure))
 		}
 	}
+	// Factories and resumes execute in separate scheduler activations. Their
+	// stack heights do not add, but an unsafe child makes every native parent
+	// unsafe, including imported factories and address-taken cleanup entries.
+	// Cycles here are finite state-machine recursion, not machine recursion.
+	dependencies := make(map[loader.Sym][]loader.Sym)
+	for root := range roots {
+		seen := make(map[loader.Sym]bool)
+		var visit func(loader.Sym)
+		visit = func(s loader.Sym) {
+			if seen[s] || trustedCoroStackBoundary(ldr.SymName(s)) {
+				return
+			}
+			seen[s] = true
+			relocs := ldr.Relocs(s)
+			for i := 0; i < relocs.Count(); i++ {
+				r := relocs.At(i)
+				target := r.Sym()
+				if target == 0 {
+					continue
+				}
+				if !r.Type().IsDirectCall() {
+					// A static func value is one code pointer. Do not treat type descriptors
+					// or source Code comparisons as execution of arbitrary ordinary bodies.
+					if ldr.SymSize(target) == int64(ctxt.Arch.PtrSize) {
+						refs := ldr.Relocs(target)
+						if refs.Count() == 1 && refs.At(0).Type() == objabi.R_ADDR && refs.At(0).Off() == 0 {
+							target = refs.At(0).Sym()
+						}
+					}
+					if _, native := roots[target]; !native {
+						continue
+					}
+				}
+				if _, native := roots[target]; native {
+					dependencies[root] = append(dependencies[root], target)
+				}
+				if r.Type().IsDirectCall() {
+					visit(target)
+				}
+			}
+		}
+		visit(root)
+	}
+	for changed := true; changed; {
+		changed = false
+		for root, group := range roots {
+			bad := unsafe[root]
+			for _, gate := range group {
+				bad = bad || unsafe[gate]
+			}
+			for _, child := range dependencies[root] {
+				bad = bad || unsafe[child]
+			}
+			if bad {
+				if !unsafe[root] {
+					unsafe[root] = true
+					changed = true
+				}
+				for _, gate := range group {
+					if !unsafe[gate] {
+						unsafe[gate] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	rejected := 0
+	for gate := range gates {
+		if !unsafe[gate] {
+			continue
+		}
+		rejected++
+		// Only this entry's flag changes. Its code-address word and relocations
+		// remain intact, so recovery can inspect the exact factory binding.
+		sb := ldr.MakeSymbolUpdater(gate)
+		sb.SetUint(ctxt.Arch, 0, 1)
+	}
 	if *flagDebugCoroStack {
-		fmt.Printf("coro-stack: %d native machine entries fit %d bytes\n", roots, coroStackLimit)
+		fmt.Printf("coro-stack: %d native machine entries, %d gates, %d ordinary gates\n", len(roots), len(gates), rejected)
 	}
 }
 
@@ -76,7 +180,7 @@ func (p *coroStackProof) height(s loader.Sym) int {
 		return coroStackLimit + 1
 	}
 	name := p.ldr.SymName(s)
-	if strings.HasPrefix(name, "runtime.") {
+	if trustedCoroStackBoundary(name) {
 		return 0
 	}
 	info := p.ldr.FuncInfo(s)

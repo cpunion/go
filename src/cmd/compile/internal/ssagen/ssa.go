@@ -7043,7 +7043,7 @@ func genssa(htmlWriter ssa.HTMLWriter, f *ssa.Func, pp *objw.Progs) {
 	}
 
 	emitWrappedFuncInfo(e, pp)
-	emitCoroStackInfo(e.curfn)
+	emitCoroStackInfo(e.curfn, pp)
 
 	// Remember where each block starts.
 	s.bstart = make([]*obj.Prog, f.NumBlocks())

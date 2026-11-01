@@ -5,14 +5,31 @@
 package ssagen
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/objw"
+	"cmd/internal/obj"
 	"internal/abi"
 	"internal/buildcfg"
 )
 
-func emitCoroStackInfo(fn *ir.Func) {
-	if buildcfg.Experiment.Coro && coro.NativeStackEntry(fn) {
-		fn.LSym.Func().FuncFlag |= abi.FuncFlagCoroStack
+func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
+	if !buildcfg.Experiment.Coro || !coro.NativeStackEntry(fn) {
+		return
 	}
+	fn.LSym.Func().FuncFlag |= abi.FuncFlagCoroStack
+	// Funcdata permits section-relative R_ADDROFF references, not pointers.
+	// The linker consumes the exact gate identities before laying out funcdata.
+	info := base.Ctxt.Lookup(fn.LSym.Name + ".coro.stackinfo")
+	off := 0
+	for _, gate := range coro.NativeStackGates(fn) {
+		off = objw.SymPtrOff(info, off, gate.Linksym())
+	}
+	objw.Global(info, int32(off), obj.RODATA|obj.DUPOK)
+	p := pp.Prog(obj.AFUNCDATA)
+	p.From.SetConst(abi.FUNCDATA_CoroStackGates)
+	p.To.Type = obj.TYPE_MEM
+	p.To.Name = obj.NAME_EXTERN
+	p.To.Sym = info
 }
