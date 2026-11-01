@@ -2702,6 +2702,15 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	// Save validated wrapper operands before reparenting closures into resume.
+	// Dynamic callee snapshots belong to the source caller during validation;
+	// rechecking that relationship after reparenting would lose their arguments.
+	goCalls := make(map[*ir.CallExpr]*ir.CallExpr)
+	for _, edge := range function.Edges {
+		if edge.Kind == GoCall {
+			goCalls[edge.Node] = unwrapGoCall(edge.Node)
+		}
+	}
 	// Keep NoSuspend adapters unchanged. Both explicit frames and closure
 	// resumes capture invocation locals across their existing yield sites.
 	spawnYield := slices.ContainsFunc(function.Sites, func(site Site) bool {
@@ -3561,7 +3570,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		statement ir.Node, edge Edge, frozenArgs ir.Nodes) (lowerFactoryCall, error) {
 		sourceCall := call
 		if edge.Kind == GoCall {
-			sourceCall = unwrapGoCall(call)
+			sourceCall = goCalls[call]
+			if sourceCall == nil {
+				return lowerFactoryCall{}, fmt.Errorf("%s: missing validated go call", ir.PkgFuncName(fn))
+			}
 		}
 		child := factories[edge.Callee]
 		if child == nil {
@@ -3667,7 +3679,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		sourceCall := call
 		if edge.Kind == GoCall {
-			sourceCall = unwrapGoCall(call)
+			sourceCall = goCalls[call]
+			if sourceCall == nil {
+				return lowerFactoryCall{}, fmt.Errorf("%s: missing validated go call", ir.PkgFuncName(fn))
+			}
 		}
 		fun := freeze(edit(sourceCall.Fun))
 		args := make(ir.Nodes, len(sourceCall.Args))

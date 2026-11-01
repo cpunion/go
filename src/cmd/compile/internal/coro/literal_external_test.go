@@ -69,10 +69,11 @@ func main() {
 				t.Fatal(err)
 			}
 			binary := filepath.Join(dir, "program")
-			args := []string{"build", "-gcflags=" + config.flags, "-o", binary, "."}
+			args := []string{"build", "-gcflags=" + config.flags, "-o", binary}
 			if config.race {
 				args = append(args, "-race")
 			}
+			args = append(args, ".")
 			build := testenv.Command(t, testenv.GoToolPath(t), args...)
 			build.Dir = dir
 			build.Env = append(build.Environ(), "GOEXPERIMENT="+config.experiment, "GOWORK=off")
