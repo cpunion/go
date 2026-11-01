@@ -505,8 +505,8 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 
 func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) {
 	fn := function.Func
-	if fn == nil || fn.OClosure != nil {
-		return nil, fmt.Errorf("not a top-level function")
+	if fn == nil {
+		return nil, fmt.Errorf("missing function")
 	}
 	// Method value wrappers have hidden receiver parameters even though
 	// they are not closure literals. The factory ABI carries only explicit
@@ -1700,7 +1700,10 @@ func stacklessResumeType() *types.Type {
 }
 
 func resumeFactorySupported(fn *ir.Func) bool {
-	if fn == nil || fn.OClosure != nil || fn.Type() == nil ||
+	// A function literal without captures uses the same calling convention
+	// as a named function. Hidden receiver and captured environments still
+	// require a separate callable ABI and keep their ordinary entry.
+	if fn == nil || fn.Type() == nil ||
 		fn.Needctxt() || len(fn.ClosureVars) != 0 {
 		return false
 	}
