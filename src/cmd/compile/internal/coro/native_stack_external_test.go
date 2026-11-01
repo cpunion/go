@@ -186,7 +186,7 @@ func main(){c:=make(chan int,1);c<-1;if entry(c)!=2{panic("entry")};c<-8;if safe
 		}
 	}
 	binary := filepath.Join(dir, "probe.exe")
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-l -d=coro=4", "-ldflags=-debugcorostack", "-o", binary, ".")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-l -d=coro=4", "-gcflags=example.com/cleanup/helper=-l -d=coro=4", "-ldflags=-debugcorostack", "-o", binary, ".")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOEXPERIMENT=coro", "CGO_ENABLED=0")
 	log, err := cmd.CombinedOutput()
@@ -249,6 +249,80 @@ func TestLinkedNativeStackParallelMetadata(t *testing.T) {
 			if err != nil || strings.TrimSpace(string(out)) != "parallel-metadata-ok" {
 				t.Fatalf("workers %s P%s: %v\n%s", workers, p, err, out)
 			}
+		}
+	}
+}
+
+func TestLinkedNativeStackPlugin(t *testing.T) {
+	if !buildcfg.Experiment.Coro {
+		t.Skip("requires coroutine experiment")
+	}
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native executor unavailable")
+	}
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+	testenv.MustHaveBuildMode(t, "plugin")
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "payload"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "host"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var payload strings.Builder
+	payload.WriteString("package main\nfunc Evaluate()uint64{c:=make(chan uint64,1);c<-1;return root(c)}\n//go:noinline\nfunc root(c chan uint64)uint64{v:=<-c;return f0(v)}\n")
+	for i := 0; i < 4096; i++ {
+		fmt.Fprintf(&payload, "//go:noinline\nfunc f%d(v uint64)uint64{return f%d(v)+1}\n", i, i+1)
+	}
+	payload.WriteString("//go:noinline\nfunc f4096(v uint64)uint64{return v}\n")
+	for name, text := range map[string]string{
+		"go.mod":             "module example.com/stackplugin\ngo 1.27\n",
+		"payload/payload.go": payload.String(),
+		"host/main.go": `package main
+import("os";"plugin";"runtime")
+//go:noinline
+func hostEntry(c chan uint64)uint64{return <-c+1}
+func check(){c:=make(chan uint64,1);c<-8;if hostEntry(c)!=9{panic("host")}}
+func main(){check();p,e:=plugin.Open(os.Args[1]);if e!=nil{panic(e)};v,e:=p.Lookup("Evaluate");if e!=nil{panic(e)};f:=v.(func()uint64);for range 4{runtime.GC();if f()!=4097{panic("plugin")};check()};println("module-stack-ok")}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	goTool := testenv.GoToolPath(t)
+	pluginPath := filepath.Join(dir, "payload.so")
+	host := filepath.Join(dir, "host.exe")
+	for _, target := range []struct {
+		output, pkg string
+		flags       []string
+	}{
+		{pluginPath, "./payload", []string{"-buildmode=plugin"}},
+		{host, "./host", nil},
+	} {
+		args := append([]string{"build", "-gcflags=-l -d=coro=4", "-ldflags=-debugcorostack", "-o", target.output}, target.flags...)
+		args = append(args, target.pkg)
+		cmd := exec.Command(goTool, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GOENV=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOEXPERIMENT=coro", "CGO_ENABLED=1")
+		if log, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", target.pkg, err, log)
+		}
+	}
+	if !linkedCoroStackUnsafe(t, host, "main.hostEntry.coro.stackgate") {
+		t.Fatal("plugin-capable host retained native entry")
+	}
+	cmd := exec.Command(goTool, "tool", "objdump", "-s", `example\.com/stackplugin/payload\.root$`, pluginPath)
+	log, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(log), "payload.root") || strings.Contains(string(log), "runtime.coroRun") {
+		t.Fatalf("module root lost ordinary source body: %v\n%s", err, log)
+	}
+	for _, p := range []string{"1", "4"} {
+		run := exec.Command(host, pluginPath)
+		run.Env = append(os.Environ(), "GOMAXPROCS="+p, "GOGC=1")
+		out, err := run.CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != "module-stack-ok" {
+			t.Fatalf("P%s: %v\n%s", p, err, out)
 		}
 	}
 }

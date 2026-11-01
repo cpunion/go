@@ -1304,9 +1304,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		return nil, fmt.Errorf("aggregate type assertion exceeds stack transfer budget")
 	}
 	if !canLowerRunToCompletion(candidate) {
-		// These source locals stay on the nosplit resume's native stack.
+		// These source locals stay on the resume's native stack.
 		// Reserve room for generated temporaries, call transfers and runtime
-		// helpers; do not defer an oversized local to a linker stack failure.
+		// helpers; reject an oversized local before generating its factory.
 		const localBudget = abi.StackNosplitBase / 4
 		var localBytes int64
 		for name := range invocationLocals(function) {

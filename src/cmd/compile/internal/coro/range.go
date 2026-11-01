@@ -97,7 +97,7 @@ func indexedRangeLoop(stmt *ir.RangeStmt, fn *ir.Func) *ir.ForStmt {
 				// Freeze the element before storing the key: the key's
 				// storage can alias a backing-array element. Keep this
 				// temporary in the typed frame rather than an OAS2 stack
-				// temporary, which can overflow a nosplit resume.
+				// temporary, which can exceed the native stack budget.
 				snapshot := typecheck.TempAt(pos, fn, stmt.Value.Type())
 				init.Append(ir.NewDecl(pos, ir.ODCL, snapshot))
 				body.Prepend(ir.NewAssignStmt(pos, snapshot, elementValue),
