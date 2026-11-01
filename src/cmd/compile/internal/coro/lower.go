@@ -4012,6 +4012,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if deref, ok := outer.(*ir.StarExpr); ok {
 				if cell, ok := deref.X.(*ir.Name); ok {
 					snapshot := typecheck.TempAt(variable.Pos(), resume, cell.Type())
+					if !candidate.dynamicDefers {
+						snapshot = typecheck.TempAt(variable.Pos(), factory, cell.Type())
+						addDeclaration(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot))
+						snapshot = capture(snapshot)
+					}
 					deferred.captures = append(deferred.captures,
 						lowerDeferCapture{source: cell, snapshot: snapshot})
 					replaceCapturedCell(closure.Func, variable, snapshot)

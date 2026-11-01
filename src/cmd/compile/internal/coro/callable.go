@@ -77,6 +77,7 @@ func callableCaptureArguments(pos src.XPos, fn *ir.Func, value ir.Node) ir.Nodes
 	}
 	environment := types.NewStruct(fields)
 	environment.SetNoalg(true)
+	types.CalcSize(environment)
 	data := ir.NewUnaryExpr(pos, ir.OIDATA, typecheck.Conv(value, types.Types[types.TINTER]))
 	data.SetType(types.Types[types.TUNSAFEPTR])
 	data.SetTypecheck(1)
