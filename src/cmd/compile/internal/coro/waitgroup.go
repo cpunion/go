@@ -73,7 +73,10 @@ func AnalyzeWithSpecializations(funcs []*ir.Func, directives [][]string, reader 
 	demands := make(map[*ir.Func]bool)
 	index := 0
 	specializeWaitGroupCallbacks(funcs, specialized, bodies, demands, &index)
-	rewritten := specializeParameters(funcs, reader, specialized, bodies, demands)
+	rewritten, operandCalls := specializeCapturedOperands(funcs, reader, bodies)
+	for fn := range specializeParameters(typecheck.Target.Funcs, reader, specialized, bodies, demands) {
+		rewritten[fn] = true
+	}
 	// A specialized source body can itself invoke WaitGroup.Go with the
 	// now-sealed parameter. Compose the recipes before effect analysis.
 	specializeWaitGroupCallbacks(typecheck.Target.Funcs, specialized, bodies, demands, &index)
@@ -83,6 +86,7 @@ func AnalyzeWithSpecializations(funcs []*ir.Func, directives [][]string, reader 
 	}
 	plan.specializedBodies, plan.callbackFactories = bodies, demands
 	plan.rewrittenCallers = rewritten
+	plan.operandCalls = operandCalls
 	allTargets := packageFunctionTargetsWithParameters(typecheck.Target.Funcs, specialized)
 	for fn := range specialized {
 		for _, targets := range allTargets[fn] {

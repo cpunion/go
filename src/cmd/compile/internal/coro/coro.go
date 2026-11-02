@@ -270,6 +270,7 @@ type Plan struct {
 	// rejects them. Calling a specialization from ordinary code adds a frame.
 	rangeOwners      map[*ir.Func]*rangeDeferOwnerPlan
 	rangeBodies      map[*ir.Func]*rangeDeferBodyPlan
+	operandCalls     map[*ir.GoDeferStmt]*capturedOperandCall
 	rewrittenCallers map[*ir.Func]bool
 }
 
