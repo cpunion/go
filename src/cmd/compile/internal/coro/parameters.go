@@ -28,6 +28,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 	}
 	copies := make(map[key]*ir.Func)
 	generated := make(map[*ir.Func]bool)
+	pinnedCaptures := make(map[*ir.Func]bool)
 	work := append([]*ir.Func(nil), funcs...)
 	creations, replacements := 0, 0
 	var solved map[*ir.Func]map[*ir.Name][]*ir.Func
@@ -65,15 +66,31 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 						wrapper = original.Fun.(*ir.ClosureExpr).Func
 					}
 				}
-				if ir.StaticValue(call.Fun) != call.Fun || len(call.Fun.Init()) != 0 {
+				if len(call.Fun.Init()) != 0 {
 					return
 				}
 				name := ir.StaticCalleeName(call.Fun)
-				if name == nil || name.Func == nil || generated[name.Func] {
+				var source *ir.Func
+				if name != nil {
+					source = name.Func
+				} else if local, ok := call.Fun.(*ir.Name); ok && len(targets[local]) == 1 {
+					source = targets[local][0]
+				}
+				if source == nil || generated[source] {
 					return
 				}
-				source := name.Func
-				if source.Sym().Pkg != types.LocalPkg || !resumeFactorySupported(source) ||
+				captured := capturedFactorySupported(source)
+				if captured {
+					// Existing go/defer wrappers already own their operand snapshots.
+					// Keep captured-callee conversion limited to ordinary calls with
+					// no frontend initializer whose ordering needs reconstruction.
+					if original.GoDefer || wrapper != nil || len(call.Init()) != 0 {
+						return
+					}
+				} else if ir.StaticValue(call.Fun) != call.Fun || !resumeFactorySupported(source) {
+					return
+				}
+				if source.Sym().Pkg != types.LocalPkg ||
 					source.Dupok() || source.Wrapper() || source.ABIWrapper() ||
 					source.Type().NumRecvs() != 0 || source.Pragma & ^ir.Noinline != 0 ||
 					!reader.Have(source) || len(call.Args) != source.Type().NumParams() ||
@@ -110,6 +127,10 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 					return
 				}
 				k := key{source, proof.String()}
+				var captures []*types.Type
+				if captured {
+					captures = append(captures, captureTypes(source)...)
+				}
 				helper, known := copies[k]
 				if !known {
 					if creations >= 64 {
@@ -121,6 +142,9 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 					creations++
 					sym := types.LocalPkg.Lookup(fmt.Sprintf("%s.param%d", source.Sym().Name, creations))
 					helper = reader.Clone(source, sym)
+					if captured {
+						helper = captureParameterBody(helper, captures)
+					}
 					if helper == nil {
 						copies[k] = nil
 						return
@@ -136,21 +160,31 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 					copies[k] = helper
 					parameters[helper] = make(map[*ir.Name][]*ir.Func)
 					for i, closed := range sets {
-						param := helper.Type().Param(i).Nname.(*ir.Name)
+						param := helper.Type().Param(len(captures) + i).Nname.(*ir.Name)
 						parameters[helper][param] = closed
 						for _, target := range closed {
 							demands[target] = true
 						}
 					}
 					bodies[helper] = func() *ir.Func {
-						return reader.Clone(source, types.LocalPkg.Lookup(sym.Name+".go"))
+						body := reader.Clone(source, types.LocalPkg.Lookup(sym.Name+".go"))
+						if captured {
+							body = captureParameterBody(body, captures)
+						}
+						return body
 					}
 					work = append(work, helper)
 				}
 				if helper == nil {
 					return
 				}
-				if wrapper == nil {
+				if captured {
+					if !pinnedCaptures[source] {
+						pinCapturedParameterCells(source)
+						pinnedCaptures[source] = true
+					}
+					rewriteCapturedParameterCall(caller, call, source, helper)
+				} else if wrapper == nil {
 					call.Fun = helper.Nname
 				} else {
 					// Read the proof from the caller's already-frozen operands,
