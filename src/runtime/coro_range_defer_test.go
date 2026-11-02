@@ -14,7 +14,103 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unsafe"
 )
+
+// Exercise the anchor under real structured task transitions. These are
+// runtime ownership tests; compiler admission and native stack gates have
+// separate contracts.
+func TestStacklessCoroRangeDeferStructured(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		initial     uint8
+		replacement bool
+		want        any
+		terminal    uint8
+	}{
+		{"return", runtime.StacklessCoroActionComplete, false, nil, runtime.StacklessCoroActionComplete},
+		{"panic", runtime.StacklessCoroActionPanic, false, "original", runtime.StacklessCoroActionComplete},
+		{"Goexit", runtime.StacklessCoroActionGoexit, false, nil, runtime.StacklessCoroActionGoexit},
+		{"replacement-panic", runtime.StacklessCoroActionPanic, true, "replacement", runtime.StacklessCoroActionComplete},
+		{"panic-during-Goexit", runtime.StacklessCoroActionGoexit, true, "replacement", runtime.StacklessCoroActionGoexit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			type result struct {
+				recovered any
+				terminal  uint8
+				order     []int
+				distinct  bool
+				released  bool
+			}
+			results := make(chan result, 1)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				state := 0
+				var anchor any
+				var token unsafe.Pointer
+				var got result
+				child := func(ctx unsafe.Pointer) uint8 {
+					got.distinct = runtime.DeferTokenStacklessCoroForTest(ctx) != token &&
+						runtime.OwnerStacklessCoroRangeDeferForTest(anchor) == token
+					// Registration runs while the enclosing task is Waiting.
+					runtime.PushStacklessCoroRangeDeferForTest(anchor, func() {
+						got.order = append(got.order, 1)
+						got.recovered = runtime.DeferRecoverStacklessCoroForTest(token)
+					})
+					runtime.PushStacklessCoroRangeDeferForTest(anchor, func() {
+						got.order = append(got.order, 2)
+						if test.replacement {
+							runtime.DeferPanicStacklessCoroForTest(token, "replacement")
+						}
+					})
+					return runtime.StacklessCoroActionComplete
+				}
+				runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+					if state == 0 {
+						state = 1
+						anchor = runtime.NewStacklessCoroRangeDeferAtForTest(ctx)
+						token = runtime.OwnerStacklessCoroRangeDeferForTest(anchor)
+						runtime.AwaitStacklessCoroForTest(ctx, child)
+						return runtime.StacklessCoroActionWait
+					}
+					switch test.initial {
+					case runtime.StacklessCoroActionPanic:
+						runtime.PanicStacklessCoroForTest(ctx, "original")
+					case runtime.StacklessCoroActionGoexit:
+						runtime.GoexitStacklessCoroForTest(ctx)
+					}
+					for {
+						fn, ok := runtime.NextStacklessCoroRangeDeferForTest(ctx, anchor)
+						if !ok {
+							break
+						}
+						fn()
+					}
+					got.terminal = runtime.TerminalActionStacklessCoroForTest(ctx)
+					got.released = runtime.StacklessCoroRangeDeferReleasedForTest(anchor)
+					results <- got
+					return got.terminal
+				})
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("structured range cleanup did not finish")
+			}
+			select {
+			case got := <-results:
+				if got.recovered != test.want || got.terminal != test.terminal ||
+					!slices.Equal(got.order, []int{2, 1}) || !got.distinct || !got.released {
+					t.Fatalf("structured cleanup = %+v, want recovered=%v terminal=%d", got, test.want, test.terminal)
+				}
+			default:
+				t.Fatal("structured range cleanup lost its outcome")
+			}
+		})
+	}
+}
 
 func TestStacklessCoroRangeDeferRemaining(t *testing.T) {
 	a, ctx := runtime.NewStacklessCoroRangeDeferForTest()

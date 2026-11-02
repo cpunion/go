@@ -21,6 +21,7 @@ func NewStacklessCoroRangeDeferForTest() (any, unsafe.Pointer) {
 var PushStacklessCoroRangeDeferForTest = coroRangeDeferPush
 var NextStacklessCoroRangeDeferForTest = coroRangeDeferNext
 var OwnerStacklessCoroRangeDeferForTest = coroRangeDeferOwner
+var NewStacklessCoroRangeDeferAtForTest = coroRangeDefer
 
 func StacklessCoroRangeDeferReleasedForTest(frame any) bool {
 	a := checkedStacklessCoroRangeDefer(frame)
