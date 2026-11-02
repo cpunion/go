@@ -14,6 +14,9 @@ import (
 
 func TestDeferStackMarkerCleanup(t *testing.T) {
 	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	typecheck.Target = new(ir.Package)
+	t.Cleanup(func() { typecheck.Target = oldTarget })
 	for _, records := range []bool{false, true} {
 		for _, recover := range []bool{false, true} {
 			fn := newLowerTestFunc(types.NewPkg("example.com/coro/marker", "p"), "cleanup")
