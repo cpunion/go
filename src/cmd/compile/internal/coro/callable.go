@@ -17,15 +17,15 @@ import (
 // represent one of these cells as an explicitly captured pointer.
 var factoryCaptureTypes = make(map[*ir.Func][]*types.Type)
 
-// Body rewriting can remove the last closure literal for an entry that was
-// already inlined. Its content-addressed code symbol is still referenced by
-// inline metadata and may also be used by native target dispatch. Keep the
+// Body rewriting can remove the last closure literal for a captured entry.
+// Its content-addressed code symbol can still be referenced by inline metadata
+// and native target dispatch, including when DWARF generation is disabled. Keep the
 // public entry on its factory's compilation list. Use walkClosure's queue flag
 // so a surviving literal does not enqueue it again; its lexical parent and
 // capture layout remain unchanged.
-func retainInlinedCapturedEntries(candidates map[*ir.Func]*lowerCandidate) {
+func retainCapturedEntries(candidates map[*ir.Func]*lowerCandidate) {
 	for fn, candidate := range candidates {
-		if fn.IsClosure() && fn.Linksym().WasInlined() && !fn.Walked() {
+		if fn.IsClosure() && !fn.Walked() {
 			fn.SetNeedctxt(true)
 			fn.SetWalked(true)
 			candidate.factory.Closures = append(candidate.factory.Closures, fn)

@@ -69,6 +69,7 @@ func main(){
 		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},
 		{"native-inline", "coro", "-d=coro=4"},
 		{"checkptr-inline", "coro", "-d=coro=4 -d=checkptr=2"},
+		{"native-inline-no-dwarf", "coro", "-d=coro=4 -dwarf=false -gendwarfinl=0"},
 		{"ordinary", "nocoro", "-l"},
 	} {
 		t.Run(config.name, func(t *testing.T) {
@@ -87,7 +88,7 @@ func main(){
 			}
 			if config.experiment == "coro" {
 				names := []string{"direct", "pureDriver", "instances", "readonlyDriver", "selected", "nilDriver", "recursiveDriver", "spawn", "panicDriver", "implicit", "exitDriver", "held"}
-				if strings.HasSuffix(config.name, "-inline") {
+				if strings.Contains(config.name, "inline") {
 					// Inlining the constructor creates independently named
 					// closure entries. Check the entries actually linked into
 					// this programme, as well as their native public callers.

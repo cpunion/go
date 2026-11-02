@@ -526,7 +526,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 		result.Lowered++
 	}
-	retainInlinedCapturedEntries(candidates)
+	retainCapturedEntries(candidates)
 	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
 		if plan.rewrittenCallers[function.Func] && candidates[function.Func] == nil {
