@@ -5000,3 +5000,17 @@ identity. This also admits a returned iterator directly as a range operand.
 No expression is hoisted out of a conditional or repeated evaluation point.
 Open or multiple callee targets and context-free indirect callees retain their
 ordinary execution until their selected-entry/nil-call contract is represented.
+
+### Conditional await expressions (work in progress, 2026-11-02)
+
+A logical expression with an awaited right operand becomes an ordered left
+assignment and a selected branch that assigns the same typed result cell. AND
+executes the right branch only for a true left result; OR executes it only for
+false. Recursive normalization keeps tuple argument initializers and complete
+inline bodies inside that selected branch. The logical expression's initializer
+runs once before its left operand, and the result cell survives suspension.
+
+The surrounding prefix must still permit exposing the whole logical expression
+at its original evaluation point. Expressions following an observable outer
+prefix and repeated for-header conditions retain the existing conservative
+fallback. Source ordinary entries preserve the original language control flow.

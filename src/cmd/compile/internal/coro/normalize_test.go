@@ -232,11 +232,29 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 		},
 	})
 
-	if len(conditionalReturn.Init()) != 0 {
-		t.Fatal("short-circuit right operand was hoisted")
-	}
-	if len(prefixReturn.Init()) != 0 {
-		t.Fatal("call following an observable prefix was hoisted")
+	for _, test := range []struct {
+		ret  *ir.ReturnStmt
+		left ir.Node
+		call *ir.CallExpr
+	}{
+		{conditionalReturn, conditional.X, conditionalCall},
+		{prefixReturn, prefix.X, prefixCall},
+	} {
+		if len(test.ret.Init()) != 2 {
+			t.Fatal("logical await has no ordered assignment and selected branch")
+		}
+		first, ok := test.ret.Init()[0].(*ir.AssignStmt)
+		if !ok || first.Y != test.left || test.ret.Results[0] != first.X {
+			t.Fatal("logical left operand was reordered or duplicated")
+		}
+		branch, ok := test.ret.Init()[1].(*ir.IfStmt)
+		if !ok || branch.Cond != first.X || len(branch.Body) != 1 {
+			t.Fatal("logical right operand lost its selected branch")
+		}
+		second, ok := branch.Body[0].(*ir.AssignStmt)
+		if !ok || second.X != first.X || second.Y != test.call {
+			t.Fatal("logical right await escaped its branch")
+		}
 	}
 	if len(directReturn.Init()) != 1 {
 		t.Fatalf("direct nested call Init has %d statements, want 1",
