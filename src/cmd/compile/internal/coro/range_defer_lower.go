@@ -34,6 +34,28 @@ func rangeBodyContains(body *rangeDeferBodyPlan, statement *ir.GoDeferStmt) bool
 		func(deferred *lowerDefer) bool { return deferred.statement == statement })
 }
 
+// The callback only registers these defers. Their recover/Goexit effects
+// execute later in the enclosing activation, so they must not prevent a
+// registration-only callback from supplying its demanded typed factory.
+// Every non-defer edge retains the existing range-body terminal restriction.
+func rangeDeferRegistrationFactorySupported(plan *Plan, body *rangeDeferBodyPlan) bool {
+	if body == nil || body.owner.err != nil || body.function.LocalTerminal&^MayPanic != 0 {
+		return false
+	}
+	for _, edge := range body.function.Edges {
+		if edge.Kind == DeferCall {
+			continue
+		}
+		summary, known := plan.edgeSummary(edge)
+		if !known || summary.Terminal&^MayPanic != 0 {
+			return false
+		}
+	}
+	registration := *body.function
+	registration.Terminal &= MayPanic
+	return rangeBodyFactorySupported(&registration)
+}
+
 // prepareRangeHybridBodies materializes ordinary source before any enclosing
 // frame rewrites. Each native cleanup body is an independent copy of the
 // validated working IR, bound to the ordinary callback's operand cells.

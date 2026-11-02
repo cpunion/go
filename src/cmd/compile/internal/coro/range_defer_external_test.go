@@ -28,6 +28,18 @@ func three(y func(int)bool){for i:=1;i<=3;i++{if !y(i){return}}}
 //go:noinline
 func one(y func(int)bool){y(1)}
 //go:noinline
+func empty(y func(int)bool){}
+//go:noinline
+func markerOnly(repeated bool){if repeated{for i:=0;i<3;i++{for v:=range empty{defer add(v)}}}else{for v:=range empty{defer add(v)}}}
+//go:noinline
+func repeatedMarkers(){for i:=0;i<4;i++{for v:=range one{defer add(i*10+v)}}}
+//go:noinline
+func sumArray(p *[256]int)int{sum:=0;for _,v:=range p{sum+=v};return sum}
+//go:noinline
+func bigStackTarget(){var values [256]int;for i:=range values{values[i]=i};add(sumArray(&values))}
+//go:noinline
+func overBudgetOwner(){for range one{defer bigStackTarget()}}
+//go:noinline
 func basic(){defer add(9);for v:=range three{defer add(v);runtime.Gosched()};defer add(8)}
 //go:noinline
 func separate(){defer add(9);for v:=range one{defer add(v)};defer add(8);for v:=range one{defer add(v+1)};defer add(7)}
@@ -73,6 +85,7 @@ func ordinaryBodyOwner(){defer add(9);for v:=range stash{runtime.LockOSThread();
 func mixed(lockedOwner,ordinaryBody bool){trace=nil;ready=make(chan struct{});release=make(chan struct{});done:=make(chan struct{});go func(){if lockedOwner{runtime.LockOSThread();defer runtime.UnlockOSThread()};if ordinaryBody{ordinaryBodyOwner()}else{escapedOwner()};close(done)}();<-ready;if !lockedOwner{runtime.LockOSThread()};if !saved(1)||!saved(2){panic("yield stopped")};if !lockedOwner{runtime.UnlockOSThread()};runtime.GC();close(release);<-done;check(8,2,1,9)}
 func check(want ...int){if !slices.Equal(trace,want){panic("range cleanup order")};trace=nil}
 func main(){
+ markerOnly(false);markerOnly(true);check();repeatedMarkers();check(31,21,11,1);overBudgetOwner();check(32640)
  basic();check(8,3,2,1,9);separate();check(7,2,8,1,9);nested();check(8,2,9)
  if early()!=2{panic("early result")};check(2,1,9);recursive(1);check(1,9,2,10)
  if replacement()!="replacement"{panic("replacement recover")};check(1,9)
@@ -107,13 +120,18 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"basic", "separate", "nested", "early", "recursive", "replacement", "rangeRecover", "namedRangeRecover", "rangeFactory", "nilCall", "exiting", "held", "escapedOwner", "ordinaryBodyOwner"} {
+				for _, name := range []string{"basic", "separate", "nested", "early", "recursive", "replacement", "rangeRecover", "namedRangeRecover", "rangeFactory", "nilCall", "exiting", "held", "escapedOwner", "ordinaryBodyOwner", "markerOnly", "repeatedMarkers"} {
 					t.Run(name, func(t *testing.T) {
 						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 							t.Fatal("lost native enclosing cleanup admission")
 						}
 					})
 				}
+				t.Run("over-budget", func(t *testing.T) {
+					if !linkedCoroStackUnsafe(t, binary, "main.overBudgetOwner.coro.stackgate") {
+						t.Fatal("enclosing owner ignored its deferred target's machine stack budget")
+					}
+				})
 			}
 			for _, p := range []string{"1", "4"} {
 				run := testenv.Command(t, binary)

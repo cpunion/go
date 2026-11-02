@@ -557,6 +557,22 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			specializedBodies[fn] = ordinary
 		}
 	}
+	// An ordinary-only range callback still shares its enclosing native
+	// owner's cells. Install its hybrid body before that owner reparents and
+	// rewrites the capture layout; restoring it afterward would lose those
+	// pointer-cell rewrites.
+	for _, function := range functions {
+		fn := function.Func
+		body := plan.rangeBodies[fn]
+		if body == nil || candidates[fn] != nil || candidates[body.owner.function] == nil || body.ordinary == nil {
+			continue
+		}
+		remapOrdinaryBody(fn, body.ordinary)
+		fn.Body = body.ordinary.Body
+		ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+		delete(rejectedBodies, fn)
+		delete(specializedBodies, fn)
+	}
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
 		depth := func(fn *ir.Func) int {
@@ -639,11 +655,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// typed factory to preserve its own defer scope during the outer unwind.
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
+	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
 	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) &&
-		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function))) {
+		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function) || rangeDeferRegistrationFactorySupported(plan, bodyPlan))) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
-	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
 	if ownerPlan != nil && ownerPlan.err != nil {
 		return nil, ownerPlan.err
 	}
@@ -3171,6 +3187,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		required := false
 		ir.Visit(node, func(node ir.Node) {
 			if required {
+				return
+			}
+			if assignment, ok := node.(*ir.AssignStmt); ok && candidate.rangeMarkers[assignment] != nil {
+				required = true
 				return
 			}
 			if panicExpr, ok := node.(*ir.UnaryExpr); ok &&
