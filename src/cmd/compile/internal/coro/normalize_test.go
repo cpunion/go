@@ -100,7 +100,10 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 
 func TestNormalizeAssignmentPrefixBoundaries(t *testing.T) {
 	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
 	pkg := types.NewPkg("example.com/coro/assignmentprefix", "p")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
 	caller := newLowerTestFunc(pkg, "caller")
 	result := []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}
 	target := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("target"), types.NewSignature(nil, nil, result))
