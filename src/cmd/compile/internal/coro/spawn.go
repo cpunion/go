@@ -40,11 +40,9 @@ func plainSpawnFactorySupported(function *Function) bool {
 	return function != nil && resumeFactorySupported(function.Func) && plainFactoryBodySupported(function)
 }
 
-// A normal callback invokes its ordinary entry from the resume adapter, rather
-// than as a deferred Go frame. A leaf recover therefore returns nil there and
-// cannot consume its caller's logical defer token. Keep the existing bounded
-// leaf and context-free ABI requirements; captured or transitive recover needs
-// a separate environment and terminal-control proof.
+// A normal callback has no direct-defer recover rights. Keep the existing
+// bounded leaf and context-free ABI requirements; captured or transitive
+// recover needs a separate environment and terminal-control proof.
 func plainCallbackFactorySupported(function *Function) bool {
 	return function != nil && resumeFactorySupported(function.Func) &&
 		function.LocalTerminal == function.Terminal &&
@@ -88,6 +86,41 @@ func plainFactoryBodySupportedWithTerminal(function *Function, allowed TerminalF
 		}
 		return false
 	})
+}
+
+// normalRecoverCallback supplies the normal-call variant of a bounded plain
+// callback. Calling the public entry here would expose the enclosing cleanup's
+// runtime recover bridge. A separate private copy makes its direct recover
+// expressions nil, retaining all other source effects and the public entry's
+// direct-defer behavior. Never rewrite shared source IR or publish this variant
+// as a defer entry.
+func normalRecoverCallback(fn *ir.Func, reader *BodyReader) *ir.Func {
+	if reader == nil || reader.Clone == nil || !reader.Have(fn) {
+		return nil
+	}
+	copy := reader.Clone(fn, types.LocalPkg.Lookup(fn.Sym().Name+".coro.callback"))
+	if copy == nil {
+		return nil
+	}
+	found := false
+	var edit func(ir.Node) ir.Node
+	edit = func(node ir.Node) ir.Node {
+		if node.Op() == ir.ORECOVER {
+			found = true
+			return ir.InitExpr(ir.TakeInit(node), ir.NewNilExpr(node.Pos(), node.Type()))
+		}
+		ir.EditChildren(node, edit)
+		return node
+	}
+	for i, statement := range copy.Body {
+		copy.Body[i] = edit(statement)
+	}
+	if !found {
+		return nil
+	}
+	ir.WithFunc(copy, func() { typecheck.Stmts(copy.Body) })
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, copy)
+	return copy
 }
 
 // newPlainSpawnFactory adapts an ordinary entry to the existing closure factory

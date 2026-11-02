@@ -127,3 +127,53 @@ func TestRangeDeferOwnerPlans(t *testing.T) {
 		})
 	}
 }
+
+func TestRangeDeferRegistrationExecution(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	typecheck.Target = new(ir.Package)
+	t.Cleanup(func() { typecheck.Target = oldTarget })
+	for _, mode := range []string{"registered", "direct-same-context", "local-context", "unregistered", "unknown", "spawn", "recover", "thread"} {
+		t.Run(mode, func(t *testing.T) {
+			pkg := types.NewPkg("example.com/coro/rangeregistration/"+mode, "p")
+			owner := newLowerTestFunc(pkg, "owner")
+			anchor := typecheck.TempAt(src.NoXPos, owner, types.Types[types.TINTER])
+			fn := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.ORANGE,
+				types.NewSignature(nil, nil, []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TBOOL])}),
+				owner, typecheck.Target, 0)
+			fn.DeclareParams(true)
+			ir.NewClosureVar(src.NoXPos, fn, anchor)
+			target := newLowerTestFunc(pkg, "cleanup")
+			call := newLowerTestCall(target)
+			function := &Function{Func: fn, Exec: NeedsTaskContext,
+				Edges: []Edge{{Kind: DeferCall, Callee: target, Node: call}}}
+			plan := &Plan{Functions: map[*ir.Func]*Function{
+				fn: function, target: {Func: target, Exec: NeedsTaskContext},
+			}}
+			body := &rangeDeferBodyPlan{function: function,
+				owner:   &rangeDeferOwnerPlan{function: owner},
+				cleanup: &lowerCandidate{defers: []*lowerDefer{{call: call}}},
+			}
+			switch mode {
+			case "direct-same-context":
+				function.Edges = append(function.Edges, Edge{Kind: DirectCall, Callee: target})
+			case "local-context":
+				function.LocalExec = NeedsTaskContext
+			case "unregistered":
+				body.cleanup.defers = nil
+			case "unknown":
+				function.Edges = append(function.Edges, Edge{Kind: DirectCall, Unknown: true})
+			case "spawn":
+				function.Edges = append(function.Edges, Edge{Kind: GoCall, Callee: target})
+			case "recover":
+				function.LocalTerminal, function.Terminal = UsesRecover, UsesRecover
+			case "thread":
+				function.LocalExec = ThreadAffine
+				function.Exec |= ThreadAffine
+			}
+			if got, want := rangeDeferRegistrationFactorySupported(plan, body), mode == "registered"; got != want {
+				t.Fatalf("registration factory=%t, want %t", got, want)
+			}
+		})
+	}
+}

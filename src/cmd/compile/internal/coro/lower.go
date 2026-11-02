@@ -347,7 +347,14 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	})
 	for _, target := range callbackTargets {
 		if child := plan.Functions[target]; plainCallbackFactorySupported(child) {
-			factories[target] = newPlainSpawnFactory(target, target.Nname)
+			callee := target
+			if child.Terminal&UsesRecover != 0 {
+				callee = normalRecoverCallback(target, bodies)
+				if callee == nil {
+					continue
+				}
+			}
+			factories[target] = newPlainSpawnFactory(target, callee.Nname)
 			child.Factory = FactoryABI1
 		}
 	}
