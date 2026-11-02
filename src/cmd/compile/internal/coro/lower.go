@@ -863,6 +863,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 			case *ir.BranchStmt:
 				var target ir.Node
+				if stmt.Op() == ir.OGOTO && function.inlineLabels[stmt.Label] != nil {
+					target = function.inlineLabels[stmt.Label]
+				}
 				if stmt.Label == nil {
 					switch stmt.Op() {
 					case ir.OBREAK:
@@ -927,6 +930,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				switch stmt.Op() {
 				case ir.OLABEL:
+					if label := stmt.(*ir.LabelStmt); function.inlineLabels[label.Label] == label {
+						break
+					}
 					return fmt.Errorf("control flow %v", stmt.Op())
 				}
 			}
@@ -3053,6 +3059,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		states = append(states, state)
 		return stateIndex
 	}
+	inlineStates := make(map[*ir.LabelStmt]int)
+	var inlineLabels []*ir.LabelStmt
+	for _, label := range function.inlineLabels {
+		inlineLabels = append(inlineLabels, label)
+	}
+	slices.SortFunc(inlineLabels, func(a, b *ir.LabelStmt) int {
+		return strings.Compare(a.Label.Name, b.Label.Name)
+	})
+	for _, label := range inlineLabels {
+		inlineStates[label] = addState(lowerState{next: -1, thenState: -1, elseState: -1})
+	}
 	captureCellAllocation := func(name *ir.Name) ir.Node {
 		cell := captureCell(name)
 		if cell == nil {
@@ -3156,6 +3173,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				required = true
 				return
 			}
+			if label, ok := node.(*ir.LabelStmt); ok {
+				if _, owned := inlineStates[label]; owned {
+					required = true
+					return
+				}
+			}
 			if branch, ok := node.(*ir.BranchStmt); ok && candidate.branches[branch] != nil {
 				required = true
 				return
@@ -3192,6 +3215,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			return true
 		case *ir.BranchStmt:
 			return candidate.branches[stmt] != nil
+		case *ir.LabelStmt:
+			_, ok := inlineStates[stmt]
+			return ok
 		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.RangeStmt, *ir.SelectStmt:
 			return requiresControlLowering(stmt)
 		}
@@ -3247,6 +3273,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	lowerStatement = func(stmt ir.Node, next int) int {
 		switch stmt := stmt.(type) {
+		case *ir.LabelStmt:
+			state, ok := inlineStates[stmt]
+			if !ok {
+				panic("unexpected coroutine label")
+			}
+			states[state].next = next
+			return lowerStatements(stmt.Init(), state)
 		case *ir.SwitchStmt:
 			breakStates[stmt] = next
 			entries := make([]int, len(stmt.Cases))
@@ -3261,6 +3294,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 		case *ir.BranchStmt:
 			target := candidate.branches[stmt]
+			if label, ok := target.(*ir.LabelStmt); ok {
+				return lowerStatements(stmt.Init(), inlineStates[label])
+			}
 			state, ok := breakStates[target]
 			if stmt.Op() == ir.OCONTINUE {
 				state, ok = continueStates[target]

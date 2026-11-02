@@ -41,7 +41,7 @@ func invoke(f func(int)int,x int)int{return f(x)}
 func makeCaller(seed int)func(func(int)int,int)int{return func(f func(int)int,x int)int{seed++;return f(seed+x)}}
 //go:noinline
 func direct()int{g:=func(x int)int{runtime.Gosched();return x+1};a:=makeCaller(10)(g,0);b:=inlineCaller(11)(g,0);return a+b}
-func inlineCaller(seed int)func(func(int)int,int)int{return func(f func(int)int,x int)int{seed++;return f(seed+x)}}
+func inlineCaller(seed int)func(func(int)int,int)int{return func(f func(int)int,x int)int{seed++;if seed<0{return f(-seed+x)};return f(seed+x)}}
 var operands int
 func argument()int{events=events*10+3;operands++;runtime.Gosched();return 2}
 //go:noinline
