@@ -17,6 +17,22 @@ import (
 // represent one of these cells as an explicitly captured pointer.
 var factoryCaptureTypes = make(map[*ir.Func][]*types.Type)
 
+// Body rewriting can remove the last closure literal for an entry that was
+// already inlined. Its content-addressed code symbol is still referenced by
+// inline metadata and may also be used by native target dispatch. Keep the
+// public entry on its factory's compilation list. Use walkClosure's queue flag
+// so a surviving literal does not enqueue it again; its lexical parent and
+// capture layout remain unchanged.
+func retainInlinedCapturedEntries(candidates map[*ir.Func]*lowerCandidate) {
+	for fn, candidate := range candidates {
+		if fn.IsClosure() && fn.Linksym().WasInlined() && !fn.Walked() {
+			fn.SetNeedctxt(true)
+			fn.SetWalked(true)
+			candidate.factory.Closures = append(candidate.factory.Closures, fn)
+		}
+	}
+}
+
 func capturedFactorySupported(fn *ir.Func) bool {
 	if fn == nil || fn.OClosure == nil || fn.Wrapper() ||
 		fn.Type() == nil || fn.Type().HasShape() || len(fn.ClosureVars) == 0 {
