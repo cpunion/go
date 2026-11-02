@@ -81,7 +81,25 @@ func stash(y func(int)bool){saved=y;close(callbackReady);<-callbackRelease}
 //go:noinline
 func escapedOwner()(n int){b:=&box{};defer func(){n=b.n}();for v:=range stash{runtime.LockOSThread();b.n+=v;f:=maker(b,1);defer f(twice);f=nil;runtime.UnlockOSThread()};return}
 func mixed(locked bool){callbackReady=make(chan struct{});callbackRelease=make(chan struct{});done:=make(chan int,1);go func(){if locked{runtime.LockOSThread();defer runtime.UnlockOSThread()};done<-escapedOwner()}();<-callbackReady;if !locked{runtime.LockOSThread()};saved(1);saved(2);if !locked{runtime.UnlockOSThread()};runtime.GC();close(callbackRelease);if <-done!=15{panic("escaped callback cells")}}
-func controls(){if deferOne()!=15||variants()!=45||union(false)!=15||union(true)!=22||capturedCallback()!=12||rangeOwner()!=15{panic("callback operands")};before:=evaluations;if _,ok:=nilCallee(true).(runtime.Error);!ok||evaluations!=before+1{panic("callee nil timing")};if nilCallee(false)!=nil{panic("non-nil callee")};if _,ok:=nilCallback(true).(runtime.Error);!ok||nilCallback(false)!=nil{panic("callback nil timing")};observed="unset";if recoverOwner()!="direct"||observed!=nil||replacement()!="replacement"{panic("callback terminal ownership")}}
+
+//go:noinline
+func publicRecover(){defer recoverCallback();runtime.Gosched();panic("public-defer")}
+//go:noinline
+func noRecoverCallback()any{return nil}
+//go:noinline
+func recoverUnion(choose bool)(caught any){f:=recoverMaker(&caught);cb:=noRecoverCallback;if choose{cb=recoverCallback};defer f(cb);runtime.Gosched();panic("union")}
+//go:noinline
+func indirectRecover()any{return recoverCallback()}
+//go:noinline
+func recoverIndirect()(caught any){f:=recoverMaker(&caught);defer f(indirectRecover);runtime.Gosched();panic("indirect")}
+var capturedRecoverEffect int
+//go:noinline
+func capturedRecovery(seed int)func()any{return func()any{capturedRecoverEffect+=seed;return recover()}}
+//go:noinline
+func recoverCaptured()(caught any){f:=recoverMaker(&caught);defer f(capturedRecovery(7));runtime.Gosched();panic("captured")}
+func extraControls(){publicRecover();observed="unset";if recoverUnion(false)!="union"||observed!=nil{panic("plain union")};observed="unset";if recoverUnion(true)!="union"||observed!=nil{panic("recover union")};observed="unset";if recoverIndirect()!="indirect"||observed!=nil{panic("transitive recovery fallback")};observed="unset";before:=capturedRecoverEffect;if recoverCaptured()!="captured"||observed!=nil||capturedRecoverEffect!=before+7{panic("captured recovery fallback")}}
+
+func controls(){extraControls();if deferOne()!=15||variants()!=45||union(false)!=15||union(true)!=22||capturedCallback()!=12||rangeOwner()!=15{panic("callback operands")};before:=evaluations;if _,ok:=nilCallee(true).(runtime.Error);!ok||evaluations!=before+1{panic("callee nil timing")};if nilCallee(false)!=nil{panic("non-nil callee")};if _,ok:=nilCallback(true).(runtime.Error);!ok||nilCallback(false)!=nil{panic("callback nil timing")};observed="unset";if recoverOwner()!="direct"||observed!=nil||replacement()!="replacement"{panic("callback terminal ownership")}}
 func main(){controls();runtime.LockOSThread();controls();runtime.UnlockOSThread();d:=make(chan struct{});go exiting(d);<-d;if exited!=8{panic("callback Goexit")};ready=make(chan struct{},32);release=make(chan struct{});done:=make(chan int,32);for i:=0;i<32;i++{p:=&box{n:10};p.pad[2047]=byte(i);spawn(p,i,done)};for i:=0;i<32;i++{<-ready};runtime.GC();close(release);sum:=0;for i:=0;i<32;i++{sum+=<-done};if sum!=1136{panic("callback parked captures")};mixed(false);mixed(true);println("captured-operand-callbacks-ok")}
 `
 	for _, config := range []struct{ name, experiment, flags string }{
@@ -105,7 +123,7 @@ func main(){controls();runtime.LockOSThread();controls();runtime.UnlockOSThread(
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"deferOne", "variants", "union", "capturedCallback", "nilCallee", "nilCallback", "spawn", "recoverOwner", "replacement", "exiting", "rangeOwner", "escapedOwner"} {
+				for _, name := range []string{"deferOne", "variants", "union", "capturedCallback", "nilCallee", "nilCallback", "spawn", "recoverOwner", "publicRecover", "recoverUnion", "replacement", "exiting", "rangeOwner", "escapedOwner"} {
 					t.Run(name, func(t *testing.T) {
 						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 							t.Fatal("captured operand callback lost native admission")

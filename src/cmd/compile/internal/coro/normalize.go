@@ -331,23 +331,31 @@ func safeCallPrefix(root, target ir.Node) bool {
 	// snapshotting p would move a nil check or a variable read before target.
 	// Calls, indices and other complex destinations retain the conservative
 	// prefix check below until their ordered operands can be exposed too.
-	switch assign := root.(type) {
-	case *ir.AssignStmt:
-		if lateAssignmentTarget(assign.X) && containsCall(assign.Y, target) {
-			return safeCallPrefix(assign.Y, target)
-		}
-	case *ir.AssignListStmt:
-		late := true
-		for _, lhs := range assign.Lhs {
-			late = late && lateAssignmentTarget(lhs)
-		}
-		if late {
-			for _, rhs := range assign.Rhs {
-				if containsCall(rhs, target) {
-					return safeCallPrefix(rhs, target)
-				}
-				if staticinit.AnySideEffects(rhs) {
-					return false
+	// Initializers and tuple/receive protocols retain their complete original
+	// ordering. In particular a two-result receive cannot become a scalar.
+	if len(root.Init()) == 0 {
+		switch assign := root.(type) {
+		case *ir.AssignStmt:
+			if assign.X.Op() != ir.ONAME && lateAssignmentTarget(assign.X) && containsCall(assign.Y, target) {
+				return safeCallPrefix(assign.Y, target)
+			}
+		case *ir.AssignListStmt:
+			if assign.Op() != ir.OAS2 {
+				break
+			}
+			late, complex := true, false
+			for _, lhs := range assign.Lhs {
+				late = late && lateAssignmentTarget(lhs)
+				complex = complex || lhs.Op() != ir.ONAME
+			}
+			if late && complex {
+				for _, rhs := range assign.Rhs {
+					if containsCall(rhs, target) {
+						return safeCallPrefix(rhs, target)
+					}
+					if staticinit.AnySideEffects(rhs) {
+						return false
+					}
 				}
 			}
 		}
