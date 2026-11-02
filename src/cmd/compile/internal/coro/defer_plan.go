@@ -16,10 +16,23 @@ import (
 // resumable defer contract and retain their existing fallback here.
 func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 	function := plan.Functions[fn]
-	return function != nil && fn.OClosure != nil && !fn.Wrapper() &&
-		fn.Type().NumParams() == 0 && fn.Type().NumResults() == 0 &&
-		callableFactorySupported(fn) && function.Effect == MaySuspend &&
-		function.Exec == 0 && function.Terminal&^MayPanic == 0
+	if function == nil || fn.OClosure == nil || fn.Wrapper() ||
+		fn.Type().NumParams() != 0 || fn.Type().NumResults() != 0 ||
+		!callableFactorySupported(fn) || function.Effect != MaySuspend ||
+		function.Exec != 0 || function.Terminal&^MayPanic != 0 {
+		return false
+	}
+	for _, edge := range function.Edges {
+		// MaySuspend can also come from an unknown call. It is not proof
+		// that a typed child factory exists for that call or its captures.
+		if edge.Unknown {
+			return false
+		}
+		if _, known := plan.edgeSummary(edge); !known {
+			return false
+		}
+	}
+	return true
 }
 
 // planNativeDefers validates the exact cleanup targets and capture lifetimes

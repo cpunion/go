@@ -1147,7 +1147,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if site.Kind == SiteAwait {
 				continue
 			}
-			return nil, fmt.Errorf("unsupported deferred operation %s", site.Kind)
+			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
 		case SiteRangeDefer:
