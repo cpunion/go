@@ -77,7 +77,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"integers", "slices", "arrays", "arrayPointers", "stringsRange", "maps", "channels", "selected", "nested"} {
+				for _, name := range []string{"integers", "slices", "arrays", "arrayPointers", "stringsRange", "maps", "channels", "selected", "nested", "shortCircuit"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission", name)
 					}

@@ -128,6 +128,11 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 		})
 		if call, ok := node.(*ir.CallExpr); ok && calls[call] {
 			order = append(order, node)
+		} else if logical, ok := node.(*ir.LogicalExpr); ok && ir.Any(logical.Y, func(n ir.Node) bool {
+			call, ok := n.(*ir.CallExpr)
+			return ok && calls[call]
+		}) {
+			order = append(order, node)
 		} else if inlined, ok := node.(*ir.InlinedCallExpr); ok && len(labels) != 0 &&
 			len(inlined.ReturnVars) == 1 && ir.Any(inlined, func(n ir.Node) bool {
 			call, ok := n.(*ir.CallExpr)
@@ -147,6 +152,33 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	for {
 		changed := false
 		for _, node := range order {
+			if logical, ok := node.(*ir.LogicalExpr); ok && safeCallPrefix(root, logical) {
+				// Preserve the conditional evaluation point by assigning the
+				// left operand first and executing the complete right operand
+				// only in its selected branch. Recursive normalization keeps
+				// inline control flow and argument initializers in that branch.
+				logical = typecheck.Expr(logical).(*ir.LogicalExpr)
+				value := typecheck.TempAt(logical.Pos(), fn, logical.Type())
+				first := ir.NewAssignStmt(logical.Pos(), value, logical.X)
+				first.SetInit(ir.Nodes{ir.NewDecl(logical.Pos(), ir.ODCL, value)})
+				value.Defn = first
+				var condition ir.Node = value
+				if logical.Op() == ir.OOROR {
+					condition = ir.NewUnaryExpr(logical.Pos(), ir.ONOT, value)
+				}
+				second := ir.NewAssignStmt(logical.Pos(), value, logical.Y)
+				branch := ir.NewIfStmt(logical.Pos(), condition, ir.Nodes{second}, nil)
+				body := append(ir.TakeInit(logical), typecheck.Stmt(first), typecheck.Stmt(branch))
+				normalizeCallList(body, fn, calls, labels...)
+				// Typechecking an auto temporary updates Defn for each write.
+				// Keep its declaration's initial assignment as the definition;
+				// ordinary reassignment analysis still sees the guarded write.
+				value.Defn = first
+				init = append(init, body...)
+				root = replaceNormalizedExpression(root, logical, value)
+				changed = true
+				continue
+			}
 			if inlined, ok := node.(*ir.InlinedCallExpr); ok && len(inlined.Body) != 0 &&
 				safeCallPrefix(root, inlined) {
 				// Move the complete inline execution at its original evaluation

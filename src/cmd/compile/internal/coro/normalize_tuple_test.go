@@ -25,7 +25,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
 	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
-	for _, mode := range []string{"return", "plain-return", "tuple-return", "condition", "statement", "short-circuit", "observable-prefix", "loop", "inlined", "inlined-init", "plain-init"} {
+	for _, mode := range []string{"return", "plain-return", "tuple-return", "condition", "statement", "short-circuit", "or-circuit", "observable-prefix", "loop", "inlined", "inlined-init", "plain-init"} {
 		t.Run(mode, func(t *testing.T) {
 			pkg := types.NewPkg("example.com/coro/tupleinit/"+mode, "p")
 			types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
@@ -36,7 +36,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 			results := one()
 			if mode == "tuple-return" {
 				results = fields()
-			} else if mode == "condition" || mode == "short-circuit" || mode == "loop" {
+			} else if mode == "condition" || mode == "short-circuit" || mode == "or-circuit" || mode == "loop" {
 				results = fields()[1:]
 			}
 			caller := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("caller"), types.NewSignature(nil, nil, results))
@@ -80,8 +80,12 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 				root = ir.NewIfStmt(src.NoXPos, outer, nil, nil)
 			case "statement":
 				root = outer
-			case "short-circuit":
-				ret.Results[0] = ir.NewLogicalExpr(src.NoXPos, ir.OANDAND, ir.NewBool(src.NoXPos, true), outer)
+			case "short-circuit", "or-circuit":
+				op := ir.OANDAND
+				if mode == "or-circuit" {
+					op = ir.OOROR
+				}
+				ret.Results[0] = ir.NewLogicalExpr(src.NoXPos, op, ir.NewBool(src.NoXPos, true), outer)
 			case "observable-prefix":
 				prior := newLowerTestCall(ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("prior"), types.NewSignature(nil, nil, one())))
 				prior.SetType(types.Types[types.TINT])
@@ -110,6 +114,42 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 			}
 			function := &Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary, Sites: sites}
 			normalizeSingleResultCalls(function)
+			if mode == "short-circuit" || mode == "or-circuit" {
+				if len(root.Init()) != 2 {
+					t.Fatal("logical tuple call has no guarded execution")
+				}
+				first, ok := root.Init()[0].(*ir.AssignStmt)
+				if !ok || len(first.Init()) != 1 || first.Init()[0].Op() != ir.ODCL || first.X.Name().Defn != first {
+					t.Fatal("logical result storage is not declared once")
+				}
+				branch, ok := root.Init()[1].(*ir.IfStmt)
+				if !ok || len(branch.Body) != 1 {
+					t.Fatal("logical tuple initializer has no selected branch")
+				}
+				condition := branch.Cond
+				if mode == "or-circuit" {
+					negated, ok := condition.(*ir.UnaryExpr)
+					if !ok || negated.Op() != ir.ONOT {
+						t.Fatal("OR right operand uses the wrong condition")
+					}
+					condition = negated.X
+				}
+				second, ok := branch.Body[0].(*ir.AssignStmt)
+				if !ok || condition != first.X || second.X != first.X || second.Y != outer || !slices.Equal(second.Init(), original) {
+					t.Fatal("tuple effects crossed the short-circuit boundary")
+				}
+				for i, value := range values {
+					if outer.Args[i] != arguments[i] || value.Name().Defn != assignment || assignment.Init()[i].Op() != ir.ODCL {
+						t.Fatal("logical tuple declarations changed")
+					}
+				}
+				before := slices.Clone(root.Init())
+				normalizeSingleResultCalls(function)
+				if !slices.Equal(root.Init(), before) || !slices.Equal(second.Init(), original) {
+					t.Fatal("logical tuple normalization is not idempotent")
+				}
+				return
+			}
 			if mode == "inlined" || mode == "inlined-init" {
 				// The complete inline execution can now be exposed. Check its
 				// evaluation sequence rather than requiring the old fallback.
