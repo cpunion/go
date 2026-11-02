@@ -77,6 +77,20 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		initNode.SetInit(prefix)
 		normalizeCallList(stmt.Body, fn, calls)
 		return
+	case *ir.RangeStmt:
+		// Keep the operand and bindings at their original evaluation points.
+		// Only body statements execute once for each selected iteration.
+		initNode.SetInit(prefix)
+		normalizeCallList(stmt.Body, fn, calls)
+		return
+	case *ir.SelectStmt:
+		// Communications are chosen before any case body runs. Normalize
+		// awaits inside the chosen body without moving them into dispatch.
+		initNode.SetInit(prefix)
+		for _, clause := range stmt.Cases {
+			normalizeCallList(clause.Body, fn, calls)
+		}
+		return
 	case *ir.SwitchStmt:
 		initNode.SetInit(prefix)
 		for _, clause := range stmt.Cases {
