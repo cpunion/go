@@ -11,26 +11,35 @@ import (
 	"cmd/compile/internal/types"
 )
 
-// normalizeSingleResultCalls makes nested single-result awaits, sole
-// multi-result return awaits, and safe call initializers explicit.
+// normalizeSuspensionExpressions exposes single-value receives and awaited
+// operations at their original evaluation points, including guarded branches and
+// repeated loop headers. Sole multi-result returns keep independent result cells.
 //
 // The normal ordering pass runs after escape analysis, but coroutine lowering
 // must run before it. Keep this pass deliberately smaller: it only introduces
 // assignments that expose suspension points, and declines transformations
 // that would move a call across an observable operation.
-func normalizeSingleResultCalls(function *Function) {
+func normalizeSuspensionExpressions(function *Function) {
 	if function == nil || function.Func == nil ||
 		function.Primary != CoroPrimary {
 		return
 	}
 
-	calls := make(map[*ir.CallExpr]bool)
+	operations := make(map[ir.Node]bool)
 	for _, site := range function.Sites {
-		call, ok := site.Node.(*ir.CallExpr)
-		if !ok || site.Kind != SiteAwait || call.Type() == nil {
+		if site.Node == nil || site.Node.Type() == nil {
 			continue
 		}
-		calls[call] = true
+		switch site.Kind {
+		case SiteAwait:
+			if _, ok := site.Node.(*ir.CallExpr); ok {
+				operations[site.Node] = true
+			}
+		case SiteChannel:
+			if site.Node.Op() == ir.ORECV {
+				operations[site.Node] = true
+			}
+		}
 	}
 
 	oldCurFunc := ir.CurFunc
@@ -38,38 +47,38 @@ func normalizeSingleResultCalls(function *Function) {
 	if function.continuationLabels == nil {
 		function.continuationLabels = make(map[*types.Sym]*ir.LabelStmt)
 	}
-	normalizeCallList(function.Func.Body, function.Func, calls, function.continuationLabels)
+	normalizeCallList(function.Func.Body, function.Func, operations, function.continuationLabels)
 	ir.CurFunc = oldCurFunc
 }
 
 func normalizeCallList(list ir.Nodes, fn *ir.Func,
-	calls map[*ir.CallExpr]bool, labels ...map[*types.Sym]*ir.LabelStmt) {
+	operations map[ir.Node]bool, labels ...map[*types.Sym]*ir.LabelStmt) {
 	for _, stmt := range list {
-		normalizeCallStatement(stmt, fn, calls, labels...)
+		normalizeCallStatement(stmt, fn, operations, labels...)
 	}
 }
 
 func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
-	calls map[*ir.CallExpr]bool, labels ...map[*types.Sym]*ir.LabelStmt) {
+	operations map[ir.Node]bool, labels ...map[*types.Sym]*ir.LabelStmt) {
 	initNode, ok := stmt.(ir.InitNode)
 	if !ok {
 		return
 	}
 	prefix := ir.TakeInit(stmt)
-	normalizeCallList(prefix, fn, calls, labels...)
+	normalizeCallList(prefix, fn, operations, labels...)
 
 	var root ir.Node
 	switch stmt := stmt.(type) {
 	case *ir.BlockStmt:
 		initNode.SetInit(prefix)
-		normalizeCallList(stmt.List, fn, calls, labels...)
+		normalizeCallList(stmt.List, fn, operations, labels...)
 		return
 	case *ir.IfStmt:
 		var init ir.Nodes
-		stmt.Cond, init = normalizeCallExpression(stmt.Cond, fn, calls, false, labels...)
+		stmt.Cond, init = normalizeCallExpression(stmt.Cond, fn, operations, false, labels...)
 		initNode.SetInit(append(prefix, init...))
-		normalizeCallList(stmt.Body, fn, calls, labels...)
-		normalizeCallList(stmt.Else, fn, calls, labels...)
+		normalizeCallList(stmt.Body, fn, operations, labels...)
+		normalizeCallList(stmt.Else, fn, operations, labels...)
 		return
 	case *ir.ForStmt:
 		// Keep condition execution inside the loop. In particular continue
@@ -77,8 +86,7 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		// moving condition initializers to the loop's Init would run them once.
 		initNode.SetInit(prefix)
 		if stmt.Cond != nil && ir.Any(stmt.Cond, func(node ir.Node) bool {
-			call, ok := node.(*ir.CallExpr)
-			return ok && calls[call]
+			return operations[node]
 		}) {
 			not := ir.NewUnaryExpr(stmt.Cond.Pos(), ir.ONOT, stmt.Cond)
 			stop := ir.NewBranchStmt(stmt.Pos(), ir.OBREAK, nil)
@@ -87,9 +95,9 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 			stmt.Cond = nil
 		}
 		if stmt.Post != nil {
-			normalizeCallStatement(stmt.Post, fn, calls, labels...)
+			normalizeCallStatement(stmt.Post, fn, operations, labels...)
 		}
-		normalizeCallList(stmt.Body, fn, calls, labels...)
+		normalizeCallList(stmt.Body, fn, operations, labels...)
 		return
 	case *ir.LabelStmt:
 		if stmt.LoopVarContinue() && len(labels) != 0 {
@@ -101,20 +109,20 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		// Keep the operand and bindings at their original evaluation points.
 		// Only body statements execute once for each selected iteration.
 		initNode.SetInit(prefix)
-		normalizeCallList(stmt.Body, fn, calls, labels...)
+		normalizeCallList(stmt.Body, fn, operations, labels...)
 		return
 	case *ir.SelectStmt:
 		// Communications are chosen before any case body runs. Normalize
 		// awaits inside the chosen body without moving them into dispatch.
 		initNode.SetInit(prefix)
 		for _, clause := range stmt.Cases {
-			normalizeCallList(clause.Body, fn, calls, labels...)
+			normalizeCallList(clause.Body, fn, operations, labels...)
 		}
 		return
 	case *ir.SwitchStmt:
 		initNode.SetInit(prefix)
 		for _, clause := range stmt.Cases {
-			normalizeCallList(clause.Body, fn, calls, labels...)
+			normalizeCallList(clause.Body, fn, operations, labels...)
 		}
 		return
 	case *ir.ReturnStmt, *ir.AssignStmt, *ir.AssignListStmt:
@@ -126,12 +134,12 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		return
 	}
 
-	_, init := normalizeCallExpression(root, fn, calls, true, labels...)
+	_, init := normalizeCallExpression(root, fn, operations, true, labels...)
 	initNode.SetInit(append(prefix, init...))
 }
 
 func normalizeCallExpression(root ir.Node, fn *ir.Func,
-	calls map[*ir.CallExpr]bool, directStatement bool, labels ...map[*types.Sym]*ir.LabelStmt) (ir.Node, ir.Nodes) {
+	operations map[ir.Node]bool, directStatement bool, labels ...map[*types.Sym]*ir.LabelStmt) (ir.Node, ir.Nodes) {
 	var order []ir.Node
 	var visit func(ir.Node)
 	visit = func(node ir.Node) {
@@ -142,20 +150,18 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			visit(child)
 			return false
 		})
-		if call, ok := node.(*ir.CallExpr); ok && calls[call] {
+		if operations[node] {
 			order = append(order, node)
 		} else if logical, ok := node.(*ir.LogicalExpr); ok && ir.Any(logical.Y, func(n ir.Node) bool {
-			call, ok := n.(*ir.CallExpr)
-			return ok && calls[call]
+			return operations[n]
 		}) {
 			order = append(order, node)
 		} else if inlined, ok := node.(*ir.InlinedCallExpr); ok && len(labels) != 0 &&
 			len(inlined.ReturnVars) == 1 && ir.Any(inlined, func(n ir.Node) bool {
-			call, ok := n.(*ir.CallExpr)
-			return ok && calls[call]
+			return operations[n]
 		}) {
 			order = append(order, node)
-		} else if node.Op() != ir.OINLCALL && node.Type() != nil && hasAwaitInit(node, calls) {
+		} else if node.Op() != ir.OINLCALL && node.Type() != nil && hasSuspensionInit(node, operations) {
 			order = append(order, node)
 		}
 	}
@@ -163,7 +169,7 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 
 	var init ir.Nodes
 	// Exposing a call's initializer can make an argument initializer safe on
-	// the next pass. Each change removes an initializer or await from root,
+	// the next pass. Each change removes an initializer or suspension from root,
 	// so this reaches a fixed point without duplicating an evaluation.
 	for {
 		changed := false
@@ -185,7 +191,7 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				second := ir.NewAssignStmt(logical.Pos(), value, logical.Y)
 				branch := ir.NewIfStmt(logical.Pos(), condition, ir.Nodes{second}, nil)
 				body := append(ir.TakeInit(logical), typecheck.Stmt(first), typecheck.Stmt(branch))
-				normalizeCallList(body, fn, calls, labels...)
+				normalizeCallList(body, fn, operations, labels...)
 				// Typechecking an auto temporary updates Defn for each write.
 				// Keep its declaration's initial assignment as the definition;
 				// ordinary reassignment analysis still sees the guarded write.
@@ -216,35 +222,34 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				for _, statement := range body {
 					ownLabels(statement)
 				}
-				normalizeCallList(body, fn, calls, labels...)
+				normalizeCallList(body, fn, operations, labels...)
 				init = append(init, body...)
 				root = replaceNormalizedExpression(root, inlined, inlined.SingleResult())
 				changed = true
 				continue
 			}
-			if hasAwaitInit(node, calls) && safeCallPrefix(root, node) {
+			if hasSuspensionInit(node, operations) && safeCallPrefix(root, node) {
 				// The frontend expands f(g()) into tuple assignments in an
 				// argument conversion's Init list or the call's Init list.
 				// Expose the entire ordered prefix before normalizing f,
 				// including earlier callee evaluation. A non-suspending f
 				// needs the same treatment.
 				prefix := ir.TakeInit(node)
-				normalizeCallList(prefix, fn, calls, labels...)
+				normalizeCallList(prefix, fn, operations, labels...)
 				init = append(init, prefix...)
 				changed = true
 			}
-			call, ok := node.(*ir.CallExpr)
-			if !ok || !calls[call] {
+			if !operations[node] {
 				continue
 			}
-			if directStatement && directCallStatement(root, call) {
+			if directStatement && directSuspensionStatement(root, node) {
 				continue
 			}
-			if hasNestedCall(call, calls) ||
-				!safeCallPrefix(root, call) {
+			if hasNestedSuspension(node, operations) ||
+				!safeCallPrefix(root, node) {
 				continue
 			}
-			if call.Type().IsFuncArgStruct() {
+			if call, ok := node.(*ir.CallExpr); ok && call.Type().IsFuncArgStruct() {
 				ret, ok := root.(*ir.ReturnStmt)
 				if !ok || len(ret.Results) != 1 || ret.Results[0] != call ||
 					call.Fun.Type().NumResults() != fn.Type().NumResults() || fn.Type().NumResults() < 2 {
@@ -270,12 +275,12 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				continue
 			}
 
-			temp := typecheck.TempAt(call.Pos(), fn, call.Type())
-			assign := ir.NewAssignStmt(call.Pos(), temp, call)
-			assign.PtrInit().Append(ir.NewDecl(call.Pos(), ir.ODCL, temp))
+			temp := typecheck.TempAt(node.Pos(), fn, node.Type())
+			assign := ir.NewAssignStmt(node.Pos(), temp, node)
+			assign.PtrInit().Append(ir.NewDecl(node.Pos(), ir.ODCL, temp))
 			temp.Defn = assign
 			init.Append(typecheck.Stmt(assign))
-			root = replaceCall(root, call, temp)
+			root = replaceNormalizedExpression(root, node, temp)
 			changed = true
 		}
 		if !changed {
@@ -285,11 +290,10 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	return root, init
 }
 
-func hasAwaitInit(node ir.Node, calls map[*ir.CallExpr]bool) bool {
+func hasSuspensionInit(node ir.Node, operations map[ir.Node]bool) bool {
 	for _, stmt := range node.Init() {
 		if ir.Any(stmt, func(node ir.Node) bool {
-			await, ok := node.(*ir.CallExpr)
-			return ok && calls[await]
+			return operations[node]
 		}) {
 			return true
 		}
@@ -297,22 +301,21 @@ func hasAwaitInit(node ir.Node, calls map[*ir.CallExpr]bool) bool {
 	return false
 }
 
-func directCallStatement(root ir.Node, call *ir.CallExpr) bool {
+func directSuspensionStatement(root, operation ir.Node) bool {
 	switch root := root.(type) {
 	case *ir.CallExpr:
-		return root == call
+		return root == operation
 	case *ir.AssignStmt:
-		return root.Y == call
+		return root.Y == operation
 	case *ir.AssignListStmt:
-		return len(root.Rhs) == 1 && root.Rhs[0] == call
+		return len(root.Rhs) == 1 && root.Rhs[0] == operation
 	}
 	return false
 }
 
-func hasNestedCall(root *ir.CallExpr, calls map[*ir.CallExpr]bool) bool {
+func hasNestedSuspension(root ir.Node, operations map[ir.Node]bool) bool {
 	return ir.Any(root, func(node ir.Node) bool {
-		call, ok := node.(*ir.CallExpr)
-		return ok && call != root && calls[call]
+		return node != root && operations[node]
 	})
 }
 

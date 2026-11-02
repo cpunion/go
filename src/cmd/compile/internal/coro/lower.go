@@ -277,8 +277,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 	}
 	for _, function := range functions {
-		normalizeReceiveExpressions(function)
-		normalizeSingleResultCalls(function)
+		normalizeSuspensionExpressions(function)
 	}
 	// Source defer literals use the existing in-place cleanup rewrite. Do not
 	// also replace their bodies with standalone entries: the cleanup rewrite

@@ -219,7 +219,7 @@ func TestLowerTupleFunctionReturn(t *testing.T) {
 	if edge.Unknown || !slices.Equal(edge.Targets, []*ir.Func{first, second}) {
 		t.Fatalf("tuple target edge=%+v", edge)
 	}
-	normalizeSingleResultCalls(plan.Functions[forward])
+	normalizeSuspensionExpressions(plan.Functions[forward])
 	if len(forwarded.Results) != 2 || len(forwarded.Init()) != 1 {
 		t.Fatal("sole tuple return did not become independent typed result cells")
 	}
@@ -281,7 +281,7 @@ func TestNormalizeTupleReturnBoundary(t *testing.T) {
 			}
 			caller.Body = ir.Nodes{root}
 			before := len(caller.Dcl)
-			normalizeSingleResultCalls(&Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary,
+			normalizeSuspensionExpressions(&Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary,
 				Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}}})
 			if len(root.Init()) != 0 || len(caller.Dcl) != before || !containsCall(root, call) {
 				t.Fatal("tuple call was moved outside the supported sole-return boundary")

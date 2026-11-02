@@ -113,7 +113,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 				sites = []Site{{ID: 1, Kind: SiteAwait, Node: other}}
 			}
 			function := &Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary, Sites: sites}
-			normalizeSingleResultCalls(function)
+			normalizeSuspensionExpressions(function)
 			if mode == "loop" {
 				loop := root.(*ir.ForStmt)
 				if loop.Cond != nil || len(loop.Init()) != 0 || len(loop.Body) != 1 {
@@ -155,7 +155,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 					}
 				}
 				before := slices.Clone(root.Init())
-				normalizeSingleResultCalls(function)
+				normalizeSuspensionExpressions(function)
 				if !slices.Equal(root.Init(), before) || !slices.Equal(second.Init(), original) {
 					t.Fatal("logical tuple normalization is not idempotent")
 				}
@@ -186,7 +186,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 					}
 				}
 				before := slices.Clone(root.Init())
-				normalizeSingleResultCalls(function)
+				normalizeSuspensionExpressions(function)
 				if !slices.Equal(root.Init(), before) {
 					t.Fatal("expanded inline normalization is not idempotent")
 				}
@@ -212,7 +212,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 				}
 			}
 			before := slices.Clone(root.Init())
-			normalizeSingleResultCalls(function)
+			normalizeSuspensionExpressions(function)
 			if !slices.Equal(root.Init(), before) || root != owner && len(owner.Init()) != 0 {
 				t.Fatal("initializer normalization is not idempotent")
 			}
@@ -279,7 +279,7 @@ func TestLowerTupleCallInitializers(t *testing.T) {
 			}
 			// Both producer and callee initializers must be detached before
 			// the consumer can be normalized. Preserve their source order.
-			normalizeSingleResultCalls(plan.Functions[parent])
+			normalizeSuspensionExpressions(plan.Functions[parent])
 			prefix := parent.Body[0].Init()
 			if len(prefix) < 2 || prefix[0] != calleeAssignment || prefix[1] != assignment {
 				t.Fatalf("callee/argument prefix order = %v", prefix)

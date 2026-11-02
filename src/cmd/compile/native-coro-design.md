@@ -5034,3 +5034,20 @@ Fresh traced cells are allocated at the per-entry declarations, including
 when only a variable's address escapes. Existing variables retain their shared
 identity. Arbitrary source labels and goto remain conservative ordinary
 execution. The ordinary source body continues to serve thread-affine calls.
+
+### Guarded receive expressions (work in progress, 2026-11-02)
+
+Single-value channel receives and awaited calls share one normalization pass.
+The same ordered-prefix proof exposes each operation at its original execution
+point. AND/OR branches and complete inline bodies retain conditional receives;
+for conditions retain repeated receives in their body-entry guard, while post
+receives stay on the post edge. Mixing receives, channel-producing awaits and
+tuple call initializers therefore needs no ordering between two separate passes.
+
+The channel operation nodes remain the original analysis sites, and every
+exposed value uses a declared typed cell. Comma-ok and direct receive assignments
+retain their existing lowering. Switch/select headers, range operands and
+observable outer prefixes keep conservative ordinary execution until their
+separate ordering contracts can be represented. Skipped nil-channel operands,
+closed conditions, Goexit cleanup and GC of parked received pointers require
+actual entry-gate and genuine-SDK validation before acceptance.
