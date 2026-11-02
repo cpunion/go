@@ -491,6 +491,28 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			prepareRootArray(candidate)
 		}
 	}
+	// Lowering an enclosing function can replace a closure's captures with
+	// explicit pointer cells. Materialize every remaining source fallback
+	// before that changes the layout expected by its serialized body.
+	rejectedBodies := make(map[*ir.Func]*ir.Func)
+	specializedBodies := make(map[*ir.Func]*ir.Func)
+	for _, function := range functions {
+		fn := function.Func
+		if plan.rewrittenCallers[fn] && candidates[fn] == nil {
+			ordinary := bodies.Read(fn)
+			if ordinary == nil {
+				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(fn))
+			}
+			rejectedBodies[fn] = ordinary
+		}
+		if build := plan.specializedBodies[fn]; build != nil {
+			ordinary := build()
+			if ordinary == nil {
+				return result, fmt.Errorf("%s: missing specialized ordinary body", ir.PkgFuncName(fn))
+			}
+			specializedBodies[fn] = ordinary
+		}
+	}
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
 		depth := func(fn *ir.Func) int {
@@ -529,20 +551,15 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	retainCapturedEntries(candidates)
 	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
-		if plan.rewrittenCallers[function.Func] && candidates[function.Func] == nil {
-			ordinary := bodies.Read(function.Func)
-			if ordinary == nil {
-				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(function.Func))
-			}
+		if ordinary := rejectedBodies[function.Func]; ordinary != nil {
 			remapOrdinaryBody(function.Func, ordinary)
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
 		}
-		if build := plan.specializedBodies[function.Func]; build != nil {
+		if ordinary := specializedBodies[function.Func]; ordinary != nil {
 			// A rejected caller can still invoke a private helper's ordinary
 			// entry. In particular recover must then run directly in its
 			// deferred Go frame, never through a fresh root scheduler.
-			ordinary := build()
 			remapOrdinaryBody(function.Func, ordinary)
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
