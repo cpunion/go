@@ -48,6 +48,12 @@ type node struct{value int;child *node}
 func held(cond chan bool,ptr chan *node,ready,release chan int)*node{var p *node;for <-cond{p=<-ptr;ready<-1;<-release};return p}
 //go:noinline
 func exited(cond chan bool,post chan int,done chan struct{}){defer func(){close(done)}();for ;<-cond;<-post{runtime.Goexit()};panic("continued after Goexit")}
+//go:noinline
+func returnedComparison(c chan int)bool{return <-c>0&&<-c>0}
+//go:noinline
+func conditionComparison(c chan int)int{if <-c>0&&<-c>0{return 1};return 0}
+//go:noinline
+func loopComparison(c chan int)int{n:=0;for <-c>0&&<-c>0{n++};return n}
 func main(){
  if conjunction(false,nil)||!disjunction(true,nil){panic("skipped nil receive")};c:=make(chan bool,4);c<-true;if !conjunction(true,c)||len(c)!=0{panic("selected AND receive")};c<-false;if disjunction(false,c)||len(c)!=0{panic("selected OR receive")}
  order=0;if mixed(false,nil)||order!=1{panic("mixed skipped receive")};c<-true;order=0;if !mixed(true,c)||order!=12{panic("mixed selected OR")};c<-false;order=0;if !mixed(true,c)||order!=123{panic("mixed receive/await order")}
@@ -57,6 +63,7 @@ func main(){
  if nilCall(false,nil,true)!=false{panic("nil call selected skipped receive")};c<-true;if _,ok:=nilCall(true,c,true).(runtime.Error);!ok||len(c)!=0{panic("nil callee before argument receive")};c<-true;order=0;if nilCall(true,c,false)!=true||order!=5{panic("selected receive argument")}
  ptr:=make(chan *node,1);ptr<-&node{value:41,child:&node{value:42}};ready,release:=make(chan int),make(chan int);result:=make(chan *node,1);conditions:=make(chan bool,2);conditions<-true;conditions<-false;go func(){result<-held(conditions,ptr,ready,release)}();<-ready;runtime.GC();release<-1;p:=<-result;if p.value!=41||p.child.value!=42{panic("parked received pointer root")}
  exitCond:=make(chan bool,1);exitCond<-true;exitPost:=make(chan int,1);exitPost<-1;done:=make(chan struct{});go exited(exitCond,exitPost,done);<-done;if len(exitPost)!=1{panic("Goexit executed receive post")}
+ ints:=make(chan int,3);ints<-1;ints<-1;if !returnedComparison(ints){panic("comparison return")};ints<-1;ints<-1;if conditionComparison(ints)!=1{panic("comparison condition")};ints<-1;ints<-1;ints<-0;if loopComparison(ints)!=1{panic("comparison repeated condition")}
  runtime.LockOSThread();c<-true;if !conjunction(true,c){panic("ordinary guarded receive")};runtime.UnlockOSThread();println("guarded-receive-ok")
 }
 `
@@ -81,7 +88,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"conjunction", "disjunction", "mixed", "headers", "tuples", "inline", "nilCall", "held", "exited"} {
+				for _, name := range []string{"conjunction", "disjunction", "mixed", "headers", "tuples", "inline", "nilCall", "held", "exited", "returnedComparison", "conditionComparison", "loopComparison"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission", name)
 					}

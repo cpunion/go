@@ -33,12 +33,14 @@ func TestNormalizeReceiveExpressions(t *testing.T) {
 			case "short-circuit", "or-circuit", "loop":
 				condition := ir.NewBinaryExpr(src.NoXPos, ir.ONE, recv, typedInt(src.NoXPos, types.Types[types.TINT], 0))
 				condition.SetType(types.Types[types.TBOOL])
+				condition.SetTypecheck(1)
 				op := ir.OANDAND
 				if mode == "or-circuit" {
 					op = ir.OOROR
 				}
 				expr = ir.NewLogicalExpr(src.NoXPos, op, ir.NewBool(src.NoXPos, false), condition)
 				expr.SetType(types.Types[types.TBOOL])
+				expr.SetTypecheck(1)
 				if mode == "loop" {
 					expr = condition
 				}
