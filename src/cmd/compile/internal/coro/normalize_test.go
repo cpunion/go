@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
+	"slices"
 	"testing"
 )
 
@@ -311,4 +312,50 @@ func TestNormalizeSingleResultCallDirectStatements(t *testing.T) {
 	normalizeSingleResultCalls(nil)
 	normalizeSingleResultCalls(&Function{})
 	normalizeSingleResultCalls(&Function{Func: callee, Primary: PlainPrimary})
+}
+
+func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldLocal := typecheck.Target, types.LocalPkg
+	defer func() { typecheck.Target = oldTarget; types.LocalPkg = oldLocal }()
+	pkg := types.NewPkg("example.com/coro/inlineawait", "p")
+	types.LocalPkg = pkg
+	typecheck.Target = new(ir.Package)
+	callee := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("callee"), types.NewSignature(nil, nil, []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}))
+	callee.DeclareParams(true)
+	caller := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("caller"), callee.Type())
+	caller.DeclareParams(true)
+	value := caller.NewLocal(src.NoXPos, pkg.Lookup("value"), types.Types[types.TINT])
+	call := newLowerTestCall(callee)
+	call.SetType(types.Types[types.TINT])
+	assignment := ir.NewAssignStmt(src.NoXPos, value, call)
+	label := ir.NewLabelStmt(src.NoXPos, pkg.Lookup("inlineExit"))
+	jump := ir.NewBranchStmt(src.NoXPos, ir.OGOTO, label.Label)
+	branch := ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), ir.Nodes{assignment, jump}, nil)
+	nestedLabel := ir.NewLabelStmt(src.NoXPos, pkg.Lookup("nestedInlineExit"))
+	nested := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{nestedLabel}, ir.Nodes{ir.NewInt(src.NoXPos, 1)})
+	nested.SetType(types.Types[types.TINT])
+	nested.SetTypecheck(1)
+	nestedAssign := ir.NewAssignStmt(src.NoXPos, value, nested)
+	inlined := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{nestedAssign, branch, label}, ir.Nodes{value})
+	inlined.SetType(value.Type())
+	inlined.SetTypecheck(1)
+	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{inlined})
+	caller.Body = ir.Nodes{ret}
+	function := &Function{Func: caller, Primary: CoroPrimary, Effect: MaySuspend, Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}}}
+	normalizeSingleResultCalls(function)
+	if len(ret.Init()) != 3 || ret.Init()[0] != nestedAssign || ret.Init()[1] != branch || ret.Init()[2] != label || ret.Results[0] != value {
+		t.Fatal("inline execution was not exposed as an intact ordered body")
+	}
+	if function.inlineLabels[nestedLabel.Label] != nil {
+		t.Fatal("nested pure inline label acquired a continuation state")
+	}
+	if branch.Body[0] != assignment || branch.Body[1] != jump || function.inlineLabels[label.Label] != label {
+		t.Fatal("inline return jump or conditional await lost its ownership")
+	}
+	before := append(ir.Nodes(nil), ret.Init()...)
+	normalizeSingleResultCalls(function)
+	if !slices.Equal(before, ret.Init()) || function.inlineLabels[label.Label] != label {
+		t.Fatal("repeated normalization lost inline execution or label ownership")
+	}
 }

@@ -15,9 +15,10 @@ import (
 // Result vertices belong only to functions in the package being analyzed; this
 // proof is not an exported callable capability.
 type functionTargetKey struct {
-	local  *ir.Name
-	result *ir.Func
-	index  int
+	local      *ir.Name
+	result     *ir.Func
+	index      int
+	expression ir.Node
 }
 
 // localFunctionTargets is the single-function form of packageFunctionTargets.
@@ -38,7 +39,16 @@ func packageFunctionTargets(funcs []*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Fu
 // parameters remain unknown regardless of the apparent set of callers.
 func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 	parameters map[*ir.Func]map[*ir.Name][]*ir.Func) map[*ir.Func]map[*ir.Name][]*ir.Func {
+	locals, _ := packageFunctionExpressionTargets(funcs, parameters)
+	return locals
+}
+
+// Function-valued producer expressions use the same result dependency graph
+// as local assignments. A proof never removes or duplicates their evaluation.
+func packageFunctionExpressionTargets(funcs []*ir.Func,
+	parameters map[*ir.Func]map[*ir.Name][]*ir.Func) (map[*ir.Func]map[*ir.Name][]*ir.Func, map[ir.Node][]*ir.Func) {
 	locals := make(map[*ir.Func]map[*ir.Name][]*ir.Func)
+	expressions := make(map[ir.Node][]*ir.Func)
 	targets := make(map[functionTargetKey][]*ir.Func)
 	invalid := make(map[functionTargetKey]bool)
 	dependents := make(map[functionTargetKey][]functionTargetKey)
@@ -154,6 +164,11 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 		returned := results[fn]
 		sawReturn := false
 		ir.Visit(fn, func(node ir.Node) {
+			if node.Type() != nil && node.Type().Kind() == types.TFUNC &&
+				(node.Op() == ir.OCALLFUNC || node.Op() == ir.OINLCALL) {
+				expressions[node] = nil
+				write(fn, functionTargetKey{expression: node}, node)
+			}
 			switch node := node.(type) {
 			case *ir.AssignStmt:
 				localWrite(node.X, node.Y)
@@ -275,5 +290,17 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 			names[name] = functions
 		}
 	}
-	return locals
+	for expression := range expressions {
+		key := functionTargetKey{expression: expression}
+		if invalid[key] || len(targets[key]) == 0 {
+			delete(expressions, expression)
+			continue
+		}
+		functions := targets[key]
+		slices.SortFunc(functions, func(a, b *ir.Func) int {
+			return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
+		})
+		expressions[expression] = functions
+	}
+	return locals, expressions
 }

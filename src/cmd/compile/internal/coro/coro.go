@@ -17,6 +17,7 @@ package coro
 import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/types"
 	"fmt"
 	"io"
 	"slices"
@@ -247,6 +248,9 @@ type Function struct {
 	Sites         []Site
 	Factory       FactoryABI
 	Defer         DeferABI
+	// Only labels exposed from an inlined expression may become native
+	// continuation targets; unrelated source goto statements remain ordinary.
+	inlineLabels map[*types.Sym]*ir.LabelStmt
 }
 
 // Plan is the result of analyzing one package.

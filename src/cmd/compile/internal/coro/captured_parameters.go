@@ -79,7 +79,7 @@ func pinCapturedParameterCells(source *ir.Func) {
 // before any environment read. Nil calls therefore still evaluate operands,
 // and distinct instances of one proved source target retain distinct cells.
 func rewriteCapturedParameterCall(caller *ir.Func, call *ir.CallExpr, source, helper *ir.Func) {
-	var prefix ir.Nodes
+	prefix := ir.TakeInit(call)
 	freeze := func(value ir.Node) *ir.Name {
 		name := typecheck.TempAt(value.Pos(), caller, value.Type())
 		assign := ir.NewAssignStmt(value.Pos(), name, value)
