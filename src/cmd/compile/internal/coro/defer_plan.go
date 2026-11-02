@@ -51,6 +51,12 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 				deferred.snapshotCallee = true
 			}
 			for _, target := range edge.Targets {
+				if target == nil || target.Needctxt() || len(target.ClosureVars) != 0 {
+					// Dispatch below calls a static entry without a closure
+					// context. A captured value needs its environment explicitly
+					// represented before it can use this cleanup contract.
+					return fmt.Errorf("captured dynamic defer target requires an environment")
+				}
 				targetSummary, _ := plan.funcSummary(target)
 				terminal := lowerDeferTerminal{target: target}
 				if targetSummary.Terminal != 0 {
