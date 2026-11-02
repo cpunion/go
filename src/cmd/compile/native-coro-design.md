@@ -4963,3 +4963,24 @@ This work does not yet supply a runtime registry for arbitrary open callable
 values, method-value or interface dispatch, generic dictionaries or iterator
 yields. It is a dependency of those native ABIs, rather than evidence that those
 remaining capabilities are complete.
+
+### Closed named iterator range (work in progress, 2026-11-02)
+
+Closed local calls to named iterators can specialize the generated yield
+closure with its typed shared cells. This includes zero, one and two yield
+arguments, early stop and return, nested loops and suspended callbacks. The
+compiler-owned `panicrangestate(int)` declaration is a non-suspending operation
+that may panic. Its private runtime identity and complete signature are checked;
+an unrelated source function does not acquire that capability.
+
+A generated yield body still needs a native factory when the user body is
+plain. Its protocol branches and panic checks use regular continuation lowering,
+identified by the frontend's `RangeParent` metadata and demanded callback proof.
+Protocol state remains in traced shared cells after callback escape.
+
+A defer registered by a range-function body belongs to its enclosing source
+activation. A non-nil `DeferAt` is explicitly rejected by native lowering until
+that ownership can be represented. The ordinary source body retains the
+registration lifetime and LIFO order. Returned captured iterator specialization
+also remains outside this slice, since replacing its callable with a static
+specialization would discard its environment.

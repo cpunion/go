@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"strings"
@@ -14,6 +15,9 @@ import (
 
 func TestRangeStatePanicRecipe(t *testing.T) {
 	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	typecheck.Target = new(ir.Package)
+	t.Cleanup(func() { typecheck.Target = oldTarget })
 	field := func(typ *types.Type) *types.Field { return types.NewField(src.NoXPos, nil, typ) }
 	integer := types.Types[types.TINT]
 	signature := types.NewSignature(nil, []*types.Field{field(integer)}, nil)
@@ -61,6 +65,9 @@ func TestRangeStatePanicRecipe(t *testing.T) {
 
 func TestRejectRangeDeferOwnership(t *testing.T) {
 	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	typecheck.Target = new(ir.Package)
+	t.Cleanup(func() { typecheck.Target = oldTarget })
 	pkg := types.NewPkg("example.com/coro/rangedeferownership", "rangedeferownership")
 	fn := newLowerTestFunc(pkg, "caller")
 	leaf := newLowerTestFunc(pkg, "cleanup")
