@@ -320,6 +320,7 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 					seq++
 					labelStmt := ir.NewLabelStmt(x.Pos(), label)
 					labelStmt.SetTypecheck(1)
+					labelStmt.SetLoopVarContinue(true)
 
 					loopLabel := x.Label
 					loopDepth := 0

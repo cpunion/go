@@ -5012,5 +5012,25 @@ runs once before its left operand, and the result cell survives suspension.
 
 The surrounding prefix must still permit exposing the whole logical expression
 at its original evaluation point. Expressions following an observable outer
-prefix and repeated for-header conditions retain the existing conservative
-fallback. Source ordinary entries preserve the original language control flow.
+prefix retain the existing conservative fallback. Source ordinary entries
+preserve the original language control flow.
+
+### Awaited for conditions and post statements (work in progress, 2026-11-02)
+
+A for condition containing an await becomes an exit guard at the beginning of
+the loop body. The loop's initializer still executes once. Each condition's
+complete initializer, selected logical branches and inline body execute at
+that guard on every iteration. Post initializers stay attached to Post, so a
+continue executes Post and then the next condition, while break, return and
+panic skip Post. This uses the existing lexical loop edges in the continuation
+builder rather than moving repeated work into the once-only loop initializer.
+
+The frontend's loopvar pass already expands escaping Go 1.22 iteration
+variables into per-entry declarations, copied values, a post/condition guard
+and a generated continue target. A private IR flag identifies that target by
+frontend provenance; its spelling grants no eligibility. Only these targets
+and explicitly exposed inline labels enter the continuation label table.
+Fresh traced cells are allocated at the per-entry declarations, including
+when only a variable's address escapes. Existing variables retain their shared
+identity. Arbitrary source labels and goto remain conservative ordinary
+execution. The ordinary source body continues to serve thread-affine calls.

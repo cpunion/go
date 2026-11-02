@@ -99,7 +99,7 @@ type lowerCandidate struct {
 	selects           map[*ir.SelectStmt]*lowerSelect
 	switches          map[*ir.SwitchStmt]bool
 	branches          map[*ir.BranchStmt]ir.Node
-	rangeVars         []*ir.Name
+	iterationVars     []*ir.Name
 	panics            map[*ir.UnaryExpr]bool
 	parameters        map[*ir.Name]*ir.Name
 	captureParameters map[*ir.Name]*ir.Name
@@ -616,8 +616,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	goCalls := make(map[*ir.CallExpr]bool)
 	var defers []*lowerDefer
 	dynamicDefers := false
-	var rangeVars []*ir.Name
-	recordedRangeVars := make(map[*ir.Name]bool)
+	var iterationVars []*ir.Name
+	recordedIterationVars := make(map[*ir.Name]bool)
 	recordAssignmentCall := func(node ir.Node) *ir.CallExpr {
 		switch node := node.(type) {
 		case *ir.AssignStmt:
@@ -775,6 +775,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				if stmt.Label != nil {
 					return fmt.Errorf("labeled for loop")
 				}
+				for _, variable := range transformedForVariables(stmt) {
+					if !recordedIterationVars[variable.Canonical()] {
+						recordedIterationVars[variable.Canonical()] = true
+						iterationVars = append(iterationVars, variable)
+					}
+				}
 				if stmt.Post != nil {
 					if err := collectStatements(ir.Nodes{stmt.Post}, true); err != nil {
 						return err
@@ -827,9 +833,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				for _, operand := range []ir.Node{stmt.Key, stmt.Value} {
 					if variable := transformedRangeVariable(stmt, operand); variable != nil &&
-						!recordedRangeVars[variable.Canonical()] {
-						recordedRangeVars[variable.Canonical()] = true
-						rangeVars = append(rangeVars, variable)
+						!recordedIterationVars[variable.Canonical()] {
+						recordedIterationVars[variable.Canonical()] = true
+						iterationVars = append(iterationVars, variable)
 					}
 				}
 				oldBreak, oldContinue := breakTarget, continueTarget
@@ -863,8 +869,8 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 			case *ir.BranchStmt:
 				var target ir.Node
-				if stmt.Op() == ir.OGOTO && function.inlineLabels[stmt.Label] != nil {
-					target = function.inlineLabels[stmt.Label]
+				if stmt.Op() == ir.OGOTO && function.continuationLabels[stmt.Label] != nil {
+					target = function.continuationLabels[stmt.Label]
 				}
 				if stmt.Label == nil {
 					switch stmt.Op() {
@@ -930,7 +936,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				}
 				switch stmt.Op() {
 				case ir.OLABEL:
-					if label := stmt.(*ir.LabelStmt); function.inlineLabels[label.Label] == label {
+					if label := stmt.(*ir.LabelStmt); function.continuationLabels[label.Label] == label {
 						break
 					}
 					return fmt.Errorf("control flow %v", stmt.Op())
@@ -978,7 +984,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		selects:       selects,
 		switches:      switches,
 		branches:      branches,
-		rangeVars:     rangeVars,
+		iterationVars: iterationVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
 	for _, site := range function.Sites {
@@ -1362,6 +1368,34 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		}
 	}
 	return candidate, nil
+}
+
+// transformedForVariables finds the per-iteration declarations prepended by
+// loopvar.ForCapture. The frontend marker establishes ownership; a source label
+// with a similar name does not make a loop eligible. These cells must be newly
+// allocated on every entry, even when only their addresses escape.
+func transformedForVariables(stmt *ir.ForStmt) []*ir.Name {
+	marked := false
+	for _, node := range stmt.Body {
+		if label, ok := node.(*ir.LabelStmt); ok && label.LoopVarContinue() {
+			marked = true
+			break
+		}
+	}
+	if !marked {
+		return nil
+	}
+	var variables []*ir.Name
+	for _, node := range stmt.Body {
+		assignment, ok := node.(*ir.AssignStmt)
+		if !ok || !assignment.Def {
+			break
+		}
+		if variable, ok := assignment.X.(*ir.Name); ok {
+			variables = append(variables, variable)
+		}
+	}
+	return variables
 }
 
 // transformedRangeVariable recognizes the assignment inserted by
@@ -1874,7 +1908,7 @@ func resumeFactoryABI(factory, fn *ir.Func) FactoryABI {
 func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	if candidate == nil ||
 		candidate.function.Defer != NoDeferABI || len(candidate.defers) != 0 ||
-		len(candidate.rangeVars) != 0 || candidate.function.Terminal != 0 {
+		len(candidate.iterationVars) != 0 || candidate.function.Terminal != 0 {
 		return false
 	}
 	runToCompletion := canLowerRunToCompletion(candidate)
@@ -2900,7 +2934,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 		}
 	})
-	for _, variable := range candidate.rangeVars {
+	for _, variable := range candidate.iterationVars {
 		addCaptureCell(variable)
 	}
 	// Case declarations execute on every selection, including in the closure
@@ -3073,16 +3107,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		states = append(states, state)
 		return stateIndex
 	}
-	inlineStates := make(map[*ir.LabelStmt]int)
-	var inlineLabels []*ir.LabelStmt
-	for _, label := range function.inlineLabels {
-		inlineLabels = append(inlineLabels, label)
+	labelStates := make(map[*ir.LabelStmt]int)
+	var continuationLabels []*ir.LabelStmt
+	for _, label := range function.continuationLabels {
+		continuationLabels = append(continuationLabels, label)
 	}
-	slices.SortFunc(inlineLabels, func(a, b *ir.LabelStmt) int {
+	slices.SortFunc(continuationLabels, func(a, b *ir.LabelStmt) int {
 		return strings.Compare(a.Label.Name, b.Label.Name)
 	})
-	for _, label := range inlineLabels {
-		inlineStates[label] = addState(lowerState{next: -1, thenState: -1, elseState: -1})
+	for _, label := range continuationLabels {
+		labelStates[label] = addState(lowerState{next: -1, thenState: -1, elseState: -1})
 	}
 	captureCellAllocation := func(name *ir.Name) ir.Node {
 		cell := captureCell(name)
@@ -3188,7 +3222,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return
 			}
 			if label, ok := node.(*ir.LabelStmt); ok {
-				if _, owned := inlineStates[label]; owned {
+				if _, owned := labelStates[label]; owned {
 					required = true
 					return
 				}
@@ -3230,7 +3264,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.BranchStmt:
 			return candidate.branches[stmt] != nil
 		case *ir.LabelStmt:
-			_, ok := inlineStates[stmt]
+			_, ok := labelStates[stmt]
 			return ok
 		case *ir.BlockStmt, *ir.IfStmt, *ir.ForStmt, *ir.RangeStmt, *ir.SelectStmt:
 			return requiresControlLowering(stmt)
@@ -3288,7 +3322,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	lowerStatement = func(stmt ir.Node, next int) int {
 		switch stmt := stmt.(type) {
 		case *ir.LabelStmt:
-			state, ok := inlineStates[stmt]
+			state, ok := labelStates[stmt]
 			if !ok {
 				panic("unexpected coroutine label")
 			}
@@ -3309,7 +3343,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.BranchStmt:
 			target := candidate.branches[stmt]
 			if label, ok := target.(*ir.LabelStmt); ok {
-				return lowerStatements(stmt.Init(), inlineStates[label])
+				return lowerStatements(stmt.Init(), labelStates[label])
 			}
 			state, ok := breakStates[target]
 			if stmt.Op() == ir.OCONTINUE {

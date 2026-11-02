@@ -248,9 +248,9 @@ type Function struct {
 	Sites         []Site
 	Factory       FactoryABI
 	Defer         DeferABI
-	// Only labels exposed from an inlined expression may become native
-	// continuation targets; unrelated source goto statements remain ordinary.
-	inlineLabels map[*types.Sym]*ir.LabelStmt
+	// Only labels exposed from an inline expression or created by loopvar
+	// may become continuation targets. Source goto statements remain ordinary.
+	continuationLabels map[*types.Sym]*ir.LabelStmt
 }
 
 // Plan is the result of analyzing one package.

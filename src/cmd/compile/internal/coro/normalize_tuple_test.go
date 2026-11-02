@@ -114,6 +114,17 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 			}
 			function := &Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary, Sites: sites}
 			normalizeSingleResultCalls(function)
+			if mode == "loop" {
+				loop := root.(*ir.ForStmt)
+				if loop.Cond != nil || len(loop.Init()) != 0 || len(loop.Body) != 1 {
+					t.Fatal("loop condition effects left their per-iteration position")
+				}
+				guard, ok := loop.Body[0].(*ir.IfStmt)
+				if !ok || guard.Cond.Op() != ir.ONOT || len(guard.Body) != 1 || guard.Body[0].Op() != ir.OBREAK {
+					t.Fatal("loop condition has no guarded exit")
+				}
+				root = guard
+			}
 			if mode == "short-circuit" || mode == "or-circuit" {
 				if len(root.Init()) != 2 {
 					t.Fatal("logical tuple call has no guarded execution")
@@ -181,7 +192,7 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 				}
 				return
 			}
-			safe := mode == "return" || mode == "plain-return" || mode == "tuple-return" || mode == "condition" || mode == "statement"
+			safe := mode == "return" || mode == "plain-return" || mode == "tuple-return" || mode == "condition" || mode == "statement" || mode == "loop"
 			if !safe {
 				if len(root.Init()) != 0 || !slices.Equal(owner.Init(), original) {
 					t.Fatal("initializer crossed an unsupported expression boundary")

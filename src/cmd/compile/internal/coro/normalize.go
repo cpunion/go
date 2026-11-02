@@ -38,10 +38,10 @@ func normalizeSingleResultCalls(function *Function) {
 
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = function.Func
-	if function.inlineLabels == nil {
-		function.inlineLabels = make(map[*types.Sym]*ir.LabelStmt)
+	if function.continuationLabels == nil {
+		function.continuationLabels = make(map[*types.Sym]*ir.LabelStmt)
 	}
-	normalizeCallList(function.Func.Body, function.Func, calls, function.inlineLabels)
+	normalizeCallList(function.Func.Body, function.Func, calls, function.continuationLabels)
 	ir.CurFunc = oldCurFunc
 }
 
@@ -75,11 +75,30 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		normalizeCallList(stmt.Else, fn, calls, labels...)
 		return
 	case *ir.ForStmt:
-		// A for condition is reevaluated on every iteration, whereas the
-		// statement Init list runs only once. Leave nested condition and post
-		// calls for a later control-flow normalization.
+		// Keep condition execution inside the loop. In particular continue
+		// must still pass through Post before reaching the next condition;
+		// moving condition initializers to the loop's Init would run them once.
 		initNode.SetInit(prefix)
+		if stmt.Cond != nil && ir.Any(stmt.Cond, func(node ir.Node) bool {
+			call, ok := node.(*ir.CallExpr)
+			return ok && calls[call]
+		}) {
+			not := ir.NewUnaryExpr(stmt.Cond.Pos(), ir.ONOT, stmt.Cond)
+			stop := ir.NewBranchStmt(stmt.Pos(), ir.OBREAK, nil)
+			guard := typecheck.Stmt(ir.NewIfStmt(stmt.Pos(), not, ir.Nodes{stop}, nil))
+			stmt.Body = append(ir.Nodes{guard}, stmt.Body...)
+			stmt.Cond = nil
+		}
+		if stmt.Post != nil {
+			normalizeCallStatement(stmt.Post, fn, calls, labels...)
+		}
 		normalizeCallList(stmt.Body, fn, calls, labels...)
+		return
+	case *ir.LabelStmt:
+		if stmt.LoopVarContinue() && len(labels) != 0 {
+			labels[0][stmt.Label] = stmt
+		}
+		initNode.SetInit(prefix)
 		return
 	case *ir.RangeStmt:
 		// Keep the operand and bindings at their original evaluation points.
