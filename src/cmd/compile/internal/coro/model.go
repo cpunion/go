@@ -366,6 +366,9 @@ func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 	if fn == nil || fn.Nname == nil {
 		return OperationRecipe{}, false
 	}
+	if recipe, ok := rangeStatePanicRecipe(fn); ok {
+		return recipe, true
+	}
 	name := symbolName(fn.Nname)
 	recipe, ok := operationRecipes[name]
 	if recipe.Kind == SiteSemaphore && !semaphoreSignature(name, fn.Type()) {

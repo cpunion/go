@@ -579,7 +579,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
 	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) &&
-		!(plan.callbackFactories[fn] && capturedPlainFactorySupported(function)) {
+		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function))) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
 	statementCalls := make(map[*ir.CallExpr]bool)
@@ -724,6 +724,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("non-call go or defer statement")
 				}
 				if stmt.Op() == ir.ODEFER {
+					if stmt.DeferAt != nil {
+						return fmt.Errorf("range defer belongs to enclosing activation")
+					}
 					if inLoop {
 						dynamicDefers = true
 					}
