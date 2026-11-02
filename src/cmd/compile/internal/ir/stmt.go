@@ -382,6 +382,12 @@ func NewLabelStmt(pos src.XPos, label *types.Sym) *LabelStmt {
 
 func (n *LabelStmt) Sym() *types.Sym { return n.Label }
 
+// LoopVarContinue identifies a continue target created by loopvar.ForCapture.
+// It is frontend provenance, independent of the label's spelling. Loopvar runs
+// after body reading and inlining, so this flag need not be serialized.
+func (n *LabelStmt) LoopVarContinue() bool     { return n.bits&(1<<3) != 0 }
+func (n *LabelStmt) SetLoopVarContinue(b bool) { n.bits.set(1<<3, b) }
+
 // A RangeStmt is a range loop: for Key, Value = range X { Body }
 type RangeStmt struct {
 	miniStmt

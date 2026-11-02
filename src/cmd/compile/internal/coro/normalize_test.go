@@ -98,6 +98,50 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 	}
 }
 
+func TestNormalizeForHeaderControlFlow(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+	defer func() { typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldPkg, oldCurFunc }()
+	pkg := types.NewPkg("example.com/coro/forheader", "p")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	fn := newLowerTestFunc(pkg, "caller")
+	callee := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("value"),
+		types.NewSignature(nil, nil, []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}))
+	call := newLowerTestCall(callee)
+	call.SetType(types.Types[types.TINT])
+	variable := fn.NewLocal(src.NoXPos, pkg.Lookup("iteration"), types.Types[types.TINT])
+	decl := ir.NewAssignStmt(src.NoXPos, variable, ir.NewInt(src.NoXPos, 0))
+	decl.Def = true
+	post := ir.NewAssignStmt(src.NoXPos, variable, call)
+	init := ir.NewAssignStmt(src.NoXPos, variable, ir.NewInt(src.NoXPos, 1))
+	label := ir.NewLabelStmt(src.NoXPos, pkg.Lookup(".3clNext_1"))
+	label.SetLoopVarContinue(true)
+	jump := ir.NewBranchStmt(src.NoXPos, ir.OGOTO, label.Label)
+	loop := ir.NewForStmt(src.NoXPos, init, nil, post, ir.Nodes{decl, jump, label}, false)
+	ordinary := ir.NewLabelStmt(src.NoXPos, pkg.Lookup(".3clNext_2"))
+	fn.Body = ir.Nodes{loop, ordinary}
+	function := &Function{Func: fn, Primary: CoroPrimary, Sites: []Site{{Kind: SiteAwait, Node: call}}}
+	normalizeSingleResultCalls(function)
+	if len(loop.Init()) != 1 || loop.Init()[0] != init || loop.Post != post || post.Y != call {
+		t.Fatal("once-only initializer or post execution changed")
+	}
+	if function.continuationLabels[label.Label] != label || function.continuationLabels[ordinary.Label] != nil {
+		t.Fatal("continuation admission depends on label spelling rather than frontend provenance")
+	}
+	if variables := transformedForVariables(loop); len(variables) != 1 || variables[0] != variable {
+		t.Fatal("transformed iteration declaration was lost")
+	}
+	label.SetLoopVarContinue(false)
+	if len(transformedForVariables(loop)) != 0 {
+		t.Fatal("source-shaped loop acquired per-iteration storage")
+	}
+	label.SetLoopVarContinue(true)
+	normalizeSingleResultCalls(function)
+	if len(loop.Init()) != 1 || len(loop.Body) != 3 || loop.Post != post || function.continuationLabels[label.Label] != label {
+		t.Fatal("for header normalization is not idempotent")
+	}
+}
+
 func TestNormalizeSingleResultCallSafety(t *testing.T) {
 	prepareLowerTest(t)
 
@@ -269,8 +313,13 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 		t.Fatalf("direct nested call Init has %d statements, want 1",
 			len(directReturn.Init()))
 	}
-	if loop.Cond != forCall || len(loop.Init()) != 0 {
-		t.Fatal("for condition call was hoisted into the one-time Init list")
+	if loop.Cond != nil || len(loop.Init()) != 0 || len(loop.Body) != 1 {
+		t.Fatal("for condition is not guarded inside each iteration")
+	}
+	guard, ok := loop.Body[0].(*ir.IfStmt)
+	if !ok || len(guard.Init()) != 1 || guard.Init()[0].(*ir.AssignStmt).Y != forCall ||
+		guard.Cond.Op() != ir.ONOT || len(guard.Body) != 1 || guard.Body[0].Op() != ir.OBREAK {
+		t.Fatal("for condition await lost its evaluation or exit edge")
 	}
 	if len(ifStmt.Init()) != 1 || ifStmt.Cond == ifCall {
 		t.Fatal("if condition call was not normalized")
@@ -374,15 +423,15 @@ func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
 	if len(ret.Init()) != 3 || ret.Init()[0] != nestedAssign || ret.Init()[1] != branch || ret.Init()[2] != label || ret.Results[0] != value {
 		t.Fatal("inline execution was not exposed as an intact ordered body")
 	}
-	if function.inlineLabels[nestedLabel.Label] != nil {
+	if function.continuationLabels[nestedLabel.Label] != nil {
 		t.Fatal("nested pure inline label acquired a continuation state")
 	}
-	if branch.Body[0] != assignment || branch.Body[1] != jump || function.inlineLabels[label.Label] != label {
+	if branch.Body[0] != assignment || branch.Body[1] != jump || function.continuationLabels[label.Label] != label {
 		t.Fatal("inline return jump or conditional await lost its ownership")
 	}
 	before := append(ir.Nodes(nil), ret.Init()...)
 	normalizeSingleResultCalls(function)
-	if !slices.Equal(before, ret.Init()) || function.inlineLabels[label.Label] != label {
+	if !slices.Equal(before, ret.Init()) || function.continuationLabels[label.Label] != label {
 		t.Fatal("repeated normalization lost inline execution or label ownership")
 	}
 }
