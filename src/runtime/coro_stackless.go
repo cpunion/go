@@ -304,7 +304,10 @@ type stacklessCoroScheduler struct {
 	liveSpawns     uint64
 	root           stacklessCoroTask
 	terminalValues map[*stacklessCoroTask]any
-	wake           chan struct{}
+	// Only deferred child activations may await an owner already unwinding.
+	// Keep this uncommon identity outside every task's fixed-size header.
+	deferChildren map[*stacklessCoroTask]bool
+	wake          chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
 	rootDone chan struct{}
@@ -774,7 +777,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 		s.root.state == stacklessCoroTaskComplete &&
 		!s.root.resuming && !s.root.readyPending &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
-		len(s.terminalValues) == 0 && s.blockingExecutors.Load() == 0 &&
+		len(s.terminalValues) == 0 && len(s.deferChildren) == 0 && s.blockingExecutors.Load() == 0 &&
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
 			state == stacklessCoroExecutorStateSingleP ||
@@ -3196,6 +3199,38 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	unlock(&s.lock)
 }
 
+// coroDeferAwaitFrame starts one compiler-proved cleanup activation on the
+// current scheduler. The owner retains its panic and sticky Goexit while the
+// child suspends. Completion resumes the owner's remaining LIFO cleanup.
+// This does not lend the child an ordinary call's right to recover its owner.
+func coroDeferAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
+	context := (*stacklessCoroContext)(ctx)
+	parent := context.task()
+	if context == nil || context.scheduler == nil || parent == nil || child == nil {
+		throw("runtime: invalid stackless coroutine defer await")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+		parent.readyPending ||
+		(parent.terminal != stacklessCoroTerminalNone && parent.terminal != stacklessCoroTerminalPanic) {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine defer await outside cleanup")
+	}
+	task := s.takeReservedFrameTaskLocked(parent, frame, child)
+	if task == nil {
+		task = s.newTaskLocked(frame, child, parent)
+	}
+	if s.deferChildren == nil {
+		s.deferChildren = make(map[*stacklessCoroTask]bool)
+	}
+	s.deferChildren[task] = true
+	s.markUncachedFrameLineageLocked(task, parent, frame)
+	parent.state = stacklessCoroTaskWaiting
+	s.readyLocked(task)
+	unlock(&s.lock)
+}
+
 // coroPanic records a panic value before the compiler-generated resume enters
 // its frame-owned cleanup state.
 func coroPanic(ctx unsafe.Pointer, value any) {
@@ -4424,8 +4459,10 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		s.logicalTaskComplete(root)
 		return nil
 	}
+	deferred := s.deferChildren[task]
+	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
-		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine completed for non-waiting parent")
 	}
@@ -4483,14 +4520,16 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		s.logicalTaskComplete(true)
 		return
 	}
+	deferred := s.deferChildren[task]
+	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
-		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine terminated for invalid parent")
 	}
 	delete(s.terminalValues, task)
 	parent.terminal = task.terminal
-	parent.goexit = task.goexit
+	parent.goexit = parent.goexit || task.goexit
 	task.terminal = stacklessCoroTerminalNone
 	task.goexit = false
 	s.terminalValues[parent] = value
@@ -4531,10 +4570,16 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		s.logicalTaskComplete(false)
 		return
 	}
+	deferred := s.deferChildren[task]
+	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
-		parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine Goexit for invalid parent")
+	}
+	if deferred {
+		parent.terminal = stacklessCoroTerminalNone
+		delete(s.terminalValues, parent)
 	}
 	parent.goexit = true
 	task.goexit = false

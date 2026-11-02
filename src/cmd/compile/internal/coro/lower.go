@@ -151,6 +151,7 @@ type lowerDefer struct {
 	armed           *ir.Name
 	snapshotCallee  bool
 	calleeSnapshot  *ir.Name
+	asyncTarget     *ir.Func
 	terminalTargets []lowerDeferTerminal
 	sourceLiteral   bool
 	literalCaptures []*ir.Name
@@ -316,9 +317,15 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			!plainCapturedCallbacks[function.Func] {
 			continue
 		}
-		if deferredLiterals[function.Func] {
+		if deferredLiterals[function.Func] && !canPlanSuspendingDefer(plan, function.Func) {
 			result.Diagnostics = append(result.Diagnostics,
 				fmt.Sprintf("%s: literal uses defer cleanup entry", ir.PkgFuncName(function.Func)))
+			continue
+		}
+		if deferredLiterals[function.Func] && capturedFactorySupported(function.Func) && bodies != nil &&
+			(bodies.PinCaptures == nil || !bodies.PinCaptures(function.Func)) {
+			result.Diagnostics = append(result.Diagnostics,
+				fmt.Sprintf("%s: suspending defer capture layout unavailable", ir.PkgFuncName(function.Func)))
 			continue
 		}
 		candidate, err := newLowerCandidate(plan, function)
@@ -1135,7 +1142,12 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			continue
 		}
 		if deferredSite {
-			return nil, fmt.Errorf("suspending defer")
+			// Registration only freezes operands. planNativeDefers independently
+			// proves the deferred factory and its resumable cleanup contract.
+			if site.Kind == SiteAwait {
+				continue
+			}
+			return nil, fmt.Errorf("unsupported deferred operation %s", site.Kind)
 		}
 		switch site.Kind {
 		case SiteRangeDefer:
@@ -3800,7 +3812,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		args := make(ir.Nodes, 0, len(sourceCall.Args)+len(captures)+1)
 		if childABI == FactoryABI3 {
-			args = append(args, ctx)
+			if edge.Kind == DeferCall {
+				// Ordinary frame reservations reject an unwinding owner.
+				// Allocate the typed cleanup frame before the defer await
+				// establishes its separate structured-child identity.
+				args = append(args, ir.NewNilExpr(call.Pos(), types.Types[types.TUNSAFEPTR]))
+			} else {
+				args = append(args, ctx)
+			}
 		}
 		if len(captures) != 0 {
 			args = append(args, callableCaptureArguments(call.Pos(), edge.Callee, frozenFun)...)
@@ -4004,6 +4023,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	deferClosures := make(map[*ir.Func]bool, len(candidate.defers))
 	for _, deferred := range candidate.defers {
+		if deferred.asyncTarget != nil {
+			continue
+		}
 		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
 			deferClosures[closure.Func] = true
 		}
@@ -4058,6 +4080,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			})
 	}
 	for _, deferred := range candidate.defers {
+		if deferred.asyncTarget != nil {
+			// The source literal already owns a factory and an independent
+			// ordinary body. General capture reparenting handled its shared cells.
+			continue
+		}
 		deferredToken := resumeDeferToken
 		if deferred.rangeAnchor != nil {
 			deferred.rangeToken = typecheck.TempAt(deferred.statement.Pos(), resume, types.Types[types.TUNSAFEPTR])
@@ -4450,6 +4477,26 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					fun := edit(deferred.call.Fun)
 					if deferred.calleeSnapshot != nil {
 						fun = capture(deferred.calleeSnapshot)
+					}
+					if deferred.asyncTarget != nil {
+						edge := Edge{Kind: DeferCall, Callee: deferred.asyncTarget,
+							CalleeName: ir.PkgFuncName(deferred.asyncTarget)}
+						child, err := staticFactoryCall(deferred.call, deferred.call, edge, ir.Nodes{}, fun)
+						if err != nil {
+							return err
+						}
+						frame := child.frame
+						if frame == nil {
+							frame = ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])
+						}
+						invoke := ir.Nodes{clear}
+						invoke = append(invoke, child.setup...)
+						invoke = append(invoke, assignResumePC(i),
+							typecheck.Call(pos, typecheck.LookupRuntime("coroDeferAwaitFrame"),
+								ir.Nodes{ctx, frame, child.resume}, false),
+							ir.NewReturnStmt(pos, ir.Nodes{typedInt(pos, types.Types[types.TUINT8], int64(actionWait))}))
+						body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
+						continue
 					}
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
 						typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{fun}, false))

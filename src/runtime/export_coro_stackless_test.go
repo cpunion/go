@@ -497,6 +497,10 @@ func DeferRunStacklessCoroFrameForTest(token, frame unsafe.Pointer,
 	coroDeferRunFrame(token, frame, resume)
 }
 
+func DeferAwaitStacklessCoroForTest(ctx unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
+	coroDeferAwaitFrame(ctx, nil, resume)
+}
+
 func DeferGoexitStacklessCoroForTest(token unsafe.Pointer) {
 	coroDeferGoexit(token)
 }
