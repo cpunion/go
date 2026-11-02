@@ -84,8 +84,8 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"shortCircuit", "nested await site"}, {"observablePrefix", "nested await site"}, {"selectedPlain", "nested await site"}, {"nilReturn", "dynamic await site"}, {"missingReturn", "unsupported coroutine dependency main.missing"}, {"unknown", "dynamic await site"}},
-		[]string{"direct", "plainReturn", "forward", "named", "condition", "nested", "statement", "loopBody", "recursive", "selected", "variadicReturn", "recoveredReturn", "panicReturn", "consumerPanic", "exitReturn", "pointerReturn"})
+		[]switchFallback{{"observablePrefix", "nested await site"}, {"selectedPlain", "nested await site"}, {"nilReturn", "dynamic await site"}, {"missingReturn", "unsupported coroutine dependency main.missing"}, {"unknown", "dynamic await site"}},
+		[]string{"direct", "plainReturn", "forward", "named", "condition", "nested", "statement", "loopBody", "recursive", "selected", "variadicReturn", "recoveredReturn", "panicReturn", "consumerPanic", "exitReturn", "pointerReturn", "shortCircuit"})
 }
 
 func TestTupleCallInitializersImported(t *testing.T) {

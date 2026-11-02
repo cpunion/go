@@ -244,8 +244,17 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 			t.Fatal("logical await has no ordered assignment and selected branch")
 		}
 		first, ok := test.ret.Init()[0].(*ir.AssignStmt)
-		if !ok || first.Y != test.left || test.ret.Results[0] != first.X {
+		if !ok || test.ret.Results[0] != first.X {
 			t.Fatal("logical left operand was reordered or duplicated")
+		}
+		sameLeft := first.Y == test.left
+		if test.left.Op() == ir.OLITERAL && first.Y.Op() == ir.OLITERAL {
+			// Assigning an untyped boolean to the typed result cell may
+			// copy the literal while defaulting its type.
+			sameLeft = ir.BoolVal(first.Y) == ir.BoolVal(test.left)
+		}
+		if !sameLeft {
+			t.Fatal("logical left operand evaluation changed")
 		}
 		branch, ok := test.ret.Init()[1].(*ir.IfStmt)
 		if !ok || branch.Cond != first.X || len(branch.Body) != 1 {

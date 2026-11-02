@@ -170,6 +170,10 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				branch := ir.NewIfStmt(logical.Pos(), condition, ir.Nodes{second}, nil)
 				body := append(ir.TakeInit(logical), typecheck.Stmt(first), typecheck.Stmt(branch))
 				normalizeCallList(body, fn, calls, labels...)
+				// Typechecking an auto temporary updates Defn for each write.
+				// Keep its declaration's initial assignment as the definition;
+				// ordinary reassignment analysis still sees the guarded write.
+				value.Defn = first
 				init = append(init, body...)
 				root = replaceNormalizedExpression(root, logical, value)
 				changed = true
