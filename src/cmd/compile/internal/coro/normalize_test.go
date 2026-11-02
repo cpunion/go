@@ -61,7 +61,7 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 	stmt := ir.NewSwitchStmt(src.NoXPos, nil, []*ir.CaseClause{clause})
 	caller.Body = ir.Nodes{stmt}
 
-	normalizeSingleResultCalls(&Function{
+	normalizeSuspensionExpressions(&Function{
 		Func:    caller,
 		Effect:  MaySuspend,
 		Primary: CoroPrimary,
@@ -121,7 +121,7 @@ func TestNormalizeForHeaderControlFlow(t *testing.T) {
 	ordinary := ir.NewLabelStmt(src.NoXPos, pkg.Lookup(".3clNext_2"))
 	fn.Body = ir.Nodes{loop, ordinary}
 	function := &Function{Func: fn, Primary: CoroPrimary, Sites: []Site{{Kind: SiteAwait, Node: call}}}
-	normalizeSingleResultCalls(function)
+	normalizeSuspensionExpressions(function)
 	if len(loop.Init()) != 1 || loop.Init()[0] != init || loop.Post != post || post.Y != call {
 		t.Fatal("once-only initializer or post execution changed")
 	}
@@ -136,7 +136,7 @@ func TestNormalizeForHeaderControlFlow(t *testing.T) {
 		t.Fatal("source-shaped loop acquired per-iteration storage")
 	}
 	label.SetLoopVarContinue(true)
-	normalizeSingleResultCalls(function)
+	normalizeSuspensionExpressions(function)
 	if len(loop.Init()) != 1 || len(loop.Body) != 3 || loop.Post != post || function.continuationLabels[label.Label] != label {
 		t.Fatal("for header normalization is not idempotent")
 	}
@@ -258,7 +258,7 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 		selection,
 		assignOp,
 	}
-	normalizeSingleResultCalls(&Function{
+	normalizeSuspensionExpressions(&Function{
 		Func:    caller,
 		Effect:  MaySuspend,
 		Primary: CoroPrimary,
@@ -348,7 +348,7 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 	}
 
 	if root, init := normalizeCallExpression(nil, caller,
-		map[*ir.CallExpr]bool{}, false); root != nil || len(init) != 0 {
+		map[ir.Node]bool{}, false); root != nil || len(init) != 0 {
 		t.Fatalf("nil expression normalized to %v, %v", root, init)
 	}
 }
@@ -369,25 +369,25 @@ func TestNormalizeSingleResultCallDirectStatements(t *testing.T) {
 	name := ir.NewNameAt(src.NoXPos, pkg.Lookup("value"),
 		types.Types[types.TINT])
 
-	if !directCallStatement(call, call) {
+	if !directSuspensionStatement(call, call) {
 		t.Fatal("call statement is not direct")
 	}
-	if !directCallStatement(ir.NewAssignStmt(src.NoXPos, name, call), call) {
+	if !directSuspensionStatement(ir.NewAssignStmt(src.NoXPos, name, call), call) {
 		t.Fatal("assignment call is not direct")
 	}
 	list := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
 		ir.Nodes{name}, ir.Nodes{call})
-	if !directCallStatement(list, call) {
+	if !directSuspensionStatement(list, call) {
 		t.Fatal("assignment-list call is not direct")
 	}
-	if directCallStatement(ir.NewReturnStmt(src.NoXPos,
+	if directSuspensionStatement(ir.NewReturnStmt(src.NoXPos,
 		ir.Nodes{call}), call) {
 		t.Fatal("return call is unexpectedly direct")
 	}
 
-	normalizeSingleResultCalls(nil)
-	normalizeSingleResultCalls(&Function{})
-	normalizeSingleResultCalls(&Function{Func: callee, Primary: PlainPrimary})
+	normalizeSuspensionExpressions(nil)
+	normalizeSuspensionExpressions(&Function{})
+	normalizeSuspensionExpressions(&Function{Func: callee, Primary: PlainPrimary})
 }
 
 func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
@@ -419,7 +419,7 @@ func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
 	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{inlined})
 	caller.Body = ir.Nodes{ret}
 	function := &Function{Func: caller, Primary: CoroPrimary, Effect: MaySuspend, Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}}}
-	normalizeSingleResultCalls(function)
+	normalizeSuspensionExpressions(function)
 	if len(ret.Init()) != 3 || ret.Init()[0] != nestedAssign || ret.Init()[1] != branch || ret.Init()[2] != label || ret.Results[0] != value {
 		t.Fatal("inline execution was not exposed as an intact ordered body")
 	}
@@ -430,7 +430,7 @@ func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
 		t.Fatal("inline return jump or conditional await lost its ownership")
 	}
 	before := append(ir.Nodes(nil), ret.Init()...)
-	normalizeSingleResultCalls(function)
+	normalizeSuspensionExpressions(function)
 	if !slices.Equal(before, ret.Init()) || function.continuationLabels[label.Label] != label {
 		t.Fatal("repeated normalization lost inline execution or label ownership")
 	}

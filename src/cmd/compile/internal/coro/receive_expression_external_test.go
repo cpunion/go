@@ -46,8 +46,6 @@ func main() {
 }
 `
 	testSwitchReturnProgram(t, source, []switchFallback{
-		{"conditional", "channel site 1: nested receive in return"},
 		{"prior", "channel site 1: nested receive in return"},
-		{"loop", "channel site 1: nested receive in for"},
-	}, []string{"receive", "add", "argument", "pair", "condition", "after", "withCleanup", "literal", "pointer", "nested"})
+	}, []string{"receive", "add", "argument", "pair", "condition", "after", "withCleanup", "literal", "pointer", "nested", "conditional", "loop"})
 }
