@@ -42,6 +42,14 @@ func checkedStacklessCoroRangeDefer(frame any) *stacklessCoroRangeDefer {
 	return a
 }
 
+// The representation stays native after draining. An ordinary callback must
+// never pass a completed native anchor to ordinary deferprocat, whose token
+// has a different concrete runtime type. No current-task assumption is made.
+func coroRangeDeferIsNative(frame any) bool {
+	a, ok := frame.(*stacklessCoroRangeDefer)
+	return ok && a != nil
+}
+
 func coroRangeDefer(ctx unsafe.Pointer) any {
 	owner := (*stacklessCoroTask)(coroDeferToken(ctx))
 	a := &stacklessCoroRangeDefer{

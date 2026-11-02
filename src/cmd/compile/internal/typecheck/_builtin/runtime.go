@@ -344,6 +344,7 @@ func KeepAlive(interface{})
 
 // stackless coroutine deferred terminal control
 func coroRangeDefer(unsafe.Pointer) interface{}
+func coroRangeDeferIsNative(interface{}) bool
 func coroRangeDeferOwner(interface{}) unsafe.Pointer
 func coroRangeDeferPush(interface{}, func())
 func coroRangeDeferNext(unsafe.Pointer, interface{}) (func(), bool)
