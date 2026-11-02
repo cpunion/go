@@ -179,6 +179,10 @@ const (
 	stacklessCoroTaskSwitchPending
 	stacklessCoroTaskFreeChunk
 	stacklessCoroTaskTypedSpawn
+	// Structured children always have a parent; independent typed spawns
+	// never do. Share this bit and consume the defer identity before clearing
+	// a frame or detaching its parent, without growing either fixed header.
+	stacklessCoroTaskDeferChild          = stacklessCoroTaskTypedSpawn
 	stacklessCoroTaskFusedTransitionMask = stacklessCoroTaskFusedRequested |
 		stacklessCoroTaskFusedPending | stacklessCoroTaskFusedChunk
 	stacklessCoroTaskCompletionMask = stacklessCoroTaskFusedFrames |
@@ -304,10 +308,7 @@ type stacklessCoroScheduler struct {
 	liveSpawns     uint64
 	root           stacklessCoroTask
 	terminalValues map[*stacklessCoroTask]any
-	// Only deferred child activations may await an owner already unwinding.
-	// Keep this uncommon identity outside every task's fixed-size header.
-	deferChildren map[*stacklessCoroTask]bool
-	wake          chan struct{}
+	wake           chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
 	rootDone chan struct{}
@@ -777,7 +778,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 		s.root.state == stacklessCoroTaskComplete &&
 		!s.root.resuming && !s.root.readyPending &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
-		len(s.terminalValues) == 0 && len(s.deferChildren) == 0 && s.blockingExecutors.Load() == 0 &&
+		len(s.terminalValues) == 0 && s.blockingExecutors.Load() == 0 &&
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
 			state == stacklessCoroExecutorStateSingleP ||
@@ -3221,11 +3222,8 @@ func coroDeferAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	if task == nil {
 		task = s.newTaskLocked(frame, child, parent)
 	}
-	if s.deferChildren == nil {
-		s.deferChildren = make(map[*stacklessCoroTask]bool)
-	}
-	s.deferChildren[task] = true
 	s.markUncachedFrameLineageLocked(task, parent, frame)
+	task.setFlag(stacklessCoroTaskDeferChild, true)
 	parent.state = stacklessCoroTaskWaiting
 	s.readyLocked(task)
 	unlock(&s.lock)
@@ -4439,6 +4437,10 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
 	}
+	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	if deferred {
+		task.setFlag(stacklessCoroTaskDeferChild, false)
+	}
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	if !task.hasFlag(stacklessCoroTaskCacheFrame) {
@@ -4459,8 +4461,6 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		s.logicalTaskComplete(root)
 		return nil
 	}
-	deferred := s.deferChildren[task]
-	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
 		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
@@ -4495,6 +4495,10 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine termination")
 	}
+	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	if deferred {
+		task.setFlag(stacklessCoroTaskDeferChild, false)
+	}
 	s.discardFusedFramesLocked(task)
 	task.flags &^= stacklessCoroTaskFusedTransitionMask
 	s.cancelReservedFrameTasksLocked(task)
@@ -4520,8 +4524,6 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		s.logicalTaskComplete(true)
 		return
 	}
-	deferred := s.deferChildren[task]
-	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
 		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
@@ -4545,6 +4547,10 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		task.terminal != stacklessCoroTerminalNone || !task.goexit {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine Goexit termination")
+	}
+	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	if deferred {
+		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
 	s.discardFusedFramesLocked(task)
 	task.flags &^= stacklessCoroTaskFusedTransitionMask
@@ -4570,8 +4576,6 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		s.logicalTaskComplete(false)
 		return
 	}
-	deferred := s.deferChildren[task]
-	delete(s.deferChildren, task)
 	if parent.state != stacklessCoroTaskWaiting ||
 		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
 		unlock(&s.lock)
