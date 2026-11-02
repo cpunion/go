@@ -4979,11 +4979,10 @@ identified by the frontend's `RangeParent` metadata and demanded callback proof.
 Protocol state remains in traced shared cells after callback escape.
 
 A defer registered by a range-function body belongs to its enclosing source
-activation. A non-nil `DeferAt` is explicitly rejected by native lowering until
-that ownership can be represented. The ordinary source body retains the
-registration lifetime and LIFO order. Returned captured iterator specialization
-also remains outside this slice, since replacing its callable with a static
-specialization would discard its environment.
+activation. Enclosing cleanup admission validates the frontend's exact marker
+and `DeferAt` ownership, then every possible cleanup target. Unknown targets or
+unsupported cleanup contracts retain ordinary execution. Returned captured
+iterator specialization freezes the actual environment, as described below.
 
 
 ### Direct iterator producer expressions (work in progress, 2026-11-02)
@@ -5051,3 +5050,35 @@ observable outer prefixes keep conservative ordinary execution until their
 separate ordering contracts can be represented. Skipped nil-channel operands,
 closed conditions, Goexit cleanup and GC of parked received pointers require
 actual entry-gate and genuine-SDK validation before acceptance.
+
+### Enclosing range cleanup (work in progress, 2026-11-02)
+
+An enclosing activation keeps ordinary defers and range markers in one traced
+registration stack. Each marker captures the exact task, frame and resume
+identity. Yield callbacks register against that anchor rather than their own
+cleanup stack. Empty iterations, repeated markers, nested loops and recursive
+activations retain their original registration positions and LIFO order.
+
+Ordinary callbacks inspect the anchor representation after freezing the original
+deferred function and operands. An ordinary anchor retains the original Go
+registration. A native anchor receives an independent copy of the validated
+cleanup body, bound to the ordinary callback's captured cells. Terminal rewrites
+use the enclosing owner's token. This also supports escaped callbacks invoked
+from another goroutine, including callbacks that themselves require ordinary
+thread execution. Those ordinary bodies must be restored before the enclosing
+native owner rewrites shared capture cells into pointer fields.
+
+Only cleanup registrations transfer recover and Goexit effects to the owner;
+non-defer callback operations keep their existing execution restrictions. The
+owner's linker gate includes every possible cleanup body and factory, including
+adapters registered from ordinary callbacks. An unsafe machine target rejects
+the complete owner before source effects execute. Source-level rejection and
+linker budget rejection both preserve ordinary registration semantics.
+
+Cleanup seals an anchor at its original marker position and removes one callback
+before invocation. The marker stays registered until the anchor is drained, so
+replacement panic and Goexit cannot lose the remaining callbacks. Captured
+operands stay traced while the owner is parked, and draining releases owner,
+frame and resume roots even when an escaped yield still retains the anchor.
+Registration against a drained native anchor remains an invalid late native
+registration; it must never be mistaken for an ordinary runtime token.

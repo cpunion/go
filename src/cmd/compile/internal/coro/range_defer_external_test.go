@@ -38,7 +38,141 @@ func sumArray(p *[256]int)int{sum:=0;for _,v:=range p{sum+=v};return sum}
 //go:noinline
 func bigStackTarget(){var values [256]int;for i:=range values{values[i]=i};add(sumArray(&values))}
 //go:noinline
-func overBudgetOwner(){for range one{defer bigStackTarget()}}
+func sourceBudgetOwner(){for range one{defer bigStackTarget()}}
+//go:noinline
+func overBudgetOwner(){for range one{defer deepStackTarget()}}
+//go:noinline
+func deepStackTarget(){add(stack0(0))}
+//go:noinline
+func stack0(v int)int{return stack1(v)+1}
+//go:noinline
+func stack1(v int)int{return stack2(v)+1}
+//go:noinline
+func stack2(v int)int{return stack3(v)+1}
+//go:noinline
+func stack3(v int)int{return stack4(v)+1}
+//go:noinline
+func stack4(v int)int{return stack5(v)+1}
+//go:noinline
+func stack5(v int)int{return stack6(v)+1}
+//go:noinline
+func stack6(v int)int{return stack7(v)+1}
+//go:noinline
+func stack7(v int)int{return stack8(v)+1}
+//go:noinline
+func stack8(v int)int{return stack9(v)+1}
+//go:noinline
+func stack9(v int)int{return stack10(v)+1}
+//go:noinline
+func stack10(v int)int{return stack11(v)+1}
+//go:noinline
+func stack11(v int)int{return stack12(v)+1}
+//go:noinline
+func stack12(v int)int{return stack13(v)+1}
+//go:noinline
+func stack13(v int)int{return stack14(v)+1}
+//go:noinline
+func stack14(v int)int{return stack15(v)+1}
+//go:noinline
+func stack15(v int)int{return stack16(v)+1}
+//go:noinline
+func stack16(v int)int{return stack17(v)+1}
+//go:noinline
+func stack17(v int)int{return stack18(v)+1}
+//go:noinline
+func stack18(v int)int{return stack19(v)+1}
+//go:noinline
+func stack19(v int)int{return stack20(v)+1}
+//go:noinline
+func stack20(v int)int{return stack21(v)+1}
+//go:noinline
+func stack21(v int)int{return stack22(v)+1}
+//go:noinline
+func stack22(v int)int{return stack23(v)+1}
+//go:noinline
+func stack23(v int)int{return stack24(v)+1}
+//go:noinline
+func stack24(v int)int{return stack25(v)+1}
+//go:noinline
+func stack25(v int)int{return stack26(v)+1}
+//go:noinline
+func stack26(v int)int{return stack27(v)+1}
+//go:noinline
+func stack27(v int)int{return stack28(v)+1}
+//go:noinline
+func stack28(v int)int{return stack29(v)+1}
+//go:noinline
+func stack29(v int)int{return stack30(v)+1}
+//go:noinline
+func stack30(v int)int{return stack31(v)+1}
+//go:noinline
+func stack31(v int)int{return stack32(v)+1}
+//go:noinline
+func stack32(v int)int{return stack33(v)+1}
+//go:noinline
+func stack33(v int)int{return stack34(v)+1}
+//go:noinline
+func stack34(v int)int{return stack35(v)+1}
+//go:noinline
+func stack35(v int)int{return stack36(v)+1}
+//go:noinline
+func stack36(v int)int{return stack37(v)+1}
+//go:noinline
+func stack37(v int)int{return stack38(v)+1}
+//go:noinline
+func stack38(v int)int{return stack39(v)+1}
+//go:noinline
+func stack39(v int)int{return stack40(v)+1}
+//go:noinline
+func stack40(v int)int{return stack41(v)+1}
+//go:noinline
+func stack41(v int)int{return stack42(v)+1}
+//go:noinline
+func stack42(v int)int{return stack43(v)+1}
+//go:noinline
+func stack43(v int)int{return stack44(v)+1}
+//go:noinline
+func stack44(v int)int{return stack45(v)+1}
+//go:noinline
+func stack45(v int)int{return stack46(v)+1}
+//go:noinline
+func stack46(v int)int{return stack47(v)+1}
+//go:noinline
+func stack47(v int)int{return stack48(v)+1}
+//go:noinline
+func stack48(v int)int{return stack49(v)+1}
+//go:noinline
+func stack49(v int)int{return stack50(v)+1}
+//go:noinline
+func stack50(v int)int{return stack51(v)+1}
+//go:noinline
+func stack51(v int)int{return stack52(v)+1}
+//go:noinline
+func stack52(v int)int{return stack53(v)+1}
+//go:noinline
+func stack53(v int)int{return stack54(v)+1}
+//go:noinline
+func stack54(v int)int{return stack55(v)+1}
+//go:noinline
+func stack55(v int)int{return stack56(v)+1}
+//go:noinline
+func stack56(v int)int{return stack57(v)+1}
+//go:noinline
+func stack57(v int)int{return stack58(v)+1}
+//go:noinline
+func stack58(v int)int{return stack59(v)+1}
+//go:noinline
+func stack59(v int)int{return stack60(v)+1}
+//go:noinline
+func stack60(v int)int{return stack61(v)+1}
+//go:noinline
+func stack61(v int)int{return stack62(v)+1}
+//go:noinline
+func stack62(v int)int{return stack63(v)+1}
+//go:noinline
+func stack63(v int)int{return stack64(v)+1}
+//go:noinline
+func stack64(v int)int{return v}
 //go:noinline
 func basic(){defer add(9);for v:=range three{defer add(v);runtime.Gosched()};defer add(8)}
 //go:noinline
@@ -85,7 +219,7 @@ func ordinaryBodyOwner(){defer add(9);for v:=range stash{runtime.LockOSThread();
 func mixed(lockedOwner,ordinaryBody bool){trace=nil;ready=make(chan struct{});release=make(chan struct{});done:=make(chan struct{});go func(){if lockedOwner{runtime.LockOSThread();defer runtime.UnlockOSThread()};if ordinaryBody{ordinaryBodyOwner()}else{escapedOwner()};close(done)}();<-ready;if !lockedOwner{runtime.LockOSThread()};if !saved(1)||!saved(2){panic("yield stopped")};if !lockedOwner{runtime.UnlockOSThread()};runtime.GC();close(release);<-done;check(8,2,1,9)}
 func check(want ...int){if !slices.Equal(trace,want){panic("range cleanup order")};trace=nil}
 func main(){
- markerOnly(false);markerOnly(true);check();repeatedMarkers();check(31,21,11,1);overBudgetOwner();check(32640)
+ markerOnly(false);markerOnly(true);check();repeatedMarkers();check(31,21,11,1);overBudgetOwner();check(64);sourceBudgetOwner();check(32640)
  basic();check(8,3,2,1,9);separate();check(7,2,8,1,9);nested();check(8,2,9)
  if early()!=2{panic("early result")};check(2,1,9);recursive(1);check(1,9,2,10)
  if replacement()!="replacement"{panic("replacement recover")};check(1,9)
