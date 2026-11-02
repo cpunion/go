@@ -56,7 +56,7 @@ var observed any
 //go:noinline
 func recoverCallback()any{return recover()}
 //go:noinline
-func recoverMaker(p *any)func(func()any){return func(cb func()any){*p=recover();observed=cb()}}
+func recoverMaker(p *any)func(func()any){return func(cb func()any){observed=cb();*p=recover()}}
 //go:noinline
 func recoverOwner()(caught any){f:=recoverMaker(&caught);defer f(recoverCallback);runtime.Gosched();panic("direct")}
 //go:noinline

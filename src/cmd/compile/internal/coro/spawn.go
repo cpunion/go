@@ -40,6 +40,17 @@ func plainSpawnFactorySupported(function *Function) bool {
 	return function != nil && resumeFactorySupported(function.Func) && plainFactoryBodySupported(function)
 }
 
+// A normal callback invokes its ordinary entry from the resume adapter, rather
+// than as a deferred Go frame. A leaf recover therefore returns nil there and
+// cannot consume its caller's logical defer token. Keep the existing bounded
+// leaf and context-free ABI requirements; captured or transitive recover needs
+// a separate environment and terminal-control proof.
+func plainCallbackFactorySupported(function *Function) bool {
+	return function != nil && resumeFactorySupported(function.Func) &&
+		function.LocalTerminal == function.Terminal &&
+		plainFactoryBodySupportedWithTerminal(function, UsesRecover)
+}
+
 // A captured plain callback cannot use the ordinary-call adapter: that adapter
 // has no source closure environment. Its demanded private factory instead uses
 // the regular typed capture lowering, without publishing a context-free ABI.
@@ -48,9 +59,13 @@ func capturedPlainFactorySupported(function *Function) bool {
 }
 
 func plainFactoryBodySupported(function *Function) bool {
+	return plainFactoryBodySupportedWithTerminal(function, 0)
+}
+
+func plainFactoryBodySupportedWithTerminal(function *Function, allowed TerminalFlags) bool {
 	if !(function != nil && function.Primary == PlainPrimary &&
 		function.Effect == NoSuspend && function.Exec == 0 &&
-		function.Terminal == 0 &&
+		function.Terminal & ^allowed == 0 &&
 		len(function.Func.Body) != 0 &&
 		len(function.Edges) == 0) {
 		return false

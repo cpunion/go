@@ -346,7 +346,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, target := range callbackTargets {
-		if child := plan.Functions[target]; plainSpawnFactorySupported(child) {
+		if child := plan.Functions[target]; plainCallbackFactorySupported(child) {
 			factories[target] = newPlainSpawnFactory(target, target.Nname)
 			child.Factory = FactoryABI1
 		}
