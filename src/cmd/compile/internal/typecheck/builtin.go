@@ -283,31 +283,35 @@ var runtimeDecls = [...]struct {
 	{"riscv64HasZbb", varTag, 6},
 	{"asanregisterglobals", funcTag, 162},
 	{"KeepAlive", funcTag, 11},
-	{"coroDeferToken", funcTag, 190},
-	{"coroDeferInvoke", funcTag, 191},
+	{"coroRangeDefer", funcTag, 190},
+	{"coroRangeDeferOwner", funcTag, 191},
+	{"coroRangeDeferPush", funcTag, 192},
+	{"coroRangeDeferNext", funcTag, 193},
+	{"coroDeferToken", funcTag, 194},
+	{"coroDeferInvoke", funcTag, 195},
 	{"coroDeferCall", funcTag, 145},
 	{"coroDeferRun", funcTag, 128},
 	{"coroDeferGoexit", funcTag, 146},
 	{"coroDeferPanic", funcTag, 136},
-	{"coroDeferRecover", funcTag, 192},
+	{"coroDeferRecover", funcTag, 190},
 	{"coroGoexit", funcTag, 146},
 	{"coroTerminalAction", funcTag, 123},
-	{"coroTakeFrame", funcTag, 193},
-	{"coroTakeTypedTaskFrame", funcTag, 194},
-	{"coroTakeFrameChunk", funcTag, 194},
-	{"coroTakeSelfFrame", funcTag, 194},
-	{"coroTakeFusedFrame", funcTag, 195},
-	{"coroSemacquireMutex", funcTag, 198},
-	{"coroSemacquire", funcTag, 199},
-	{"coroSemacquireWaitGroup", funcTag, 200},
-	{"coroNotifyListWait", funcTag, 201},
-	{"coroSemreleasePoll", funcTag, 202},
-	{"coroSemrelease", funcTag, 203},
-	{"coroUseOrdinary", funcTag, 204},
+	{"coroTakeFrame", funcTag, 196},
+	{"coroTakeTypedTaskFrame", funcTag, 197},
+	{"coroTakeFrameChunk", funcTag, 197},
+	{"coroTakeSelfFrame", funcTag, 197},
+	{"coroTakeFusedFrame", funcTag, 198},
+	{"coroSemacquireMutex", funcTag, 201},
+	{"coroSemacquire", funcTag, 202},
+	{"coroSemacquireWaitGroup", funcTag, 203},
+	{"coroNotifyListWait", funcTag, 204},
+	{"coroSemreleasePoll", funcTag, 205},
+	{"coroSemrelease", funcTag, 206},
+	{"coroUseOrdinary", funcTag, 207},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [205]*types.Type
+	var typs [208]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -498,21 +502,24 @@ func runtimeTypes() []*types.Type {
 	typs[187] = newSig(params(typs[30], typs[30], typs[15]), nil)
 	typs[188] = types.NewArray(typs[0], 16)
 	typs[189] = newSig(params(typs[7], typs[67], typs[188], typs[30], typs[13], typs[71], typs[71]), params(typs[67]))
-	typs[190] = newSig(params(typs[7]), params(typs[7]))
-	typs[191] = newSig(params(typs[9]), nil)
-	typs[192] = newSig(params(typs[7]), params(typs[10]))
-	typs[193] = newSig(params(typs[7], typs[123], typs[5]), params(typs[7]))
-	typs[194] = newSig(params(typs[7], typs[123], typs[5], typs[1]), params(typs[7]))
-	typs[195] = newSig(params(typs[7], typs[123], typs[5], typs[1], typs[6]), params(typs[7]))
-	typs[196] = types.NewPtr(typs[67])
-	typs[197] = types.NewPtr(typs[7])
-	typs[198] = newSig(params(typs[7], typs[196], typs[6], typs[13], typs[197]), params(typs[6]))
-	typs[199] = newSig(params(typs[7], typs[196], typs[197]), params(typs[6]))
-	typs[200] = newSig(params(typs[7], typs[196], typs[6], typs[197]), params(typs[6]))
-	typs[201] = newSig(params(typs[7], typs[7], typs[67], typs[197]), params(typs[6]))
-	typs[202] = newSig(params(typs[7], typs[196]), params(typs[6]))
-	typs[203] = newSig(params(typs[7], typs[196], typs[6], typs[13]), params(typs[6]))
-	typs[204] = newSig(nil, params(typs[6]))
+	typs[190] = newSig(params(typs[7]), params(typs[10]))
+	typs[191] = newSig(params(typs[10]), params(typs[7]))
+	typs[192] = newSig(params(typs[10], typs[9]), nil)
+	typs[193] = newSig(params(typs[7], typs[10]), params(typs[9], typs[6]))
+	typs[194] = newSig(params(typs[7]), params(typs[7]))
+	typs[195] = newSig(params(typs[9]), nil)
+	typs[196] = newSig(params(typs[7], typs[123], typs[5]), params(typs[7]))
+	typs[197] = newSig(params(typs[7], typs[123], typs[5], typs[1]), params(typs[7]))
+	typs[198] = newSig(params(typs[7], typs[123], typs[5], typs[1], typs[6]), params(typs[7]))
+	typs[199] = types.NewPtr(typs[67])
+	typs[200] = types.NewPtr(typs[7])
+	typs[201] = newSig(params(typs[7], typs[199], typs[6], typs[13], typs[200]), params(typs[6]))
+	typs[202] = newSig(params(typs[7], typs[199], typs[200]), params(typs[6]))
+	typs[203] = newSig(params(typs[7], typs[199], typs[6], typs[200]), params(typs[6]))
+	typs[204] = newSig(params(typs[7], typs[7], typs[67], typs[200]), params(typs[6]))
+	typs[205] = newSig(params(typs[7], typs[199]), params(typs[6]))
+	typs[206] = newSig(params(typs[7], typs[199], typs[6], typs[13]), params(typs[6]))
+	typs[207] = newSig(nil, params(typs[6]))
 	return typs[:]
 }
 
