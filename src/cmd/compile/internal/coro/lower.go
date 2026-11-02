@@ -491,6 +491,28 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			prepareRootArray(candidate)
 		}
 	}
+	// Lowering an enclosing function can replace a closure's captures with
+	// explicit pointer cells. Materialize every remaining source fallback
+	// before that changes the layout expected by its serialized body.
+	rejectedBodies := make(map[*ir.Func]*ir.Func)
+	specializedBodies := make(map[*ir.Func]*ir.Func)
+	for _, function := range functions {
+		fn := function.Func
+		if plan.rewrittenCallers[fn] && candidates[fn] == nil {
+			ordinary := bodies.Read(fn)
+			if ordinary == nil {
+				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(fn))
+			}
+			rejectedBodies[fn] = ordinary
+		}
+		if build := plan.specializedBodies[fn]; build != nil {
+			ordinary := build()
+			if ordinary == nil {
+				return result, fmt.Errorf("%s: missing specialized ordinary body", ir.PkgFuncName(fn))
+			}
+			specializedBodies[fn] = ordinary
+		}
+	}
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
 		depth := func(fn *ir.Func) int {
@@ -529,20 +551,15 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	retainCapturedEntries(candidates)
 	resolveFusedFrameChunkProofs(candidates)
 	for _, function := range functions {
-		if plan.rewrittenCallers[function.Func] && candidates[function.Func] == nil {
-			ordinary := bodies.Read(function.Func)
-			if ordinary == nil {
-				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(function.Func))
-			}
+		if ordinary := rejectedBodies[function.Func]; ordinary != nil {
 			remapOrdinaryBody(function.Func, ordinary)
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
 		}
-		if build := plan.specializedBodies[function.Func]; build != nil {
+		if ordinary := specializedBodies[function.Func]; ordinary != nil {
 			// A rejected caller can still invoke a private helper's ordinary
 			// entry. In particular recover must then run directly in its
 			// deferred Go frame, never through a fresh root scheduler.
-			ordinary := build()
 			remapOrdinaryBody(function.Func, ordinary)
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
@@ -2709,13 +2726,13 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 }
 
 func reparentClosureCaptures(fn, resume *ir.Func,
-	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node) error {
+	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node, detached ...ir.Node) error {
 	// Source function literals now execute inside resume. Reparent them and
 	// route their captures through resume's copy of each factory local.
 	// Defer wrappers need specialized snapshot and terminal rewriting, so
 	// leave those closures alone here.
 	var captureErr error
-	ir.Visit(fn, func(node ir.Node) {
+	visit := func(node ir.Node) {
 		if captureErr != nil {
 			return
 		}
@@ -2762,7 +2779,9 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 				variable.Defn = variable.Outer.Canonical()
 			}
 		})
-	})
+	}
+	ir.Visit(fn, visit)
+	ir.VisitList(detached, visit)
 	return captureErr
 }
 
@@ -3644,6 +3663,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		panic(fmt.Sprintf("unexpected coroutine lowering boundary %s", stmt.Op()))
 	}
+	// Building states detaches statement initializers from the source tree.
+	// Retain their literals so their captures still move into resume, including
+	// callee snapshots introduced by captured-parameter specialization.
+	var sourceLiterals ir.Nodes
+	ir.Visit(fn, func(node ir.Node) {
+		if closure, ok := node.(*ir.ClosureExpr); ok {
+			sourceLiterals = append(sourceLiterals, closure)
+		}
+	})
 	entryState := lowerStatements(fn.Body, completeState)
 	candidate.entryZeroed = entryZeroedFrameLocals(states[entryState].body)
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
@@ -3894,7 +3922,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			deferClosures[closure.Func] = true
 		}
 	}
-	if err := reparentClosureCaptures(fn, resume, deferClosures, edit); err != nil {
+	if err := reparentClosureCaptures(fn, resume, deferClosures, edit, sourceLiterals...); err != nil {
 		return err
 	}
 

@@ -7306,9 +7306,17 @@ func TestReparentClosureCaptures(t *testing.T) {
 		}
 		return node
 	}
+	detached := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE,
+		types.NewSignature(nil, nil, nil), fn, typecheck.Target, 0)
+	detached.DeclareParams(true)
+	detachedCapture := ir.NewClosureVar(src.NoXPos, detached, source)
 	if err := reparentClosureCaptures(fn, resume,
-		map[*ir.Func]bool{excluded: true}, edit); err != nil {
+		map[*ir.Func]bool{excluded: true}, edit, detached.OClosure); err != nil {
 		t.Fatal(err)
+	}
+	if detached.ClosureParent != resume || detachedCapture.Outer != resumeSource ||
+		detachedCapture.Canonical() != resumeSource {
+		t.Fatal("detached initializer closure retained its source capture")
 	}
 	if closure.ClosureParent != resume {
 		t.Fatalf("closure parent = %v, want resume", closure.ClosureParent)
