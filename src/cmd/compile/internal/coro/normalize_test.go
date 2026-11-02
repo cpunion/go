@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
+	"slices"
 	"testing"
 )
 
@@ -351,5 +352,10 @@ func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
 	}
 	if branch.Body[0] != assignment || branch.Body[1] != jump || function.inlineLabels[label.Label] != label {
 		t.Fatal("inline return jump or conditional await lost its ownership")
+	}
+	before := append(ir.Nodes(nil), ret.Init()...)
+	normalizeSingleResultCalls(function)
+	if !slices.Equal(before, ret.Init()) || function.inlineLabels[label.Label] != label {
+		t.Fatal("repeated normalization lost inline execution or label ownership")
 	}
 }

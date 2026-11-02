@@ -38,7 +38,9 @@ func normalizeSingleResultCalls(function *Function) {
 
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = function.Func
-	function.inlineLabels = make(map[*types.Sym]*ir.LabelStmt)
+	if function.inlineLabels == nil {
+		function.inlineLabels = make(map[*types.Sym]*ir.LabelStmt)
+	}
 	normalizeCallList(function.Func.Body, function.Func, calls, function.inlineLabels)
 	ir.CurFunc = oldCurFunc
 }

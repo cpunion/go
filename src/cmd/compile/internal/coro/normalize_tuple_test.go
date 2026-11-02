@@ -110,6 +110,37 @@ func testNormalizeTupleInitializers(t *testing.T, argumentInit bool) {
 			}
 			function := &Function{Func: caller, Effect: MaySuspend, Primary: CoroPrimary, Sites: sites}
 			normalizeSingleResultCalls(function)
+			if mode == "inlined" || mode == "inlined-init" {
+				// The complete inline execution can now be exposed. Check its
+				// evaluation sequence rather than requiring the old fallback.
+				var execution ir.Nodes
+				var visit func(ir.Node)
+				visit = func(node ir.Node) {
+					for _, init := range node.Init() {
+						visit(init)
+					}
+					if node == prefix || node == assignment || node == outer {
+						execution = append(execution, node)
+					}
+				}
+				for _, init := range root.Init() {
+					visit(init)
+				}
+				if !slices.Equal(execution, ir.Nodes{prefix, assignment, outer}) {
+					t.Fatalf("expanded inline evaluation = %v, want prefix, tuple assignment, consumer", execution)
+				}
+				for i, value := range values {
+					if outer.Args[i] != arguments[i] || value.Name().Defn != assignment || assignment.Init()[i].Op() != ir.ODCL {
+						t.Fatal("expanded inline tuple operands or declaration ownership changed")
+					}
+				}
+				before := slices.Clone(root.Init())
+				normalizeSingleResultCalls(function)
+				if !slices.Equal(root.Init(), before) {
+					t.Fatal("expanded inline normalization is not idempotent")
+				}
+				return
+			}
 			safe := mode == "return" || mode == "plain-return" || mode == "tuple-return" || mode == "condition" || mode == "statement"
 			if !safe {
 				if len(root.Init()) != 0 || !slices.Equal(owner.Init(), original) {
