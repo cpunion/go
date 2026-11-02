@@ -176,6 +176,8 @@ func stack64(v int)int{return v}
 //go:noinline
 func basic(){defer add(9);for v:=range three{defer add(v);runtime.Gosched()};defer add(8)}
 //go:noinline
+func parameterLiteral(){for v:=range three{defer func(x int){add(x+10)}(v)}}
+//go:noinline
 func separate(){defer add(9);for v:=range one{defer add(v)};defer add(8);for v:=range one{defer add(v+1)};defer add(7)}
 //go:noinline
 func nested(){defer add(9);for i:=range one{for j:=range one{defer add(i+j)}};defer add(8)}
@@ -220,7 +222,7 @@ func mixed(lockedOwner,ordinaryBody bool){trace=nil;ready=make(chan struct{});re
 func check(want ...int){if !slices.Equal(trace,want){panic("range cleanup order")};trace=nil}
 func main(){
  markerOnly(false);markerOnly(true);check();repeatedMarkers();check(31,21,11,1);overBudgetOwner();check(64);sourceBudgetOwner();check(32640)
- basic();check(8,3,2,1,9);separate();check(7,2,8,1,9);nested();check(8,2,9)
+ basic();check(8,3,2,1,9);parameterLiteral();check(13,12,11);separate();check(7,2,8,1,9);nested();check(8,2,9)
  if early()!=2{panic("early result")};check(2,1,9);recursive(1);check(1,9,2,10)
  if replacement()!="replacement"{panic("replacement recover")};check(1,9)
  if rangeRecover()!="range"{panic("range direct recover")};check(2)
@@ -254,7 +256,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"basic", "separate", "nested", "early", "recursive", "replacement", "rangeRecover", "namedRangeRecover", "rangeFactory", "nilCall", "exiting", "held", "escapedOwner", "ordinaryBodyOwner", "markerOnly", "repeatedMarkers"} {
+				for _, name := range []string{"basic", "parameterLiteral", "separate", "nested", "early", "recursive", "replacement", "rangeRecover", "namedRangeRecover", "rangeFactory", "nilCall", "exiting", "held", "escapedOwner", "ordinaryBodyOwner", "markerOnly", "repeatedMarkers"} {
 					t.Run(name, func(t *testing.T) {
 						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 							t.Fatal("lost native enclosing cleanup admission")

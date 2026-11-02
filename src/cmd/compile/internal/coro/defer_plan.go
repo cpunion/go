@@ -82,6 +82,22 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 			if edge.Callee.Wrapper() && edge.Callee.WrappedFunc == nil {
 				return fmt.Errorf("defer wrapper has no target")
 			}
+			if target := edge.Callee.WrappedFunc; target != nil && target.OClosure != nil &&
+				len(target.ClosureVars) == 0 && summary.Terminal == 0 {
+				// A literal with arguments is frozen in a frontend wrapper.
+				// Even without an environment its ordinary call can remain
+				// indirect when inlining is disabled. Bind the exact static
+				// target through the existing cleanup dispatch, preserving
+				// operand snapshots while giving the linker a real call edge.
+				inner := unwrapGoCall(deferred.call)
+				if inner != deferred.call {
+					name := ir.StaticCalleeName(ir.StaticValue(inner.Fun))
+					if name != nil && name.Func == target {
+						deferred.terminalTargets = []lowerDeferTerminal{{target: target}}
+						continue
+					}
+				}
+			}
 			if !edge.Callee.Wrapper() && dynamicDefers {
 				deferred.sourceLiteral = true
 				deferred.literalCaptures = slices.Clone(
