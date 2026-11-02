@@ -4280,38 +4280,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		} else if state.cleanup {
 			if candidate.dynamicDefers {
 				stack := capture(deferStack)
-				deferType := candidate.defers[0].call.Fun.Type()
-				deferredCall := typecheck.TempAt(pos, resume, deferType)
-				stackLen := func() ir.Node {
-					return ir.NewUnaryExpr(pos, ir.OLEN, stack)
-				}
-				lastIndex := func() ir.Node {
-					return ir.NewBinaryExpr(pos, ir.OSUB, stackLen(),
-						ir.NewInt(pos, 1))
-				}
-				load := ir.NewAssignStmt(pos, deferredCall,
-					ir.NewIndexExpr(pos, stack, lastIndex()))
-				clear := ir.NewAssignStmt(pos,
-					ir.NewIndexExpr(pos, stack, lastIndex()),
-					typecheck.NodNil())
-				pop := ir.NewAssignStmt(pos, stack,
-					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
-						lastIndex(), nil))
-				call := ir.Node(typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{deferredCall}, false))
-				if slices.ContainsFunc(candidate.defers,
-					func(deferred *lowerDefer) bool {
-						return deferred.namedRecover
-					}) {
-					call = typecheck.Call(pos,
-						typecheck.LookupRuntime("coroDeferCall"),
-						ir.Nodes{resumeDeferToken, deferredCall}, false)
-				}
-				condition := ir.NewBinaryExpr(pos, ir.ONE, stackLen(),
-					ir.NewInt(pos, 0))
-				// Pop before calling so a later replacement-panic path cannot
-				// invoke the same deferred call twice.
-				body = append(body, ir.NewForStmt(pos, nil, condition, nil,
-					ir.Nodes{load, clear, pop, call}, false))
+				// The record form is used by enclosing range markers once owner
+				// admission has proved every callback cleanup target. Existing
+				// dynamic defers retain their original function-only stack.
+				body = append(body, lowerDeferStackCleanup(pos, resume, ctx, stack,
+					resumeDeferToken, slices.ContainsFunc(candidate.defers,
+						func(deferred *lowerDefer) bool { return deferred.namedRecover }), false))
 			} else {
 				for j := len(candidate.defers) - 1; j >= 0; j-- {
 					deferred := candidate.defers[j]
