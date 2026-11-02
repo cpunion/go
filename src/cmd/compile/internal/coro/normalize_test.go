@@ -331,15 +331,23 @@ func TestNormalizeInlinedAwaitControlFlow(t *testing.T) {
 	label := ir.NewLabelStmt(src.NoXPos, pkg.Lookup("inlineExit"))
 	jump := ir.NewBranchStmt(src.NoXPos, ir.OGOTO, label.Label)
 	branch := ir.NewIfStmt(src.NoXPos, ir.NewBool(src.NoXPos, true), ir.Nodes{assignment, jump}, nil)
-	inlined := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{branch, label}, ir.Nodes{value})
+	nestedLabel := ir.NewLabelStmt(src.NoXPos, pkg.Lookup("nestedInlineExit"))
+	nested := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{nestedLabel}, ir.Nodes{ir.NewInt(src.NoXPos, 1)})
+	nested.SetType(types.Types[types.TINT])
+	nested.SetTypecheck(1)
+	nestedAssign := ir.NewAssignStmt(src.NoXPos, value, nested)
+	inlined := ir.NewInlinedCallExpr(src.NoXPos, ir.Nodes{nestedAssign, branch, label}, ir.Nodes{value})
 	inlined.SetType(value.Type())
 	inlined.SetTypecheck(1)
 	ret := ir.NewReturnStmt(src.NoXPos, ir.Nodes{inlined})
 	caller.Body = ir.Nodes{ret}
 	function := &Function{Func: caller, Primary: CoroPrimary, Effect: MaySuspend, Sites: []Site{{ID: 1, Kind: SiteAwait, Node: call}}}
 	normalizeSingleResultCalls(function)
-	if len(ret.Init()) != 2 || ret.Init()[0] != branch || ret.Init()[1] != label || ret.Results[0] != value {
+	if len(ret.Init()) != 3 || ret.Init()[0] != nestedAssign || ret.Init()[1] != branch || ret.Init()[2] != label || ret.Results[0] != value {
 		t.Fatal("inline execution was not exposed as an intact ordered body")
+	}
+	if function.inlineLabels[nestedLabel.Label] != nil {
+		t.Fatal("nested pure inline label acquired a continuation state")
 	}
 	if branch.Body[0] != assignment || branch.Body[1] != jump || function.inlineLabels[label.Label] != label {
 		t.Fatal("inline return jump or conditional await lost its ownership")

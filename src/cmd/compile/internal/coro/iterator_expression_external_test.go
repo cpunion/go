@@ -55,8 +55,10 @@ type object struct{n int;pad[2048]byte}
 func pointerIterator(p *object)func(func(*object)bool){return func(yield func(*object)bool){for range 3{p.n++;if !yield(p){return}}}}
 //go:noinline
 func held(p *object,ready,release chan int)int{n:=0;for v:=range pointerIterator(p){ready<-v.n;<-release;if v.pad[2047]!=7{panic("captured iterator pointer")};n+=v.n};return n}
+//go:noinline
+func conditional(flag bool)bool{g:=func(v int)int{runtime.Gosched();return v+1};return flag && inlineCaller(11)(g,0)==13}
 func main(){
- if first()!=36||constructed!=1{panic("iterator constructor evaluated twice")};if readOnly()!=33||repeated()!=81||distinct()!=333||literal(10)!=33||direct()!=25{panic("captured callee environment")}
+ if conditional(false)||!conditional(true){panic("conditional inline await")};if first()!=36||constructed!=1{panic("iterator constructor evaluated twice")};if readOnly()!=33||repeated()!=81||distinct()!=333||literal(10)!=33||direct()!=25{panic("captured callee environment")}
  if nilCall(false)!=14||operands!=1||events!=123{panic("captured caller argument")};events=0;if _,ok:=nilCall(true).(runtime.Error);!ok||operands!=2||events!=123{panic("nil captured callee operand order")}
  ready,release:=make(chan int),make(chan int);go func(){for i:=1;i<=3;i++{if <-ready!=i{panic("captured iterator GC input")};runtime.GC();release<-1}}();p:=&object{};p.pad[2047]=7;if held(p,ready,release)!=6{panic("captured iterator GC result")}
  runtime.LockOSThread();if first()!=36||direct()!=25{panic("captured caller ordinary fallback")};runtime.UnlockOSThread();println("iterator-expressions-ok")

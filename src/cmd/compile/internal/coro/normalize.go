@@ -151,11 +151,21 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				// point, retaining branches and local return jumps. Never hoist
 				// an individual await out of the inline body's control flow.
 				body := append(ir.TakeInit(inlined), inlined.Body.Take()...)
-				ir.VisitList(body, func(n ir.Node) {
+				var ownLabels func(ir.Node) bool
+				ownLabels = func(n ir.Node) bool {
+					// A nested inline expression owns its own jumps. If it
+					// needs normalization, its expansion registers them later.
+					if n.Op() == ir.OINLCALL {
+						return false
+					}
 					if label, ok := n.(*ir.LabelStmt); ok {
 						labels[0][label.Label] = label
 					}
-				})
+					return ir.DoChildren(n, ownLabels)
+				}
+				for _, statement := range body {
+					ownLabels(statement)
+				}
 				normalizeCallList(body, fn, calls, labels...)
 				init = append(init, body...)
 				root = replaceNormalizedExpression(root, inlined, inlined.SingleResult())

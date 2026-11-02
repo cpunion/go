@@ -1052,6 +1052,20 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			}
 			resultCount := call.Fun.Type().NumResults()
 			container := awaitContainers[call]
+			if ir.Any(container, func(node ir.Node) bool {
+				inlined, ok := node.(*ir.InlinedCallExpr)
+				if !ok {
+					return false
+				}
+				return slices.ContainsFunc(inlined.Body, func(statement ir.Node) bool {
+					return containsCall(statement, call)
+				})
+			}) {
+				// Conditional inline expressions must keep their own control
+				// flow until normalization exposes the complete body. An inner
+				// assignment alone cannot prove a valid continuation boundary.
+				return nil, fmt.Errorf("await site %d in unnormalized inline expression", site.ID)
+			}
 			if statement != container && !supportsAwaitInit(container) {
 				_, err := callResultTargets(call, container,
 					resultCount)
