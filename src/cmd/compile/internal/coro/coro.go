@@ -17,6 +17,7 @@ package coro
 import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/types"
 	"fmt"
 	"io"
 	"slices"
