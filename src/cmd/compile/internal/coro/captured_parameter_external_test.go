@@ -67,6 +67,8 @@ func main(){
 	for _, config := range []struct{ name, experiment, flags string }{
 		{"native", "coro", "-l -d=coro=4"},
 		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},
+		{"native-inline", "coro", "-d=coro=4"},
+		{"checkptr-inline", "coro", "-d=coro=4 -d=checkptr=2"},
 		{"ordinary", "nocoro", "-l"},
 	} {
 		t.Run(config.name, func(t *testing.T) {
@@ -84,7 +86,36 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"direct", "pureDriver", "pure.func1", "instances", "readonlyDriver", "readonly.func1", "selected", "outer.func1", "nilDriver", "recursiveDriver", "spawn", "spawn.func1", "panicDriver", "implicit", "implicit.func1", "exitDriver", "held"} {
+				names := []string{"direct", "pureDriver", "instances", "readonlyDriver", "selected", "nilDriver", "recursiveDriver", "spawn", "panicDriver", "implicit", "exitDriver", "held"}
+				if strings.HasSuffix(config.name, "-inline") {
+					// Inlining the constructor creates independently named
+					// closure entries. Check the entries actually linked into
+					// this programme, as well as their native public callers.
+					nm := testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", binary)
+					data, err := nm.CombinedOutput()
+					if err != nil {
+						t.Fatalf("nm: %v\n%s", err, data)
+					}
+					found := false
+					for _, line := range strings.Split(string(data), "\n") {
+						fields := strings.Fields(line)
+						if len(fields) == 0 {
+							continue
+						}
+						name := fields[len(fields)-1]
+						if strings.HasPrefix(name, "main.") && strings.Contains(name, "outer") &&
+							strings.HasSuffix(name, ".coro.stackgate") {
+							names = append(names, strings.TrimSuffix(strings.TrimPrefix(name, "main."), ".coro.stackgate"))
+							found = true
+						}
+					}
+					if !found {
+						t.Fatal("inlined constructor lost its captured native closure")
+					}
+				} else {
+					names = append(names, "pure.func1", "readonly.func1", "outer.func1", "spawn.func1", "implicit.func1")
+				}
+				for _, name := range names {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission\n%s", name, out)
 					}

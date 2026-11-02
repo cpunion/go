@@ -4851,7 +4851,7 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	ir.CurFunc = oldCurFunc
 
 	// The source inline body no longer describes the physical primary.
-	fn.Inl = nil
+	fn.DiscardInlineBody()
 }
 
 func explicitFrameField(pos src.XPos, frame ir.Node,
@@ -5387,7 +5387,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	ir.CurFunc = oldCurFunc
 
 	// The source inline body no longer describes the physical primary.
-	fn.Inl = nil
+	fn.DiscardInlineBody()
 }
 
 func edgeForCall(function *Function, call *ir.CallExpr) Edge {
