@@ -1019,7 +1019,7 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 		t.Error("defer candidate supports an explicit frame")
 	}
 	ranged := candidate(SiteYield)
-	ranged.rangeVars = []*ir.Name{ir.NewNameAt(src.NoXPos,
+	ranged.iterationVars = []*ir.Name{ir.NewNameAt(src.NoXPos,
 		pkg.Lookup("rangeValue"), types.Types[types.TINT])}
 	if explicitFrameFactorySupported(ranged) {
 		t.Error("range candidate supports an explicit frame")
@@ -7423,8 +7423,8 @@ func TestLowerRangeVariableClosure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidate.rangeVars) != 1 || candidate.rangeVars[0] != variable {
-		t.Fatalf("per-iteration variables = %v, want %v", candidate.rangeVars, variable)
+	if len(candidate.iterationVars) != 1 || candidate.iterationVars[0] != variable {
+		t.Fatalf("per-iteration variables = %v, want %v", candidate.iterationVars, variable)
 	}
 }
 

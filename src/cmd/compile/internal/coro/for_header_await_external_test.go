@@ -43,6 +43,8 @@ func captures()([]func()int,[]*int){var fs []func()int;var ps []*int;for i:=0;ch
 //go:noinline
 func addresses()[]*int{var ps []*int;for i:=0;check(i);i=step(i){ps=append(ps,&i);runtime.GC();continue};return ps}
 //go:noinline
+func yieldOnlyAddresses()[]*int{var ps []*int;for i:=0;i<3;i++{ps=append(ps,&i);runtime.Gosched();continue};return ps}
+//go:noinline
 func existing()[]*int{var ps []*int;i:=0;for ;check(i);i=step(i){ps=append(ps,&i);runtime.GC();continue};return ps}
 //go:noinline
 func nested()int{sum:=0;for i:=0;check(i);i=step(i){for j:=0;j<3&&check(j);j=step(j){if j==1{continue};sum+=i+j};if i==1{continue}};return sum}
@@ -61,6 +63,7 @@ func main(){
  trace="";if tuples()!=3{panic("tuple header")};if inlineHeaders()!=3{panic("inline header")}
  fs,ps:=captures();runtime.GC();if len(fs)!=3||len(ps)!=3{panic("capture count")};for i:=range 3{if fs[i]()!=i||*ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("iteration capture identity")};*ps[i]+=10;if fs[i]()!=i+10{panic("capture cell sharing")}}
  ps=addresses();runtime.GC();for i:=range 3{if *ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("escaped iteration address")}}
+ ps=yieldOnlyAddresses();runtime.GC();for i:=range 3{if *ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("yield-only iteration address")}}
  ps=existing();runtime.GC();for i:=range 3{if *ps[i]!=3||ps[i]!=ps[0]{panic("existing variable identity")}}
  if nested()!=12{panic("nested condition/post")};for mode,want:=range []int{7,8,9}{trace="";if exit(mode)!=want||trace!="CBD"{panic("exit executed post or lost cleanup: "+trace)}}
  trace="";if _,ok:=nilPost(true).(runtime.Error);!ok||trace!="CBAD"{panic("nil post operand/cleanup: "+trace)};trace="";if _,ok:=nilCondition(true).(runtime.Error);!ok||trace!="AD"{panic("nil condition operand/cleanup: "+trace)}
@@ -88,7 +91,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"headers", "tuples", "inlineHeaders", "captures", "addresses", "existing", "nested", "exit", "nilPost", "nilCondition"} {
+				for _, name := range []string{"headers", "tuples", "inlineHeaders", "captures", "addresses", "yieldOnlyAddresses", "existing", "nested", "exit", "nilPost", "nilCondition"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission", name)
 					}

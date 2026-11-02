@@ -32,9 +32,6 @@ func normalizeSingleResultCalls(function *Function) {
 		}
 		calls[call] = true
 	}
-	if len(calls) == 0 {
-		return
-	}
 
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = function.Func
