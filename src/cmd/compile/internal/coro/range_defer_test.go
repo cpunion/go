@@ -20,8 +20,8 @@ func TestRangeDeferAnchorIdentity(t *testing.T) {
 	if !rangeDeferAnchorDeclaration(helper) {
 		t.Fatal("lost exact compiler-owned range anchor declaration")
 	}
-	if _, ok := operationRecipe(helper); ok {
-		t.Fatal("anchor identity alone granted an unimplemented native/ordinary operation recipe")
+	if recipe, ok := operationRecipe(helper); !ok || recipe != (OperationRecipe{Kind: SiteRangeDefer, Exec: NeedsTaskContext}) {
+		t.Fatalf("anchor requires its dedicated task-context marker lowering: %+v, %t", recipe, ok)
 	}
 	for _, test := range []struct {
 		name string

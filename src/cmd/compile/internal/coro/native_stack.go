@@ -67,7 +67,23 @@ func recordNativeStackMetadata(candidates map[*ir.Func]*lowerCandidate) {
 			} else if name := ir.StaticCalleeName(deferred.call.Fun); name != nil {
 				target = name.Func
 			}
-			if target != nil && !slices.Contains(nativeStackCallees[candidate.factory], target) {
+			factory := candidate.factory
+			if deferred.rangeAnchor != nil && candidate.rangeBody != nil {
+				if owner := candidates[candidate.rangeBody.owner.function]; owner != nil {
+					factory = owner.factory
+				}
+			}
+			if target != nil && !slices.Contains(nativeStackCallees[factory], target) {
+				nativeStackCallees[factory] = append(nativeStackCallees[factory], target)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate.rangeOwner == nil {
+			continue
+		}
+		for _, registration := range candidate.rangeOwner.hybrids {
+			if target := registration.target; target != nil && !slices.Contains(nativeStackCallees[candidate.factory], target) {
 				nativeStackCallees[candidate.factory] = append(nativeStackCallees[candidate.factory], target)
 			}
 		}

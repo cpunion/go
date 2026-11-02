@@ -268,6 +268,8 @@ type Plan struct {
 	callbackParameters map[*ir.Name]bool
 	// rewrittenCallers must recover their source body if native lowering
 	// rejects them. Calling a specialization from ordinary code adds a frame.
+	rangeOwners      map[*ir.Func]*rangeDeferOwnerPlan
+	rangeBodies      map[*ir.Func]*rangeDeferBodyPlan
 	rewrittenCallers map[*ir.Func]bool
 }
 

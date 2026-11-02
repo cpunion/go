@@ -148,6 +148,7 @@ const (
 	SiteGoexit
 	SiteSemaphore
 	SiteNotify
+	SiteRangeDefer
 )
 
 func (k SiteKind) String() string {
@@ -178,6 +179,8 @@ func (k SiteKind) String() string {
 		return "semaphore"
 	case SiteNotify:
 		return "notify"
+	case SiteRangeDefer:
+		return "range-defer"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -365,6 +368,9 @@ var operationRecipes = map[string]OperationRecipe{
 func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 	if fn == nil || fn.Nname == nil {
 		return OperationRecipe{}, false
+	}
+	if rangeDeferAnchorDeclaration(fn) {
+		return OperationRecipe{Kind: SiteRangeDefer, Exec: NeedsTaskContext}, true
 	}
 	if recipe, ok := rangeStatePanicRecipe(fn); ok {
 		return recipe, true

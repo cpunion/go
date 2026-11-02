@@ -16,6 +16,7 @@ type rangeDeferOwnerPlan struct {
 	function *ir.Func
 	anchors  map[*ir.Name]*ir.AssignStmt
 	bodies   []*rangeDeferBodyPlan
+	hybrids  []*rangeHybridRegistration
 	err      error
 }
 
@@ -23,6 +24,7 @@ type rangeDeferBodyPlan struct {
 	function *Function
 	owner    *rangeDeferOwnerPlan
 	cleanup  *lowerCandidate
+	ordinary *ir.Func
 }
 
 func planRangeDeferOwners(plan *Plan, functions []*Function) map[*ir.Func]*rangeDeferOwnerPlan {

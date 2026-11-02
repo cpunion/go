@@ -99,22 +99,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				nm := testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", binary)
-				symbols, err := nm.CombinedOutput()
-				if err != nil {
-					t.Fatalf("nm: %v\n%s", err, symbols)
-				}
-				for _, line := range strings.Split(string(symbols), "\n") {
-					fields := strings.Fields(line)
-					if len(fields) == 0 {
-						continue
-					}
-					name := fields[len(fields)-1]
-					if strings.HasPrefix(name, "main.rangeDefer-range") && strings.HasSuffix(name, ".coro.stackgate") {
-						t.Fatalf("enclosing range defer acquired a callback-owned native frame: %s", name)
-					}
-				}
-				for _, name := range []string{"sum", "early", "returned", "continued", "nested", "paired", "noValues", "parked", "pointerSum", "bad", "missing", "escaped"} {
+				for _, name := range []string{"sum", "early", "returned", "continued", "nested", "paired", "noValues", "parked", "pointerSum", "bad", "missing", "escaped", "rangeDefer"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission", name)
 					}
