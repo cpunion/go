@@ -203,7 +203,7 @@ func installRangeHybridRegistrations(body *rangeDeferBodyPlan) {
 
 func appendRangeDeferRecord(pos src.XPos, stack ir.Node, function, anchor ir.Node) ir.Node {
 	element := stack.Type().Elem()
-	value := ir.NewCompLitExpr(pos, ir.OSTRUCTLIT, element, []ir.Node{
+	value := ir.NewCompLitExpr(pos, ir.OCOMPLIT, element, []ir.Node{
 		ir.NewStructKeyExpr(pos, element.Field(0), function),
 		ir.NewStructKeyExpr(pos, element.Field(1), anchor),
 	})

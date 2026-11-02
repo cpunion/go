@@ -40,7 +40,9 @@ func recursive(n int){defer add(9+n);for v:=range one{defer add(v+n);if n>0{recu
 //go:noinline
 func replacement()(caught any){defer func(){caught=recover();add(9)}();for range one{defer add(1);defer func(){panic("replacement")}()};panic("original")}
 //go:noinline
-func nilCall()(caught any){defer func(){caught=recover()}();var f func(int);for range one{defer add(1);defer f(effect())};return nil}
+func nilCall(useNil bool)(caught any){defer func(){caught=recover()}();f:=add;if useNil{f=nil};for range one{defer add(1);defer f(effect())};return nil}
+//go:noinline
+func unknownNil()(caught any){defer func(){caught=recover()}();var f func(int);for range one{defer add(1);defer f(effect())};return nil}
 //go:noinline
 func effect()int{add(4);return 0}
 //go:noinline
@@ -62,7 +64,8 @@ func main(){
  basic();check(8,3,2,1,9);separate();check(7,2,8,1,9);nested();check(8,2,9)
  if early()!=2{panic("early result")};check(2,1,9);recursive(1);check(1,9,2,10)
  if replacement()!="replacement"{panic("replacement recover")};check(1,9)
- if _,ok:=nilCall().(runtime.Error);!ok{panic("nil deferred call")};check(4,1)
+ if _,ok:=nilCall(true).(runtime.Error);!ok{panic("nil deferred call")};check(4,1)
+ if _,ok:=unknownNil().(runtime.Error);!ok{panic("unknown nil deferred call")};check(4,1)
  done:=make(chan struct{});go exiting(done);<-done;check(0,3,1)
  a,b:=make(chan int),make(chan int);done=make(chan struct{});go func(){held(a,b);close(done)}();for i:=1;i<=3;i++{if <-a!=i{panic("GC handshake")};runtime.GC();b<-1};<-done;check(3,2,1)
  mixed(false);mixed(true);runtime.LockOSThread();basic();runtime.UnlockOSThread();check(8,3,2,1,9);println("enclosing-range-defer-ok")
