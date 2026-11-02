@@ -35,7 +35,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 		changed = false
 		for index := 0; index < len(work) && replacements < 256; index++ {
 			caller := work[index]
-			if !resumeFactorySupported(caller) ||
+			if !callableFactorySupported(caller) ||
 				!reader.Have(caller) && parameters[caller] == nil {
 				continue
 			}
@@ -92,7 +92,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 					}
 					var closed []*ir.Func
 					if target := ir.StaticCalleeName(arg); target != nil &&
-						resumeFactorySupported(target.Func) && target.Type().NumRecvs() == 0 {
+						callableFactorySupported(target.Func) && target.Type().NumRecvs() == 0 {
 						closed = []*ir.Func{target.Func}
 					} else if local, ok := arg.(*ir.Name); ok {
 						closed = targets[local]

@@ -264,6 +264,12 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	slices.SortFunc(functions, func(a, b *Function) int {
 		return strings.Compare(ir.PkgFuncName(a.Func), ir.PkgFuncName(b.Func))
 	})
+	plainCapturedCallbacks := make(map[*ir.Func]bool)
+	for _, function := range functions {
+		if plan.callbackFactories[function.Func] && capturedPlainFactorySupported(function) {
+			plainCapturedCallbacks[function.Func] = true
+		}
+	}
 	affinePlans := make(map[*ir.Func]*affineReturnPlan)
 	for _, function := range functions {
 		if p := planAffineReturn(function); p != nil {
@@ -294,7 +300,8 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 	}
 	for _, function := range functions {
-		if function.Primary != CoroPrimary {
+		if function.Primary != CoroPrimary &&
+			!plainCapturedCallbacks[function.Func] {
 			continue
 		}
 		if deferredLiterals[function.Func] {
@@ -539,7 +546,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
 		}
-		if function.Primary == CoroPrimary {
+		if function.Primary == CoroPrimary || plainCapturedCallbacks[function.Func] {
 			result.Skipped++
 		}
 	}
@@ -568,7 +575,10 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	}
 	// A sealed helper may only register callback cleanup. It still needs a
 	// typed factory to preserve its own defer scope during the outer unwind.
-	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) {
+	// A demanded captured plain leaf also needs a factory to carry its cells,
+	// even though its source body contains no suspension site.
+	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) &&
+		!(plan.callbackFactories[fn] && capturedPlainFactorySupported(function)) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
 	statementCalls := make(map[*ir.CallExpr]bool)

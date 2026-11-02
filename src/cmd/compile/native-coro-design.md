@@ -4951,6 +4951,14 @@ assignment to an existing variable retains its shared cell. A selected type
 switch case allocates its cell before saving the dispatch value, so closures
 and escaped addresses from separate selections keep distinct mutable bindings.
 
+Sealed callback specializations may carry a proved captured source closure as
+an ordinary typed function parameter. The selected closure value retains its
+environment; its private target factory receives the corresponding typed cells.
+Captured callers may invoke context-free specialized helpers. Demanded pure
+captured leaves also use typed capture lowering, rather than an ordinary-call
+adapter that would discard their environment. Open source parameters remain
+unknown, and these capture prefixes are not exported as cross-package ABIs.
+
 This work does not yet supply a runtime registry for arbitrary open callable
 values, method-value or interface dispatch, generic dictionaries or iterator
 yields. It is a dependency of those native ABIs, rather than evidence that those
