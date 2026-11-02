@@ -108,9 +108,11 @@ func main(){
 			}
 			if config.experiment == "coro" {
 				for _, name := range []string{"basic", "separate", "nested", "early", "recursive", "replacement", "rangeRecover", "namedRangeRecover", "rangeFactory", "nilCall", "exiting", "held", "escapedOwner", "ordinaryBodyOwner"} {
-					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
-						t.Fatalf("%s lost native enclosing cleanup admission", name)
-					}
+					t.Run(name, func(t *testing.T) {
+						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
+							t.Fatal("lost native enclosing cleanup admission")
+						}
+					})
 				}
 			}
 			for _, p := range []string{"1", "4"} {
