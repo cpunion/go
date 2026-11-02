@@ -219,8 +219,7 @@ func main() {
 `
 	testSwitchReturnProgram(t, source, []switchFallback{
 		{"suspendingGuard", "coroutine site in switch header"},
-		{"escapingClosures", "type switch variable captured by closure"},
 	}, []string{
-		"concrete", "interfaceOrder", "concreteOrder", "initialized", "captured", "addressed", "deferredOnce", "noBinding", "empty", "spawned",
+		"escapingClosures", "concrete", "interfaceOrder", "concreteOrder", "initialized", "captured", "addressed", "deferredOnce", "noBinding", "empty", "spawned",
 	})
 }

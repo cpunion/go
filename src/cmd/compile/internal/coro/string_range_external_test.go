@@ -73,8 +73,8 @@ func main(){
  if labeled("A¢中")!=1 {panic("labeled string fallback")};println("switch-return-ok")
 }`
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"captured", "range variable captured by closure"}, {"labeled", "control flow LABEL"}, {"received", "channel site 1: nested receive in range"}},
-		[]string{"each", "named", "keys", "keyless", "converted", "assignment", "cells", "held", "control", "nested"})
+		[]switchFallback{{"labeled", "control flow LABEL"}, {"received", "channel site 1: nested receive in range"}},
+		[]string{"captured", "each", "named", "keys", "keyless", "converted", "assignment", "cells", "held", "control", "nested"})
 }
 
 func TestStringRangeTerminal(t *testing.T) {

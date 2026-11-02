@@ -87,13 +87,10 @@ func main() {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, name := range []string{"direct", "local", "nested", "spawn", "exitLiteral"} {
+			for _, name := range []string{"direct", "local", "nested", "spawn", "exitLiteral", "capturing"} {
 				if got := strings.Contains(string(symbols), "main."+name+".coro"); got != native {
 					t.Fatalf("%s native=%t want=%t\n%s", name, got, native, data)
 				}
-			}
-			if strings.Contains(string(symbols), "main.capturing.coro") {
-				t.Fatal("captured environment lost its fallback")
 			}
 			if native && config.name != "inline" && !strings.Contains(string(symbols), "main.direct.func1.coro") {
 				t.Fatalf("literal factory missing\n%s", data)

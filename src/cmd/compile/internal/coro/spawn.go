@@ -37,9 +37,20 @@ func (p *Plan) PreserveGoCalls() {
 // execution summaries describe bounded plain calls, reject calls and loops.
 // The ordinary entry remains unchanged, including its inline body.
 func plainSpawnFactorySupported(function *Function) bool {
+	return function != nil && resumeFactorySupported(function.Func) && plainFactoryBodySupported(function)
+}
+
+// A captured plain callback cannot use the ordinary-call adapter: that adapter
+// has no source closure environment. Its demanded private factory instead uses
+// the regular typed capture lowering, without publishing a context-free ABI.
+func capturedPlainFactorySupported(function *Function) bool {
+	return function != nil && capturedFactorySupported(function.Func) && plainFactoryBodySupported(function)
+}
+
+func plainFactoryBodySupported(function *Function) bool {
 	if !(function != nil && function.Primary == PlainPrimary &&
 		function.Effect == NoSuspend && function.Exec == 0 &&
-		function.Terminal == 0 && resumeFactorySupported(function.Func) &&
+		function.Terminal == 0 &&
 		len(function.Func.Body) != 0 &&
 		len(function.Edges) == 0) {
 		return false

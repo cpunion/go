@@ -55,7 +55,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 			}
 		}
 		sig := fn.Type()
-		if !resumeFactorySupported(fn) || sig.NumRecvs() != 0 {
+		if !callableFactorySupported(fn) || sig.NumRecvs() != 0 {
 			continue
 		}
 		for i, field := range sig.Results() {
@@ -92,7 +92,16 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 		// including deferred overwrites after an explicit return expression.
 		depend(functionTargetKey{local: name}, result)
 	}
-	callResult := func(destination functionTargetKey, rhs ir.Node, index, count int) bool {
+	var write func(*ir.Func, functionTargetKey, ir.Node)
+	callResult := func(fn *ir.Func, destination functionTargetKey, rhs ir.Node, index, count int) bool {
+		if inlined, ok := rhs.(*ir.InlinedCallExpr); ok &&
+			len(inlined.ReturnVars) == count && index >= 0 && index < count {
+			// The body already writes these caller-owned result cells. Keep
+			// their normal dependency and invalidation rules after inlining,
+			// including unknown writes, address-taking and closure capture.
+			write(fn, destination, inlined.ReturnVars[index])
+			return true
+		}
 		if call, ok := rhs.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
 			if name := ir.StaticCalleeName(ir.StaticValue(call.Fun)); name != nil &&
 				name.Type().NumResults() == count {
@@ -104,7 +113,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 		}
 		return false
 	}
-	write := func(fn *ir.Func, destination functionTargetKey, rhs ir.Node) {
+	write = func(fn *ir.Func, destination functionTargetKey, rhs ir.Node) {
 		for rhs != nil && (rhs.Op() == ir.OCONV || rhs.Op() == ir.OCONVNOP) {
 			rhs = rhs.(*ir.ConvExpr).X
 		}
@@ -120,12 +129,12 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 					return
 				}
 			}
-			if callResult(destination, rhs, 0, 1) {
+			if callResult(fn, destination, rhs, 0, 1) {
 				return
 			}
 		}
 		if callee == nil || callee.Func == nil ||
-			!resumeFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
+			!callableFactorySupported(callee.Func) || callee.Type().NumRecvs() != 0 {
 			invalid[destination] = true
 			return
 		}
@@ -155,7 +164,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 					} else if name, ok := lhs.(*ir.Name); ok {
 						key := functionTargetKey{local: name}
 						if _, tracked := locals[fn][name]; tracked && node.Op() == ir.OAS2FUNC &&
-							len(node.Lhs) > 1 && len(node.Rhs) == 1 && callResult(key, node.Rhs[0], i, len(node.Lhs)) {
+							len(node.Lhs) > 1 && len(node.Rhs) == 1 && callResult(fn, key, node.Rhs[0], i, len(node.Lhs)) {
 							continue
 						}
 						invalid[key] = true
@@ -174,7 +183,7 @@ func packageFunctionTargetsWithParameters(funcs []*ir.Func,
 					if len(node.Results) == fn.Type().NumResults() {
 						write(fn, destination, node.Results[i])
 					} else if len(node.Results) == 1 && fn.Type().NumResults() > 1 &&
-						callResult(destination, node.Results[0], i, fn.Type().NumResults()) {
+						callResult(fn, destination, node.Results[0], i, fn.Type().NumResults()) {
 						continue
 					} else {
 						invalid[destination] = true

@@ -228,12 +228,15 @@ func TestIntegerRange(t *testing.T) {
 			if err != nil {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
-			for _, name := range []string{"signed", "unsigned", "named", "assignment", "keyless", "nested", "pointers", "early", "deferred", "spawn", "worker", "wait", "bubble", "sliced"} {
+			for _, name := range []string{"signed", "unsigned", "named", "assignment", "keyless", "nested", "pointers", "early", "deferred", "spawn", "worker", "wait", "bubble", "sliced", "captured"} {
 				if got := strings.Contains(string(symbols), "command-line-arguments."+name+".coro"); got != native {
 					t.Errorf("%s native entry = %t, want %t", name, got, native)
 				}
 			}
-			for _, name := range []string{"captured", "labeled"} {
+			if native && linkedCoroStackUnsafe(t, exe, "command-line-arguments.captured.coro.stackgate") {
+				t.Error("captured integer range lost native admission")
+			}
+			for _, name := range []string{"labeled"} {
 				if strings.Contains(string(symbols), "command-line-arguments."+name+".coro") {
 					t.Errorf("%s lost conservative range fallback", name)
 				}

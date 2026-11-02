@@ -14,6 +14,66 @@ import (
 	"testing"
 )
 
+func TestInlinedReturnedFunctionTargets(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget := typecheck.Target
+	defer func() { typecheck.Target = oldTarget }()
+	for _, mode := range []string{"single", "tuple", "two-targets", "nil", "unknown", "address", "capture"} {
+		t.Run(mode, func(t *testing.T) {
+			typecheck.Target = new(ir.Package)
+			pkg := types.NewPkg("example.com/coro/inlinedreturn/"+mode, "p")
+			callback := types.NewSignature(nil, nil, nil)
+			first := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("first"), callback)
+			second := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("second"), callback)
+			parent := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("parent"),
+				types.NewSignature(nil, []*types.Field{types.NewField(src.NoXPos, pkg.Lookup("unknown"), callback)}, nil))
+			parent.DeclareParams(true)
+			unknown := parent.Dcl[0]
+			result := parent.NewLocal(src.NoXPos, pkg.Lookup("inlineResult"), callback)
+			value := parent.NewLocal(src.NoXPos, pkg.Lookup("value"), callback)
+			body := ir.Nodes{ir.NewAssignStmt(src.NoXPos, result, first.Nname)}
+			funcs := []*ir.Func{parent, first, second}
+			switch mode {
+			case "two-targets":
+				body = append(body, ir.NewAssignStmt(src.NoXPos, result, second.Nname))
+			case "nil":
+				body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, result, ir.NewNilExpr(src.NoXPos, callback))}
+			case "unknown":
+				body = append(body, ir.NewAssignStmt(src.NoXPos, result, unknown))
+			case "address":
+				body = append(body, ir.NewAssignStmt(src.NoXPos, ir.BlankNode, ir.NewAddrExpr(src.NoXPos, result)))
+			case "capture":
+				closure := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE, callback, parent, typecheck.Target, 0)
+				ir.NewClosureVar(src.NoXPos, closure, result)
+				body = append(body, ir.NewAssignStmt(src.NoXPos, ir.BlankNode, closure.OClosure))
+				funcs = append(funcs, closure)
+			}
+			inlined := ir.NewInlinedCallExpr(src.NoXPos, body, ir.Nodes{result})
+			inlined.SetType(callback)
+			parent.Body = ir.Nodes{ir.NewAssignStmt(src.NoXPos, value, inlined)}
+			if mode == "tuple" {
+				number := parent.NewLocal(src.NoXPos, pkg.Lookup("number"), types.Types[types.TINT])
+				inlined.ReturnVars = append(inlined.ReturnVars, number)
+				inlined.SetType(types.NewSignature(nil, nil, []*types.Field{
+					types.NewField(src.NoXPos, nil, callback),
+					types.NewField(src.NoXPos, nil, number.Type()),
+				}).ResultsTuple())
+				parent.Body = ir.Nodes{ir.NewAssignListStmt(src.NoXPos, ir.OAS2FUNC,
+					ir.Nodes{value, number}, ir.Nodes{inlined})}
+			}
+			var want []*ir.Func
+			if mode == "single" || mode == "tuple" {
+				want = []*ir.Func{first}
+			} else if mode == "two-targets" {
+				want = []*ir.Func{first, second}
+			}
+			if got := packageFunctionTargets(funcs)[parent][value]; !slices.Equal(got, want) {
+				t.Fatalf("inlined result targets = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestPackageFunctionTargets(t *testing.T) {
 	prepareLowerTest(t)
 	for _, test := range []struct {

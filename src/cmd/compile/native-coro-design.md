@@ -4925,3 +4925,41 @@ updates to the object context's data-symbol list. Tests cover final frame
 spills, deep ordinary and native-child dependencies, independent safe entries,
 shared imported cleanup ownership and multiple parallel backend worker counts.
 Performance and memory comparison remains deferred.
+
+### Typed captured source closures (work in progress, 2026-11-02)
+
+Captured source closures can carry shared cells into a private native factory.
+The factory receives one typed `*T` for each source capture before its ordinary
+parameters. The public closure entry takes the addresses of its actual captures;
+closed function-value dispatch freezes the chosen closure and every operand
+before reading those typed environment fields. The native continuation retains
+ordinary traced pointers, including pointers to pointer-bearing capture cells.
+These capture prefixes are private to the current compiler invocation and are
+not published as context-free cross-package factory summaries.
+
+A source declaration that executes repeatedly allocates its capture cell at the
+original declaration. Each nested closure snapshots the current cell pointer at
+creation. Moving a mutable pointer slot into a shared resume frame must not make
+older closure instances observe the next declaration's cell. Nested closures
+are lowered before their parents reparent their capture expressions. Ordinary
+fallback bodies reconstruct their own capture bindings in place, preserving the
+source defer/recover frame.
+
+Range declarations and implicit type-switch case bindings use the same cell
+lifetime. A range `:=` binding receives a fresh cell each iteration; a range
+assignment to an existing variable retains its shared cell. A selected type
+switch case allocates its cell before saving the dispatch value, so closures
+and escaped addresses from separate selections keep distinct mutable bindings.
+
+Sealed callback specializations may carry a proved captured source closure as
+an ordinary typed function parameter. The selected closure value retains its
+environment; its private target factory receives the corresponding typed cells.
+Captured callers may invoke context-free specialized helpers. Demanded pure
+captured leaves also use typed capture lowering, rather than an ordinary-call
+adapter that would discard their environment. Open source parameters remain
+unknown, and these capture prefixes are not exported as cross-package ABIs.
+
+This work does not yet supply a runtime registry for arbitrary open callable
+values, method-value or interface dispatch, generic dictionaries or iterator
+yields. It is a dependency of those native ABIs, rather than evidence that those
+remaining capabilities are complete.

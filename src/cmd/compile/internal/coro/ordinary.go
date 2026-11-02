@@ -45,6 +45,9 @@ func addOrdinaryBody(fn, ordinary *ir.Func) {
 // these ordinary bodies; only their validated factories enter native tasks.
 func remapOrdinaryBody(fn, ordinary *ir.Func) {
 	parameters := make(map[*ir.Name]*ir.Name)
+	for i, variable := range ordinary.ClosureVars {
+		parameters[variable] = fn.ClosureVars[i]
+	}
 	count := len(fn.Type().RecvParams()) + fn.Type().NumResults()
 	for i := 0; i < count; i++ {
 		parameters[ordinary.Dcl[i]] = fn.Dcl[i]
