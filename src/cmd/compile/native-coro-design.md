@@ -4984,3 +4984,19 @@ that ownership can be represented. The ordinary source body retains the
 registration lifetime and LIFO order. Returned captured iterator specialization
 also remains outside this slice, since replacing its callable with a static
 specialization would discard its environment.
+
+
+### Direct iterator producer expressions (work in progress, 2026-11-02)
+
+Function-valued call and inlined-call expressions can receive the same local
+result target proof as a temporary assignment. Unknown writes, address-taking,
+closure capture and every return still flow through the existing invalidation
+graph. The expression proof never evaluates the producer.
+
+A captured-callee specialization freezes the actual producer result once, after
+its original initializer and before callback/argument evaluation. Typed environment
+reads occur after those operands, preserving nil-call evaluation and shared cell
+identity. This also admits a returned iterator directly as a range operand.
+No expression is hoisted out of a conditional or repeated evaluation point.
+Open or multiple callee targets and context-free indirect callees retain their
+ordinary execution until their selected-entry/nil-call contract is represented.

@@ -32,6 +32,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 	work := append([]*ir.Func(nil), funcs...)
 	creations, replacements := 0, 0
 	var solved map[*ir.Func]map[*ir.Name][]*ir.Func
+	var expressions map[ir.Node][]*ir.Func
 	for changed := true; changed && replacements < 256; {
 		changed = false
 		for index := 0; index < len(work) && replacements < 256; index++ {
@@ -41,7 +42,7 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				continue
 			}
 			if solved == nil {
-				solved = packageFunctionTargetsWithParameters(typecheck.Target.Funcs, parameters)
+				solved, expressions = packageFunctionExpressionTargets(typecheck.Target.Funcs, parameters)
 			}
 			targets := solved[caller]
 			goDefers := make(map[*ir.CallExpr]bool)
@@ -66,15 +67,14 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 						wrapper = original.Fun.(*ir.ClosureExpr).Func
 					}
 				}
-				if len(call.Fun.Init()) != 0 {
-					return
-				}
 				name := ir.StaticCalleeName(call.Fun)
 				var source *ir.Func
 				if name != nil {
 					source = name.Func
 				} else if local, ok := call.Fun.(*ir.Name); ok && len(targets[local]) == 1 {
 					source = targets[local][0]
+				} else if len(expressions[call.Fun]) == 1 {
+					source = expressions[call.Fun][0]
 				}
 				if source == nil || generated[source] {
 					return
@@ -82,12 +82,13 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 				captured := capturedFactorySupported(source)
 				if captured {
 					// Existing go/defer wrappers already own their operand snapshots.
-					// Keep captured-callee conversion limited to ordinary calls with
-					// no frontend initializer whose ordering needs reconstruction.
-					if original.GoDefer || wrapper != nil || len(call.Init()) != 0 {
+					// Keep captured-callee conversion limited to ordinary calls.
+					// Their initializers and producer evaluation remain in the
+					// ordered operand snapshot before any environment read.
+					if original.GoDefer || wrapper != nil {
 						return
 					}
-				} else if ir.StaticValue(call.Fun) != call.Fun || !resumeFactorySupported(source) {
+				} else if name == nil || len(call.Fun.Init()) != 0 || ir.StaticValue(call.Fun) != call.Fun || !resumeFactorySupported(source) {
 					return
 				}
 				if source.Sym().Pkg != types.LocalPkg ||
@@ -113,6 +114,8 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 						closed = []*ir.Func{target.Func}
 					} else if local, ok := arg.(*ir.Name); ok {
 						closed = targets[local]
+					} else {
+						closed = expressions[arg]
 					}
 					if len(closed) == 0 || len(closed) > 16 {
 						return

@@ -67,8 +67,12 @@ func TestInlinedReturnedFunctionTargets(t *testing.T) {
 			} else if mode == "two-targets" {
 				want = []*ir.Func{first, second}
 			}
-			if got := packageFunctionTargets(funcs)[parent][value]; !slices.Equal(got, want) {
+			locals, expressions := packageFunctionExpressionTargets(funcs, nil)
+			if got := locals[parent][value]; !slices.Equal(got, want) {
 				t.Fatalf("inlined result targets = %v, want %v", got, want)
+			}
+			if mode != "tuple" && !slices.Equal(expressions[inlined], want) {
+				t.Fatalf("inlined producer expression targets = %v, want %v", expressions[inlined], want)
 			}
 		})
 	}
