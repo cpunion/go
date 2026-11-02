@@ -47,12 +47,15 @@ func argument()int {operands++;runtime.Gosched();return 2}
 func nilDriver(isNil bool)(result any) {seed:=10;f:=func(x int)int{runtime.Gosched();return seed+x};if isNil {f=nil};defer func(){if v:=recover();v!=nil {result=v}}();return invoke(f,argument())}
 func recursiveDriver()int {seed:=10;return recurse(func(x int)int{seed+=x;runtime.Gosched();return seed},32)}
 func spawn(ready,release,done chan int) {for v:=range 64 {launch(func(){ready<-v;<-release;runtime.Gosched();done<-v})}}
+var implicitCalls int
+func implicit(p *int)(result any) {f:=func(x int)int{implicitCalls++;return *p+x};defer func(){if v:=recover();v!=nil {result=v}}();return invoke(f,3)}
 func panicDriver(seed int)int {f:=func(x int)(result int){defer func(){if recover()!=nil {result=seed+x};seed++}();runtime.Gosched();panic("callback")};return invoke(f,2)+invoke(f,3)}
 func exitDriver(done chan struct{},result *int) {seed:=41;invokeVoid(func(){defer func(){*result=seed;close(done)}();runtime.Gosched();runtime.Goexit()});panic("continued after callback Goexit")}
 type object struct {n int;pad [2048]byte}
 func held(p *object,ready,release chan int)int {return invoke(func(x int)int{ready<-p.n;<-release;runtime.Gosched();return p.n+x},2)}
 func main(){
  if direct(10)!=12||pureDriver()!=27||instances()!=114||readonlyDriver()!=115||selected(false)!=13||selected(true)!=7||recursiveDriver()!=44||panicDriver(10)!=26 {panic("captured callback result or environment")}
+ value:=7;if implicit(&value)!=10||implicitCalls!=1 {panic("pure callback pointer result")};if _,ok:=implicit(nil).(runtime.Error);!ok||implicitCalls!=2 {panic("pure callback implicit panic reentered source")}
  c:=make(chan int,2);c<-1;c<-1;f:=outer(10,c);if f(2)!=13||f(3)!=16 {panic("captured caller callback specialization")}
  if nilDriver(false)!=12||operands!=1 {panic("callback argument order")};if _,ok:=nilDriver(true).(runtime.Error);!ok||operands!=2 {panic("nil callback operand snapshot")}
  ready,release,done:=make(chan int),make(chan int),make(chan int);before:=runtime.NumGoroutine();spawn(ready,release,done);total:=0;for range 64 {total+=<-ready};if total!=2016 {panic("callback spawned cell input")};if NATIVE && runtime.NumGoroutine()>before+16 {panic("ordinary goroutine per callback child")};runtime.GC();for range 64 {release<-1};total=0;for range 64 {total+=<-done};if total!=2016 {panic("callback spawned cell output")}
@@ -81,7 +84,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"direct", "pureDriver", "pure.func1", "instances", "readonlyDriver", "readonly.func1", "selected", "outer.func1", "nilDriver", "recursiveDriver", "spawn", "spawn.func1", "panicDriver", "exitDriver", "held"} {
+				for _, name := range []string{"direct", "pureDriver", "pure.func1", "instances", "readonlyDriver", "readonly.func1", "selected", "outer.func1", "nilDriver", "recursiveDriver", "spawn", "spawn.func1", "panicDriver", "implicit", "implicit.func1", "exitDriver", "held"} {
 					if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission\n%s", name, out)
 					}
