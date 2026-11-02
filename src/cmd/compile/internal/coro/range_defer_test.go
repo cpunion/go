@@ -67,10 +67,15 @@ func TestSynchronousRangeIterator(t *testing.T) {
 			if mode == "two-direct" || mode == "second-unused" || mode == "second-escapes" {
 				fields = append(fields, types.NewField(src.NoXPos, pkg.Lookup("other"), callback))
 			}
-			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("iterator"), types.NewSignature(nil, fields, nil))
+			var results []*types.Field
+			if mode == "return" {
+				results = []*types.Field{types.NewField(src.NoXPos, nil, callback)}
+			}
+			fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("iterator"), types.NewSignature(nil, fields, results))
 			fn.DeclareParams(true)
 			parameter := fn.Dcl[0]
-			call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, parameter, nil)
+			call := ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, parameter,
+				ir.Nodes{ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER])})
 			call.SetType(types.Types[types.TBOOL])
 			fn.Body = ir.Nodes{call}
 			global := ir.NewNameAt(src.NoXPos, pkg.Lookup("saved"), callback)
@@ -80,9 +85,14 @@ func TestSynchronousRangeIterator(t *testing.T) {
 				sig := types.NewSignature(nil, nil, nil)
 				cl := ir.NewClosureFunc(src.NoXPos, src.NoXPos, ir.OCLOSURE, sig, fn, typecheck.Target, 0)
 				if capture {
-					ir.NewClosureVar(src.NoXPos, cl.Func, parameter)
+					ir.NewClosureVar(src.NoXPos, cl, parameter)
 				}
-				return cl
+				return cl.OClosure
+			}
+			closureAssignment := func(capture bool) ir.Node {
+				cl := closure(capture)
+				local := typecheck.TempAt(src.NoXPos, fn, cl.Type())
+				return ir.NewAssignStmt(src.NoXPos, local, cl)
 			}
 			want := false
 			switch mode {
@@ -95,7 +105,7 @@ func TestSynchronousRangeIterator(t *testing.T) {
 				fn.Body = ir.Nodes{ir.NewForStmt(src.NoXPos, nil, ir.NewBool(src.NoXPos, true), nil, ir.Nodes{call}, false)}
 				want = true
 			case "unrelated-closure":
-				fn.Body = append(fn.Body, closure(false))
+				fn.Body = append(fn.Body, closureAssignment(false))
 				want = true
 			case "global":
 				fn.Body = append(fn.Body, store)
@@ -117,11 +127,12 @@ func TestSynchronousRangeIterator(t *testing.T) {
 			case "replace":
 				fn.Body = append(fn.Body, ir.NewAssignStmt(src.NoXPos, parameter, ir.NewNilExpr(src.NoXPos, callback)))
 			case "address":
-				fn.Body = append(fn.Body, ir.NewAddrExpr(src.NoXPos, parameter))
+				local := typecheck.TempAt(src.NoXPos, fn, types.NewPtr(callback))
+				fn.Body = append(fn.Body, ir.NewAssignStmt(src.NoXPos, local, ir.NewAddrExpr(src.NoXPos, parameter)))
 			case "return":
 				fn.Body = append(fn.Body, ir.NewReturnStmt(src.NoXPos, ir.Nodes{parameter}))
 			case "capture":
-				fn.Body = append(fn.Body, closure(true))
+				fn.Body = append(fn.Body, closureAssignment(true))
 			case "go", "defer":
 				op := ir.OGO
 				if mode == "defer" {
@@ -144,7 +155,8 @@ func TestSynchronousRangeIterator(t *testing.T) {
 			case "unused":
 				fn.Body = nil
 			case "two-direct":
-				fn.Body = append(fn.Body, ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, fn.Dcl[1], nil))
+				fn.Body = append(fn.Body, ir.NewCallExpr(src.NoXPos, ir.OCALLFUNC, fn.Dcl[1],
+					ir.Nodes{ir.NewNilExpr(src.NoXPos, types.Types[types.TINTER])}))
 				want = true
 			case "second-unused":
 			case "second-escapes":
