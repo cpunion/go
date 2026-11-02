@@ -178,6 +178,23 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 	block := ir.NewBlockStmt(src.NoXPos, ir.Nodes{blockReturn})
 	block.SetTypecheck(1)
 
+	rangeCall := newCall(awaited)
+	rangeIf := ir.NewIfStmt(src.NoXPos, rangeCall, nil, nil)
+	rangeStmt := ir.NewRangeStmt(src.NoXPos, nil, nil,
+		ir.NewInt(src.NoXPos, 3), ir.Nodes{rangeIf}, false)
+	commCall := newCall(awaited)
+	channel := caller.NewLocal(src.NoXPos, pkg.Lookup("channel"),
+		types.NewChan(types.Types[types.TBOOL], types.Cboth))
+	comm := ir.NewSendStmt(src.NoXPos, channel, commCall)
+	selectCall := newCall(awaited)
+	selectIf := ir.NewIfStmt(src.NoXPos, selectCall, nil, nil)
+	defaultCall := newCall(awaited)
+	defaultIf := ir.NewIfStmt(src.NoXPos, defaultCall, nil, nil)
+	selection := ir.NewSelectStmt(src.NoXPos, []*ir.CommClause{
+		ir.NewCommStmt(src.NoXPos, comm, ir.Nodes{selectIf}),
+		ir.NewCommStmt(src.NoXPos, nil, ir.Nodes{defaultIf}),
+	})
+
 	local := caller.NewLocal(src.NoXPos, pkg.Lookup("local"),
 		types.Types[types.TINT])
 	decl := ir.NewDecl(src.NoXPos, ir.ODCL, local)
@@ -192,6 +209,8 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 		loop,
 		ifStmt,
 		block,
+		rangeStmt,
+		selection,
 		assignOp,
 	}
 	normalizeSingleResultCalls(&Function{
@@ -205,6 +224,10 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 			{ID: 4, Kind: SiteAwait, Node: forCall},
 			{ID: 5, Kind: SiteAwait, Node: ifCall},
 			{ID: 6, Kind: SiteAwait, Node: blockCall},
+			{ID: 7, Kind: SiteAwait, Node: rangeCall},
+			{ID: 8, Kind: SiteAwait, Node: commCall},
+			{ID: 9, Kind: SiteAwait, Node: selectCall},
+			{ID: 10, Kind: SiteAwait, Node: defaultCall},
 		},
 	})
 
@@ -226,6 +249,16 @@ func TestNormalizeSingleResultCallSafety(t *testing.T) {
 	}
 	if len(blockReturn.Init()) != 1 {
 		t.Fatal("call in block return was not normalized")
+	}
+	if len(rangeStmt.Init()) != 0 || len(rangeIf.Init()) != 1 || rangeIf.Cond == rangeCall {
+		t.Fatal("range body await must stay in its iteration")
+	}
+	if len(selection.Init()) != 0 || len(comm.Init()) != 0 || comm.Value != commCall {
+		t.Fatal("select communication await moved into dispatch")
+	}
+	if len(selectIf.Init()) != 1 || selectIf.Cond == selectCall ||
+		len(defaultIf.Init()) != 1 || defaultIf.Cond == defaultCall {
+		t.Fatal("select body awaits must stay in their chosen cases")
 	}
 
 	inlinedCall := newCall(awaited)
