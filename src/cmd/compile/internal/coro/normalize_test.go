@@ -369,18 +369,18 @@ func TestNormalizeSingleResultCallDirectStatements(t *testing.T) {
 	name := ir.NewNameAt(src.NoXPos, pkg.Lookup("value"),
 		types.Types[types.TINT])
 
-	if !directCallStatement(call, call) {
+	if !directSuspensionStatement(call, call) {
 		t.Fatal("call statement is not direct")
 	}
-	if !directCallStatement(ir.NewAssignStmt(src.NoXPos, name, call), call) {
+	if !directSuspensionStatement(ir.NewAssignStmt(src.NoXPos, name, call), call) {
 		t.Fatal("assignment call is not direct")
 	}
 	list := ir.NewAssignListStmt(src.NoXPos, ir.OAS2,
 		ir.Nodes{name}, ir.Nodes{call})
-	if !directCallStatement(list, call) {
+	if !directSuspensionStatement(list, call) {
 		t.Fatal("assignment-list call is not direct")
 	}
-	if directCallStatement(ir.NewReturnStmt(src.NoXPos,
+	if directSuspensionStatement(ir.NewReturnStmt(src.NoXPos,
 		ir.Nodes{call}), call) {
 		t.Fatal("return call is unexpectedly direct")
 	}
