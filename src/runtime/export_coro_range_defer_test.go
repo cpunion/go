@@ -22,6 +22,9 @@ var PushStacklessCoroRangeDeferForTest = coroRangeDeferPush
 var NextStacklessCoroRangeDeferForTest = coroRangeDeferNext
 var OwnerStacklessCoroRangeDeferForTest = coroRangeDeferOwner
 var NewStacklessCoroRangeDeferAtForTest = coroRangeDefer
+var IsNativeStacklessCoroRangeDeferForTest = coroRangeDeferIsNative
+
+func NilStacklessCoroRangeDeferForTest() any { return (*stacklessCoroRangeDefer)(nil) }
 
 func StacklessCoroRangeDeferReleasedForTest(frame any) bool {
 	a := checkedStacklessCoroRangeDefer(frame)

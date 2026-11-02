@@ -25,12 +25,16 @@ type BodyReader struct {
 // addOrdinaryBody keeps the source body in the public entry, rather than
 // calling a helper: an extra frame would change direct recover semantics.
 // Native factories bypass this entry and never execute the ordinary body.
-func addOrdinaryBody(fn, ordinary *ir.Func) {
+func addOrdinaryBody(fn, ordinary *ir.Func, anchors ...*ir.Name) {
 	remapOrdinaryBody(fn, ordinary)
 	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
 	gate := ir.NewIndexExpr(fn.Pos(), nativeSourceGates[fn], ir.NewInt(fn.Pos(), 0))
 	condition = ir.NewLogicalExpr(fn.Pos(), ir.OOROR, condition,
 		ir.NewBinaryExpr(fn.Pos(), ir.ONE, gate, ir.NewInt(fn.Pos(), 0)))
+	for _, anchor := range anchors {
+		condition = ir.NewLogicalExpr(fn.Pos(), ir.OOROR, condition,
+			ir.NewUnaryExpr(fn.Pos(), ir.ONOT, typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroRangeDeferIsNative"), ir.Nodes{anchor}, false)))
+	}
 	// Separately loaded Go modules have no closed linked-image stack proof.
 	// Retain their factory ABI and summaries, while keeping public calls ordinary.
 	if base.Flag.Dynlink != nil && *base.Flag.Dynlink || base.Flag.LinkShared != nil && *base.Flag.LinkShared {

@@ -95,6 +95,10 @@ type lowerCandidate struct {
 	deferDeps         map[*ir.Func]bool
 	defers            []*lowerDefer
 	dynamicDefers     bool
+	rangeOwner        *rangeDeferOwnerPlan
+	rangeBody         *rangeDeferBodyPlan
+	rangeMarkers      map[*ir.AssignStmt]*ir.CallExpr
+	rangeNamedRecover bool
 	channels          map[ir.Node]*lowerChannel
 	selects           map[*ir.SelectStmt]*lowerSelect
 	switches          map[*ir.SwitchStmt]bool
@@ -156,6 +160,8 @@ type lowerDefer struct {
 	runTerminal     bool
 	directGoexit    bool
 	captures        []lowerDeferCapture
+	rangeAnchor     ir.Node
+	rangeToken      *ir.Name
 }
 
 type lowerDeferCapture struct {
@@ -279,6 +285,13 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	for _, function := range functions {
 		normalizeSuspensionExpressions(function)
 	}
+	plan.rangeOwners = planRangeDeferOwners(plan, functions)
+	plan.rangeBodies = make(map[*ir.Func]*rangeDeferBodyPlan)
+	for _, owner := range plan.rangeOwners {
+		for _, body := range owner.bodies {
+			plan.rangeBodies[body.function.Func] = body
+		}
+	}
 	// Source defer literals use the existing in-place cleanup rewrite. Do not
 	// also replace their bodies with standalone entries: the cleanup rewrite
 	// must retain its own terminal-control and capture ownership.
@@ -323,6 +336,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		candidate.heapLocals = plan.HeapLocals
 	}
 
+	prepareRangeHybridBodies(plan, plan.rangeOwners, candidates, bodies)
 	factories := make(map[*ir.Func]*ir.Func)
 	var callbackTargets []*ir.Func
 	for target := range plan.callbackFactories {
@@ -374,6 +388,12 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			fn := function.Func
 			candidate := candidates[fn]
 			if candidate == nil {
+				continue
+			}
+			if candidate.rangeOwner != nil && candidate.rangeOwner.err != nil {
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("%s: %v", ir.PkgFuncName(fn), candidate.rangeOwner.err))
+				delete(candidates, fn)
+				changed = true
 				continue
 			}
 			var unsupported []string
@@ -433,7 +453,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		if candidate == nil {
 			continue
 		}
-		if bodies != nil && plan.specializedBodies[function.Func] == nil {
+		if bodies != nil && plan.specializedBodies[function.Func] == nil && candidate.ordinary == nil {
 			candidate.ordinary = bodies.Read(function.Func)
 			if candidate.ordinary == nil {
 				return result, fmt.Errorf("%s: missing admitted ordinary body", ir.PkgFuncName(function.Func))
@@ -483,6 +503,19 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			candidate.resultPtrs = append(candidate.resultPtrs, pointer)
 		}
 	}
+	for _, owner := range plan.rangeOwners {
+		if candidates[owner.function] == nil {
+			continue
+		}
+		for _, registration := range owner.hybrids {
+			if err := finishRangeHybridRegistration(registration, factories); err != nil {
+				return result, err
+			}
+		}
+		for _, body := range owner.bodies {
+			installRangeHybridRegistrations(body)
+		}
+	}
 	markFusedFrameCandidates(candidates)
 	preferRootArrayFrames(candidates)
 	for _, function := range functions {
@@ -497,7 +530,14 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	specializedBodies := make(map[*ir.Func]*ir.Func)
 	for _, function := range functions {
 		fn := function.Func
-		if plan.rewrittenCallers[fn] && candidates[fn] == nil {
+		if body := plan.rangeBodies[fn]; body != nil && body.ordinary != nil && candidates[body.owner.function] != nil {
+			if candidate := candidates[fn]; candidate != nil {
+				candidate.ordinary = body.ordinary
+			} else {
+				rejectedBodies[fn] = body.ordinary
+			}
+		}
+		if plan.rewrittenCallers[fn] && candidates[fn] == nil && rejectedBodies[fn] == nil {
 			ordinary := bodies.Read(fn)
 			if ordinary == nil {
 				return result, fmt.Errorf("%s: missing rejected ordinary body", ir.PkgFuncName(fn))
@@ -505,12 +545,33 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			rejectedBodies[fn] = ordinary
 		}
 		if build := plan.specializedBodies[fn]; build != nil {
-			ordinary := build()
+			var ordinary *ir.Func
+			if body := plan.rangeBodies[fn]; body != nil && body.ordinary != nil && candidates[body.owner.function] != nil {
+				ordinary = body.ordinary
+			} else {
+				ordinary = build()
+			}
 			if ordinary == nil {
 				return result, fmt.Errorf("%s: missing specialized ordinary body", ir.PkgFuncName(fn))
 			}
 			specializedBodies[fn] = ordinary
 		}
+	}
+	// An ordinary-only range callback still shares its enclosing native
+	// owner's cells. Install its hybrid body before that owner reparents and
+	// rewrites the capture layout; restoring it afterward would lose those
+	// pointer-cell rewrites.
+	for _, function := range functions {
+		fn := function.Func
+		body := plan.rangeBodies[fn]
+		if body == nil || candidates[fn] != nil || candidates[body.owner.function] == nil || body.ordinary == nil {
+			continue
+		}
+		remapOrdinaryBody(fn, body.ordinary)
+		fn.Body = body.ordinary.Body
+		ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+		delete(rejectedBodies, fn)
+		delete(specializedBodies, fn)
 	}
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
@@ -540,7 +601,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 		lowerAffineRootEntry(candidate)
 		if candidate.ordinary != nil {
-			addOrdinaryBody(function.Func, candidate.ordinary)
+			addOrdinaryBody(function.Func, candidate.ordinary, rangeBodyEntryAnchors(candidate)...)
 		}
 		if resumeFactorySupported(function.Func) {
 			function.Factory = candidate.factoryABI
@@ -594,9 +655,13 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// typed factory to preserve its own defer scope during the outer unwind.
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
+	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
 	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) &&
-		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function))) {
+		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function) || rangeDeferRegistrationFactorySupported(plan, bodyPlan))) {
 		return nil, fmt.Errorf("no coroutine sites")
+	}
+	if ownerPlan != nil && ownerPlan.err != nil {
+		return nil, ownerPlan.err
 	}
 	statementCalls := make(map[*ir.CallExpr]bool)
 	awaitStatements := make(map[*ir.CallExpr]ir.Node)
@@ -740,8 +805,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return fmt.Errorf("non-call go or defer statement")
 				}
 				if stmt.Op() == ir.ODEFER {
-					if stmt.DeferAt != nil {
+					if stmt.DeferAt != nil && !rangeBodyContains(bodyPlan, stmt) {
 						return fmt.Errorf("range defer belongs to enclosing activation")
+					}
+					if stmt.DeferAt != nil {
+						dynamicDefers = true
 					}
 					if inLoop {
 						dynamicDefers = true
@@ -753,8 +821,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						return fmt.Errorf("non-normalized defer call")
 					}
 					defers = append(defers, &lowerDefer{
-						statement: stmt,
-						call:      call,
+						statement:   stmt,
+						call:        call,
+						rangeAnchor: stmt.DeferAt,
 					})
 					continue
 				}
@@ -986,6 +1055,25 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 		iterationVars: iterationVars,
 		panics:        make(map[*ir.UnaryExpr]bool),
 	}
+	candidate.rangeOwner, candidate.rangeBody = ownerPlan, bodyPlan
+	candidate.rangeMarkers = make(map[*ir.AssignStmt]*ir.CallExpr)
+	if bodyPlan != nil {
+		candidate.dependencies[bodyPlan.owner.function] = true
+	}
+	if ownerPlan != nil {
+		candidate.dynamicDefers = true
+		for _, body := range ownerPlan.bodies {
+			for dependency := range body.cleanup.dependencies {
+				candidate.dependencies[dependency] = true
+			}
+			for dependency := range body.cleanup.deferDeps {
+				candidate.deferDeps[dependency] = true
+			}
+			for _, deferred := range body.cleanup.defers {
+				candidate.rangeNamedRecover = candidate.rangeNamedRecover || deferred.namedRecover
+			}
+		}
+	}
 	for _, site := range function.Sites {
 		if site.Kind == SitePanic {
 			panicExpr, ok := site.Node.(*ir.UnaryExpr)
@@ -1034,6 +1122,17 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			return nil, fmt.Errorf("suspending defer")
 		}
 		switch site.Kind {
+		case SiteRangeDefer:
+			assignment, ok := awaitStatements[call].(*ir.AssignStmt)
+			if !ok || ownerPlan == nil || assignment.Y != call {
+				return nil, fmt.Errorf("unbound enclosing range marker site %d", site.ID)
+			}
+			name, ok := assignment.X.(*ir.Name)
+			if !ok || ownerPlan.anchors[name.Canonical()] != assignment {
+				return nil, fmt.Errorf("range marker site %d has no exact owner", site.ID)
+			}
+			candidate.rangeMarkers[assignment] = call
+			continue
 		case SiteSemaphore:
 			if !statementCalls[call] || semaphoreOperation(call) == "" {
 				return nil, fmt.Errorf("unsupported semaphore site %d", site.ID)
@@ -2049,7 +2148,7 @@ func canLowerRunToCompletion(candidate *lowerCandidate) bool {
 // structured terminal outcome or panic while executing ordinary Go code.
 // Unknown IR operations are treated conservatively.
 func needsTerminalEntry(candidate *lowerCandidate) bool {
-	if candidate.function.Terminal != 0 || len(candidate.defers) != 0 {
+	if candidate.function.Terminal != 0 || len(candidate.defers) != 0 || candidate.rangeOwner != nil {
 		return true
 	}
 	for _, channel := range candidate.channels {
@@ -2884,15 +2983,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		len(candidate.defers))
 	var deferStack *ir.Name
 	var deferToken *ir.Name
-	if candidate.dynamicDefers {
-		// Use one stack for every site so fixed and repeated registrations
-		// retain their global LIFO order.
-		deferType := candidate.defers[0].call.Fun.Type()
+	if candidate.dynamicDefers && (candidate.hasLocalDefers() || candidate.rangeOwner != nil) {
+		// Markers and ordinary calls share the owner's registration order.
+		var deferType *types.Type
+		if candidate.rangeOwner != nil {
+			deferType = rangeDeferRecordType()
+		} else {
+			deferType = candidate.defers[0].call.Fun.Type()
+		}
 		deferStack = typecheck.TempAt(pos, factory, types.NewSlice(deferType))
 		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferStack))
 	}
+	if candidate.rangeNamedRecover {
+		deferToken = typecheck.TempAt(pos, factory, types.Types[types.TUNSAFEPTR])
+		addDeclaration(ir.NewDecl(pos, ir.ODCL, deferToken))
+	}
 	for _, deferred := range candidate.defers {
-		if (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
+		if deferred.rangeAnchor == nil && (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
 			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
@@ -3080,6 +3187,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		required := false
 		ir.Visit(node, func(node ir.Node) {
 			if required {
+				return
+			}
+			if assignment, ok := node.(*ir.AssignStmt); ok && candidate.rangeMarkers[assignment] != nil {
+				required = true
 				return
 			}
 			if panicExpr, ok := node.(*ir.UnaryExpr); ok &&
@@ -3931,15 +4042,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			})
 	}
 	for _, deferred := range candidate.defers {
+		deferredToken := resumeDeferToken
+		if deferred.rangeAnchor != nil {
+			deferred.rangeToken = typecheck.TempAt(deferred.statement.Pos(), resume, types.Types[types.TUNSAFEPTR])
+			deferredToken = deferred.rangeToken
+		}
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
 		if len(deferred.terminalTargets) != 0 {
-			if err := rewriteDynamicDeferCall(deferred, resumeDeferToken, factories); err != nil {
+			if err := rewriteDynamicDeferCall(deferred, deferredToken, factories); err != nil {
 				return err
 			}
 		} else if deferred.directGoexit {
 			var err error
 			closure, err = rewriteDeferGoexitCall(deferred, resume,
-				resumeDeferToken, deferred.terminalTarget)
+				deferredToken, deferred.terminalTarget)
 			if err != nil {
 				return err
 			}
@@ -3947,7 +4063,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		} else if deferred.runTerminal {
 			var err error
 			closure, err = rewriteDeferFactoryCall(deferred, resume,
-				resumeDeferToken, deferred.terminalTarget,
+				deferredToken, deferred.terminalTarget,
 				factories[deferred.terminalTarget])
 			if err != nil {
 				return err
@@ -3960,7 +4076,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		closure.Func.ClosureParent = resume
 		if deferred.rewriteTerminal != 0 {
 			token := ir.NewClosureVar(deferred.statement.Pos(),
-				closure.Func, resumeDeferToken)
+				closure.Func, deferredToken)
 			if err := rewriteDeferTerminal(closure.Func, token,
 				deferred.rewriteTerminal); err != nil {
 				return err
@@ -4120,6 +4236,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
 		for _, stmt := range state.body {
+			if assignment, ok := stmt.(*ir.AssignStmt); ok && candidate.rangeMarkers[assignment] != nil {
+				anchor := edit(assignment.X)
+				assignment.Y = typecheck.Call(assignment.Pos(), typecheck.LookupRuntime("coroRangeDefer"), ir.Nodes{ctx}, false)
+				body = append(body, edit(assignment), appendRangeDeferRecord(assignment.Pos(), capture(deferStack),
+					ir.NewNilExpr(assignment.Pos(), types.NewSignature(nil, nil, nil)), anchor))
+				continue
+			}
 			if deferStmt, ok := stmt.(*ir.GoDeferStmt); ok &&
 				deferStmt.Op() == ir.ODEFER {
 				deferred := deferByStatement[deferStmt]
@@ -4129,6 +4252,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				for _, init := range deferStmt.Init() {
 					body = append(body, edit(init))
+				}
+				if deferred.rangeAnchor != nil {
+					owner := ir.NewAssignStmt(deferStmt.Pos(), deferred.rangeToken,
+						typecheck.Call(deferStmt.Pos(), typecheck.LookupRuntime("coroRangeDeferOwner"), ir.Nodes{edit(deferred.rangeAnchor)}, false))
+					owner.Def, deferred.rangeToken.Defn = true, owner
+					body = append(body, ir.NewDecl(deferStmt.Pos(), ir.ODCL, deferred.rangeToken), owner)
 				}
 				if candidate.dynamicDefers {
 					for _, deferredCapture := range deferred.captures {
@@ -4141,12 +4270,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							ir.NewDecl(deferStmt.Pos(), ir.ODCL, snapshot),
 							assignment)
 					}
-					stack := capture(deferStack)
-					appendCall := typecheck.Call(deferStmt.Pos(),
-						types.BuiltinPkg.Lookup("append").Def.(*ir.Name),
-						ir.Nodes{stack, edit(deferred.call.Fun)}, false)
-					body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
-						stack, appendCall))
+					value := edit(deferred.call.Fun)
+					if deferred.rangeAnchor != nil {
+						body = append(body, typecheck.Call(deferStmt.Pos(), typecheck.LookupRuntime("coroRangeDeferPush"), ir.Nodes{edit(deferred.rangeAnchor), value}, false))
+					} else {
+						stack := capture(deferStack)
+						if candidate.rangeOwner != nil {
+							body = append(body, appendRangeDeferRecord(deferStmt.Pos(), stack, value, ir.NewNilExpr(deferStmt.Pos(), types.Types[types.TINTER])))
+						} else {
+							appendCall := typecheck.Call(deferStmt.Pos(), types.BuiltinPkg.Lookup("append").Def.(*ir.Name), ir.Nodes{stack, value}, false)
+							body = append(body, ir.NewAssignStmt(deferStmt.Pos(), stack, appendCall))
+						}
+					}
 				} else {
 					for _, deferredCapture := range deferred.captures {
 						body = append(body, ir.NewAssignStmt(deferStmt.Pos(),
@@ -4278,43 +4413,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				gotoState(state.next),
 			)
 		} else if state.cleanup {
-			if candidate.dynamicDefers {
+			if candidate.dynamicDefers && deferStack != nil {
 				stack := capture(deferStack)
-				deferType := candidate.defers[0].call.Fun.Type()
-				deferredCall := typecheck.TempAt(pos, resume, deferType)
-				stackLen := func() ir.Node {
-					return ir.NewUnaryExpr(pos, ir.OLEN, stack)
-				}
-				lastIndex := func() ir.Node {
-					return ir.NewBinaryExpr(pos, ir.OSUB, stackLen(),
-						ir.NewInt(pos, 1))
-				}
-				load := ir.NewAssignStmt(pos, deferredCall,
-					ir.NewIndexExpr(pos, stack, lastIndex()))
-				clear := ir.NewAssignStmt(pos,
-					ir.NewIndexExpr(pos, stack, lastIndex()),
-					typecheck.NodNil())
-				pop := ir.NewAssignStmt(pos, stack,
-					ir.NewSliceExpr(pos, ir.OSLICE, stack, nil,
-						lastIndex(), nil))
-				call := ir.Node(typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{deferredCall}, false))
-				if slices.ContainsFunc(candidate.defers,
-					func(deferred *lowerDefer) bool {
-						return deferred.namedRecover
-					}) {
-					call = typecheck.Call(pos,
-						typecheck.LookupRuntime("coroDeferCall"),
-						ir.Nodes{resumeDeferToken, deferredCall}, false)
-				}
-				condition := ir.NewBinaryExpr(pos, ir.ONE, stackLen(),
-					ir.NewInt(pos, 0))
-				// Pop before calling so a later replacement-panic path cannot
-				// invoke the same deferred call twice.
-				body = append(body, ir.NewForStmt(pos, nil, condition, nil,
-					ir.Nodes{load, clear, pop, call}, false))
+				// The record form is used by enclosing range markers once owner
+				// admission has proved every callback cleanup target. Existing
+				// dynamic defers retain their original function-only stack.
+				body = append(body, lowerDeferStackCleanup(pos, resume, ctx, stack,
+					resumeDeferToken, candidate.rangeNamedRecover || slices.ContainsFunc(candidate.defers,
+						func(deferred *lowerDefer) bool { return deferred.rangeAnchor == nil && deferred.namedRecover }), candidate.rangeOwner != nil))
 			} else {
 				for j := len(candidate.defers) - 1; j >= 0; j-- {
 					deferred := candidate.defers[j]
+					if deferred.rangeAnchor != nil {
+						continue
+					}
 					armed := capture(deferred.armed)
 					clear := ir.NewAssignStmt(deferred.statement.Pos(), armed,
 						ir.NewBasicLit(deferred.statement.Pos(),

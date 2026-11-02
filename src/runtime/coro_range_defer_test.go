@@ -13,10 +13,27 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 )
+
+func TestStacklessCoroRangeDeferAnchorKind(t *testing.T) {
+	for _, ordinary := range []any{nil, 17, new(atomic.Pointer[byte]), (*int)(nil), runtime.NilStacklessCoroRangeDeferForTest()} {
+		if runtime.IsNativeStacklessCoroRangeDeferForTest(ordinary) {
+			t.Fatalf("ordinary or invalid token acquired native representation: %T", ordinary)
+		}
+	}
+	anchor, ctx := runtime.NewStacklessCoroRangeDeferForTest()
+	if !runtime.IsNativeStacklessCoroRangeDeferForTest(anchor) {
+		t.Fatal("active native anchor lost its representation")
+	}
+	runtime.NextStacklessCoroRangeDeferForTest(ctx, anchor)
+	if !runtime.StacklessCoroRangeDeferReleasedForTest(anchor) || !runtime.IsNativeStacklessCoroRangeDeferForTest(anchor) {
+		t.Fatal("completed native anchor would be routed into ordinary deferprocat")
+	}
+}
 
 // Exercise the anchor under real structured task transitions. These are
 // runtime ownership tests; compiler admission and native stack gates have
