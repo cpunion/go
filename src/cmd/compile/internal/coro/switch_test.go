@@ -285,8 +285,14 @@ func TestTypeSwitchClosureBinding(t *testing.T) {
 			yield := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("yield"), sig)
 			site := newLowerTestCall(yield)
 			fn.Body = append(ir.Nodes{site}, fn.Body...)
-			candidate, err := newLowerCandidate(&Plan{}, &Function{Func: fn, Primary: CoroPrimary,
-				Sites: []Site{{ID: 1, Kind: SiteYield, Node: site}}})
+			function := &Function{Func: fn, Primary: CoroPrimary,
+				Sites: []Site{{ID: 1, Kind: SiteYield, Node: site}}}
+			if test.deferLiteral {
+				function.Edges = []Edge{{Kind: DeferCall, Node: call, Callee: closure}}
+			}
+			candidate, err := newLowerCandidate(&Plan{Functions: map[*ir.Func]*Function{
+				fn: function, closure: {Func: closure},
+			}}, function)
 			if err != nil {
 				t.Fatal(err)
 			}
