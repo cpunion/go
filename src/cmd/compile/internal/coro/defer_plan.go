@@ -1,0 +1,147 @@
+// Copyright 2026 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package coro
+
+import (
+	"cmd/compile/internal/ir"
+	"fmt"
+	"slices"
+)
+
+// planNativeDefers validates the exact cleanup targets and capture lifetimes
+// independently of continuation construction. Registration only freezes operands;
+// cleanup invokes each target with its separately proved terminal contract.
+func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallExpr]Edge) error {
+	fn := candidate.function.Func
+	defers, dynamicDefers := candidate.defers, candidate.dynamicDefers
+	for _, deferred := range defers {
+		edge, ok := edges[deferred.call]
+		if !ok || edge.Kind != DeferCall || edge.Callee == nil && len(edge.Targets) == 0 {
+			return fmt.Errorf("defer has no static call plan")
+		}
+		if edge.Unknown {
+			return fmt.Errorf("defer target has unknown effects")
+		}
+		summary, _ := plan.edgeSummary(edge)
+		if summary.Effect != NoSuspend {
+			return fmt.Errorf("suspending defer")
+		}
+		var parameterTarget *ir.Func
+		if call := unwrapGoCall(deferred.call); call != deferred.call {
+			if name := ir.StaticCalleeName(call.Fun); name != nil &&
+				canPlanParameterDeferTarget(plan, name.Func) {
+				parameterTarget = name.Func
+			}
+		}
+		if summary.Exec != 0 && (summary.Exec != NeedsTaskContext || parameterTarget == nil) {
+			return fmt.Errorf("defer target has execution constraints %s",
+				summary.Exec)
+		}
+		if len(edge.Targets) != 0 {
+			if unwrapDynamicDeferCall(deferred.call) == deferred.call {
+				name, ok := deferred.call.Fun.(*ir.Name)
+				if !ok || name.Curfn != fn {
+					return fmt.Errorf("dynamic defer has no frozen callee")
+				}
+				// A func() call is already normalized without a wrapper.
+				// Save the selected value before arming a fixed defer site.
+				// Repeated sites save it directly in the common defer stack.
+				deferred.snapshotCallee = true
+			}
+			for _, target := range edge.Targets {
+				targetSummary, _ := plan.funcSummary(target)
+				terminal := lowerDeferTerminal{target: target}
+				if targetSummary.Terminal != 0 {
+					var ok bool
+					terminal, ok = planDeferTerminal(plan, target, targetSummary)
+					if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
+						return fmt.Errorf("dynamic defer target %s has unsupported terminal control %s",
+							ir.PkgFuncName(target), targetSummary.Terminal)
+					}
+				}
+				deferred.terminalTargets = append(deferred.terminalTargets, terminal)
+				deferred.namedRecover = deferred.namedRecover ||
+					!terminal.factory && targetSummary.Terminal&UsesRecover != 0
+				if terminal.factory {
+					candidate.dependencies[target] = true
+					candidate.deferDeps[target] = true
+				}
+			}
+			// Dispatch the frozen closed set directly during cleanup. This
+			// also binds plain targets for the machine-stack proof. Nil is
+			// still checked at invocation, after registration froze operands.
+			continue
+		}
+		closure, isClosure := deferred.call.Fun.(*ir.ClosureExpr)
+		if edge.Callee.OClosure != nil {
+			if !isClosure || closure.Func != edge.Callee {
+				return fmt.Errorf("defer closure does not match call plan")
+			}
+			if edge.Callee.Wrapper() && edge.Callee.WrappedFunc == nil {
+				return fmt.Errorf("defer wrapper has no target")
+			}
+			if !edge.Callee.Wrapper() && dynamicDefers {
+				deferred.sourceLiteral = true
+				deferred.literalCaptures = slices.Clone(
+					edge.Callee.ClosureVars)
+				captured := make(map[*ir.Name]bool,
+					len(deferred.literalCaptures))
+				for _, variable := range deferred.literalCaptures {
+					source := variable.Canonical()
+					if source == nil || source.Type() == nil {
+						return fmt.Errorf(
+							"repeated source defer capture has no type")
+					}
+					captured[source] = true
+				}
+				nested := false
+				ir.Visit(edge.Callee, func(node ir.Node) {
+					closure, ok := node.(*ir.ClosureExpr)
+					if !ok || closure.Func == edge.Callee {
+						return
+					}
+					for _, variable := range closure.Func.ClosureVars {
+						if captured[variable.Canonical()] {
+							nested = true
+						}
+					}
+				})
+				if nested {
+					return fmt.Errorf(
+						"nested repeated source defer capture")
+				}
+			}
+		}
+		if parameterTarget != nil {
+			// Even an all-plain sealed callback uses its typed factory. Its
+			// task-context flag is internal to dispatch, not permission to
+			// suspend, create children, or enter an arbitrary task context.
+			deferred.terminalTarget = parameterTarget
+			deferred.runTerminal = true
+			candidate.dependencies[parameterTarget] = true
+			candidate.deferDeps[parameterTarget] = true
+			continue
+		}
+		if summary.Terminal != 0 {
+			terminal, ok := planDeferTerminal(plan, edge.Callee, summary)
+			if !ok {
+				return fmt.Errorf("defer target has terminal control %s",
+					summary.Terminal)
+			}
+			deferred.rewriteTerminal = terminal.rewrite
+			deferred.terminalTarget = terminal.target
+			deferred.runTerminal = terminal.factory
+			deferred.directGoexit = terminal.directGoexit
+			deferred.namedRecover = terminal.target != nil &&
+				!deferred.runTerminal && !deferred.directGoexit &&
+				summary.Terminal&UsesRecover != 0
+			if deferred.runTerminal {
+				candidate.dependencies[terminal.target] = true
+				candidate.deferDeps[terminal.target] = true
+			}
+		}
+	}
+	return nil
+}

@@ -343,6 +343,10 @@ func asanregisterglobals(unsafe.Pointer, uintptr)
 func KeepAlive(interface{})
 
 // stackless coroutine deferred terminal control
+func coroRangeDefer(unsafe.Pointer) interface{}
+func coroRangeDeferOwner(interface{}) unsafe.Pointer
+func coroRangeDeferPush(interface{}, func())
+func coroRangeDeferNext(unsafe.Pointer, interface{}) (func(), bool)
 func coroDeferToken(unsafe.Pointer) unsafe.Pointer
 func coroDeferInvoke(func())
 func coroDeferCall(unsafe.Pointer, func())
