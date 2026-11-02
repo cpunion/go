@@ -73,7 +73,7 @@ func AnalyzeWithSpecializations(funcs []*ir.Func, directives [][]string, reader 
 	demands := make(map[*ir.Func]bool)
 	index := 0
 	specializeWaitGroupCallbacks(funcs, specialized, bodies, demands, &index)
-	rewritten, operandCalls := specializeCapturedOperands(funcs, reader, bodies)
+	rewritten, operandCalls := specializeCapturedOperands(funcs, reader, specialized, bodies)
 	for fn := range specializeParameters(typecheck.Target.Funcs, reader, specialized, bodies, demands) {
 		rewritten[fn] = true
 	}
