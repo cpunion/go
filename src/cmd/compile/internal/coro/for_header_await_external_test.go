@@ -21,6 +21,9 @@ func TestForHeaderAwaitExpressions(t *testing.T) {
 	const source = `package main
 import "runtime"
 var trace string
+var park,release chan int
+//go:noinline
+func parked(){if park!=nil{park<-1;<-release}}
 //go:noinline
 func start()int{trace+="I";runtime.Gosched();return 0}
 //go:noinline
@@ -39,13 +42,13 @@ func apply(f func(int)bool,i int)bool{if i<0{return false};return f(i)}
 //go:noinline
 func inlineHeaders()int{f:=func(i int)bool{runtime.Gosched();return i<3};sum:=0;for i:=0;apply(f,i);i=step(i){sum+=i};return sum}
 //go:noinline
-func captures()([]func()int,[]*int){var fs []func()int;var ps []*int;for i:=0;check(i);i=step(i){fs=append(fs,func()int{return i});ps=append(ps,&i);runtime.GC();if i==1{continue};runtime.Gosched()};return fs,ps}
+func captures()([]func()int,[]*int){var fs []func()int;var ps []*int;for i:=0;check(i);i=step(i){fs=append(fs,func()int{return i});ps=append(ps,&i);parked();if i==1{continue};runtime.Gosched()};return fs,ps}
 //go:noinline
-func addresses()[]*int{var ps []*int;for i:=0;check(i);i=step(i){ps=append(ps,&i);runtime.GC();continue};return ps}
+func addresses()[]*int{var ps []*int;for i:=0;check(i);i=step(i){ps=append(ps,&i);runtime.Gosched();continue};return ps}
 //go:noinline
 func yieldOnlyAddresses()[]*int{var ps []*int;for i:=0;i<3;i++{ps=append(ps,&i);runtime.Gosched();continue};return ps}
 //go:noinline
-func existing()[]*int{var ps []*int;i:=0;for ;check(i);i=step(i){ps=append(ps,&i);runtime.GC();continue};return ps}
+func existing()[]*int{var ps []*int;i:=0;for ;check(i);i=step(i){ps=append(ps,&i);runtime.Gosched();continue};return ps}
 //go:noinline
 func nested()int{sum:=0;for i:=0;check(i);i=step(i){for j:=0;j<3&&check(j);j=step(j){if j==1{continue};sum+=i+j};if i==1{continue}};return sum}
 //go:noinline
@@ -61,7 +64,7 @@ func sourceLabels()int{n:=0;again:for i:=0;check(i);i=step(i){n++;if n<2{continu
 func main(){
  trace="";if headers()!=2||trace!="ICBPCBPCBPC"{panic("init/condition/body/continue/post order: "+trace)}
  trace="";if tuples()!=3{panic("tuple header")};if inlineHeaders()!=3{panic("inline header")}
- fs,ps:=captures();runtime.GC();if len(fs)!=3||len(ps)!=3{panic("capture count")};for i:=range 3{if fs[i]()!=i||*ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("iteration capture identity")};*ps[i]+=10;if fs[i]()!=i+10{panic("capture cell sharing")}}
+ var fs []func()int;var ps []*int;park=make(chan int);release=make(chan int);done:=make(chan struct{});go func(){fs,ps=captures();close(done)}();for range 3{<-park;runtime.GC();release<-1};<-done;park=nil;runtime.GC();if len(fs)!=3||len(ps)!=3{panic("capture count")};for i:=range 3{if fs[i]()!=i||*ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("iteration capture identity")};*ps[i]+=10;if fs[i]()!=i+10{panic("capture cell sharing")}}
  ps=addresses();runtime.GC();for i:=range 3{if *ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("escaped iteration address")}}
  ps=yieldOnlyAddresses();runtime.GC();for i:=range 3{if *ps[i]!=i||i>0&&ps[i]==ps[i-1]{panic("yield-only iteration address")}}
  ps=existing();runtime.GC();for i:=range 3{if *ps[i]!=3||ps[i]!=ps[0]{panic("existing variable identity")}}
