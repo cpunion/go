@@ -2709,13 +2709,13 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 }
 
 func reparentClosureCaptures(fn, resume *ir.Func,
-	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node) error {
+	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node, detached ...ir.Node) error {
 	// Source function literals now execute inside resume. Reparent them and
 	// route their captures through resume's copy of each factory local.
 	// Defer wrappers need specialized snapshot and terminal rewriting, so
 	// leave those closures alone here.
 	var captureErr error
-	ir.Visit(fn, func(node ir.Node) {
+	visit := func(node ir.Node) {
 		if captureErr != nil {
 			return
 		}
@@ -2762,7 +2762,9 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 				variable.Defn = variable.Outer.Canonical()
 			}
 		})
-	})
+	}
+	ir.Visit(fn, visit)
+	ir.VisitList(detached, visit)
 	return captureErr
 }
 
@@ -3644,6 +3646,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		panic(fmt.Sprintf("unexpected coroutine lowering boundary %s", stmt.Op()))
 	}
+	// Building states detaches statement initializers from the source tree.
+	// Retain their literals so their captures still move into resume, including
+	// callee snapshots introduced by captured-parameter specialization.
+	var sourceLiterals ir.Nodes
+	ir.Visit(fn, func(node ir.Node) {
+		if closure, ok := node.(*ir.ClosureExpr); ok {
+			sourceLiterals = append(sourceLiterals, closure)
+		}
+	})
 	entryState := lowerStatements(fn.Body, completeState)
 	candidate.entryZeroed = entryZeroedFrameLocals(states[entryState].body)
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
@@ -3894,7 +3905,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			deferClosures[closure.Func] = true
 		}
 	}
-	if err := reparentClosureCaptures(fn, resume, deferClosures, edit); err != nil {
+	if err := reparentClosureCaptures(fn, resume, deferClosures, edit, sourceLiterals...); err != nil {
 		return err
 	}
 
