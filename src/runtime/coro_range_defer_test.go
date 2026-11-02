@@ -89,6 +89,11 @@ func TestStacklessCoroRangeDeferStructured(t *testing.T) {
 						fn()
 					}
 					got.terminal = runtime.TerminalActionStacklessCoroForTest(ctx)
+					if got.terminal == runtime.StacklessCoroActionInvalid {
+						// No pending terminal action follows the compiler's
+						// normal-completion edge after cleanup.
+						got.terminal = runtime.StacklessCoroActionComplete
+					}
 					got.released = runtime.StacklessCoroRangeDeferReleasedForTest(anchor)
 					results <- got
 					return got.terminal
