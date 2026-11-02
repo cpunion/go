@@ -355,7 +355,16 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				}
 			}
 			factories[target] = newPlainSpawnFactory(target, callee.Nname)
-			child.Factory = FactoryABI1
+			if resumeFactorySupported(target) {
+				child.Factory = FactoryABI1
+			}
+			if capturedFactorySupported(target) && !target.Walked() {
+				// Ordinary bodies and target dispatch still reference the
+				// source closure's code, including without DWARF metadata.
+				target.SetNeedctxt(true)
+				target.SetWalked(true)
+				factories[target].Closures = append(factories[target].Closures, target)
+			}
 		}
 	}
 	for _, function := range functions {
