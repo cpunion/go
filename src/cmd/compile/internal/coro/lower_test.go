@@ -7360,7 +7360,7 @@ func TestReparentClosureCaptures(t *testing.T) {
 	}
 }
 
-func TestLowerRejectsRangeVariableClosure(t *testing.T) {
+func TestLowerRangeVariableClosure(t *testing.T) {
 	prepareLowerTest(t)
 
 	oldTarget := typecheck.Target
@@ -7409,12 +7409,14 @@ func TestLowerRejectsRangeVariableClosure(t *testing.T) {
 			ID: 1, Kind: SiteChannel, Node: loop,
 		}},
 	}
-	_, err := newLowerCandidate(
+	candidate, err := newLowerCandidate(
 		&Plan{Functions: map[*ir.Func]*Function{fn: function}},
 		function)
-	if err == nil || !strings.Contains(err.Error(),
-		"range variable captured by closure") {
-		t.Fatalf("newLowerCandidate error = %v, want range closure error", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidate.rangeVars) != 1 || candidate.rangeVars[0] != variable {
+		t.Fatalf("per-iteration variables = %v, want %v", candidate.rangeVars, variable)
 	}
 }
 

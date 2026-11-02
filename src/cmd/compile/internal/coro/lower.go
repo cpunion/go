@@ -911,33 +911,6 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	if hasUnplannedTypeSwitch(fn.Body, switches) {
 		return nil, fmt.Errorf("type switch in unsupported expression")
 	}
-	if typeSwitchHasOrdinaryClosureCapture(fn, switches, defers) {
-		return nil, fmt.Errorf("type switch variable captured by closure")
-	}
-	if len(rangeVars) != 0 {
-		rangeVariableSet := make(map[*ir.Name]bool, len(rangeVars))
-		for _, variable := range rangeVars {
-			rangeVariableSet[variable.Canonical()] = true
-		}
-		rangeClosureCapture := false
-		ir.Visit(fn, func(node ir.Node) {
-			if rangeClosureCapture {
-				return
-			}
-			closure, ok := node.(*ir.ClosureExpr)
-			if !ok {
-				return
-			}
-			for _, variable := range closure.Func.ClosureVars {
-				if rangeVariableSet[variable.Canonical()] {
-					rangeClosureCapture = true
-				}
-			}
-		})
-		if rangeClosureCapture {
-			return nil, fmt.Errorf("range variable captured by closure")
-		}
-	}
 
 	edges := make(map[*ir.CallExpr]Edge)
 	for _, edge := range function.Edges {

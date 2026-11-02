@@ -50,7 +50,7 @@ func main(){
  n:=number(10);if strings(map[name]*number{"abc":&n})!=13||interfaces(map[any]any{1:2,3:4})!=10||zero(map[struct{}]struct{}{{}:{}})!=1 {panic("map key or value types")};assignment(map[int]int{3:7});if operandOrder(map[int]int{3:7})!=12||singleDestination(map[int]int{3:7})!=3 {panic("map operand evaluation")};if alias(map[int]int{3:7})!=7||calls!=3||control(map[int]int{0:2,1:3,2:4})!=7 {panic("map assignment or control")}
  ch:=make(chan map[int]int,1);ch<-map[int]int{1:2};if received(ch)!=1||labeled(map[int]int{1:2})!=1 {panic("map fallback")};println("switch-return-ok")
 }`
-	testSwitchReturnProgram(t, source, []switchFallback{{"captured", "range variable captured by closure"}, {"labeled", "control flow LABEL"}, {"received", "channel site 1: nested receive in range"}}, []string{"each", "named", "keys", "keyless", "converted", "strings", "interfaces", "zero", "assignment", "operandOrder", "singleDestination", "alias", "cells", "control", "nested"})
+	testSwitchReturnProgram(t, source, []switchFallback{{"labeled", "control flow LABEL"}, {"received", "channel site 1: nested receive in range"}}, []string{"captured", "each", "named", "keys", "keyless", "converted", "strings", "interfaces", "zero", "assignment", "operandOrder", "singleDestination", "alias", "cells", "control", "nested"})
 }
 
 func TestMapRangeMutation(t *testing.T) {

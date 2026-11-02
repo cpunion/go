@@ -4945,6 +4945,12 @@ are lowered before their parents reparent their capture expressions. Ordinary
 fallback bodies reconstruct their own capture bindings in place, preserving the
 source defer/recover frame.
 
+Range declarations and implicit type-switch case bindings use the same cell
+lifetime. A range `:=` binding receives a fresh cell each iteration; a range
+assignment to an existing variable retains its shared cell. A selected type
+switch case allocates its cell before saving the dispatch value, so closures
+and escaped addresses from separate selections keep distinct mutable bindings.
+
 This work does not yet supply a runtime registry for arbitrary open callable
 values, method-value or interface dispatch, generic dictionaries or iterator
 yields. It is a dependency of those native ABIs, rather than evidence that those

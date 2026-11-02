@@ -4189,7 +4189,7 @@ func main() {
 	}
 }
 
-func TestChannelRangeClosureFallback(t *testing.T) {
+func TestChannelRangeClosure(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
 	tmp := t.TempDir()
@@ -4253,9 +4253,11 @@ func main() {
 	if diagnostic := "skip main.values:"; strings.Contains(out, diagnostic) {
 		t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
 	}
-	if diagnostic := "coro: skip main.collect: range variable captured by closure"; !strings.Contains(
-		out, diagnostic) {
-		t.Errorf("output does not contain %q\n%s", diagnostic, out)
+	if diagnostic := "skip main.collect:"; strings.Contains(out, diagnostic) {
+		t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+	}
+	if linkedCoroStackUnsafe(t, exe, "main.collect.coro.stackgate") {
+		t.Fatal("captured channel range lost native admission")
 	}
 
 	cmd = testenv.Command(t, exe)
