@@ -25,20 +25,62 @@ type stacklessCoroHost struct {
 	started      bool
 }
 
+// Only an ordinary host allocates this extension. The native executor keeps
+// the original three-pointer G state and its existing context size class.
+type stacklessCoroHostGState struct {
+	stacklessCoroGState
+	host          *stacklessCoroHost
+	ordinaryDepth uint32
+}
+
+// Fixed executors retain their original self pointer. An ordinary extension
+// points to its blockingScheduler slot instead. Both are real GC-visible
+// pointers into the owning allocation; no pointer bits are tagged.
+func stacklessCoroHostState(gp *g) *stacklessCoroHostGState {
+	state := gp.stacklessCoro
+	if state == nil || state.native != unsafe.Pointer(&state.blockingScheduler) {
+		return nil
+	}
+	return (*stacklessCoroHostGState)(unsafe.Pointer(state))
+}
+
+func currentStacklessCoroHost() *stacklessCoroHost {
+	if state := stacklessCoroHostState(getg()); state != nil {
+		return state.host
+	}
+	return nil
+}
+
+func stacklessCoroOrdinaryHostCall(gp *g) bool {
+	state := stacklessCoroHostState(gp)
+	return state != nil && state.ordinaryDepth != 0
+}
+
+type stacklessCoroHostMap map[*stacklessCoroTask]*stacklessCoroHost
+
+// Real panic values always have a nonnil task key. This private cold slot
+// shares the existing optional metadata pointer without growing every scheduler.
+func (s *stacklessCoroScheduler) hostsLocked() stacklessCoroHostMap {
+	if s.terminalValues == nil {
+		return nil
+	}
+	hosts, _ := s.terminalValues[nil].(stacklessCoroHostMap)
+	return hosts
+}
+
 func (s *stacklessCoroScheduler) taskHostLocked(task *stacklessCoroTask) *stacklessCoroHost {
-	if s.hosts == nil {
+	if s.terminalValues == nil {
 		return nil
 	}
 	for task.parent != nil {
 		task = task.parent
 	}
-	return s.hosts[task]
+	return s.hostsLocked()[task]
 }
 
 func (s *stacklessCoroScheduler) taskHostCurrentLocked(task *stacklessCoroTask) bool {
 	h := s.taskHostLocked(task)
-	state := getg().stacklessCoro
-	return h == nil || state != nil && state.host == h
+	return h == nil || currentStacklessCoroHost() == h
 }
 
 func (h *stacklessCoroHost) notifyLocked() {
@@ -117,10 +159,15 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 	for root.parent != nil {
 		root = root.parent
 	}
-	if s.hosts == nil {
-		s.hosts = make(map[*stacklessCoroTask]*stacklessCoroHost)
+	hosts := s.hostsLocked()
+	if hosts == nil {
+		hosts = make(stacklessCoroHostMap)
+		if s.terminalValues == nil {
+			s.terminalValues = make(map[*stacklessCoroTask]any)
+		}
+		s.terminalValues[nil] = hosts
 	}
-	h := s.hosts[root]
+	h := hosts[root]
 	start := false
 	if h == nil {
 		h = &stacklessCoroHost{scheduler: s, root: root}
@@ -132,7 +179,7 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 			h.wake = make(chan struct{}, 1)
 			start = true
 		}
-		s.hosts[root] = h
+		hosts[root] = h
 		// A pull comparison retains its active leaf in head instead of an
 		// ordinary queue. That leaf now belongs exclusively to this host.
 		if stacklessCoroIsPullComparison(s) && s.head == task {
@@ -174,7 +221,8 @@ func (s *stacklessCoroScheduler) hostHandoff(task *stacklessCoroTask) {
 }
 
 func (s *stacklessCoroScheduler) completeHostLocked(task *stacklessCoroTask) {
-	h := s.hosts[task]
+	hosts := s.hostsLocked()
+	h := hosts[task]
 	if h == nil {
 		return
 	}
@@ -183,14 +231,17 @@ func (s *stacklessCoroScheduler) completeHostLocked(task *stacklessCoroTask) {
 	}
 	// Set done and remove the identity before an independent task is recycled.
 	h.done = true
-	delete(s.hosts, task)
+	delete(hosts, task)
+	if len(hosts) == 0 {
+		delete(s.terminalValues, nil)
+	}
 	h.notifyLocked()
 }
 
 func (s *stacklessCoroScheduler) waitPublicRoot() {
 	for !s.rootComplete() {
 		lock(&s.lock)
-		h := s.hosts[&s.root]
+		h := s.hostsLocked()[&s.root]
 		start := h != nil && !h.started
 		unlock(&s.lock)
 		if start {
@@ -210,12 +261,24 @@ func (h *stacklessCoroHost) run() {
 	}
 	h.started = true
 	unlock(&s.lock)
-	scope := enterStacklessCoroRunScope()
-	previous := scope.state.host
-	scope.state.host = h
+	gp := getg()
+	previous := gp.stacklessCoro
+	state := new(stacklessCoroHostGState)
+	if previous != nil {
+		if gp.stackIsFixed() {
+			throw("runtime: ordinary host on fixed executor")
+		}
+		state.stacklessCoroGState = *previous
+	}
+	previousDefer := state.deferTask
+	state.native = unsafe.Pointer(&state.blockingScheduler)
+	state.host = h
+	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		scope.state.host = previous
-		scope.leave()
+		if state.blockingScheduler != nil || state.deferTask != previousDefer || state.ordinaryDepth != 0 {
+			throw("runtime: active state during stackless coroutine host finish")
+		}
+		gp.stacklessCoro = previous
 	}()
 	h.driveThroughGoexit()
 }
@@ -287,7 +350,10 @@ func (h *stacklessCoroHost) drive() {
 
 func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferred func(any, bool, bool)) {
 	s := h.scheduler
-	state := getg().stacklessCoro
+	state := stacklessCoroHostState(getg())
+	if state == nil || state.host != h {
+		throw("runtime: missing ordinary host call state")
+	}
 	oldDefer := state.deferTask
 	state.deferTask = nil
 	state.ordinaryDepth++

@@ -311,7 +311,6 @@ type stacklessCoroScheduler struct {
 	liveSpawns     uint64
 	root           stacklessCoroTask
 	terminalValues map[*stacklessCoroTask]any
-	hosts          map[*stacklessCoroTask]*stacklessCoroHost
 	wake           chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
@@ -619,7 +618,7 @@ func init() {
 func coroUseOrdinary() bool {
 	gp := getg()
 	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil ||
-		gp.stacklessCoro != nil && gp.stacklessCoro.ordinaryDepth != 0
+		stacklessCoroOrdinaryHostCall(gp)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -1707,7 +1706,7 @@ resumeActive:
 		}
 	case stacklessCoroActionHost:
 		s.hostHandoff(task)
-		if state := getg().stacklessCoro; state != nil && state.host != nil && state.host.scheduler == s {
+		if h := currentStacklessCoroHost(); h != nil && h.scheduler == s {
 			return
 		}
 		idlePollSkip = nil
@@ -4382,10 +4381,9 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
-	state := getg().stacklessCoro
-	var current *stacklessCoroHost
-	if state != nil && state.host != nil && state.host.scheduler == s {
-		current = state.host
+	current := currentStacklessCoroHost()
+	if current != nil && current.scheduler != s {
+		current = nil
 	}
 	var task *stacklessCoroTask
 	for {

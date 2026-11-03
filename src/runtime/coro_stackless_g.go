@@ -12,8 +12,6 @@ type stacklessCoroGState struct {
 	native            unsafe.Pointer
 	deferTask         *stacklessCoroTask
 	blockingScheduler *stacklessCoroScheduler
-	host              *stacklessCoroHost
-	ordinaryDepth     uint32
 }
 
 type stacklessCoroG struct {
@@ -42,7 +40,8 @@ func (s *stacklessCoroSudog) clear() {
 }
 
 func (gp *g) stackIsFixed() bool {
-	return gp.stacklessCoro != nil && gp.stacklessCoro.native != nil
+	state := gp.stacklessCoro
+	return state != nil && state.native == unsafe.Pointer(state)
 }
 
 func stacklessCoroRecover(gp *g) any {
