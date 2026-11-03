@@ -25,7 +25,8 @@ func arg(order *[]int,n int)int{*order=append(*order,n);return n}
 func nilCall(w worker,order *[]int){w.Add(arg(order,1));*order=append(*order,2)}
 func nilGo(w worker,order *[]int){go w.Store(arg(order,1),nil);*order=append(*order,2)}
 func nilDefer(w worker,order *[]int){defer w.Store(arg(order,1),nil);*order=append(*order,2)}
-func nilBound(w worker,order *[]int){bound(w.Add,arg(order,1));*order=append(*order,2)}
+func nilBound(w worker,order *[]int){f:=w.Add;bound(f,arg(order,1));*order=append(*order,2)}
+func nilBoundOperand(w worker,order *[]int){bound(w.Add,arg(order,1));*order=append(*order,2)}
 func caught(f func(worker,*[]int),order *[]int)(yes bool){defer func(){yes=recover()!=nil}();f(nil,order);return}
 func main(){
  p:=&box{n:11};var w worker=p
@@ -42,6 +43,7 @@ func main(){
   var order []int;if !caught(f,&order)||len(order)!=1||order[0]!=1{panic("nil interface argument evaluation or caller panic timing")}
  }
  var order []int;if !caught(nilBound,&order)||len(order)!=0{panic("nil interface bound method evaluation timing")}
+ order=nil;if !caught(nilBoundOperand,&order)||len(order)!=1||order[0]!=1{panic("nil interface bound operand evaluation timing")}
  done=make(chan struct{});launchExit(p,done);<-done;if p.n!=23{panic("interface Goexit returned")}
  println("switch-return-ok")
 }

@@ -221,7 +221,9 @@ func openInterfaceArguments(call *ir.CallExpr, value ir.Node) ir.Nodes {
 	dot := call.Fun.(*ir.SelectorExpr)
 	types.CalcSize(dot.X.Type())
 	tab := typecheck.Expr(ir.NewUnaryExpr(pos, ir.OITAB, value))
-	data := typecheck.Expr(ir.NewUnaryExpr(pos, ir.OIDATA, value))
+	data := ir.NewUnaryExpr(pos, ir.OIDATA, value)
+	data.SetType(ptr)
+	data.SetTypecheck(1)
 	signature := typecheck.Conv(ir.NewNilExpr(pos, openCallableSignature(call)), types.Types[types.TINTER])
 	return ir.Nodes{typecheck.ConvNop(tab, ptr), typecheck.ConvNop(data, ptr),
 		typedInt(pos, types.Types[types.TUINTPTR], dot.Offset()/int64(types.PtrSize)), signature}
