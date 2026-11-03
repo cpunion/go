@@ -22,20 +22,20 @@ func rewriteOpenDeferCall(deferred *lowerDefer, token *ir.Name) error {
 	}
 	wrapper := closure.Func
 	call, ok := wrapper.Body[0].(*ir.CallExpr)
-	if !ok || call.Op() != ir.OCALLFUNC || len(call.Init()) != 0 || call.Fun.Type().Kind() != types.TFUNC {
+	if !ok || !openCallableCall(call) || len(call.Init()) != 0 {
 		return fmt.Errorf("open defer wrapper has no frozen function call")
 	}
 	pos := deferred.statement.Pos()
-	signature := callableTypeSignature(call.Fun.Type())
+	signature := openCallableSignature(call)
 	if len(call.Args) != signature.NumParams() {
 		return fmt.Errorf("open defer arguments are not normalized")
 	}
 	requestType := callableRequestType(signature)
 	request := typecheck.TempAt(pos, wrapper, types.NewPtr(requestType))
-	fun := typecheck.TempAt(pos, wrapper, call.Fun.Type())
+	fun := typecheck.TempAt(pos, wrapper, openCallableValue(call).Type())
 	owner := ir.NewClosureVar(pos, wrapper, token)
 	body := ir.Nodes{
-		ir.NewDecl(pos, ir.ODCL, fun), ir.NewAssignStmt(pos, fun, call.Fun),
+		ir.NewDecl(pos, ir.ODCL, fun), ir.NewAssignStmt(pos, fun, openCallableValue(call)),
 		ir.NewDecl(pos, ir.ODCL, request), ir.NewAssignStmt(pos, request, typedNew(pos, requestType)),
 	}
 	fields := requestType.Fields()
@@ -60,7 +60,7 @@ func rewriteOpenDeferCall(deferred *lowerDefer, token *ir.Name) error {
 		for i := range args {
 			args[i] = explicitFrameField(pos, frozenRequest, fields[i])
 		}
-		invoke := typecheck.Call(pos, frozenFun, args, call.IsDDD)
+		invoke := openCallableInvoke(call, frozenFun, args)
 		var incoming ir.Nodes
 		for _, param := range thunk.Type().Params() {
 			incoming = append(incoming, param.Nname.(*ir.Name))
@@ -71,9 +71,15 @@ func rewriteOpenDeferCall(deferred *lowerDefer, token *ir.Name) error {
 			typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInject"), incoming, false)}
 		typecheck.Stmts(thunk.Body)
 	})
-	boxed := typecheck.Conv(typecheck.Conv(fun, signature), types.Types[types.TINTER])
-	body = append(body, typecheck.Call(pos, typecheck.LookupRuntime("coroDeferStartFunction"),
-		ir.Nodes{owner, boxed, typecheck.ConvNop(request, types.Types[types.TUNSAFEPTR]), thunk.OClosure}, false))
+	if call.Op() == ir.OCALLINTER {
+		args := append(ir.Nodes{owner}, openInterfaceArguments(call, fun)...)
+		args = append(args, typecheck.ConvNop(request, types.Types[types.TUNSAFEPTR]), thunk.OClosure)
+		body = append(body, typecheck.Call(pos, typecheck.LookupRuntime("coroDeferStartInterface"), args, false))
+	} else {
+		boxed := typecheck.Conv(typecheck.Conv(fun, signature), types.Types[types.TINTER])
+		body = append(body, typecheck.Call(pos, typecheck.LookupRuntime("coroDeferStartFunction"),
+			ir.Nodes{owner, boxed, typecheck.ConvNop(request, types.Types[types.TUNSAFEPTR]), thunk.OClosure}, false))
+	}
 	wrapper.Body = body
 	ir.WithFunc(wrapper, func() { typecheck.Stmts(wrapper.Body) })
 	return nil

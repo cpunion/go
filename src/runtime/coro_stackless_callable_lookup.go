@@ -15,9 +15,43 @@ import (
 // match the companion's canonical callable signature. Nil function values
 // remain an ordinary fallback; lookup itself must not trigger their panic.
 func coroLookupFunction(value any) (unsafe.Pointer, unsafe.Pointer) {
+	entry, environment := lookupStacklessCoroFunction(value, false)
+	return unsafe.Pointer(entry), environment
+}
+
+func lookupStacklessCoroFunction(value any, deferred bool) (*stacklessCoroCallable, unsafe.Pointer) {
 	words := efaceOf(&value)
 	if words._type == nil || words._type.Kind() != abi.Func || words.data == nil {
 		return nil, nil
 	}
-	return coroLookupCallable((*funcval)(words.data).fn, unsafe.Pointer(words._type)), words.data
+	entry := loadStacklessCoroCallable((*funcval)(words.data).fn)
+	if entry == nil || entry.signature != words._type {
+		return nil, nil
+	}
+	if entry.boundMethod != 0 {
+		// Only an explicitly recorded interface method-value wrapper has this
+		// marker. Its environment is the unchanged {code, interface} Go layout.
+		receiver := (*iface)(add(words.data, unsafe.Sizeof(uintptr(0))))
+		entry = lookupStacklessCoroInterface(unsafe.Pointer(receiver.tab), entry.boundMethod-1, value, deferred)
+		return entry, receiver.data
+	}
+	return checkStacklessCoroCallable(entry, unsafe.Pointer(words._type), deferred), words.data
+}
+
+func coroLookupInterface(table, environment unsafe.Pointer, method uintptr, signature any) (unsafe.Pointer, unsafe.Pointer) {
+	return unsafe.Pointer(lookupStacklessCoroInterface(table, method, signature, false)), environment
+}
+
+func lookupStacklessCoroInterface(table unsafe.Pointer, method uintptr, signature any, deferred bool) *stacklessCoroCallable {
+	tab := (*itab)(table)
+	typ := efaceOf(&signature)._type
+	if tab == nil || tab.Inter == nil || method >= uintptr(len(tab.Inter.Methods)) || typ == nil || typ.Kind() != abi.Func {
+		return nil
+	}
+	code := *(*uintptr)(add(unsafe.Pointer(&tab.Fun[0]), method*unsafe.Sizeof(uintptr(0))))
+	entry := loadStacklessCoroCallable(code)
+	if entry == nil {
+		return nil
+	}
+	return checkStacklessCoroCallable(entry.method, unsafe.Pointer(typ), deferred)
 }

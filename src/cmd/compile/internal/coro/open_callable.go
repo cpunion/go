@@ -29,11 +29,11 @@ func lowerOpenSpawn(call *ir.CallExpr, ctx ir.Node, resume *ir.Func,
 
 func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 	resume *ir.Func, edit func(ir.Node) ir.Node, spawn bool) (ir.Nodes, ir.Node, error) {
-	if call.Op() != ir.OCALLFUNC || call.Fun.Type().Kind() != types.TFUNC {
+	if !openCallableCall(call) {
 		return nil, nil, fmt.Errorf("open function await has no function value")
 	}
 	pos := call.Pos()
-	signature := callableTypeSignature(call.Fun.Type())
+	signature := openCallableSignature(call)
 	requestType := callableRequestType(signature)
 	// Discarded go results belong to the child, never the parent's locals.
 	targets := make(ir.Nodes, signature.NumResults())
@@ -53,7 +53,7 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 		setup = append(setup, ir.NewDecl(pos, ir.ODCL, temp), ir.NewAssignStmt(pos, temp, value))
 		return temp
 	}
-	fun := freeze(edit(call.Fun))
+	fun := freeze(edit(openCallableValue(call)))
 	args := make(ir.Nodes, len(call.Args))
 	for i, arg := range call.Args {
 		args[i] = freeze(edit(arg))
@@ -75,8 +75,13 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 	ptr := types.Types[types.TUNSAFEPTR]
 	descriptor := typecheck.TempAt(pos, resume, ptr)
 	environment := typecheck.TempAt(pos, resume, ptr)
-	lookup := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupFunction"),
-		ir.Nodes{typecheck.Conv(typecheck.Conv(fun, signature), types.Types[types.TINTER])}, false)
+	var lookup ir.Node
+	if call.Op() == ir.OCALLINTER {
+		lookup = typecheck.Call(pos, typecheck.LookupRuntime("coroLookupInterface"), openInterfaceArguments(call, fun), false)
+	} else {
+		lookup = typecheck.Call(pos, typecheck.LookupRuntime("coroLookupFunction"),
+			ir.Nodes{typecheck.Conv(typecheck.Conv(fun, signature), types.Types[types.TINTER])}, false)
+	}
 	setup = append(setup,
 		ir.NewDecl(pos, ir.ODCL, descriptor),
 		ir.NewDecl(pos, ir.ODCL, environment),
@@ -125,7 +130,7 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 		for i := range arguments {
 			arguments[i] = explicitFrameField(pos, frozenRequest, fields[i])
 		}
-		invoke := typecheck.Call(pos, frozenFun, arguments, call.IsDDD)
+		invoke := openCallableInvoke(call, frozenFun, arguments)
 		if len(targets) == 0 {
 			thunk.Body = ir.Nodes{invoke}
 		} else {
@@ -148,7 +153,7 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 	}
 	var dispatch ir.Node = ir.NewIfStmt(pos,
 		ir.NewBinaryExpr(pos, ir.ONE, descriptor, ir.NewNilExpr(pos, ptr)), native, fallback)
-	if spawn {
+	if spawn && call.Op() != ir.OCALLINTER {
 		// Execute the frontend's original nil-go startup on the ordinary
 		// host. The registering task must return the host action before this
 		// thunk can run; Wait does not release an ordinary-host handoff.
@@ -174,4 +179,50 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 
 	setup = append(setup, dispatch)
 	return setup, action, nil
+}
+
+func openCallableCall(call *ir.CallExpr) bool {
+	if call == nil || call.Fun == nil || call.Fun.Type() == nil || call.Fun.Type().Kind() != types.TFUNC {
+		return false
+	}
+	if call.Op() == ir.OCALLFUNC {
+		return true
+	}
+	if call.Op() == ir.OCALLINTER {
+		dot, ok := call.Fun.(*ir.SelectorExpr)
+		return ok && dot.Op() == ir.ODOTINTER && dot.X != nil && dot.X.Type() != nil && dot.X.Type().IsInterface()
+	}
+	return false
+}
+
+func openCallableSignature(call *ir.CallExpr) *types.Type {
+	if call.Op() == ir.OCALLINTER {
+		return callableMethodSignature(call.Fun.Type())
+	}
+	return callableTypeSignature(call.Fun.Type())
+}
+func openCallableValue(call *ir.CallExpr) ir.Node {
+	if call.Op() == ir.OCALLINTER {
+		return call.Fun.(*ir.SelectorExpr).X
+	}
+	return call.Fun
+}
+func openCallableInvoke(call *ir.CallExpr, value ir.Node, args ir.Nodes) ir.Node {
+	if call.Op() == ir.OCALLINTER {
+		dot := ir.Copy(call.Fun).(*ir.SelectorExpr)
+		dot.X = value
+		return typecheck.Call(call.Pos(), dot, args, call.IsDDD)
+	}
+	return typecheck.Call(call.Pos(), value, args, call.IsDDD)
+}
+func openInterfaceArguments(call *ir.CallExpr, value ir.Node) ir.Nodes {
+	pos := call.Pos()
+	ptr := types.Types[types.TUNSAFEPTR]
+	dot := call.Fun.(*ir.SelectorExpr)
+	types.CalcSize(dot.X.Type())
+	tab := typecheck.Expr(ir.NewUnaryExpr(pos, ir.OITAB, value))
+	data := typecheck.Expr(ir.NewUnaryExpr(pos, ir.OIDATA, value))
+	signature := typecheck.Conv(ir.NewNilExpr(pos, openCallableSignature(call)), types.Types[types.TINTER])
+	return ir.Nodes{typecheck.ConvNop(tab, ptr), typecheck.ConvNop(data, ptr),
+		typedInt(pos, types.Types[types.TUINTPTR], dot.Offset()/int64(types.PtrSize)), signature}
 }

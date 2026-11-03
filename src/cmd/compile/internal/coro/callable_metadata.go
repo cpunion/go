@@ -40,6 +40,10 @@ func callableTypeSignature(signature *types.Type) *types.Type {
 	return types.NewSignature(nil, copyFields(signature.RecvParams()), copyFields(signature.Results()))
 }
 
+func callableMethodSignature(signature *types.Type) *types.Type {
+	return callableTypeSignature(types.NewSignature(nil, signature.Params(), signature.Results()))
+}
+
 func callableRequestType(signature *types.Type) *types.Type {
 	var fields []*types.Field
 	for i, field := range signature.Params() {
@@ -64,6 +68,9 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 	for source := range candidates {
 		sources = append(sources, source)
 	}
+	for source := range boundInterfaceMethods {
+		sources = append(sources, source)
+	}
 	for source := range boundMethodValues {
 		if candidates[source] == nil && plainFactories[source] == nil {
 			sources = append(sources, source)
@@ -78,6 +85,13 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, source := range sources {
+		if dot := boundInterfaceMethods[source]; dot != nil {
+			types.CalcSize(dot.X.Type())
+			descriptor := emitCallableRecord(source, callableSignature(source), nil, nil, nil,
+				uint64(dot.Offset()/int64(types.PtrSize)+1), ".coro.callable")
+			emitCallableProvider(source, descriptor)
+			continue
+		}
 		if source.Type().HasShape() || !callableFactorySupported(source) && boundMethodValues[source] == nil {
 			continue
 		}
@@ -103,9 +117,12 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 	}
 }
 
-func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix string) *ir.Func {
+func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix string, method bool) *ir.Func {
 	pos := source.Pos()
 	signature := callableSignature(source)
+	if method {
+		signature = callableMethodSignature(source.Type())
+	}
 	requestType := callableRequestType(signature)
 	ptr := types.Types[types.TUNSAFEPTR]
 	params := []*types.Field{
@@ -130,7 +147,16 @@ func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix s
 		if factoryABI == FactoryABI3 {
 			args = append(args, ctx)
 		}
-		if bound := boundMethodValues[source]; bound != nil {
+		if method {
+			receiver := source.Type().Recv().Type
+			if types.IsDirectIface(receiver) {
+				// A direct interface receiver occupies the data word itself.
+				cell := typecheck.ConvNop(typecheck.NodAddr(environment), types.Types[types.TUNSAFEPTR])
+				args = append(args, typedDeref(pos, typecheck.ConvNop(cell, types.NewPtr(receiver)), receiver))
+			} else {
+				args = append(args, typedDeref(pos, typecheck.ConvNop(environment, types.NewPtr(receiver)), receiver))
+			}
+		} else if bound := boundMethodValues[source]; bound != nil {
 			args = append(args, boundMethodReceiver(pos, bound, environment))
 		}
 		captures := captureTypes(source)
@@ -172,21 +198,32 @@ func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix s
 }
 
 func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCapable bool) {
-	pos := source.Pos()
-	ptr := types.Types[types.TUNSAFEPTR]
-	signature := callableSignature(source)
-	companion := callableCompanion(source, factory, factoryABI, ".coro.call")
-	gate := nativeSourceGates[companion]
+	companion := callableCompanion(source, factory, factoryABI, ".coro.call", false)
 	var deferred *ir.Func
 	if deferCapable {
-		// A real native activation grants direct recover only through the
-		// runtime's structured defer-child identity. Plain normal-call
-		// adapters deliberately suppress that right and are never reused.
-		deferred = callableCompanion(source, factory, factoryABI, ".coro.defer")
+		deferred = callableCompanion(source, factory, factoryABI, ".coro.defer", false)
 	}
+	var method *ir.Name
+	if source.Type().Recv() != nil {
+		call := callableCompanion(source, factory, factoryABI, ".coro.iface.call", true)
+		var cleanup *ir.Func
+		if deferCapable {
+			cleanup = callableCompanion(source, factory, factoryABI, ".coro.iface.defer", true)
+		}
+		method = emitCallableRecord(source, callableMethodSignature(source.Type()), call, cleanup, nil, 0, ".coro.interface")
+	}
+	descriptor := emitCallableRecord(source, callableSignature(source), companion, deferred, method, 0, ".coro.callable")
+	emitCallableProvider(source, descriptor)
+}
 
-	// These six words match runtime.stacklessCoroCallable. All pointers refer
-	// to immutable module data or code; this descriptor owns no heap objects.
+// Each entry retains its own signature, receiver convention, and stack gates.
+// An interface method's request omits the receiver; its data word is passed as
+// environment. A bound interface marker is resolved against its captured itab
+// before native capability is granted, without invoking its ordinary wrapper.
+func emitCallableRecord(source *ir.Func, signature *types.Type, companion, deferred *ir.Func,
+	method *ir.Name, boundMethod uint64, suffix string) *ir.Name {
+	pos := source.Pos()
+	ptr := types.Types[types.TUNSAFEPTR]
 	fields := []*types.Field{
 		types.NewField(pos, types.LocalPkg.Lookup("version"), types.Types[types.TUINTPTR]),
 		types.NewField(pos, types.LocalPkg.Lookup("signature"), ptr),
@@ -194,10 +231,12 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCa
 		types.NewField(pos, types.LocalPkg.Lookup("factory"), types.Types[types.TUINTPTR]),
 		types.NewField(pos, types.LocalPkg.Lookup("deferGate"), ptr),
 		types.NewField(pos, types.LocalPkg.Lookup("deferFactory"), types.Types[types.TUINTPTR]),
+		types.NewField(pos, types.LocalPkg.Lookup("method"), ptr),
+		types.NewField(pos, types.LocalPkg.Lookup("boundMethod"), types.Types[types.TUINTPTR]),
 	}
 	descType := types.NewStruct(fields)
 	types.CalcSize(descType)
-	sym := source.Sym().Pkg.Lookup(source.Sym().Name + ".coro.callable")
+	sym := source.Sym().Pkg.Lookup(source.Sym().Name + suffix)
 	descriptor := ir.NewNameAt(pos, sym, descType)
 	descriptor.Class = ir.PEXTERN
 	sym.Def = descriptor
@@ -206,25 +245,33 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCa
 		off := objw.Uintptr(data, 0, uint64(abi.CoroCallableVersion))
 		reflectdata.NeedRuntimeType(signature)
 		off = objw.SymPtr(data, off, reflectdata.TypeLinksym(signature), 0)
-		off = objw.SymPtr(data, off, gate.Linksym(), 0)
-		off = objw.SymPtr(data, off, companion.Linksym(), 0)
-		if deferred != nil {
-			off = objw.SymPtr(data, off, nativeSourceGates[deferred].Linksym(), 0)
-			off = objw.SymPtr(data, off, deferred.Linksym(), 0)
+		for _, entry := range []*ir.Func{companion, deferred} {
+			if entry != nil {
+				off = objw.SymPtr(data, off, nativeSourceGates[entry].Linksym(), 0)
+				off = objw.SymPtr(data, off, entry.Linksym(), 0)
+			} else {
+				off = objw.Uintptr(data, off, 0)
+				off = objw.Uintptr(data, off, 0)
+			}
+		}
+		if method != nil {
+			off = objw.SymPtr(data, off, method.Linksym(), 0)
 		} else {
 			off = objw.Uintptr(data, off, 0)
-			off = objw.Uintptr(data, off, 0)
 		}
+		off = objw.Uintptr(data, off, boundMethod)
 		flags := int16(obj.RODATA)
 		if source.Dupok() {
 			flags |= obj.DUPOK
 		}
 		objw.Global(data, int32(off), flags)
 	}
+	return descriptor
+}
 
-	// Funcdata accepts section-relative offsets rather than absolute pointers.
-	// A tiny static provider keeps the descriptor in ordinary rodata (including
-	// PIE relocation handling) without a process-wide initialization registry.
+func emitCallableProvider(source *ir.Func, descriptor *ir.Name) {
+	pos := source.Pos()
+	ptr := types.Types[types.TUNSAFEPTR]
 	provider := ir.NewFunc(pos, pos, source.Sym().Pkg.Lookup(source.Sym().Name+".coro.callableProvider"),
 		types.NewSignature(nil, nil, []*types.Field{types.NewField(pos, nil, ptr)}))
 	provider.SetDupok(source.Dupok())

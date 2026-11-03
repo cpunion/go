@@ -6,7 +6,6 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/types"
 	"fmt"
 	"slices"
 )
@@ -26,8 +25,8 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 			// The target's independently admitted factory handles an open
 			// function call through its managed native/ordinary boundary.
 			// The caller still depends on that factory surviving admission.
-			if edge.Kind == DirectCall && edge.ValueCall && !edge.FactoryRequired &&
-				edge.Node.Op() == ir.OCALLFUNC && edge.Node.Fun.Type().Kind() == types.TFUNC {
+			if edge.Kind == DirectCall && !edge.FactoryRequired &&
+				(edge.ValueCall || edge.Node.Op() == ir.OCALLINTER) && openCallableCall(edge.Node) {
 				continue
 			}
 			return false
@@ -44,7 +43,7 @@ func hasSuspendingDeferSite(plan *Plan, function *Function) bool {
 		if edge.Kind == DeferCall && !edge.FactoryRequired &&
 			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
 			call := unwrapGoCall(edge.Node)
-			if call.Op() == ir.OCALLFUNC && call.Fun != nil && call.Fun.Type().Kind() == types.TFUNC {
+			if openCallableCall(call) {
 				return true
 			}
 		}
@@ -117,7 +116,7 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 		if ok && edge.Kind == DeferCall && !edge.FactoryRequired &&
 			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
 			call := unwrapGoCall(deferred.call)
-			if call.Op() != ir.OCALLFUNC || call.Fun == nil || call.Fun.Type().Kind() != types.TFUNC {
+			if !openCallableCall(call) {
 				return fmt.Errorf("open defer has no frozen function value")
 			}
 			deferred.open = true

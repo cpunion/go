@@ -221,6 +221,7 @@ func coroCallRead(unsafe.Pointer, func())
 func coroGC(unsafe.Pointer)
 func coroLookupCallable(uintptr, unsafe.Pointer) unsafe.Pointer
 func coroLookupFunction(interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroLookupInterface(unsafe.Pointer, unsafe.Pointer, uintptr, interface{}) (unsafe.Pointer, unsafe.Pointer)
 func coroHostCall(unsafe.Pointer, func()) uint8
 func coroCallableFactory(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroEnterForeign()
@@ -366,6 +367,7 @@ func coroDeferStartFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) ui
 func coroDeferSuspended(unsafe.Pointer) bool
 func coroDeferAction(unsafe.Pointer) uint8
 func coroDeferStartFunction(unsafe.Pointer, interface{}, unsafe.Pointer, func(interface{}, bool, bool))
+func coroDeferStartInterface(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, uintptr, interface{}, unsafe.Pointer, func(interface{}, bool, bool))
 func coroDeferInject(interface{}, bool, bool)
 func coroDeferRecoverAwait(unsafe.Pointer) interface{}
 func coroDeferRecoverDirect(unsafe.Pointer) interface{}

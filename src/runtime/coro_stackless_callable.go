@@ -21,6 +21,8 @@ type stacklessCoroCallable struct {
 	factoryCode uintptr
 	deferGate   *[2]uintptr
 	deferCode   uintptr
+	method      *stacklessCoroCallable
+	boundMethod uintptr
 }
 
 type stacklessCoroCallableInfo struct {
@@ -36,7 +38,11 @@ func coroLookupCallable(code uintptr, signature unsafe.Pointer) unsafe.Pointer {
 }
 
 func lookupStacklessCoroCallable(code uintptr, signature unsafe.Pointer, deferred bool) unsafe.Pointer {
-	if code == 0 || signature == nil {
+	return unsafe.Pointer(checkStacklessCoroCallable(loadStacklessCoroCallable(code), signature, deferred))
+}
+
+func loadStacklessCoroCallable(code uintptr) *stacklessCoroCallable {
+	if code == 0 {
 		return nil
 	}
 	fn := findfunc(code)
@@ -55,7 +61,14 @@ func lookupStacklessCoroCallable(code uintptr, signature unsafe.Pointer, deferre
 	providerData := noescape(unsafe.Pointer(&provider))
 	load := *(*func() unsafe.Pointer)(unsafe.Pointer(&providerData))
 	entry := (*stacklessCoroCallable)(load())
-	if entry == nil || entry.version != abi.CoroCallableVersion || entry.signature != (*_type)(signature) {
+	if entry == nil || entry.version != abi.CoroCallableVersion {
+		return nil
+	}
+	return entry
+}
+
+func checkStacklessCoroCallable(entry *stacklessCoroCallable, signature unsafe.Pointer, deferred bool) *stacklessCoroCallable {
+	if entry == nil || entry.version != abi.CoroCallableVersion || signature == nil || entry.signature != (*_type)(signature) {
 		return nil
 	}
 	gate, factory := entry.gate, entry.factoryCode
@@ -65,7 +78,7 @@ func lookupStacklessCoroCallable(code uintptr, signature unsafe.Pointer, deferre
 	if gate == nil || gate[0] != 0 || factory == 0 {
 		return nil
 	}
-	return unsafe.Pointer(entry)
+	return entry
 }
 
 // A frozen starter is invoked once after its registration has been popped.
@@ -74,17 +87,25 @@ func lookupStacklessCoroCallable(code uintptr, signature unsafe.Pointer, deferre
 func coroDeferStartFunction(token unsafe.Pointer, value any, request unsafe.Pointer, ordinary func(any, bool, bool)) {
 	task := activeStacklessCoroDeferTask(token, "runtime: invalid stackless coroutine function defer")
 	ctx := unsafe.Pointer(&task.context)
-	words := efaceOf(&value)
-	if words._type != nil && words._type.Kind() == abi.Func && words.data != nil {
-		entry := (*stacklessCoroCallable)(lookupStacklessCoroCallable((*funcval)(words.data).fn, unsafe.Pointer(words._type), true))
-		if entry != nil {
-			data := unsafe.Pointer(&entry.deferCode)
-			invoke := *(*func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, stacklessCoroResume))(unsafe.Pointer(&data))
-			frame, resume := invoke(ctx, words.data, request)
-			coroDeferAwaitFrame(ctx, frame, resume)
-			return
-		}
+	entry, environment := lookupStacklessCoroFunction(value, true)
+	startStacklessCoroCallableDefer(ctx, entry, environment, request, ordinary)
+}
+
+func coroDeferStartInterface(token, table, environment unsafe.Pointer, method uintptr, signature any, request unsafe.Pointer, ordinary func(any, bool, bool)) {
+	task := activeStacklessCoroDeferTask(token, "runtime: invalid stackless coroutine interface defer")
+	entry := lookupStacklessCoroInterface(table, method, signature, true)
+	startStacklessCoroCallableDefer(unsafe.Pointer(&task.context), entry, environment, request, ordinary)
+}
+
+func startStacklessCoroCallableDefer(ctx unsafe.Pointer, entry *stacklessCoroCallable, environment, request unsafe.Pointer, ordinary func(any, bool, bool)) {
+	if entry != nil {
+		data := unsafe.Pointer(&entry.deferCode)
+		invoke := *(*func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, stacklessCoroResume))(unsafe.Pointer(&data))
+		frame, resume := invoke(ctx, environment, request)
+		coroDeferAwaitFrame(ctx, frame, resume)
+		return
 	}
+
 	coroHostDefer(ctx, ordinary)
 }
 

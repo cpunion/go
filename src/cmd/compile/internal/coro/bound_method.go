@@ -20,12 +20,20 @@ type boundMethodValue struct {
 // The frontend records the actual wrapper relationship before inlining can
 // erase it. Names and wrapper flags alone never establish this capability.
 var boundMethodValues = make(map[*ir.Func]*boundMethodValue)
+var boundInterfaceMethods = make(map[*ir.Func]*ir.SelectorExpr)
 
 func RecordBoundMethodValue(wrapper *ir.Func, receiver ir.Node, call *ir.CallExpr) {
 	name, ok := receiver.(*ir.Name)
 	if !ok || wrapper.OClosure != nil || len(wrapper.ClosureVars) != 1 ||
 		wrapper.ClosureVars[0] != name || !name.Byval() || wrapper.Type().HasShape() ||
-		call.Op() != ir.OCALLFUNC || len(call.Init()) != 0 {
+		(call.Op() != ir.OCALLFUNC && call.Op() != ir.OCALLINTER) || len(call.Init()) != 0 {
+		return
+	}
+	if call.Op() == ir.OCALLINTER {
+		dot := call.Fun.(*ir.SelectorExpr)
+		if dot.X == name {
+			boundInterfaceMethods[wrapper] = dot
+		}
 		return
 	}
 	target := ir.StaticCalleeName(call.Fun)

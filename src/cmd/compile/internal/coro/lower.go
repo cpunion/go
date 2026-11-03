@@ -1213,7 +1213,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				candidate.openCalls[call] = true
 			}
 			if edge.Callee == nil && len(edge.Targets) == 0 {
-				if call.Op() != ir.OCALLFUNC || call.Fun.Type().Kind() != types.TFUNC ||
+				if !openCallableCall(call) || call.Op() == ir.OCALLFUNC &&
 					ir.StaticCalleeName(ir.StaticValue(call.Fun)) != nil {
 					return nil, fmt.Errorf("dynamic await site %d", site.ID)
 				}
@@ -1280,7 +1280,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
 				}
 				target := unwrapGoCall(call)
-				if target.Op() != ir.OCALLFUNC || target.Fun.Type().Kind() != types.TFUNC {
+				if !openCallableCall(target) {
 					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
 				}
 				candidate.openCalls[call] = true
