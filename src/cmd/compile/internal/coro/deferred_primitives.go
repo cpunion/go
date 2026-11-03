@@ -53,6 +53,12 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 			!smallParameterBody(helper) {
 			return nil
 		}
+		// Static calls carry the receiver as their first argument. A private
+		// helper is a function rather than a method expression, so make that
+		// input an explicit parameter for type checking and argument walking.
+		if helper.Type().Recv() != nil {
+			helper.Nname.SetType(types.NewSignature(nil, helper.Type().RecvParams(), helper.Type().Results()))
+		}
 		imported[target] = helper
 		bodies[helper] = func() *ir.Func {
 			return reader.Clone(target, types.LocalPkg.Lookup(sym.Name+".go"))
@@ -92,7 +98,28 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 			}
 			if closure, ok := call.Fun.(*ir.ClosureExpr); ok {
 				wrapper := closure.Func
-				if !wrapper.Wrapper() || len(wrapper.Body) != 1 {
+				if !wrapper.Wrapper() {
+					return
+				}
+				if deferredSyncMethod(wrapper.WrappedFunc) {
+					syncOwners[owner] = true
+					// Inlining can replace the wrapper's original method call
+					// with several statements. Its sole frozen receiver still
+					// proves the complete invocation; do not evaluate it again.
+					recv := wrapper.WrappedFunc.Type().Recv().Type
+					if len(wrapper.ClosureVars) == 1 && types.Identical(wrapper.ClosureVars[0].Type(), recv) {
+						if helper := localize(wrapper.WrappedFunc); helper != nil {
+							ir.WithFunc(wrapper, func() {
+								wrapper.Body = ir.Nodes{typecheck.Call(call.Pos(), helper.Nname, ir.Nodes{wrapper.ClosureVars[0]}, false)}
+								typecheck.Stmts(wrapper.Body)
+							})
+							wrapper.WrappedFunc = helper
+							rewritten[owner] = true
+							return
+						}
+					}
+				}
+				if len(wrapper.Body) != 1 {
 					return
 				}
 				if wrapper.WrappedFunc == nil {
