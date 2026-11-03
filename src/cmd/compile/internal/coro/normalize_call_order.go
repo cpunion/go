@@ -25,18 +25,39 @@ func orderedCallValue(node ir.Node, fn *ir.Func, prefix *ir.Nodes) ir.Node {
 		})
 	}
 	switch node.Op() {
+	case ir.OINDEXMAP:
+		index := node.(*ir.IndexExpr)
+		key := index.Index
+		kt := typecheck.MapKeyRuntimeType(index.X.Type())
+		copyKey := !ir.IsAddressable(key)
+		if kt != nil {
+			nt := key.Type()
+			// A fast scalar key is converted at its eventual use. A fast
+			// aggregate instead needs an early memory temporary for the
+			// runtime's scalar load, even if the aggregate is addressable.
+			copyKey = nt.Kind() != kt.Kind() &&
+				!(nt.IsPtrShaped() && kt.IsPtrShaped()) &&
+				!(nt.IsInteger() && kt.IsInteger())
+		}
+		if copyKey {
+			index.Index = orderedCallTemp(key, fn, prefix)
+		}
 	case ir.OCALLFUNC, ir.OCALLINTER, ir.ORECV, ir.OANDAND, ir.OOROR, ir.OINLCALL:
 		if node.Type() == nil || node.Type().IsFuncArgStruct() {
 			return node
 		}
-		value := typecheck.TempAt(node.Pos(), fn, node.Type())
-		assign := ir.NewAssignStmt(node.Pos(), value, node)
-		assign.SetInit(ir.Nodes{ir.NewDecl(node.Pos(), ir.ODCL, value)})
-		value.Defn = assign
-		*prefix = append(*prefix, typecheck.Stmt(assign))
-		return value
+		return orderedCallTemp(node, fn, prefix)
 	}
 	return node
+}
+
+func orderedCallTemp(node ir.Node, fn *ir.Func, prefix *ir.Nodes) ir.Node {
+	value := typecheck.TempAt(node.Pos(), fn, node.Type())
+	assign := ir.NewAssignStmt(node.Pos(), value, node)
+	assign.SetInit(ir.Nodes{ir.NewDecl(node.Pos(), ir.ODCL, value)})
+	value.Defn = assign
+	*prefix = append(*prefix, typecheck.Stmt(assign))
+	return value
 }
 
 // Keep the complete ordered operand prefix on its call. Existing suspension

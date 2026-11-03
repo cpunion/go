@@ -6,7 +6,6 @@ package walk
 
 import (
 	"fmt"
-	"internal/abi"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
@@ -193,60 +192,25 @@ var mapassign = mkmapnames("mapassign", "ptr")
 var mapdelete = mkmapnames("mapdelete", "")
 
 func mapfast(t *types.Type) int {
-	if t.Elem().Size() > abi.MapMaxElemBytes {
+	kt := typecheck.MapKeyRuntimeType(t)
+	if kt == nil {
 		return mapslow
 	}
-	switch algType(t.Key()) {
-	case types.AMEM32:
-		if !t.Key().HasPointers() {
-			return mapfast32
-		}
+	switch kt.Kind() {
+	case types.TUINT32:
+		return mapfast32
+	case types.TUINT64:
+		return mapfast64
+	case types.TUNSAFEPTR:
 		if types.PtrSize == 4 {
 			return mapfast32ptr
 		}
-		base.Fatalf("small pointer %v", t.Key())
-	case types.AMEM64:
-		if !t.Key().HasPointers() {
-			return mapfast64
-		}
-		if types.PtrSize == 8 {
-			return mapfast64ptr
-		}
-		// Two-word object, at least one of which is a pointer.
-		// Use the slow path.
-	case types.ASTRING:
+		return mapfast64ptr
+	case types.TSTRING:
 		return mapfaststr
 	}
+	base.Fatalf("unexpected map runtime key %v", kt)
 	return mapslow
-}
-
-// algType returns the fixed-width AMEMxx variants instead of the general
-// AMEM kind when possible.
-func algType(t *types.Type) types.AlgKind {
-	a := types.AlgType(t)
-	if a == types.AMEM {
-		if t.Alignment() < int64(base.Ctxt.Arch.Alignment) && t.Alignment() < t.Size() {
-			// For example, we can't treat [2]int16 as an int32 if int32s require
-			// 4-byte alignment. See issue 46283.
-			return a
-		}
-		switch t.Size() {
-		case 0:
-			return types.AMEM0
-		case 1:
-			return types.AMEM8
-		case 2:
-			return types.AMEM16
-		case 4:
-			return types.AMEM32
-		case 8:
-			return types.AMEM64
-		case 16:
-			return types.AMEM128
-		}
-	}
-
-	return a
 }
 
 func walkAppendArgs(n *ir.CallExpr, init *ir.Nodes) {

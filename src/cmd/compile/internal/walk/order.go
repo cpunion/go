@@ -297,20 +297,9 @@ func (o *orderState) mapKeyTemp(outerPos src.XPos, t *types.Type, n ir.Node) ir.
 	}
 	// Most map calls need to take the address of the key.
 	// Exception: map*_fast* calls. See golang.org/issue/19015.
-	alg := mapfast(t)
-	if alg == mapslow {
+	kt := typecheck.MapKeyRuntimeType(t)
+	if kt == nil {
 		return o.addrTemp(n)
-	}
-	var kt *types.Type
-	switch alg {
-	case mapfast32:
-		kt = types.Types[types.TUINT32]
-	case mapfast64:
-		kt = types.Types[types.TUINT64]
-	case mapfast32ptr, mapfast64ptr:
-		kt = types.Types[types.TUNSAFEPTR]
-	case mapfaststr:
-		kt = types.Types[types.TSTRING]
 	}
 	nt := n.Type()
 	switch {

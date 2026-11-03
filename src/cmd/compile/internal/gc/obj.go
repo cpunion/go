@@ -264,11 +264,14 @@ func bindCoroSourceEntries() {
 	defined := make(map[*obj.LSym]bool)
 	copies := make(map[*obj.LSym]*obj.LSym)
 	for _, s := range base.Ctxt.Text {
-		defined[s] = true
 		fn := s.Func()
-		if fn == nil {
+		// Text also contains fully inlined functions with no code or PC
+		// tables. Retaining one through an entry cell would make it reachable
+		// as a runtime function even though it has no valid PC anchor.
+		if fn == nil || s.Size == 0 || fn.Pcln.Pcsp == nil {
 			continue
 		}
+		defined[s] = true
 		if fn.CoroSourceEntry != nil && fn.CoroSourceInfo != nil &&
 			base.Ctxt.Arch.ByteOrder.Uint32(fn.CoroSourceInfo.P[4:])&abi.CoroSourceCopy != 0 {
 			source := fn.CoroSourceEntry.R[0].Sym
