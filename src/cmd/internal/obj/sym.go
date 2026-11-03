@@ -355,7 +355,7 @@ func (ctxt *Link) NumberSyms() {
 		pkg := rs.Pkg
 		if rs.ContentAddressable() {
 			// for now, only support content-addressable symbols that are always locally defined.
-			panic("hashed refs unsupported for now")
+			panic(fmt.Sprintf("hashed refs unsupported for now: %s", rs.Name))
 		}
 		if pkg == "" || pkg == "\"\"" || pkg == "_" || !rs.Indexed() {
 			rs.PkgIdx = goobj.PkgIdxNone

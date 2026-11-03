@@ -28,10 +28,8 @@ func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 			// permits section offsets, so reference a local ordinary RODATA
 			// cell whose code pointer also supports dynamic-import relocations.
 			entry := base.Ctxt.Lookup(fn.LSym.Name + ".coro.sourceentry")
-			if !entry.OnList() {
-				objw.SymPtr(entry, 0, frame.Source, 0)
-				objw.Global(entry, int32(base.Ctxt.Arch.PtrSize), obj.RODATA|obj.DUPOK)
-			}
+			objw.SymPtr(entry, 0, frame.Source, 0)
+			fn.LSym.Func().CoroSourceEntry = entry
 			objw.SymPtrOff(info, 8, entry)
 		} else {
 			objw.Uint32(info, 8, 0)
