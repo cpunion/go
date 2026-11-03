@@ -12,6 +12,8 @@ type stacklessCoroGState struct {
 	native            unsafe.Pointer
 	deferTask         *stacklessCoroTask
 	blockingScheduler *stacklessCoroScheduler
+	host              *stacklessCoroHost
+	ordinaryDepth     uint32
 }
 
 type stacklessCoroG struct {

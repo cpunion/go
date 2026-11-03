@@ -26,6 +26,7 @@ const (
 	stacklessCoroActionGoexit
 	stacklessCoroActionSwitch
 	stacklessCoroActionHandoff
+	stacklessCoroActionHost
 )
 
 const stacklessCoroWarmExecutorCount = 4
@@ -156,6 +157,8 @@ const (
 	stacklessCoroLifetimeRootComplete
 	stacklessCoroLifetimeSpawned
 	stacklessCoroLifetimeDrained
+	stacklessCoroLifetimeHostStarted
+	stacklessCoroLifetimePublicHost
 )
 
 type stacklessCoroTaskState uint8
@@ -308,6 +311,7 @@ type stacklessCoroScheduler struct {
 	liveSpawns     uint64
 	root           stacklessCoroTask
 	terminalValues map[*stacklessCoroTask]any
+	hosts          map[*stacklessCoroTask]*stacklessCoroHost
 	wake           chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
@@ -614,7 +618,8 @@ func init() {
 // a new logical root would lose the direct deferred function's recover rights.
 func coroUseOrdinary() bool {
 	gp := getg()
-	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil
+	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil ||
+		gp.stacklessCoro != nil && gp.stacklessCoro.ordinaryDepth != 0
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -627,13 +632,21 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	frameSize uintptr) bool {
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 	s = runStacklessCoroRoot(s)
+	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
+		if !s.drained() {
+			go s.runOwner()
+		}
+		s.waitPublicRoot()
+		s.finish()
+		return false
+	}
 	if s.spawned() && !s.drained() {
 		// The public driver's native activation has ended. Transfer its one
 		// executor slot to an independent owner before waiting for the root.
 		// Otherwise a spawned blocking C call could pin this ordinary caller
 		// even after a replacement executor completed the logical root.
 		go s.runOwner()
-		<-s.rootDone
+		s.waitPublicRoot()
 		s.finish()
 		// The owner, detached frames, or a late operation producer may still
 		// retain the scheduler and root frame. Neither may enter a root pool.
@@ -770,7 +783,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// removing its operation from the global registry. It may still read wake
 	// to signal an already completed task, so retain the immutable channel and
 	// leave both allocations to GC rather than inspecting or reusing them.
-	if s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 {
+	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted) != 0 {
 		return false
 	}
 	state := s.executorState.Load()
@@ -1653,7 +1666,7 @@ resumeActive:
 	// A waiting source retains its scheduler through this context. The
 	// source owns task until completion, then the ready queue owns it until
 	// its next resume. Non-wait actions keep the active-context cleanup.
-	if action != stacklessCoroActionWait {
+	if action != stacklessCoroActionWait && action != stacklessCoroActionHost {
 		task.context.scheduler = nil
 	}
 
@@ -1692,6 +1705,12 @@ resumeActive:
 				stacklessCoroGoschedIfRunnable()
 			}
 		}
+	case stacklessCoroActionHost:
+		s.hostHandoff(task)
+		if state := getg().stacklessCoro; state != nil && state.host != nil && state.host.scheduler == s {
+			return
+		}
+		idlePollSkip = nil
 	case stacklessCoroActionWait:
 		if s.waiting(task, native) {
 			idlePollSkip = nil
@@ -1751,7 +1770,7 @@ func (s *stacklessCoroScheduler) drained() bool {
 }
 
 func (s *stacklessCoroScheduler) publicDriverDone() bool {
-	return s.lifetime.Load()&(stacklessCoroLifetimeRootComplete|stacklessCoroLifetimeSpawned) != 0
+	return s.lifetime.Load()&(stacklessCoroLifetimeRootComplete|stacklessCoroLifetimeSpawned|stacklessCoroLifetimePublicHost) != 0
 }
 
 func (s *stacklessCoroScheduler) driverDone(public bool) bool {
@@ -1764,6 +1783,7 @@ func (s *stacklessCoroScheduler) driverDone(public bool) bool {
 // completeLogicalTaskLocked ends one root or independently spawned logical
 // goroutine. Structured await children keep their parent's count unchanged.
 func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTask) {
+	s.completeHostLocked(task)
 	if task == &s.root {
 		s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 	} else {
@@ -4328,6 +4348,13 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
+	if h := s.taskHostLocked(task); h != nil {
+		if raceenabled {
+			racereleasemerge(unsafe.Pointer(task))
+		}
+		h.readyLocked(task)
+		return 0
+	}
 	var runnable uint32
 	if stacklessCoroIsPullComparison(s) {
 		// A pull comparison root has one active structured leaf. An event
@@ -4355,27 +4382,49 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
-	pull := stacklessCoroIsPullComparison(s)
-	task := s.head
-	if task == nil || pull && task.state != stacklessCoroTaskRunnable {
-		unlock(&s.lock)
-		return nil
+	state := getg().stacklessCoro
+	var current *stacklessCoroHost
+	if state != nil && state.host != nil && state.host.scheduler == s {
+		current = state.host
 	}
-	if !pull {
-		s.head = task.next
-		if s.head == nil {
-			s.tail = nil
+	var task *stacklessCoroTask
+	for {
+		if current != nil {
+			task = current.takeLocked()
+		} else {
+			pull := stacklessCoroIsPullComparison(s)
+			task = s.head
+			if task == nil || pull && task.state != stacklessCoroTaskRunnable {
+				unlock(&s.lock)
+				return nil
+			}
+			if !pull {
+				s.head = task.next
+				if s.head == nil {
+					s.tail = nil
+				}
+				s.runnableState.Add(-1)
+			}
+			task.next = nil
+			if h := s.taskHostLocked(task); h != nil {
+				if pull {
+					s.head = nil
+				}
+				h.readyLocked(task)
+				continue
+			}
 		}
-		s.runnableState.Add(-1)
+		if task == nil {
+			unlock(&s.lock)
+			return nil
+		}
+		break
 	}
-	task.next = nil
-	if task.state != stacklessCoroTaskRunnable || task.resuming ||
-		task.readyPending {
+	if task.state != stacklessCoroTaskRunnable || task.resuming || task.readyPending {
 		unlock(&s.lock)
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
-	task.state = stacklessCoroTaskRunning
-	task.resuming = true
+	task.state, task.resuming = stacklessCoroTaskRunning, true
 	unlock(&s.lock)
 	if raceenabled {
 		raceacquire(unsafe.Pointer(task))
@@ -4438,7 +4487,7 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 	}
 	ready := task.readyPending
 	task.readyPending = false
-	if ready && native && !raceenabled &&
+	if ready && native && !raceenabled && s.taskHostCurrentLocked(task) &&
 		!stacklessCoroIsPullComparison(s) && !s.drained() &&
 		s.head == nil && s.tail == nil && s.runnableState.Load() == 0 {
 		// The producer completed while the initiating resume call was still
@@ -4552,6 +4601,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	// synchronization or comparison policy.
 	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
 		!parent.resuming && !parent.readyPending && parent.next == nil &&
+		s.taskHostCurrentLocked(parent) &&
 		s.head == nil && s.tail == nil {
 		parent.state = stacklessCoroTaskRunning
 		parent.resuming = true
@@ -4724,7 +4774,7 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		!s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}
-	s.rootDone = make(chan struct{})
+	s.rootDone = make(chan struct{}, 1)
 	if !raceenabled && !stacklessCoroIsPullComparison(s) && gomaxprocs == 1 {
 		s.executorState.Store(stacklessCoroExecutorStateSingleP)
 		return
