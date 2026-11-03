@@ -3687,6 +3687,14 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		s.liveSpawns <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
+	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
+		// A host does not consume the scheduler's ordinary task queue. Its
+		// owner may already be parked, including on a single P where spawn
+		// does not admit replacement executors. Notify that owner after
+		// publishing the independent child rather than relying on the host
+		// to select it when its current resume yields.
+		s.signal()
+	}
 	s.wakeReplacementExecutor()
 	return yield
 }

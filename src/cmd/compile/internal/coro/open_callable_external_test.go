@@ -23,6 +23,7 @@ type box struct{n int;pad[4096]byte}
 var calls int
 func named(n int)int{runtime.Gosched();runtime.GC();return n+3}
 func plain(n int)int{return n+5}
+func opaque(n int)int{var stack[1024]byte;if runtime.Stack(stack[:],false)==0{panic("opaque stack")};runtime.Gosched();return n+5}
 func captured(p *box)callback{return func(n int)int{runtime.Gosched();runtime.GC();return n+p.n+int(p.pad[4095])}}
 func(p *box)add(n int)int{runtime.Gosched();p.n+=n;return p.n}
 func tuple(p *box,n int)(int,*box){runtime.Gosched();runtime.GC();return p.n+n,p}
@@ -31,6 +32,8 @@ func store(p *box,n int){runtime.Gosched();runtime.GC();p.n=n}
 func pair(n int)(int,int){runtime.Gosched();return n+10,1}
 
 func owner(f callback,n int)int{calls++;value:=f(n);runtime.Gosched();calls++;return value+1}
+func sendAfterOpen(ch chan int,n int){runtime.Gosched();ch<-n}
+func spawnAfterOpen(f callback)int{value:=f(7);done:=make(chan int);go sendAfterOpen(done,value);runtime.Gosched();return <-done}
 func methodOwner(f func(*box,int)int,p *box,n int)int{value:=f(p,n);runtime.Gosched();return value}
 func tupleOwner(f func(*box,int)(int,*box),p *box,n int)(value int,out *box){value,out=f(p,n);runtime.Gosched();return}
 func variadicOwner(f func(int,...int)int)int{value:=f(2,3,5,7);runtime.Gosched();return value}
@@ -48,6 +51,7 @@ func effectAssignmentOwner(f func(int)(int,int),arg func()int)([2]int,int){value
 func boundsOwner(f func(int)(int,int))(caught any){defer func(){caught=recover()}();values:=[2]int{};index:=2;values[index],index=f(7);runtime.Gosched();return}
 func partialOwner(f func(int)(int,int))(caught any){one:=&box{};defer func(){caught=recover();if one.n!=17{panic("tuple stores did not proceed left to right")}}();var two *box;one.n,two.n=f(7);runtime.Gosched();return}
 var ownerEntry=owner
+var spawnAfterOpenEntry=spawnAfterOpen
 var methodEntry=methodOwner
 var tupleEntry=tupleOwner
 var variadicEntry=variadicOwner
@@ -68,6 +72,7 @@ func plainArgument()int{argumentCalls++;chosen=plain;return 7}
 func main(){
  if ownerEntry(named,7)!=11||calls!=2{panic("native open function result or source replay")}
  if ownerEntry(plain,7)!=13||calls!=4{panic("ordinary open function result or source replay")}
+ if spawnAfterOpenEntry(opaque)!=12{panic("ordinary host did not wake native spawn owner")}
  p:=&box{n:19};p.pad[4095]=11;f:=captured(p);p=nil
  if ownerEntry(f,7)!=38||calls!=6{panic("open captured environment")};f=nil
  p=&box{n:19};p.pad[4095]=23
@@ -126,7 +131,7 @@ func main(){
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, data)
 				}
-				for _, name := range []string{"owner", "methodOwner", "tupleOwner", "variadicOwner", "emptyOwner", "nilOwner", "snapshotOwner", "assignmentOwner", "plainArgumentOwner", "knownSnapshotOwner", "effectAssignmentOwner", "boundsOwner", "partialOwner", "named"} {
+				for _, name := range []string{"owner", "methodOwner", "tupleOwner", "variadicOwner", "emptyOwner", "nilOwner", "snapshotOwner", "assignmentOwner", "plainArgumentOwner", "knownSnapshotOwner", "effectAssignmentOwner", "boundsOwner", "partialOwner", "named", "spawnAfterOpen", "sendAfterOpen"} {
 					if !hasSwitchReturnFactory(data, name) {
 						t.Errorf("open source lost native factory %s", name)
 					}
