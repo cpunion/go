@@ -109,7 +109,7 @@ func main(){
  println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source, []switchFallback{{"indirect", "defer target has execution constraints task-context"}}, []string{"replacement", "nilPlain", "direct", "exit", "argumentPanic", "argumentExit", "repeated"})
+	testSwitchReturnProgram(t, source, nil, []string{"replacement", "nilPlain", "direct", "indirect", "exit", "argumentPanic", "argumentExit", "repeated"})
 }
 
 func TestClosedParameterDeferBoundaries(t *testing.T) {

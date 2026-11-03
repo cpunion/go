@@ -98,6 +98,41 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 	}
 }
 
+func TestNormalizeAssignmentPrefixBoundaries(t *testing.T) {
+	prepareLowerTest(t)
+	oldPkg, oldTarget := types.LocalPkg, typecheck.Target
+	defer func() { types.LocalPkg, typecheck.Target = oldPkg, oldTarget }()
+	pkg := types.NewPkg("example.com/coro/assignmentprefix", "p")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	caller := newLowerTestFunc(pkg, "caller")
+	result := []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}
+	target := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("target"), types.NewSignature(nil, nil, result))
+	prefix := newLowerTestFunc(pkg, "prefix")
+	pointer := caller.NewLocal(src.NoXPos, pkg.Lookup("p"), types.NewPtr(types.Types[types.TINT]))
+	left := ir.NewStarExpr(src.NoXPos, pointer)
+	left.SetType(types.Types[types.TINT])
+	left.SetTypecheck(1)
+	call := newLowerTestCall(target)
+	call.SetType(types.Types[types.TINT])
+	value := ir.NewBinaryExpr(src.NoXPos, ir.OADD, call, ir.NewInt(src.NoXPos, 1))
+	value.SetType(types.Types[types.TINT])
+	value.SetTypecheck(1)
+	assign := ir.NewAssignStmt(src.NoXPos, left, value)
+	assign.SetInit(ir.Nodes{newLowerTestCall(prefix)})
+	if safeCallPrefix(assign, call) {
+		t.Fatal("RHS await crossed the destination statement's initializer")
+	}
+	channel := caller.NewLocal(src.NoXPos, pkg.Lookup("ch"), types.NewChan(types.Types[types.TINT], types.Cboth))
+	recv := ir.NewUnaryExpr(src.NoXPos, ir.ORECV, channel)
+	recv.SetType(types.Types[types.TINT])
+	recv.SetTypecheck(1)
+	ok := caller.NewLocal(src.NoXPos, pkg.Lookup("ok"), types.Types[types.TBOOL])
+	pair := ir.NewAssignListStmt(src.NoXPos, ir.OAS2RECV, ir.Nodes{left, ok}, ir.Nodes{recv})
+	if safeCallPrefix(pair, recv) {
+		t.Fatal("two-result receive acquired a scalar hoisting contract")
+	}
+}
+
 func TestNormalizeForHeaderControlFlow(t *testing.T) {
 	prepareLowerTest(t)
 	oldTarget, oldPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc

@@ -28,9 +28,21 @@ func canPlanParameterDeferTarget(plan *Plan, fn *ir.Func) bool {
 			return false
 		}
 		summary, known := plan.edgeSummary(edge)
-		if !known || summary.Effect != NoSuspend || summary.Exec != 0 ||
-			edge.Kind == DirectCall && summary.Terminal&UsesRecover != 0 {
+		if !known || summary.Effect != NoSuspend || summary.Exec != 0 {
 			return false
+		}
+		if edge.Kind == DirectCall && summary.Terminal&UsesRecover != 0 {
+			// Only an ordinary, bounded leaf adapter is known to give a
+			// normal callback no direct-defer recover rights. Arbitrary
+			// recover dependencies retain the existing rejection.
+			if !edge.FactoryRequired || len(edge.Targets) == 0 {
+				return false
+			}
+			for _, target := range edge.Targets {
+				if !plainCallbackFactorySupported(plan.Functions[target]) {
+					return false
+				}
+			}
 		}
 		sealed = sealed || edge.FactoryRequired
 	}

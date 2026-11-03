@@ -326,6 +326,40 @@ func safeCallPrefix(root, target ir.Node) bool {
 	if root == target {
 		return true
 	}
+	// The ordinary ordering pass leaves simple destination loads and store
+	// checks until after RHS calls. Keep that behavior here: taking &p.x or
+	// snapshotting p would move a nil check or a variable read before target.
+	// Calls, indices and other complex destinations retain the conservative
+	// prefix check below until their ordered operands can be exposed too.
+	// Initializers and tuple/receive protocols retain their complete original
+	// ordering. In particular a two-result receive cannot become a scalar.
+	if len(root.Init()) == 0 {
+		switch assign := root.(type) {
+		case *ir.AssignStmt:
+			if assign.X.Op() != ir.ONAME && lateAssignmentTarget(assign.X) && containsCall(assign.Y, target) {
+				return safeCallPrefix(assign.Y, target)
+			}
+		case *ir.AssignListStmt:
+			if assign.Op() != ir.OAS2 {
+				break
+			}
+			late, complex := true, false
+			for _, lhs := range assign.Lhs {
+				late = late && lateAssignmentTarget(lhs)
+				complex = complex || lhs.Op() != ir.ONAME
+			}
+			if late && complex {
+				for _, rhs := range assign.Rhs {
+					if containsCall(rhs, target) {
+						return safeCallPrefix(rhs, target)
+					}
+					if staticinit.AnySideEffects(rhs) {
+						return false
+					}
+				}
+			}
+		}
+	}
 	if root.Op() == ir.OINLCALL {
 		// An inlined call body can contain branches and returns that are not
 		// represented by the expression child order.
@@ -353,6 +387,24 @@ func safeCallPrefix(root, target ir.Node) bool {
 		return true
 	})
 	return found && safe
+}
+
+// lateAssignmentTarget contains only variable, pointer and field loads. None
+// has a separately ordered call or receive; even an intermediate nil pointer
+// must be checked by the original assignment, after its RHS has run.
+func lateAssignmentTarget(node ir.Node) bool {
+	if node == nil || len(node.Init()) != 0 {
+		return false
+	}
+	switch node := node.(type) {
+	case *ir.Name:
+		return true
+	case *ir.StarExpr:
+		return lateAssignmentTarget(node.X)
+	case *ir.SelectorExpr:
+		return (node.Op() == ir.ODOT || node.Op() == ir.ODOTPTR) && lateAssignmentTarget(node.X)
+	}
+	return false
 }
 
 func containsCall(root, target ir.Node) bool {

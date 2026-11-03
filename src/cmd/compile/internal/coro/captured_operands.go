@@ -10,6 +10,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"fmt"
+	"strings"
 )
 
 // capturedOperandCall records the actual statement and compiler-created
@@ -90,6 +91,7 @@ func capturedOperandBody(body *ir.Func, sourceType *types.Type, captures []*type
 // including its results, direct recover, panic, Goexit and suspending work.
 // Normal effect, factory, defer and machine-budget admission still apply.
 func specializeCapturedOperands(funcs []*ir.Func, reader *BodyReader,
+	parameters map[*ir.Func]map[*ir.Name][]*ir.Func,
 	bodies map[*ir.Func]func() *ir.Func) (map[*ir.Func]bool, map[*ir.GoDeferStmt]*capturedOperandCall) {
 	rewritten := make(map[*ir.Func]bool)
 	sites := make(map[*ir.GoDeferStmt]*capturedOperandCall)
@@ -98,7 +100,11 @@ func specializeCapturedOperands(funcs []*ir.Func, reader *BodyReader,
 	}
 	var resolved map[*ir.Func]map[*ir.Name][]*ir.Func
 	var expressions map[ir.Node][]*ir.Func
-	helpers := make(map[*ir.Func]*ir.Func)
+	type key struct {
+		source *ir.Func
+		proof  string
+	}
+	helpers := make(map[key]*ir.Func)
 	generated := make(map[*ir.Func]bool)
 	count := 0
 	work := append([]*ir.Func(nil), funcs...)
@@ -121,7 +127,7 @@ func specializeCapturedOperands(funcs []*ir.Func, reader *BodyReader,
 				return
 			}
 			if resolved == nil {
-				resolved, expressions = packageFunctionExpressionTargets(typecheck.Target.Funcs, nil)
+				resolved, expressions = packageFunctionExpressionTargets(typecheck.Target.Funcs, parameters)
 			}
 			inner := unwrapGoCall(call)
 			var wrapper *ir.Func
@@ -149,22 +155,83 @@ func specializeCapturedOperands(funcs []*ir.Func, reader *BodyReader,
 				len(inner.Args) != source.Type().NumParams() || !smallParameterBody(source) {
 				return
 			}
-			helper, known := helpers[source]
+			// Seal the original callback operands, before adding the selected
+			// callee as a data parameter. Private helpers have no serialized
+			// body of their own for a later parameter-specialization pass.
+			// Distinct incoming target sets must get independent helpers.
+			sets := make(map[int][]*ir.Func)
+			var proof strings.Builder
+			if readOnlyCallbackParameters(source) {
+				for i, field := range source.Type().Params() {
+					if field.Type.Kind() != types.TFUNC {
+						continue
+					}
+					arg := inner.Args[i]
+					for arg.Op() == ir.OCONV || arg.Op() == ir.OCONVNOP {
+						arg = arg.(*ir.ConvExpr).X
+					}
+					var closed []*ir.Func
+					if name := ir.StaticCalleeName(arg); name != nil {
+						closed = []*ir.Func{name.Func}
+					} else if name, ok := arg.(*ir.Name); ok {
+						closed = resolved[caller][name]
+					} else {
+						closed = expressions[arg]
+					}
+					if len(closed) == 0 || len(closed) > 16 {
+						continue
+					}
+					valid := true
+					for _, target := range closed {
+						if !callableFactorySupported(target) ||
+							capturedFactorySupported(target) &&
+								(target.Sym().Pkg != types.LocalPkg || !reader.Have(target)) {
+							valid = false
+						}
+					}
+					if !valid {
+						continue
+					}
+					sets[i] = closed
+					fmt.Fprintf(&proof, "%d:", i)
+					for _, target := range closed {
+						fmt.Fprintf(&proof, "%p;", target)
+					}
+				}
+			}
+			k := key{source, proof.String()}
+			helper, known := helpers[k]
 			if !known {
 				if count >= 64 || !reader.PinCaptures(source) {
 					return
+				}
+				for _, closed := range sets {
+					for _, target := range closed {
+						if capturedFactorySupported(target) && !reader.PinCaptures(target) {
+							return
+						}
+					}
 				}
 				count++
 				captures := append([]*types.Type(nil), captureTypes(source)...)
 				sig := source.Type()
 				sym := types.LocalPkg.Lookup(fmt.Sprintf("%s.operand%d", source.Sym().Name, count))
 				helper = capturedOperandBody(reader.Clone(source, sym), sig, captures)
-				helpers[source] = helper
+				helpers[k] = helper
 				if helper == nil {
 					return
 				}
 				typecheck.Target.Funcs = append(typecheck.Target.Funcs, helper)
 				generated[helper] = true
+				if len(sets) != 0 {
+					parameters[helper] = make(map[*ir.Name][]*ir.Func)
+					for i, closed := range sets {
+						// Parameter zero is the frozen selected function value,
+						// inspected for its environment rather than invoked.
+						name := helper.Type().Param(i + 1).Nname.(*ir.Name)
+						parameters[helper][name] = closed
+					}
+				}
 				bodies[helper] = func() *ir.Func {
 					return capturedOperandBody(reader.Clone(source, types.LocalPkg.Lookup(sym.Name+".go")), sig, captures)
 				}

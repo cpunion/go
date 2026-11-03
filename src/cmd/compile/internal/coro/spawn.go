@@ -40,6 +40,15 @@ func plainSpawnFactorySupported(function *Function) bool {
 	return function != nil && resumeFactorySupported(function.Func) && plainFactoryBodySupported(function)
 }
 
+// A normal callback has no direct-defer recover rights. Keep the existing
+// bounded leaf and context-free ABI requirements; captured or transitive
+// recover needs a separate environment and terminal-control proof.
+func plainCallbackFactorySupported(function *Function) bool {
+	return function != nil && resumeFactorySupported(function.Func) &&
+		function.LocalTerminal == function.Terminal &&
+		plainFactoryBodySupportedWithTerminal(function, UsesRecover)
+}
+
 // A captured plain callback cannot use the ordinary-call adapter: that adapter
 // has no source closure environment. Its demanded private factory instead uses
 // the regular typed capture lowering, without publishing a context-free ABI.
@@ -48,9 +57,13 @@ func capturedPlainFactorySupported(function *Function) bool {
 }
 
 func plainFactoryBodySupported(function *Function) bool {
+	return plainFactoryBodySupportedWithTerminal(function, 0)
+}
+
+func plainFactoryBodySupportedWithTerminal(function *Function, allowed TerminalFlags) bool {
 	if !(function != nil && function.Primary == PlainPrimary &&
 		function.Effect == NoSuspend && function.Exec == 0 &&
-		function.Terminal == 0 &&
+		function.Terminal & ^allowed == 0 &&
 		len(function.Func.Body) != 0 &&
 		len(function.Edges) == 0) {
 		return false
@@ -73,6 +86,41 @@ func plainFactoryBodySupported(function *Function) bool {
 		}
 		return false
 	})
+}
+
+// normalRecoverCallback supplies the normal-call variant of a bounded plain
+// callback. Calling the public entry here would expose the enclosing cleanup's
+// runtime recover bridge. A separate private copy makes its direct recover
+// expressions nil, retaining all other source effects and the public entry's
+// direct-defer behavior. Never rewrite shared source IR or publish this variant
+// as a defer entry.
+func normalRecoverCallback(fn *ir.Func, reader *BodyReader) *ir.Func {
+	if reader == nil || reader.Clone == nil || !reader.Have(fn) {
+		return nil
+	}
+	copy := reader.Clone(fn, types.LocalPkg.Lookup(fn.Sym().Name+".coro.callback"))
+	if copy == nil {
+		return nil
+	}
+	found := false
+	var edit func(ir.Node) ir.Node
+	edit = func(node ir.Node) ir.Node {
+		if node.Op() == ir.ORECOVER {
+			found = true
+			return ir.InitExpr(ir.TakeInit(node), ir.NewNilExpr(node.Pos(), node.Type()))
+		}
+		ir.EditChildren(node, edit)
+		return node
+	}
+	for i, statement := range copy.Body {
+		copy.Body[i] = edit(statement)
+	}
+	if !found {
+		return nil
+	}
+	ir.WithFunc(copy, func() { typecheck.Stmts(copy.Body) })
+	typecheck.Target.Funcs = append(typecheck.Target.Funcs, copy)
+	return copy
 }
 
 // newPlainSpawnFactory adapts an ordinary entry to the existing closure factory

@@ -13,7 +13,7 @@ import (
 
 func TestClosedParameterDeferContract(t *testing.T) {
 	prepareLowerTest(t)
-	for _, mode := range []string{"plain", "panic", "recover", "exit", "missing", "unsealed", "writable", "suspending", "exec", "local-exec", "callback-suspend", "callback-exec", "callback-recover", "unknown", "spawn", "defer", "defer-recover", "defer-suspend", "defer-exec", "defer-unknown", "operation"} {
+	for _, mode := range []string{"plain", "panic", "recover", "exit", "missing", "unsealed", "writable", "suspending", "exec", "local-exec", "callback-suspend", "callback-exec", "callback-recover", "callback-recover-leaf", "unknown", "spawn", "defer", "defer-recover", "defer-suspend", "defer-exec", "defer-unknown", "operation"} {
 		t.Run(mode, func(t *testing.T) {
 			pkg := types.NewPkg("example.com/coro/parameterdefer/"+mode, "p")
 			callback := types.NewSignature(nil, nil, nil)
@@ -31,7 +31,7 @@ func TestClosedParameterDeferContract(t *testing.T) {
 			}
 			function := plan.Functions[fn]
 			edge := &function.Edges[0]
-			want := mode == "plain" || mode == "panic" || mode == "recover" || mode == "exit" || mode == "defer" || mode == "defer-recover"
+			want := mode == "plain" || mode == "panic" || mode == "recover" || mode == "exit" || mode == "defer" || mode == "defer-recover" || mode == "callback-recover-leaf"
 			switch mode {
 			case "panic":
 				function.Terminal = MayPanic
@@ -56,6 +56,9 @@ func TestClosedParameterDeferContract(t *testing.T) {
 			case "callback-exec":
 				plan.Functions[leaf].Exec = NeedsTaskContext
 			case "callback-recover":
+				plan.Functions[leaf].Terminal = UsesRecover
+			case "callback-recover-leaf":
+				plan.Functions[leaf].LocalTerminal = UsesRecover
 				plan.Functions[leaf].Terminal = UsesRecover
 			case "unknown":
 				edge.Targets, edge.Unknown = nil, true

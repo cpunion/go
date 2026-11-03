@@ -42,16 +42,33 @@ func rangeDeferRegistrationFactorySupported(plan *Plan, body *rangeDeferBodyPlan
 	if body == nil || body.owner.err != nil || body.function.LocalTerminal&^MayPanic != 0 {
 		return false
 	}
+	registration := *body.function
+	registration.Exec = registration.LocalExec
+	allExec := registration.LocalExec
 	for _, edge := range body.function.Edges {
-		if edge.Kind == DeferCall {
-			continue
-		}
-		summary, known := plan.edgeSummary(edge)
-		if !known || summary.Terminal&^MayPanic != 0 {
+		if edge.Kind == GoCall {
 			return false
 		}
+		summary, known := plan.edgeSummary(edge)
+		if !known {
+			return false
+		}
+		allExec |= summary.Exec
+		if edge.Kind == DeferCall && slices.ContainsFunc(body.cleanup.defers,
+			func(deferred *lowerDefer) bool { return deferred.call == edge.Node }) {
+			// Only an exactly validated enclosing-owner registration can
+			// defer its execution constraints as well as terminal effects.
+			// Direct calls and local execution requirements remain live.
+			continue
+		}
+		if summary.Terminal&^MayPanic != 0 {
+			return false
+		}
+		registration.Exec |= summary.Exec
 	}
-	registration := *body.function
+	if allExec != body.function.Exec {
+		return false
+	}
 	registration.Terminal &= MayPanic
 	return rangeBodyFactorySupported(&registration)
 }
