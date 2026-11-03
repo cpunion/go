@@ -13,6 +13,11 @@ import (
 
 var coroBodyGen int
 
+// Retain source eligibility before backend compilation releases the working IR.
+// Only real serialized Go definitions receive this capability; synthetic
+// wrappers and assembly declarations cannot become empty private helpers.
+var coroSourceBodies = make(map[*ir.Func]bool)
+
 // Use serialized body identity, including its instantiation dictionary. A
 // reread has fresh closure symbols and declarations, so source spelling or
 // positions cannot identify its environment layout.
@@ -108,10 +113,27 @@ func pinCoroCaptureCopies(body *ir.Func, source pkgReaderIndex) {
 	visit(body, source)
 }
 
+// coroBodyReader includes imported static bodies, which are indexed separately
+// from local declarations and imported generic instances. Looking up either
+// index does not materialize source declarations or mutate the public entry.
+func coroBodyReader(fn *ir.Func) (pkgReaderIndex, bool) {
+	if fn == nil || fn.Nname == nil {
+		return pkgReaderIndex{}, false
+	}
+	if pri, ok := bodyReader[fn]; ok {
+		return pri, true
+	}
+	if fn.Nname.Defn == nil && fn.Sym() != nil {
+		pri, ok := importBodyReader[fn.Sym()]
+		return pri, ok
+	}
+	return pkgReaderIndex{}, false
+}
+
 // HaveCoroBody reports whether fn has a serialized source body without
 // constructing any local declarations or closures.
 func HaveCoroBody(fn *ir.Func) bool {
-	_, ok := bodyReader[fn]
+	_, ok := coroBodyReader(fn)
 	return ok
 }
 
@@ -128,7 +150,7 @@ func ReadCoroBody(fn *ir.Func) *ir.Func {
 // ReadCoroBodyAs materializes a source body under an independently owned
 // symbol. Its closures are named beneath that symbol before they are read.
 func ReadCoroBodyAs(fn *ir.Func, sym *types.Sym) *ir.Func {
-	pri, ok := bodyReader[fn]
+	pri, ok := coroBodyReader(fn)
 	if !ok {
 		return nil
 	}

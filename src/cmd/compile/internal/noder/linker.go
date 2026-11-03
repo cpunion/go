@@ -221,8 +221,19 @@ func (l *linker) exportBody(obj *ir.Name, local bool) {
 	assert(obj.Op() == ir.ONAME && obj.Class == ir.PFUNC)
 
 	fn := obj.Func
-	if fn.Inl == nil {
-		return // not inlinable anyway
+	inlineBody := fn.Inl != nil && (local || fn.Inl.HaveDcl)
+	coroBody := false
+	if buildcfg.Experiment.Coro && !fn.Type().HasShape() && !fn.Needctxt() && fn.OClosure == nil {
+		if summary, known := coro.Summary(fn); known && summary.Primary() == coro.CoroPrimary && summary.Exec == 0 {
+			if fn.Nname.Defn == nil {
+				// Imported entries only exist here after another package has
+				// exported their real Go definitions. Keep the same bounded
+				// source dependency available through intermediate packages.
+				_, coroBody = importBodyReader[obj.Sym()]
+			} else {
+				coroBody = coroSourceBodies[fn]
+			}
+		}
 	}
 
 	// As a simple heuristic, if the function was declared in this
@@ -234,8 +245,7 @@ func (l *linker) exportBody(obj *ir.Name, local bool) {
 	//
 	// TODO(mdempsky): Reimplement the reachable method crawling logic
 	// from typecheck/crawler.go.
-	exportBody := local || fn.Inl.HaveDcl
-	if !exportBody {
+	if !inlineBody && !coroBody {
 		return
 	}
 
@@ -246,7 +256,13 @@ func (l *linker) exportBody(obj *ir.Name, local bool) {
 		return
 	}
 
-	pri, ok := bodyReaderFor(fn)
+	var pri pkgReaderIndex
+	var ok bool
+	if coroBody {
+		pri, ok = coroBodyReader(fn)
+	} else {
+		pri, ok = bodyReaderFor(fn)
+	}
 	assert(ok)
 	l.bodies[sym] = l.relocIdx(pri.pr, pkgbits.SectionBody, pri.idx)
 }

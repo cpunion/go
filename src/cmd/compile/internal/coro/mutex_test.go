@@ -103,7 +103,7 @@ func main() {
 	for range 1 {
 		uncontended()
 		deferredUnlock()
-		if count != 21 { panic("deferred unlock fallback") }
+		if count != 21 { panic("deferred unlock count") }
 		contention()
 		mu.Lock()
 		spawnDetached()
@@ -145,11 +145,8 @@ func main() {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				if strings.Contains(string(data), "func=deferredUnlock.coro,") {
-					t.Errorf("suspending deferred unlock was lowered\n%s", data)
-				}
 				for _, name := range []string{
-					"uncontended", "mutexWorker", "contention", "detachedWaiter", "spawnDetached",
+					"uncontended", "deferredUnlock", "mutexWorker", "contention", "detachedWaiter", "spawnDetached",
 				} {
 					if !strings.Contains(string(data), "func="+name+".coro,") {
 						t.Errorf("%s was not lowered\n%s", name, data)
@@ -168,6 +165,9 @@ func main() {
 					if !strings.Contains(string(symbols), name+".coro") {
 						t.Errorf("missing generated entry for %s", name)
 					}
+				}
+				if linkedCoroStackUnsafe(t, exe, "main.deferredUnlock.coro.stackgate") {
+					t.Error("deferred unlock native entry selected the machine-stack fallback")
 				}
 			}
 			for _, procs := range []int{1, 4} {

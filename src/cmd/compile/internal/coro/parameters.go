@@ -209,6 +209,12 @@ func specializeParameters(funcs []*ir.Func, reader *BodyReader,
 	return rewritten
 }
 
+// SourceBodyWithinBudget bounds serialized bodies retained for private source
+// specialization. Keep the export and materialization budgets in agreement.
+func SourceBodyWithinBudget(fn *ir.Func) bool {
+	return fn != nil && smallParameterBody(fn)
+}
+
 // Count enclosed bodies as well: cloning one small outer function must not
 // multiply an arbitrarily large closure body by the specialization limit.
 func smallParameterBody(fn *ir.Func) bool {

@@ -1399,6 +1399,11 @@ func (pri pkgReaderIndex) funcBody(fn *ir.Func) {
 		}
 	}()
 	r.funcBody(fn)
+	if buildcfg.Experiment.Coro && fn.Body != nil {
+		if source, ok := bodyReader[fn]; ok && source.synthetic == nil {
+			coroSourceBodies[fn] = coro.SourceBodyWithinBudget(fn)
+		}
+	}
 	panicking = false
 
 }

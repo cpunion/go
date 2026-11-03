@@ -25,6 +25,34 @@ type BodyReader struct {
 	PinCaptures func(*ir.Func) bool
 }
 
+// A captured source temporary can survive as a declaration after its defining
+// assignment has moved into a typed cell or frame field. That assignment no
+// longer defines the original name. Keep static-value queries from following
+// the obsolete link, including for interface operands frozen by defer wrappers.
+func clearRewrittenVariableDefinitions(funcs []*ir.Func) {
+	for _, fn := range funcs {
+		for _, name := range fn.Dcl {
+			if name.Class != ir.PAUTO && name.Class != ir.PAUTOHEAP {
+				continue
+			}
+			valid := false
+			switch definition := name.Defn.(type) {
+			case *ir.AssignStmt:
+				valid = definition.X == name
+			case *ir.AssignListStmt:
+				for _, lhs := range definition.Lhs {
+					valid = valid || lhs == name
+				}
+			default:
+				continue
+			}
+			if !valid {
+				name.Defn = nil
+			}
+		}
+	}
+}
+
 // addOrdinaryBody keeps the source body in the public entry, rather than
 // calling a helper: an extra frame would change direct recover semantics.
 // Native factories bypass this entry and never execute the ordinary body.
