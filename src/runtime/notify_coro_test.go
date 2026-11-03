@@ -212,6 +212,15 @@ func testStacklessCoroNotifyMixed(t *testing.T, mode string) {
 				if strings.HasPrefix(frame.Function, "runtime.coroNotifyListWait") ||
 					frame.Function == "runtime.(*stacklessCoroNotifyWaiter).finish" {
 					t.Errorf("block profile exposes notification implementation frame %s", frame.Function)
+					t.Logf("notification block profile raw PCs: %x", record.Stack())
+					detail := runtime.CallersFrames(record.Stack())
+					for {
+						f, more := detail.Next()
+						t.Logf("notification block profile pc=%x function=%s file=%s line=%d", f.PC, f.Function, f.File, f.Line)
+						if !more {
+							break
+						}
+					}
 				}
 				if !more {
 					break
