@@ -73,7 +73,11 @@ func AnalyzeWithSpecializations(funcs []*ir.Func, directives [][]string, reader 
 	demands := make(map[*ir.Func]bool)
 	index := 0
 	specializeWaitGroupCallbacks(funcs, specialized, bodies, demands, &index)
-	rewritten, operandCalls := specializeCapturedOperands(funcs, reader, specialized, bodies)
+	deferredPrimitives := specializeDeferredPrimitives(typecheck.Target.Funcs, reader, bodies)
+	rewritten, operandCalls := specializeCapturedOperands(typecheck.Target.Funcs, reader, specialized, bodies)
+	for fn := range deferredPrimitives {
+		rewritten[fn] = true
+	}
 	for fn := range specializeParameters(typecheck.Target.Funcs, reader, specialized, bodies, demands) {
 		rewritten[fn] = true
 	}
