@@ -24,6 +24,7 @@ type cleanup func(*state)
 var finalized atomic.Int32
 func nativeRecover(s *state){runtime.Gosched();runtime.GC();s.caught=recover();s.log=append(s.log,1)}
 func nativeReplace(s *state){runtime.Gosched();s.log=append(s.log,1);panic(s.replacement)}
+func noSuspendReplace(s *state){s.caught=recover();s.log=append(s.log,1);panic(s.replacement)}
 func nativeExit(s *state){runtime.Gosched();s.log=append(s.log,1);runtime.Goexit()}
 //go:noinline
 func indirect()any{return recover()}
@@ -33,6 +34,8 @@ func opaqueRecover(s *state){var stack[2048]byte;if runtime.Stack(stack[:],false
 func opaqueReplace(s *state){var stack[2048]byte;if runtime.Stack(stack[:],false)==0{panic("opaque stack")};s.log=append(s.log,1);panic(s.replacement)}
 func opaqueExit(s *state){var stack[2048]byte;if runtime.Stack(stack[:],false)==0{panic("opaque stack")};s.log=append(s.log,1);runtime.Goexit()}
 func owner(f cleanup,s *state,mode int){defer tail(s);defer f(s);s.body=true;runtime.Gosched();if mode==1{panic(s.token)};if mode==2{runtime.Goexit()}}
+func bareOwner(f cleanup,s *state){defer f(s);s.body=true}
+func bareNilOwner(f func(),s *state){defer func(){s.log=append(s.log,2)}();defer f();s.body=true}
 func stickyOwner(replace,catch cleanup,s *state){defer tail(s);defer catch(s);defer replace(s);runtime.Gosched();runtime.Goexit()}
 func nilOwner(f func(int),s *state){defer func(){s.log=append(s.log,2)}();defer f(argument(s));s.body=true;runtime.Gosched()}
 func argument(s *state)int{s.calls++;return 7}
@@ -42,6 +45,8 @@ func iterator(yield func(int)bool){for i:=0;i<6;i++{runtime.Gosched();if !yield(
 func rangeOwner(f func(*state,int),s *state){defer record(s,9);for i:=range iterator{defer f(s,i);runtime.Gosched()};defer record(s,8)}
 func tuple(s *state)(int,*state){runtime.Gosched();s.log=append(s.log,3);return 17,s}
 func tupleOwner(f func(*state)(int,*state),s *state){defer f(s);runtime.Gosched()}
+func big(data [1024]byte,s *state){runtime.Gosched();runtime.GC();s.log=append(s.log,int(data[0])+int(data[1023]))}
+func bigOwner(f func([1024]byte,*state),s *state){var data[1024]byte;data[0]=17;data[1023]=19;defer f(data,s);data[0]=99;runtime.Gosched()}
 func variadic(s *state,values ...int){for _,n:=range values{runtime.Gosched();s.log=append(s.log,n)}}
 func variadicOwner(f func(*state,...int),s *state){defer f(s,3,5,7);runtime.Gosched()}
 type box struct{n int;pad[4096]byte}
@@ -63,11 +68,14 @@ func affinityOwner(start,finish cleanup,s *state){start(s);defer finish(s);for i
 func parked(s *state,ready chan<-struct{},release <-chan struct{}){runtime.LockOSThread();defer runtime.UnlockOSThread();gid,tid:=goid(),thread();ready<-struct{}{};<-release;for i:=0;i<8;i++{runtime.Gosched()};runtime.GC();if goid()!=gid||thread()!=tid||s.payload[4095]!=37{panic("parked defer lost environment or affinity")};s.log=append(s.log,int(s.payload[0]))}
 func pressureOwner(f func(*state,chan<-struct{},<-chan struct{}),s *state,ready chan<-struct{},release <-chan struct{}){defer f(s,ready,release);runtime.Gosched()}
 var ownerEntry=owner
+var bareEntry=bareOwner
+var bareNilEntry=bareNilOwner
 var stickyEntry=stickyOwner
 var nilEntry=nilOwner
 var repeatedEntry=repeatedOwner
 var rangeEntry=rangeOwner
 var tupleEntry=tupleOwner
+var bigEntry=bigOwner
 var variadicEntry=variadicOwner
 var methodEntry=methodOwner
 var snapshotEntry=snapshotOwner
@@ -80,6 +88,7 @@ func equal(got []int,want ...int){if len(got)!=len(want){panic("cleanup log leng
 func main(){
  for _,f:=range []cleanup{nativeRecover,opaqueRecover}{for mode:=0;mode<3;mode++{s:=fresh();execute(func(s *state){ownerEntry(f,s,mode)},s);equal(s.log,1,2);if !s.body||s.outer!=nil||s.returned!=(mode!=2){panic("recover terminal or owner replay")};if mode==1{if s.caught!=s.token{panic("direct recover lost panic")}}else if s.caught!=nil{panic("recover invented panic")}}}
  for _,f:=range []cleanup{nativeReplace,opaqueReplace}{for mode:=0;mode<3;mode++{s:=fresh();execute(func(s *state){ownerEntry(f,s,mode)},s);equal(s.log,1,2);if s.outer!=s.replacement||s.returned{panic("replacement panic")}}}
+ for mode:=0;mode<3;mode++{s:=fresh();execute(func(s *state){ownerEntry(noSuspendReplace,s,mode)},s);equal(s.log,1,2);if s.outer!=s.replacement||s.returned{panic("NoSuspend replacement panic")};if mode==1{if s.caught!=s.token{panic("NoSuspend direct recover lost owner")}}else if s.caught!=nil{panic("NoSuspend recover invented panic")}}
  for _,f:=range []cleanup{nativeExit,opaqueExit}{for mode:=0;mode<3;mode++{s:=fresh();execute(func(s *state){ownerEntry(f,s,mode)},s);equal(s.log,1,2);if s.outer!=nil||s.returned{panic("deferred Goexit returned")}}}
  s:=fresh();execute(func(s *state){ownerEntry(nativeIndirect,s,1)},s);equal(s.log,1,2);if s.outer!=s.token||s.returned{panic("indirect recover consumed panic")}
  for _,f:=range []cleanup{nativeReplace,opaqueReplace}{for _,catch:=range []cleanup{nativeRecover,opaqueRecover}{s:=fresh();execute(func(s *state){stickyEntry(f,catch,s)},s);equal(s.log,1,1,2);if s.caught!=s.replacement||s.outer!=nil||s.returned{panic("sticky Goexit was recovered or panic lost")}}}
@@ -87,6 +96,9 @@ func main(){
  s=fresh();repeatedEntry(record,s);equal(s.log,5,4,3,2,1,0)
  s=fresh();rangeEntry(record,s);equal(s.log,8,5,4,3,2,1,0,9)
  s=fresh();tupleEntry(tuple,s);equal(s.log,3)
+ s=fresh();bigEntry(big,s);equal(s.log,36)
+ s=fresh();bareEntry(nativeRecover,s);equal(s.log,1);if !s.body||s.caught!=nil{panic("no-yield defer owner")}
+ s=fresh();execute(func(s *state){bareNilEntry(nil,s)},s);equal(s.log,2);if _,ok:=s.outer.(runtime.Error);!ok||!s.body||s.returned{panic("bare nil defer timing")}
  s=fresh();variadicEntry(variadic,s);equal(s.log,3,5,7)
  s=fresh();p:=&box{n:19};p.pad[4095]=11;methodEntry((*box).touch,p,s);equal(s.log,37)
  s=fresh();f:=captured(p);p=nil;execute(func(s *state){ownerEntry(f,s,1)},s);f=nil;equal(s.log,30,2);if s.caught!=s.token||!s.returned{panic("captured direct recover")}
@@ -128,15 +140,18 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"owner", "stickyOwner", "nilOwner", "repeatedOwner", "rangeOwner", "tupleOwner", "variadicOwner", "methodOwner", "snapshotOwner", "lateOwner", "affinityOwner", "pressureOwner", "nativeRecover", "nativeReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic"} {
+				for _, name := range []string{"owner", "bareOwner", "bareNilOwner", "bigOwner", "stickyOwner", "nilOwner", "repeatedOwner", "rangeOwner", "tupleOwner", "variadicOwner", "methodOwner", "snapshotOwner", "lateOwner", "affinityOwner", "pressureOwner", "nativeRecover", "nativeReplace", "noSuspendReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic", "captured.func1"} {
 					if linkedCoroStackUnsafe(t, executable, "main."+name+".coro.stackgate") {
 						t.Errorf("open defer source lost native admission: %s", name)
 					}
 				}
-				for _, name := range []string{"nativeRecover", "nativeReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic"} {
+				for _, name := range []string{"nativeRecover", "nativeReplace", "noSuspendReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic", "captured.func1"} {
 					if linkedCoroStackUnsafe(t, executable, "main."+name+".coro.defer.coro.stackgate") {
 						t.Errorf("deferred callee has no independently admitted companion: %s", name)
 					}
+				}
+				if !linkedCoroStackUnsafe(t, executable, "main.big.coro.defer.coro.stackgate") {
+					t.Fatal("oversized deferred transfer acquired native capability")
 				}
 			}
 			for _, p := range []string{"1", "4"} {

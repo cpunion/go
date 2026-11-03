@@ -86,8 +86,8 @@ func TestLowerDynamicDefer(t *testing.T) {
 				t.Fatal(err)
 			}
 			edge := edgeForCall(plan.Functions[f.caller], f.call)
-			want := mode == "valid" || mode == "repeated" || mode == "direct" || mode == "direct-repeated" || mode == "direct-terminal" || mode == "nil-write" || mode == "imported" || mode == "static-wrapper" || mode == "terminal" || mode == "suspending"
-			if want && mode != "static-wrapper" && (edge.Kind != DeferCall || edge.Callee != nil || edge.Unknown || len(edge.Targets) != 1 || edge.Targets[0] != f.child) {
+			want := true
+			if mode != "static-wrapper" && mode != "source-closure" && mode != "unknown" && (edge.Kind != DeferCall || edge.Callee != nil || edge.Unknown || len(edge.Targets) != 1 || edge.Targets[0] != f.child) {
 				t.Fatalf("lost closed defer proof: %+v", edge)
 			}
 			if err := plan.Verify(); err != nil {
@@ -100,15 +100,20 @@ func TestLowerDynamicDefer(t *testing.T) {
 			if got := plan.Functions[f.caller].Factory != NoFactory; got != want {
 				t.Fatalf("native defer factory = %t, want %t: %+v", got, want, result)
 			}
-			if !want {
-				wantReason := map[string]string{
-					"unknown":           "defer target has unknown effects",
-					"exec":              "defer target has execution constraints task-context",
-					"source-closure":    "suspending defer",
-					"imported-terminal": "unsupported terminal control panic",
-				}[mode]
-				if !strings.Contains(strings.Join(result.Diagnostics, "\n"), wantReason) {
-					t.Fatalf("missing fallback %q: %+v", wantReason, result)
+			if mode != "static-wrapper" && mode != "source-closure" {
+				starter, rawDefer := false, false
+				for _, generated := range typecheck.Target.Funcs {
+					ir.Visit(generated, func(node ir.Node) {
+						if call, ok := node.(*ir.CallExpr); ok && symbolName(ir.StaticCalleeName(call.Fun)) == "runtime.coroDeferStartFunction" {
+							starter = true
+						}
+						if stmt, ok := node.(*ir.GoDeferStmt); ok && stmt.Op() == ir.ODEFER && NativeStackEntry(generated) {
+							rawDefer = true
+						}
+					})
+				}
+				if !starter || rawDefer {
+					t.Fatalf("managed defer starter=%t raw native defer=%t", starter, rawDefer)
 				}
 			}
 		})

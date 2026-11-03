@@ -308,6 +308,7 @@ var runtimeDecls = [...]struct {
 	{"coroDeferStartFunction", funcTag, 203},
 	{"coroDeferInject", funcTag, 202},
 	{"coroDeferRecoverAwait", funcTag, 195},
+	{"coroDeferRecoverDirect", funcTag, 195},
 	{"coroGoexit", funcTag, 147},
 	{"coroTerminalAction", funcTag, 123},
 	{"coroTakeFrame", funcTag, 204},

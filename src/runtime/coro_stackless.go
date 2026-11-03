@@ -3651,6 +3651,22 @@ func coroDeferRecoverAwait(ctx unsafe.Pointer) any {
 	return value
 }
 
+// A bounded non-suspending activation can also be entered by the legacy
+// synchronous defer runner. That runner explicitly installs its owner scope;
+// a new structured defer instead owns a distinct task with DeferChild set.
+// Ordinary await children have neither permission and must observe nil.
+func coroDeferRecoverDirect(ctx unsafe.Pointer) any {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine direct recover")
+	}
+	if task.hasFlag(stacklessCoroTaskDeferChild) {
+		return coroDeferRecoverAwait(ctx)
+	}
+	return stacklessCoroRecover(getg())
+}
+
 // coroSpawn enqueues an independent logical goroutine. Its result is a hint
 // that a resumable producer may yield after publishing the child. Callers
 // without a continuation boundary may discard it and keep running.

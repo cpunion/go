@@ -4044,8 +4044,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.AssignListStmt:
 			node.Def = false
 		case *ir.CallExpr:
-			if node.Op() == ir.ORECOVER && function.Effect == MaySuspend {
-				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime("coroDeferRecoverAwait"), ir.Nodes{ctx}, false)
+			if node.Op() == ir.ORECOVER {
+				entry := "coroDeferRecoverAwait"
+				if function.Effect == NoSuspend {
+					entry = "coroDeferRecoverDirect"
+				}
+				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime(entry), ir.Nodes{ctx}, false)
 				init := slices.Clone(node.Init())
 				for i, statement := range init {
 					init[i] = edit(statement)

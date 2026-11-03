@@ -122,7 +122,7 @@ func exiting(which bool, done chan struct{}) {
  runtime.Gosched()
  runtime.Goexit()
 }
-// A dynamic call in a source literal remains outside the operand-wrapper proof.
+// Runtime-selected values and source literals retain their own defer scope.
 var global=zeroA
 func open(f func()) {defer f();runtime.Gosched()}
 func globalCall() {defer global();runtime.Gosched()}
@@ -172,15 +172,8 @@ func main() {
  println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"open", "defer has no static call plan"},
-			{"globalCall", "defer has no static call plan"},
-			{"captured", "defer has no static call plan"},
-			{"addressed", "defer has no static call plan"},
-			{"literal", "suspending defer"},
-		},
-		[]string{"suspended", "snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting", "terminal", "terminalRecover", "terminalExit"})
+	required := []string{"open", "globalCall", "captured", "addressed", "literal", "suspended", "snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting", "terminal", "terminalRecover", "terminalExit"}
+	testSwitchReturnProgram(t, source, nil, required, required...)
 }
 
 func TestDynamicDeferImported(t *testing.T) {

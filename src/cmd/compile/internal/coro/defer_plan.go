@@ -23,6 +23,13 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 	}
 	for _, edge := range function.Edges {
 		if edge.Unknown {
+			// The target's independently admitted factory handles an open
+			// function call through its managed native/ordinary boundary.
+			// The caller still depends on that factory surviving admission.
+			if edge.Kind == DirectCall && edge.ValueCall && !edge.FactoryRequired &&
+				edge.Node.Op() == ir.OCALLFUNC && edge.Node.Fun.Type().Kind() == types.TFUNC {
+				continue
+			}
 			return false
 		}
 		if _, known := plan.edgeSummary(edge); !known {
