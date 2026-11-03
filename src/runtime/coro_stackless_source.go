@@ -37,7 +37,8 @@ func stacklessCoroSourceFrame(f funcInfo) *stacklessCoroSourceInfo {
 
 func stacklessCoroSourceFunc(f funcInfo, info *stacklessCoroSourceInfo) funcInfo {
 	if info != nil && info.flags&(abi.CoroSourceResume|abi.CoroSourceCopy) != 0 {
-		return findfunc(f.datap.textAddr(info.source))
+		entry := *(*uintptr)(unsafe.Pointer(f.datap.rodata + uintptr(info.source)))
+		return findfunc(entry)
 	}
 	return f
 }
