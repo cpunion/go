@@ -106,7 +106,10 @@ func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer) (funcInf
 		unsafe.Sizeof(*info)+uintptr(state)*unsafe.Sizeof(stacklessCoroSourcePosition{})))
 	file := ""
 	if at.fileSize != 0 {
-		file = unsafe.String((*byte)(unsafe.Pointer(f.datap.rodata+uintptr(at.file))), int(at.fileSize))
+		// The linker owns this immutable range. Avoid unsafe.String's panic
+		// path: the profiler also reaches this walk without write barriers.
+		header := stringStruct{str: unsafe.Pointer(f.datap.rodata + uintptr(at.file)), len: int(at.fileSize)}
+		file = *(*string)(unsafe.Pointer(&header))
 	}
 	return source, stacklessCoroSourcePC(source, file, int32(at.line))
 }
