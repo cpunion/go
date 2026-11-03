@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/types"
 	"fmt"
 )
 
@@ -149,6 +150,7 @@ const (
 	SiteSemaphore
 	SiteNotify
 	SiteRangeDefer
+	SiteGC
 )
 
 func (k SiteKind) String() string {
@@ -181,6 +183,8 @@ func (k SiteKind) String() string {
 		return "notify"
 	case SiteRangeDefer:
 		return "range-defer"
+	case SiteGC:
+		return "gc"
 	default:
 		return fmt.Sprintf("SiteKind(%d)", k)
 	}
@@ -307,6 +311,10 @@ var operationRecipes = map[string]OperationRecipe{
 		Kind:   SiteYield,
 		Effect: MaySuspend,
 	},
+	"runtime.GC": {
+		Kind:   SiteGC,
+		Effect: MaySuspend,
+	},
 	"time.Sleep": {
 		Kind:   SiteTimer,
 		Effect: MaySuspend,
@@ -384,6 +392,13 @@ func operationRecipe(fn *ir.Func) (OperationRecipe, bool) {
 	}
 	if recipe.Kind == SiteNotify && !notifySignature(fn.Type()) {
 		recipe.Kind = SiteAwait
+	}
+	if recipe.Kind == SiteGC {
+		typ := fn.Type()
+		if typ == nil || typ.Kind() != types.TFUNC || typ.Recv() != nil ||
+			typ.NumParams() != 0 || typ.NumResults() != 0 || typ.IsVariadic() {
+			recipe.Kind = SiteAwait
+		}
 	}
 	return recipe, ok
 }

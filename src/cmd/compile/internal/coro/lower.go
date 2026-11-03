@@ -319,6 +319,18 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			}
 		}
 	}
+	normalRecoverAdapters := make(map[*ir.Func]*ir.Func)
+	normalRecover := func(target *ir.Func) *ir.Func {
+		if adapter := normalRecoverAdapters[target]; adapter != nil {
+			return adapter
+		}
+		adapter := normalRecoverCallback(target, bodies)
+		if adapter != nil {
+			normalRecoverAdapters[target] = adapter
+		}
+		return adapter
+	}
+	prepareLiteralNormalRecoverCalls(plan, deferredLiterals, normalRecover)
 	for _, function := range functions {
 		if function.Primary != CoroPrimary &&
 			!plainCapturedCallbacks[function.Func] {
@@ -363,7 +375,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		if child := plan.Functions[target]; plainCallbackFactorySupported(child) {
 			callee := target
 			if child.Terminal&UsesRecover != 0 {
-				callee = normalRecoverCallback(target, bodies)
+				callee = normalRecover(target)
 				if callee == nil {
 					continue
 				}
@@ -1176,7 +1188,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			if !statementCalls[call] || notifyOperation(call) == "" {
 				return nil, fmt.Errorf("unsupported notification site %d", site.ID)
 			}
-		case SiteYield, SiteTimer, SiteFile, SitePoll, SiteGoexit:
+		case SiteYield, SiteTimer, SiteFile, SitePoll, SiteGoexit, SiteGC:
 			if !statementCalls[call] {
 				return nil, fmt.Errorf("nested %s site %d", site.Kind, site.ID)
 			}
@@ -1924,7 +1936,7 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
 		// These transitions keep their suspended state in the resume frame.
-		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify:
+		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify, SiteGC:
 		case SiteForeign:
 			if !runToCompletion {
 				return false
@@ -3301,7 +3313,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			switch candidate.transitions[call] {
 			case SiteSpawn:
 				return spawnYield
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify, SiteGC,
 				SiteGoexit:
 				return true
 			}
@@ -3722,7 +3734,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				index := newBodyState(ir.Nodes{stmt}, next)
 				states[index].spawnYield = spawnYield
 				return index
-			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify,
+			case SiteYield, SiteAwait, SiteTimer, SiteFile, SitePoll, SiteForeign, SiteSemaphore, SiteNotify, SiteGC,
 				SiteGoexit:
 				stateNext := next
 				if candidate.transitions[call] == SiteGoexit {
@@ -4079,23 +4091,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A repeated site snapshots each capture before constructing its wrapper;
 	// otherwise every registration would observe the last value written to
 	// the shared frame slot.
-	rewriteLiteralCapture := func(fn *ir.Func, variable, pointer *ir.Name) {
-		var rewrite func(ir.Node) ir.Node
-		rewrite = func(node ir.Node) ir.Node {
-			if node == variable {
-				return typedDeref(node.Pos(), pointer, variable.Type())
-			}
-			ir.EditChildren(node, rewrite)
-			return node
-		}
-		for i, stmt := range fn.Body {
-			fn.Body[i] = rewrite(stmt)
-		}
-		fn.ClosureVars = slices.DeleteFunc(fn.ClosureVars,
-			func(candidate *ir.Name) bool {
-				return candidate == variable
-			})
-	}
 	for _, deferred := range candidate.defers {
 		deferredToken := resumeDeferToken
 		if deferred.rangeAnchor != nil {
@@ -4150,9 +4145,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				cell := captureCell(variable)
 				snapshot := typecheck.TempAt(variable.Pos(), resume,
 					cell.Type())
-				pointer := ir.NewClosureVar(variable.Pos(), closure.Func,
-					snapshot)
-				rewriteLiteralCapture(closure.Func, variable, pointer)
+				// Preserve this registration's cell in every nested closure,
+				// including closures that escape after cleanup returns. Rebind
+				// their capture chains before refreshing canonical owners.
+				replaceCapturedCell(closure.Func, variable, snapshot)
 				deferred.captures = append(deferred.captures,
 					lowerDeferCapture{
 						source: capture(cell), snapshot: snapshot,
@@ -4634,6 +4630,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					gotoState(state.next))
 			case SiteYield:
 				action = actionYield
+			case SiteGC:
+				body = append(body, typecheck.Call(state.call.Pos(),
+					typecheck.LookupRuntime("coroGC"), ir.Nodes{ctx}, false))
+				action = actionWait
 			case SiteGoexit:
 				body = append(body,
 					typecheck.Call(state.call.Pos(),

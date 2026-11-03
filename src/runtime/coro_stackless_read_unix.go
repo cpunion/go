@@ -94,6 +94,13 @@ func coroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *ui
 	startStacklessCoroSocketRead(ctx, fd, buffer, n, errno)
 }
 
+// coroGC waits for an ordinary Go worker to complete the synchronous GC call.
+// The pending operation keeps the native activation and its typed frame alive;
+// GC's goroutine waits must not execute on the fixed native executor stack.
+func coroGC(ctx unsafe.Pointer) {
+	coroCallRead(ctx, GC)
+}
+
 func coroCallRead(ctx unsafe.Pointer, call func()) {
 	if call == nil {
 		throw("runtime: nil stackless coroutine read call")

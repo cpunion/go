@@ -181,6 +181,7 @@ var runtimeDecls = [...]struct {
 	{"coroFileRead", funcTag, 144},
 	{"coroSocketRead", funcTag, 144},
 	{"coroCallRead", funcTag, 145},
+	{"coroGC", funcTag, 146},
 	{"coroEnterForeign", funcTag, 9},
 	{"coroExitForeign", funcTag, 9},
 	{"coroEnterBlocking", funcTag, 146},

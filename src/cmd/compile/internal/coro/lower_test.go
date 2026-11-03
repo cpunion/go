@@ -6281,9 +6281,10 @@ func TestLowerRepeatedSourceLiteral(t *testing.T) {
 		t.Fatalf("repeated literal candidate = %+v", candidate.defers)
 	}
 
-	if _, err := newCandidate(true, false); err == nil ||
-		!strings.Contains(err.Error(), "nested repeated source defer capture") {
-		t.Fatalf("nested repeated literal error = %v", err)
+	if nested, err := newCandidate(true, false); err != nil ||
+		len(nested.defers) != 1 || !nested.defers[0].sourceLiteral ||
+		len(nested.defers[0].literalCaptures) != 1 {
+		t.Fatalf("nested repeated literal candidate = %v, error = %v", nested, err)
 	}
 	if _, err := newCandidate(false, true); err == nil ||
 		!strings.Contains(err.Error(),

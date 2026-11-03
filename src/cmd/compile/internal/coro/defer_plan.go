@@ -192,31 +192,12 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 				deferred.sourceLiteral = true
 				deferred.literalCaptures = slices.Clone(
 					edge.Callee.ClosureVars)
-				captured := make(map[*ir.Name]bool,
-					len(deferred.literalCaptures))
 				for _, variable := range deferred.literalCaptures {
 					source := variable.Canonical()
 					if source == nil || source.Type() == nil {
 						return fmt.Errorf(
 							"repeated source defer capture has no type")
 					}
-					captured[source] = true
-				}
-				nested := false
-				ir.Visit(edge.Callee, func(node ir.Node) {
-					closure, ok := node.(*ir.ClosureExpr)
-					if !ok || closure.Func == edge.Callee {
-						return
-					}
-					for _, variable := range closure.Func.ClosureVars {
-						if captured[variable.Canonical()] {
-							nested = true
-						}
-					}
-				})
-				if nested {
-					return fmt.Errorf(
-						"nested repeated source defer capture")
 				}
 			}
 		}

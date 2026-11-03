@@ -1558,8 +1558,13 @@ func main() {
 	if err != nil {
 		t.Fatalf("building dynamic defer coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=5 skipped=3"; !strings.Contains(out, want) {
+	if want := "coro: phase=lower lowered=6 skipped=2"; !strings.Contains(out, want) {
 		t.Fatalf("output does not contain %q\n%s", want, out)
+	}
+	for _, name := range []string{"dynamic", "retain", "retainLiteral", "retainLarge", "invoke", "collect"} {
+		if diagnostic := "coro: skip main." + name + ":"; strings.Contains(out, diagnostic) {
+			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
+		}
 	}
 
 	cmd = testenv.Command(t, exe)

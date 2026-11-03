@@ -217,6 +217,7 @@ func coroSelect(unsafe.Pointer, *byte, int, int, bool, *int, *bool) bool
 func coroFileRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroCallRead(unsafe.Pointer, func())
+func coroGC(unsafe.Pointer)
 func coroEnterForeign()
 func coroExitForeign()
 func coroEnterBlocking(unsafe.Pointer)
