@@ -73,18 +73,14 @@ func main(){controls();runtime.LockOSThread();controls();runtime.UnlockOSThread(
 				t.Fatalf("build: %v\n%s", err, buildOut)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"returning", "panicking", "replacing", "bounds", "closed", "exiting", "exitPanic", "walk", "walkPanic", "structuredCleanup", "structuredPanic", "nestedPanic"} {
+				for _, name := range []string{"returning", "panicking", "replacing", "bounds", "closed", "exiting", "exitPanic", "walk", "walkPanic", "structuredCleanup", "structuredPanic", "nestedPanic", "directAsync", "repeated"} {
 					t.Run(name, func(t *testing.T) {
 						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 							t.Fatal("suspending defer literal lost native admission")
 						}
 					})
 				}
-				for _, name := range []string{"repeated", "directAsync"} {
-					if !strings.Contains(string(buildOut), "skip main."+name+":") {
-						t.Fatalf("unproved suspending defer %s lost ordinary fallback", name)
-					}
-				}
+
 			}
 			for _, p := range []string{"1", "4"} {
 				run := testenv.Command(t, binary)

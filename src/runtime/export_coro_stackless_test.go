@@ -539,6 +539,10 @@ func DeferRecoverStacklessCoroForTest(token unsafe.Pointer) any {
 	return coroDeferRecover(token)
 }
 
+func DeferRecoverAwaitStacklessCoroForTest(ctx unsafe.Pointer) any {
+	return coroDeferRecoverAwait(ctx)
+}
+
 func StacklessCoroTaskSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroTask{})
 }
@@ -2174,3 +2178,8 @@ func SeedStacklessCoroCompactOperationForTest(ctx unsafe.Pointer) {
 	s.freeOperationCount = 1
 	unlock(&s.lock)
 }
+
+func DeferStartStacklessCoroForTest(ctx unsafe.Pointer, child func(unsafe.Pointer) uint8) {
+	coroDeferStartFrame(coroDeferToken(ctx), nil, child)
+}
+func DeferSuspendedStacklessCoroForTest(ctx unsafe.Pointer) bool { return coroDeferSuspended(ctx) }

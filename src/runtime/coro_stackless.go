@@ -610,9 +610,11 @@ func init() {
 // allocates frames or enters an executor. Native tasks do not participate in
 // synctest accounting or inherit the caller's thread lock. C callbacks also
 // hold a thread lock, so nested calls keep the ordinary cgo execution context.
+// An active ordinary panic/Goexit also retains its source frames: switching to
+// a new logical root would lose the direct deferred function's recover rights.
 func coroUseOrdinary() bool {
 	gp := getg()
-	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0
+	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -3229,6 +3231,36 @@ func coroDeferAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	unlock(&s.lock)
 }
 
+// coroDeferStartFrame is called by a compiler-proved frozen cleanup starter.
+// Its stable owner token also works for registrations made by an ordinary
+// escaped range callback; the callback never runs the cleanup itself.
+func coroDeferStartFrame(token, frame unsafe.Pointer, child stacklessCoroResume) {
+	task := activeStacklessCoroDeferTask(token, "runtime: invalid stackless coroutine defer starter")
+	coroDeferAwaitFrame(unsafe.Pointer(&task.context), frame, child)
+}
+
+// coroDeferSuspended checks the handoff after a private cleanup starter returns.
+// A child may already have completed on another executor: readyLocked retains
+// Waiting plus readyPending until this active resume returns Wait. This needs
+// no additional task flag, scheduler map, or per-registration stack word.
+func coroDeferSuspended(ctx unsafe.Pointer) bool {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine cleanup handoff")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	if !task.resuming || (task.state != stacklessCoroTaskRunning && task.state != stacklessCoroTaskWaiting) ||
+		(task.state == stacklessCoroTaskRunning && task.readyPending) {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine cleanup handoff outside resume")
+	}
+	suspended := task.state == stacklessCoroTaskWaiting
+	unlock(&s.lock)
+	return suspended
+}
+
 // coroPanic records a panic value before the compiler-generated resume enters
 // its frame-owned cleanup state.
 func coroPanic(ctx unsafe.Pointer, value any) {
@@ -3531,6 +3563,53 @@ func coroDeferRecover(token unsafe.Pointer) any {
 	delete(s.terminalValues, task)
 	unlock(&s.lock)
 
+	if value == nil {
+		if debug.panicnil.Load() != 1 {
+			value = new(PanicNilError)
+		} else {
+			panicnil.IncNonDefault()
+		}
+	}
+	return value
+}
+
+// coroDeferRecoverAwait is emitted only for direct recover expressions in a
+// suspending native activation. Ordinary await children have no defer-child
+// identity and cannot recover their caller. The compiler also keeps functions
+// with recover in distinct task activations rather than fusing their frames.
+func coroDeferRecoverAwait(ctx unsafe.Pointer) any {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine awaited recover")
+	}
+	s := context.scheduler
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine awaited recover outside resume")
+	}
+	owner := task.parent
+	if owner == nil || !task.hasFlag(stacklessCoroTaskDeferChild) {
+		unlock(&s.lock)
+		return nil
+	}
+	if owner.state != stacklessCoroTaskWaiting || owner.readyPending || owner.context.scheduler != s {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine awaited recover has invalid owner")
+	}
+	if owner.terminal == stacklessCoroTerminalNone {
+		unlock(&s.lock)
+		return nil
+	}
+	value, ok := s.terminalValues[owner]
+	if owner.terminal != stacklessCoroTerminalPanic || !ok {
+		unlock(&s.lock)
+		throw("runtime: invalid stackless coroutine awaited recover state")
+	}
+	owner.terminal = stacklessCoroTerminalNone
+	delete(s.terminalValues, owner)
+	unlock(&s.lock)
 	if value == nil {
 		if debug.panicnil.Load() != 1 {
 			value = new(PanicNilError)

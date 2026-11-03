@@ -10,21 +10,17 @@ import (
 	"slices"
 )
 
-// A fixed source literal has a private, typed environment and no invocation
-// operands left to evaluate during cleanup. Its ordinary entry remains intact.
-// Direct recover and arbitrary dynamic/range registrations need a separate
-// resumable defer contract and retain their existing fallback here.
+// A resumable cleanup target uses the normal typed factory. Its public entry
+// retains ordinary Go behavior, while direct recover observes only the explicit
+// structured defer-child identity.
 func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 	function := plan.Functions[fn]
-	if function == nil || fn.OClosure == nil || fn.Wrapper() ||
-		fn.Type().NumParams() != 0 || fn.Type().NumResults() != 0 ||
-		!callableFactorySupported(fn) || function.Effect != MaySuspend ||
-		function.Exec != 0 || function.Terminal&^MayPanic != 0 {
+	if function == nil || fn.Wrapper() || !callableFactorySupported(fn) ||
+		function.Effect != MaySuspend || function.Exec != 0 ||
+		function.Terminal&^(MayPanic|UsesRecover|MayGoexit) != 0 {
 		return false
 	}
 	for _, edge := range function.Edges {
-		// MaySuspend can also come from an unknown call. It is not proof
-		// that a typed child factory exists for that call or its captures.
 		if edge.Unknown {
 			return false
 		}
@@ -33,6 +29,66 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 		}
 	}
 	return true
+}
+
+func hasSuspendingDeferSite(plan *Plan, function *Function) bool {
+	for _, edge := range function.Edges {
+		if edge.Kind == DeferCall && !edge.Unknown {
+			if summary, known := plan.edgeSummary(edge); known && summary.Effect == MaySuspend {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func planResumableDefer(plan *Plan, candidate *lowerCandidate, deferred *lowerDefer, edge Edge) error {
+	targets := edge.Targets
+	if len(targets) == 0 {
+		target := edge.Callee
+		if call := unwrapGoCall(deferred.call); call != deferred.call {
+			name := ir.StaticCalleeName(ir.StaticValue(call.Fun))
+			if name == nil {
+				return fmt.Errorf("suspending defer has no proved frozen target")
+			}
+			target = name.Func
+		}
+		targets = []*ir.Func{target}
+	}
+	for _, target := range targets {
+		summary, known := plan.funcSummary(target)
+		if !known || summary.Exec != 0 {
+			return fmt.Errorf("suspending defer target has unsupported effects")
+		}
+		entry := lowerResumableDefer{target: target}
+		if summary.Effect == MaySuspend {
+			if !canPlanSuspendingDefer(plan, target) {
+				return fmt.Errorf("suspending defer target has no typed factory")
+			}
+			entry.async = true
+			candidate.dependencies[target] = true
+		} else {
+			if target == nil || target.Needctxt() || len(target.ClosureVars) != 0 {
+				return fmt.Errorf("mixed defer target requires an environment")
+			}
+			entry.terminal = lowerDeferTerminal{target: target}
+			if summary.Terminal != 0 {
+				terminal, ok := planDeferTerminal(plan, target, summary)
+				if !ok || terminal.target != target || terminal.rewrite != 0 || terminal.directGoexit {
+					return fmt.Errorf("mixed defer target has unsupported terminal control")
+				}
+				entry.terminal = terminal
+			}
+			deferred.namedRecover = deferred.namedRecover || !entry.terminal.factory && summary.Terminal&UsesRecover != 0
+			if entry.terminal.factory {
+				candidate.dependencies[target] = true
+				candidate.deferDeps[target] = true
+			}
+		}
+		deferred.resumable = append(deferred.resumable, entry)
+	}
+	deferred.resumableDispatch = len(edge.Targets) != 0
+	return nil
 }
 
 // planNativeDefers validates the exact cleanup targets and capture lifetimes
@@ -51,14 +107,9 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 		}
 		summary, _ := plan.edgeSummary(edge)
 		if summary.Effect != NoSuspend {
-			closure, literal := deferred.call.Fun.(*ir.ClosureExpr)
-			if dynamicDefers || deferred.rangeAnchor != nil || len(edge.Targets) != 0 ||
-				!literal || closure.Func != edge.Callee || !canPlanSuspendingDefer(plan, edge.Callee) {
-				return fmt.Errorf("suspending defer requires a fixed source literal")
+			if err := planResumableDefer(plan, candidate, deferred, edge); err != nil {
+				return err
 			}
-			deferred.asyncTarget = edge.Callee
-			deferred.snapshotCallee = true
-			candidate.dependencies[edge.Callee] = true
 			continue
 		}
 		var parameterTarget *ir.Func

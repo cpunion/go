@@ -62,11 +62,7 @@ func recordNativeStackMetadata(candidates map[*ir.Func]*lowerCandidate) {
 	for _, candidate := range candidates {
 		for _, deferred := range candidate.defers {
 			var target *ir.Func
-			if deferred.asyncTarget != nil {
-				// Cleanup invokes the typed factory. Its public source entry
-				// keeps an independent ordinary body and is not called here.
-				target = candidates[deferred.asyncTarget].factory
-			} else if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
+			if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
 				target = closure.Func
 			} else if name := ir.StaticCalleeName(deferred.call.Fun); name != nil {
 				target = name.Func
