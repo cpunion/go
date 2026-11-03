@@ -49,7 +49,7 @@ func dynamicOwner(other bool)(out any,n int){f:=asyncRecover;if other{f=otherRec
 //go:noinline
 func mixedOwner(plain bool)(out any,n int){f:=asyncRecover;if plain{f=plainRecover};defer f(&out,&n,2);runtime.Gosched();panic("mixed")}
 //go:noinline
-func nilOwner(useNil bool)(out any){defer func(){out=recover()}();f:=asyncRecover;if useNil{f=nil};var v any;var n int;defer f(&v,&n,argument(2));runtime.Gosched();panic("outer")}
+func nilOwner(useNil bool)(out any){defer func(){if v:=recover();v!=nil{out=v}}();f:=asyncRecover;if useNil{f=nil};var n int;defer f(&out,&n,argument(2));runtime.Gosched();panic("outer")}
 //go:noinline
 func repeated()(out any,trace []int){defer func(){out=recover()}();for i:=0;i<4;i++{defer record(&trace,i)};runtime.Gosched();panic("repeat")}
 //go:noinline
