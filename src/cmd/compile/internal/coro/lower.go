@@ -89,6 +89,7 @@ type lowerCandidate struct {
 	function          *Function
 	ordinary          *ir.Func
 	transitions       map[*ir.CallExpr]SiteKind
+	openCalls         map[*ir.CallExpr]bool
 	foreignCalls      map[*ir.CallExpr]ForeignCallClass
 	directCalls       map[*ir.CallExpr]lowerDirectCall
 	dependencies      map[*ir.Func]bool
@@ -1088,6 +1089,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	candidate := &lowerCandidate{
 		function:      function,
 		transitions:   make(map[*ir.CallExpr]SiteKind),
+		openCalls:     make(map[*ir.CallExpr]bool),
 		foreignCalls:  make(map[*ir.CallExpr]ForeignCallClass),
 		directCalls:   make(map[*ir.CallExpr]lowerDirectCall),
 		dependencies:  make(map[*ir.Func]bool),
@@ -1203,7 +1205,11 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 			}
 			edge := edges[call]
 			if edge.Callee == nil && len(edge.Targets) == 0 {
-				return nil, fmt.Errorf("dynamic await site %d", site.ID)
+				if call.Op() != ir.OCALLFUNC || call.Fun.Type().Kind() != types.TFUNC ||
+					ir.StaticCalleeName(ir.StaticValue(call.Fun)) != nil {
+					return nil, fmt.Errorf("dynamic await site %d", site.ID)
+				}
+				candidate.openCalls[call] = true
 			}
 			resultCount := call.Fun.Type().NumResults()
 			container := awaitContainers[call]
@@ -1244,14 +1250,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						site.ID, i)
 				}
 			}
-			if len(edge.Targets) != 0 {
-				for _, target := range edge.Targets {
-					candidate.dependencies[target] = true
-				}
-			} else {
-				candidate.dependencies[edge.Callee] = true
-				if edge.Callee == fn {
-					candidate.selfAwait = true
+			if !candidate.openCalls[call] {
+				if len(edge.Targets) != 0 {
+					for _, target := range edge.Targets {
+						candidate.dependencies[target] = true
+					}
+				} else {
+					candidate.dependencies[edge.Callee] = true
+					if edge.Callee == fn {
+						candidate.selfAwait = true
+					}
 				}
 			}
 		case SiteSpawn:
@@ -4648,6 +4656,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			case SiteAwait:
 				for _, init := range state.call.Init() {
 					body = append(body, edit(init))
+				}
+				if candidate.openCalls[state.call] {
+					setup, result, err := lowerOpenAwait(state.call, state.statement, ctx, resume, edit)
+					if err != nil {
+						return err
+					}
+					body = append(body, setup...)
+					actionResult = result
+					break
 				}
 				child, err := factoryCall(state.call, state.statement)
 				if err != nil {

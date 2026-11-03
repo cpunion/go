@@ -25,6 +25,10 @@ var nativeCallableProviders = make(map[*ir.Func]*ir.Func)
 func NativeCallableProvider(fn *ir.Func) *ir.Func { return nativeCallableProviders[fn] }
 
 func callableSignature(fn *ir.Func) *types.Type {
+	return callableTypeSignature(fn.Type())
+}
+
+func callableTypeSignature(signature *types.Type) *types.Type {
 	copyFields := func(fields []*types.Field) []*types.Field {
 		result := make([]*types.Field, len(fields))
 		for i, field := range fields {
@@ -33,7 +37,7 @@ func callableSignature(fn *ir.Func) *types.Type {
 		}
 		return result
 	}
-	return types.NewSignature(nil, copyFields(fn.Type().RecvParams()), copyFields(fn.Type().Results()))
+	return types.NewSignature(nil, copyFields(signature.RecvParams()), copyFields(signature.Results()))
 }
 
 func callableRequestType(signature *types.Type) *types.Type {

@@ -219,6 +219,8 @@ func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroCallRead(unsafe.Pointer, func())
 func coroGC(unsafe.Pointer)
 func coroLookupCallable(uintptr, unsafe.Pointer) unsafe.Pointer
+func coroLookupFunction(interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroHostCall(unsafe.Pointer, func()) uint8
 func coroCallableFactory(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroEnterForeign()
 func coroExitForeign()
