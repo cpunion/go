@@ -37,6 +37,13 @@ func directClosureCall(n *ir.CallExpr) {
 		return // leave for walkClosure to handle
 	}
 
+	// A retained closure entry already uses the context register and may have
+	// other value references. Converting this call would change that entry's
+	// ABI and enqueue the same function again. Keep the normal closure call.
+	if clofn.Needctxt() {
+		return
+	}
+
 	// We are going to insert captured variables before input args.
 	var params []*types.Field
 	var decls []*ir.Name

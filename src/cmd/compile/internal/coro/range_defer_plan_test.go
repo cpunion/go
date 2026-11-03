@@ -42,7 +42,7 @@ func TestRangeDeferOwnerPlans(t *testing.T) {
 			statement.DeferAt = captured
 			body.Body = ir.Nodes{statement, ir.NewReturnStmt(src.NoXPos, ir.Nodes{ir.NewBool(src.NoXPos, true)})}
 			funcs := []*ir.Func{owner, body, leaf}
-			want := mode == "valid" || mode == "ordinary-body" || mode == "separate-markers"
+			want := mode == "valid" || mode == "ordinary-body" || mode == "separate-markers" || mode == "suspending-target"
 			switch mode {
 			case "wrong-owner":
 				body.RangeParent = newLowerTestFunc(pkg, "unrelated")
@@ -119,6 +119,12 @@ func TestRangeDeferOwnerPlans(t *testing.T) {
 				t.Fatal("separate marker positions or registration bodies were lost")
 			}
 			for _, registration := range got.bodies {
+				if mode == "suspending-target" {
+					deferred := registration.cleanup.defers[0]
+					if len(deferred.resumable) != 1 || !deferred.resumable[0].async || deferred.resumable[0].target != leaf || !registration.cleanup.dependencies[leaf] {
+						t.Fatal("suspending registration lost exact target factory dependency")
+					}
+				}
 				if registration.owner != got || len(registration.cleanup.defers) != 1 ||
 					!registration.cleanup.dynamicDefers || registration.cleanup.function != registration.function {
 					t.Fatal("cleanup targets lost their exact enclosing owner plan")

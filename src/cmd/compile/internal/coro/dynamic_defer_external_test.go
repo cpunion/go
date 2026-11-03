@@ -179,9 +179,8 @@ func main() {
 			{"captured", "defer has no static call plan"},
 			{"addressed", "defer has no static call plan"},
 			{"literal", "suspending defer"},
-			{"suspended", "suspending defer"},
 		},
-		[]string{"snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting", "terminal", "terminalRecover", "terminalExit"})
+		[]string{"suspended", "snapshot", "repeated", "returned", "zero", "variadic", "nilCall", "nilArgument", "repeatedNil", "nilReplacesPanic", "nilDuringExit", "argumentPanic", "implicitPanic", "bodyPanic", "exiting", "terminal", "terminalRecover", "terminalExit"})
 }
 
 func TestDynamicDeferImported(t *testing.T) {

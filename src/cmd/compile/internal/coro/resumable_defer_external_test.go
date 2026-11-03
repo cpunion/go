@@ -56,6 +56,12 @@ func repeated()(out any,trace []int){defer func(){out=recover()}();for i:=0;i<4;
 func values(y func(int)bool){for i:=1;i<=3;i++{if !y(i){return}}}
 //go:noinline
 func rangeOwner()(out any,trace []int){defer func(){out=recover()}();for v:=range values{defer record(&trace,v)};runtime.Gosched();panic("range")}
+//go:noinline
+func literalRepeated()(trace []int){for i:=0;i<4;i++{v:=i;defer func(){runtime.Gosched();trace=append(trace,v)}();v+=10};runtime.Gosched();return}
+//go:noinline
+func literalArguments()(out any,trace []int){defer func(){out=recover()}();for i:=0;i<3;i++{defer func(v int){runtime.Gosched();trace=append(trace,v);if v!=0{panic(v)}}(i)};runtime.Gosched();panic("body")}
+//go:noinline
+func immediateOwner()(out any){func(){defer publicRecover(&out);panic("immediate")}();return}
 var saved func(int)bool
 var callbackReady,callbackRelease chan struct{}
 //go:noinline
@@ -84,7 +90,7 @@ func publicOrdinary()(out any){defer publicRecover(&out);if publicFlag!=0{goto f
 func parked(v int,ready,gate chan struct{},done chan int)(out any,n int){defer func(){if out!="park"{panic("park recovery")};done<-n}();defer asyncRecover(&out,&n,v);ready<-struct{}{};<-gate;panic("park")}
 //go:noinline
 func startParked(v int,ready,gate chan struct{},done chan int){go parked(v,ready,gate,done)}
-func controls(){evaluated=0;if onlyDefer()!=7{panic("only deferred suspension")};if out,n:=literal();out!="literal"||n!=7{panic("literal recover")};if out,n:=namedOwner();out!="named"||n!=3{panic("named operands")};if out,n:=captured();out!="captured"||n!=7{panic("captured selected callee")};for _,b:=range []bool{false,true}{out,n:=dynamicOwner(b);want:=3;if b{want=6};if out!="dynamic"||n!=want{panic("dynamic closed targets")};out,n=mixedOwner(b);want=2;if b{want=6};if out!="mixed"||n!=want{panic("mixed synchronous targets")}};if _,ok:=nilOwner(true).(runtime.Error);!ok{panic("nil invocation")};if nilOwner(false)!="outer"{panic("non-nil invocation")};if evaluated!=6{panic("frozen argument count")};if out,t:=repeated();out!="repeat"||len(t)!=4||t[0]!=3||t[1]!=2||t[2]!=1||t[3]!=0{panic("repeated LIFO")};if out,t:=rangeOwner();out!="range"||len(t)!=3||t[0]!=3||t[1]!=2||t[2]!=1{panic("range LIFO")};if normalOwner()!="normal"{panic("normal call isolation")};if recursiveOwner()!="recursive"{panic("recursive recover isolation")};if nestedOwner()!="outer"{panic("nested owner panic")};d:=make(chan int);go exitOwner(d);if <-d!=1{panic("exit cleanup")};go exitPanicOwner(d);if <-d!=2{panic("sticky exit cleanup")};if _,ok:=nilPanicOwner().(*runtime.PanicNilError);!ok{panic("nil panic recovery")};if publicOrdinary()!="public"{panic("ordinary public direct recover")}}
+func controls(){if immediateOwner()!="immediate"{panic("immediate closure recovery")};if t:=literalRepeated();len(t)!=4||t[0]!=13||t[1]!=12||t[2]!=11||t[3]!=10{panic("live repeated closure cells")};if out,t:=literalArguments();out!=1||len(t)!=3||t[0]!=2||t[1]!=1||t[2]!=0{panic("argument literal panic replacement")};evaluated=0;if onlyDefer()!=7{panic("only deferred suspension")};if out,n:=literal();out!="literal"||n!=7{panic("literal recover")};if out,n:=namedOwner();out!="named"||n!=3{panic("named operands")};if out,n:=captured();out!="captured"||n!=7{panic("captured selected callee")};for _,b:=range []bool{false,true}{out,n:=dynamicOwner(b);want:=3;if b{want=6};if out!="dynamic"||n!=want{panic("dynamic closed targets")};out,n=mixedOwner(b);want=2;if b{want=6};if out!="mixed"||n!=want{panic("mixed synchronous targets")}};if _,ok:=nilOwner(true).(runtime.Error);!ok{panic("nil invocation")};if nilOwner(false)!="outer"{panic("non-nil invocation")};if evaluated!=6{panic("frozen argument count")};if out,t:=repeated();out!="repeat"||len(t)!=4||t[0]!=3||t[1]!=2||t[2]!=1||t[3]!=0{panic("repeated LIFO")};if out,t:=rangeOwner();out!="range"||len(t)!=3||t[0]!=3||t[1]!=2||t[2]!=1{panic("range LIFO")};if normalOwner()!="normal"{panic("normal call isolation")};if recursiveOwner()!="recursive"{panic("recursive recover isolation")};if nestedOwner()!="outer"{panic("nested owner panic")};d:=make(chan int);go exitOwner(d);if <-d!=1{panic("exit cleanup")};go exitPanicOwner(d);if <-d!=2{panic("sticky exit cleanup")};if _,ok:=nilPanicOwner().(*runtime.PanicNilError);!ok{panic("nil panic recovery")};if publicOrdinary()!="public"{panic("ordinary public direct recover")}}
 func main(){controls();runtime.LockOSThread();controls();runtime.UnlockOSThread();r:=make(chan struct{},32);g:=make(chan struct{});d:=make(chan int,32);for i:=0;i<32;i++{startParked(i,r,g,d)};for i:=0;i<32;i++{<-r};runtime.GC();close(g);sum:=0;for i:=0;i<32;i++{sum+=<-d};if sum!=496{panic("parked cleanup GC roots")};mixedThreads(false);mixedThreads(true);println("resumable-defer-calls-ok")}
 `
 	for _, config := range []struct{ name, experiment, flags string }{
@@ -108,7 +114,7 @@ func main(){controls();runtime.LockOSThread();controls();runtime.UnlockOSThread(
 				t.Fatalf("build: %v\n%s", err, out)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"publicRecover", "asyncRecover", "otherRecover", "record", "asyncPanic", "onlyDefer", "literal", "namedOwner", "captured", "dynamicOwner", "mixedOwner", "nilOwner", "repeated", "rangeOwner", "escapedOwner", "normalOwner", "recurseRecover", "recursiveOwner", "nestedOwner", "exitOwner", "exitPanicOwner", "nilPanicOwner", "parked", "startParked"} {
+				for _, name := range []string{"publicRecover", "asyncRecover", "otherRecover", "record", "asyncPanic", "onlyDefer", "literal", "namedOwner", "immediateOwner", "immediateOwner.func1", "literalRepeated", "literalArguments", "captured", "dynamicOwner", "mixedOwner", "nilOwner", "repeated", "rangeOwner", "escapedOwner", "normalOwner", "recurseRecover", "recursiveOwner", "nestedOwner", "exitOwner", "exitPanicOwner", "nilPanicOwner", "parked", "startParked"} {
 					t.Run(name, func(t *testing.T) {
 						if linkedCoroStackUnsafe(t, binary, "main."+name+".coro.stackgate") {
 							t.Fatal("resumable defer lost required native admission")

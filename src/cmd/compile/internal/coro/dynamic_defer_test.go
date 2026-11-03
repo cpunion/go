@@ -86,7 +86,7 @@ func TestLowerDynamicDefer(t *testing.T) {
 				t.Fatal(err)
 			}
 			edge := edgeForCall(plan.Functions[f.caller], f.call)
-			want := mode == "valid" || mode == "repeated" || mode == "direct" || mode == "direct-repeated" || mode == "direct-terminal" || mode == "nil-write" || mode == "imported" || mode == "static-wrapper" || mode == "terminal"
+			want := mode == "valid" || mode == "repeated" || mode == "direct" || mode == "direct-repeated" || mode == "direct-terminal" || mode == "nil-write" || mode == "imported" || mode == "static-wrapper" || mode == "terminal" || mode == "suspending"
 			if want && mode != "static-wrapper" && (edge.Kind != DeferCall || edge.Callee != nil || edge.Unknown || len(edge.Targets) != 1 || edge.Targets[0] != f.child) {
 				t.Fatalf("lost closed defer proof: %+v", edge)
 			}
@@ -102,7 +102,7 @@ func TestLowerDynamicDefer(t *testing.T) {
 			}
 			if !want {
 				wantReason := map[string]string{
-					"unknown": "defer target has unknown effects", "suspending": "suspending defer",
+					"unknown":           "defer target has unknown effects",
 					"exec":              "defer target has execution constraints task-context",
 					"source-closure":    "suspending defer",
 					"imported-terminal": "unsupported terminal control panic",
