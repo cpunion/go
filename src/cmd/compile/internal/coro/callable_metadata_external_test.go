@@ -73,7 +73,7 @@ func main(){
 	} {
 		t.Run(config.name, func(t *testing.T) {
 			exe := filepath.Join(tmp, config.name+".exe")
-			args := []string{"build", "-gcflags=" + config.flags, "-ldflags=-checklinkname=0"}
+			args := []string{"build", "-gcflags=" + config.flags + " -d=coro=4", "-ldflags=-checklinkname=0"}
 			if config.link == "-w" {
 				args[len(args)-1] += " -w"
 			} else if config.link != "" {

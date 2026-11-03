@@ -124,7 +124,7 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 			frame := typecheck.TempAt(pos, companion, ptr)
 			resume := typecheck.TempAt(pos, companion, stacklessResumeType())
 			companion.Body = ir.Nodes{
-				ir.NewAssignListStmt(pos, ir.OAS2FUNC, ir.Nodes{frame, resume}, ir.Nodes{call}),
+				ir.NewAssignListStmt(pos, ir.OAS2, ir.Nodes{frame, resume}, ir.Nodes{call}),
 				ir.NewReturnStmt(pos, ir.Nodes{frame, resume}),
 			}
 		}
