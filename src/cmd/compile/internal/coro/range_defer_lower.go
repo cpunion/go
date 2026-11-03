@@ -92,7 +92,7 @@ func prepareRangeHybridBodies(plan *Plan, owners map[*ir.Func]*rangeDeferOwnerPl
 				break
 			}
 			for i, original := range statements {
-				registration, err := prepareRangeHybridRegistration(body.cleanup.defers[i], original, ordinary)
+				registration, err := prepareRangeHybridRegistration(plan, body.cleanup.defers[i], original, ordinary)
 				if err != nil {
 					owner.err = fmt.Errorf("%s: %w", ir.PkgFuncName(fn), err)
 					break
@@ -106,11 +106,20 @@ func prepareRangeHybridBodies(plan *Plan, owners map[*ir.Func]*rangeDeferOwnerPl
 	}
 }
 
-func prepareRangeHybridRegistration(source *lowerDefer, ordinary *ir.GoDeferStmt,
+func prepareRangeHybridRegistration(plan *Plan, source *lowerDefer, ordinary *ir.GoDeferStmt,
 	parent *ir.Func) (*rangeHybridRegistration, error) {
 	call, ok := ordinary.Call.(*ir.CallExpr)
+	lifted := plan.operandCalls[source.statement]
+	var selected *ir.Name
+	if lifted != nil && lifted.created {
+		if closure, ok := source.call.Fun.(*ir.ClosureExpr); ok && closure.Func == lifted.wrapper &&
+			len(closure.Func.ClosureVars) == 1 {
+			selected = closure.Func.ClosureVars[0]
+		}
+	}
 	if !ok || ordinary.Op() != ir.ODEFER || call.Fun == nil || len(call.Args) != 0 ||
-		!types.Identical(source.call.Fun.Type(), call.Fun.Type()) || ordinary.DeferAt == nil ||
+		(selected == nil && !types.Identical(source.call.Fun.Type(), call.Fun.Type()) ||
+			selected != nil && !types.Identical(selected.Type(), call.Fun.Type())) || ordinary.DeferAt == nil ||
 		!ordinary.DeferAt.Type().IsEmptyInterface() {
 		return nil, fmt.Errorf("ordinary range defer has no matching normalized call")
 	}
@@ -126,6 +135,11 @@ func prepareRangeHybridRegistration(source *lowerDefer, ordinary *ir.GoDeferStmt
 	copy.call.SetInit(nil)
 	copy.statement = ir.NewGoDeferStmt(pos, ir.ODEFER, copy.call)
 	if closure, ok := source.call.Fun.(*ir.ClosureExpr); ok {
+		if selected != nil {
+			copy.call.Fun = copyRangeDeferBody(closure.Func, parent, map[*ir.Name]*ir.Name{selected: frozen})
+			return &rangeHybridRegistration{statement: ordinary, parent: parent,
+				cleanup: &copy, frozen: frozen, token: token, anchor: anchor}, nil
+		}
 		original, ok := call.Fun.(*ir.ClosureExpr)
 		if !ok {
 			return nil, fmt.Errorf("ordinary range defer lost its source function body")

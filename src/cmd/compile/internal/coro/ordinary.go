@@ -20,6 +20,9 @@ type BodyReader struct {
 	Read func(*ir.Func) *ir.Func
 	// Clone reads a source body under a compiler-owned helper symbol.
 	Clone func(*ir.Func, *types.Sym) *ir.Func
+	// PinCaptures gives every serialized copy of this source closure the
+	// same traced *T environment fields before escape analysis.
+	PinCaptures func(*ir.Func) bool
 }
 
 // addOrdinaryBody keeps the source body in the public entry, rather than

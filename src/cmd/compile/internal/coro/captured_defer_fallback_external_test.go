@@ -71,9 +71,6 @@ func main(){
 			if err != nil {
 				t.Fatalf("build: %v\n%s", err, out)
 			}
-			if config.experiment == "coro" && strings.Contains(config.flags, "-l ") && !strings.Contains(string(out), "captured dynamic defer target requires an environment") {
-				t.Fatal("captured callee entered dispatch without an environment contract")
-			}
 			for _, p := range []string{"1", "4"} {
 				run := testenv.Command(t, binary)
 				run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=1")

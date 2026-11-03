@@ -330,9 +330,10 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			return body
 		}
 		bodies := &coro.BodyReader{
-			Have:  noder.HaveCoroBody,
-			Read:  func(fn *ir.Func) *ir.Func { return readBody(fn, nil) },
-			Clone: readBody,
+			Have:        noder.HaveCoroBody,
+			Read:        func(fn *ir.Func) *ir.Func { return readBody(fn, nil) },
+			Clone:       readBody,
+			PinCaptures: noder.PinCoroCaptures,
 		}
 		var plan *coro.Plan
 		var err error
