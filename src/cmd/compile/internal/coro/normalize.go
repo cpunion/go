@@ -127,6 +127,8 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		return
 	case *ir.ReturnStmt, *ir.AssignStmt, *ir.AssignListStmt:
 		root = stmt
+	case *ir.AssignOpStmt:
+		root = stmt
 	case *ir.CallExpr:
 		root = stmt
 	default:
@@ -136,6 +138,16 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 
 	if assignment, ok := root.(*ir.AssignListStmt); ok {
 		ordered := normalizeTupleAssignmentOrder(assignment, fn, operations)
+		normalizeCallList(ordered, fn, operations, labels...)
+		prefix = append(prefix, ordered...)
+	}
+	if assignment, ok := root.(*ir.AssignOpStmt); ok && ir.Any(root, func(node ir.Node) bool { return operations[node] }) {
+		// Order calls/receives in the destination before the RHS, without
+		// taking its address or reading its value. Ordinary Go leaves simple
+		// loads and the eventual nil/bounds/store checks after RHS calls.
+		var ordered ir.Nodes
+		assignment.X = orderedCallValue(assignment.X, fn, &ordered)
+		assignment.Y = orderedCallValue(assignment.Y, fn, &ordered)
 		normalizeCallList(ordered, fn, operations, labels...)
 		prefix = append(prefix, ordered...)
 	}

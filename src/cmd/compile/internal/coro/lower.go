@@ -1204,6 +1204,9 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
+			if plan.edgeNeedsValueHandoff(edge) {
+				candidate.openCalls[call] = true
+			}
 			if edge.Callee == nil && len(edge.Targets) == 0 {
 				if call.Op() != ir.OCALLFUNC || call.Fun.Type().Kind() != types.TFUNC ||
 					ir.StaticCalleeName(ir.StaticValue(call.Fun)) != nil {
