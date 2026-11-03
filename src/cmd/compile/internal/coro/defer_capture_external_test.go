@@ -117,16 +117,13 @@ func main() {
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
-				for _, name := range []string{"counter.result", "recovered", "exiting"} {
+				for _, name := range []string{"counter.result", "repeated", "recovered", "exiting"} {
 					if !strings.Contains(string(symbols), "main."+name+".coro") {
 						t.Errorf("missing native factory %s\n%s", name, out)
 					}
-				}
-				// Repeated nested captures still use the existing conservative
-				// fallback unless inlining removes the nested closure.
-				if config.name != "inline" && !strings.Contains(string(out),
-					"coro: skip main.repeated: nested repeated source defer capture") {
-					t.Errorf("repeated nested capture did not preserve its fallback boundary\n%s", out)
+					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+						t.Errorf("nested defer capture lost native admission: %s", name)
+					}
 				}
 			}
 			for _, procs := range []int{1, 4} {
