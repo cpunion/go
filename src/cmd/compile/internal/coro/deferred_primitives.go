@@ -61,7 +61,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 				return
 			}
 			name := ir.StaticCalleeName(call.Fun)
-			if name == nil || call.Fun != name {
+			if name == nil || ir.StaticValue(call.Fun) != call.Fun {
 				return
 			}
 			if child := localize(name.Func); child != nil {
@@ -117,7 +117,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 					return
 				}
 				name := ir.StaticCalleeName(inner.Fun)
-				if name == nil || inner.Fun != name || name.Func != wrapper.WrappedFunc ||
+				if name == nil || ir.StaticValue(inner.Fun) != inner.Fun || name.Func != wrapper.WrappedFunc ||
 					!deferredSyncMethod(name.Func) {
 					return
 				}

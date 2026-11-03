@@ -670,6 +670,9 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			result.Skipped++
 		}
 	}
+	if result.Lowered != 0 {
+		clearRewrittenVariableDefinitions(typecheck.Target.Funcs)
+	}
 	recordNativeStackMetadata(candidates)
 	result.Skipped -= result.Lowered
 	return result, nil
