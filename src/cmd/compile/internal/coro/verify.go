@@ -71,7 +71,7 @@ func (p *Plan) Verify() error {
 
 func siteMaySuspend(site Site) bool {
 	switch site.Kind {
-	case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify:
+	case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify, SiteGC:
 		return true
 	case SiteForeign:
 		return site.Foreign == AsyncOperation

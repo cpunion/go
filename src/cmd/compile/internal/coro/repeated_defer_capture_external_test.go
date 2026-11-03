@@ -57,9 +57,14 @@ func recoveredLoop()(caught any,trace []int) {
  for i:=0;i<4;i++ { x:=i; defer func(){trace=append(trace,func()int{return x}());if v:=recover();v!=nil{caught=v}}() }
  runtime.Gosched(); panic("body")
 }
+var recoverChecks int
+//go:noinline
+func recoverProbe(out *any) {recoverChecks++;*out=recover()}
+//go:noinline
+func publicProbe()(caught any) {defer recoverProbe(&caught);panic("public probe")}
 //go:noinline
 func indirectRecover()(caught any,trace []int) {
- for i:=0;i<4;i++ { x:=i; defer func(){if func()any{return recover()}()!=nil{panic("nested normal recover stole panic")};trace=append(trace,func()int{return x}());if v:=recover();v!=nil{caught=v}}() }
+ for i:=0;i<4;i++ { x:=i; defer func(){var nested any;recoverProbe(&nested);if nested!=nil{panic("nested normal recover stole panic")};trace=append(trace,func()int{return x}());if v:=recover();v!=nil{caught=v}}() }
  runtime.Gosched(); panic("body")
 }
 //go:noinline
@@ -81,7 +86,7 @@ func parked(v int,ready,gate chan struct{})(n int) {
  ready<-struct{}{};<-gate;return
 }
 //go:noinline
-func worker(v int,ready,gate chan struct{},done chan int) {n:=parked(v,ready,gate);done<-n}
+func worker(v int,ready,gate chan struct{},done chan int) {runtime.GC();n:=parked(v,ready,gate);runtime.GC();done<-n}
 func check(got []int,want ...int) {if len(got)!=len(want){panic("trace length")};for i,n:=range want{if got[i]!=n{panic("trace value")}}}
 func controls() {
  check(repeatedCells(),13,12,11,10);check(sharedCells(),4,4,4,4);check(typedCapture(),17,15,13,11)
@@ -89,7 +94,8 @@ func controls() {
  ps:=aliasAddresses();runtime.GC();for i,p:=range ps{if *p!=i+10{panic("nested capture address")};for j:=0;j<i;j++{if ps[j]==p{panic("aliased iteration cell")}}}
  caught,trace:=panicOwner();if caught!=1{panic("replacement panic")};check(trace,3,2,1,0)
  caught,trace=recoveredLoop();if caught!="body"{panic("direct repeated recover")};check(trace,3,2,1,0)
- caught,trace=indirectRecover();if caught!="body"{panic("indirect recover isolation")};check(trace,3,2,1,0)
+ before:=recoverChecks;caught,trace=indirectRecover();if caught!="body"||recoverChecks!=before+4{panic("indirect recover isolation or effects")};check(trace,3,2,1,0)
+ if publicProbe()!="public probe"||recoverChecks!=before+5{panic("public recover entry changed")}
  done:=make(chan []int,1);go exitOwner(done);check(<-done,3,2,1,0);check(rangeOwner(),13,12,11)
 }
 func main() {

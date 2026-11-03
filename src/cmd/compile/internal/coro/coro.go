@@ -189,6 +189,7 @@ const (
 	SchedulerYield
 	TimerWait
 	UnknownCall
+	GCWait
 )
 
 func (s Seed) String() string {
@@ -207,6 +208,8 @@ func (s Seed) String() string {
 		return "timer-wait"
 	case UnknownCall:
 		return "unknown-call"
+	case GCWait:
+		return "gc-wait"
 	default:
 		return fmt.Sprintf("Seed(%d)", s)
 	}
@@ -593,6 +596,8 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 					addSeed(SchedulerYield)
 				case SiteTimer:
 					addSeed(TimerWait)
+				case SiteGC:
+					addSeed(GCWait)
 				}
 			}
 			if kind != GoCall && recipe.Kind != SiteInvalid {
