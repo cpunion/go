@@ -28,6 +28,7 @@ const (
 	actionGoexit
 	actionSwitch
 	actionHandoff
+	actionHost
 )
 
 // Keep these in sync with runtime's stackless coroutine frame chunk sizes. The
@@ -365,6 +366,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 
 	prepareRangeHybridBodies(plan, plan.rangeOwners, candidates, bodies)
 	factories := make(map[*ir.Func]*ir.Func)
+	plainFactories := make(map[*ir.Func]*ir.Func)
 	var callbackTargets []*ir.Func
 	for target := range plan.callbackFactories {
 		callbackTargets = append(callbackTargets, target)
@@ -382,6 +384,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				}
 			}
 			factories[target] = newPlainSpawnFactory(target, callee.Nname)
+			plainFactories[target] = factories[target]
 			if resumeFactorySupported(target) {
 				child.Factory = FactoryABI1
 			}
@@ -414,6 +417,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 						callee = target.Nname
 					}
 					factories[target] = newPlainSpawnFactory(child.Func, callee)
+					plainFactories[target] = factories[target]
 					child.Factory = FactoryABI1
 				}
 			}
@@ -674,7 +678,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	if result.Lowered != 0 {
 		clearRewrittenVariableDefinitions(typecheck.Target.Funcs)
 	}
-	emitNativeCallableMetadata(candidates)
+	emitNativeCallableMetadata(candidates, plainFactories)
 	recordNativeStackMetadata(candidates)
 	result.Skipped -= result.Lowered
 	return result, nil
@@ -4430,7 +4434,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						body = append(body, setup...)
 						body = append(body, ir.NewIfStmt(goStmt.Pos(),
 							ir.NewBinaryExpr(goStmt.Pos(), ir.OEQ, action,
-								typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionWait))), ir.Nodes{
+								typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionHost))), ir.Nodes{
 								assignResumePC(state.next),
 								ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{action}),
 							}, nil))

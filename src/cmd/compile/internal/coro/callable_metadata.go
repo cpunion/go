@@ -59,27 +59,35 @@ func callableRequestType(signature *types.Type) *types.Type {
 // emitNativeCallableMetadata runs after the ordinary bodies and capture
 // layouts have been fixed. Only independently admitted factories receive a
 // companion. Missing entries remain distinguishable from native capability.
-func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate) {
+func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFactories map[*ir.Func]*ir.Func) {
 	var sources []*ir.Func
 	for source := range candidates {
 		sources = append(sources, source)
+	}
+	for source := range plainFactories {
+		if candidates[source] == nil {
+			sources = append(sources, source)
+		}
 	}
 	slices.SortFunc(sources, func(a, b *ir.Func) int {
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, source := range sources {
-		candidate := candidates[source]
 		if source.Type().HasShape() || !callableFactorySupported(source) {
 			continue
 		}
-		factory := candidate.factory
-		if candidate.rootArray != nil {
-			// An erased call starts a new lineage. The public factory keeps
-			// the source ABI and allocates private array storage; its internal
-			// implementation also takes a selector for serial self-awaits.
-			factory = candidate.rootArray.public
+		// Bounded ordinary-call adapters already have their own native
+		// proof. Expose that capability to erased dispatch too; a missing
+		// ordinary adapter must still remain a missing descriptor.
+		factory, factoryABI := plainFactories[source], FactoryABI1
+		if candidate := candidates[source]; candidate != nil {
+			factory, factoryABI = candidate.factory, candidate.factoryABI
+			if candidate.rootArray != nil {
+				// An erased call starts a new lineage with private array storage.
+				factory = candidate.rootArray.public
+			}
 		}
-		emitNativeCallable(source, factory, candidate.factoryABI)
+		emitNativeCallable(source, factory, factoryABI)
 	}
 }
 

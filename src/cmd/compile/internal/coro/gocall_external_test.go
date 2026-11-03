@@ -166,18 +166,30 @@ func main() {
 				"-gcflags=-l -d=coro=4", "-o", exe, source)
 			cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=coro", "GOWORK=off")
 			out, err := cmd.CombinedOutput()
-			if err != nil || !strings.Contains(string(out), "coro: skip main.spawn:") {
-				t.Fatalf("missing conservative fallback: %v\n%s", err, out)
+			if err != nil || strings.Contains(string(out), "coro: skip main.spawn:") {
+				t.Fatalf("dynamic source creator did not remain native: %v\n%s", err, out)
 			}
-			cmd = testenv.Command(t, exe)
-			cmd.Env = append(cmd.Environ(), "GOMAXPROCS=1", "GOGC=1")
-			if out, err := cmd.CombinedOutput(); err != nil ||
-				strings.TrimSpace(string(out)) != "go-call-fallback-ok" {
-				t.Fatalf("execution = (%v, %q), want go-call-fallback-ok", err, out)
+			for _, name := range []string{"spawn", "worker"} {
+				if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+					t.Fatalf("dynamic go lost native admission: %s", name)
+				}
 			}
-			cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s", `^main\.spawn$`, exe)
-			if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "runtime.newproc(SB)") {
-				t.Fatalf("ordinary go call was not retained: %v\n%s", err, out)
+			for _, p := range []string{"1", "4"} {
+				cmd = testenv.Command(t, exe)
+				cmd.Env = append(cmd.Environ(), "GOMAXPROCS="+p, "GOGC=1")
+				if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "go-call-fallback-ok" {
+					t.Fatalf("P%s execution = (%v, %q), want go-call-fallback-ok", p, err, out)
+				}
+			}
+			cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s", `^main[.]spawn[.]coro[.]func[0-9]+$`, exe)
+			out, err = cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("inspect native creator: %v\n%s", err, out)
+			}
+			for _, helper := range []string{"runtime.coroLookupFunction", "runtime.coroSpawnFrame", "runtime.coroSpawnOpaque"} {
+				if !strings.Contains(string(out), helper) {
+					t.Fatalf("native creator lost managed dispatch %s:\n%s", helper, out)
+				}
 			}
 		})
 	}

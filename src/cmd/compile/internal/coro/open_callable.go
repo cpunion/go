@@ -150,8 +150,8 @@ func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 		ir.NewBinaryExpr(pos, ir.ONE, descriptor, ir.NewNilExpr(pos, ptr)), native, fallback)
 	if spawn {
 		// Execute the frontend's original nil-go startup on the ordinary
-		// host. The registering task must return Wait before this thunk can
-		// run; a raw GoStmt on the fixed executor has no stack proof.
+		// host. The registering task must return the host action before this
+		// thunk can run; Wait does not release an ordinary-host handoff.
 		nilThunk := ir.NewClosureFunc(pos, pos, ir.OCLOSURE,
 			types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
 		nilThunk.DeclareParams(true)

@@ -94,7 +94,7 @@ func recursive(depth int, done chan int) {
  f:=recursive
  go f(depth-1,done)
 }
-// Open targets and caller cells that a source closure can mutate stay ordinary.
+// Open targets and mutable caller cells exercise descriptor dispatch.
 var global=yielding
 func parameter(f func(chan int,int)int, done chan int) {go f(done,1)}
 func globalSpawn(done chan int) {go global(done,2)}
@@ -151,13 +151,9 @@ func main() {
  println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"parameter", "dynamic spawn site"}, {"globalSpawn", "dynamic spawn site"},
-			{"captured", "dynamic spawn site"}, {"addressed", "dynamic spawn site"},
-			{"missingFactory", "unsupported coroutine dependency main.missing"},
-		},
-		[]string{"spawn", "mixed", "zero", "plainZero", "variadic", "returned", "argumentSpawn", "argumentPanic", "argumentExit", "exiting", "recursive"})
+	testSwitchReturnProgram(t, source, nil,
+		[]string{"spawn", "mixed", "zero", "plainZero", "variadic", "returned", "argumentSpawn", "argumentPanic", "argumentExit", "exiting", "recursive",
+			"parameter", "globalSpawn", "captured", "addressed", "missingFactory"})
 }
 
 func TestDynamicSpawnFatal(t *testing.T) {
@@ -232,6 +228,6 @@ func main() {
 `,
 	}
 	testSwitchReturnFiles(t, files, "example.com/dynamicspawn/...=",
-		[]switchFallback{{"missing", "unsupported coroutine dependency example.com/dynamicspawn/leaf.Plain"}},
-		[]string{"spawn"})
+		nil,
+		[]string{"spawn", "missing"})
 }

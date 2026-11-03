@@ -63,7 +63,7 @@ func snapshotOwner(produce func()callback,arg func()int,ch chan int) {go produce
 func lateVariableOwner(ch chan int) {go chosen(ch,replace());runtime.Gosched()}
 func produce()callback {producerCalls++;return chosen}
 func nilOwner(f func(int),arg func()int) {defer func(){if recover()!=nil{println("parent-recovered")}}();go f(arg());select{}}
-func nilEmptyOwner(f func()) {defer func(){if recover()!=nil{println("parent-recovered")}}();go f();select{}}
+func nilEmptyOwner(f func()) {defer func(){if recover()!=nil{println("parent-recovered")}}();println("nil-go-before");go f();println("nil-go-after");select{}}
 func argument()int {println("argument-evaluated");return 9}
 
 var spawnEntry=spawnOwner
@@ -159,7 +159,10 @@ func main() {
 							t.Fatalf("P%s: %v\n%s", p, err, data)
 						}
 					} else if timedOut || err == nil || strings.Contains(string(data), "parent-recovered") ||
-						mode == "nil-argument" && strings.Count(string(data), "argument-evaluated") != 1 ||
+						mode == "nil-argument" && (strings.Count(string(data), "argument-evaluated") != 1 ||
+							!strings.Contains(string(data), "panic: runtime error: invalid memory address or nil pointer dereference")) ||
+						mode == "nil-empty" && (!strings.Contains(string(data), "go of nil func value") ||
+							!strings.Contains(string(data), "nil-go-before") || strings.Contains(string(data), "nil-go-after")) ||
 						mode == "panic-native" && !strings.Contains(string(data), "child-native-panic") ||
 						mode == "panic-opaque" && !strings.Contains(string(data), "child-opaque-panic") {
 						t.Fatalf("P%s %s changed child terminal outcome: %v\n%s", p, mode, err, data)
