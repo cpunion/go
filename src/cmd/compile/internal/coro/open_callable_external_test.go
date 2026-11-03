@@ -38,6 +38,15 @@ func emptyOwner(f func(*box,int),p *box,n int){f(p,n);runtime.Gosched()}
 func nilOwner(f callback,arg func()int)(caught any){defer func(){caught=recover()}();f(arg());runtime.Gosched();return}
 func snapshotOwner(produce func()callback,arg func()int)int{value:=produce()(arg());runtime.Gosched();return value}
 func assignmentOwner(f func(int)(int,int))([2]int,int){values:=[2]int{};index:=0;values[index],index=f(7);runtime.Gosched();return values,index}
+func plainArgumentOwner()int{value:=chosen(plainArgument());runtime.Gosched();return value}
+func knownSnapshotOwner()int{value:=produce()(argument());runtime.Gosched();return value}
+var trace string
+func destination()int{trace+="d";return 0}
+func tracedArgument()int{trace+="a";return 7}
+func tracedPair(n int)(int,int){trace+="p";runtime.Gosched();return n+10,1}
+func effectAssignmentOwner(f func(int)(int,int),arg func()int)([2]int,int){values:=[2]int{};index:=0;values[destination()],index=f(arg());runtime.Gosched();return values,index}
+func boundsOwner(f func(int)(int,int))(caught any){defer func(){caught=recover()}();values:=[2]int{};index:=2;values[index],index=f(7);runtime.Gosched();return}
+func partialOwner(f func(int)(int,int))(caught any){one:=&box{};defer func(){caught=recover();if one.n!=17{panic("tuple stores did not proceed left to right")}}();var two *box;one.n,two.n=f(7);runtime.Gosched();return}
 var ownerEntry=owner
 var methodEntry=methodOwner
 var tupleEntry=tupleOwner
@@ -46,10 +55,16 @@ var emptyEntry=emptyOwner
 var nilEntry=nilOwner
 var snapshotEntry=snapshotOwner
 var assignmentEntry=assignmentOwner
+var plainArgumentEntry=plainArgumentOwner
+var knownSnapshotEntry=knownSnapshotOwner
+var effectAssignmentEntry=effectAssignmentOwner
+var boundsEntry=boundsOwner
+var partialEntry=partialOwner
 var chosen callback
 var producerCalls,argumentCalls int
 func produce()callback{producerCalls++;return chosen}
 func argument()int{argumentCalls++;chosen=plain;return 7}
+func plainArgument()int{argumentCalls++;chosen=plain;return 7}
 func main(){
  if ownerEntry(named,7)!=11||calls!=2{panic("native open function result or source replay")}
  if ownerEntry(plain,7)!=13||calls!=4{panic("ordinary open function result or source replay")}
@@ -64,8 +79,16 @@ func main(){
  if _,ok:=nilEntry(nil,argument).(runtime.Error);!ok||argumentCalls!=1{panic("nil function argument evaluation")}
  chosen=named;producerCalls=0;argumentCalls=0
  if snapshotEntry(produce,argument)!=10||producerCalls!=1||argumentCalls!=1{panic("open function snapshot or operand replay")}
+ chosen=named;argumentCalls=0
+ if plainArgumentEntry()!=12||argumentCalls!=1{panic("plain argument/callee order differs from official")}
+ chosen=named;producerCalls=0;argumentCalls=0
+ if knownSnapshotEntry()!=10||producerCalls!=1||argumentCalls!=1{panic("known callee producer/argument call order")}
  values,index:=assignmentEntry(pair)
  if values!=[2]int{17,0}||index!=1{panic("open result assignment destination order")}
+ trace="";values,index=effectAssignmentEntry(tracedPair,tracedArgument)
+ if values!=[2]int{17,0}||index!=1||trace!="dap"{panic("tuple destination/callee operand order")}
+ trace="";if _,ok:=boundsEntry(tracedPair).(runtime.Error);!ok||trace!="p"{panic("tuple bounds check crossed producer")}
+ trace="";if _,ok:=partialEntry(tracedPair).(runtime.Error);!ok||trace!="p"{panic("tuple partial stores or panic order")}
  runtime.GC();if out.n!=37||out.pad[4095]!=23{panic("open result pointer liveness")}
  println("open-callable-ok")
 }
@@ -103,7 +126,7 @@ func main(){
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, data)
 				}
-				for _, name := range []string{"owner", "methodOwner", "tupleOwner", "variadicOwner", "emptyOwner", "nilOwner", "snapshotOwner", "assignmentOwner", "named"} {
+				for _, name := range []string{"owner", "methodOwner", "tupleOwner", "variadicOwner", "emptyOwner", "nilOwner", "snapshotOwner", "assignmentOwner", "plainArgumentOwner", "knownSnapshotOwner", "effectAssignmentOwner", "boundsOwner", "partialOwner", "named"} {
 					if !hasSwitchReturnFactory(data, name) {
 						t.Errorf("open source lost native factory %s", name)
 					}

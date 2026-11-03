@@ -5663,7 +5663,7 @@ func supportsAwaitInit(stmt ir.Node) bool {
 func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
 	count int) (*ir.AssignListStmt, bool) {
 	outer, ok := stmt.(*ir.AssignListStmt)
-	if !ok || len(outer.Lhs) != count || len(outer.Rhs) != count {
+	if !ok {
 		return nil, false
 	}
 	for _, target := range outer.Lhs {
@@ -5674,7 +5674,15 @@ func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
 			return nil, false
 		}
 	}
+	return normalizedResultProjection(call, stmt, count)
+}
 
+func normalizedResultProjection(call *ir.CallExpr, stmt ir.Node,
+	count int) (*ir.AssignListStmt, bool) {
+	outer, ok := stmt.(*ir.AssignListStmt)
+	if !ok || len(outer.Lhs) != count || len(outer.Rhs) != count {
+		return nil, false
+	}
 	var inner *ir.AssignListStmt
 	ir.Visit(outer, func(node ir.Node) {
 		if inner != nil {
