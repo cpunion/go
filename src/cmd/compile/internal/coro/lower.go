@@ -1270,8 +1270,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested spawn site %d", site.ID)
 			}
 			edge := edges[call]
-			if edge.Callee == nil && len(edge.Targets) == 0 {
-				return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+			if edge.ValueCall && !edge.FactoryRequired || edge.Callee == nil && len(edge.Targets) == 0 {
+				if edge.FactoryRequired {
+					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+				}
+				target := unwrapGoCall(call)
+				if target.Op() != ir.OCALLFUNC || target.Fun.Type().Kind() != types.TFUNC {
+					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+				}
+				candidate.openCalls[call] = true
+				break
 			}
 			if _, known := plan.edgeSummary(edge); !known {
 				return nil, fmt.Errorf("unknown spawn target")
@@ -4413,6 +4421,30 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					candidate.transitions[call] == SiteSpawn {
 					for _, init := range goStmt.Init() {
 						body = append(body, edit(init))
+					}
+					if candidate.openCalls[call] {
+						setup, action, err := lowerOpenSpawn(call, ctx, resume, edit)
+						if err != nil {
+							return err
+						}
+						body = append(body, setup...)
+						body = append(body, ir.NewIfStmt(goStmt.Pos(),
+							ir.NewBinaryExpr(goStmt.Pos(), ir.OEQ, action,
+								typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionWait))), ir.Nodes{
+								assignResumePC(state.next),
+								ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{action}),
+							}, nil))
+						if state.spawnYield {
+							body = append(body, ir.NewIfStmt(goStmt.Pos(),
+								ir.NewBinaryExpr(goStmt.Pos(), ir.OEQ, action,
+									typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionYield))), ir.Nodes{
+									assignResumePC(state.next),
+									ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{
+										typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionYield)),
+									}),
+								}, nil))
+						}
+						continue
 					}
 					child, err := factoryCall(call, nil)
 					if err != nil {

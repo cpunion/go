@@ -207,6 +207,7 @@ func coroAwaitFusedFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) ui
 func coroCompleteFusedFrame(unsafe.Pointer) uint8
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8) bool
 func coroSpawnFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) bool
+func coroSpawnOpaque(unsafe.Pointer, func()) bool
 func coroPanic(unsafe.Pointer, interface{})
 func coroPanicPending(unsafe.Pointer) bool
 func coroFrameNeedsClear(unsafe.Pointer) bool
