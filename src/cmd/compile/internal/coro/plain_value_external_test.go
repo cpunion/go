@@ -13,9 +13,9 @@ func plain(n int) int {return n+3}
 //go:noinline
 func namedValue() int {f:=plain;return f(4)}
 //go:noinline
-func capturedValue() int {n:=1;f:=func(){n+=2};f();return n}
+func capturedValue(which bool) int {n:=1;f:=func(){n+=2};if which{f=func(){n+=4}};f();return n}
 //go:noinline
-func capturedResult() int {n:=1;f:=func()int{return n};n=7;return f()}
+func capturedResult(which bool) int {n:=1;f:=func()int{return n};if which{f=func()int{return n+1}};n=7;return f()}
 //go:noinline
 func capturedPointers() int {
  var f [3]func()int
@@ -24,7 +24,7 @@ func capturedPointers() int {
  return f[0]()+f[1]()*10+f[2]()*100
 }
 func main(){
- if namedValue()!=7||capturedValue()!=3||capturedResult()!=7||capturedPointers()!=210 {panic("plain function value invocation")}
+ if namedValue()!=7||capturedValue(false)!=3||capturedValue(true)!=5||capturedResult(false)!=7||capturedResult(true)!=8||capturedPointers()!=210 {panic("plain function value invocation")}
  println("switch-return-ok")
 }
 `

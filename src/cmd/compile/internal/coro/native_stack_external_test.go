@@ -61,7 +61,7 @@ func linkedCoroStackUnsafe(t *testing.T, path, name string) bool {
 			}
 		}
 	}
-	t.Fatalf("linked native-stack guard missing in %s", path)
+	t.Fatalf("linked native-stack guard %s missing in %s", name, path)
 	return false
 }
 
