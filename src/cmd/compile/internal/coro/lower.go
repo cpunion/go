@@ -146,23 +146,30 @@ type lowerFactoryCall struct {
 }
 
 type lowerDefer struct {
-	statement       *ir.GoDeferStmt
-	call            *ir.CallExpr
-	armed           *ir.Name
-	snapshotCallee  bool
-	calleeSnapshot  *ir.Name
-	asyncTarget     *ir.Func
-	terminalTargets []lowerDeferTerminal
-	sourceLiteral   bool
-	literalCaptures []*ir.Name
-	rewriteTerminal TerminalFlags
-	terminalTarget  *ir.Func
-	namedRecover    bool
-	runTerminal     bool
-	directGoexit    bool
-	captures        []lowerDeferCapture
-	rangeAnchor     ir.Node
-	rangeToken      *ir.Name
+	statement         *ir.GoDeferStmt
+	call              *ir.CallExpr
+	armed             *ir.Name
+	snapshotCallee    bool
+	calleeSnapshot    *ir.Name
+	resumable         []lowerResumableDefer
+	resumableDispatch bool
+	terminalTargets   []lowerDeferTerminal
+	sourceLiteral     bool
+	literalCaptures   []*ir.Name
+	rewriteTerminal   TerminalFlags
+	terminalTarget    *ir.Func
+	namedRecover      bool
+	runTerminal       bool
+	directGoexit      bool
+	captures          []lowerDeferCapture
+	rangeAnchor       ir.Node
+	rangeToken        *ir.Name
+}
+
+type lowerResumableDefer struct {
+	target   *ir.Func
+	async    bool
+	terminal lowerDeferTerminal
 }
 
 type lowerDeferCapture struct {
@@ -679,7 +686,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
 	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
-	if len(function.Sites) == 0 && !canPlanParameterDeferTarget(plan, fn) &&
+	if len(function.Sites) == 0 && !hasSuspendingDeferSite(plan, function) && !canPlanParameterDeferTarget(plan, fn) &&
 		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function) || rangeDeferRegistrationFactorySupported(plan, bodyPlan))) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
@@ -1977,7 +1984,9 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 			}
 			edge := edgeForCall(candidate.function, call)
 			child := candidates[edge.Callee]
-			if child == nil || child.factoryABI != FactoryABI3 {
+			// A normal call to a function containing recover must not inherit
+			// the calling task's deferred activation identity.
+			if child == nil || child.factoryABI != FactoryABI3 || child.function.Terminal&UsesRecover != 0 {
 				continue
 			}
 			self := edge.Callee == candidate.function.Func
@@ -2859,7 +2868,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return site.Kind == SiteYield
 	})
 	for _, deferred := range candidate.defers {
-		if len(deferred.terminalTargets) != 0 {
+		if len(deferred.resumable) != 0 {
+			prepareResumableDeferWrapper(deferred, fn)
+		} else if len(deferred.terminalTargets) != 0 {
 			prepareDynamicDeferWrapper(deferred, fn)
 		}
 	}
@@ -3028,7 +3039,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		if deferred.rangeAnchor == nil && (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
-			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0) &&
+			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0 || len(deferred.resumable) != 0) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -3992,6 +4003,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.AssignListStmt:
 			node.Def = false
 		case *ir.CallExpr:
+			if node.Op() == ir.ORECOVER && function.Effect == MaySuspend {
+				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime("coroDeferRecoverAwait"), ir.Nodes{ctx}, false)
+				init := slices.Clone(node.Init())
+				for i, statement := range init {
+					init[i] = edit(statement)
+				}
+				call.(ir.InitNode).SetInit(init)
+				return call
+			}
 			if direct := candidate.directCalls[node]; direct.function != nil {
 				node.Fun = direct.function.Nname
 				if direct.errno {
@@ -4023,9 +4043,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	deferClosures := make(map[*ir.Func]bool, len(candidate.defers))
 	for _, deferred := range candidate.defers {
-		if deferred.asyncTarget != nil {
-			continue
-		}
 		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
 			deferClosures[closure.Func] = true
 		}
@@ -4080,18 +4097,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			})
 	}
 	for _, deferred := range candidate.defers {
-		if deferred.asyncTarget != nil {
-			// The source literal already owns a factory and an independent
-			// ordinary body. General capture reparenting handled its shared cells.
-			continue
-		}
 		deferredToken := resumeDeferToken
 		if deferred.rangeAnchor != nil {
 			deferred.rangeToken = typecheck.TempAt(deferred.statement.Pos(), resume, types.Types[types.TUNSAFEPTR])
 			deferredToken = deferred.rangeToken
 		}
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
-		if len(deferred.terminalTargets) != 0 {
+		if len(deferred.resumable) != 0 {
+			if err := rewriteResumableDeferCall(deferred, deferredToken, factories); err != nil {
+				return err
+			}
+		} else if len(deferred.terminalTargets) != 0 {
 			if err := rewriteDynamicDeferCall(deferred, deferredToken, factories); err != nil {
 				return err
 			}
@@ -4461,9 +4477,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				// The record form is used by enclosing range markers once owner
 				// admission has proved every callback cleanup target. Existing
 				// dynamic defers retain their original function-only stack.
-				body = append(body, lowerDeferStackCleanup(pos, resume, ctx, stack,
+				cleanup := lowerDeferStackCleanup(pos, resume, ctx, stack,
 					resumeDeferToken, candidate.rangeNamedRecover || slices.ContainsFunc(candidate.defers,
-						func(deferred *lowerDefer) bool { return deferred.rangeAnchor == nil && deferred.namedRecover }), candidate.rangeOwner != nil))
+						func(deferred *lowerDefer) bool { return deferred.rangeAnchor == nil && deferred.namedRecover }), candidate.rangeOwner != nil)
+				if candidate.hasResumableDefers() {
+					cleanup.Body = append(ir.Nodes{assignResumePC(i)}, cleanup.Body...)
+					cleanup.Body = append(cleanup.Body, resumableDeferWait(pos, ctx))
+				}
+				body = append(body, cleanup)
 			} else {
 				for j := len(candidate.defers) - 1; j >= 0; j-- {
 					deferred := candidate.defers[j]
@@ -4478,26 +4499,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					if deferred.calleeSnapshot != nil {
 						fun = capture(deferred.calleeSnapshot)
 					}
-					if deferred.asyncTarget != nil {
-						edge := Edge{Kind: DeferCall, Callee: deferred.asyncTarget,
-							CalleeName: ir.PkgFuncName(deferred.asyncTarget)}
-						child, err := staticFactoryCall(deferred.call, deferred.call, edge, ir.Nodes{}, fun)
-						if err != nil {
-							return err
-						}
-						frame := child.frame
-						if frame == nil {
-							frame = ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])
-						}
-						invoke := ir.Nodes{clear}
-						invoke = append(invoke, child.setup...)
-						invoke = append(invoke, assignResumePC(i),
-							typecheck.Call(pos, typecheck.LookupRuntime("coroDeferAwaitFrame"),
-								ir.Nodes{ctx, frame, child.resume}, false),
-							ir.NewReturnStmt(pos, ir.Nodes{typedInt(pos, types.Types[types.TUINT8], int64(actionWait))}))
-						body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
-						continue
-					}
+
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
 						typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{fun}, false))
 					if deferred.namedRecover {
@@ -4505,8 +4507,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							typecheck.LookupRuntime("coroDeferCall"),
 							ir.Nodes{resumeDeferToken, fun}, false)
 					}
-					body = append(body, ir.NewIfStmt(deferred.statement.Pos(),
-						armed, ir.Nodes{clear, call}, nil))
+					invoke := ir.Nodes{clear}
+					if len(deferred.resumable) != 0 {
+						invoke = append(invoke, assignResumePC(i))
+					}
+					invoke = append(invoke, call)
+					if len(deferred.resumable) != 0 {
+						invoke = append(invoke, resumableDeferWait(pos, ctx))
+					}
+					body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
 				}
 			}
 			if terminalAware && !localSelfFrames {

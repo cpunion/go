@@ -181,7 +181,12 @@ func finishRangeHybridRegistration(registration *rangeHybridRegistration,
 	factories map[*ir.Func]*ir.Func) error {
 	deferred := registration.cleanup
 	parent, token := registration.parent, registration.token
-	if len(deferred.terminalTargets) != 0 {
+	if len(deferred.resumable) != 0 {
+		prepareResumableDeferWrapper(deferred, parent)
+		if err := rewriteResumableDeferCall(deferred, token, factories); err != nil {
+			return err
+		}
+	} else if len(deferred.terminalTargets) != 0 {
 		prepareDynamicDeferWrapper(deferred, parent)
 		if err := rewriteDynamicDeferCall(deferred, token, factories); err != nil {
 			return err
