@@ -60,8 +60,7 @@ func nilPointer(){
  packed(true,nil,true,&value,true,0)
 }
 func main(){
- // The nested held call below keeps this controller ordinary. Snapshot
- // expectations before invoking packed so its arguments have no later use.
+ // Snapshot expectations before invoking packed so its arguments have no later use.
  go collect()
  rounds:=make(chan int,3)
  rounds<-0;rounds<-1;rounds<-2;close(rounds)
@@ -119,13 +118,10 @@ func main(){
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
 				native := config.experiment == "coro" && config.name != "race"
-				for _, name := range []string{"packed", "held"} {
+				for _, name := range []string{"packed", "held", "main", "collect"} {
 					if got := strings.Contains(string(symbols), "main."+name+".coro"); got != native {
 						t.Fatalf("%s native self frame=%v, want %v", name, got, native)
 					}
-				}
-				if strings.Contains(string(symbols), "main.main.coro") {
-					t.Fatal("measurement controller unexpectedly lowered")
 				}
 			}
 			if config.name == "noinline" {
