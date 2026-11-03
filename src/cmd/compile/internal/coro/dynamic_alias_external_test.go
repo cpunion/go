@@ -131,14 +131,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"parameter", "dynamic await site"}, {"globalCopy", "dynamic await site"},
-			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
-			{"lateUnknown", "dynamic await site"}, {"typeCase", "dynamic await site"},
-			{"rangeCopy", "dynamic await site"}, {"multiResult", "dynamic await site"},
-			{"missingFactory", "unsupported coroutine dependency main.missing"},
-		},
-		[]string{"chain", "swapped", "cycle", "self", "nilAlias", "mixed", "pair"})
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency main.missing"}},
+		[]string{"chain", "swapped", "cycle", "self", "nilAlias", "mixed", "pair"}, "parameter", "globalCopy", "addressed", "captured", "lateUnknown", "typeCase", "rangeCopy", "multiResult")
 }
 
 func TestDynamicAliasImported(t *testing.T) {

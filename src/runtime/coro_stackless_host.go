@@ -31,6 +31,7 @@ type stacklessCoroHostGState struct {
 	stacklessCoroGState
 	host          *stacklessCoroHost
 	ordinaryDepth uint32
+	activeTask    *stacklessCoroTask
 }
 
 // Fixed executors retain their original self pointer. An ordinary extension
@@ -275,7 +276,7 @@ func (h *stacklessCoroHost) run() {
 	state.host = h
 	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		if state.blockingScheduler != nil || state.deferTask != previousDefer || state.ordinaryDepth != 0 {
+		if state.blockingScheduler != nil || state.deferTask != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
 		gp.stacklessCoro = previous
@@ -355,7 +356,9 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 		throw("runtime: missing ordinary host call state")
 	}
 	oldDefer := state.deferTask
+	oldTask := state.activeTask
 	state.deferTask = nil
+	state.activeTask = task
 	state.ordinaryDepth++
 	returned := false
 	defer func() {
@@ -371,6 +374,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 		}
 		state.ordinaryDepth--
 		state.deferTask = oldDefer
+		state.activeTask = oldTask
 		if panicking {
 			recordStacklessCoroPanic(s, task, value, true)
 		}

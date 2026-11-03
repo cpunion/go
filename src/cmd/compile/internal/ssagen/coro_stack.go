@@ -9,6 +9,8 @@ import (
 	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/objw"
+	"cmd/compile/internal/staticdata"
+	"cmd/compile/internal/typecheck"
 	"cmd/internal/obj"
 	"internal/abi"
 	"internal/buildcfg"
@@ -17,6 +19,65 @@ import (
 func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 	if !buildcfg.Experiment.Coro {
 		return
+	}
+	if frame := coro.SourceFrameInfo(fn); frame != nil {
+		info := base.Ctxt.Lookup(fn.LSym.Name + ".coro.sourceinfo")
+		objw.Uint32(info, 0, abi.CoroSourceVersion)
+		objw.Uint32(info, 4, frame.Flags)
+		if frame.Source != nil {
+			objw.SymPtrOff(info, 8, frame.Source)
+		} else {
+			objw.Uint32(info, 8, 0)
+		}
+		kind, offset, width := uint32(abi.CoroSourcePCNone), uint32(0), uint32(0)
+		if frame.Field != nil {
+			kind = abi.CoroSourcePCFrame
+			offset, width = uint32(frame.Field.Offset), uint32(frame.Field.Type.Size())
+		} else if frame.PC != nil {
+			it := typecheck.NewClosureStructIter(fn.ClosureVars)
+			for {
+				name, _, off := it.Next()
+				if name == nil {
+					break
+				}
+				if name == frame.PC {
+					kind = abi.CoroSourcePCClosureIndirect
+					if name.Byval() {
+						kind = abi.CoroSourcePCClosure
+					}
+					offset, width = uint32(off), uint32(name.Type().Size())
+					break
+				}
+			}
+		}
+		objw.Uint32(info, 12, kind)
+		objw.Uint32(info, 16, offset)
+		objw.Uint32(info, 20, width)
+		objw.Uint32(info, 24, uint32(len(frame.Positions)))
+		off := 28
+		for _, pos := range frame.Positions {
+			filename, line := "", uint32(0)
+			if pos.IsKnown() {
+				p := base.Ctxt.InnermostPos(pos)
+				filename, line = p.AbsFilename(), uint32(p.RelLine())
+			}
+			if filename != "" {
+				objw.SymPtrOff(info, off, staticdata.StringSym(pos, filename))
+			} else {
+				objw.Uint32(info, off, 0)
+			}
+			objw.Uint32(info, off+4, uint32(len(filename)))
+			objw.Uint32(info, off+8, line)
+			off += 12
+		}
+		info.Align = 4
+		info.Set(obj.AttrContentAddressable, true)
+		fn.LSym.Func().CoroSourceInfo = info
+		p := pp.Prog(obj.AFUNCDATA)
+		p.From.SetConst(abi.FUNCDATA_CoroSource)
+		p.To.Type = obj.TYPE_MEM
+		p.To.Name = obj.NAME_EXTERN
+		p.To.Sym = info
 	}
 	if provider := coro.NativeCallableProvider(fn); provider != nil {
 		info := base.Ctxt.Lookup(fn.LSym.Name + ".coro.callinfo")

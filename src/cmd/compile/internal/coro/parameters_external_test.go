@@ -73,8 +73,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"invoke", "dynamic await site"}, {"recurse", "dynamic await site"}},
-		[]string{"driver", "repeated", "recursiveDriver", "longDriver", "plainDriver", "allPlain", "nilDriver", "pairDriver", "variadicDriver", "panicDriver", "exitWorker"})
+		nil,
+		[]string{"driver", "repeated", "recursiveDriver", "longDriver", "plainDriver", "allPlain", "nilDriver", "pairDriver", "variadicDriver", "panicDriver", "exitWorker"}, "invoke", "recurse")
 }
 
 func TestClosedParameterOrdinaryBoundaries(t *testing.T) {
@@ -128,9 +128,9 @@ func main(){
 }
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/coroparam/...=",
-		[]switchFallback{{"invoke", "dynamic await site"}, {"rejected", "control flow goto"}},
-		[]string{"closed", "importedDriver"})
+	testSwitchReturnFilesNative(t, files, "example.com/coroparam/...=",
+		[]switchFallback{{"rejected", "control flow goto"}},
+		[]string{"closed", "importedDriver"}, []string{"invoke"})
 }
 
 func TestClosedParameterParked(t *testing.T) {
@@ -249,8 +249,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{{"invoke", "dynamic await site"}},
-		[]string{"returned", "paired", "tupleArgument"})
+		nil,
+		[]string{"returned", "paired", "tupleArgument"}, "invoke")
 }
 
 func TestClosedParameterContexts(t *testing.T) {

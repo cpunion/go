@@ -2546,6 +2546,7 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
+	recordSourceResume(resume, fn, nil, nil)
 	ctx := resume.Dcl[0]
 
 	captured := make(map[*ir.Name]*ir.Name)
@@ -4280,6 +4281,25 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Dispatch once on entry, then use direct branches between states. Persist
 	// the next state only before handing control to the scheduler or terminal
 	// machinery; ordinary state edges do not need a frame write.
+	// Distinct await sites may share their next state. Give each persisted
+	// return point its own landing label so a suspended frame retains the
+	// exact source call site without adding a word to its allocation.
+	positions := make([]src.XPos, len(states))
+	for i := range positions {
+		positions[i] = pos
+	}
+	awaitPCs := make(map[int]int)
+	for i, state := range states {
+		if state.transition != SiteAwait {
+			continue
+		}
+		awaitPCs[i] = len(states)
+		states = append(states, lowerState{
+			next: state.next, thenState: -1, elseState: -1,
+		})
+		positions = append(positions, state.call.Pos())
+	}
+	recordSourceResume(resume, fn, resumePC, positions)
 	labels := make([]*types.Sym, len(states))
 	cases := make([]*ir.CaseClause, len(states))
 	for i := range states {
@@ -4613,7 +4633,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return fmt.Errorf("%s: state %d transition has no continuation",
 					ir.PkgFuncName(fn), i)
 			}
-			body = append(body, assignResumePC(state.next))
+			returnPC := state.next
+			if pc, ok := awaitPCs[i]; ok {
+				returnPC = pc
+			}
+			body = append(body, assignResumePC(returnPC))
 			action := actionInvalid
 			var actionResult ir.Node
 			switch state.transition {
@@ -5172,6 +5196,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	frameType.SetNoalg(true)
 	types.CalcSize(frameType)
 	candidate.frameType = frameType
+	if source := nativeSourceFrames[resume]; source != nil {
+		source.Field = replacements[candidate.resumePC]
+	}
 	framePointerType := types.NewPtr(frameType)
 	rootType := frameType
 	var rootArrayField *types.Field

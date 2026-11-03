@@ -500,6 +500,7 @@ type FuncInfo struct {
 	WrapInfo           *LSym // for wrapper, info of wrapped function
 	CoroStackInfo      *LSym // linker proof bindings for native coroutine entries
 	CoroCallableInfo   *LSym // callable companion provider, as a text-relative offset
+	CoroSourceInfo     *LSym // source identity and continuation location metadata
 	JumpTables         []JumpTable
 
 	FuncInfoSym *LSym

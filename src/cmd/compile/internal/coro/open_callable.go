@@ -82,6 +82,7 @@ func lowerOpenAwait(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 	thunk := ir.NewClosureFunc(pos, pos, ir.OCLOSURE,
 		types.NewSignature(nil, nil, nil), resume, typecheck.Target, 0)
 	thunk.DeclareParams(true)
+	recordSourceBridge(thunk)
 	frozenFun := ir.NewClosureVar(pos, thunk, fun)
 	frozenRequest := ir.NewClosureVar(pos, thunk, request)
 	ir.WithFunc(thunk, func() {

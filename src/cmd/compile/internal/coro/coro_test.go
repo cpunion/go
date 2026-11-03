@@ -6003,19 +6003,27 @@ func main() {
 	if err != nil {
 		t.Fatalf("multi-result fallback build failed: %v\n%s", err, data)
 	}
+	fallbackBuild := string(data)
 	for _, want := range []string{
-		"ComplexPair: await site 1: coroutine call has 2 results without matching assignment",
-		"unsupported coroutine dependency example.com/corofactory/mid.ComplexPair",
 		"UnsafeNestedAdd: nested await site 1",
 	} {
-		if !strings.Contains(string(data), want) {
+		if !strings.Contains(fallbackBuild, want) {
 			t.Fatalf("multi-result fallback output does not contain %q\n%s",
 				want, data)
 		}
 	}
-	if unwanted := "NestedPair: nested await site"; strings.Contains(string(data), unwanted) {
+	if linkedCoroStackUnsafe(t, multiFallback, "example.com/corofactory/mid.ComplexPair.coro.stackgate") {
+		t.Fatal("complex tuple assignment lost native admission")
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `example.com/corofactory/mid\.ComplexPair\.coro\.func[0-9]+$`, multiFallback)
+	data, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(data), "example.com/corofactory/leaf.Pair.coro") {
+		t.Fatalf("complex tuple assignment does not use the native leaf factory: %v\n%s", err, data)
+	}
+	if unwanted := "NestedPair: nested await site"; strings.Contains(fallbackBuild, unwanted) {
 		t.Fatalf("multi-result expression output contains %q\n%s",
-			unwanted, data)
+			unwanted, fallbackBuild)
 	}
 
 	cmd = testenv.Command(t, multiFallback)

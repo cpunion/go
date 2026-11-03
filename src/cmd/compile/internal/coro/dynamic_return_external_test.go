@@ -133,14 +133,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"parameter", "dynamic await site"}, {"globalResult", "dynamic await site"},
-			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
-			{"caseResult", "dynamic await site"},
-			{"namedResult", "dynamic await site"},
-			{"lateUnknown", "dynamic await site"}, {"missingFactory", "unsupported coroutine dependency main.missing"},
-		},
-		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair", "multipleResult", "chooseMulti", "closureResult", "chooseClosure", "chooseClosure.func1"})
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency main.missing"}},
+		[]string{"consume", "repeated", "recursive", "fromDefer", "nilReturned", "nilArgument", "consumePair", "childPanic", "childExit", "choose", "chooseA", "chooseB", "chooseDefer", "choosePair", "multipleResult", "chooseMulti", "closureResult", "chooseClosure", "chooseClosure.func1"}, "parameter", "globalResult", "addressed", "captured", "caseResult", "namedResult", "lateUnknown")
 }
 
 func TestDynamicReturnImported(t *testing.T) {
@@ -172,7 +166,7 @@ func main(){
 }
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/cororeturn/...=",
-		[]switchFallback{{"importedProducer", "dynamic await site"}, {"missingFactory", "unsupported coroutine dependency example.com/cororeturn/leaf.Missing"}},
-		[]string{"importedTarget", "chooseLocal"})
+	testSwitchReturnFilesNative(t, files, "example.com/cororeturn/...=",
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency example.com/cororeturn/leaf.Missing"}},
+		[]string{"importedTarget", "chooseLocal"}, []string{"importedProducer"})
 }

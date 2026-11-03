@@ -95,12 +95,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"unknownSecond", "dynamic await site"}, {"deferredSecond", "dynamic await site"},
-			{"addressSecond", "dynamic await site"}, {"caseSecond", "dynamic await site"},
-			{"missingSecond", "unsupported coroutine dependency main.missing"}, {"dynamicProducer", "dynamic await site"},
-		},
-		[]string{"choose", "forward", "converted", "consume", "consumeConverted", "repeated", "small", "named", "consumeNamed", "cycleA", "cycleB", "recursive", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit", "useFirst", "useDeferredFirst", "useAddressFirst", "useCaseFirst", "useMissingFirst", "scalarResult"})
+		[]switchFallback{{"missingSecond", "unsupported coroutine dependency main.missing"}},
+		[]string{"choose", "forward", "converted", "consume", "consumeConverted", "repeated", "small", "named", "consumeNamed", "cycleA", "cycleB", "recursive", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit", "useFirst", "useDeferredFirst", "useAddressFirst", "useCaseFirst", "useMissingFirst", "scalarResult"}, "unknownSecond", "deferredSecond", "addressSecond", "caseSecond", "dynamicProducer")
 }
 
 func TestDynamicTupleResultImported(t *testing.T) {
@@ -128,7 +124,7 @@ func usedMissing() int {_,n,b:=missingSplit();v:=b(4);return v+n}
 func main(){if importedTarget(false)!=1227 || importedTarget(true)!=2317 || importedProducer(false)!=1227 || importedProducer(true)!=2317 || unusedMissing()!=19 || usedMissing()!=39 {panic("tuple imported contracts")};println("switch-return-ok")}
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/corotuple/...=",
-		[]switchFallback{{"importedProducer", "dynamic await site"}, {"usedMissing", "unsupported coroutine dependency example.com/corotuple/leaf.Missing"}},
-		[]string{"chooseLocal", "forward", "importedTarget", "unusedMissing"})
+	testSwitchReturnFilesNative(t, files, "example.com/corotuple/...=",
+		[]switchFallback{{"usedMissing", "unsupported coroutine dependency example.com/corotuple/leaf.Missing"}},
+		[]string{"chooseLocal", "forward", "importedTarget", "unusedMissing"}, []string{"importedProducer"})
 }

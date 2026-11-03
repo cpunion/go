@@ -96,14 +96,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"parameterOpen", "dynamic await site"}, {"globalResult", "dynamic await site"},
-			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
-			{"deferred", "dynamic await site"}, {"aliasCapture", "dynamic await site"},
-			{"rangeResult", "dynamic await site"}, {"caseResult", "dynamic await site"},
-			{"missingFactory", "unsupported coroutine dependency main.missing"},
-		},
-		[]string{"parameter", "consume", "repeated", "inside", "fromInside", "chooseCopy", "fromCopy", "recursive", "chooseA", "chooseB", "choose", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit"})
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency main.missing"}},
+		[]string{"parameter", "consume", "repeated", "inside", "fromInside", "chooseCopy", "fromCopy", "recursive", "chooseA", "chooseB", "choose", "recovered", "fromRecovered", "nilArgument", "choosePair", "consumePair", "childPanic", "childExit"}, "parameterOpen", "globalResult", "addressed", "captured", "deferred", "aliasCapture", "rangeResult", "caseResult")
 }
 
 func TestDynamicNamedResultImported(t *testing.T) {
@@ -129,7 +123,7 @@ func missingFactory() int {f:=chooseMissing();v:=f(4);return v}
 func main(){if importedTarget(false)!=12 || importedTarget(true)!=23 || importedProducer(false)!=13 || importedProducer(true)!=24 || missingFactory()!=34 {panic("named imported contracts")};println("switch-return-ok")}
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/coronamed/...=",
-		[]switchFallback{{"importedProducer", "dynamic await site"}, {"missingFactory", "unsupported coroutine dependency example.com/coronamed/leaf.Missing"}},
-		[]string{"chooseLocal", "importedTarget"})
+	testSwitchReturnFilesNative(t, files, "example.com/coronamed/...=",
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency example.com/coronamed/leaf.Missing"}},
+		[]string{"chooseLocal", "importedTarget"}, []string{"importedProducer"})
 }

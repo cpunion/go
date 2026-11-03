@@ -125,11 +125,27 @@ const (
 	FUNCDATA_WrapInfo           = 7
 	FUNCDATA_CoroStackGates     = 8
 	FUNCDATA_CoroCallable       = 9
+	FUNCDATA_CoroSource         = 10
 )
 
 // CoroCallableVersion identifies compiler-owned callable companion metadata.
 // It does not change source function values or interface method tables.
 const CoroCallableVersion = 1
+
+const CoroSourceVersion = 1
+
+const (
+	CoroSourceResume uint32 = 1 << iota
+	CoroSourceCopy
+	CoroSourceBridge
+)
+
+const (
+	CoroSourcePCNone uint32 = iota
+	CoroSourcePCFrame
+	CoroSourcePCClosure
+	CoroSourcePCClosureIndirect
+)
 
 // Special values for the PCDATA_UnsafePoint table.
 const (
