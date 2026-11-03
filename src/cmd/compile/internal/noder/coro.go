@@ -13,6 +13,11 @@ import (
 
 var coroBodyGen int
 
+// Retain source eligibility before backend compilation releases the working IR.
+// Only real serialized Go definitions receive this capability; synthetic
+// wrappers and assembly declarations cannot become empty private helpers.
+var coroSourceBodies = make(map[*ir.Func]bool)
+
 // Use serialized body identity, including its instantiation dictionary. A
 // reread has fresh closure symbols and declarations, so source spelling or
 // positions cannot identify its environment layout.

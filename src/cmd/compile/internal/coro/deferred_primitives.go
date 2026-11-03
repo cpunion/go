@@ -22,6 +22,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 	}
 	index := 0
 	imported := make(map[*ir.Func]*ir.Func)
+	syncOwners := make(map[*ir.Func]bool)
 	var localize func(*ir.Func) *ir.Func
 	localize = func(target *ir.Func) *ir.Func {
 		if helper := imported[target]; helper != nil {
@@ -127,6 +128,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 					!deferredSyncMethod(name.Func) {
 					return
 				}
+				syncOwners[owner] = true
 				if helper := localize(name.Func); helper != nil {
 					inner.Fun, wrapper.WrappedFunc = helper.Nname, helper
 					rewritten[owner] = true
@@ -164,6 +166,27 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 			bodies[helper] = func() *ir.Func { return build(".go") }
 			call.Fun = helper.Nname
 			rewritten[owner] = true
+		})
+	}
+	// A cleanup receiver can also be used by Lock/RLock in the same owner.
+	// Materialize those ordinary source calls through the same closed sync
+	// implementation; otherwise a valid cleanup would inherit an unavailable
+	// imported suspension dependency from the acquisition before it.
+	for owner := range syncOwners {
+		ir.Visit(owner, func(node ir.Node) {
+			call, ok := node.(*ir.CallExpr)
+			if !ok || call.Op() != ir.OCALLFUNC || call.GoDefer || call.Fun == nil ||
+				len(call.Fun.Init()) != 0 || ir.StaticValue(call.Fun) != call.Fun {
+				return
+			}
+			name := ir.StaticCalleeName(call.Fun)
+			if name == nil {
+				return
+			}
+			if helper := localize(name.Func); helper != nil {
+				call.Fun = helper.Nname
+				rewritten[owner] = true
+			}
 		})
 	}
 	return rewritten
