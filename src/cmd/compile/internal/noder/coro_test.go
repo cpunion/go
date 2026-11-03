@@ -30,6 +30,32 @@ func TestReadCoroBodyUnavailable(t *testing.T) {
 	}
 }
 
+func TestCoroBodyDefinitionCapability(t *testing.T) {
+	savedBodies, savedDefinitions := bodyReader, coroSourceBodies
+	bodyReader = make(map[*ir.Func]pkgReaderIndex)
+	coroSourceBodies = make(map[*ir.Func]bool)
+	defer func() { bodyReader, coroSourceBodies = savedBodies, savedDefinitions }()
+	pkg := types.NewPkg("example.com/coro/bodyless", "bodyless")
+	fn := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("declaration"),
+		types.NewSignature(nil, nil, nil))
+	bodyReader[fn] = pkgReaderIndex{pr: new(pkgReader)}
+	if HaveCoroBody(fn) || ReadCoroBody(fn) != nil {
+		t.Fatal("bodyless declaration acquired an independent Go body")
+	}
+	// The backend may have released Body, and a real local definition may
+	// exceed the export budget. Neither removes ordinary fallback authority.
+	coroSourceBodies[fn] = false
+	if !HaveCoroBody(fn) {
+		t.Fatal("over-budget Go definition lost its ordinary source body")
+	}
+	pri := bodyReader[fn]
+	pri.synthetic = func(src.XPos, *reader) {}
+	bodyReader[fn] = pri
+	if HaveCoroBody(fn) {
+		t.Fatal("synthetic reader acquired Go source definition authority")
+	}
+}
+
 // A prior ReadCoroBodyAs result is an IR container, not an OClosure. Its
 // captures must still agree with a later selected-value helper's source layout.
 func TestPinCoroCaptureCopies(t *testing.T) {
