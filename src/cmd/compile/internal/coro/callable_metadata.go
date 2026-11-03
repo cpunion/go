@@ -152,6 +152,7 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 	sym.Def = descriptor
 	data := descriptor.Linksym()
 	off := objw.Uintptr(data, 0, uint64(abi.CoroCallableVersion))
+	reflectdata.NeedRuntimeType(signature)
 	off = objw.SymPtr(data, off, reflectdata.TypeLinksym(signature), 0)
 	off = objw.SymPtr(data, off, gate.Linksym(), 0)
 	off = objw.SymPtr(data, off, companion.Linksym(), 0)
