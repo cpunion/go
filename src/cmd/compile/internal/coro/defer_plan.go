@@ -10,6 +10,31 @@ import (
 	"slices"
 )
 
+// A fixed source literal has a private, typed environment and no invocation
+// operands left to evaluate during cleanup. Its ordinary entry remains intact.
+// Direct recover and arbitrary dynamic/range registrations need a separate
+// resumable defer contract and retain their existing fallback here.
+func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
+	function := plan.Functions[fn]
+	if function == nil || fn.OClosure == nil || fn.Wrapper() ||
+		fn.Type().NumParams() != 0 || fn.Type().NumResults() != 0 ||
+		!callableFactorySupported(fn) || function.Effect != MaySuspend ||
+		function.Exec != 0 || function.Terminal&^MayPanic != 0 {
+		return false
+	}
+	for _, edge := range function.Edges {
+		// MaySuspend can also come from an unknown call. It is not proof
+		// that a typed child factory exists for that call or its captures.
+		if edge.Unknown {
+			return false
+		}
+		if _, known := plan.edgeSummary(edge); !known {
+			return false
+		}
+	}
+	return true
+}
+
 // planNativeDefers validates the exact cleanup targets and capture lifetimes
 // independently of continuation construction. Registration only freezes operands;
 // cleanup invokes each target with its separately proved terminal contract.
@@ -26,7 +51,15 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 		}
 		summary, _ := plan.edgeSummary(edge)
 		if summary.Effect != NoSuspend {
-			return fmt.Errorf("suspending defer")
+			closure, literal := deferred.call.Fun.(*ir.ClosureExpr)
+			if dynamicDefers || deferred.rangeAnchor != nil || len(edge.Targets) != 0 ||
+				!literal || closure.Func != edge.Callee || !canPlanSuspendingDefer(plan, edge.Callee) {
+				return fmt.Errorf("suspending defer requires a fixed source literal")
+			}
+			deferred.asyncTarget = edge.Callee
+			deferred.snapshotCallee = true
+			candidate.dependencies[edge.Callee] = true
+			continue
 		}
 		var parameterTarget *ir.Func
 		if call := unwrapGoCall(deferred.call); call != deferred.call {

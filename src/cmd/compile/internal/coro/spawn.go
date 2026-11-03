@@ -41,12 +41,26 @@ func plainSpawnFactorySupported(function *Function) bool {
 }
 
 // A normal callback has no direct-defer recover rights. Keep the existing
-// bounded leaf and context-free ABI requirements; captured or transitive
-// recover needs a separate environment and terminal-control proof.
+// bounded leaf requirements. Captured recover callbacks use a private helper
+// with the source environment's traced pointer cells as explicit parameters.
+// Transitive recover still needs a separate terminal-control proof.
 func plainCallbackFactorySupported(function *Function) bool {
-	return function != nil && resumeFactorySupported(function.Func) &&
-		function.LocalTerminal == function.Terminal &&
-		plainFactoryBodySupportedWithTerminal(function, UsesRecover)
+	if function == nil || !callableFactorySupported(function.Func) || function.LocalTerminal != function.Terminal ||
+		!plainFactoryBodySupportedWithTerminal(function, UsesRecover) {
+		return false
+	}
+	if resumeFactorySupported(function.Func) {
+		return true
+	}
+	if function.Terminal != UsesRecover || !capturedFactorySupported(function.Func) {
+		return false
+	}
+	// The ordinary helper call includes every capture cell, as well as the
+	// original inputs and result destinations. Preserve the adapter's small
+	// call bound; the linked machine proof still owns the actual stack cost.
+	typ := function.Func.Type()
+	types.CalcSize(types.NewFuncArgs(typ))
+	return typ.ArgWidth()+int64(len(captureTypes(function.Func))+typ.NumResults())*int64(types.PtrSize) <= 128
 }
 
 // A captured plain callback cannot use the ordinary-call adapter: that adapter
@@ -98,13 +112,47 @@ func normalRecoverCallback(fn *ir.Func, reader *BodyReader) *ir.Func {
 	if reader == nil || reader.Clone == nil || !reader.Have(fn) {
 		return nil
 	}
+	if capturedFactorySupported(fn) && (reader.PinCaptures == nil || !reader.PinCaptures(fn)) {
+		return nil
+	}
 	copy := reader.Clone(fn, types.LocalPkg.Lookup(fn.Sym().Name+".coro.callback"))
 	if copy == nil {
 		return nil
 	}
+	// Keep the public closure entry and environment intact. Only this
+	// private ordinary helper receives the capture pointers already decoded
+	// by typed callback dispatch, in their original field order.
+	cells := make(map[*ir.Name]*ir.Name)
+	var fields []*types.Field
+	var parameters []*ir.Name
+	for i, variable := range copy.ClosureVars {
+		pos := variable.Pos()
+		parameter := ir.NewNameAt(pos, typecheck.LookupNum(".coro.capture", i), types.NewPtr(variable.Type()))
+		parameter.Class, parameter.Curfn = ir.PPARAM, copy
+		parameter.SetTypecheck(1)
+		field := types.NewField(pos, parameter.Sym(), parameter.Type())
+		field.Nname = parameter
+		fields = append(fields, field)
+		parameters = append(parameters, parameter)
+		cells[variable] = parameter
+	}
+	if len(fields) != 0 {
+		copy.Nname.SetType(types.NewSignature(nil, append(fields, copy.Type().Params()...), copy.Type().Results()))
+		copy.Dcl = append(parameters, copy.Dcl...)
+	}
 	found := false
 	var edit func(ir.Node) ir.Node
 	edit = func(node ir.Node) ir.Node {
+		if name, ok := node.(*ir.Name); ok && cells[name] != nil {
+			return typedDeref(node.Pos(), cells[name], name.Type())
+		}
+		if closure, ok := node.(*ir.ClosureExpr); ok {
+			for _, variable := range append([]*ir.Name(nil), closure.Func.ClosureVars...) {
+				if cell := cells[variable.Outer]; cell != nil {
+					replaceCapturedCell(closure.Func, variable, cell)
+				}
+			}
+		}
 		if node.Op() == ir.ORECOVER {
 			found = true
 			return ir.InitExpr(ir.TakeInit(node), ir.NewNilExpr(node.Pos(), node.Type()))
@@ -118,6 +166,8 @@ func normalRecoverCallback(fn *ir.Func, reader *BodyReader) *ir.Func {
 	if !found {
 		return nil
 	}
+	copy.ClosureVars = nil
+	copy.SetNeedctxt(false)
 	ir.WithFunc(copy, func() { typecheck.Stmts(copy.Body) })
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, copy)
 	return copy
@@ -133,7 +183,7 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 		factory, typecheck.Target, 0)
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
-	inputs := len(fn.Type().RecvParams())
+	inputs := len(captureTypes(fn)) + len(fn.Type().RecvParams())
 	args := make(ir.Nodes, inputs)
 	results := make(ir.Nodes, fn.Type().NumResults())
 	for i, field := range factory.Type().Params() {

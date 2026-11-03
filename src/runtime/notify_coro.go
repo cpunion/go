@@ -41,6 +41,11 @@ func coroNotifyListWait(ctx, list unsafe.Pointer, t uint32, state *unsafe.Pointe
 			w.waiter.coro.get() != unsafe.Pointer(w) || !less(t, atomic.Load(&l.notify)) {
 			throw("runtime: invalid resumed stackless coroutine notification wait")
 		}
+		if w.waiter.releasetime > 0 {
+			// Record at the declaration entry, as notifyListWait does. Helper
+			// frames and their inlining decisions must not change the caller skip.
+			blockevent(w.waiter.releasetime-w.startTime, 2)
+		}
 		w.finish(state)
 		return false
 	}
@@ -96,10 +101,6 @@ func (w *stacklessCoroNotifyWaiter) park(state *unsafe.Pointer) bool {
 }
 
 func (w *stacklessCoroNotifyWaiter) finish(state *unsafe.Pointer) {
-	if w.waiter.releasetime > 0 {
-		// finish adds a frame below the notification declaration entry.
-		blockevent(w.waiter.releasetime-w.startTime, 3)
-	}
 	w.waiter.coro.clear()
 	w.scheduler = nil
 	w.task = nil
