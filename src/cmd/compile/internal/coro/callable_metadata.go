@@ -64,6 +64,11 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 	for source := range candidates {
 		sources = append(sources, source)
 	}
+	for source := range boundMethodValues {
+		if candidates[source] == nil && plainFactories[source] == nil {
+			sources = append(sources, source)
+		}
+	}
 	for source := range plainFactories {
 		if candidates[source] == nil {
 			sources = append(sources, source)
@@ -73,7 +78,7 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, source := range sources {
-		if source.Type().HasShape() || !callableFactorySupported(source) {
+		if source.Type().HasShape() || !callableFactorySupported(source) && boundMethodValues[source] == nil {
 			continue
 		}
 		// Bounded ordinary-call adapters already have their own native
@@ -87,7 +92,14 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 				factory = candidate.rootArray.public
 			}
 		}
-		emitNativeCallable(source, factory, factoryABI, candidates[source] != nil)
+		deferCapable := candidates[source] != nil
+		if bound := boundMethodValues[source]; bound != nil {
+			factory, factoryABI, deferCapable = boundMethodFactory(bound, candidates, plainFactories)
+			if factory == nil {
+				continue
+			}
+		}
+		emitNativeCallable(source, factory, factoryABI, deferCapable)
 	}
 }
 
@@ -117,6 +129,9 @@ func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix s
 		var args ir.Nodes
 		if factoryABI == FactoryABI3 {
 			args = append(args, ctx)
+		}
+		if bound := boundMethodValues[source]; bound != nil {
+			args = append(args, boundMethodReceiver(pos, bound, environment))
 		}
 		captures := captureTypes(source)
 		if len(captures) != 0 {

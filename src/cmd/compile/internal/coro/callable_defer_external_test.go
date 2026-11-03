@@ -33,6 +33,8 @@ var ordinaryRootDriver=run
 func native(dst *any){runtime.Gosched();runtime.GC();*dst=recover()}
 func nonSuspending(dst *any,replacement any){*dst=recover();panic(replacement)}
 func plain(dst *any){*dst=recover()}
+type receiver struct{dst *any}
+func(p *receiver)capture(){runtime.Gosched();runtime.GC();*p.dst=recover()}
 func normal(f func(*any),dst *any){f(dst);runtime.Gosched()}
 func ordinaryCall(dst *any){normal(plain,dst);runtime.Gosched()}
 func signature(f any)unsafe.Pointer{return (*[2]unsafe.Pointer)(unsafe.Pointer(&f))[0]}
@@ -66,6 +68,12 @@ func drive(ctx unsafe.Pointer)uint8{
   if action(ctx)!=8||s.fallbacks!=0{panic("ordinary direct-defer handoff barrier")};return 8
  case 4:
   if s.fallbacks!=1||s.observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("ordinary direct defer did not recover its own panic")}
+  s.pc=5;panicking(ctx,s.incoming)
+  method:=(&receiver{dst:&s.observed}).capture
+  start(token(ctx),method,nil,noFallback)
+  if action(ctx)!=2{panic("bound method cleanup used ordinary host")};return 2
+ case 5:
+  if s.observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("bound method lost direct recover")}
   s.done=true;return 3
  }
  panic("invalid direct-defer ABI driver")

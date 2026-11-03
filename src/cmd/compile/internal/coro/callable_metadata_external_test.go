@@ -49,7 +49,7 @@ func check(f any){
 func main(){
  for range 1{
   p:=&box{n:11};p.pad[2046]=17;f:=captured(p)
-  check(named);check(f);check((*box).add)
+  check(named);check(f);check((*box).add);check(p.add)
   if descriptor(plain)!=nil{panic("plain function acquired an unproved factory")}
   if descriptor(large)!=nil{panic("large transfer acquired native capability")}
   runtime.GC()
@@ -89,6 +89,8 @@ type box struct{n int;pad[4095]byte}
 func named(n int)int{runtime.Gosched();runtime.GC();return n+3}
 func captured(p *box)func(int)int{return func(n int)int{runtime.Gosched();runtime.GC();return p.n+n+int(p.pad[4094])}}
 func(p *box)add(n int)int{runtime.Gosched();runtime.GC();p.n+=n;return p.n}
+type valueReceiver struct{pad byte;n int;p *box}
+func(v valueReceiver)add(n int)int{runtime.Gosched();runtime.GC();return v.n+v.p.n+n+int(v.pad)}
 func pair(p *box,n int)(int,*box){runtime.Gosched();runtime.GC();return p.n+n,p}
 func sum(n int,values ...int)int{for _,v:=range values{runtime.Gosched();n+=v};return n}
 func store(p *box,n int){runtime.Gosched();runtime.GC();p.n=n}
@@ -149,6 +151,13 @@ func main(){
  p=&box{n:19};p.pad[4094]=23
  method:=struct{p *box;n int;result *int}{p,5,&result}
  invoke((*box).add,unsafe.Pointer(&method));if result!=24||p.n!=24||p.pad[4094]!=23{panic("method receiver")}
+ bound:=(&box{n:35}).add
+ invoke(bound,unsafe.Pointer(&one));bound=nil
+ if result!=42{panic("bound pointer receiver")}
+ value:=valueReceiver{pad:2,n:11,p:&box{n:17}}
+ snapshot:=value.add;value=valueReceiver{}
+ invoke(snapshot,unsafe.Pointer(&one));snapshot=nil
+ if result!=37{panic("bound value receiver snapshot or GC")}
  var returned *box
  tuple:=struct{p *box;n int;result *int;returned **box}{p,7,&result,&returned}
  invoke(pair,unsafe.Pointer(&tuple));if result!=31||returned!=p||returned.pad[4094]!=23{panic("typed tuple result")}
