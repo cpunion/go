@@ -29,6 +29,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 			return helper
 		}
 		if target == nil || target.Nname == nil || target.Sym() == nil || target.Sym().Pkg == nil ||
+			target.Type() == nil || target.Type().HasShape() ||
 			target.Needctxt() || target.Wrapper() || len(target.ClosureVars) != 0 ||
 			len(imported) >= 32 || !reader.Have(target) {
 			return nil
@@ -46,13 +47,16 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 		if helper == nil || len(helper.Body) == 0 {
 			return nil
 		}
-		// Reading a body creates its nested closures, but the independent
-		// root is only an IR container until its caller registers it.
-		typecheck.Target.Funcs = append(typecheck.Target.Funcs, helper)
 		if !types.Identical(helper.Type(), target.Type()) ||
 			!smallParameterBody(helper) {
 			return nil
 		}
+		// Only concrete source bodies can use this private invocation ABI.
+		// Shaped implementations carry an implicit dictionary that an ordinary
+		// signature copy cannot reproduce. Keep their existing entry intact.
+		// Reading a body creates its nested closures, but the independent
+		// root is only an IR container until its caller registers it.
+		typecheck.Target.Funcs = append(typecheck.Target.Funcs, helper)
 		// Static calls carry the receiver as their first argument. A private
 		// helper is a function rather than a method expression, so make that
 		// input an explicit parameter for type checking and argument walking.
