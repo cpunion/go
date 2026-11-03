@@ -121,6 +121,14 @@ func coroBodyReader(fn *ir.Func) (pkgReaderIndex, bool) {
 		return pkgReaderIndex{}, false
 	}
 	if pri, ok := bodyReader[fn]; ok {
+		// A local declaration also has a serialized body index, even when
+		// its implementation is assembly or supplied by linkname. Only a
+		// materialized Go definition can authorize an independent body copy.
+		// Keep membership separate from the export budget: an over-budget
+		// local definition still supplies its ordinary fallback body.
+		if _, defined := coroSourceBodies[fn]; !defined || pri.synthetic != nil || pri.pr == nil {
+			return pkgReaderIndex{}, false
+		}
 		return pri, true
 	}
 	if fn.Nname.Defn == nil && fn.Sym() != nil {
