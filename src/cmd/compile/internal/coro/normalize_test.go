@@ -98,6 +98,32 @@ func TestNormalizeSingleResultCalls(t *testing.T) {
 	}
 }
 
+func TestNormalizeVoidCallOperandPrefix(t *testing.T) {
+	prepareLowerTest(t)
+	oldTarget, oldPkg, oldCurFunc := typecheck.Target, types.LocalPkg, ir.CurFunc
+	defer func() { typecheck.Target, types.LocalPkg, ir.CurFunc = oldTarget, oldPkg, oldCurFunc }()
+	pkg := types.NewPkg("example.com/coro/voidprefix", "p")
+	types.LocalPkg, typecheck.Target = pkg, new(ir.Package)
+	caller := newLowerTestFunc(pkg, "caller")
+	producer := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("producer"),
+		types.NewSignature(nil, nil, []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}))
+	consumer := ir.NewFunc(src.NoXPos, src.NoXPos, pkg.Lookup("consumer"),
+		types.NewSignature(nil, []*types.Field{types.NewField(src.NoXPos, nil, types.Types[types.TINT])}, nil))
+	inner := newLowerTestCall(producer)
+	inner.SetType(types.Types[types.TINT])
+	outer := typecheck.Call(src.NoXPos, consumer.Nname, ir.Nodes{inner}, false)
+	caller.Body = ir.Nodes{outer}
+	normalizeSuspensionExpressions(&Function{
+		Func: caller, Primary: CoroPrimary,
+		Sites: []Site{{Kind: SiteAwait, Node: inner}, {Kind: SiteAwait, Node: outer}},
+	})
+	seen := false
+	ir.Visit(caller, func(node ir.Node) { seen = seen || node == inner })
+	if !seen || len(outer.Init()) == 0 {
+		t.Fatal("void call lost its result-producing operand and defining prefix")
+	}
+}
+
 func TestNormalizeAssignmentPrefixBoundaries(t *testing.T) {
 	prepareLowerTest(t)
 	oldPkg, oldTarget := types.LocalPkg, typecheck.Target

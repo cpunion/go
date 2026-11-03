@@ -156,7 +156,11 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			visit(child)
 			return false
 		})
-		if operations[node] {
+		if operations[node] || ordered[node] {
+			// An ordered call may have no result type. Its complete operand
+			// prefix still belongs in the worklist: normalizing an inner
+			// suspension can remove the last suspension from that prefix,
+			// while the original operand's defining assignment remains.
 			order = append(order, node)
 		} else if logical, ok := node.(*ir.LogicalExpr); ok && ir.Any(logical.Y, func(n ir.Node) bool {
 			return operations[n]
