@@ -150,11 +150,19 @@ func appendStacklessCoroSourceFrames(u *unwinder, task *stacklessCoroTask, skip 
 				break
 			}
 			header := (*stacklessCoroFusedFrameHeader)(frame)
+			if header.parent == nil {
+				break
+			}
 			if header.marker&stacklessCoroFusedFrameResume != 0 {
 				resume = (*stacklessCoroFusedResumeFrameHeader)(frame).resume
 			}
 			frame = header.parent
-			fused = header.marker&stacklessCoroFusedFrameParent != 0
+			// Self-await uses the same resume and gives every activation a
+			// header, including the root. Only a heterogeneous resume switch
+			// can point to a plain root without a header; its Parent bit says
+			// whether a further fused edge is present.
+			fused = header.marker&stacklessCoroFusedFrameResume == 0 ||
+				header.marker&stacklessCoroFusedFrameParent != 0
 		}
 		task = task.parent
 	}

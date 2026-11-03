@@ -78,6 +78,18 @@ func right(n int,f func()){
  }
  f() // right-leaf
 }
+func inlineLeaf(f func()) {
+ f() // inline-leaf
+}
+func inlineWrapper(f func()) {
+ inlineLeaf(f) // inline-wrapper
+}
+//go:noinline
+func inlineOwner(f func()) {
+ runtime.Gosched()
+ inlineWrapper(f) // inline-owner
+}
+var inlineEntry=inlineOwner
 var rootEntry=root
 var outerEntry=outer
 var recursiveEntry=recursive
@@ -94,6 +106,8 @@ func main(){
  recursiveEntry(8,inspect)
  expected=[]frame{{"main.inspect",0},{"main.left",LEFT_LEAF_LINE},{"main.right",RIGHT_CALL_LINE},{"main.left",LEFT_CALL_LINE},{"main.right",RIGHT_CALL_LINE},{"main.left",LEFT_CALL_LINE},{"main.main",0}}
  leftEntry(4,inspect)
+ expected=[]frame{{"main.inspect",0},{"main.inlineLeaf",INLINE_LEAF_LINE},{"main.inlineWrapper",INLINE_WRAPPER_LINE},{"main.inlineOwner",INLINE_OWNER_LINE},{"main.main",0}}
+ inlineEntry(inspect)
  println("source-frames-ok")
 }
 `
@@ -104,6 +118,7 @@ func sourceFrameFixture() string {
 		"root-call": "ROOT_LINE", "inner-call": "INNER_LINE", "outer-call": "OUTER_LINE",
 		"recursive-call": "RECURSIVE_CALL_LINE", "recursive-leaf": "RECURSIVE_LEAF_LINE",
 		"left-call": "LEFT_CALL_LINE", "left-leaf": "LEFT_LEAF_LINE", "right-call": "RIGHT_CALL_LINE",
+		"inline-leaf": "INLINE_LEAF_LINE", "inline-wrapper": "INLINE_WRAPPER_LINE", "inline-owner": "INLINE_OWNER_LINE",
 	} {
 		for i, line := range strings.Split(sourceFrameProgram, "\n") {
 			if strings.Contains(line, "// "+marker) {
@@ -147,7 +162,7 @@ func TestSourceFramesAcrossOrdinaryHost(t *testing.T) {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"root", "inner", "outer", "recursive", "left", "right"} {
+				for _, name := range []string{"root", "inner", "outer", "recursive", "left", "right", "inlineOwner"} {
 					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
 						t.Errorf("source frame lost native admission: %s", name)
 					}
