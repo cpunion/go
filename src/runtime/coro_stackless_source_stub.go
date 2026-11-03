@@ -6,6 +6,8 @@
 
 package runtime
 
+func stacklessCoroSourceName(funcInfo) string { return "" }
+
 func stacklessCoroTracebackPCs(*unwinder, int, []uintptr) (int, bool) {
 	return 0, false
 }

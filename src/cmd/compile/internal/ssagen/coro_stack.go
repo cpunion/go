@@ -59,7 +59,13 @@ func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 		objw.Uint32(info, 16, offset)
 		objw.Uint32(info, 20, width)
 		objw.Uint32(info, 24, uint32(len(frame.Positions)))
-		off := 28
+		if frame.Name != nil {
+			objw.SymPtrOff(info, 28, frame.Name)
+		} else {
+			objw.Uint32(info, 28, 0)
+		}
+		objw.Uint32(info, 32, frame.NameSize)
+		off := 36
 		for _, pos := range frame.Positions {
 			if pos.File != nil {
 				objw.SymPtrOff(info, off, pos.File)

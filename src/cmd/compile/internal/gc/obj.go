@@ -20,6 +20,8 @@ import (
 	"cmd/internal/objabi"
 	"encoding/json"
 	"fmt"
+	"internal/abi"
+	"internal/buildcfg"
 	"strings"
 )
 
@@ -199,6 +201,7 @@ func dumpGlobalConst(n *ir.Name) {
 // This is done during the sequential phase after compilation, since
 // global symbols can't be declared during parallel compilation.
 func addGCLocals() {
+	bindCoroSourceEntries()
 	for _, s := range base.Ctxt.Text {
 		fn := s.Func()
 		if fn == nil {
@@ -246,6 +249,48 @@ func addGCLocals() {
 		}
 		for _, jt := range fn.JumpTables {
 			objw.Global(jt.Sym, int32(len(jt.Targets)*base.Ctxt.Arch.PtrSize), obj.RODATA)
+		}
+	}
+}
+
+// Ordinary restoration can replace a source closure with an independent body
+// copy. Such closures are only compiled when Walk encounters their literals,
+// so an old canonical closure symbol may have no emitted code. Use a real,
+// explicitly recorded copy as its PC anchor while FD10 retains its source name.
+func bindCoroSourceEntries() {
+	if !buildcfg.Experiment.Coro {
+		return
+	}
+	defined := make(map[*obj.LSym]bool)
+	copies := make(map[*obj.LSym]*obj.LSym)
+	for _, s := range base.Ctxt.Text {
+		defined[s] = true
+		fn := s.Func()
+		if fn == nil {
+			continue
+		}
+		if fn.CoroSourceEntry != nil && fn.CoroSourceInfo != nil &&
+			base.Ctxt.Arch.ByteOrder.Uint32(fn.CoroSourceInfo.P[4:])&abi.CoroSourceCopy != 0 {
+			source := fn.CoroSourceEntry.R[0].Sym
+			if copies[source] == nil {
+				copies[source] = s
+			}
+		}
+	}
+	for _, s := range base.Ctxt.Text {
+		fn := s.Func()
+		if fn == nil {
+			continue
+		}
+		if entry := fn.CoroSourceEntry; entry != nil {
+			source := entry.R[0].Sym
+			if !defined[source] {
+				if copy := copies[source]; copy != nil {
+					entry.R[0].Sym = copy
+				} else if source.ContentAddressable() {
+					base.Fatalf("coroutine source closure has no emitted ordinary copy: %s", source.Name)
+				}
+			}
 		}
 	}
 }

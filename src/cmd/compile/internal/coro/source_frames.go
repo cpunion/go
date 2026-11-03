@@ -18,10 +18,13 @@ import (
 // Source identities come from an explicit body-copy relationship. In
 // particular private helper suffixes and source positions are not identities.
 var sourceFrameCopies = make(map[*ir.Func]*obj.LSym)
+var sourceFrameNames = make(map[*obj.LSym]*obj.LSym)
 var nativeSourceFrames = make(map[*ir.Func]*SourceFrame)
 
 type SourceFrame struct {
 	Source    *obj.LSym
+	Name      *obj.LSym
+	NameSize  uint32
 	Flags     uint32
 	PC        *ir.Name
 	Field     *types.Field
@@ -31,6 +34,15 @@ type SourceFrame struct {
 type SourcePosition struct {
 	File           *obj.LSym
 	FileSize, Line uint32
+}
+
+func recordSourceName(source *obj.LSym) *obj.LSym {
+	name := sourceFrameNames[source]
+	if name == nil {
+		name = staticdata.StringSym(src.NoXPos, source.Name)
+		sourceFrameNames[source] = name
+	}
+	return name
 }
 
 func sourceFrameSymbol(fn *ir.Func) *obj.LSym {
@@ -48,6 +60,7 @@ func RecordSourceCopy(copy, source *ir.Func) {
 		return
 	}
 	origin := sourceFrameSymbol(source)
+	recordSourceName(origin)
 	sourceFrameCopies[copy] = origin
 	prefix := copy.Sym().Name
 	var visit func(*ir.Func)
@@ -61,6 +74,7 @@ func RecordSourceCopy(copy, source *ir.Func) {
 			if strings.HasPrefix(child.Sym().Name, prefix+".") {
 				name := origin.Name + strings.TrimPrefix(child.Sym().Name, prefix)
 				sourceFrameCopies[child] = base.Ctxt.LookupABI(name, obj.ABIInternal)
+				recordSourceName(sourceFrameCopies[child])
 			}
 			visit(child)
 		})
@@ -84,8 +98,9 @@ func recordSourceResume(resume, source *ir.Func, pc *ir.Name, positions []src.XP
 			encoded[i].FileSize = uint32(len(filename))
 		}
 	}
+	origin := sourceFrameSymbol(source)
 	nativeSourceFrames[resume] = &SourceFrame{
-		Source: sourceFrameSymbol(source), Flags: abi.CoroSourceResume,
+		Source: origin, Name: recordSourceName(origin), NameSize: uint32(len(origin.Name)), Flags: abi.CoroSourceResume,
 		PC: pc, Positions: encoded,
 	}
 }
@@ -101,7 +116,7 @@ func SourceFrameInfo(fn *ir.Func) *SourceFrame {
 		return frame
 	}
 	if source := sourceFrameCopies[fn]; source != nil {
-		return &SourceFrame{Source: source, Flags: abi.CoroSourceCopy}
+		return &SourceFrame{Source: source, Name: sourceFrameNames[source], NameSize: uint32(len(source.Name)), Flags: abi.CoroSourceCopy}
 	}
 	return nil
 }

@@ -162,10 +162,16 @@ func (ci *Frames) Next() (frame Frame, more bool) {
 				break
 			}
 		}
+		name := sf.name()
+		if !u.isInlined(uf) {
+			if source := stacklessCoroSourceName(funcInfo); source != "" {
+				name = source
+			}
+		}
 		ci.frames = append(ci.frames, Frame{
 			PC:        pc,
 			Func:      f,
-			Function:  funcNameForPrint(sf.name()),
+			Function:  funcNameForPrint(name),
 			Entry:     entry,
 			startLine: int(sf.startLine),
 			funcInfo:  funcInfo,
@@ -817,7 +823,11 @@ func (f *Func) Name() string {
 		fi := (*funcinl)(unsafe.Pointer(fn))
 		return funcNameForPrint(fi.name)
 	}
-	return funcNameForPrint(funcname(f.funcInfo()))
+	info := f.funcInfo()
+	if source := stacklessCoroSourceName(info); source != "" {
+		return funcNameForPrint(source)
+	}
+	return funcNameForPrint(funcname(info))
 }
 
 // Entry returns the entry address of the function.

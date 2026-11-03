@@ -32,6 +32,9 @@ func TestSourceFrameCopyIdentity(t *testing.T) {
 	if got := SourceFrameInfo(child); got == nil || got.Source.Name != want {
 		t.Fatalf("nested copy source = %v, want %s", got, want)
 	}
+	if got := SourceFrameInfo(child); got.Name == nil || string(got.Name.P) != want || got.NameSize != uint32(len(want)) {
+		t.Fatal("nested source identity depends on the original closure having emitted code")
+	}
 	unrelated := newLowerTestFunc(pkg, "unrelated.coro.func1")
 	if SourceFrameInfo(unrelated) != nil {
 		t.Fatal("source attribution inferred identity from a helper-like name")

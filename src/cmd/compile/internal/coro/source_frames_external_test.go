@@ -89,6 +89,19 @@ func inlineOwner(f func()) {
  runtime.Gosched()
  inlineWrapper(f) // inline-owner
 }
+//go:noinline
+func closureSource(f func()) func() {
+ runtime.Gosched()
+ return func(){
+  f() // closure-call
+ }
+}
+var sourceClosure func()
+//go:noinline
+func makeSourceClosure(){
+ if _,_,_,ok:=runtime.Caller(0);!ok{panic("ordinary closure producer")}
+ sourceClosure=closureSource(inspect)
+}
 var inlineEntry=inlineOwner
 var rootEntry=root
 var outerEntry=outer
@@ -108,6 +121,9 @@ func main(){
  leftEntry(4,inspect)
  expected=[]frame{{"main.inspect",0},{"main.inlineLeaf",INLINE_LEAF_LINE},{"main.inlineWrapper",INLINE_WRAPPER_LINE},{"main.inlineOwner",INLINE_OWNER_LINE},{"main.main",0}}
  inlineEntry(inspect)
+ rootEntry(makeSourceClosure)
+ expected=[]frame{{"main.inspect",0},{"main.closureSource.func1",CLOSURE_LINE},{"main.root",ROOT_LINE},{"main.main",0}}
+ rootEntry(sourceClosure)
  println("source-frames-ok")
 }
 `
@@ -119,6 +135,7 @@ func sourceFrameFixture() string {
 		"recursive-call": "RECURSIVE_CALL_LINE", "recursive-leaf": "RECURSIVE_LEAF_LINE",
 		"left-call": "LEFT_CALL_LINE", "left-leaf": "LEFT_LEAF_LINE", "right-call": "RIGHT_CALL_LINE",
 		"inline-leaf": "INLINE_LEAF_LINE", "inline-wrapper": "INLINE_WRAPPER_LINE", "inline-owner": "INLINE_OWNER_LINE",
+		"closure-call": "CLOSURE_LINE",
 	} {
 		for i, line := range strings.Split(sourceFrameProgram, "\n") {
 			if strings.Contains(line, "// "+marker) {
@@ -162,7 +179,7 @@ func TestSourceFramesAcrossOrdinaryHost(t *testing.T) {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"root", "inner", "outer", "recursive", "left", "right", "inlineOwner"} {
+				for _, name := range []string{"root", "inner", "outer", "recursive", "left", "right", "inlineOwner", "closureSource"} {
 					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
 						t.Errorf("source frame lost native admission: %s", name)
 					}

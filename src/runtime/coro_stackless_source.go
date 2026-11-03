@@ -19,6 +19,16 @@ type stacklessCoroSourceInfo struct {
 	version, flags, source   uint32
 	pcKind, pcOffset, pcSize uint32
 	positions                uint32
+	name, nameSize           uint32
+}
+
+func stacklessCoroSourceName(f funcInfo) string {
+	info := stacklessCoroSourceFrame(f)
+	if info == nil || info.flags&abi.CoroSourceCopy == 0 || info.nameSize == 0 {
+		return ""
+	}
+	header := stringStruct{str: unsafe.Pointer(f.datap.rodata + uintptr(info.name)), len: int(info.nameSize)}
+	return *(*string)(unsafe.Pointer(&header))
 }
 
 type stacklessCoroSourcePosition struct {

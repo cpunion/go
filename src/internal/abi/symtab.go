@@ -132,7 +132,7 @@ const (
 // It does not change source function values or interface method tables.
 const CoroCallableVersion = 1
 
-const CoroSourceVersion = 1
+const CoroSourceVersion = 2
 
 const (
 	CoroSourceResume uint32 = 1 << iota
