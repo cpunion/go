@@ -2894,6 +2894,7 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	recordFreshOperandAssignments(fn)
 	// Save validated wrapper operands before reparenting closures into resume.
 	// Dynamic callee snapshots belong to the source caller during validation;
 	// rechecking that relationship after reparenting would lose their arguments.

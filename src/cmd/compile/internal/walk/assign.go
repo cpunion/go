@@ -155,7 +155,7 @@ func walkAssignFunc(init *ir.Nodes, n *ir.AssignListStmt) ir.Node {
 // walkAssignList walks an OAS2 node.
 func walkAssignList(init *ir.Nodes, n *ir.AssignListStmt) ir.Node {
 	init.Append(ir.TakeInit(n)...)
-	return ir.NewBlockStmt(src.NoXPos, ascompatee(ir.OAS, n.Lhs, n.Rhs))
+	return ir.NewBlockStmt(src.NoXPos, ascompatee(ir.OAS, n.Lhs, n.Rhs, n.CoroFreshOperands))
 }
 
 // walkAssignMapRead walks an OAS2MAPR node.
@@ -248,7 +248,7 @@ func walkReturn(n *ir.ReturnStmt) ir.Node {
 		dsts[i] = typecheck.AssignExpr(v.Nname.(*ir.Name))
 	}
 
-	n.Results = ascompatee(n.Op(), dsts, n.Results)
+	n.Results = ascompatee(n.Op(), dsts, n.Results, false)
 	return n
 }
 
@@ -288,7 +288,7 @@ func ascompatet(nl ir.Nodes, nr *types.Type) []ir.Node {
 // an expression list. called in
 //
 //	expr-list = expr-list
-func ascompatee(op ir.Op, nl, nr []ir.Node) []ir.Node {
+func ascompatee(op ir.Op, nl, nr []ir.Node, freshOperands bool) []ir.Node {
 	// cannot happen: should have been rejected during type checking
 	if len(nl) != len(nr) {
 		base.Fatalf("assignment operands mismatch: %+v / %+v", ir.Nodes(nl), ir.Nodes(nr))
@@ -300,6 +300,13 @@ func ascompatee(op ir.Op, nl, nr []ir.Node) []ir.Node {
 	// affected reports whether expression n could be affected by
 	// the assignments applied so far.
 	affected := func(n ir.Node) bool {
+		// The normal order pass has already evaluated every RHS call in
+		// Go order. Stores to proven fresh operand cells cannot affect a
+		// later RHS load. Preserve the single parallel assignment until
+		// here; splitting it earlier would change callee/argument timing.
+		if freshOperands {
+			return false
+		}
 		if deferResultWrite {
 			return true
 		}

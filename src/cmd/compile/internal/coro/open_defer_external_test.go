@@ -47,6 +47,11 @@ func tuple(s *state)(int,*state){runtime.Gosched();s.log=append(s.log,3);return 
 func tupleOwner(f func(*state)(int,*state),s *state){defer f(s);runtime.Gosched()}
 func big(data [1024]byte,s *state){runtime.Gosched();runtime.GC();s.log=append(s.log,int(data[0])+int(data[1023]))}
 func bigOwner(f func([1024]byte,*state),s *state){var data[1024]byte;data[0]=17;data[1023]=19;defer f(data,s);data[0]=99;runtime.Gosched()}
+func otherBig(data [1024]byte,s *state){runtime.Gosched();s.log=append(s.log,100+int(data[0])+int(data[1023]))}
+var bigChosen func([1024]byte,*state)
+var bigSource [1024]byte
+func mutateBigArgument(s *state)*state{argumentCalls++;bigChosen=otherBig;bigSource[0]=23;return s}
+func bigLateOwner(s *state){defer bigChosen(bigSource,mutateBigArgument(s));bigSource[0]=99;runtime.Gosched()}
 func variadic(s *state,values ...int){for _,n:=range values{runtime.Gosched();s.log=append(s.log,n)}}
 func variadicOwner(f func(*state,...int),s *state){defer f(s,3,5,7);runtime.Gosched()}
 type box struct{n int;pad[4096]byte}
@@ -76,6 +81,7 @@ var repeatedEntry=repeatedOwner
 var rangeEntry=rangeOwner
 var tupleEntry=tupleOwner
 var bigEntry=bigOwner
+var bigLateEntry=bigLateOwner
 var variadicEntry=variadicOwner
 var methodEntry=methodOwner
 var snapshotEntry=snapshotOwner
@@ -97,6 +103,7 @@ func main(){
  s=fresh();rangeEntry(record,s);equal(s.log,8,5,4,3,2,1,0,9)
  s=fresh();tupleEntry(tuple,s);equal(s.log,3)
  s=fresh();bigEntry(big,s);equal(s.log,36)
+ s=fresh();bigSource[0]=17;bigSource[1023]=19;bigChosen=big;argumentCalls=0;bigLateEntry(s);equal(s.log,142);if argumentCalls!=1{panic("large deferred argument replay")}
  s=fresh();bareEntry(nativeRecover,s);equal(s.log,1);if !s.body||s.caught!=nil{panic("no-yield defer owner")}
  s=fresh();execute(func(s *state){bareNilEntry(nil,s)},s);equal(s.log,2);if _,ok:=s.outer.(runtime.Error);!ok||!s.body||s.returned{panic("bare nil defer timing")}
  s=fresh();variadicEntry(variadic,s);equal(s.log,3,5,7)
@@ -140,7 +147,7 @@ func main(){
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"owner", "bareOwner", "bareNilOwner", "bigOwner", "stickyOwner", "nilOwner", "repeatedOwner", "rangeOwner", "tupleOwner", "variadicOwner", "methodOwner", "snapshotOwner", "lateOwner", "affinityOwner", "pressureOwner", "nativeRecover", "nativeReplace", "noSuspendReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic", "captured.func1"} {
+				for _, name := range []string{"owner", "bareOwner", "bareNilOwner", "bigOwner", "bigLateOwner", "stickyOwner", "nilOwner", "repeatedOwner", "rangeOwner", "tupleOwner", "variadicOwner", "methodOwner", "snapshotOwner", "lateOwner", "affinityOwner", "pressureOwner", "nativeRecover", "nativeReplace", "noSuspendReplace", "nativeExit", "nativeIndirect", "record", "tuple", "variadic", "captured.func1"} {
 					if linkedCoroStackUnsafe(t, executable, "main."+name+".coro.stackgate") {
 						t.Errorf("open defer source lost native admission: %s", name)
 					}

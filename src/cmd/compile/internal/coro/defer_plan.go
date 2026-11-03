@@ -41,6 +41,13 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 
 func hasSuspendingDeferSite(plan *Plan, function *Function) bool {
 	for _, edge := range function.Edges {
+		if edge.Kind == DeferCall && !edge.FactoryRequired &&
+			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
+			call := unwrapGoCall(edge.Node)
+			if call.Op() == ir.OCALLFUNC && call.Fun != nil && call.Fun.Type().Kind() == types.TFUNC {
+				return true
+			}
+		}
 		if edge.Kind == DeferCall && !edge.Unknown {
 			if summary, known := plan.edgeSummary(edge); known && summary.Effect == MaySuspend {
 				return true

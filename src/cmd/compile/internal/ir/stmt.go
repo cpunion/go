@@ -64,7 +64,11 @@ type AssignListStmt struct {
 	miniStmt
 	Lhs Nodes
 	Def bool
-	Rhs Nodes
+	// CoroFreshOperands preserves the frontend proof that these operand
+	// destinations are distinct fresh temporaries, even after coroutine
+	// lowering represents their storage as private traced pointer cells.
+	CoroFreshOperands bool
+	Rhs               Nodes
 }
 
 func NewAssignListStmt(pos src.XPos, op Op, lhs, rhs []Node) *AssignListStmt {

@@ -104,7 +104,7 @@ func TestLowerDynamicDefer(t *testing.T) {
 				starter, rawDefer := false, false
 				for _, generated := range typecheck.Target.Funcs {
 					ir.Visit(generated, func(node ir.Node) {
-						if call, ok := node.(*ir.CallExpr); ok && symbolName(ir.StaticCalleeName(call.Fun)) == "runtime.coroDeferStartFunction" {
+						if call, ok := node.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC && call.Fun != nil && symbolName(ir.StaticCalleeName(call.Fun)) == "runtime.coroDeferStartFunction" {
 							starter = true
 						}
 						if stmt, ok := node.(*ir.GoDeferStmt); ok && stmt.Op() == ir.ODEFER && NativeStackEntry(generated) {
