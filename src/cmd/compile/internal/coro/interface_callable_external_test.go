@@ -83,10 +83,17 @@ func frame(unsafe.Pointer)unsafe.Pointer
 func run(unsafe.Pointer,func(unsafe.Pointer)uint8,uintptr)bool
 var ordinaryRootDriver=run
 type worker interface{Add(int)int;Capture()}
-type box struct{n int;observed any;pad[4095]byte}
+type box struct{n int;observed *any;pad[4095]byte}
 func(p *box)Add(n int)int{runtime.Gosched();runtime.GC();return p.n+n+int(p.pad[4094])}
-func(p *box)Capture(){runtime.Gosched();runtime.GC();p.observed=recover()}
-type state struct{pc int;w worker;incoming any;result int;done bool}
+func(p *box)Capture(){runtime.Gosched();runtime.GC();*p.observed=recover()}
+type value struct{n int;observed *any;offset int}
+func(v value)Add(n int)int{runtime.Gosched();runtime.GC();return v.n+n+v.offset}
+func(v value)Capture(){*v.observed=recover()}
+type promoted struct{value}
+type direct struct{observed *any}
+func(v direct)Add(n int)int{return n+30}
+func(v direct)Capture(){*v.observed=recover()}
+type state struct{pc int;w worker;observed *any;incoming any;result int;done bool}
 func noFallback(any,bool,bool){panic("interface native defer bypassed")}
 func drive(ctx unsafe.Pointer)uint8{
  s:=(*state)(frame(ctx));words:=(*[2]unsafe.Pointer)(unsafe.Pointer(&s.w))
@@ -112,22 +119,57 @@ func drive(ctx unsafe.Pointer)uint8{
   start(token(ctx),words[0],words[1],1,(func())(nil),nil,noFallback)
   if action(ctx)!=2{panic("interface cleanup used host")};return 2
  case 3:
-  if s.w.(*box).observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("interface lost direct recover")}
+  if *s.observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("interface lost direct recover")}
   s.pc=4;panicking(ctx,s.incoming)
   startFunction(token(ctx),s.w.Capture,nil,noFallback)
   if action(ctx)!=2{panic("bound interface cleanup used host")};return 2
  case 4:
-  if s.w.(*box).observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("bound interface lost direct recover")}
+  if *s.observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("bound interface lost direct recover")}
   s.done=true;return 3
  }
  panic("invalid interface driver")
 }
 func main(){
- p:=&box{n:13};p.pad[4094]=17;s:=&state{w:p,incoming:new(int)};p=nil;runtime.GC()
- ordinaryRootDriver(unsafe.Pointer(s),drive,0)
- if !s.done{panic("interface driver incomplete")}
+ var observed any
+ p:=&box{n:13,observed:&observed};p.pad[4094]=17
+ v:=value{13,&observed,17}
+ for _,w:=range []worker{p,v,&v,promoted{v},&promoted{v},direct{&observed}}{
+  observed=nil;s:=&state{w:w,observed:&observed,incoming:new(int)};runtime.GC()
+  ordinaryRootDriver(unsafe.Pointer(s),drive,0)
+  if !s.done{panic("interface driver incomplete")}
+ }
+ var absent *value;var w worker=absent;words:=(*[2]unsafe.Pointer)(unsafe.Pointer(&w))
+ if p,_:=lookup(words[0],words[1],0,(func(int)int)(nil));p!=nil{panic("nil value wrapper bypassed panicwrap")}
+ if p,_:=lookupFunction(w.Capture);p!=nil{panic("nil bound value wrapper bypassed panicwrap")}
+ w=direct{};words=(*[2]unsafe.Pointer)(unsafe.Pointer(&w))
+ if p,_:=lookup(words[0],words[1],0,(func(int)int)(nil));p==nil{panic("nil direct-interface data rejected")}
+
  println("interface-invocation-ok")
 }
 `
 	testCallableProgramme(t, source, "interface-invocation-ok")
+}
+
+func TestInterfaceNilValueReceiver(t *testing.T) {
+	const source = `package main
+import "runtime"
+type receiver struct{n int}
+func(v receiver)Run(){runtime.Gosched()}
+type runner interface{Run()}
+func call(v runner){runtime.Gosched();v.Run()}
+func cleanup(v runner){defer v.Run();runtime.Gosched()}
+func bound(f func()){runtime.Gosched();f()}
+func caught(f func())(out any){defer func(){out=recover()}();f();return}
+func main(){
+ var p *receiver;var v runner=p
+ for _,f:=range []func(){func(){call(v)},func(){cleanup(v)},func(){bound(v.Run)}}{
+  got:=caught(f);if got==nil{panic("nil value receiver did not panic")}
+  message:=got.(interface{Error()string}).Error()
+  if message!="value method main.receiver.Run called using nil *receiver pointer"{panic(message)}
+ }
+ println("switch-return-ok")
+}
+`
+	required := []string{"call", "cleanup", "bound"}
+	testSwitchReturnProgram(t, source, nil, required, required...)
 }

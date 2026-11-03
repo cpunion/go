@@ -32,17 +32,17 @@ func lookupStacklessCoroFunction(value any, deferred bool) (*stacklessCoroCallab
 		// Only an explicitly recorded interface method-value wrapper has this
 		// marker. Its environment is the unchanged {code, interface} Go layout.
 		receiver := (*iface)(add(words.data, unsafe.Sizeof(uintptr(0))))
-		entry = lookupStacklessCoroInterface(unsafe.Pointer(receiver.tab), entry.boundMethod-1, value, deferred)
+		entry = lookupStacklessCoroInterface(unsafe.Pointer(receiver.tab), receiver.data, entry.boundMethod-1, value, deferred)
 		return entry, receiver.data
 	}
 	return checkStacklessCoroCallable(entry, unsafe.Pointer(words._type), deferred), words.data
 }
 
 func coroLookupInterface(table, environment unsafe.Pointer, method uintptr, signature any) (unsafe.Pointer, unsafe.Pointer) {
-	return unsafe.Pointer(lookupStacklessCoroInterface(table, method, signature, false)), environment
+	return unsafe.Pointer(lookupStacklessCoroInterface(table, environment, method, signature, false)), environment
 }
 
-func lookupStacklessCoroInterface(table unsafe.Pointer, method uintptr, signature any, deferred bool) *stacklessCoroCallable {
+func lookupStacklessCoroInterface(table, environment unsafe.Pointer, method uintptr, signature any, deferred bool) *stacklessCoroCallable {
 	tab := (*itab)(table)
 	typ := efaceOf(&signature)._type
 	if tab == nil || tab.Inter == nil || method >= uintptr(len(tab.Inter.Methods)) || typ == nil || typ.Kind() != abi.Func {
@@ -53,5 +53,12 @@ func lookupStacklessCoroInterface(table unsafe.Pointer, method uintptr, signatur
 	if entry == nil {
 		return nil
 	}
-	return checkStacklessCoroCallable(entry.method, unsafe.Pointer(typ), deferred)
+	entry = checkStacklessCoroCallable(entry.method, unsafe.Pointer(typ), deferred)
+	// A value-method wrapper must execute its original panicwrap when its
+	// pointer receiver is nil. The companion may bypass that wrapper only
+	// after proving the receiver exists, preserving the public panic text.
+	if entry != nil && entry.nilCheck != 0 && environment == nil {
+		return nil
+	}
+	return entry
 }

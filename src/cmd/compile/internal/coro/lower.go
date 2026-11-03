@@ -336,7 +336,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	prepareLiteralNormalRecoverCalls(plan, deferredLiterals, normalRecover)
 	for _, function := range functions {
 		if function.Primary != CoroPrimary &&
-			!plainCapturedCallbacks[function.Func] {
+			!plainCapturedCallbacks[function.Func] && !plainCallableMethod(function) {
 			continue
 		}
 		if deferredLiterals[function.Func] && !canPlanSuspendingDefer(plan, function.Func) {
@@ -376,7 +376,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, target := range callbackTargets {
-		if child := plan.Functions[target]; plainCallbackFactorySupported(child) {
+		if child := plan.Functions[target]; candidates[target] == nil && plainCallbackFactorySupported(child) {
 			callee := target
 			if child.Terminal&UsesRecover != 0 {
 				callee = normalRecover(target)
@@ -412,7 +412,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			}
 			for _, target := range targets {
 				child := plan.Functions[target]
-				if factories[target] == nil && plainSpawnFactorySupported(child) {
+				if factories[target] == nil && candidates[target] == nil && plainSpawnFactorySupported(child) {
 					callee := unwrapGoCall(edge.Node).Fun
 					if len(edge.Targets) != 0 {
 						callee = target.Nname
@@ -672,7 +672,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
 		}
-		if function.Primary == CoroPrimary || plainCapturedCallbacks[function.Func] {
+		if function.Primary == CoroPrimary || plainCapturedCallbacks[function.Func] || plainCallableMethod(function) {
 			result.Skipped++
 		}
 	}
@@ -708,7 +708,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
 	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
-	if len(function.Sites) == 0 && !hasSuspendingDeferSite(plan, function) && !canPlanParameterDeferTarget(plan, fn) &&
+	if len(function.Sites) == 0 && !plainCallableMethod(function) && !hasSuspendingDeferSite(plan, function) && !canPlanParameterDeferTarget(plan, fn) &&
 		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function) || rangeDeferRegistrationFactorySupported(plan, bodyPlan))) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}

@@ -130,7 +130,7 @@ const (
 
 // CoroCallableVersion identifies compiler-owned callable companion metadata.
 // It does not change source function values or interface method tables.
-const CoroCallableVersion = 3
+const CoroCallableVersion = 4
 
 const CoroSourceVersion = 2
 

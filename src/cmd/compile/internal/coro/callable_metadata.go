@@ -71,6 +71,11 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 	for source := range boundInterfaceMethods {
 		sources = append(sources, source)
 	}
+	for source := range interfaceMethodWrappers {
+		if candidates[source] == nil && plainFactories[source] == nil {
+			sources = append(sources, source)
+		}
+	}
 	for source := range boundMethodValues {
 		if candidates[source] == nil && plainFactories[source] == nil {
 			sources = append(sources, source)
@@ -88,7 +93,26 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 		if dot := boundInterfaceMethods[source]; dot != nil {
 			types.CalcSize(dot.X.Type())
 			descriptor := emitCallableRecord(source, callableSignature(source), nil, nil, nil,
-				uint64(dot.Offset()/int64(types.PtrSize)+1), ".coro.callable")
+				uint64(dot.Offset()/int64(types.PtrSize)+1), 0, ".coro.callable")
+			emitCallableProvider(source, descriptor)
+			continue
+		}
+		if wrapper := interfaceMethodWrappers[source]; wrapper != nil {
+			factory, abi, deferred := boundMethodFactory(wrapper.boundMethodValue, candidates, plainFactories)
+			if factory == nil {
+				continue
+			}
+			call := callableCompanion(source, factory, abi, ".coro.iface.call", true)
+			var cleanup *ir.Func
+			if deferred {
+				cleanup = callableCompanion(source, factory, abi, ".coro.iface.defer", true)
+			}
+			var nilCheck uint64
+			if wrapper.nilCheck {
+				nilCheck = 1
+			}
+			method := emitCallableRecord(source, callableMethodSignature(source.Type()), call, cleanup, nil, 0, nilCheck, ".coro.interface")
+			descriptor := emitCallableRecord(source, callableSignature(source), nil, nil, method, 0, 0, ".coro.callable")
 			emitCallableProvider(source, descriptor)
 			continue
 		}
@@ -149,13 +173,18 @@ func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix s
 		}
 		if method {
 			receiver := source.Type().Recv().Type
+			var value ir.Node
 			if types.IsDirectIface(receiver) {
 				// A direct interface receiver occupies the data word itself.
 				cell := typecheck.ConvNop(typecheck.NodAddr(environment), types.Types[types.TUNSAFEPTR])
-				args = append(args, typedDeref(pos, typecheck.ConvNop(cell, types.NewPtr(receiver)), receiver))
+				value = typedDeref(pos, typecheck.ConvNop(cell, types.NewPtr(receiver)), receiver)
 			} else {
-				args = append(args, typedDeref(pos, typecheck.ConvNop(environment, types.NewPtr(receiver)), receiver))
+				value = typedDeref(pos, typecheck.ConvNop(environment, types.NewPtr(receiver)), receiver)
 			}
+			if wrapper := interfaceMethodWrappers[source]; wrapper != nil {
+				value = adjustedMethodReceiver(pos, wrapper.boundMethodValue, value)
+			}
+			args = append(args, value)
 		} else if bound := boundMethodValues[source]; bound != nil {
 			args = append(args, boundMethodReceiver(pos, bound, environment))
 		}
@@ -210,9 +239,9 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCa
 		if deferCapable {
 			cleanup = callableCompanion(source, factory, factoryABI, ".coro.iface.defer", true)
 		}
-		method = emitCallableRecord(source, callableMethodSignature(source.Type()), call, cleanup, nil, 0, ".coro.interface")
+		method = emitCallableRecord(source, callableMethodSignature(source.Type()), call, cleanup, nil, 0, 0, ".coro.interface")
 	}
-	descriptor := emitCallableRecord(source, callableSignature(source), companion, deferred, method, 0, ".coro.callable")
+	descriptor := emitCallableRecord(source, callableSignature(source), companion, deferred, method, 0, 0, ".coro.callable")
 	emitCallableProvider(source, descriptor)
 }
 
@@ -221,7 +250,7 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCa
 // environment. A bound interface marker is resolved against its captured itab
 // before native capability is granted, without invoking its ordinary wrapper.
 func emitCallableRecord(source *ir.Func, signature *types.Type, companion, deferred *ir.Func,
-	method *ir.Name, boundMethod uint64, suffix string) *ir.Name {
+	method *ir.Name, boundMethod, nilCheck uint64, suffix string) *ir.Name {
 	pos := source.Pos()
 	ptr := types.Types[types.TUNSAFEPTR]
 	fields := []*types.Field{
@@ -233,6 +262,7 @@ func emitCallableRecord(source *ir.Func, signature *types.Type, companion, defer
 		types.NewField(pos, types.LocalPkg.Lookup("deferFactory"), types.Types[types.TUINTPTR]),
 		types.NewField(pos, types.LocalPkg.Lookup("method"), ptr),
 		types.NewField(pos, types.LocalPkg.Lookup("boundMethod"), types.Types[types.TUINTPTR]),
+		types.NewField(pos, types.LocalPkg.Lookup("nilCheck"), types.Types[types.TUINTPTR]),
 	}
 	descType := types.NewStruct(fields)
 	types.CalcSize(descType)
@@ -260,6 +290,7 @@ func emitCallableRecord(source *ir.Func, signature *types.Type, companion, defer
 			off = objw.Uintptr(data, off, 0)
 		}
 		off = objw.Uintptr(data, off, boundMethod)
+		off = objw.Uintptr(data, off, nilCheck)
 		flags := int16(obj.RODATA)
 		if source.Dupok() {
 			flags |= obj.DUPOK

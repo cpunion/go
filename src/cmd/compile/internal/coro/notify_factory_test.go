@@ -75,8 +75,8 @@ func TestCoroNotifyEntry(t *testing.T) {
   c.Broadcast()
   for i := 0; i < 128; i++ { <-done }
 
-  // The Locker interface is still unsupported. Keep the ordinary body so
-  // that public Cond.Wait, including lock reacquisition, remains correct.
+  // Public Cond.Wait dispatches the Locker interface and reacquires its lock
+  // before returning, through independently admitted native method entries.
   started, finished := make(chan struct{}), make(chan struct{})
   go func() {
    mu.Lock()
@@ -145,7 +145,7 @@ func TestCoroNotifyBubble(t *testing.T) {
 			}
 			exe := filepath.Join(tmp, "notify.test")
 			args := []string{"test", "-c", "-overlay=" + overlay,
-				"-gcflags=sync=" + config.flags, "-o", exe, "sync"}
+				"-gcflags=sync=" + config.flags, "-gcflags=internal/sync=" + config.flags, "-o", exe, "sync"}
 			if config.race {
 				args = append(args, "-race")
 			}
@@ -164,8 +164,15 @@ func TestCoroNotifyBubble(t *testing.T) {
 					t.Fatalf("coroNotify%s native entry = %t, want %t\n%s", name, got, native, data)
 				}
 			}
-			if strings.Contains(string(symbols), "sync.coroNotifyPublicWait.coro") {
-				t.Fatal("dynamic Locker wait lost its conservative fallback")
+			if got := strings.Contains(string(symbols), "sync.coroNotifyPublicWait.coro"); got != native {
+				t.Fatalf("dynamic Locker wait native entry = %t, want %t", got, native)
+			}
+			if native {
+				for _, name := range []string{"sync.coroNotifyPublicWait", "sync.(*Cond).Wait", "sync.(*Mutex).Lock.coro.iface.call", "sync.(*Mutex).Unlock.coro.iface.defer"} {
+					if linkedCoroStackUnsafe(t, exe, name+".coro.stackgate") {
+						t.Fatalf("dynamic Locker native stack admission rejected: %s", name)
+					}
+				}
 			}
 			if got := strings.Contains(string(symbols), "runtime.coroNotifyListWait"); got != native {
 				t.Fatalf("runtime notification entry = %t, want %t", got, native)

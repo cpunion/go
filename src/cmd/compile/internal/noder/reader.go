@@ -4309,6 +4309,10 @@ func addTailCall(pos src.XPos, fn *ir.Func, recv ir.Node, method *types.Field) {
 	call := typecheck.Call(pos, dot, args, method.Type.IsVariadic()).(*ir.CallExpr)
 	if buildcfg.Experiment.Coro && fn.Needctxt() {
 		coro.RecordBoundMethodValue(fn, recv, call)
+	} else if buildcfg.Experiment.Coro && fn.Type().Recv() != nil {
+		// methodWrapper adds only the standard nil-receiver guard before
+		// this normalized forwarding call.
+		coro.RecordInterfaceMethodWrapper(fn, recv, call, len(fn.Body) != 0)
 	}
 
 	if recv.Type() != nil && recv.Type().IsPtr() && method.Type.Recv().Type.IsPtr() &&

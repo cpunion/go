@@ -23,6 +23,7 @@ type stacklessCoroCallable struct {
 	deferCode   uintptr
 	method      *stacklessCoroCallable
 	boundMethod uintptr
+	nilCheck    uintptr
 }
 
 type stacklessCoroCallableInfo struct {
@@ -93,7 +94,7 @@ func coroDeferStartFunction(token unsafe.Pointer, value any, request unsafe.Poin
 
 func coroDeferStartInterface(token, table, environment unsafe.Pointer, method uintptr, signature any, request unsafe.Pointer, ordinary func(any, bool, bool)) {
 	task := activeStacklessCoroDeferTask(token, "runtime: invalid stackless coroutine interface defer")
-	entry := lookupStacklessCoroInterface(table, method, signature, true)
+	entry := lookupStacklessCoroInterface(table, environment, method, signature, true)
 	startStacklessCoroCallableDefer(unsafe.Pointer(&task.context), entry, environment, request, ordinary)
 }
 
