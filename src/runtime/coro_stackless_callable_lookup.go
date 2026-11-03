@@ -16,7 +16,7 @@ import (
 // remain an ordinary fallback; lookup itself must not trigger their panic.
 func coroLookupFunction(value any) (unsafe.Pointer, unsafe.Pointer) {
 	words := efaceOf(&value)
-	if words._type == nil || words._type.Kind_&abi.KindMask != abi.Func || words.data == nil {
+	if words._type == nil || words._type.Kind() != abi.Func || words.data == nil {
 		return nil, nil
 	}
 	return coroLookupCallable((*funcval)(words.data).fn, unsafe.Pointer(words._type)), words.data
