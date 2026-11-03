@@ -90,6 +90,16 @@ func(p *box)add(n int)int{runtime.Gosched();runtime.GC();p.n+=n;return p.n}
 func pair(p *box,n int)(int,*box){runtime.Gosched();runtime.GC();return p.n+n,p}
 func sum(n int,values ...int)int{for _,v:=range values{runtime.Gosched();n+=v};return n}
 func store(p *box,n int){runtime.Gosched();runtime.GC();p.n=n}
+//go:noinline
+func read(p *[5120]byte)int{return int(p[0])+int(p[5119])}
+func sequence(n,seed int)int{
+ var data [5120]byte
+ data[5119]=byte(seed)
+ seed+=7
+ if n==0{runtime.Gosched();return read(&data)+read(&data)}
+ got:=sequence(n-1,seed)
+ return got+read(&data)+read(&data)
+}
 
 type invocation struct{
  pc uint8
@@ -145,6 +155,14 @@ func main(){
  empty:=struct{p *box;n int}{p,37}
  invoke(store,unsafe.Pointer(&empty));if p.n!=37{panic("empty result request")}
  runtime.GC();if returned.n!=37||returned.pad[4094]!=23{panic("result pointer liveness")}
+ for _,n:=range []int{0,1,16,64,513}{
+  for seed:=0;seed<4;seed++{
+   request:=struct{n,seed int;result *int}{n,seed,&result}
+   invoke(sequence,unsafe.Pointer(&request))
+   want:=0;for i:=0;i<=n;i++{want+=2*int(byte(seed+7*i))}
+   if result!=want{panic("erased callable array root or recursive snapshot")}
+  }
+ }
  println("callable-invocation-ok")
 }
 `

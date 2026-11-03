@@ -68,7 +68,14 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate) {
 		if source.Type().HasShape() || !callableFactorySupported(source) {
 			continue
 		}
-		emitNativeCallable(source, candidate.factory, candidate.factoryABI)
+		factory := candidate.factory
+		if candidate.rootArray != nil {
+			// An erased call starts a new lineage. The public factory keeps
+			// the source ABI and allocates private array storage; its internal
+			// implementation also takes a selector for serial self-awaits.
+			factory = candidate.rootArray.public
+		}
+		emitNativeCallable(source, factory, candidate.factoryABI)
 	}
 }
 
