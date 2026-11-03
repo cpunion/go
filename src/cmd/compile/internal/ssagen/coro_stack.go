@@ -15,7 +15,23 @@ import (
 )
 
 func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
-	if !buildcfg.Experiment.Coro || !coro.NativeStackEntry(fn) {
+	if !buildcfg.Experiment.Coro {
+		return
+	}
+	if provider := coro.NativeCallableProvider(fn); provider != nil {
+		info := base.Ctxt.Lookup(fn.LSym.Name + ".coro.callinfo")
+		objw.Uint32(info, 0, abi.CoroCallableVersion)
+		objw.SymPtrOff(info, 4, provider.Linksym())
+		info.Align = 4
+		info.Set(obj.AttrContentAddressable, true)
+		fn.LSym.Func().CoroCallableInfo = info
+		p := pp.Prog(obj.AFUNCDATA)
+		p.From.SetConst(abi.FUNCDATA_CoroCallable)
+		p.To.Type = obj.TYPE_MEM
+		p.To.Name = obj.NAME_EXTERN
+		p.To.Sym = info
+	}
+	if !coro.NativeStackEntry(fn) {
 		return
 	}
 	fn.LSym.Func().FuncFlag |= abi.FuncFlagCoroStack

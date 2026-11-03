@@ -499,6 +499,7 @@ type FuncInfo struct {
 	ArgLiveInfo        *LSym // argument liveness info for traceback
 	WrapInfo           *LSym // for wrapper, info of wrapped function
 	CoroStackInfo      *LSym // linker proof bindings for native coroutine entries
+	CoroCallableInfo   *LSym // callable companion provider, as a text-relative offset
 	JumpTables         []JumpTable
 
 	FuncInfoSym *LSym

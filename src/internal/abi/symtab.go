@@ -124,7 +124,12 @@ const (
 	FUNCDATA_ArgLiveInfo        = 6
 	FUNCDATA_WrapInfo           = 7
 	FUNCDATA_CoroStackGates     = 8
+	FUNCDATA_CoroCallable       = 9
 )
+
+// CoroCallableVersion identifies compiler-owned callable companion metadata.
+// It does not change source function values or interface method tables.
+const CoroCallableVersion = 1
 
 // Special values for the PCDATA_UnsafePoint table.
 const (
