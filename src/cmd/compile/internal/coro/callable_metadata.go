@@ -101,7 +101,7 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 		}
 		captures := captureTypes(source)
 		if len(captures) != 0 {
-			fields := []*types.Field{types.NewField(pos, nil, types.Types[types.TUINTPTR])}
+			fields := []*types.Field{types.NewField(pos, types.LocalPkg.Lookup("F"), types.Types[types.TUINTPTR])}
 			for i, typ := range captures {
 				fields = append(fields, types.NewField(pos, types.LocalPkg.LookupNum(".corocapture", i), types.NewPtr(typ)))
 			}
