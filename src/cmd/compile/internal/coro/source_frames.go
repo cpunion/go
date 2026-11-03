@@ -7,6 +7,7 @@ package coro
 import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/staticdata"
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/src"
@@ -24,7 +25,12 @@ type SourceFrame struct {
 	Flags     uint32
 	PC        *ir.Name
 	Field     *types.Field
-	Positions []src.XPos
+	Positions []SourcePosition
+}
+
+type SourcePosition struct {
+	File           *obj.LSym
+	FileSize, Line uint32
 }
 
 func sourceFrameSymbol(fn *ir.Func) *obj.LSym {
@@ -63,9 +69,24 @@ func RecordSourceCopy(copy, source *ir.Func) {
 }
 
 func recordSourceResume(resume, source *ir.Func, pc *ir.Name, positions []src.XPos) {
+	// StringSym can create and publish a new object symbol. Prepare all such
+	// references here, while lowering is serial, before parallel SSA emission.
+	encoded := make([]SourcePosition, len(positions))
+	for i, pos := range positions {
+		if !pos.IsKnown() {
+			continue
+		}
+		p := base.Ctxt.InnermostPos(pos)
+		filename := p.AbsFilename()
+		encoded[i].Line = uint32(p.RelLine())
+		if filename != "" {
+			encoded[i].File = staticdata.StringSym(pos, filename)
+			encoded[i].FileSize = uint32(len(filename))
+		}
+	}
 	nativeSourceFrames[resume] = &SourceFrame{
 		Source: sourceFrameSymbol(source), Flags: abi.CoroSourceResume,
-		PC: pc, Positions: positions,
+		PC: pc, Positions: encoded,
 	}
 }
 

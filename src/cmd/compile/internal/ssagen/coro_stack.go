@@ -9,7 +9,6 @@ import (
 	"cmd/compile/internal/coro"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/objw"
-	"cmd/compile/internal/staticdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/internal/obj"
 	"internal/abi"
@@ -64,18 +63,13 @@ func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 		objw.Uint32(info, 24, uint32(len(frame.Positions)))
 		off := 28
 		for _, pos := range frame.Positions {
-			filename, line := "", uint32(0)
-			if pos.IsKnown() {
-				p := base.Ctxt.InnermostPos(pos)
-				filename, line = p.AbsFilename(), uint32(p.RelLine())
-			}
-			if filename != "" {
-				objw.SymPtrOff(info, off, staticdata.StringSym(pos, filename))
+			if pos.File != nil {
+				objw.SymPtrOff(info, off, pos.File)
 			} else {
 				objw.Uint32(info, off, 0)
 			}
-			objw.Uint32(info, off+4, uint32(len(filename)))
-			objw.Uint32(info, off+8, line)
+			objw.Uint32(info, off+4, pos.FileSize)
+			objw.Uint32(info, off+8, pos.Line)
 			off += 12
 		}
 		info.Align = 4

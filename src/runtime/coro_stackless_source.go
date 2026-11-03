@@ -12,8 +12,9 @@ import (
 	"unsafe"
 )
 
-// Every reference is section-relative, so source attribution also works in
-// PIE and without DWARF. This record does not grant native-call capability.
+// Every reference is relative to moduledata.rodata, including entry cells
+// that the linker places in relro. This works in PIE and without DWARF and
+// does not grant native-call capability.
 type stacklessCoroSourceInfo struct {
 	version, flags, source   uint32
 	pcKind, pcOffset, pcSize uint32
