@@ -34,10 +34,12 @@ func signature(f any)unsafe.Pointer{return (*[2]unsafe.Pointer)(unsafe.Pointer(&
 func descriptor(f any)unsafe.Pointer{return lookup(reflect.ValueOf(f).Pointer(),signature(f))}
 func check(f any){
  p:=descriptor(f);if p==nil{panic("missing callable descriptor")}
- words:=(*[4]uintptr)(p)
- if words[0]!=1||words[1]!=uintptr(signature(f))||words[2]==0||words[3]==0{panic("callable descriptor identity")}
+ words:=(*[6]uintptr)(p)
+ if words[0]!=2||words[1]!=uintptr(signature(f))||words[2]==0||words[3]==0||words[4]==0||words[5]==0{panic("callable descriptor identity")}
  gate:=(*[2]uintptr)(unsafe.Pointer(words[2]))
  if gate[0]!=0||gate[1]!=words[3]{panic("erased adapter has no independent accepted stack proof")}
+ deferred:=(*[2]uintptr)(unsafe.Pointer(words[4]))
+ if deferred[0]!=0||deferred[1]!=words[5]||words[2]==words[4]||words[3]==words[5]{panic("direct defer has no independent accepted capability")}
  code:=reflect.ValueOf(f).Pointer()
  if lookup(code+1,signature(f))!=nil{panic("interior code pointer accepted")}
  if lookup(code,signature((func(string)int)(nil)))!=nil{panic("wrong callable signature accepted")}

@@ -137,6 +137,21 @@ func coroHostDefer(ctx unsafe.Pointer, call func(any, bool, bool)) uint8 {
 	return prepareStacklessCoroHostCall(ctx, nil, call)
 }
 
+// Called after the compiler's ordinary thunk has directly deferred the frozen
+// source function. Preserve a pending Goexit even when a new panic overlays it.
+func coroDeferInject(value any, panicking, exiting bool) {
+	if panicking {
+		if exiting {
+			defer func() { panic(value) }()
+			Goexit()
+		}
+		panic(value)
+	}
+	if exiting {
+		Goexit()
+	}
+}
+
 func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func(any, bool, bool)) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()

@@ -6,6 +6,7 @@ package coro
 
 import (
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/types"
 	"fmt"
 	"slices"
 )
@@ -99,6 +100,15 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 	defers, dynamicDefers := candidate.defers, candidate.dynamicDefers
 	for _, deferred := range defers {
 		edge, ok := edges[deferred.call]
+		if ok && edge.Kind == DeferCall && !edge.FactoryRequired &&
+			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
+			call := unwrapGoCall(deferred.call)
+			if call.Op() != ir.OCALLFUNC || call.Fun == nil || call.Fun.Type().Kind() != types.TFUNC {
+				return fmt.Errorf("open defer has no frozen function value")
+			}
+			deferred.open = true
+			continue
+		}
 		if !ok || edge.Kind != DeferCall || edge.Callee == nil && len(edge.Targets) == 0 {
 			return fmt.Errorf("defer has no static call plan")
 		}

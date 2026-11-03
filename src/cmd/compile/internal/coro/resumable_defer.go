@@ -16,7 +16,7 @@ import (
 
 func (candidate *lowerCandidate) hasResumableDefers() bool {
 	has := func(defers []*lowerDefer) bool {
-		return slices.ContainsFunc(defers, func(d *lowerDefer) bool { return len(d.resumable) != 0 })
+		return slices.ContainsFunc(defers, func(d *lowerDefer) bool { return d.open || len(d.resumable) != 0 })
 	}
 	if has(candidate.defers) {
 		return true
@@ -125,6 +125,12 @@ func rewriteResumableDeferCall(deferred *lowerDefer, token *ir.Name, factories m
 	return nil
 }
 
-func resumableDeferWait(pos src.XPos, ctx ir.Node) ir.Node {
-	return ir.NewIfStmt(pos, typecheck.Call(pos, typecheck.LookupRuntime("coroDeferSuspended"), ir.Nodes{ctx}, false), ir.Nodes{ir.NewReturnStmt(pos, ir.Nodes{typedInt(pos, types.Types[types.TUINT8], int64(actionWait))})}, nil)
+func resumableDeferWait(pos src.XPos, resume *ir.Func, ctx ir.Node) ir.Node {
+	action := typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
+	query := typecheck.Call(pos, typecheck.LookupRuntime("coroDeferAction"), ir.Nodes{ctx}, false)
+	branch := ir.NewIfStmt(pos, ir.NewBinaryExpr(pos, ir.ONE, action,
+		typedInt(pos, action.Type(), int64(actionInvalid))),
+		ir.Nodes{ir.NewReturnStmt(pos, ir.Nodes{action})}, nil)
+	branch.SetInit(ir.Nodes{ir.NewAssignStmt(pos, action, query)})
+	return branch
 }

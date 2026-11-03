@@ -364,6 +364,9 @@ func coroDeferPanic(unsafe.Pointer, interface{})
 func coroDeferRecover(unsafe.Pointer) interface{}
 func coroDeferStartFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroDeferSuspended(unsafe.Pointer) bool
+func coroDeferAction(unsafe.Pointer) uint8
+func coroDeferStartFunction(unsafe.Pointer, interface{}, unsafe.Pointer, func(interface{}, bool, bool))
+func coroDeferInject(interface{}, bool, bool)
 func coroDeferRecoverAwait(unsafe.Pointer) interface{}
 
 // stackless coroutine terminal outcomes

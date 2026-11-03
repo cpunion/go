@@ -87,11 +87,11 @@ func emitNativeCallableMetadata(candidates map[*ir.Func]*lowerCandidate, plainFa
 				factory = candidate.rootArray.public
 			}
 		}
-		emitNativeCallable(source, factory, factoryABI)
+		emitNativeCallable(source, factory, factoryABI, candidates[source] != nil)
 	}
 }
 
-func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
+func callableCompanion(source, factory *ir.Func, factoryABI FactoryABI, suffix string) *ir.Func {
 	pos := source.Pos()
 	signature := callableSignature(source)
 	requestType := callableRequestType(signature)
@@ -105,7 +105,7 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 		types.NewField(pos, nil, ptr),
 		types.NewField(pos, nil, stacklessResumeType()),
 	}
-	companion := ir.NewFunc(pos, pos, source.Sym().Pkg.Lookup(source.Sym().Name+".coro.call"),
+	companion := ir.NewFunc(pos, pos, source.Sym().Pkg.Lookup(source.Sym().Name+suffix),
 		types.NewSignature(nil, params, results))
 	companion.SetDupok(source.Dupok())
 	companion.Nname.Defn = companion
@@ -153,15 +153,32 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 	// The erased adapter has its own proof, including the exact typed factory
 	// it invokes. A large argument transfer must never borrow the source gate.
 	newNativeStackGate(companion, companion)
-	gate := nativeSourceGates[companion]
+	return companion
+}
 
-	// These four words match runtime.stacklessCoroCallable. All pointers refer
+func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI, deferCapable bool) {
+	pos := source.Pos()
+	ptr := types.Types[types.TUNSAFEPTR]
+	signature := callableSignature(source)
+	companion := callableCompanion(source, factory, factoryABI, ".coro.call")
+	gate := nativeSourceGates[companion]
+	var deferred *ir.Func
+	if deferCapable {
+		// A real native activation grants direct recover only through the
+		// runtime's structured defer-child identity. Plain normal-call
+		// adapters deliberately suppress that right and are never reused.
+		deferred = callableCompanion(source, factory, factoryABI, ".coro.defer")
+	}
+
+	// These six words match runtime.stacklessCoroCallable. All pointers refer
 	// to immutable module data or code; this descriptor owns no heap objects.
 	fields := []*types.Field{
 		types.NewField(pos, types.LocalPkg.Lookup("version"), types.Types[types.TUINTPTR]),
 		types.NewField(pos, types.LocalPkg.Lookup("signature"), ptr),
 		types.NewField(pos, types.LocalPkg.Lookup("gate"), ptr),
 		types.NewField(pos, types.LocalPkg.Lookup("factory"), types.Types[types.TUINTPTR]),
+		types.NewField(pos, types.LocalPkg.Lookup("deferGate"), ptr),
+		types.NewField(pos, types.LocalPkg.Lookup("deferFactory"), types.Types[types.TUINTPTR]),
 	}
 	descType := types.NewStruct(fields)
 	types.CalcSize(descType)
@@ -176,6 +193,13 @@ func emitNativeCallable(source, factory *ir.Func, factoryABI FactoryABI) {
 		off = objw.SymPtr(data, off, reflectdata.TypeLinksym(signature), 0)
 		off = objw.SymPtr(data, off, gate.Linksym(), 0)
 		off = objw.SymPtr(data, off, companion.Linksym(), 0)
+		if deferred != nil {
+			off = objw.SymPtr(data, off, nativeSourceGates[deferred].Linksym(), 0)
+			off = objw.SymPtr(data, off, deferred.Linksym(), 0)
+		} else {
+			off = objw.Uintptr(data, off, 0)
+			off = objw.Uintptr(data, off, 0)
+		}
 		flags := int16(obj.RODATA)
 		if source.Dupok() {
 			flags |= obj.DUPOK

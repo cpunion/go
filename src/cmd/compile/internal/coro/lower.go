@@ -154,6 +154,7 @@ type lowerDefer struct {
 	snapshotCallee    bool
 	calleeSnapshot    *ir.Name
 	resumable         []lowerResumableDefer
+	open              bool
 	resumableDispatch bool
 	terminalTargets   []lowerDeferTerminal
 	sourceLiteral     bool
@@ -2908,7 +2909,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return site.Kind == SiteYield
 	})
 	for _, deferred := range candidate.defers {
-		if len(deferred.resumable) != 0 {
+		if deferred.open || len(deferred.resumable) != 0 {
 			prepareResumableDeferWrapper(deferred, fn)
 		} else if len(deferred.terminalTargets) != 0 {
 			prepareDynamicDeferWrapper(deferred, fn)
@@ -3079,7 +3080,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		if deferred.rangeAnchor == nil && (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
-			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0 || len(deferred.resumable) != 0) &&
+			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0 || deferred.open || len(deferred.resumable) != 0) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -4126,7 +4127,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			deferredToken = deferred.rangeToken
 		}
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
-		if len(deferred.resumable) != 0 {
+		if deferred.open {
+			if err := rewriteOpenDeferCall(deferred, deferredToken); err != nil {
+				return err
+			}
+		} else if len(deferred.resumable) != 0 {
 			if err := rewriteResumableDeferCall(deferred, deferredToken, factories); err != nil {
 				return err
 			}
@@ -4549,7 +4554,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						func(deferred *lowerDefer) bool { return deferred.rangeAnchor == nil && deferred.namedRecover }), candidate.rangeOwner != nil)
 				if candidate.hasResumableDefers() {
 					cleanup.Body = append(ir.Nodes{assignResumePC(i)}, cleanup.Body...)
-					cleanup.Body = append(cleanup.Body, resumableDeferWait(pos, ctx))
+					cleanup.Body = append(cleanup.Body, resumableDeferWait(pos, resume, ctx))
 				}
 				body = append(body, cleanup)
 			} else {
@@ -4575,12 +4580,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							ir.Nodes{resumeDeferToken, fun}, false)
 					}
 					invoke := ir.Nodes{clear}
-					if len(deferred.resumable) != 0 {
+					if deferred.open || len(deferred.resumable) != 0 {
 						invoke = append(invoke, assignResumePC(i))
 					}
 					invoke = append(invoke, call)
-					if len(deferred.resumable) != 0 {
-						invoke = append(invoke, resumableDeferWait(pos, ctx))
+					if deferred.open || len(deferred.resumable) != 0 {
+						invoke = append(invoke, resumableDeferWait(pos, resume, ctx))
 					}
 					body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
 				}

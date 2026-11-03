@@ -19,6 +19,8 @@ type stacklessCoroCallable struct {
 	signature   *_type
 	gate        *[2]uintptr
 	factoryCode uintptr
+	deferGate   *[2]uintptr
+	deferCode   uintptr
 }
 
 type stacklessCoroCallableInfo struct {
@@ -30,6 +32,10 @@ type stacklessCoroCallableInfo struct {
 // mismatched, older, or rejected companions do not acquire native capability.
 // Open call sites still need an ordinary-stack execution path for those cases.
 func coroLookupCallable(code uintptr, signature unsafe.Pointer) unsafe.Pointer {
+	return lookupStacklessCoroCallable(code, signature, false)
+}
+
+func lookupStacklessCoroCallable(code uintptr, signature unsafe.Pointer, deferred bool) unsafe.Pointer {
 	if code == 0 || signature == nil {
 		return nil
 	}
@@ -49,12 +55,37 @@ func coroLookupCallable(code uintptr, signature unsafe.Pointer) unsafe.Pointer {
 	providerData := noescape(unsafe.Pointer(&provider))
 	load := *(*func() unsafe.Pointer)(unsafe.Pointer(&providerData))
 	entry := (*stacklessCoroCallable)(load())
-	if entry == nil || entry.version != abi.CoroCallableVersion ||
-		entry.signature != (*_type)(signature) || entry.gate == nil ||
-		entry.gate[0] != 0 || entry.factoryCode == 0 {
+	if entry == nil || entry.version != abi.CoroCallableVersion || entry.signature != (*_type)(signature) {
+		return nil
+	}
+	gate, factory := entry.gate, entry.factoryCode
+	if deferred {
+		gate, factory = entry.deferGate, entry.deferCode
+	}
+	if gate == nil || gate[0] != 0 || factory == 0 {
 		return nil
 	}
 	return unsafe.Pointer(entry)
+}
+
+// A frozen starter is invoked once after its registration has been popped.
+// Only an independently proved direct-defer companion can run natively. The
+// ordinary thunk registers the source target directly on its logical G.
+func coroDeferStartFunction(token unsafe.Pointer, value any, request unsafe.Pointer, ordinary func(any, bool, bool)) {
+	task := activeStacklessCoroDeferTask(token, "runtime: invalid stackless coroutine function defer")
+	ctx := unsafe.Pointer(&task.context)
+	words := efaceOf(&value)
+	if words._type != nil && words._type.Kind() == abi.Func && words.data != nil {
+		entry := (*stacklessCoroCallable)(lookupStacklessCoroCallable((*funcval)(words.data).fn, unsafe.Pointer(words._type), true))
+		if entry != nil {
+			data := unsafe.Pointer(&entry.deferCode)
+			invoke := *(*func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, stacklessCoroResume))(unsafe.Pointer(&data))
+			frame, resume := invoke(ctx, words.data, request)
+			coroDeferAwaitFrame(ctx, frame, resume)
+			return
+		}
+	}
+	coroHostDefer(ctx, ordinary)
 }
 
 // coroCallableFactory invokes the one erased ABI after lookup has checked its

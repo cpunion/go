@@ -50,16 +50,18 @@ func rangeDeferRegistrationFactorySupported(plan *Plan, body *rangeDeferBodyPlan
 			return false
 		}
 		summary, known := plan.edgeSummary(edge)
-		if !known {
-			return false
+		if known {
+			allExec |= summary.Exec
 		}
-		allExec |= summary.Exec
 		if edge.Kind == DeferCall && slices.ContainsFunc(body.cleanup.defers,
 			func(deferred *lowerDefer) bool { return deferred.call == edge.Node }) {
 			// Only an exactly validated enclosing-owner registration can
 			// defer its execution constraints as well as terminal effects.
 			// Direct calls and local execution requirements remain live.
 			continue
+		}
+		if !known {
+			return false
 		}
 		if summary.Terminal&^MayPanic != 0 {
 			return false
@@ -166,7 +168,7 @@ func prepareRangeHybridRegistration(plan *Plan, source *lowerDefer, ordinary *ir
 			return nil, err
 		}
 		copy.call.Fun = copyRangeDeferBody(closure.Func, parent, bindings)
-	} else if len(copy.terminalTargets) != 0 {
+	} else if copy.open || len(copy.terminalTargets) != 0 {
 		copy.call.Fun = frozen
 	} else if ir.StaticCalleeName(source.call.Fun) == nil {
 		return nil, fmt.Errorf("ordinary range defer has no validated static or closed target")
@@ -181,7 +183,12 @@ func finishRangeHybridRegistration(registration *rangeHybridRegistration,
 	factories map[*ir.Func]*ir.Func) error {
 	deferred := registration.cleanup
 	parent, token := registration.parent, registration.token
-	if len(deferred.resumable) != 0 {
+	if deferred.open {
+		prepareResumableDeferWrapper(deferred, parent)
+		if err := rewriteOpenDeferCall(deferred, token); err != nil {
+			return err
+		}
+	} else if len(deferred.resumable) != 0 {
 		prepareResumableDeferWrapper(deferred, parent)
 		if err := rewriteResumableDeferCall(deferred, token, factories); err != nil {
 			return err

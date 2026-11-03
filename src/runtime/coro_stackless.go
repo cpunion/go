@@ -3263,6 +3263,12 @@ func coroDeferStartFrame(token, frame unsafe.Pointer, child stacklessCoroResume)
 // Waiting plus readyPending until this active resume returns Wait. This needs
 // no additional task flag, scheduler map, or per-registration stack word.
 func coroDeferSuspended(ctx unsafe.Pointer) bool {
+	return coroDeferAction(ctx) != stacklessCoroActionInvalid
+}
+
+// Host handoffs and structured cleanup children have different barriers.
+// Neither may publish its continuation before the initiating resume returns.
+func coroDeferAction(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil {
@@ -3275,9 +3281,15 @@ func coroDeferSuspended(ctx unsafe.Pointer) bool {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine cleanup handoff outside resume")
 	}
-	suspended := task.state == stacklessCoroTaskWaiting
+	action := uint8(stacklessCoroActionInvalid)
+	if task.state == stacklessCoroTaskWaiting {
+		action = stacklessCoroActionWait
+		if h := s.taskHostLocked(task); h != nil && h.pending == task {
+			action = stacklessCoroActionHost
+		}
+	}
 	unlock(&s.lock)
-	return suspended
+	return action
 }
 
 // coroPanic records a panic value before the compiler-generated resume enters
