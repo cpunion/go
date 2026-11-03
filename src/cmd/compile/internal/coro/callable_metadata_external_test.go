@@ -78,6 +78,11 @@ func frame(unsafe.Pointer)unsafe.Pointer
 //go:linkname run runtime.coroRunFrame
 func run(unsafe.Pointer,func(unsafe.Pointer)uint8,uintptr)bool
 
+// This private runtime entry starts a root from an ordinary Go stack. Keep
+// the hand-written driver outside source callback specialization and native
+// root lowering; the child factory still executes in the actual native root.
+var ordinaryRootDriver = run
+
 type box struct{n int;pad[4095]byte}
 func named(n int)int{runtime.Gosched();runtime.GC();return n+3}
 func captured(p *box)func(int)int{return func(n int)int{runtime.Gosched();runtime.GC();return p.n+n+int(p.pad[4094])}}
@@ -117,7 +122,7 @@ func invoke(f any,request unsafe.Pointer){
  // every pointer live after the creator has discarded the function value.
  f=nil
  runtime.GC()
- run(unsafe.Pointer(state),drive,0)
+ ordinaryRootDriver(unsafe.Pointer(state),drive,0)
  if !state.done{panic("callable child did not return to its parent")}
 }
 
