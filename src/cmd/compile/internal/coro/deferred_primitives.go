@@ -43,7 +43,7 @@ func specializeDeferredPrimitives(funcs []*ir.Func, reader *BodyReader,
 		index++
 		sym := types.LocalPkg.Lookup(fmt.Sprintf(".coro.defer.sync%d", index))
 		helper := reader.Clone(target, sym)
-		if helper == nil {
+		if helper == nil || len(helper.Body) == 0 {
 			return nil
 		}
 		// Reading a body creates its nested closures, but the independent
