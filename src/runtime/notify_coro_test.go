@@ -46,6 +46,17 @@ func TestStacklessCoroNotifyList(t *testing.T) {
 		testStacklessCoroNotifyRace(t)
 	})
 	for _, procs := range []int{1, 4} {
+		for _, unwind := range []string{"tracefpunwindoff=0", "tracefpunwindoff=1"} {
+			t.Run("profile/"+unwind+"/P"+strconv.Itoa(procs), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				cmd := testenv.CommandContext(t, ctx, os.Args[0], "-test.run=^TestStacklessCoroNotifyList$", "-test.count=8")
+				cmd.Env = append(cmd.Environ(), "GO_TEST_CORO_NOTIFY=profile", "GOMAXPROCS="+strconv.Itoa(procs), "GODEBUG="+unwind)
+				if data, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("notification profile caller: %v\n%s", err, data)
+				}
+			})
+		}
 		for _, mode := range []string{"fast", "signal", "broadcast", "profile", "wrap", "missing", "siblings", "race"} {
 			t.Run(mode+"/P"+strconv.Itoa(procs), func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
