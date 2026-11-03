@@ -5287,6 +5287,11 @@ func TestLowerSpawnResults(t *testing.T) {
 	wantFactory := symbolName(child.Nname) + ".coro"
 	calls := 0
 	for _, generated := range typecheck.Target.Funcs {
+		if generated.Sym().Name == child.Sym().Name+".coro.call" {
+			// The erased companion forwards the request's typed destinations.
+			// Only the source spawn allocates discarded-result destinations.
+			continue
+		}
 		ir.Visit(generated, func(node ir.Node) {
 			call, ok := node.(*ir.CallExpr)
 			if !ok || symbolName(ir.StaticCalleeName(ir.StaticValue(call.Fun))) != wantFactory {
@@ -6593,6 +6598,11 @@ func TestLowerNormalizedResults(t *testing.T) {
 	wantFactory := symbolName(leaf.Nname) + ".coro"
 	var factoryCalls, wrapperCalls int
 	for _, fn := range typecheck.Target.Funcs {
+		if fn.Sym().Name == leaf.Sym().Name+".coro.call" {
+			// Count the four original source call sites independently of the
+			// erased adapter's forwarding call.
+			continue
+		}
 		ir.Visit(fn, func(node ir.Node) {
 			call, ok := node.(*ir.CallExpr)
 			if !ok {

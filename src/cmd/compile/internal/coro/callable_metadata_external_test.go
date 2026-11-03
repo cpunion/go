@@ -15,8 +15,6 @@ import (
 // This tests discovery through the real compiler/linker and runtime funcdata.
 // It deliberately does not stand in for open call-site or interface admission.
 func TestCallableCompanionMetadata(t *testing.T) {
-	testenv.MustHaveGoBuild(t)
-	tmp := t.TempDir()
 	const source = `package main
 import("reflect";"runtime";"unsafe")
 
@@ -59,6 +57,99 @@ func main(){
  println("callable-metadata-ok")
 }
 `
+	testCallableProgramme(t, source, "callable-metadata-ok")
+}
+
+// Invoke the erased factory through the actual runtime bridge, then await its
+// generated continuation. This is an ABI test with a hand-written root driver;
+// it does not claim that source open calls or interface calls are lowered.
+func TestCallableCompanionInvocation(t *testing.T) {
+	const source = `package main
+import("reflect";"runtime";"unsafe")
+
+//go:linkname lookup runtime.coroLookupCallable
+func lookup(uintptr,unsafe.Pointer)unsafe.Pointer
+//go:linkname factory runtime.coroCallableFactory
+func factory(unsafe.Pointer,unsafe.Pointer,unsafe.Pointer,unsafe.Pointer)(unsafe.Pointer,func(unsafe.Pointer)uint8)
+//go:linkname await runtime.coroAwaitFrame
+func await(unsafe.Pointer,unsafe.Pointer,func(unsafe.Pointer)uint8)
+//go:linkname frame runtime.coroFrame
+func frame(unsafe.Pointer)unsafe.Pointer
+//go:linkname run runtime.coroRunFrame
+func run(unsafe.Pointer,func(unsafe.Pointer)uint8,uintptr)bool
+
+type box struct{n int;pad[4095]byte}
+func named(n int)int{runtime.Gosched();runtime.GC();return n+3}
+func captured(p *box)func(int)int{return func(n int)int{runtime.Gosched();runtime.GC();return p.n+n+int(p.pad[4094])}}
+func(p *box)add(n int)int{runtime.Gosched();runtime.GC();p.n+=n;return p.n}
+func pair(p *box,n int)(int,*box){runtime.Gosched();runtime.GC();return p.n+n,p}
+func sum(n int,values ...int)int{for _,v:=range values{runtime.Gosched();n+=v};return n}
+func store(p *box,n int){runtime.Gosched();runtime.GC();p.n=n}
+
+type invocation struct{
+ pc uint8
+ descriptor,environment,request unsafe.Pointer
+ done bool
+}
+
+func drive(ctx unsafe.Pointer)uint8{
+ state:=(*invocation)(frame(ctx))
+ switch state.pc{
+ case 0:
+  child,resume:=factory(ctx,state.descriptor,state.environment,state.request)
+  if resume==nil{panic("missing native callable continuation")}
+  state.pc=1
+  await(ctx,child,resume)
+  return 2
+ case 1:
+  state.done=true
+  return 3
+ }
+ panic("invalid callable test continuation")
+}
+
+func invoke(f any,request unsafe.Pointer){
+ words:=(*[2]unsafe.Pointer)(unsafe.Pointer(&f))
+ descriptor:=lookup(reflect.ValueOf(f).Pointer(),words[0])
+ if descriptor==nil{panic("missing admitted callable")}
+ state:=&invocation{descriptor:descriptor,environment:words[1],request:request}
+ // The environment, typed request, child frame, and typed results must keep
+ // every pointer live after the creator has discarded the function value.
+ f=nil
+ runtime.GC()
+ run(unsafe.Pointer(state),drive,0)
+ if !state.done{panic("callable child did not return to its parent")}
+}
+
+func main(){
+ result:=0
+ one:=struct{n int;result *int}{7,&result}
+ invoke(named,unsafe.Pointer(&one));if result!=10{panic("named result")}
+ p:=&box{n:11};p.pad[4094]=17
+ f:=captured(p);p=nil
+ invoke(f,unsafe.Pointer(&one));f=nil
+ if result!=35{panic("captured environment or result")}
+ p=&box{n:19};p.pad[4094]=23
+ method:=struct{p *box;n int;result *int}{p,5,&result}
+ invoke((*box).add,unsafe.Pointer(&method));if result!=24||p.n!=24||p.pad[4094]!=23{panic("method receiver")}
+ var returned *box
+ tuple:=struct{p *box;n int;result *int;returned **box}{p,7,&result,&returned}
+ invoke(pair,unsafe.Pointer(&tuple));if result!=31||returned!=p||returned.pad[4094]!=23{panic("typed tuple result")}
+ variadic:=struct{n int;values []int;result *int}{2,[]int{3,5,7},&result}
+ invoke(sum,unsafe.Pointer(&variadic));if result!=17{panic("variadic request")}
+ empty:=struct{p *box;n int}{p,37}
+ invoke(store,unsafe.Pointer(&empty));if p.n!=37{panic("empty result request")}
+ runtime.GC();if returned.n!=37||returned.pad[4094]!=23{panic("result pointer liveness")}
+ println("callable-invocation-ok")
+}
+`
+	testCallableProgramme(t, source, "callable-invocation-ok")
+}
+
+func testCallableProgramme(t *testing.T, source, want string) {
+	t.Helper()
+	testenv.MustHaveGoBuild(t)
+	tmp := t.TempDir()
 	path := filepath.Join(tmp, "main.go")
 	if err := os.WriteFile(path, []byte(source), 0o666); err != nil {
 		t.Fatal(err)
@@ -88,7 +179,7 @@ func main(){
 			for _, p := range []string{"1", "4"} {
 				run := testenv.Command(t, exe)
 				run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=1")
-				if data, err := run.CombinedOutput(); err != nil || strings.TrimSpace(string(data)) != "callable-metadata-ok" {
+				if data, err := run.CombinedOutput(); err != nil || strings.TrimSpace(string(data)) != want {
 					t.Fatalf("P%s: %v\n%s", p, err, data)
 				}
 			}
