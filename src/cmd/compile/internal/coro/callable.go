@@ -51,6 +51,16 @@ func callableFactorySupported(fn *ir.Func) bool {
 	return resumeFactorySupported(fn) || capturedFactorySupported(fn)
 }
 
+// Interface targets are selected after compilation. Give source methods a
+// real activation even when they have no suspension sites, so direct recover
+// and ordinary calls retain distinct ownership. Body availability, lowering
+// checks, and the linked stack budget still decide admission independently.
+func plainCallableMethod(function *Function) bool {
+	return function != nil && function.Primary == PlainPrimary &&
+		function.Func.Type().Recv() != nil && !function.Func.Wrapper() &&
+		resumeFactorySupported(function.Func)
+}
+
 func captureTypes(fn *ir.Func) []*types.Type {
 	if captures, ok := factoryCaptureTypes[fn]; ok {
 		return captures

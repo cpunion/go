@@ -38,7 +38,7 @@ func unwrapGoCall(call *ir.CallExpr) *ir.CallExpr {
 		return call
 	}
 	target, ok := wrapper.Body[0].(*ir.CallExpr)
-	if !ok || target.Op() != ir.OCALLFUNC || len(target.Init()) != 0 {
+	if !ok || !openCallableCall(target) || len(target.Init()) != 0 {
 		return call
 	}
 	captures := make(map[*ir.Name]*ir.Name, len(wrapper.ClosureVars))
@@ -56,8 +56,9 @@ func unwrapGoCall(call *ir.CallExpr) *ir.CallExpr {
 	} else {
 		// The frontend freezes a dynamic callee into a caller temporary,
 		// then captures that value in its wrapper. Only that exact shape
-		// is unpacked; source closures and interface wrappers stay ordinary.
-		name, ok := target.Fun.(*ir.Name)
+		// is unpacked; source closures stay ordinary. Interface wrappers freeze their receiver
+		// and retain the frontend nil check on the registering statement.
+		name, ok := openCallableValue(target).(*ir.Name)
 		if !ok || captures[name] == nil || captures[name].Curfn != wrapper.ClosureParent {
 			return call
 		}

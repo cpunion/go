@@ -9,7 +9,6 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
-	"strings"
 	"testing"
 )
 
@@ -134,21 +133,38 @@ func TestLowerDynamicSpawn(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if mode == "unknown" || mode == "missing-factory" {
-				if plan.Functions[parent].Factory != NoFactory || !strings.Contains(strings.Join(result.Diagnostics, "\n"), "parent:") {
-					t.Fatalf("unsupported spawn did not fall back: %+v", result)
+			if result.Lowered != 2 || plan.Functions[parent].Factory == NoFactory ||
+				plan.Functions[first].Factory != FactoryABI3 || NativeCallableProvider(first) == nil {
+				t.Fatalf("managed spawn lost its creator or native first target: %+v", result)
+			}
+			plainAvailable := mode == "direct" || mode == "wrapped"
+			if plainAvailable {
+				if plan.Functions[second].Factory != FactoryABI1 || NativeCallableProvider(second) == nil {
+					t.Fatal("bounded plain target lost its typed factory or callable companion")
 				}
-				return
+			} else if plan.Functions[second].Factory != NoFactory || NativeCallableProvider(second) != nil {
+				t.Fatal("missing or unproved target acquired native capability")
 			}
-			if result.Lowered != 2 || plan.Functions[first].Factory != FactoryABI3 || plan.Functions[second].Factory != FactoryABI1 {
-				t.Fatalf("mixed typed spawn factories not selected: %+v", result)
-			}
+
 			calls := map[string]bool{}
-			nilGo := false
+			nilGo, hostReturn := false, false
 			for _, generated := range typecheck.Target.Funcs {
 				ir.VisitList(generated.Body, func(node ir.Node) {
 					if node.Op() == ir.OGO {
 						nilGo = true
+						if NativeStackEntry(generated) {
+							t.Error("nil GoStmt remained on a native executor")
+						}
+					}
+					if branch, ok := node.(*ir.IfStmt); ok && NativeStackEntry(generated) {
+						if condition, ok := branch.Cond.(*ir.BinaryExpr); ok && condition.Op() == ir.OEQ &&
+							condition.Y.Op() == ir.OLITERAL && condition.Y.Type().IsInteger() && ir.Int64Val(condition.Y) == int64(actionHost) {
+							for _, statement := range branch.Body {
+								if ret, ok := statement.(*ir.ReturnStmt); ok && len(ret.Results) == 1 && ret.Results[0] == condition.X {
+									hostReturn = true
+								}
+							}
+						}
 					}
 					if call, ok := node.(*ir.CallExpr); ok {
 						if name := ir.StaticCalleeName(call.Fun); name != nil {
@@ -157,13 +173,17 @@ func TestLowerDynamicSpawn(t *testing.T) {
 					}
 				})
 			}
-			for _, name := range []string{"first.coro", "second.coro", "coroSpawnFrame"} {
+			required := []string{"first.coro", "coroLookupFunction", "coroCallableFactory", "coroSpawnFrame", "coroSpawnOpaque", "coroHostCall"}
+			if plainAvailable {
+				required = append(required, "second.coro")
+			}
+			for _, name := range required {
 				if !calls[name] {
 					t.Errorf("missing dynamic spawn entry %s", name)
 				}
 			}
-			if !nilGo {
-				t.Fatal("nil function startup lost its ordinary go behavior")
+			if !nilGo || !hostReturn {
+				t.Fatalf("nil function startup lost ordinary go or host handoff: go=%t host=%t", nilGo, hostReturn)
 			}
 		})
 	}

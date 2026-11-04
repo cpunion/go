@@ -61,7 +61,7 @@ func linkedCoroStackUnsafe(t *testing.T, path, name string) bool {
 			}
 		}
 	}
-	t.Fatalf("linked native-stack guard missing in %s", path)
+	t.Fatalf("linked native-stack guard %s missing in %s", name, path)
 	return false
 }
 
@@ -112,10 +112,23 @@ func leaf(v uint64)uint64{return v+1}
 func other(v uint64)uint64{return v+1}
 func entry(c chan uint64)uint64{f:=leaf;if len(c)==0 {f=other};v:=<-c;return f(v)}
 func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println("linked-stack-ok")}`
+	// The original function-value call now crosses a managed boundary. Keep
+	// a separate raw indirect cleanup in a plain callee to test rejection.
+	unprovedIndirect := `package main
+var cleanupCount int
+//go:noinline
+func first(){cleanupCount++}
+//go:noinline
+func second(){cleanupCount+=2}
+//go:noinline
+func leaf(v uint64)uint64{f:=first;if v==0{f=second};defer f();return v+1}
+func entry(c chan uint64)uint64{v:=<-c;return leaf(v)}
+func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2||cleanupCount!=1{panic("result")};println("linked-stack-ok")}
+`
 	for _, test := range []struct {
 		name, source string
 		unsafe       bool
-	}{{"small", small, false}, {"deep", deep.String(), true}, {"native-child", strings.Replace(deep.String(), "func entry(c chan uint64)uint64", "func child(c chan uint64)uint64", 1) + "\nfunc entry(c chan uint64)uint64{return child(c)}", true}, {"late-spills", large.String(), true}, {"unproved-indirect", indirect, true}} {
+	}{{"small", small, false}, {"deep", deep.String(), true}, {"native-child", strings.Replace(deep.String(), "func entry(c chan uint64)uint64", "func child(c chan uint64)uint64", 1) + "\nfunc entry(c chan uint64)uint64{return child(c)}", true}, {"late-spills", large.String(), true}, {"managed-indirect", indirect, false}, {"unproved-indirect", unprovedIndirect, true}} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
 			source := filepath.Join(dir, "main.go")
@@ -132,6 +145,16 @@ func main(){c:=make(chan uint64,1);c<-1;if entry(c)!=2{panic("result")};println(
 			}
 			if got := linkedCoroStackUnsafe(t, binary, "main.entry.coro.stackgate"); got != test.unsafe {
 				t.Fatalf("unsafe=%t want=%t\n%s", got, test.unsafe, log)
+			}
+			if test.name == "managed-indirect" {
+				inspect := exec.Command(goTool, "tool", "objdump", "-s", "^main[.]entry[.]coro[.]func[0-9]+$", binary)
+				code, err := inspect.CombinedOutput()
+				if err != nil || !strings.Contains(string(code), "runtime.coroHostCall") {
+					t.Fatalf("managed indirect call lost ordinary-host handoff: %v\n%s", err, code)
+				}
+			}
+			if test.name == "unproved-indirect" && !strings.Contains(string(log), "(at main.leaf)") {
+				t.Fatalf("raw indirect cleanup lost its linked proof failure:\n%s", log)
 			}
 			if linkedCoroStackUnsafe(t, binary, "main.safe.coro.stackgate") {
 				t.Fatalf("unrelated safe entry fell back:\n%s", log)

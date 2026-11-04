@@ -207,6 +207,7 @@ func coroAwaitFusedFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) ui
 func coroCompleteFusedFrame(unsafe.Pointer) uint8
 func coroSpawn(unsafe.Pointer, func(unsafe.Pointer) uint8) bool
 func coroSpawnFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) bool
+func coroSpawnOpaque(unsafe.Pointer, func()) bool
 func coroPanic(unsafe.Pointer, interface{})
 func coroPanicPending(unsafe.Pointer) bool
 func coroFrameNeedsClear(unsafe.Pointer) bool
@@ -218,6 +219,11 @@ func coroFileRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroSocketRead(unsafe.Pointer, int, []byte, *int, *uintptr)
 func coroCallRead(unsafe.Pointer, func())
 func coroGC(unsafe.Pointer)
+func coroLookupCallable(uintptr, unsafe.Pointer) unsafe.Pointer
+func coroLookupFunction(interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroLookupInterface(unsafe.Pointer, unsafe.Pointer, uintptr, interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroHostCall(unsafe.Pointer, func()) uint8
+func coroCallableFactory(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroEnterForeign()
 func coroExitForeign()
 func coroEnterBlocking(unsafe.Pointer)
@@ -359,7 +365,12 @@ func coroDeferPanic(unsafe.Pointer, interface{})
 func coroDeferRecover(unsafe.Pointer) interface{}
 func coroDeferStartFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroDeferSuspended(unsafe.Pointer) bool
+func coroDeferAction(unsafe.Pointer) uint8
+func coroDeferStartFunction(unsafe.Pointer, interface{}, unsafe.Pointer, func(interface{}, bool, bool))
+func coroDeferStartInterface(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, uintptr, interface{}, unsafe.Pointer, func(interface{}, bool, bool))
+func coroDeferInject(interface{}, bool, bool)
 func coroDeferRecoverAwait(unsafe.Pointer) interface{}
+func coroDeferRecoverDirect(unsafe.Pointer) interface{}
 
 // stackless coroutine terminal outcomes
 func coroGoexit(unsafe.Pointer)

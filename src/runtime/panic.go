@@ -691,6 +691,14 @@ func Goexit() {
 		if !ok {
 			break
 		}
+		if fn == nil {
+			// Do not fault in this frame. The unwinder treats a frame
+			// interrupted by sigpanic without defers as dead and skips its
+			// stack pointers when copying the stack. Unlike an ordinary
+			// faulting frame, Goexit must retain p so recovery can resume
+			// this loop after a deferred nil call has been recovered.
+			panicmem()
+		}
 		fn()
 	}
 

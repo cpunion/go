@@ -643,6 +643,9 @@ func (u *unwinder) cgoCallers(pcBuf []uintptr) int {
 //
 // Callers should set the unwindSilentErrors flag on u.
 func tracebackPCs(u *unwinder, skip int, pcBuf []uintptr) int {
+	if n, handled := stacklessCoroTracebackPCs(u, skip, pcBuf); handled {
+		return n
+	}
 	var cgoBuf [32]uintptr
 	n := 0
 	for ; n < len(pcBuf) && u.valid(); u.next() {

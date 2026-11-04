@@ -155,13 +155,8 @@ func main(){
 }
 `
 	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"parameter", "dynamic await site"}, {"globalCall", "dynamic await site"},
-			{"addressed", "dynamic await site"}, {"captured", "dynamic await site"},
-			{"missingFactory", "unsupported coroutine dependency main.missing"},
-			{"caseBinding", "dynamic await site"},
-		},
-		[]string{"choose", "repeated", "pair", "variadic", "nilCall", "nilSingle", "discarded", "childPanic", "childExit", "closedInCase"})
+		[]switchFallback{{"missingFactory", "unsupported coroutine dependency main.missing"}},
+		[]string{"choose", "repeated", "pair", "variadic", "nilCall", "nilSingle", "discarded", "childPanic", "childExit", "closedInCase"}, "parameter", "globalCall", "addressed", "captured", "caseBinding")
 }
 
 func TestDynamicCallImported(t *testing.T) {

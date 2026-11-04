@@ -178,12 +178,17 @@ func TestSwitchReturnFactorySymbols(t *testing.T) {
 	}
 }
 
-func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallback, lowered []string) {
+func testSwitchReturnProgram(t *testing.T, source string, fallback []switchFallback, lowered []string, native ...string) {
 	t.Helper()
-	testSwitchReturnFiles(t, map[string]string{"main.go": source}, "", fallback, lowered)
+	testSwitchReturnFilesNative(t, map[string]string{"main.go": source}, "", fallback, lowered, native)
 }
 
 func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string, fallback []switchFallback, lowered []string, extraFlags ...string) {
+	t.Helper()
+	testSwitchReturnFilesNative(t, files, pattern, fallback, lowered, nil, extraFlags...)
+}
+
+func testSwitchReturnFilesNative(t *testing.T, files map[string]string, pattern string, fallback []switchFallback, lowered []string, native []string, extraFlags ...string) {
 	t.Helper()
 	testenv.MustHaveGoBuild(t)
 	if !(runtime.GOOS == "linux" && runtime.GOARCH == "amd64" ||
@@ -217,11 +222,18 @@ func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string
 		t.Run(test.name, func(t *testing.T) {
 			exe := filepath.Join(t.TempDir(), "switchreturn.exe")
 			args := []string{"build"}
-			if test.experiment == "coro" {
-				args = append(args, extraFlags...)
-			}
 			if test.name == "coro/checkptr" {
 				args = append(args, "-gcflags=all=-d=checkptr=2")
+			}
+			if test.experiment == "coro" {
+				for _, flag := range extraFlags {
+					// go build uses the last matching -gcflags argument. Keep
+					// dependency-specific lowering enabled under all-checkptr.
+					if test.name == "coro/checkptr" && strings.HasPrefix(flag, "-gcflags=") {
+						flag += " -d=checkptr=2"
+					}
+					args = append(args, flag)
+				}
 			}
 			args = append(args, "-gcflags="+pattern+test.flags, "-o", exe, file)
 			cmd := testenv.Command(t, testenv.GoToolPath(t), args...)
@@ -240,12 +252,28 @@ func testSwitchReturnFiles(t *testing.T, files map[string]string, pattern string
 					}
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd = testenv.CommandContext(t, ctx, exe)
-			data, err = cmd.CombinedOutput()
-			if err != nil || strings.TrimSpace(string(data)) != "switch-return-ok" {
-				t.Fatalf("execution = (%v, %q), want switch-return-ok", err, data)
+			if test.experiment == "coro" {
+				for _, name := range native {
+					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+						t.Errorf("newly supported call lost native admission: %s", name)
+					}
+				}
+			}
+			procs := []string{""}
+			if len(native) != 0 {
+				procs = []string{"1", "4"}
+			}
+			for _, p := range procs {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				cmd = testenv.CommandContext(t, ctx, exe)
+				if p != "" {
+					cmd.Env = append(cmd.Environ(), "GOMAXPROCS="+p, "GOGC=1")
+				}
+				data, err = cmd.CombinedOutput()
+				cancel()
+				if err != nil || strings.TrimSpace(string(data)) != "switch-return-ok" {
+					t.Fatalf("P%s execution = (%v, %q), want switch-return-ok", p, err, data)
+				}
 			}
 			if !test.checkLowering {
 				return

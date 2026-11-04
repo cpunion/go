@@ -138,9 +138,9 @@ func main(){
 }
 `,
 	}
-	testSwitchReturnFiles(t, files, "example.com/coroparamspawn/...=",
-		[]switchFallback{{"apply", "dynamic await site"}, {"rejected", "control flow goto"}, {"rejectedInspection", "control flow goto"}},
-		[]string{"imported"})
+	testSwitchReturnFilesNative(t, files, "example.com/coroparamspawn/...=",
+		[]switchFallback{{"rejected", "control flow goto"}, {"rejectedInspection", "control flow goto"}},
+		[]string{"imported"}, []string{"apply"})
 }
 func TestClosedParameterSpawnContexts(t *testing.T) {
 	testenv.MustHaveGoBuild(t)

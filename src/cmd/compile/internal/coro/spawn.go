@@ -183,6 +183,7 @@ func newPlainSpawnFactory(fn *ir.Func, callee ir.Node) *ir.Func {
 		factory, typecheck.Target, 0)
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
+	recordSourceResume(resume, fn, nil, nil)
 	inputs := len(captureTypes(fn)) + len(fn.Type().RecvParams())
 	args := make(ir.Nodes, inputs)
 	results := make(ir.Nodes, fn.Type().NumResults())

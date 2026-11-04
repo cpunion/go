@@ -1080,7 +1080,7 @@ func coroNativeFinish(executor *g) {
 //go:nosplit
 func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 	state := gp.stacklessCoro
-	if state == nil {
+	if state == nil || state.native != unsafe.Pointer(state) {
 		return nil
 	}
 	return (*stacklessCoroNativeContext)(state.native)

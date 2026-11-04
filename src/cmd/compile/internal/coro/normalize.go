@@ -127,6 +127,8 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		return
 	case *ir.ReturnStmt, *ir.AssignStmt, *ir.AssignListStmt:
 		root = stmt
+	case *ir.AssignOpStmt:
+		root = stmt
 	case *ir.CallExpr:
 		root = stmt
 	default:
@@ -134,12 +136,28 @@ func normalizeCallStatement(stmt ir.Node, fn *ir.Func,
 		return
 	}
 
+	if assignment, ok := root.(*ir.AssignListStmt); ok {
+		ordered := normalizeTupleAssignmentOrder(assignment, fn, operations)
+		normalizeCallList(ordered, fn, operations, labels...)
+		prefix = append(prefix, ordered...)
+	}
+	if assignment, ok := root.(*ir.AssignOpStmt); ok && ir.Any(root, func(node ir.Node) bool { return operations[node] }) {
+		// Order calls/receives in the destination before the RHS, without
+		// taking its address or reading its value. Ordinary Go leaves simple
+		// loads and the eventual nil/bounds/store checks after RHS calls.
+		var ordered ir.Nodes
+		assignment.X = orderedCallValue(assignment.X, fn, &ordered)
+		assignment.Y = orderedCallValue(assignment.Y, fn, &ordered)
+		normalizeCallList(ordered, fn, operations, labels...)
+		prefix = append(prefix, ordered...)
+	}
 	_, init := normalizeCallExpression(root, fn, operations, true, labels...)
 	initNode.SetInit(append(prefix, init...))
 }
 
 func normalizeCallExpression(root ir.Node, fn *ir.Func,
 	operations map[ir.Node]bool, directStatement bool, labels ...map[*types.Sym]*ir.LabelStmt) (ir.Node, ir.Nodes) {
+	ordered := normalizeCallOperandOrder(root, fn, operations)
 	var order []ir.Node
 	var visit func(ir.Node)
 	visit = func(node ir.Node) {
@@ -150,7 +168,11 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 			visit(child)
 			return false
 		})
-		if operations[node] {
+		if operations[node] || ordered[node] {
+			// An ordered call may have no result type. Its complete operand
+			// prefix still belongs in the worklist: normalizing an inner
+			// suspension can remove the last suspension from that prefix,
+			// while the original operand's defining assignment remains.
 			order = append(order, node)
 		} else if logical, ok := node.(*ir.LogicalExpr); ok && ir.Any(logical.Y, func(n ir.Node) bool {
 			return operations[n]
@@ -228,13 +250,14 @@ func normalizeCallExpression(root ir.Node, fn *ir.Func,
 				changed = true
 				continue
 			}
-			if hasSuspensionInit(node, operations) && safeCallPrefix(root, node) {
+			if (hasSuspensionInit(node, operations) || ordered[node]) && safeCallPrefix(root, node) {
 				// The frontend expands f(g()) into tuple assignments in an
 				// argument conversion's Init list or the call's Init list.
 				// Expose the entire ordered prefix before normalizing f,
 				// including earlier callee evaluation. A non-suspending f
 				// needs the same treatment.
 				prefix := ir.TakeInit(node)
+				delete(ordered, node)
 				normalizeCallList(prefix, fn, operations, labels...)
 				init = append(init, prefix...)
 				changed = true
@@ -306,7 +329,7 @@ func directSuspensionStatement(root, operation ir.Node) bool {
 	case *ir.CallExpr:
 		return root == operation
 	case *ir.AssignStmt:
-		return root.Y == operation
+		return root.Y == operation && root.X.Op() == ir.ONAME
 	case *ir.AssignListStmt:
 		return len(root.Rhs) == 1 && root.Rhs[0] == operation
 	}

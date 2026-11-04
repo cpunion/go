@@ -21,7 +21,16 @@ import (
 
 func TestStacklessCoroDetachedRootLifetime(t *testing.T) {
 	if mode := os.Getenv("GO_TEST_CORO_DETACHED_CASE"); mode != "" {
-		testStacklessCoroDetachedRoot(t, mode)
+		count := 1
+		if mode == "panic" {
+			// A finishing root consumes its panic while replacement executors
+			// still inspect cold scheduler metadata for the detached child.
+			// Repeat within one subprocess to exercise that overlap under -race.
+			count = 64
+		}
+		for range count {
+			testStacklessCoroDetachedRoot(t, mode)
+		}
 		return
 	}
 	for _, procs := range []int{1, 4} {

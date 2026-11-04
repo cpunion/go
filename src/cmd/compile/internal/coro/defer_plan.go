@@ -22,6 +22,13 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 	}
 	for _, edge := range function.Edges {
 		if edge.Unknown {
+			// The target's independently admitted factory handles an open
+			// function call through its managed native/ordinary boundary.
+			// The caller still depends on that factory surviving admission.
+			if edge.Kind == DirectCall && !edge.FactoryRequired &&
+				(edge.ValueCall || edge.Node.Op() == ir.OCALLINTER) && openCallableCall(edge.Node) {
+				continue
+			}
 			return false
 		}
 		if _, known := plan.edgeSummary(edge); !known {
@@ -33,6 +40,13 @@ func canPlanSuspendingDefer(plan *Plan, fn *ir.Func) bool {
 
 func hasSuspendingDeferSite(plan *Plan, function *Function) bool {
 	for _, edge := range function.Edges {
+		if edge.Kind == DeferCall && !edge.FactoryRequired &&
+			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
+			call := unwrapGoCall(edge.Node)
+			if openCallableCall(call) {
+				return true
+			}
+		}
 		if edge.Kind == DeferCall && !edge.Unknown {
 			if summary, known := plan.edgeSummary(edge); known && summary.Effect == MaySuspend {
 				return true
@@ -99,6 +113,15 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 	defers, dynamicDefers := candidate.defers, candidate.dynamicDefers
 	for _, deferred := range defers {
 		edge, ok := edges[deferred.call]
+		if ok && edge.Kind == DeferCall && !edge.FactoryRequired &&
+			(edge.ValueCall || edge.Unknown || edge.Callee == nil && len(edge.Targets) == 0) {
+			call := unwrapGoCall(deferred.call)
+			if !openCallableCall(call) {
+				return fmt.Errorf("open defer has no frozen function value")
+			}
+			deferred.open = true
+			continue
+		}
 		if !ok || edge.Kind != DeferCall || edge.Callee == nil && len(edge.Targets) == 0 {
 			return fmt.Errorf("defer has no static call plan")
 		}
@@ -110,6 +133,10 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 			if err := planResumableDefer(plan, candidate, deferred, edge); err != nil {
 				return err
 			}
+			continue
+		}
+		if target := plainLiteralDeferTarget(plan, deferred.call, edge.Callee, summary); target != nil {
+			deferred.terminalTargets = []lowerDeferTerminal{{target: target}}
 			continue
 		}
 		var parameterTarget *ir.Func
@@ -172,22 +199,6 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 			if edge.Callee.Wrapper() && edge.Callee.WrappedFunc == nil {
 				return fmt.Errorf("defer wrapper has no target")
 			}
-			if target := edge.Callee.WrappedFunc; target != nil && target.OClosure != nil &&
-				len(target.ClosureVars) == 0 && summary.Terminal == 0 {
-				// A literal with arguments is frozen in a frontend wrapper.
-				// Even without an environment its ordinary call can remain
-				// indirect when inlining is disabled. Bind the exact static
-				// target through the existing cleanup dispatch, preserving
-				// operand snapshots while giving the linker a real call edge.
-				inner := unwrapGoCall(deferred.call)
-				if inner != deferred.call {
-					name := ir.StaticCalleeName(ir.StaticValue(inner.Fun))
-					if name != nil && name.Func == target {
-						deferred.terminalTargets = []lowerDeferTerminal{{target: target}}
-						continue
-					}
-				}
-			}
 			if !edge.Callee.Wrapper() && dynamicDefers {
 				deferred.sourceLiteral = true
 				deferred.literalCaptures = slices.Clone(
@@ -228,6 +239,33 @@ func planNativeDefers(plan *Plan, candidate *lowerCandidate, edges map[*ir.CallE
 				candidate.dependencies[terminal.target] = true
 				candidate.deferDeps[terminal.target] = true
 			}
+		}
+	}
+	return nil
+}
+
+// A frontend wrapper freezes the operands of a literal with arguments. Its
+// function-value call may acquire a task-context constraint even when the exact
+// target needs none. Bind that target directly before checking the wrapper's
+// execution flags: cleanup never executes the wrapper's managed dispatch.
+func plainLiteralDeferTarget(plan *Plan, call *ir.CallExpr, wrapper *ir.Func, summary FuncSummary) *ir.Func {
+	closure, ok := call.Fun.(*ir.ClosureExpr)
+	if !ok || wrapper == nil || closure.Func != wrapper || !wrapper.Wrapper() ||
+		summary.Effect != NoSuspend || summary.Exec&^NeedsTaskContext != 0 || summary.Terminal != 0 {
+		return nil
+	}
+	target := wrapper.WrappedFunc
+	if target == nil || target.OClosure == nil || len(target.ClosureVars) != 0 {
+		return nil
+	}
+	targetSummary, known := plan.funcSummary(target)
+	if !known || targetSummary.Effect != NoSuspend || targetSummary.Exec != 0 || targetSummary.Terminal != 0 {
+		return nil
+	}
+	inner := unwrapGoCall(call)
+	if inner != call {
+		if name := ir.StaticCalleeName(ir.StaticValue(inner.Fun)); name != nil && name.Func == target {
+			return target
 		}
 	}
 	return nil

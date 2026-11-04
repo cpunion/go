@@ -154,12 +154,8 @@ func main() {
  println("switch-return-ok")
 }
 `
-	testSwitchReturnProgram(t, source,
-		[]switchFallback{
-			{"indirect", "dynamic defer target main.indirectRecover has unsupported terminal control recover"},
-			{"missingFactory", "unsupported coroutine dependency main.missing"},
-		},
-		[]string{"direct", "conditional", "argumentPanic", "replacement", "repeated", "recoverAndReplace", "exiting", "recoveredExit", "nested", "nestedRecover", "nestA", "nestB"})
+	required := []string{"direct", "conditional", "argumentPanic", "replacement", "repeated", "recoverAndReplace", "exiting", "recoveredExit", "nested", "nestedRecover", "nestA", "nestB", "indirect", "missingFactory", "recoverReplace"}
+	testSwitchReturnProgram(t, source, nil, required, required...)
 }
 
 func TestDynamicDeferTerminalImported(t *testing.T) {
@@ -195,14 +191,12 @@ func main() {
 `,
 	}
 	t.Run("native-leaf", func(t *testing.T) {
-		testSwitchReturnFiles(t, files, "example.com/terminaldefer/...=", nil, []string{"recovered", "replacement", "exiting"})
+		required := []string{"recovered", "replacement", "exiting"}
+		testSwitchReturnFilesNative(t, files, "example.com/terminaldefer/...=", nil, required, required)
 	})
 	t.Run("default-leaf", func(t *testing.T) {
-		testSwitchReturnFiles(t, files, "", []switchFallback{
-			{"recovered", "dynamic defer target example.com/terminaldefer/leaf.RecoverA has unsupported terminal control recover"},
-			{"replacement", "dynamic defer target example.com/terminaldefer/leaf.First has unsupported terminal control panic"},
-			{"exiting", "dynamic defer target example.com/terminaldefer/leaf.ExitA has unsupported terminal control goexit"},
-		}, nil)
+		required := []string{"recovered", "replacement", "exiting"}
+		testSwitchReturnFilesNative(t, files, "", nil, required, required)
 	})
 }
 

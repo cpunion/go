@@ -138,8 +138,15 @@ func main() {
 				if err != nil {
 					t.Fatalf("nm failed: %v\n%s", err, data)
 				}
-				if strings.Contains(string(data), ".Add-fm.coro") {
+				if strings.Contains(string(data), ".Add-fm.coro\n") {
 					t.Fatal("method value wrapper has a coroutine factory")
+				}
+				if experiment == "coro" {
+					for _, wrapper := range []string{"main.(*Local).Add-fm", "example.com/coromethodvalue/leaf.(*Counter).Add-fm", "example.com/coromethodvalue/leaf.Value.Add-fm"} {
+						if linkedCoroStackUnsafe(t, exe, wrapper+".coro.call.coro.stackgate") {
+							t.Errorf("bound method lost native callable admission: %s", wrapper)
+						}
+					}
 				}
 				if experiment == "coro" && noinline {
 					for _, method := range []string{

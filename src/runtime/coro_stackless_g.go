@@ -40,7 +40,8 @@ func (s *stacklessCoroSudog) clear() {
 }
 
 func (gp *g) stackIsFixed() bool {
-	return gp.stacklessCoro != nil && gp.stacklessCoro.native != nil
+	state := gp.stacklessCoro
+	return state != nil && state.native == unsafe.Pointer(state)
 }
 
 func stacklessCoroRecover(gp *g) any {

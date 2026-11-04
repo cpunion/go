@@ -536,6 +536,7 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 	seen := make(map[loader.Sym]struct{}, len(funcs))
 	fdSyms := make([]loader.Sym, 0, len(funcs))
 	fd := []loader.Sym{}
+	var coroSourceData map[loader.Sym]bool
 	for _, s := range funcs {
 		fi := ldr.FuncInfo(s)
 		if !fi.Valid() {
@@ -546,6 +547,12 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 		for j, fdSym := range fd {
 			if ignoreFuncData(ldr, s, j, fdSym) {
 				continue
+			}
+			if j == abi.FUNCDATA_CoroSource {
+				if coroSourceData == nil {
+					coroSourceData = make(map[loader.Sym]bool)
+				}
+				coroSourceData[fdSym] = true
 			}
 
 			if _, ok := seen[fdSym]; !ok {
@@ -621,7 +628,18 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 				ctxt.Errorf(fdSym, "missing section for relocation target %s for funcdata symbol", ldr.SymName(rs))
 			}
 			o := ldr.SymValue(rs)
-			if sect.Name != ".text" {
+			if coroSourceData[fdSym] {
+				// Source metadata uses moduledata.rodata as a single base.
+				// Entry cells contain code relocations and can therefore move
+				// into .data.rel.ro for PIE or shared libraries. Their own
+				// section offset would be decoded against the wrong section.
+				base := ldr.SymSect(ldr.Lookup("runtime.rodata", 0))
+				if base == nil {
+					ctxt.Errorf(fdSym, "missing rodata base for coroutine source metadata")
+					return
+				}
+				o -= int64(base.Vaddr)
+			} else if sect.Name != ".text" {
 				o -= int64(sect.Vaddr)
 			} else {
 				// With multiple .text sections the offset
@@ -635,6 +653,10 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 				}
 			}
 			o += r.Add()
+			if coroSourceData[fdSym] && o < 0 {
+				ctxt.Errorf(fdSym, "negative rodata offset for coroutine source metadata: %#x", o)
+				return
+			}
 			if o != int64(int32(o)) && o != int64(uint32(o)) {
 				ctxt.Errorf(fdSym, "ADDROFF relocation out of range for funcdata symbol: %#x", o)
 			}

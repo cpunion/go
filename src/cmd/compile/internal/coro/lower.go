@@ -28,6 +28,7 @@ const (
 	actionGoexit
 	actionSwitch
 	actionHandoff
+	actionHost
 )
 
 // Keep these in sync with runtime's stackless coroutine frame chunk sizes. The
@@ -89,6 +90,7 @@ type lowerCandidate struct {
 	function          *Function
 	ordinary          *ir.Func
 	transitions       map[*ir.CallExpr]SiteKind
+	openCalls         map[*ir.CallExpr]bool
 	foreignCalls      map[*ir.CallExpr]ForeignCallClass
 	directCalls       map[*ir.CallExpr]lowerDirectCall
 	dependencies      map[*ir.Func]bool
@@ -152,6 +154,7 @@ type lowerDefer struct {
 	snapshotCallee    bool
 	calleeSnapshot    *ir.Name
 	resumable         []lowerResumableDefer
+	open              bool
 	resumableDispatch bool
 	terminalTargets   []lowerDeferTerminal
 	sourceLiteral     bool
@@ -333,7 +336,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	prepareLiteralNormalRecoverCalls(plan, deferredLiterals, normalRecover)
 	for _, function := range functions {
 		if function.Primary != CoroPrimary &&
-			!plainCapturedCallbacks[function.Func] {
+			!plainCapturedCallbacks[function.Func] && !plainCallableMethod(function) {
 			continue
 		}
 		if deferredLiterals[function.Func] && !canPlanSuspendingDefer(plan, function.Func) {
@@ -364,6 +367,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 
 	prepareRangeHybridBodies(plan, plan.rangeOwners, candidates, bodies)
 	factories := make(map[*ir.Func]*ir.Func)
+	plainFactories := make(map[*ir.Func]*ir.Func)
 	var callbackTargets []*ir.Func
 	for target := range plan.callbackFactories {
 		callbackTargets = append(callbackTargets, target)
@@ -372,7 +376,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		return strings.Compare(ir.PkgFuncName(a), ir.PkgFuncName(b))
 	})
 	for _, target := range callbackTargets {
-		if child := plan.Functions[target]; plainCallbackFactorySupported(child) {
+		if child := plan.Functions[target]; candidates[target] == nil && plainCallbackFactorySupported(child) {
 			callee := target
 			if child.Terminal&UsesRecover != 0 {
 				callee = normalRecover(target)
@@ -381,6 +385,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				}
 			}
 			factories[target] = newPlainSpawnFactory(target, callee.Nname)
+			plainFactories[target] = factories[target]
 			if resumeFactorySupported(target) {
 				child.Factory = FactoryABI1
 			}
@@ -407,12 +412,13 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			}
 			for _, target := range targets {
 				child := plan.Functions[target]
-				if factories[target] == nil && plainSpawnFactorySupported(child) {
+				if factories[target] == nil && candidates[target] == nil && plainSpawnFactorySupported(child) {
 					callee := unwrapGoCall(edge.Node).Fun
 					if len(edge.Targets) != 0 {
 						callee = target.Nname
 					}
 					factories[target] = newPlainSpawnFactory(child.Func, callee)
+					plainFactories[target] = factories[target]
 					child.Factory = FactoryABI1
 				}
 			}
@@ -666,13 +672,14 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			function.Func.Body = ordinary.Body
 			ir.WithFunc(function.Func, func() { typecheck.Stmts(function.Func.Body) })
 		}
-		if function.Primary == CoroPrimary || plainCapturedCallbacks[function.Func] {
+		if function.Primary == CoroPrimary || plainCapturedCallbacks[function.Func] || plainCallableMethod(function) {
 			result.Skipped++
 		}
 	}
 	if result.Lowered != 0 {
 		clearRewrittenVariableDefinitions(typecheck.Target.Funcs)
 	}
+	emitNativeCallableMetadata(candidates, plainFactories)
 	recordNativeStackMetadata(candidates)
 	result.Skipped -= result.Lowered
 	return result, nil
@@ -701,7 +708,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	// A demanded captured plain leaf also needs a factory to carry its cells,
 	// even though its source body contains no suspension site.
 	ownerPlan, bodyPlan := plan.rangeOwners[fn], plan.rangeBodies[fn]
-	if len(function.Sites) == 0 && !hasSuspendingDeferSite(plan, function) && !canPlanParameterDeferTarget(plan, fn) &&
+	if len(function.Sites) == 0 && !plainCallableMethod(function) && !hasSuspendingDeferSite(plan, function) && !canPlanParameterDeferTarget(plan, fn) &&
 		!(plan.callbackFactories[fn] && (capturedPlainFactorySupported(function) || rangeBodyFactorySupported(function) || rangeDeferRegistrationFactorySupported(plan, bodyPlan))) {
 		return nil, fmt.Errorf("no coroutine sites")
 	}
@@ -1087,6 +1094,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 	candidate := &lowerCandidate{
 		function:      function,
 		transitions:   make(map[*ir.CallExpr]SiteKind),
+		openCalls:     make(map[*ir.CallExpr]bool),
 		foreignCalls:  make(map[*ir.CallExpr]ForeignCallClass),
 		directCalls:   make(map[*ir.CallExpr]lowerDirectCall),
 		dependencies:  make(map[*ir.Func]bool),
@@ -1201,8 +1209,15 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
+			if plan.edgeNeedsValueHandoff(edge) || ordinaryThreadCall(call) {
+				candidate.openCalls[call] = true
+			}
 			if edge.Callee == nil && len(edge.Targets) == 0 {
-				return nil, fmt.Errorf("dynamic await site %d", site.ID)
+				if !openCallableCall(call) || call.Op() == ir.OCALLFUNC &&
+					ir.StaticCalleeName(ir.StaticValue(call.Fun)) != nil {
+					return nil, fmt.Errorf("dynamic await site %d", site.ID)
+				}
+				candidate.openCalls[call] = true
 			}
 			resultCount := call.Fun.Type().NumResults()
 			container := awaitContainers[call]
@@ -1243,14 +1258,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 						site.ID, i)
 				}
 			}
-			if len(edge.Targets) != 0 {
-				for _, target := range edge.Targets {
-					candidate.dependencies[target] = true
-				}
-			} else {
-				candidate.dependencies[edge.Callee] = true
-				if edge.Callee == fn {
-					candidate.selfAwait = true
+			if !candidate.openCalls[call] {
+				if len(edge.Targets) != 0 {
+					for _, target := range edge.Targets {
+						candidate.dependencies[target] = true
+					}
+				} else {
+					candidate.dependencies[edge.Callee] = true
+					if edge.Callee == fn {
+						candidate.selfAwait = true
+					}
 				}
 			}
 		case SiteSpawn:
@@ -1258,8 +1275,16 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested spawn site %d", site.ID)
 			}
 			edge := edges[call]
-			if edge.Callee == nil && len(edge.Targets) == 0 {
-				return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+			if edge.ValueCall && !edge.FactoryRequired || edge.Callee == nil && len(edge.Targets) == 0 {
+				if edge.FactoryRequired {
+					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+				}
+				target := unwrapGoCall(call)
+				if !openCallableCall(target) {
+					return nil, fmt.Errorf("dynamic spawn site %d", site.ID)
+				}
+				candidate.openCalls[call] = true
+				break
 			}
 			if _, known := plan.edgeSummary(edge); !known {
 				return nil, fmt.Errorf("unknown spawn target")
@@ -2537,6 +2562,7 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 	// linkable Go code; source-level estimates do not bound SSA spills.
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
+	recordSourceResume(resume, fn, nil, nil)
 	ctx := resume.Dcl[0]
 
 	captured := make(map[*ir.Name]*ir.Name)
@@ -2868,6 +2894,7 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	recordFreshOperandAssignments(fn)
 	// Save validated wrapper operands before reparenting closures into resume.
 	// Dynamic callee snapshots belong to the source caller during validation;
 	// rechecking that relationship after reparenting would lose their arguments.
@@ -2883,7 +2910,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return site.Kind == SiteYield
 	})
 	for _, deferred := range candidate.defers {
-		if len(deferred.resumable) != 0 {
+		if deferred.open || len(deferred.resumable) != 0 {
 			prepareResumableDeferWrapper(deferred, fn)
 		} else if len(deferred.terminalTargets) != 0 {
 			prepareDynamicDeferWrapper(deferred, fn)
@@ -3054,7 +3081,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	for _, deferred := range candidate.defers {
 		if deferred.rangeAnchor == nil && (deferred.rewriteTerminal != 0 || deferred.namedRecover ||
-			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0 || len(deferred.resumable) != 0) &&
+			deferred.runTerminal || deferred.directGoexit || len(deferred.terminalTargets) != 0 || deferred.open || len(deferred.resumable) != 0) &&
 			deferToken == nil {
 			deferToken = typecheck.TempAt(pos, factory,
 				types.Types[types.TUNSAFEPTR])
@@ -4018,8 +4045,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		case *ir.AssignListStmt:
 			node.Def = false
 		case *ir.CallExpr:
-			if node.Op() == ir.ORECOVER && function.Effect == MaySuspend {
-				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime("coroDeferRecoverAwait"), ir.Nodes{ctx}, false)
+			if node.Op() == ir.ORECOVER {
+				entry := "coroDeferRecoverAwait"
+				if function.Effect == NoSuspend {
+					entry = "coroDeferRecoverDirect"
+				}
+				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime(entry), ir.Nodes{ctx}, false)
 				init := slices.Clone(node.Init())
 				for i, statement := range init {
 					init[i] = edit(statement)
@@ -4101,7 +4132,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			deferredToken = deferred.rangeToken
 		}
 		closure, ok := deferred.call.Fun.(*ir.ClosureExpr)
-		if len(deferred.resumable) != 0 {
+		if deferred.open {
+			if err := rewriteOpenDeferCall(deferred, deferredToken); err != nil {
+				return err
+			}
+		} else if len(deferred.resumable) != 0 {
 			if err := rewriteResumableDeferCall(deferred, deferredToken, factories); err != nil {
 				return err
 			}
@@ -4271,6 +4306,25 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Dispatch once on entry, then use direct branches between states. Persist
 	// the next state only before handing control to the scheduler or terminal
 	// machinery; ordinary state edges do not need a frame write.
+	// Distinct await sites may share their next state. Give each persisted
+	// return point its own landing label so a suspended frame retains the
+	// exact source call site without adding a word to its allocation.
+	positions := make([]src.XPos, len(states))
+	for i := range positions {
+		positions[i] = pos
+	}
+	awaitPCs := make(map[int]int)
+	for i, state := range states {
+		if state.transition != SiteAwait {
+			continue
+		}
+		awaitPCs[i] = len(states)
+		states = append(states, lowerState{
+			next: state.next, thenState: -1, elseState: -1,
+		})
+		positions = append(positions, state.call.Pos())
+	}
+	recordSourceResume(resume, fn, resumePC, positions)
 	labels := make([]*types.Sym, len(states))
 	cases := make([]*ir.CaseClause, len(states))
 	for i := range states {
@@ -4382,6 +4436,30 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					for _, init := range goStmt.Init() {
 						body = append(body, edit(init))
 					}
+					if candidate.openCalls[call] {
+						setup, action, err := lowerOpenSpawn(call, ctx, resume, edit)
+						if err != nil {
+							return err
+						}
+						body = append(body, setup...)
+						body = append(body, ir.NewIfStmt(goStmt.Pos(),
+							ir.NewBinaryExpr(goStmt.Pos(), ir.OEQ, action,
+								typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionHost))), ir.Nodes{
+								assignResumePC(state.next),
+								ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{action}),
+							}, nil))
+						if state.spawnYield {
+							body = append(body, ir.NewIfStmt(goStmt.Pos(),
+								ir.NewBinaryExpr(goStmt.Pos(), ir.OEQ, action,
+									typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionYield))), ir.Nodes{
+									assignResumePC(state.next),
+									ir.NewReturnStmt(goStmt.Pos(), ir.Nodes{
+										typedInt(goStmt.Pos(), types.Types[types.TUINT8], int64(actionYield)),
+									}),
+								}, nil))
+						}
+						continue
+					}
 					child, err := factoryCall(call, nil)
 					if err != nil {
 						return err
@@ -4481,7 +4559,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						func(deferred *lowerDefer) bool { return deferred.rangeAnchor == nil && deferred.namedRecover }), candidate.rangeOwner != nil)
 				if candidate.hasResumableDefers() {
 					cleanup.Body = append(ir.Nodes{assignResumePC(i)}, cleanup.Body...)
-					cleanup.Body = append(cleanup.Body, resumableDeferWait(pos, ctx))
+					cleanup.Body = append(cleanup.Body, resumableDeferWait(pos, resume, ctx))
 				}
 				body = append(body, cleanup)
 			} else {
@@ -4507,12 +4585,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							ir.Nodes{resumeDeferToken, fun}, false)
 					}
 					invoke := ir.Nodes{clear}
-					if len(deferred.resumable) != 0 {
+					if deferred.open || len(deferred.resumable) != 0 {
 						invoke = append(invoke, assignResumePC(i))
 					}
 					invoke = append(invoke, call)
-					if len(deferred.resumable) != 0 {
-						invoke = append(invoke, resumableDeferWait(pos, ctx))
+					if deferred.open || len(deferred.resumable) != 0 {
+						invoke = append(invoke, resumableDeferWait(pos, resume, ctx))
 					}
 					body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
 				}
@@ -4604,7 +4682,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				return fmt.Errorf("%s: state %d transition has no continuation",
 					ir.PkgFuncName(fn), i)
 			}
-			body = append(body, assignResumePC(state.next))
+			returnPC := state.next
+			if pc, ok := awaitPCs[i]; ok {
+				returnPC = pc
+			}
+			body = append(body, assignResumePC(returnPC))
 			action := actionInvalid
 			var actionResult ir.Node
 			switch state.transition {
@@ -4647,6 +4729,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			case SiteAwait:
 				for _, init := range state.call.Init() {
 					body = append(body, edit(init))
+				}
+				if candidate.openCalls[state.call] {
+					setup, result, err := lowerOpenAwait(state.call, state.statement, ctx, resume, edit)
+					if err != nil {
+						return err
+					}
+					body = append(body, setup...)
+					actionResult = result
+					break
 				}
 				child, err := factoryCall(state.call, state.statement)
 				if err != nil {
@@ -5154,6 +5245,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	frameType.SetNoalg(true)
 	types.CalcSize(frameType)
 	candidate.frameType = frameType
+	if source := nativeSourceFrames[resume]; source != nil {
+		source.Field = replacements[candidate.resumePC]
+	}
 	framePointerType := types.NewPtr(frameType)
 	rootType := frameType
 	var rootArrayField *types.Field
@@ -5645,7 +5739,7 @@ func supportsAwaitInit(stmt ir.Node) bool {
 func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
 	count int) (*ir.AssignListStmt, bool) {
 	outer, ok := stmt.(*ir.AssignListStmt)
-	if !ok || len(outer.Lhs) != count || len(outer.Rhs) != count {
+	if !ok {
 		return nil, false
 	}
 	for _, target := range outer.Lhs {
@@ -5656,7 +5750,15 @@ func normalizedResultAssignment(call *ir.CallExpr, stmt ir.Node,
 			return nil, false
 		}
 	}
+	return normalizedResultProjection(call, stmt, count)
+}
 
+func normalizedResultProjection(call *ir.CallExpr, stmt ir.Node,
+	count int) (*ir.AssignListStmt, bool) {
+	outer, ok := stmt.(*ir.AssignListStmt)
+	if !ok || len(outer.Lhs) != count || len(outer.Rhs) != count {
+		return nil, false
+	}
 	var inner *ir.AssignListStmt
 	ir.Visit(outer, func(node ir.Node) {
 		if inner != nil {

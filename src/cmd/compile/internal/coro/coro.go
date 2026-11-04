@@ -233,6 +233,10 @@ type Edge struct {
 	// FactoryRequired is private to a specialized callback parameter. Even
 	// an all-plain closed set must use validated factories on the executor.
 	FactoryRequired bool
+	// ValueCall retains a runtime function value even if static-value analysis
+	// knows its code. A nosuspend summary alone cannot prove an indirect call
+	// safe on the executor or reconstruct its captured environment.
+	ValueCall bool
 }
 
 // Function is the coroutine analysis result for one function.
@@ -381,6 +385,12 @@ func analyze(funcs []*ir.Func, cgoDirectives [][]string, specializedTargets map[
 	// already requiring a constrained entry retain their execution flags.
 	needsContext := false
 	for _, function := range p.Functions {
+		for _, edge := range function.Edges {
+			if p.edgeNeedsValueHandoff(edge) {
+				function.LocalExec |= NeedsTaskContext
+				needsContext = true
+			}
+		}
 		// A plain helper is called through its ordinary Go ABI on the
 		// executor. Large locals and assertion temporaries in that body
 		// cannot grow the executor's stack. Propagate this independently
@@ -538,6 +548,7 @@ func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
 			calleeCall = unwrapDynamicDeferCall(call)
 		}
 		if calleeCall.Op() == ir.OCALLFUNC {
+			edge.ValueCall = ir.StaticCalleeName(calleeCall.Fun) == nil
 			if name := ir.StaticCalleeName(ir.StaticValue(calleeCall.Fun)); name != nil {
 				edge.Callee = name.Func
 				edge.CalleeName = symbolName(name)
@@ -636,6 +647,9 @@ func (p *Plan) edgeMaySuspend(edge Edge) bool {
 }
 
 func (p *Plan) edgeNeedsCoroEntry(edge Edge) bool {
+	if p.edgeNeedsValueHandoff(edge) {
+		return true
+	}
 	if edge.FactoryRequired {
 		return true
 	}
@@ -663,6 +677,19 @@ func (p *Plan) edgeNeedsCoroEntry(edge Edge) bool {
 		summary.Effect != NoSuspend ||
 		summary.Exec != 0 ||
 		summary.Terminal&MayGoexit != 0
+}
+
+// Existing coroutine targets already use typed factories. A plain function
+// value still needs a managed boundary: execute an independently admitted
+// companion when present, otherwise invoke the frozen value on its ordinary
+// host. Closed callback parameters retain their stronger factory contract.
+func (p *Plan) edgeNeedsValueHandoff(edge Edge) bool {
+	if edge.Kind != DirectCall || edge.Recipe.Kind != SiteInvalid ||
+		!edge.ValueCall || edge.FactoryRequired {
+		return false
+	}
+	summary, known := p.edgeSummary(edge)
+	return known && summary.Primary() == PlainPrimary
 }
 
 func (p *Plan) calledExec(function *Function) ExecFlags {

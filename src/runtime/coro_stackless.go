@@ -26,6 +26,7 @@ const (
 	stacklessCoroActionGoexit
 	stacklessCoroActionSwitch
 	stacklessCoroActionHandoff
+	stacklessCoroActionHost
 )
 
 const stacklessCoroWarmExecutorCount = 4
@@ -156,6 +157,8 @@ const (
 	stacklessCoroLifetimeRootComplete
 	stacklessCoroLifetimeSpawned
 	stacklessCoroLifetimeDrained
+	stacklessCoroLifetimeHostStarted
+	stacklessCoroLifetimePublicHost
 )
 
 type stacklessCoroTaskState uint8
@@ -307,7 +310,7 @@ type stacklessCoroScheduler struct {
 	// their lifetime; Drained is published only when this count is zero.
 	liveSpawns     uint64
 	root           stacklessCoroTask
-	terminalValues map[*stacklessCoroTask]any
+	terminalValues *stacklessCoroTerminalValue
 	wake           chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
@@ -614,7 +617,8 @@ func init() {
 // a new logical root would lose the direct deferred function's recover rights.
 func coroUseOrdinary() bool {
 	gp := getg()
-	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil
+	return gp.m.g0.stack.hi-gp.m.g0.stack.lo < 16<<10 || gp.bubble != nil || gp.lockedm != 0 || gp._panic != nil ||
+		stacklessCoroOrdinaryHostCall(gp)
 }
 
 // coroRun drives one stackless logical goroutine and its children. The
@@ -627,13 +631,21 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	frameSize uintptr) bool {
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 	s = runStacklessCoroRoot(s)
+	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
+		if !s.drained() {
+			go s.runOwner()
+		}
+		s.waitPublicRoot()
+		s.finish()
+		return false
+	}
 	if s.spawned() && !s.drained() {
 		// The public driver's native activation has ended. Transfer its one
 		// executor slot to an independent owner before waiting for the root.
 		// Otherwise a spawned blocking C call could pin this ordinary caller
 		// even after a replacement executor completed the logical root.
 		go s.runOwner()
-		<-s.rootDone
+		s.waitPublicRoot()
 		s.finish()
 		// The owner, detached frames, or a late operation producer may still
 		// retain the scheduler and root frame. Neither may enter a root pool.
@@ -770,7 +782,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// removing its operation from the global registry. It may still read wake
 	// to signal an already completed task, so retain the immutable channel and
 	// leave both allocations to GC rather than inspecting or reusing them.
-	if s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 {
+	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted) != 0 {
 		return false
 	}
 	state := s.executorState.Load()
@@ -780,7 +792,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 		s.root.state == stacklessCoroTaskComplete &&
 		!s.root.resuming && !s.root.readyPending &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
-		len(s.terminalValues) == 0 && s.blockingExecutors.Load() == 0 &&
+		s.terminalValues == nil && s.blockingExecutors.Load() == 0 &&
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
 			state == stacklessCoroExecutorStateSingleP ||
@@ -1378,7 +1390,7 @@ func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 // task address is also a race-detector synchronization identity, so race
 // builds must not reuse it for an unrelated logical goroutine.
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
-	_, hasTerminalValue := s.terminalValues[task]
+	_, hasTerminalValue := s.terminalValue(task)
 	uncachedLineage := !task.hasFlag(stacklessCoroTaskCacheFrame) &&
 		isStacklessCoroUncachedFrameLineage(task.frameSize)
 	validFrame := !task.hasFlag(stacklessCoroTaskCacheFrame) &&
@@ -1452,10 +1464,10 @@ func (s *stacklessCoroScheduler) finish() {
 	}
 	kind := s.root.terminal
 	goexit := s.root.goexit
-	value, ok := s.terminalValues[&s.root]
+	value, ok := s.terminalValue(&s.root)
 	s.root.terminal = stacklessCoroTerminalNone
 	s.root.goexit = false
-	delete(s.terminalValues, &s.root)
+	s.clearTerminalValue(&s.root)
 	if shared {
 		unlock(&s.lock)
 	}
@@ -1653,7 +1665,7 @@ resumeActive:
 	// A waiting source retains its scheduler through this context. The
 	// source owns task until completion, then the ready queue owns it until
 	// its next resume. Non-wait actions keep the active-context cleanup.
-	if action != stacklessCoroActionWait {
+	if action != stacklessCoroActionWait && action != stacklessCoroActionHost {
 		task.context.scheduler = nil
 	}
 
@@ -1692,6 +1704,12 @@ resumeActive:
 				stacklessCoroGoschedIfRunnable()
 			}
 		}
+	case stacklessCoroActionHost:
+		s.hostHandoff(task)
+		if h := currentStacklessCoroHost(); h != nil && h.scheduler == s {
+			return
+		}
+		idlePollSkip = nil
 	case stacklessCoroActionWait:
 		if s.waiting(task, native) {
 			idlePollSkip = nil
@@ -1751,7 +1769,7 @@ func (s *stacklessCoroScheduler) drained() bool {
 }
 
 func (s *stacklessCoroScheduler) publicDriverDone() bool {
-	return s.lifetime.Load()&(stacklessCoroLifetimeRootComplete|stacklessCoroLifetimeSpawned) != 0
+	return s.lifetime.Load()&(stacklessCoroLifetimeRootComplete|stacklessCoroLifetimeSpawned|stacklessCoroLifetimePublicHost) != 0
 }
 
 func (s *stacklessCoroScheduler) driverDone(public bool) bool {
@@ -1764,6 +1782,7 @@ func (s *stacklessCoroScheduler) driverDone(public bool) bool {
 // completeLogicalTaskLocked ends one root or independently spawned logical
 // goroutine. Structured await children keep their parent's count unchanged.
 func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTask) {
+	s.completeHostLocked(task)
 	if task == &s.root {
 		s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 	} else {
@@ -3244,6 +3263,12 @@ func coroDeferStartFrame(token, frame unsafe.Pointer, child stacklessCoroResume)
 // Waiting plus readyPending until this active resume returns Wait. This needs
 // no additional task flag, scheduler map, or per-registration stack word.
 func coroDeferSuspended(ctx unsafe.Pointer) bool {
+	return coroDeferAction(ctx) != stacklessCoroActionInvalid
+}
+
+// Host handoffs and structured cleanup children have different barriers.
+// Neither may publish its continuation before the initiating resume returns.
+func coroDeferAction(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil {
@@ -3256,9 +3281,15 @@ func coroDeferSuspended(ctx unsafe.Pointer) bool {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine cleanup handoff outside resume")
 	}
-	suspended := task.state == stacklessCoroTaskWaiting
+	action := uint8(stacklessCoroActionInvalid)
+	if task.state == stacklessCoroTaskWaiting {
+		action = stacklessCoroActionWait
+		if h := s.taskHostLocked(task); h != nil && h.pending == task {
+			action = stacklessCoroActionHost
+		}
+	}
 	unlock(&s.lock)
-	return suspended
+	return action
 }
 
 // coroPanic records a panic value before the compiler-generated resume enters
@@ -3285,10 +3316,7 @@ func recordStacklessCoroPanic(s *stacklessCoroScheduler,
 		throw("runtime: invalid stackless coroutine panic transition")
 	}
 	task.terminal = stacklessCoroTerminalPanic
-	if s.terminalValues == nil {
-		s.terminalValues = make(map[*stacklessCoroTask]any)
-	}
-	s.terminalValues[task] = value
+	s.setTerminalValue(task, value)
 	unlock(&s.lock)
 }
 
@@ -3463,16 +3491,13 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 	case stacklessCoroTerminalNone:
 		if goexit {
 			task.terminal = stacklessCoroTerminalNone
-			delete(parent.terminalValues, task)
+			parent.clearTerminalValue(task)
 			task.goexit = true
 		}
 	case stacklessCoroTerminalPanic:
 		task.terminal = stacklessCoroTerminalPanic
 		task.goexit = task.goexit || goexit
-		if parent.terminalValues == nil {
-			parent.terminalValues = make(map[*stacklessCoroTask]any)
-		}
-		parent.terminalValues[task] = value
+		parent.setTerminalValue(task, value)
 	}
 	unlock(&parent.lock)
 }
@@ -3482,7 +3507,7 @@ func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
 	root := &s.root
 	kind = root.terminal
 	goexit = root.goexit
-	value, ok := s.terminalValues[root]
+	value, ok := s.terminalValue(root)
 	if root.state != stacklessCoroTaskComplete {
 		return 0, false, nil,
 			"runtime: incomplete stackless coroutine defer run"
@@ -3504,7 +3529,7 @@ func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
 	}
 	root.terminal = stacklessCoroTerminalNone
 	root.goexit = false
-	delete(s.terminalValues, root)
+	s.clearTerminalValue(root)
 	return kind, goexit, value, ""
 }
 
@@ -3522,7 +3547,7 @@ func coroDeferGoexit(token unsafe.Pointer) {
 		throw("runtime: invalid stackless coroutine defer Goexit transition")
 	}
 	task.terminal = stacklessCoroTerminalNone
-	delete(s.terminalValues, task)
+	s.clearTerminalValue(task)
 	task.goexit = true
 	unlock(&s.lock)
 }
@@ -3554,13 +3579,13 @@ func coroDeferRecover(token unsafe.Pointer) any {
 		unlock(&s.lock)
 		return nil
 	}
-	value, ok := s.terminalValues[task]
+	value, ok := s.terminalValue(task)
 	if task.terminal != stacklessCoroTerminalPanic || !ok {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine defer recover state")
 	}
 	task.terminal = stacklessCoroTerminalNone
-	delete(s.terminalValues, task)
+	s.clearTerminalValue(task)
 	unlock(&s.lock)
 
 	if value == nil {
@@ -3602,13 +3627,13 @@ func coroDeferRecoverAwait(ctx unsafe.Pointer) any {
 		unlock(&s.lock)
 		return nil
 	}
-	value, ok := s.terminalValues[owner]
+	value, ok := s.terminalValue(owner)
 	if owner.terminal != stacklessCoroTerminalPanic || !ok {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine awaited recover state")
 	}
 	owner.terminal = stacklessCoroTerminalNone
-	delete(s.terminalValues, owner)
+	s.clearTerminalValue(owner)
 	unlock(&s.lock)
 	if value == nil {
 		if debug.panicnil.Load() != 1 {
@@ -3618,6 +3643,22 @@ func coroDeferRecoverAwait(ctx unsafe.Pointer) any {
 		}
 	}
 	return value
+}
+
+// A bounded non-suspending activation can also be entered by the legacy
+// synchronous defer runner. That runner explicitly installs its owner scope;
+// a new structured defer instead owns a distinct task with DeferChild set.
+// Ordinary await children have neither permission and must observe nil.
+func coroDeferRecoverDirect(ctx unsafe.Pointer) any {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine direct recover")
+	}
+	if task.hasFlag(stacklessCoroTaskDeferChild) {
+		return coroDeferRecoverAwait(ctx)
+	}
+	return stacklessCoroRecover(getg())
 }
 
 // coroSpawn enqueues an independent logical goroutine. Its result is a hint
@@ -3668,6 +3709,14 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		s.liveSpawns <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
+	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
+		// A host does not consume the scheduler's ordinary task queue. Its
+		// owner may already be parked, including on a single P where spawn
+		// does not admit replacement executors. Notify that owner after
+		// publishing the independent child rather than relying on the host
+		// to select it when its current resume yields.
+		s.signal()
+	}
 	s.wakeReplacementExecutor()
 	return yield
 }
@@ -4285,10 +4334,7 @@ func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
 		throw("runtime: invalid stackless coroutine operation panic")
 	}
 	task.terminal = stacklessCoroTerminalPanic
-	if s.terminalValues == nil {
-		s.terminalValues = make(map[*stacklessCoroTask]any)
-	}
-	s.terminalValues[task] = value
+	s.setTerminalValue(task, value)
 	completedDuringResume := task.resuming
 	s.readyLocked(task)
 	cachedLocally := s.recycleOperationLocked(op)
@@ -4328,6 +4374,13 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 	}
 	task.state = stacklessCoroTaskRunnable
 	task.next = nil
+	if h := s.taskHostLocked(task); h != nil {
+		if raceenabled {
+			racereleasemerge(unsafe.Pointer(task))
+		}
+		h.readyLocked(task)
+		return 0
+	}
 	var runnable uint32
 	if stacklessCoroIsPullComparison(s) {
 		// A pull comparison root has one active structured leaf. An event
@@ -4355,27 +4408,48 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
-	pull := stacklessCoroIsPullComparison(s)
-	task := s.head
-	if task == nil || pull && task.state != stacklessCoroTaskRunnable {
-		unlock(&s.lock)
-		return nil
+	current := currentStacklessCoroHost()
+	if current != nil && current.scheduler != s {
+		current = nil
 	}
-	if !pull {
-		s.head = task.next
-		if s.head == nil {
-			s.tail = nil
+	var task *stacklessCoroTask
+	for {
+		if current != nil {
+			task = current.takeLocked()
+		} else {
+			pull := stacklessCoroIsPullComparison(s)
+			task = s.head
+			if task == nil || pull && task.state != stacklessCoroTaskRunnable {
+				unlock(&s.lock)
+				return nil
+			}
+			if !pull {
+				s.head = task.next
+				if s.head == nil {
+					s.tail = nil
+				}
+				s.runnableState.Add(-1)
+			}
+			task.next = nil
+			if h := s.taskHostLocked(task); h != nil {
+				if pull {
+					s.head = nil
+				}
+				h.readyLocked(task)
+				continue
+			}
 		}
-		s.runnableState.Add(-1)
+		if task == nil {
+			unlock(&s.lock)
+			return nil
+		}
+		break
 	}
-	task.next = nil
-	if task.state != stacklessCoroTaskRunnable || task.resuming ||
-		task.readyPending {
+	if task.state != stacklessCoroTaskRunnable || task.resuming || task.readyPending {
 		unlock(&s.lock)
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
-	task.state = stacklessCoroTaskRunning
-	task.resuming = true
+	task.state, task.resuming = stacklessCoroTaskRunning, true
 	unlock(&s.lock)
 	if raceenabled {
 		raceacquire(unsafe.Pointer(task))
@@ -4438,7 +4512,7 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 	}
 	ready := task.readyPending
 	task.readyPending = false
-	if ready && native && !raceenabled &&
+	if ready && native && !raceenabled && s.taskHostCurrentLocked(task) &&
 		!stacklessCoroIsPullComparison(s) && !s.drained() &&
 		s.head == nil && s.tail == nil && s.runnableState.Load() == 0 {
 		// The producer completed while the initiating resume call was still
@@ -4552,6 +4626,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	// synchronization or comparison policy.
 	if !raceenabled && !stacklessCoroIsPullComparison(s) &&
 		!parent.resuming && !parent.readyPending && parent.next == nil &&
+		s.taskHostCurrentLocked(parent) &&
 		s.head == nil && s.tail == nil {
 		parent.state = stacklessCoroTaskRunning
 		parent.resuming = true
@@ -4567,7 +4642,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 
 func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	lock(&s.lock)
-	value, ok := s.terminalValues[task]
+	value, ok := s.terminalValue(task)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
 		task.terminal != stacklessCoroTerminalPanic || !ok {
@@ -4592,7 +4667,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	if parent == nil {
 		s.completeLogicalTaskLocked(task)
 		if task != &s.root {
-			delete(s.terminalValues, task)
+			s.clearTerminalValue(task)
 			task.terminal = stacklessCoroTerminalNone
 			task.goexit = false
 			s.recycleTaskLocked(task)
@@ -4608,12 +4683,12 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine terminated for invalid parent")
 	}
-	delete(s.terminalValues, task)
+	s.clearTerminalValue(task)
 	parent.terminal = task.terminal
 	parent.goexit = parent.goexit || task.goexit
 	task.terminal = stacklessCoroTerminalNone
 	task.goexit = false
-	s.terminalValues[parent] = value
+	s.setTerminalValue(parent, value)
 	s.readyLocked(parent)
 	s.recycleTaskLocked(task)
 	unlock(&s.lock)
@@ -4662,7 +4737,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	}
 	if deferred {
 		parent.terminal = stacklessCoroTerminalNone
-		delete(s.terminalValues, parent)
+		s.clearTerminalValue(parent)
 	}
 	parent.goexit = true
 	task.goexit = false
@@ -4724,7 +4799,7 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		!s.executorState.CompareAndSwap(stacklessCoroExecutorStateOff, stacklessCoroExecutorStatePreparing) {
 		return
 	}
-	s.rootDone = make(chan struct{})
+	s.rootDone = make(chan struct{}, 1)
 	if !raceenabled && !stacklessCoroIsPullComparison(s) && gomaxprocs == 1 {
 		s.executorState.Store(stacklessCoroExecutorStateSingleP)
 		return

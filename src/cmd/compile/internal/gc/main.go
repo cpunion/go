@@ -322,6 +322,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 				body = noder.ReadCoroBodyAs(fn, sym)
 			}
 			if body != nil {
+				coro.RecordSourceCopy(body, fn)
 				transformed = append(transformed, loopvar.ForCapture(body)...)
 			}
 			for _, child := range typecheck.Target.Funcs[start:] {
