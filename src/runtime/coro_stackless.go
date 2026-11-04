@@ -1577,8 +1577,10 @@ func stacklessCoroHostRunnable() bool {
 // or a non-parking episode exhausts ready work. Public drivers stop after the
 // first spawn; owners and replacements stop only after every task completes.
 // A recovered panic starts another episode after this activation has unwound.
-// initial is valid only while the scheduler remains private.
-func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) {
+// initial is valid only while the scheduler remains private. A no-work exit
+// returns the last suspended task for an ordinary host to project while parked;
+// all other exits, including a recovered panic, return nil.
+func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *stacklessCoroTask {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot bool
@@ -1619,7 +1621,7 @@ next:
 	// owner then selects detached children without tying their C activations
 	// to the ordinary public caller's stack.
 	if s.driverDone(public) {
-		return
+		return nil
 	}
 	task = s.take()
 	if task == nil {
@@ -1628,10 +1630,10 @@ next:
 		}
 		if task == nil {
 			if !park {
-				return
+				return idlePollSkip
 			}
 			if !s.waitForWork() {
-				return
+				return nil
 			}
 			goto next
 		}
@@ -1659,7 +1661,7 @@ resumeActive:
 		if hostYieldCheck == 0 || getg().preempt {
 			if stacklessCoroHostRunnable() {
 				if yieldStacklessCoroNativeRoot(s, task) {
-					return
+					return nil
 				}
 			}
 		}
@@ -1698,7 +1700,7 @@ resumeActive:
 			if action == stacklessCoroActionHandoff || hostYieldCheck == 0 || getg().preempt {
 				if stacklessCoroHostRunnable() {
 					if yieldStacklessCoroNativeRoot(s, task) {
-						return
+						return nil
 					}
 				}
 			}
@@ -1722,7 +1724,7 @@ resumeActive:
 	case stacklessCoroActionHost:
 		s.hostHandoff(task)
 		if h := currentStacklessCoroHost(); h != nil && h.scheduler == s {
-			return
+			return nil
 		}
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
@@ -1736,7 +1738,7 @@ resumeActive:
 	case stacklessCoroActionComplete:
 		idlePollSkip = nil
 		if initial && s.completeInitialRoot(task) {
-			return
+			return nil
 		}
 		task = s.complete(task)
 		if task != nil {

@@ -72,6 +72,19 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 			}
 		}
 	}
+	if funcname(f) == "runtime.(*stacklessCoroHost).drive" {
+		if task := stacklessCoroParkedSourceTask(u.g.ptr()); task != nil {
+			rootPC, complete := walkStacklessCoroSourceFrames(task, func(f funcInfo, pc uintptr) bool {
+				return printStacklessCoroSourceFrame(u, f, pc, showRuntime, &first, commit)
+			})
+			if !complete {
+				// Count/print clones replay this expansion at the same driver.
+				return true, true
+			}
+			state.rootPC, state.bridges = rootPC, true
+			return true, false
+		}
+	}
 	if info == nil {
 		return false, false
 	}
