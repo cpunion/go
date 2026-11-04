@@ -14,7 +14,7 @@ import (
 )
 
 func sourceTextFixture() string {
-	source := strings.Replace(sourceFrameProgram, `"path/filepath"`, `"path/filepath";"strings";"strconv"`, 1)
+	source := strings.Replace(sourceFrameProgram, `"path/filepath"`, `"path/filepath";"strings";"strconv";"sync"`, 1)
 	start := strings.Index(source, "func inspect(){")
 	end := strings.Index(source[start:], "//go:noinline\nfunc root") + start
 	source = source[:start] + `func inspect(){
@@ -94,7 +94,46 @@ var inlineEntry=inlineOwner`, 1)
  done:=make(chan struct{})
  launchEntry(inspect,done)
  <-done
+ inspectOtherHosts()
  println("source-text-ok")`, 1)
+	// Also walk other goroutines while their ordinary hosts are parked.
+	// The closure copy must retain its source name, like CallersFrames.
+	source += `
+//go:noinline
+func hold(ready chan<- struct{},release <-chan struct{}) {
+ goto body
+body:
+ ready<-struct{}{}
+ <-release
+}
+//go:noinline
+func worker(ready chan<- struct{},release <-chan struct{},done *sync.WaitGroup) {
+ goto body
+body:
+ defer done.Done()
+ recursiveEntry(16,func(){hold(ready,release)})
+}
+func inspectOtherHosts(){
+ goto body
+body:
+ ready:=make(chan struct{},4);release:=make(chan struct{});var done sync.WaitGroup
+ for i:=0;i<4;i++ {done.Add(1);go worker(ready,release,&done)}
+ for i:=0;i<4;i++ {<-ready}
+ for i:=0;i<20;i++ {
+  runtime.GC()
+  buffer:=make([]byte,1<<20);n:=runtime.Stack(buffer,true);text:=string(buffer[:n]);hosts:=0
+  for _,stack:=range strings.Split(text,"\n\n") {
+   if !strings.Contains(stack,"main.hold("){continue}
+   hosts++
+   if strings.Count(stack,"main.recursive(")!=17||strings.Contains(stack,".coro.")||strings.Contains(stack,"runtime.coroRunFrame(") {
+    print(stack);panic("cross-host source chain")
+   }
+  }
+  if hosts!=4 {print(text);panic("missing ordinary hosts")}
+ }
+ close(release);done.Wait()
+}
+`
 	return sourceFrameFixtureFor(source)
 }
 

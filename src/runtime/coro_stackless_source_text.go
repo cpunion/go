@@ -86,7 +86,13 @@ func printStacklessCoroSourceFrame(u *unwinder, f funcInfo, pc uintptr, showRunt
 			continue
 		}
 		file, line := iu.fileLine(uf)
-		printFuncName(sf.name())
+		name := sf.name()
+		if !iu.isInlined(uf) {
+			if source := stacklessCoroSourceName(f); source != "" {
+				name = source
+			}
+		}
+		printFuncName(name)
 		// These activations live in typed heap frames, not ordinary ABI
 		// argument slots. As for inlined frames, omit arguments and physical
 		// stack addresses rather than reading unrelated bridge stack slots.

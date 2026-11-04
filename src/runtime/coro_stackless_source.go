@@ -195,11 +195,6 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 	if !u.valid() {
 		return 0, true
 	}
-	state := stacklessCoroHostState(u.g.ptr())
-	var task *stacklessCoroTask
-	if state != nil && state.ordinaryDepth != 0 {
-		task = state.activeTask
-	}
 	var cgoBuf [32]uintptr
 	n := 0
 	bridges, afterDriver := false, false
@@ -231,10 +226,16 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 				continue
 			}
 		}
-		if task != nil && info != nil && info.flags&abi.CoroSourceBridge != 0 {
-			rootPC = appendStacklessCoroSourceFrames(u, task, &skip, buf, &n)
-			bridges = true
-			continue
+		if info != nil && info.flags&abi.CoroSourceBridge != 0 {
+			// Profiling may start on g0 and cross morestack or systemstack
+			// before reaching this bridge. Resolve its owner from the
+			// current unwind cursor, not the goroutine at the first PC.
+			state := stacklessCoroHostState(u.g.ptr())
+			if state != nil && state.ordinaryDepth != 0 && state.activeTask != nil {
+				rootPC = appendStacklessCoroSourceFrames(u, state.activeTask, &skip, buf, &n)
+				bridges = true
+				continue
+			}
 		}
 		cgoN := u.cgoCallers(cgoBuf[:])
 		pc := u.symPC()
