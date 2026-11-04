@@ -15,19 +15,23 @@ import (
 // ordinary stack. Keep only source positions, with the same inner/outer bound
 // as text tracebacks. Neither this record nor its entries retain user objects.
 type stacklessCoroPanicTrace struct {
-	rootPC uintptr
-	count  int
-	frames [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
-	goexit bool
+	rootPC       uintptr
+	count        int
+	frames       [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
+	goexit       bool
+	calleeFuncID abi.FuncID
 }
 
 type stacklessCoroPanicState struct {
 	coroTrace *stacklessCoroPanicTrace
 }
 
-func (trace *stacklessCoroPanicTrace) append(f funcInfo, pc uintptr, gp *g) {
+func (trace *stacklessCoroPanicTrace) append(f funcInfo, pc uintptr) {
 	for iu, uf := newInlineUnwinder(f, pc); uf.valid(); uf = iu.next(uf) {
-		if !showframe(iu.srcFunc(uf), gp, trace.count == 0, abi.FuncIDNormal) {
+		sf := iu.srcFunc(uf)
+		callee := trace.calleeFuncID
+		trace.calleeFuncID = sf.funcID
+		if !showfuncinfoUser(sf, trace.count == 0, callee) {
 			continue
 		}
 		trace.appendFrame(uf)
@@ -60,6 +64,7 @@ func (trace *stacklessCoroPanicTrace) appendTrace(previous *stacklessCoroPanicTr
 		trace.appendFrame(uf)
 	}
 	trace.rootPC = previous.rootPC
+	trace.calleeFuncID = previous.calleeFuncID
 }
 
 func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp *g, leafEntry, leafPC uintptr) {
@@ -82,7 +87,7 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 				}
 				leafEntry = 0
 			}
-			trace.append(f, pc, gp)
+			trace.append(f, pc)
 			return true
 		})
 		if pc != 0 {
@@ -156,7 +161,7 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 						f, at = source, stacklessCoroSourcePC(source, file, line)
 					}
 				}
-				trace.append(f, at, gp)
+				trace.append(f, at)
 			}
 		}
 		trace.appendLineage(task, gp, leafEntry, leafPC)

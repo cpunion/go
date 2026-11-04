@@ -160,3 +160,145 @@ func parseTerminalSourceStack(t *testing.T, text string) terminalSourceStack {
 	}
 	return result
 }
+
+func TestTerminalSourceStackDuringDefer(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native coroutine executor is not supported")
+	}
+	const program = `package main
+import("runtime";"os")
+//go:noinline
+func recursive(n int){runtime.Gosched();if n>0{recursive(n-1);return};panic("original")}
+var entry=recursive
+//go:noinline
+func inspect(){goto body;body:b:=make([]byte,1<<20);n:=runtime.Stack(b,false);print(string(b[:n]))}
+func main(){goto body;body:n:=16;if os.Args[1]=="deep"{n=220};defer func(){inspect();if recover()!="original"{panic("missing original")}}();entry(n)}
+`
+	dir := t.TempDir()
+	file := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(file, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	want := make(map[string]terminalSourceStack)
+	for _, config := range []struct{ name, experiment, flags string }{
+		{"ordinary", "nocoro", "-l"},
+		{"native", "coro", "-l -d=coro=4"},
+		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},
+		{"inline", "coro", "-d=coro=4"},
+	} {
+		t.Run(config.name, func(t *testing.T) {
+			exe := filepath.Join(dir, config.name)
+			build := testenv.Command(t, testenv.GoToolPath(t), "build", "-gcflags="+config.flags, "-o", exe, file)
+			build.Env = append(build.Environ(), "GOEXPERIMENT="+config.experiment, "GOWORK=off")
+			if data, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("build: %v\n%s", err, data)
+			}
+			if config.experiment == "coro" && linkedCoroStackUnsafe(t, exe, "main.recursive.coro.stackgate") {
+				t.Fatal("terminal source owner lost native admission")
+			}
+			for _, depth := range []string{"shallow", "deep"} {
+				for _, level := range []string{"single", "system"} {
+					for _, p := range []string{"1", "4"} {
+						run := testenv.Command(t, exe, depth)
+						run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0", "GOTRACEBACK="+level)
+						data, err := run.CombinedOutput()
+						text := string(data)
+						if err != nil || strings.Contains(text, ".coro.") || strings.Contains(text, "runtime.coroPanic") || strings.Contains(text, "source frame omitted") {
+							t.Fatalf("%s %s P%s: %v\n%s", depth, level, p, err, text)
+						}
+						got := parseTerminalSourceStack(t, text)
+						if len(got.frames) == 0 || (depth == "deep") != (got.elided > 0) {
+							t.Fatalf("missing bounded source frames: %v", got)
+						}
+						if config.name == "ordinary" && want[depth].frames == nil {
+							want[depth] = got
+						}
+						if !reflect.DeepEqual(got, want[depth]) {
+							t.Fatalf("%s %s P%s: source stack %v, want %v\n%s", depth, level, p, got, want[depth], text)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTerminalSourceLifetime(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native coroutine executor is not supported")
+	}
+	const program = `package main
+import("runtime";"sync/atomic";"time")
+type token struct {id int;pad [64]byte}
+var finalized, recovered atomic.Int32
+//go:noinline
+func allocate(id int)*token {goto body;body:p:=&token{id:id};runtime.SetFinalizer(p,func(*token){finalized.Add(1)});return p}
+//go:noinline
+func take(){goto body;body:v:=recover();if v==nil{panic("missing value")};if v.(*token).id<0{panic("bad token")};recovered.Add(1)}
+//go:noinline
+func recursive(n int,p *token){runtime.Gosched();if n>0{recursive(n-1,p);return};panic(p)}
+//go:noinline
+func inside(i int,maker func(int)*token,cleanup func()){defer cleanup();p:=maker(i);recursive(8,p)}
+//go:noinline
+func propagated(i int,maker func(int)*token){p:=maker(i);recursive(8,p)}
+var insideEntry=inside
+var propagatedEntry=propagated
+//go:noinline
+func outside(i int){goto body;body:defer take();propagatedEntry(i,allocate)}
+//go:noinline
+func exitLeaf(p *token){goto body;body:defer func(){panic(p)}();runtime.Goexit()}
+//go:noinline
+func exitRoot(i int,maker func(int)*token,leaf func(*token),cleanup func(),done chan struct{}){defer close(done);defer cleanup();p:=maker(i);runtime.Gosched();leaf(p);panic("Goexit returned")}
+//go:noinline
+func launch(i int,maker func(int)*token,leaf func(*token),cleanup func(),done chan struct{}){go exitRoot(i,maker,leaf,cleanup,done)}
+var launchEntry=launch
+func main(){goto body;body:
+ const cycles=1024
+ for i:=0;i<cycles;i++ {insideEntry(i,allocate,take);outside(i)}
+ for i:=0;i<cycles/2;i++ {done:=make(chan struct{});launchEntry(i,allocate,exitLeaf,take,done);<-done}
+ const want=cycles*2+cycles/2
+ if recovered.Load()!=want{println(recovered.Load(),want);panic("recovery count")}
+ deadline:=time.Now().Add(20*time.Second)
+ for finalized.Load()!=want&&time.Now().Before(deadline){runtime.GC();runtime.Gosched();time.Sleep(time.Millisecond)}
+ if finalized.Load()!=want{println(finalized.Load(),want);panic("retained terminal user objects")}
+ println("terminal-lifetime-ok")
+}
+`
+	dir := t.TempDir()
+	file := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(file, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, config := range []struct{ name, experiment, flags string }{
+		{"ordinary", "nocoro", "-l"},
+		{"native", "coro", "-l -d=coro=4"},
+		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},
+		{"inline", "coro", "-d=coro=4"},
+	} {
+		t.Run(config.name, func(t *testing.T) {
+			exe := filepath.Join(dir, config.name)
+			build := testenv.Command(t, testenv.GoToolPath(t), "build", "-gcflags="+config.flags, "-o", exe, file)
+			build.Env = append(build.Environ(), "GOEXPERIMENT="+config.experiment, "GOWORK=off")
+			if data, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("build: %v\n%s", err, data)
+			}
+			if config.experiment == "coro" {
+				for _, name := range []string{"recursive", "inside", "propagated", "exitRoot", "launch"} {
+					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+						t.Fatalf("%s lost native admission", name)
+					}
+				}
+			}
+			for _, p := range []string{"1", "4"} {
+				run := testenv.Command(t, exe)
+				run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0")
+				data, err := run.CombinedOutput()
+				if err != nil || strings.TrimSpace(string(data)) != "terminal-lifetime-ok" {
+					t.Fatalf("P%s: %v\n%s", p, err, data)
+				}
+			}
+		})
+	}
+}
