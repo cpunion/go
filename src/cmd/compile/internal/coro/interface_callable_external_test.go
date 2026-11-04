@@ -21,6 +21,9 @@ func cleanup(w worker,token any){defer w.Capture();runtime.Gosched();panic(token
 func launchExit(w worker,done chan struct{}){runtime.Gosched();go w.Exit(done)}
 func bound(f func(int)(int,*box),n int)(int,*box){runtime.Gosched();return f(n)}
 func boundCleanup(f func(),token any){defer f();runtime.Gosched();panic(token)}
+func normalInterface(w worker){w.Capture();runtime.Gosched()}
+func cleanupFunction(f func(worker),w worker,token any)(caught any){defer func(){caught=recover()}();defer f(w);panic(token)}
+func exitCleanup(f func(worker),w worker,done chan struct{}){defer close(done);defer f(w);runtime.Goexit()}
 func arg(order *[]int,n int)int{*order=append(*order,n);return n}
 func nilCall(w worker,order *[]int){w.Add(arg(order,1));*order=append(*order,2)}
 func nilGo(w worker,order *[]int){go w.Store(arg(order,1),nil);*order=append(*order,2)}
@@ -38,6 +41,9 @@ func main(){
  token:=new(int);cleanup(p,token);if p.caught!=token{panic("interface direct defer recover")}
  w=p;boundCleanup(w.Capture,token);if p.caught!=token{panic("bound interface direct recover")}
  w.Capture();if p.caught!=nil{panic("normal interface call borrowed recover")}
+ if cleanupFunction(normalInterface,p,token)!=token||p.caught!=nil{panic("deferred factory reservation or normal recover isolation")}
+ done=make(chan struct{});go exitCleanup(normalInterface,p,done);<-done
+ if p.caught!=nil{panic("deferred factory during Goexit borrowed recover")}
  var absent *box;n,q=call(absent,7);if n!=71||q!=nil{panic("typed nil interface receiver")}
  for _,f:=range []func(worker,*[]int){nilCall,nilGo,nilDefer}{
   var order []int;if !caught(f,&order)||len(order)!=1||order[0]!=1{panic("nil interface argument evaluation or caller panic timing")}
@@ -48,7 +54,7 @@ func main(){
  println("switch-return-ok")
 }
 `
-	required := []string{"call", "launch", "cleanup", "launchExit", "bound", "boundCleanup"}
+	required := []string{"call", "launch", "cleanup", "launchExit", "bound", "boundCleanup", "normalInterface", "cleanupFunction", "exitCleanup"}
 	testSwitchReturnProgram(t, source, nil, required, required...)
 }
 

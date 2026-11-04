@@ -102,7 +102,10 @@ func startStacklessCoroCallableDefer(ctx unsafe.Pointer, entry *stacklessCoroCal
 	if entry != nil {
 		data := unsafe.Pointer(&entry.deferCode)
 		invoke := *(*func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) (unsafe.Pointer, stacklessCoroResume))(unsafe.Pointer(&data))
-		frame, resume := invoke(ctx, environment, request)
+		// The cleanup owner may retain a panic or sticky Goexit. Ordinary
+		// frame reservations require a non-terminal parent, so construct a
+		// private frame just as compiler-generated closed defer starters do.
+		frame, resume := invoke(nil, environment, request)
 		coroDeferAwaitFrame(ctx, frame, resume)
 		return
 	}
