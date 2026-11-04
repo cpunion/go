@@ -5082,3 +5082,27 @@ operands stay traced while the owner is parked, and draining releases owner,
 frame and resume roots even when an escaped yield still retains the anchor.
 Registration against a drained native anchor remains an invalid late native
 registration; it must never be mistaken for an ordinary runtime token.
+
+
+### Terminal source traceback lifetime
+
+A terminal native activation releases its typed frames before its outcome is
+replayed on an ordinary stack. A bounded snapshot keeps the first and last
+50 source inline frames and the full frame count, with no frame, receiver,
+environment or panic-value pointers. It transfers separately from the panic
+value, including a present nil value. Ordinary `_panic` records own snapshots
+through recovery and stack copying. Runtime failure and system tracebacks
+continue to use the physical unwinder.
+
+Deferred activations retain their incoming panic positions until they return,
+including the interval after recover. Replacement panics prepend their deferred
+source chain and the visible panic boundary. `coroDeferInvokeTrace` carries this
+scope through ordinary cleanup without granting a direct recover right;
+`coroDeferCall` retains its existing recover scope. Both use cold records behind
+the existing defer-state pointer, preserving the native context allocation
+class. Independent go roots inherit no creator activation chain. Channel and
+panic positions remain in compiler source metadata without reading ABI slots.
+
+This implements bounded terminal text projection. Complete terminal PC
+collection, parked native-task enumeration, creation ancestry, native profiles,
+trace and native-task race still require separate work. Performance is deferred.

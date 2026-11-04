@@ -4592,7 +4592,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					}
 
 					call := ir.Node(typecheck.Call(deferred.call.Pos(),
-						typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{fun}, false))
+						typecheck.LookupRuntime("coroDeferInvokeTrace"), ir.Nodes{ctx, fun}, false))
 					if deferred.namedRecover {
 						call = typecheck.Call(deferred.call.Pos(),
 							typecheck.LookupRuntime("coroDeferCall"),

@@ -26,7 +26,7 @@ type stacklessCoroPanicState struct {
 
 func (trace *stacklessCoroPanicTrace) append(f funcInfo, pc uintptr, gp *g) {
 	for iu, uf := newInlineUnwinder(f, pc); uf.valid(); uf = iu.next(uf) {
-		if !showframe(iu.srcFunc(uf), gp, false, abi.FuncIDNormal) {
+		if !showframe(iu.srcFunc(uf), gp, trace.count == 0, abi.FuncIDNormal) {
 			continue
 		}
 		trace.appendFrame(uf)
@@ -43,6 +43,11 @@ func (trace *stacklessCoroPanicTrace) appendFrame(uf inlineFrame) {
 }
 
 func (trace *stacklessCoroPanicTrace) appendTrace(previous *stacklessCoroPanicTrace) {
+	if trace.count != 0 {
+		// Ordinary tracebacks expose the panic boundary between deferred
+		// code and the original chain. It also counts toward 50/50 elision.
+		trace.appendFrame(inlineFrame{pc: abi.FuncPCABIInternal(gopanic), index: -1})
+	}
 	for i := 0; i < previous.count; i++ {
 		// Missing middle entries cannot enter our first inner frames and
 		// are overwritten by the retained outer frames before publication.
@@ -203,8 +208,22 @@ func raiseStacklessCoroPanic(value any, trace *stacklessCoroPanicTrace) {
 func initStacklessCoroPanicTrace(p *_panic, pc uintptr) {
 	gp := getg()
 	state := gp.stacklessCoro
-	if p.goexit || state == nil || state.deferState == nil || !state.deferState.pending ||
-		funcname(findfunc(pc)) != "runtime.raiseStacklessCoroPanic" {
+	if p.goexit || p.deferreturn || state == nil || state.deferState == nil {
+		return
+	}
+	if !state.deferState.pending {
+		// An implicit panic can unwind the trace scope before runTasks
+		// catches it. Capture while a recovered prior chain is still owned
+		// by this deferred activation.
+		if task := state.deferState.task; task != nil && state.deferState.trace != nil {
+			s := task.context.scheduler
+			lock(&s.lock)
+			p.coroTrace = captureStacklessCoroPanicTrace(task, nil, p.startPC, p.startSP)
+			unlock(&s.lock)
+		}
+		return
+	}
+	if funcname(findfunc(pc)) != "runtime.raiseStacklessCoroPanic" {
 		return
 	}
 	pending := state.deferState

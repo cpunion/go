@@ -3426,7 +3426,7 @@ type stacklessCoroDeferScope struct {
 	temporary bool
 }
 
-func enterStacklessCoroDeferScope(task *stacklessCoroTask) stacklessCoroDeferScope {
+func enterStacklessCoroDeferScope(task *stacklessCoroTask, recoverable bool) stacklessCoroDeferScope {
 	gp := getg()
 	state := gp.stacklessCoro
 	temporary := state == nil
@@ -3439,7 +3439,7 @@ func enterStacklessCoroDeferScope(task *stacklessCoroTask) stacklessCoroDeferSco
 	lock(&s.lock)
 	trace := s.terminalTrace(task)
 	unlock(&s.lock)
-	state.deferState = &stacklessCoroDeferState{task: task, trace: trace}
+	state.deferState = &stacklessCoroDeferState{task: task, trace: trace, recoverable: recoverable}
 	return stacklessCoroDeferScope{gp: gp, state: state, previous: previous, temporary: temporary}
 }
 
@@ -3458,13 +3458,26 @@ func coroDeferInvoke(deferred func()) {
 	deferred()
 }
 
+// Retaining an ordinary cleanup's former panic positions must not give a
+// nested ordinary recover the right to take the logical owner's panic value.
+func coroDeferInvokeTrace(ctx unsafe.Pointer, deferred func()) {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if context == nil || context.scheduler == nil || task == nil {
+		throw("runtime: invalid stackless coroutine defer trace")
+	}
+	scope := enterStacklessCoroDeferScope(task, false)
+	defer scope.leave()
+	deferred()
+}
+
 // coroDeferCall invokes a statically proven named defer target with access to
 // its task-owned panic. Ordinary native panics remain visible to gorecover
 // before this logical panic.
 func coroDeferCall(token unsafe.Pointer, deferred func()) {
 	task := activeStacklessCoroDeferTask(token,
 		"runtime: invalid stackless coroutine defer call")
-	scope := enterStacklessCoroDeferScope(task)
+	scope := enterStacklessCoroDeferScope(task, true)
 	defer scope.leave()
 	deferred()
 }
@@ -3480,7 +3493,7 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 	resume stacklessCoroResume) {
 	task := activeStacklessCoroDeferTask(token,
 		"runtime: invalid stackless coroutine defer run")
-	scope := enterStacklessCoroDeferScope(task)
+	scope := enterStacklessCoroDeferScope(task, true)
 	defer scope.leave()
 
 	s := newStacklessCoroScheduler(frame, resume)

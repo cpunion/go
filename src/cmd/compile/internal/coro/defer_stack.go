@@ -76,7 +76,7 @@ func lowerDeferStackCleanup(pos src.XPos, resume *ir.Func, ctx ir.Node,
 				ir.NewNilExpr(pos, types.Types[types.TINTER])), marker, ordinary),
 		)
 	}
-	invoke := typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvoke"), ir.Nodes{deferred}, false)
+	invoke := typecheck.Call(pos, typecheck.LookupRuntime("coroDeferInvokeTrace"), ir.Nodes{ctx, deferred}, false)
 	if namedRecover {
 		invoke = typecheck.Call(pos, typecheck.LookupRuntime("coroDeferCall"), ir.Nodes{token, deferred}, false)
 	}
