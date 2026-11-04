@@ -209,7 +209,7 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 	}
 	var cgoBuf [32]uintptr
 	n := 0
-	bridges, afterDriver := false, false
+	bridges, afterDriver, terminal := false, false, false
 	var rootPC uintptr
 	for ; n < len(buf) && u.valid(); u.next() {
 		f := u.frame.fn
@@ -220,10 +220,14 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 				// The source root is already in the logical chain. Its
 				// physical public entry contributes no duplicate frame.
 				bridges = false
+				terminal = false
 				continue
 			}
 			switch funcname(f) {
 			case "runtime.coroRunFrame":
+				if terminal {
+					continue
+				}
 				bridges, afterDriver = false, true
 				continue
 			case "runtime.goexit":
@@ -235,6 +239,21 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 		if afterDriver {
 			afterDriver = false
 			if source.valid() && source.entry() == rootPC {
+				continue
+			}
+		}
+		if f.funcID == abi.FuncID_gopanic || funcname(f) == "runtime.Goexit" {
+			var trace *stacklessCoroPanicTrace
+			for p := u.g.ptr()._panic; p != nil; p = p.link {
+				if p.coroTrace != nil && uintptr(p.startSP) == u.frame.sp {
+					trace = p.coroTrace
+					break
+				}
+			}
+			if trace != nil {
+				appendStacklessCoroSourcePC(u, f, u.symPC(), &skip, buf, &n)
+				appendStacklessCoroPanicPCs(u, trace, &skip, buf, &n)
+				rootPC, bridges, terminal = trace.rootPC, true, true
 				continue
 			}
 		}

@@ -120,6 +120,10 @@ func testStacklessCoroNotifyMixed(t *testing.T, mode string) {
 		list.Reset(^uint32(0) - 1)
 	}
 	if mode == "profile" {
+		// Starting the GC workers can itself block in an allocation made
+		// by WaitCoro. Initialize them before sampling notification waits,
+		// so that unrelated startup wait does not enter this profile.
+		runtime.GC()
 		runtime.SetBlockProfileRate(1)
 		defer runtime.SetBlockProfileRate(0)
 	}

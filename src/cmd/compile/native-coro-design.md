@@ -5104,6 +5104,31 @@ the existing defer-state pointer, preserving the native context allocation
 class. Independent go roots inherit no creator activation chain. Channel and
 panic positions remain in compiler source metadata without reading ABI slots.
 
-This implements bounded terminal text projection. Complete terminal PC
-collection, parked native-task enumeration, creation ancestry, native profiles,
-trace and native-task race still require separate work. Performance is deferred.
+This text projection remains bounded. Complete terminal PC collection uses the
+separate payload described below. Parked native-task enumeration, creation
+ancestry, native profiles, trace and native-task race still require separate
+work. Performance is deferred.
+
+
+### Complete terminal source PCs
+
+Terminal snapshots also retain a complete immutable return-PC payload for
+`Callers`, independently of the bounded text window. Capture first counts the
+positions, allocates outside the physical walk, then reinitializes the cursor
+and fills the payload under the same logical-task ownership. Extending a
+snapshot allocates a new payload instead of mutating a published one. Only
+code positions are retained; receivers, environments, user values and task
+frames are not kept alive by this metadata.
+
+PC replay preserves buffer limits, skip counts, inline expansion and panic or
+Goexit boundaries, then elides the completed scheduler through its public
+source root. Independent go roots do not inherit the creator chain. Ordinary
+and native channel-send entry functions remain their real runtime implementation
+PCs; source-name comparison does not fabricate an ordinary entry PC for a
+native fast path. A blocked native send completes through the operation
+protocol and retains its complete source chain without the ordinary physical
+`chansend` activations. Each execution's skip and buffer queries must match
+its own complete PC sequence, including these implementation differences.
+Full terminal PC storage has depth-dependent cold memory
+cost. Performance is deferred. Parked task enumeration, creation ancestry,
+complete native profiles, trace, race and long-service validation remain open.
