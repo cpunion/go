@@ -5245,8 +5245,8 @@ stable IDs across promotion, source creation and suspension lines, labels,
 deep chains, undersized profile behavior, and frame release after return,
 recovered panic and Goexit. A concurrent churn regression checks active
 resumes, recursive frame transitions, host promotion, GC, profile depth and
-registry drainage with ordinary, native, checkptr, inlining and race fallback
-builds. Internal hand-written continuations without source metadata still
+registry drainage with ordinary, native, checkptr, inlining, static lock
+ranking and race fallback builds. Internal hand-written continuations without source metadata still
 contribute a nonempty profile at their actual resume entry. Complete public-root
 source projection, native
 execution tracing, CPU profiles and native-task race instrumentation still

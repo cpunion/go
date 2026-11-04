@@ -281,7 +281,6 @@ func TestStacklessCoroUnhostedProfile(t *testing.T) {
 	var list runtime.NotifyListStacklessCoroForTest
 	done := make(chan struct{}, count)
 	defer list.Broadcast()
-	baseline := runtime.NumGoroutine()
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		for range count {
 			ticket := list.Add()
@@ -301,10 +300,13 @@ func TestStacklessCoroUnhostedProfile(t *testing.T) {
 		t.Fatalf("unhosted count = %d, want %d", n, count)
 	}
 	runtime.GC()
-	records := make([]runtime.StackRecord, baseline+count+32)
+	records := make([]runtime.StackRecord, runtime.NumGoroutine()+32)
 	n, ok := runtime.GoroutineProfile(records)
-	if !ok || n < baseline+count {
-		t.Fatalf("profile count = %d, ok = %v, want at least %d", n, ok, baseline+count)
+	// Other tests' helper goroutines can exit while these tasks wait. Count
+	// our exact source records below instead of subtracting a stale global
+	// baseline; the profile must also contain this coordinating goroutine.
+	if !ok || n < count+1 {
+		t.Fatalf("profile count = %d, ok = %v, want at least %d", n, ok, count+1)
 	}
 	found := 0
 	for _, record := range records[:n] {

@@ -60,6 +60,7 @@ func main(){goto body;body:
 		{"native", "coro", "-l -d=coro=4", ""},
 		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2", ""},
 		{"inline", "coro", "-d=coro=4", ""},
+		{"lockrank", "coro,staticlockranking", "-l -d=coro=4", ""},
 		{"ordinary-race", "nocoro", "-l", "-race"},
 		{"coro-race", "coro", "-l -d=coro=4", "-race"},
 	} {
@@ -74,7 +75,7 @@ func main(){goto body;body:
 			if data, err := build.CombinedOutput(); err != nil {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
-			native := config.experiment == "coro" && config.extra == ""
+			native := config.experiment != "nocoro" && config.extra == ""
 			if native {
 				for _, owner := range []string{"left", "right", "child", "launch"} {
 					if linkedCoroStackUnsafe(t, exe, "main."+owner+".coro.stackgate") {
