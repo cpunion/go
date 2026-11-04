@@ -12,9 +12,12 @@ import "internal/abi"
 // GC and panic recovery remains unchanged. Like unwinder, this is pointer-free
 // so copying a print/count cursor never requires a write barrier.
 type stacklessCoroTracebackState struct {
-	rootPC      uintptr
-	bridges     bool
-	afterDriver bool
+	rootPC        uintptr
+	bridges       bool
+	afterDriver   bool
+	terminal      bool
+	panicStarted  bool
+	panicBoundary bool
 }
 
 func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState, showRuntime, first bool, commit func() (bool, bool)) (handled, stop bool) {
@@ -24,10 +27,14 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 	if state.bridges {
 		if state.rootPC != 0 && source.valid() && source.entry() == state.rootPC {
 			state.bridges = false
+			state.terminal = false
 			return true, false
 		}
 		switch funcname(f) {
 		case "runtime.coroRunFrame":
+			if state.terminal {
+				return true, false
+			}
 			state.bridges, state.afterDriver = false, true
 			return true, false
 		case "runtime.goexit":
@@ -40,6 +47,29 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 		state.afterDriver = false
 		if source.valid() && source.entry() == state.rootPC {
 			return true, false
+		}
+	}
+	if f.funcID == abi.FuncID_gopanic || funcname(f) == "runtime.Goexit" {
+		for p := u.g.ptr()._panic; p != nil; p = p.link {
+			if p.coroTrace != nil && uintptr(p.startSP) == u.frame.sp {
+				if !state.panicStarted {
+					state.panicStarted = true
+					state.panicBoundary = !first || p.goexit
+				}
+				if state.panicBoundary {
+					boundaryFirst := false
+					if !printStacklessCoroSourceFrame(u, f, u.symPC(), showRuntime, &boundaryFirst, commit) {
+						return true, true
+					}
+				}
+				if !printStacklessCoroPanicTrace(u, p.coroTrace, commit) {
+					return true, true
+				}
+				state.rootPC, state.bridges = p.coroTrace.rootPC, true
+				state.terminal = true
+				state.panicStarted = false
+				return true, false
+			}
 		}
 	}
 	if info == nil {

@@ -358,6 +358,7 @@ func coroRangeDeferPush(interface{}, func())
 func coroRangeDeferNext(unsafe.Pointer, interface{}) (func(), bool)
 func coroDeferToken(unsafe.Pointer) unsafe.Pointer
 func coroDeferInvoke(func())
+func coroDeferInvokeTrace(unsafe.Pointer, func())
 func coroDeferCall(unsafe.Pointer, func())
 func coroDeferRun(unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroDeferGoexit(unsafe.Pointer)

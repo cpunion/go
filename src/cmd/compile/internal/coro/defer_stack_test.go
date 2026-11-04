@@ -34,7 +34,7 @@ func TestDeferStackMarkerCleanup(t *testing.T) {
 			fn.Body = ir.Nodes{loop}
 			ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
 			invocation := loop.Body[len(loop.Body)-1].(*ir.CallExpr)
-			want := "coroDeferInvoke"
+			want := "coroDeferInvokeTrace"
 			if recover {
 				want = "coroDeferCall"
 				if invocation.Args[0] != token {

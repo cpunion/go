@@ -1018,7 +1018,7 @@ func coroNativeFinish(executor *g) {
 	if ctx == nil || ctx.executor != executor {
 		throw("runtime: invalid stackless coroutine native finish")
 	}
-	if ctx.gState.deferTask != nil || ctx.gState.blockingScheduler != nil {
+	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil {
 		throw("runtime: active stackless coroutine state during native finish")
 	}
 	schedulerG := getg()

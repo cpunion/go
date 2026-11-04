@@ -1217,11 +1217,14 @@ func showframe(sf srcFunc, gp *g, firstFrame bool, calleeID abi.FuncID) bool {
 // be printed during a traceback.
 func showfuncinfo(sf srcFunc, firstFrame bool, calleeID abi.FuncID) bool {
 	level, _, _ := gotraceback()
-	if level > 1 {
-		// Show all frames.
-		return true
-	}
+	return level > 1 || showfuncinfoUser(sf, firstFrame, calleeID)
+}
 
+// showfuncinfoUser applies the level 1 visibility rules independently of the
+// current traceback setting. Retained source traces also use these rules:
+// runtime.Stack can request a user traceback after a panic was captured while
+// GOTRACEBACK=system was in effect.
+func showfuncinfoUser(sf srcFunc, firstFrame bool, calleeID abi.FuncID) bool {
 	if sf.funcID == abi.FuncIDWrapper && elideWrapperCalling(calleeID) {
 		return false
 	}

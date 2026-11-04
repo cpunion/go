@@ -142,15 +142,23 @@ func coroHostDefer(ctx unsafe.Pointer, call func(any, bool, bool)) uint8 {
 // Called after the compiler's ordinary thunk has directly deferred the frozen
 // source function. Preserve a pending Goexit even when a new panic overlays it.
 func coroDeferInject(value any, panicking, exiting bool) {
+	var trace, exitTrace *stacklessCoroPanicTrace
+	if state := stacklessCoroHostState(getg()); state != nil && state.activeTask != nil {
+		task := state.activeTask
+		s := task.context.scheduler
+		lock(&s.lock)
+		trace, exitTrace = s.terminalTrace(task), s.terminalExitTrace(task)
+		unlock(&s.lock)
+	}
 	if panicking {
 		if exiting {
-			defer func() { panic(value) }()
-			Goexit()
+			defer func() { raiseStacklessCoroPanic(value, trace) }()
+			raiseStacklessCoroGoexit(exitTrace)
 		}
-		panic(value)
+		raiseStacklessCoroPanic(value, trace)
 	}
 	if exiting {
-		Goexit()
+		raiseStacklessCoroGoexit(exitTrace)
 	}
 }
 
@@ -287,12 +295,12 @@ func (h *stacklessCoroHost) run() {
 		}
 		state.stacklessCoroGState = *previous
 	}
-	previousDefer := state.deferTask
+	previousDefer := state.deferState
 	state.native = unsafe.Pointer(&state.blockingScheduler)
 	state.host = h
 	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		if state.blockingScheduler != nil || state.deferTask != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil {
+		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
 		gp.stacklessCoro = previous
@@ -320,12 +328,15 @@ func (h *stacklessCoroHost) driveThroughGoexit() {
 			s := h.scheduler
 			lock(&s.lock)
 			value, panicking := s.terminalValue(h.root)
+			trace := s.terminalTrace(h.root)
 			if h.root.terminal == stacklessCoroTerminalPanic && panicking {
 				h.root.terminal = stacklessCoroTerminalNone
 				s.clearTerminalValue(h.root)
+				s.clearExitTrace(h.root)
 				unlock(&s.lock)
-				panic(value)
+				raiseStacklessCoroPanic(value, trace)
 			}
+			s.clearExitTrace(h.root)
 			unlock(&s.lock)
 		}
 	}()
@@ -371,17 +382,18 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 	if state == nil || state.host != h {
 		throw("runtime: missing ordinary host call state")
 	}
-	oldDefer := state.deferTask
+	oldDefer := state.deferState
 	oldTask := state.activeTask
-	state.deferTask = nil
+	state.deferState = nil
 	state.activeTask = task
 	state.ordinaryDepth++
 	returned := false
 	defer func() {
 		var value any
+		var p *_panic
 		panicking, exiting := false, false
 		if !returned {
-			p := getg()._panic
+			p = getg()._panic
 			if p != nil && !p.goexit {
 				value, panicking = recover(), true
 			} else {
@@ -389,10 +401,10 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 			}
 		}
 		state.ordinaryDepth--
-		state.deferTask = oldDefer
+		state.deferState = oldDefer
 		state.activeTask = oldTask
 		if panicking {
-			recordStacklessCoroPanic(s, task, value, true)
+			recordStacklessCoroPanic(s, task, value, true, p)
 		}
 		lock(&s.lock)
 		if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {
@@ -400,6 +412,12 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 			throw("runtime: invalid stackless coroutine host return")
 		}
 		if exiting {
+			trace := captureStacklessCoroPanicTrace(task, p, 0, nil)
+			if trace != nil {
+				trace.goexit = true
+				p.coroTrace = trace
+			}
+			s.setExitTrace(task, trace)
 			task.terminal = stacklessCoroTerminalNone
 			s.clearTerminalValue(task)
 			task.goexit = true
