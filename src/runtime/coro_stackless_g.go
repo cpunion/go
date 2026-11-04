@@ -9,12 +9,18 @@ package runtime
 import "unsafe"
 
 type stacklessCoroGState struct {
-	native              unsafe.Pointer
-	deferTask           *stacklessCoroTask
-	deferTrace          *stacklessCoroPanicTrace
-	blockingScheduler   *stacklessCoroScheduler
-	pendingPanicTrace   *stacklessCoroPanicTrace
-	temporaryPanicTrace bool
+	native            unsafe.Pointer
+	deferState        *stacklessCoroDeferState
+	blockingScheduler *stacklessCoroScheduler
+}
+
+// Cold state lives behind the existing defer word. The native context embeds
+// stacklessCoroGState and must keep its established allocation size.
+type stacklessCoroDeferState struct {
+	task               *stacklessCoroTask
+	trace              *stacklessCoroPanicTrace
+	previous           *stacklessCoroDeferState
+	pending, temporary bool
 }
 
 type stacklessCoroG struct {
@@ -49,10 +55,10 @@ func (gp *g) stackIsFixed() bool {
 
 func stacklessCoroRecover(gp *g) any {
 	state := gp.stacklessCoro
-	if state == nil || state.deferTask == nil {
+	if state == nil || state.deferState == nil || state.deferState.task == nil {
 		return nil
 	}
-	return coroDeferRecover(unsafe.Pointer(state.deferTask))
+	return coroDeferRecover(unsafe.Pointer(state.deferState.task))
 }
 
 // stacklessCoroExitsyscallNoP publishes a native executor that could not

@@ -1548,7 +1548,7 @@ func (scope *stacklessCoroRunScope) leave() {
 		throw("runtime: active stackless coroutine blocking call after run")
 	}
 	if scope.temporary {
-		if scope.gp.stacklessCoro != scope.state || scope.state.deferTask != nil {
+		if scope.gp.stacklessCoro != scope.state || scope.state.deferState != nil {
 			throw("runtime: invalid stackless coroutine run state")
 		}
 		scope.gp.stacklessCoro = nil
@@ -3420,11 +3420,10 @@ func activeStacklessCoroDeferTask(token unsafe.Pointer,
 }
 
 type stacklessCoroDeferScope struct {
-	gp            *g
-	state         *stacklessCoroGState
-	previous      *stacklessCoroTask
-	previousTrace *stacklessCoroPanicTrace
-	temporary     bool
+	gp        *g
+	state     *stacklessCoroGState
+	previous  *stacklessCoroDeferState
+	temporary bool
 }
 
 func enterStacklessCoroDeferScope(task *stacklessCoroTask) stacklessCoroDeferScope {
@@ -3435,21 +3434,17 @@ func enterStacklessCoroDeferScope(task *stacklessCoroTask) stacklessCoroDeferSco
 		state = new(stacklessCoroGState)
 		gp.stacklessCoro = state
 	}
-	previous := state.deferTask
-	previousTrace := state.deferTrace
+	previous := state.deferState
 	s := task.context.scheduler
 	lock(&s.lock)
-	state.deferTrace = s.terminalTrace(task)
+	trace := s.terminalTrace(task)
 	unlock(&s.lock)
-	state.deferTask = task
-	return stacklessCoroDeferScope{
-		gp: gp, state: state, previous: previous, previousTrace: previousTrace, temporary: temporary,
-	}
+	state.deferState = &stacklessCoroDeferState{task: task, trace: trace}
+	return stacklessCoroDeferScope{gp: gp, state: state, previous: previous, temporary: temporary}
 }
 
 func (scope *stacklessCoroDeferScope) leave() {
-	scope.state.deferTask = scope.previous
-	scope.state.deferTrace = scope.previousTrace
+	scope.state.deferState = scope.previous
 	if scope.temporary {
 		scope.gp.stacklessCoro = nil
 	}

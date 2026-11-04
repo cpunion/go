@@ -295,12 +295,12 @@ func (h *stacklessCoroHost) run() {
 		}
 		state.stacklessCoroGState = *previous
 	}
-	previousDefer := state.deferTask
+	previousDefer := state.deferState
 	state.native = unsafe.Pointer(&state.blockingScheduler)
 	state.host = h
 	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		if state.blockingScheduler != nil || state.deferTask != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil {
+		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
 		gp.stacklessCoro = previous
@@ -380,9 +380,9 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 	if state == nil || state.host != h {
 		throw("runtime: missing ordinary host call state")
 	}
-	oldDefer := state.deferTask
+	oldDefer := state.deferState
 	oldTask := state.activeTask
-	state.deferTask = nil
+	state.deferState = nil
 	state.activeTask = task
 	state.ordinaryDepth++
 	returned := false
@@ -399,7 +399,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 			}
 		}
 		state.ordinaryDepth--
-		state.deferTask = oldDefer
+		state.deferState = oldDefer
 		state.activeTask = oldTask
 		if panicking {
 			recordStacklessCoroPanic(s, task, value, true, p)

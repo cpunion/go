@@ -61,8 +61,8 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 				return
 			}
 		}
-		if state := gp.stacklessCoro; state != nil && state.deferTask == task && state.deferTrace != nil {
-			trace.appendTrace(state.deferTrace)
+		if state := gp.stacklessCoro; state != nil && state.deferState != nil && state.deferState.task == task && state.deferState.trace != nil {
+			trace.appendTrace(state.deferState.trace)
 			return
 		}
 		pc, _ := walkStacklessCoroSourceTaskFrames(task, func(f funcInfo, pc uintptr) bool {
@@ -183,15 +183,15 @@ func raiseStacklessCoroPanic(value any, trace *stacklessCoroPanicTrace) {
 		state = new(stacklessCoroGState)
 		gp.stacklessCoro = state
 	}
-	if state.pendingPanicTrace != nil {
+	if state.deferState != nil && state.deferState.pending {
 		throw("runtime: duplicate pending coroutine panic trace")
 	}
-	state.pendingPanicTrace = trace
-	state.temporaryPanicTrace = temporary
+	pending := &stacklessCoroDeferState{trace: trace, previous: state.deferState, pending: true, temporary: temporary}
+	state.deferState = pending
 	defer func() {
-		if state.pendingPanicTrace == trace {
-			state.pendingPanicTrace = nil
-			state.temporaryPanicTrace = false
+		if state.deferState == pending {
+			state.deferState = pending.previous
+			pending.previous, pending.trace = nil, nil
 			if temporary {
 				gp.stacklessCoro = nil
 			}
@@ -203,14 +203,15 @@ func raiseStacklessCoroPanic(value any, trace *stacklessCoroPanicTrace) {
 func initStacklessCoroPanicTrace(p *_panic, pc uintptr) {
 	gp := getg()
 	state := gp.stacklessCoro
-	if p.goexit || state == nil || state.pendingPanicTrace == nil ||
+	if p.goexit || state == nil || state.deferState == nil || !state.deferState.pending ||
 		funcname(findfunc(pc)) != "runtime.raiseStacklessCoroPanic" {
 		return
 	}
-	p.coroTrace = state.pendingPanicTrace
-	state.pendingPanicTrace = nil
-	if state.temporaryPanicTrace {
-		state.temporaryPanicTrace = false
+	pending := state.deferState
+	p.coroTrace = pending.trace
+	state.deferState = pending.previous
+	pending.trace, pending.previous = nil, nil
+	if pending.temporary {
 		gp.stacklessCoro = nil
 	}
 }
