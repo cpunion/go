@@ -157,36 +157,48 @@ func appendStacklessCoroSourceFrames(u *unwinder, task *stacklessCoroTask, skip 
 func walkStacklessCoroSourceFrames(task *stacklessCoroTask, visit func(funcInfo, uintptr) bool) (uintptr, bool) {
 	var rootPC uintptr
 	for task != nil {
-		resume := stacklessCoroResumeIdentity(task.resume)
-		frame := task.context.frame
-		fused := task.hasFlag(stacklessCoroTaskFusedFrames)
-		for resume != nil {
-			f, pc := stacklessCoroResumeSourcePC(resume, frame)
-			if f.valid() {
-				rootPC = f.entry()
-				if !visit(f, pc) {
-					return rootPC, false
-				}
-			}
-			if !fused || frame == nil {
-				break
-			}
-			header := (*stacklessCoroFusedFrameHeader)(frame)
-			if header.parent == nil {
-				break
-			}
-			if header.marker&stacklessCoroFusedFrameResume != 0 {
-				resume = (*stacklessCoroFusedResumeFrameHeader)(frame).resume
-			}
-			frame = header.parent
-			// Self-await uses the same resume and gives every activation a
-			// header, including the root. Only a heterogeneous resume switch
-			// can point to a plain root without a header; its Parent bit says
-			// whether a further fused edge is present.
-			fused = header.marker&stacklessCoroFusedFrameResume == 0 ||
-				header.marker&stacklessCoroFusedFrameParent != 0
+		pc, complete := walkStacklessCoroSourceTaskFrames(task, visit)
+		if pc != 0 {
+			rootPC = pc
+		}
+		if !complete {
+			return rootPC, false
 		}
 		task = task.parent
+	}
+	return rootPC, true
+}
+
+func walkStacklessCoroSourceTaskFrames(task *stacklessCoroTask, visit func(funcInfo, uintptr) bool) (uintptr, bool) {
+	var rootPC uintptr
+	resume := stacklessCoroResumeIdentity(task.resume)
+	frame := task.context.frame
+	fused := task.hasFlag(stacklessCoroTaskFusedFrames)
+	for resume != nil {
+		f, pc := stacklessCoroResumeSourcePC(resume, frame)
+		if f.valid() {
+			rootPC = f.entry()
+			if !visit(f, pc) {
+				return rootPC, false
+			}
+		}
+		if !fused || frame == nil {
+			break
+		}
+		header := (*stacklessCoroFusedFrameHeader)(frame)
+		if header.parent == nil {
+			break
+		}
+		if header.marker&stacklessCoroFusedFrameResume != 0 {
+			resume = (*stacklessCoroFusedResumeFrameHeader)(frame).resume
+		}
+		frame = header.parent
+		// Self-await uses the same resume and gives every activation a
+		// header, including the root. Only a heterogeneous resume switch
+		// can point to a plain root without a header; its Parent bit says
+		// whether a further fused edge is present.
+		fused = header.marker&stacklessCoroFusedFrameResume == 0 ||
+			header.marker&stacklessCoroFusedFrameParent != 0
 	}
 	return rootPC, true
 }

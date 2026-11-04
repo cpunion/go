@@ -143,11 +143,19 @@ func coroHostDefer(ctx unsafe.Pointer, call func(any, bool, bool)) uint8 {
 // source function. Preserve a pending Goexit even when a new panic overlays it.
 func coroDeferInject(value any, panicking, exiting bool) {
 	if panicking {
+		var trace *stacklessCoroPanicTrace
+		if state := stacklessCoroHostState(getg()); state != nil && state.activeTask != nil {
+			task := state.activeTask
+			s := task.context.scheduler
+			lock(&s.lock)
+			trace = s.terminalTrace(task)
+			unlock(&s.lock)
+		}
 		if exiting {
-			defer func() { panic(value) }()
+			defer func() { raiseStacklessCoroPanic(value, trace) }()
 			Goexit()
 		}
-		panic(value)
+		raiseStacklessCoroPanic(value, trace)
 	}
 	if exiting {
 		Goexit()
@@ -320,11 +328,12 @@ func (h *stacklessCoroHost) driveThroughGoexit() {
 			s := h.scheduler
 			lock(&s.lock)
 			value, panicking := s.terminalValue(h.root)
+			trace := s.terminalTrace(h.root)
 			if h.root.terminal == stacklessCoroTerminalPanic && panicking {
 				h.root.terminal = stacklessCoroTerminalNone
 				s.clearTerminalValue(h.root)
 				unlock(&s.lock)
-				panic(value)
+				raiseStacklessCoroPanic(value, trace)
 			}
 			unlock(&s.lock)
 		}
@@ -379,9 +388,10 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 	returned := false
 	defer func() {
 		var value any
+		var p *_panic
 		panicking, exiting := false, false
 		if !returned {
-			p := getg()._panic
+			p = getg()._panic
 			if p != nil && !p.goexit {
 				value, panicking = recover(), true
 			} else {
@@ -392,7 +402,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 		state.deferTask = oldDefer
 		state.activeTask = oldTask
 		if panicking {
-			recordStacklessCoroPanic(s, task, value, true)
+			recordStacklessCoroPanic(s, task, value, true, p)
 		}
 		lock(&s.lock)
 		if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {

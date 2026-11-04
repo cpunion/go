@@ -4312,17 +4312,30 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	positions := make([]src.XPos, len(states))
 	for i := range positions {
 		positions[i] = pos
+		if states[i].panicValue != nil {
+			positions[i] = states[i].panicValue.Pos()
+		}
 	}
 	awaitPCs := make(map[int]int)
 	for i, state := range states {
-		if state.transition != SiteAwait {
+		var sourcePos src.XPos
+		switch state.transition {
+		case SiteAwait:
+			sourcePos = state.call.Pos()
+		case SiteChannel:
+			if state.channel != nil {
+				sourcePos = state.channel.node.Pos()
+			} else {
+				sourcePos = state.statement.Pos()
+			}
+		default:
 			continue
 		}
 		awaitPCs[i] = len(states)
 		states = append(states, lowerState{
 			next: state.next, thenState: -1, elseState: -1,
 		})
-		positions = append(positions, state.call.Pos())
+		positions = append(positions, sourcePos)
 	}
 	recordSourceResume(resume, fn, resumePC, positions)
 	labels := make([]*types.Sym, len(states))
@@ -4534,7 +4547,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					ir.PkgFuncName(fn), i)
 			}
 			body = append(body,
-				typecheck.Call(pos, typecheck.LookupRuntime("coroPanic"),
+				assignResumePC(i),
+				typecheck.Call(state.panicValue.Pos(), typecheck.LookupRuntime("coroPanic"),
 					ir.Nodes{ctx, edit(state.panicValue)}, false),
 				assignResumePC(state.next),
 				gotoState(state.next),

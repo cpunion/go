@@ -8,6 +8,10 @@ package runtime
 
 type stacklessCoroTracebackState struct{}
 
+type stacklessCoroPanicState struct{}
+
+func initStacklessCoroPanicTrace(*_panic, uintptr) {}
+
 func stacklessCoroTracebackText(*unwinder, *stacklessCoroTracebackState, bool, bool, func() (bool, bool)) (bool, bool) {
 	return false, false
 }

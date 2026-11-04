@@ -1123,6 +1123,7 @@ type _defer struct {
 type _panic struct {
 	arg  any     // argument to panic
 	link *_panic // link to earlier panic
+	stacklessCoroPanicState
 
 	// startPC and startSP track where _panic.start was called.
 	// (These are the SP and PC of the gopanic frame itself.)

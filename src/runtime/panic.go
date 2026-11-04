@@ -899,6 +899,7 @@ func (p *_panic) start(pc uintptr, sp unsafe.Pointer) {
 	// to jump past it.
 	p.startPC = sys.GetCallerPC()
 	p.startSP = unsafe.Pointer(sys.GetCallerSP())
+	initStacklessCoroPanicTrace(p, pc)
 
 	if p.deferreturn {
 		p.sp = sp
