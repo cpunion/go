@@ -44,6 +44,9 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 		}
 	}
 	if state.afterDriver {
+		if funcname(f) == "runtime.coroRun" {
+			return true, false
+		}
 		state.afterDriver = false
 		if source.valid() && source.entry() == state.rootPC {
 			return true, false

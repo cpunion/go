@@ -5178,6 +5178,8 @@ projection expands at that driver and preserves the existing first/last-frame
 counting and elision rules. Public roots retain their ordinary caller suffix;
 independent roots do not acquire a creator activation chain. Physical GC,
 panic recovery and runtime-failure tracebacks keep their existing unwinder.
+Closure-shaped public entries include a `coroRun` adapter above `coroRunFrame`;
+the duplicate-root check spans that adapter before consuming the source entry.
 
 The regression covers native channel send and receive, public and independent
 hosts, shallow and deep source chains, return/panic/Goexit cleanup, live-frame

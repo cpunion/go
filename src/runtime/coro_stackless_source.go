@@ -251,6 +251,11 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 			}
 		}
 		if afterDriver {
+			if funcname(f) == "runtime.coroRun" {
+				// Closure-shaped public entries add this adapter between
+				// coroRunFrame and the already-projected source root.
+				continue
+			}
 			afterDriver = false
 			if source.valid() && source.entry() == rootPC {
 				continue
