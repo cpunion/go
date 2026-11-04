@@ -5149,8 +5149,9 @@ do not inherit their creator's activation chain, and completion through return,
 panic recovery or Goexit releases the user-goroutine count. This classification
 does not add a task registry or change physical stack scanning.
 
-Pure-native tasks with no ordinary host, creation ancestry and full native
-trace and profile integration remain separate work. Performance is deferred.
+Independent tasks without hosts are enumerated by the logical registry below.
+Full native trace and profile integration remain separate work. Performance is
+deferred.
 
 Open `go` lowering uses the same saved, validated operand-wrapper target as
 closed factory dispatch. Closure reparenting changes the wrapper's capture
@@ -5196,7 +5197,50 @@ checking incoming panic/Goexit chains and the cleanup source line at both waits.
 The regression covers native channel send and receive, public and independent
 hosts, shallow and deep source chains, return/panic/Goexit cleanup, live-frame
 GC roots and finalizer release. Native-only one-PC profiles check that capacity
-is applied after removing the private receive. This covers allocated hosts;
-pure-native tasks without hosts, creation ancestry and complete native
-profiling, trace and race support remain separate work. The cold host allocation
-cost and broader performance work are deferred.
+is applied after removing the private receive. This projection covers allocated
+hosts; the logical registry below handles independent tasks before host
+allocation. Complete native profiling, trace and race support remain separate
+work. The cold host allocation cost and broader performance work are deferred.
+
+### Enumerating independent tasks before host allocation
+
+Each independent native `go` statement registers a typed logical-goroutine
+record before publishing its child. The record owns its stable Go ID, creator
+position, inherited labels, optional creation ancestors and current source
+leaf. Structured awaits change the leaf without adding goroutines. Completion
+updates the leaf or removes the independent root before recycling its frames;
+completed records and their user labels are not cached. The registry uses a
+runtime mutex and typed buckets, with scheduler-to-registry lock ordering. It
+does not use Go maps or user synchronization and does not enlarge task, frame
+or native-context layouts.
+
+`NumGoroutine` includes unhosted independent tasks. `Stack(all=true)` and both
+goroutine-profile implementations copy their source stacks during the initial
+stop-the-world interval. Profiles retain the caller-buffer contract, inherited
+labels and configured PC depth; text retains the 50/50 elision window. The
+running owner's physical resume position refines the active source leaf.
+Uncached fused-frame transitions disable preemption while publishing matching
+frame, resume and parent links, so a stopped-world reader sees a complete
+chain. Fatal signal tracebacks and physical GC/recovery scanning do not walk
+this registry.
+
+Host creation registers a pending transfer keyed by its synchronous creator
+and stable host-entry closure. `newproc1` installs the logical Go ID, creator
+and labels before publishing the G or emitting its ordinary `GoCreate` event;
+it does not depend on closure-environment layout. It removes the unhosted count
+in the same non-preemptible interval. A host created after a concurrent
+profile's initial snapshot is already satisfied by that logical record, so
+promotion cannot add a duplicate record. Promotion is not another source go
+statement and does not increment the created-goroutine metric again.
+
+The `/sched/coro/goroutines/unhosted:goroutines` metric reports independent live
+tasks without ordinary stacks, and is zero with the experiment disabled.
+Native-dispatch regressions subtract this value from the logical goroutine
+count when checking ordinary-stack allocation; their original limits remain
+unchanged. Separate semantic regressions require the full logical count,
+stable IDs across promotion, source creation and suspension lines, labels,
+deep chains, undersized profile behavior, and frame release after return,
+recovered panic and Goexit. Complete public-root source projection, native
+execution tracing, CPU profiles and native-task race instrumentation still
+require additional integration. Registry allocation and scheduling costs have
+not been optimized.

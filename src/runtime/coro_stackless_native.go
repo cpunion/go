@@ -1086,6 +1086,13 @@ func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 	return (*stacklessCoroNativeContext)(state.native)
 }
 
+func stacklessCoroPublicCaller(gp *g) *g {
+	if ctx := stacklessCoroNativeContextFor(gp); ctx != nil && ctx.public {
+		return ctx.caller
+	}
+	return gp
+}
+
 //go:nosplit
 func stacklessCoroNativeSchedulerFor(gp *g) *stacklessCoroScheduler {
 	ctx := stacklessCoroNativeContextFor(gp)

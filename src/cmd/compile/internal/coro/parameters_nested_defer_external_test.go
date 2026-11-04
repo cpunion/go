@@ -15,6 +15,7 @@ import (
 
 func TestClosedParameterNestedDefer(t *testing.T) {
 	const source = `package main
+import "runtime/metrics"
 import ("runtime";"runtime/debug")
 type state struct {trace []int}
 func record(p *state,n int) {p.trace=append(p.trace,n)}
@@ -44,12 +45,22 @@ func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
  p:=new(state);repeated(p);if arguments!=4 {panic("argument count")}
  equal(p,14,206,205,204,104,3,205,204,203,103,12,204,203,202,102,1,203,202,201,101)
- baseline:=runtime.NumGoroutine();ready,gate:=make(chan int,128),make(chan struct{});ps:=make([]*state,128);ds:=make([]chan struct{},128)
+ baseline:=ordinaryGoroutines();ready,gate:=make(chan int,128),make(chan struct{});ps:=make([]*state,128);ds:=make([]chan struct{},128)
  for i:=range 128 {p,done:=new(state),make(chan struct{});ps[i],ds[i]=p,done;start(p,ready,gate,done)}
- for range 128 {<-ready};if native && runtime.NumGoroutine()>baseline+12 {panic("ordinary nested cleanup tasks")};runtime.GC();close(gate)
+ for range 128 {<-ready};if native && ordinaryGoroutines()>baseline+12 {panic("ordinary nested cleanup tasks")};runtime.GC();close(gate)
  for i:=range 128 {<-ds[i];equal(ps[i],7,209,208,207,107)}
  println("switch-return-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	testSwitchReturnProgram(t, source, nil, []string{"repeated", "parked", "start"})
 }
 

@@ -16,6 +16,7 @@ import (
 func TestWaitGroupGo(t *testing.T) {
 	const source = `package main
 import (
+ "runtime/metrics"
  "runtime"
  "runtime/debug"
  "sync"
@@ -81,13 +82,13 @@ func main() {
  native:=false
  if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
  ready,gate=make(chan int,128),make(chan struct{})
- baseline:=runtime.NumGoroutine()
+ baseline:=ordinaryGoroutines()
  finished:=make(chan struct{})
  go func(){spawn();close(finished)}()
  <-finished
  var seen [128]bool
  for range 128 {n:=<-ready;if n<0 || n>=128 || seen[n] {panic("callback identity")};seen[n]=true}
- if native && runtime.NumGoroutine()>baseline+16 {panic("WaitGroup.Go retained ordinary goroutines")}
+ if native && ordinaryGoroutines()>baseline+16 {panic("WaitGroup.Go retained ordinary goroutines")}
  runtime.GC();close(gate);group.Wait()
  for i,n:=range values {if n!=i+1 {panic("callback completion or GC")}}
  mixed(false);group.Wait();if values[0]!=99 {panic("plain callback")}
@@ -114,6 +115,16 @@ func main() {
  go func(){runtime.Gosched();values[2]=9;group.Done()}()
  group.Wait();if values[2]!=9 {panic("ordinary interoperability")}
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	fallback := []switchFallback{

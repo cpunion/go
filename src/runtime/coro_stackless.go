@@ -1591,6 +1591,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
 		}
+		stacklessCoroClearLogicalOwner(task)
 		p := getg()._panic
 		if p == nil || p.goexit {
 			return
@@ -1654,7 +1655,9 @@ resume:
 	// iteration would repeat two pointer write barriers while no other executor
 	// can observe or resume this task.
 resumeActive:
+	stacklessCoroSetLogicalLeaf(task, getg())
 	action := task.resume(unsafe.Pointer(&task.context))
+	stacklessCoroClearLogicalOwner(task)
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
 		hostYieldCheck++
@@ -2298,10 +2301,13 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 			next = parentHeader.marker&^stacklessCoroFusedFrameAllocationMask |
 				stacklessCoroFusedFrameChunkFirst
 		}
+		// STW source enumeration must see either complete frame chain.
+		mp := acquirem()
 		childHeader.marker = next
 		childHeader.parent = context.frame
 		context.frame = frame
 		parent.setFlag(stacklessCoroTaskFusedFrames, true)
+		releasem(mp)
 		if s.runnableState.Load() == 0 {
 			if !localSwitch {
 				parent.setFlag(stacklessCoroTaskSwitchPending, true)
@@ -2390,11 +2396,13 @@ func coroCompleteSelfFrame(ctx unsafe.Pointer, localSwitch bool) uint8 {
 		}
 		allocation := header.marker & stacklessCoroFusedFrameAllocationMask
 		parentFrame := header.parent
+		mp := acquirem()
 		header.parent = nil
 		header.marker = 0
 		context.frame = parentFrame
 		parentHeader := (*stacklessCoroFusedFrameHeader)(parentFrame)
 		task.setFlag(stacklessCoroTaskFusedFrames, parentHeader.parent != nil)
+		releasem(mp)
 		if (allocation >= stacklessCoroFusedFrameDirectFirst &&
 			allocation <= stacklessCoroFusedFrameDirectLast) ||
 			allocation == stacklessCoroFusedFrameChunkFirst {
@@ -2708,6 +2716,9 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 					allocation == stacklessCoroFusedFrameChunkLastFor(parentHeader.marker) {
 					next = stacklessCoroFusedFrameChunkFirst
 				}
+				// Publish the new frame and its matching resume together to
+				// stop-the-world logical stack readers.
+				mp := acquirem()
 				header.resume = stacklessCoroResumeIdentity(parent.resume)
 				header.marker = next | stacklessCoroFusedFrameParent |
 					stacklessCoroFusedFrameResume |
@@ -2717,6 +2728,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 				context.frame = frame
 				parent.resume = child
 				parent.flags &^= stacklessCoroTaskFusedPending | stacklessCoroTaskFusedChunk
+				releasem(mp)
 				// The executing task owns these links. Match local self-await and
 				// fused completion's fairness snapshot without reading the queue.
 				if s.runnableState.Load() == 0 {
@@ -2935,6 +2947,9 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 // the saved resume, when present. Cached holders are recycled separately.
 func restoreStacklessCoroFusedParent(context *stacklessCoroContext,
 	task *stacklessCoroTask, header *stacklessCoroFusedFrameHeader) {
+	// The uncached caller does not hold s.lock. A stopped-world profiler
+	// must not pair the parent's resume with the child's old frame.
+	mp := acquirem()
 	parentFrame := header.parent
 	parentFused := header.marker&stacklessCoroFusedFrameParent != 0
 	if header.marker&stacklessCoroFusedFrameResume != 0 {
@@ -2947,6 +2962,7 @@ func restoreStacklessCoroFusedParent(context *stacklessCoroContext,
 	header.marker = 0
 	context.frame = parentFrame
 	task.setFlag(stacklessCoroTaskFusedFrames, parentFused)
+	releasem(mp)
 }
 
 // discardFusedFramesLocked drops every fused child after a terminal outcome.
@@ -3757,6 +3773,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		task.setFlag(stacklessCoroTaskTypedSpawn, true)
 	}
 	s.liveSpawns++
+	s.registerGoroutineLocked(task, parent, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
 	runnable := s.readyLocked(task)
 	// Give ready children an execution opportunity before a producer grows
@@ -4433,6 +4450,7 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 		s.initialRootPrivate = false
 	}
 	task.state = stacklessCoroTaskRunnable
+	stacklessCoroSetLogicalLeaf(task, nil)
 	task.next = nil
 	if h := s.taskHostLocked(task); h != nil {
 		if raceenabled {
@@ -4651,6 +4669,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		throw("runtime: invalid stackless coroutine completion")
 	}
 	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
@@ -4712,6 +4731,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine termination")
 	}
 	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
@@ -4769,6 +4789,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		throw("runtime: invalid stackless coroutine Goexit termination")
 	}
 	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}

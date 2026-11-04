@@ -50,6 +50,7 @@ func CoroNotifyAdd(c *Cond) uint32 { return runtime_notifyListAdd(&c.notify) }
 	const controller = `package sync_test
 
 import (
+ "runtime/metrics"
  "runtime"
  "sync"
  "testing"
@@ -65,10 +66,10 @@ func TestCoroNotifyEntry(t *testing.T) {
   c.Signal()
   sync.CoroNotifyWait(c, ticket)
   ready, done := make(chan struct{}, 128), make(chan struct{}, 128)
-  baseline := runtime.NumGoroutine()
+  baseline := ordinaryGoroutines()
   sync.CoroNotifySpawn(c, ready, done)
   for i := 0; i < 128; i++ { <-ready }
-  if NATIVE && runtime.NumGoroutine() > baseline+8 {
+  if NATIVE && ordinaryGoroutines() > baseline+8 {
    t.Fatal("logical notification waiters created ordinary goroutines")
   }
   runtime.GC()
@@ -103,6 +104,16 @@ func TestCoroNotifyBubble(t *testing.T) {
   sync.CoroNotifyWait(c, ticket)
   if time.Since(start) != time.Hour { t.Fatal("lost bubble wait accounting") }
  })
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	for _, config := range []struct {

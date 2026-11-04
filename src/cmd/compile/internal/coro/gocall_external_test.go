@@ -21,6 +21,7 @@ func TestGoCallArguments(t *testing.T) {
 	}
 	const program = `package main
 import (
+ "runtime/metrics"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -58,11 +59,11 @@ func spawn(n int) {
 func launch() { spawn(count); close(finished) }
 
 func main() {
-	before := runtime.NumGoroutine()
+	before := ordinaryGoroutines()
 	go launch()
 	for atomic.LoadUint64(&ready) < count { runtime.Gosched() }
 	runtime.GC()
-	if os.Getenv("EXPECT_NATIVE") == "1" && runtime.NumGoroutine() > before+16 {
+	if os.Getenv("EXPECT_NATIVE") == "1" && ordinaryGoroutines() > before+16 {
 		panic("go argument wrapper retained ordinary goroutines")
 	}
 	atomic.StoreUint64(&release, 1)
@@ -72,6 +73,16 @@ func main() {
 		if result != 18+i { panic("argument snapshot or pointer root") }
 	}
 	println("go-call-arguments-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	source := filepath.Join(t.TempDir(), "main.go")

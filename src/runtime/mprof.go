@@ -1391,7 +1391,15 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		labels[0] = ourg.labels
 	}
 	ourg.goroutineProfiled.Store(goroutineProfileSatisfied)
-	goroutineProfile.offset.Store(1)
+	logical := 0
+	systemstack(func() {
+		var logicalLabels []unsafe.Pointer
+		if labels != nil {
+			logicalLabels = labels[1:]
+		}
+		logical = stacklessCoroGoroutineProfile(p[1:], logicalLabels)
+	})
+	goroutineProfile.offset.Store(1 + int64(logical))
 
 	// Prepare for all other goroutines to enter the profile. Aside from ourg,
 	// every goroutine struct in the allgs list has its goroutineProfiled field
@@ -1583,7 +1591,7 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 	stw := stopTheWorld(stwGoroutineProfile)
 
 	// World is stopped, no locking required.
-	n = 1
+	n = 1 + int(stacklessCoroUnhostedGoroutines())
 	forEachGRace(func(gp1 *g) {
 		if isOK(gp1) {
 			n++
@@ -1606,6 +1614,12 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 		if labels != nil {
 			lbl[0] = gp.labels
 			lbl = lbl[1:]
+		}
+		logical := 0
+		systemstack(func() { logical = stacklessCoroGoroutineProfile(r, lbl) })
+		r = r[logical:]
+		if lbl != nil {
+			lbl = lbl[logical:]
 		}
 
 		// Save other goroutines.
@@ -1711,6 +1725,7 @@ func Stack(buf []byte, all bool) int {
 			traceback(pc, sp, 0, gp)
 			if all {
 				tracebackothers(gp)
+				stacklessCoroTracebackGoroutines()
 			}
 			g0.m.traceback = 0
 			n = len(g0.writebuf)

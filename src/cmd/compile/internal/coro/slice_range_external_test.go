@@ -183,7 +183,8 @@ func main(){
 
 func TestSliceRangeSpawn(t *testing.T) {
 	const source = `package main
-import ("runtime";"runtime/debug")
+import (
+ "runtime/metrics""runtime";"runtime/debug")
 type box struct {n int}
 func child(p *box,ready chan int,gate chan struct{},done chan int) {ready<-p.n;<-gate;runtime.Gosched();done<-p.n}
 func spawn(values []*box,ready chan int,gate chan struct{},done chan int) {
@@ -193,12 +194,22 @@ func main(){
  values:=make([]*box,128);for i:=range values {values[i]=&box{i}}
  ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine();spawn(values,ready,gate,done);values=nil
+ baseline:=ordinaryGoroutines();spawn(values,ready,gate,done);values=nil
  sum:=0;for range 128 {sum+=<-ready};if sum!=8128 {panic("range go operands")}
- if native && runtime.NumGoroutine()>baseline+8 {panic("ordinary slice tasks")}
+ if native && ordinaryGoroutines()>baseline+8 {panic("ordinary slice tasks")}
  runtime.GC();close(gate);sum=0;for range 128 {sum+=<-done};if sum!=8128 {panic("spawned element lifetime")}
  println("switch-return-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	testSwitchReturnProgram(t, source, nil, []string{"spawn", "child"})
 }
 

@@ -14,6 +14,7 @@ func TestIOCancellation(t *testing.T) {
 	const source = `package main
 
 import (
+ "runtime/metrics"
 	"errors"
 	"fmt"
 	"os"
@@ -68,7 +69,7 @@ func batch(round int, deadline bool) {
 	ready := make(chan int, count)
 	out := make(chan reply, count)
 	finished := make(chan struct{})
-	before := runtime.NumGoroutine()
+	before := ordinaryGoroutines()
 	go func() { readBatch(readers, buffers, ready, out); close(finished) }()
 	seen := make([]bool, count)
 	for range count {
@@ -88,8 +89,8 @@ func batch(round int, deadline bool) {
 	if len(out) != 0 {
 		panic("empty pipe read completed before cancellation")
 	}
-	if native == "1" && runtime.NumGoroutine()-before > 24 {
-		panic(fmt.Sprintf("native batch allocated ordinary workers: before=%d during=%d", before, runtime.NumGoroutine()))
+	if native == "1" && ordinaryGoroutines()-before > 24 {
+		panic(fmt.Sprintf("native batch allocated ordinary workers: before=%d during=%d", before, ordinaryGoroutines()))
 	}
 	runtime.GC()
 	for i, file := range readers {
@@ -204,6 +205,16 @@ func main() {
   }
  }
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	testSwitchReturnProgram(t, source, nil, []string{"readPipe", "readBatch"})
