@@ -1,254 +1,61 @@
-name: Coroutine compiler
-
+name: Coroutine logical task enumeration exact source
 on:
-  pull_request:
-    branches:
-      - coro/main
-  push:
-    branches:
-      - coro/main
   workflow_dispatch:
-    inputs:
-      benchmarks:
-        description: Collect observational native Linux benchmarks after tests
-        type: boolean
-        required: false
-        default: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: coro-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  GOTOOLCHAIN: local
-
+  actions: read
 jobs:
-  focused:
-    name: Focused (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-15
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      - name: Install bootstrap Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: 1.26.5
-          cache: false
-
-      - name: Select bootstrap GOROOT
-        shell: bash
-        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-
-      - name: Build default toolchain
-        working-directory: src
-        run: ./make.bash
-
-      - name: Test default compiler and runtime
-        run: >-
-          ./bin/go test -count=1 -timeout=20m
-          cmd/compile/...
-          cmd/cgo
-          cmd/go/internal/work
-          go/build
-          internal/pkgbits
-          internal/buildcfg
-          runtime
-
-      - name: Test default coroutine architecture probes
-        working-directory: src/cmd/compile/testdata/corobench
-        env:
-          GO111MODULE: off
-        run: ../../../../../bin/go test -count=1 -cover
-
-      - name: Build coroutine experiment toolchain
-        working-directory: src
-        env:
-          GOEXPERIMENT: coro
-        run: ./make.bash
-
-      - name: Test coroutine compiler and runtime
-        env:
-          GOEXPERIMENT: coro
-        run: >-
-          ./bin/go test -count=1 -timeout=20m
-          cmd/compile/...
-          cmd/cgo
-          cmd/go/internal/work
-          go/build
-          internal/pkgbits
-          internal/buildcfg
-          runtime
-
-      - name: Compile coroutine 386 layout contracts
-        env:
-          GOEXPERIMENT: coro
-          GOOS: linux
-          GOARCH: '386'
-          CGO_ENABLED: '0'
-        run: ./bin/go test -c -o "$RUNNER_TEMP/runtime-linux386.test" runtime
-
-      - name: Test host fairness without asynchronous preemption
-        env:
-          GOEXPERIMENT: coro
-          GODEBUG: asyncpreemptoff=1
-        run: >-
-          ./bin/go test -count=100 runtime
-          -run '^TestStacklessCoro(Queued)?YieldRunsOrdinaryGoroutine$'
-
-      - name: Test push and pull comparison
-        env:
-          GOEXPERIMENT: coro
-        run: |
-          ./bin/go test -tags=coropullcompare -count=1 -cover \
-            runtime -run '^TestStacklessCoro'
-          ./bin/go test -race -tags=coropullcompare -count=1 \
-            runtime -run '^TestStacklessCoroPushPull'
-
-      - name: Test coroutine architecture probes
-        working-directory: src/cmd/compile/testdata/corobench
-        env:
-          GO111MODULE: off
-          GOEXPERIMENT: coro
-        run: ./check.bash "$GITHUB_WORKSPACE" "$RUNNER_TEMP/corobench"
-
-      - name: Test coroutine heap-link lock ranks
-        env:
-          GOEXPERIMENT: coro,staticlockranking
-          GODEBUG: asyncpreemptoff=1
-          GOGC: 1
-        shell: bash
-        run: |
-          out="$RUNNER_TEMP/corobench/static-lockrank"
-          mkdir -p "$out"
-          ./bin/go test -c -o "$out/runtime.test" runtime
-          ./bin/go version -m "$out/runtime.test" > "$out/version.txt"
-          pattern='^TestStacklessCoro(WriteBarrierLockRanks|Compact.*|CompletedTaskCache.*|ScalarTaskCache.*|TypedTaskFrames|TypedTaskFrameInvalidType|FrameCache|NetpollReadyAccounting|SchedulerSize|OperationSize|TaskSize|IOOriginImmediateChannel|TimerOwnerReuse|SelectStorageCache|SelectOperationReuse|OperationReuse|ChannelImmediateWaiterCleanup|ChannelOperationRootingModes|Native(PoolGrowthAndReuse|SchedulerDescriptorReuse|SchedulerRuntimeWork))$'
-          for procs in 1 4; do
-            GOMAXPROCS=$procs "$out/runtime.test" -test.v -test.run="$pattern" \
-              -test.count=10 -test.timeout=10m > "$out/p$procs.log" 2>&1
-            cat "$out/p$procs.log"
-          done
-
-      - name: Upload coroutine architecture probe audit
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: corobench-${{ matrix.os }}
-          path: ${{ runner.temp }}/corobench
-          if-no-files-found: error
-
-      - name: Test transparent cgo direct calls
-        env:
-          GOEXPERIMENT: coro
-        run: |
-          ./bin/go test -count=1 cmd/go -run '^TestScript/cgo_coro_direct_metadata$'
-          ./bin/go test -count=1 internal/runtime/cgobench \
-            -gcflags=internal/runtime/cgobench='-l -d=coro=4'
-
-      - name: Test coroutine operation races
-        env:
-          GOEXPERIMENT: coro
-        run: ./bin/go test -race -count=1 runtime -run '^TestStacklessCoro'
-
-  native-full:
-    name: Native all.bash (Linux)
-    if: github.event_name != 'pull_request'
+  native-task-enumeration:
+    name: Exact-source logical task enumeration (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      - name: Install bootstrap Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: 1.26.5
-          cache: false
-
-      - name: Select bootstrap GOROOT
-        shell: bash
-        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-
-      - name: Run native full test suite
-        working-directory: src
-        env:
-          # Source-oracle compiler tests share the all.bash package deadline.
-          GO_TEST_TIMEOUT_SCALE: '2'
-        run: ./all.bash
-
-  native-benchmarks:
-    name: Native benchmark collection (Linux)
-    if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
-    needs:
-      - focused
-      - native-full
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    steps:
-      - name: Check out source and history
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Install bootstrap Go
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 1.26.5
           cache: false
-
-      - name: Select bootstrap and exact upstream baseline
-        shell: bash
+      - name: Restore exact source and validation inputs
         run: |
-          echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-          git config --local core.abbrev 10
-          git fetch --no-tags https://go.googlesource.com/go \
-            master:refs/remotes/upstream/master
-          baseline=$(git merge-base HEAD upstream/master)
-          git worktree add --detach "$RUNNER_TEMP/go-baseline" "$baseline"
-
-      - name: Build exact upstream default toolchain
-        shell: bash
+          python3 - <<'PYINPUT'
+          import base64,hashlib,io,tarfile
+          data=base64.b64decode('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')
+          assert hashlib.sha256(data).hexdigest()=='ebd04e83b200cf88455bdfdf579d22ce653f0d8d302b7251092f5d1bf459be43'
+          with tarfile.open(fileobj=io.BytesIO(data)) as t:t.extractall('.',filter='data')
+          PYINPUT
+          git worktree add --detach "$RUNNER_TEMP/fixed" 9bd89522931de4bc36bb64a9fc098f53ceb04ba3
+          mkdir -p native-output
+      - name: Build genuine exact-source SDK
+        id: build
         run: |
-          cd "$RUNNER_TEMP/go-baseline/src"
-          GOEXPERIMENT='' ./make.bash
-
-      - name: Build coroutine experiment toolchain
-        working-directory: src
-        env:
-          GOEXPERIMENT: coro
-        run: ./make.bash
-
-      - name: Collect frozen native binaries
-        working-directory: src/cmd/compile/testdata/corobench
-        env:
-          UPSTREAM_REF: upstream/master
-        shell: bash
-        run: |
-          ./collect.bash "$RUNNER_TEMP/go-baseline" "$GITHUB_WORKSPACE" \
-            "$RUNNER_TEMP/native-corobench"
-
-      - name: Upload all raw measurements and receipts
+          export GOROOT_BOOTSTRAP=$(go env GOROOT)
+          cd "$RUNNER_TEMP/fixed/src"
+          GOEXPERIMENT=coro GOMAXPROCS=4 GOFLAGS=-p=4 GOGC=100 ./make.bash > "$GITHUB_WORKSPACE/native-output/make.log" 2>&1
+      - name: Freeze genuine SDK before tests
+        id: freeze
         if: always()
-        uses: actions/upload-artifact@v7
+        env:
+          CORO_BUILD_OUTCOME: ${{ steps.build.conclusion }}
+        run: python3 native-inputs/export.py "$RUNNER_TEMP/fixed" "$GITHUB_WORKSPACE/native-output/frozen/linux"
+      - name: Compiler runtime maps pprof trace and repeated nil-Goexit regression
+        run: python3 native-inputs/matrix.py "$RUNNER_TEMP/fixed" "$GITHUB_WORKSPACE/native-output/matrix"
+      - name: Restore archived source and SDK and compile fresh semantic replay
+        run: python3 native-inputs/replay.py "$GITHUB_WORKSPACE/native-output" "$RUNNER_TEMP/restored-sdk"
+      - name: Export original run identity
+        if: always()
+        run: |
+          python3 - <<'PYMETA'
+          import json,os
+          from pathlib import Path
+          names=['GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_SHA','GITHUB_REF','RUNNER_OS','RUNNER_ARCH']
+          d=Path('native-output');d.mkdir(exist_ok=True)
+          (d/'identity.json').write_text(json.dumps({n:os.environ.get(n) for n in names},indent=2)+'\n')
+          PYMETA
+      - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          name: native-corobench-linux
-          path: ${{ runner.temp }}/native-corobench
-          if-no-files-found: error
+          name: coro-task-enumeration-validation
+          path: native-output
+          retention-days: 7
