@@ -136,6 +136,7 @@ func main(){
 func TestClosedParameterParked(t *testing.T) {
 	const source = `package main
 import (
+ "runtime/metrics"
  "runtime"
  "runtime/debug"
 )
@@ -149,13 +150,23 @@ func spawn(ready chan int,gate chan struct{},done chan int) {for n:=range 128 {g
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
  ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
- baseline:=runtime.NumGoroutine();finished:=make(chan struct{})
+ baseline:=ordinaryGoroutines();finished:=make(chan struct{})
  go func(){spawn(ready,gate,done);close(finished)}();<-finished
  var seen [128]bool
  for range 128 {n:=<-ready;if n<0 || n>=128 || seen[n] {panic("parameter child argument")};seen[n]=true}
- if native && runtime.NumGoroutine()>baseline+12 {panic("closed parameter await used ordinary goroutines")}
+ if native && ordinaryGoroutines()>baseline+12 {panic("closed parameter await used ordinary goroutines")}
  runtime.GC();close(gate);total:=0;for range 128 {total+=<-done};if total!=8192 {panic("parameter parked task result")}
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	testSwitchReturnProgram(t, source, nil, []string{"worker", "spawn"})
@@ -164,6 +175,7 @@ func main(){
 func TestClosedParameterWaitGroupGo(t *testing.T) {
 	const source = `package main
 import (
+ "runtime/metrics"
  "runtime"
  "runtime/debug"
  "sync"
@@ -178,12 +190,22 @@ func apply(wg *sync.WaitGroup,f func()) {wg.Go(f)}
 func spawn(which bool) {f:=first;if which {f=second};apply(&group,f)}
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine()
+ baseline:=ordinaryGoroutines()
  for n:=range 128 {spawn(n%2!=0)}
  total:=0;for range 128 {total+=<-ready};if total!=192 {panic("parameter WaitGroup.Go target")}
- if native && runtime.NumGoroutine()>baseline+12 {panic("parameter WaitGroup.Go fell back")}
+ if native && ordinaryGoroutines()>baseline+12 {panic("parameter WaitGroup.Go fell back")}
  runtime.GC();close(gate);group.Wait()
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	testSwitchReturnProgram(t, source, nil, []string{"spawn"})
@@ -192,6 +214,7 @@ func main(){
 func TestClosedParameterOperations(t *testing.T) {
 	const source = `package main
 import (
+ "runtime/metrics"
  "runtime"
  "runtime/debug"
 )
@@ -217,13 +240,23 @@ func applyRecover(f func()) {defer f();runtime.Gosched();panic("parameter-defer-
 func recovering(which bool) {f:=recoverA;if which {f=recoverB};applyRecover(f)}
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine();for n:=range 128 {spawn(n%2!=0)}
+ baseline:=ordinaryGoroutines();for n:=range 128 {spawn(n%2!=0)}
  total:=0;for range 128 {total+=<-ready};if total!=192 {panic("parameter go target")}
- if native && runtime.NumGoroutine()>baseline+12 {panic("parameter go fell back")}
+ if native && ordinaryGoroutines()>baseline+12 {panic("parameter go fell back")}
  runtime.GC();close(gate);total=0;for range 128 {total+=<-done};if total!=192 {panic("parameter go completion")}
  deferred(false);if trace!=31 {panic("parameter deferred call")};trace=0;deferred(true);if trace!=32 {panic("parameter deferred selection")}
  recovering(false);if recovered!="parameter-defer-panic" {panic("parameter direct recover")};recovered=nil;recovering(true);if recovered!="parameter-defer-panic" {panic("parameter recover selection")}
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	testSwitchReturnProgram(t, source, nil, []string{"spawn", "deferred", "recovering"})

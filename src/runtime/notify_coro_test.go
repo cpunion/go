@@ -238,7 +238,7 @@ func testStacklessCoroNotifySiblings(t *testing.T) {
 	const count = 128
 	var list runtime.NotifyListStacklessCoroForTest
 	done := make(chan struct{})
-	before := runtime.NumGoroutine()
+	before := runtime.NumGoroutine() - runtime.StacklessCoroUnhostedGoroutinesForTest()
 	go func() {
 		first := true
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
@@ -260,8 +260,11 @@ func testStacklessCoroNotifySiblings(t *testing.T) {
 		close(done)
 	}()
 	waitStacklessCoroNotifyQueue(&list, 0, count)
-	if delta := runtime.NumGoroutine() - before; delta >= count/2 {
-		t.Fatalf("logical waiters created %d goroutines", delta)
+	if native := runtime.StacklessCoroUnhostedGoroutinesForTest(); native < count {
+		t.Fatalf("unhosted logical waiters = %d, want at least %d", native, count)
+	}
+	if delta := runtime.NumGoroutine() - runtime.StacklessCoroUnhostedGoroutinesForTest() - before; delta >= count/2 {
+		t.Fatalf("logical waiters created %d ordinary goroutines", delta)
 	}
 	runtime.GC()
 	// An unrelated ordinary timer and notifier must still run on one P.
@@ -269,6 +272,73 @@ func testStacklessCoroNotifySiblings(t *testing.T) {
 	list.Broadcast()
 	<-done
 	waitStacklessCoroNotifyQueue(&list, 0, 0)
+}
+
+// Hand-written runtime continuations have no compiler CoroSource metadata.
+// Their logical count must still correspond to nonempty profile records.
+func TestStacklessCoroUnhostedProfile(t *testing.T) {
+	const count = 32
+	var list runtime.NotifyListStacklessCoroForTest
+	done := make(chan struct{}, count)
+	defer list.Broadcast()
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		for range count {
+			ticket := list.Add()
+			var state unsafe.Pointer
+			runtime.SpawnStacklessCoroForTest(ctx, func(ctx unsafe.Pointer) uint8 {
+				if list.WaitCoro(ctx, ticket, &state) {
+					return runtime.StacklessCoroActionWait
+				}
+				done <- struct{}{}
+				return runtime.StacklessCoroActionComplete
+			})
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+	waitStacklessCoroNotifyQueue(&list, 0, count)
+	if n := runtime.StacklessCoroUnhostedGoroutinesForTest(); n != count {
+		t.Fatalf("unhosted count = %d, want %d", n, count)
+	}
+	runtime.GC()
+	records := make([]runtime.StackRecord, runtime.NumGoroutine()+32)
+	n, ok := runtime.GoroutineProfile(records)
+	// Other tests' helper goroutines can exit while these tasks wait. Count
+	// our exact source records below instead of subtracting a stale global
+	// baseline; the profile must also contain this coordinating goroutine.
+	if !ok || n < count+1 {
+		t.Fatalf("profile count = %d, ok = %v, want at least %d", n, ok, count+1)
+	}
+	found := 0
+	for _, record := range records[:n] {
+		if len(record.Stack()) == 0 {
+			t.Fatal("live logical goroutine has an empty profile")
+		}
+		frames := runtime.CallersFrames(record.Stack())
+		for {
+			frame, more := frames.Next()
+			if strings.Contains(frame.Function, "TestStacklessCoroUnhostedProfile.") {
+				found++
+				break
+			}
+			if !more {
+				break
+			}
+		}
+	}
+	if found != count {
+		t.Fatalf("continuation profile records = %d, want %d", found, count)
+	}
+	list.Broadcast()
+	for range count {
+		<-done
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.StacklessCoroUnhostedGoroutinesForTest() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("completed logical records did not drain")
+		}
+		runtime.Gosched()
+	}
 }
 
 func testStacklessCoroNotifyRace(t *testing.T) {

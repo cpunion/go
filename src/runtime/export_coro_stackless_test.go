@@ -2184,3 +2184,7 @@ func DeferStartStacklessCoroForTest(ctx unsafe.Pointer, child func(unsafe.Pointe
 	coroDeferStartFrame(coroDeferToken(ctx), nil, child)
 }
 func DeferSuspendedStacklessCoroForTest(ctx unsafe.Pointer) bool { return coroDeferSuspended(ctx) }
+
+func StacklessCoroUnhostedGoroutinesForTest() int {
+	return int(stacklessCoroUnhostedGoroutines())
+}

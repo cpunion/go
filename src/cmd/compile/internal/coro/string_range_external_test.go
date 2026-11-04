@@ -148,18 +148,29 @@ func main(){if imported(leaf.Text("A¢中"))!=40484 {panic("imported string rang
 
 func TestStringRangeSpawn(t *testing.T) {
 	const source = `package main
-import ("runtime";"runtime/debug")
+import (
+ "runtime/metrics";"runtime";"runtime/debug")
 func child(k int,v rune,ready chan int,gate chan struct{},done chan int) {ready<-k+int(v);<-gate;runtime.Gosched();done<-k+int(v)}
 func spawn(s string,ready chan int,gate chan struct{},done chan int) {for k,v:=range s {go child(k,v,ready,gate,done);s=""}}
 func main(){
  values:=make([]rune,128);for i:=range values {values[i]=rune(i+128)};s:=string(values);values=nil
  ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,setting:=range info.Settings {if setting.Key=="GOEXPERIMENT"&&setting.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine();spawn(s,ready,gate,done);s=""
+ baseline:=ordinaryGoroutines();spawn(s,ready,gate,done);s=""
  sum:=0;for range 128 {sum+=<-ready};if sum!=40768 {panic("string go operands")}
- if native&&runtime.NumGoroutine()>baseline+8 {panic("ordinary string tasks")}
+ if native&&ordinaryGoroutines()>baseline+8 {panic("ordinary string tasks")}
  runtime.GC();close(gate);sum=0;for range 128 {sum+=<-done};if sum!=40768 {panic("string child lifetime")};println("switch-return-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	testSwitchReturnProgram(t, source, nil, []string{"spawn", "child"})
 }
 

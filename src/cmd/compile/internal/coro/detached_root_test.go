@@ -88,31 +88,38 @@ func main() {
 	}
 	for _, experiment := range []string{"coro", "nocoro"} {
 		t.Run(experiment, func(t *testing.T) {
-			exe := filepath.Join(tmp, experiment+".exe")
-			flags := "-l"
-			if experiment == "coro" {
-				flags += " -d=coro=4"
-			}
-			build := testenv.Command(t, testenv.GoToolPath(t), "build",
-				"-gcflags="+flags, "-o", exe, path)
-			build.Env = append(build.Environ(), "GOEXPERIMENT="+experiment, "GOWORK=off")
-			data, err := build.CombinedOutput()
-			if err != nil {
-				t.Fatalf("build: %v\n%s", err, data)
-			}
-			if experiment == "coro" {
-				for _, name := range []string{"blockingChild", "spawnBlocking", "timerChild", "spawnTimer"} {
-					if !strings.Contains(string(data), "func="+name+".coro,") {
-						t.Errorf("%s was not lowered\n%s", name, data)
+			for _, linkmode := range []string{"auto", "internal", "external"} {
+				t.Run(linkmode, func(t *testing.T) {
+					exe := filepath.Join(tmp, experiment+"-"+linkmode+".exe")
+					flags := "-l"
+					if experiment == "coro" {
+						flags += " -d=coro=4"
 					}
-				}
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			run := testenv.CommandContext(t, ctx, exe)
-			data, err = run.CombinedOutput()
-			if err != nil || string(data) != "detached children complete\n" {
-				t.Errorf("run: %v\n%s", err, data)
+					build := testenv.Command(t, testenv.GoToolPath(t), "build",
+						"-gcflags="+flags, "-ldflags=-linkmode="+linkmode, "-o", exe, path)
+					build.Env = append(build.Environ(), "GOEXPERIMENT="+experiment, "GOWORK=off")
+					data, err := build.CombinedOutput()
+					if err != nil {
+						t.Fatalf("build: %v\n%s", err, data)
+					}
+					if experiment == "coro" {
+						for _, name := range []string{"blockingChild", "spawnBlocking", "timerChild", "spawnTimer"} {
+							if !strings.Contains(string(data), "func="+name+".coro,") {
+								t.Errorf("%s was not lowered\n%s", name, data)
+							}
+							if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+								t.Errorf("%s lost native admission with %s linking", name, linkmode)
+							}
+						}
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					run := testenv.CommandContext(t, ctx, exe)
+					data, err = run.CombinedOutput()
+					if err != nil || string(data) != "detached children complete\n" {
+						t.Errorf("run: %v\n%s", err, data)
+					}
+				})
 			}
 		})
 	}

@@ -23,6 +23,7 @@ func TestCapturedCallbackParameters(t *testing.T) {
 	}
 	testenv.MustHaveGoBuild(t)
 	const source = `package main
+import "runtime/metrics"
 import "runtime"
 //go:noinline
 func invoke(f func(int)int,x int)int {return f(x)}
@@ -58,12 +59,22 @@ func main(){
  value:=7;if implicit(&value)!=10||implicitCalls!=1 {panic("pure callback pointer result")};if _,ok:=implicit(nil).(runtime.Error);!ok||implicitCalls!=2 {panic("pure callback implicit panic reentered source")}
  c:=make(chan int,2);c<-1;c<-1;f:=outer(10,c);if f(2)!=13||f(3)!=16 {panic("captured caller callback specialization")}
  if nilDriver(false)!=12||operands!=1 {panic("callback argument order")};if _,ok:=nilDriver(true).(runtime.Error);!ok||operands!=2 {panic("nil callback operand snapshot")}
- ready,release,done:=make(chan int),make(chan int),make(chan int);before:=runtime.NumGoroutine();spawn(ready,release,done);total:=0;for range 64 {total+=<-ready};if total!=2016 {panic("callback spawned cell input")};if NATIVE && runtime.NumGoroutine()>before+16 {panic("ordinary goroutine per callback child")};runtime.GC();for range 64 {release<-1};total=0;for range 64 {total+=<-done};if total!=2016 {panic("callback spawned cell output")}
+ ready,release,done:=make(chan int),make(chan int),make(chan int);before:=ordinaryGoroutines();spawn(ready,release,done);total:=0;for range 64 {total+=<-ready};if total!=2016 {panic("callback spawned cell input")};if NATIVE && ordinaryGoroutines()>before+16 {panic("ordinary goroutine per callback child")};runtime.GC();for range 64 {release<-1};total=0;for range 64 {total+=<-done};if total!=2016 {panic("callback spawned cell output")}
  go func(){if <-ready!=23 {panic("captured callback GC input")};runtime.GC();release<-1}();if held(&object{n:23},ready,release)!=25 {panic("captured callback GC result")}
  exited:=make(chan struct{});result:=0;go exitDriver(exited,&result);<-exited;if result!=41 {panic("callback Goexit cleanup")}
  runtime.LockOSThread();if selected(true)!=7||pureDriver()!=27 {panic("ordinary callback fallback on locked thread")};runtime.UnlockOSThread()
  println("captured-parameters-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	for _, config := range []struct{ name, experiment, flags string }{
 		{"native", "coro", "-l -d=coro=4"},
 		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},

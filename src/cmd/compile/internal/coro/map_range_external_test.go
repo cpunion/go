@@ -165,13 +165,24 @@ func main(){if imported(leaf.Text{1:10,2:20})!=63 {panic("imported map range")};
 
 func TestMapRangeSpawn(t *testing.T) {
 	const source = `package main
-import ("runtime";"runtime/debug")
+import (
+ "runtime/metrics";"runtime";"runtime/debug")
 func child(k,v int,ready chan int,gate chan struct{},done chan int) {ready<-k+v;<-gate;runtime.Gosched();done<-k+v}
 func spawn(m map[int]int,ready chan int,gate chan struct{},done chan int) {for k,v:=range m {go child(k,v,ready,gate,done);m=nil}}
 func main(){m:=make(map[int]int);for i:=0;i<128;i++ {m[i]=i+128};ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT"&&s.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine();spawn(m,ready,gate,done);m=nil;sum:=0;for range 128 {sum+=<-ready};if sum!=32640 {panic("map go operands")}
- if native&&runtime.NumGoroutine()>baseline+8 {panic("ordinary map tasks")};runtime.GC();close(gate);sum=0;for range 128 {sum+=<-done};if sum!=32640 {panic("map child lifetime")};println("switch-return-ok")}
+ baseline:=ordinaryGoroutines();spawn(m,ready,gate,done);m=nil;sum:=0;for range 128 {sum+=<-ready};if sum!=32640 {panic("map go operands")}
+ if native&&ordinaryGoroutines()>baseline+8 {panic("ordinary map tasks")};runtime.GC();close(gate);sum=0;for range 128 {sum+=<-done};if sum!=32640 {panic("map child lifetime")};println("switch-return-ok")}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
 `
 	testSwitchReturnProgram(t, source, nil, []string{"spawn", "child"})
 }

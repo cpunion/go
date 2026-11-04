@@ -167,10 +167,18 @@ func TestSourceFramesAcrossOrdinaryHost(t *testing.T) {
 		{"checkptr-inline", "coro", "-d=coro=4 -d=checkptr=2", ""},
 		{"no-dwarf", "coro", "-d=coro=4", "-ldflags=-w"},
 		{"pie", "coro", "-l -d=coro=4", "-buildmode=pie"},
+		{"external", "coro", "-l -d=coro=4", "-ldflags=-linkmode=external"},
+		{"external-checkptr", "coro", "-l -d=coro=4 -d=checkptr=2", "-ldflags=-linkmode=external"},
+		{"external-inline", "coro", "-d=coro=4", "-ldflags=-linkmode=external"},
+		{"external-no-dwarf", "coro", "-l -d=coro=4", "-ldflags=-linkmode=external -w"},
 		{"ordinary", "nocoro", "-l", ""},
 		{"ordinary-inline", "nocoro", "", ""},
+		{"ordinary-external", "nocoro", "-l", "-ldflags=-linkmode=external"},
 	} {
 		t.Run(config.name, func(t *testing.T) {
+			if strings.Contains(config.name, "external") {
+				testenv.MustHaveCGO(t)
+			}
 			exe := filepath.Join(dir, config.name)
 			args := []string{"build", "-gcflags=" + config.flags, "-o", exe}
 			if config.extra != "" {

@@ -433,6 +433,11 @@ var allDesc = []Description{
 		Kind:        KindUint64,
 	},
 	{
+		Name:        "/sched/coro/goroutines/unhosted:goroutines",
+		Description: "Count of live independent coroutine goroutines that have not acquired an ordinary Go stack. These goroutines are included in /sched/goroutines:goroutines. Always zero when the coro experiment is disabled.",
+		Kind:        KindUint64,
+	},
+	{
 		Name:        "/sched/gomaxprocs:threads",
 		Description: "The current runtime.GOMAXPROCS setting, or the number of operating system threads that can execute user-level Go code simultaneously.",
 		Kind:        KindUint64,

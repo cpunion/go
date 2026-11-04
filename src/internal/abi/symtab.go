@@ -132,7 +132,9 @@ const (
 // It does not change source function values or interface method tables.
 const CoroCallableVersion = 4
 
-const CoroSourceVersion = 2
+// CoroSourceVersion 3 indexes relocated source-entry cells in moduledata.
+// String and source-position references remain offsets within rodata.
+const CoroSourceVersion = 3
 
 const (
 	CoroSourceResume uint32 = 1 << iota

@@ -24,6 +24,8 @@ type stacklessCoroHost struct {
 	pendingReady bool
 	done         bool
 	started      bool
+	startG       *g
+	startNext    *stacklessCoroHost
 }
 
 // Only an ordinary host allocates this extension. The native executor keeps
@@ -246,6 +248,7 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 //
 //go:noinline
 func stacklessCoroHostStart(h *stacklessCoroHost) {
+	stacklessCoroRegisterHostStart(h)
 	go func() { h.run() }()
 }
 
