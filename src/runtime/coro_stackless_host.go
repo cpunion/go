@@ -142,23 +142,23 @@ func coroHostDefer(ctx unsafe.Pointer, call func(any, bool, bool)) uint8 {
 // Called after the compiler's ordinary thunk has directly deferred the frozen
 // source function. Preserve a pending Goexit even when a new panic overlays it.
 func coroDeferInject(value any, panicking, exiting bool) {
+	var trace, exitTrace *stacklessCoroPanicTrace
+	if state := stacklessCoroHostState(getg()); state != nil && state.activeTask != nil {
+		task := state.activeTask
+		s := task.context.scheduler
+		lock(&s.lock)
+		trace, exitTrace = s.terminalTrace(task), s.terminalExitTrace(task)
+		unlock(&s.lock)
+	}
 	if panicking {
-		var trace *stacklessCoroPanicTrace
-		if state := stacklessCoroHostState(getg()); state != nil && state.activeTask != nil {
-			task := state.activeTask
-			s := task.context.scheduler
-			lock(&s.lock)
-			trace = s.terminalTrace(task)
-			unlock(&s.lock)
-		}
 		if exiting {
 			defer func() { raiseStacklessCoroPanic(value, trace) }()
-			Goexit()
+			raiseStacklessCoroGoexit(exitTrace)
 		}
 		raiseStacklessCoroPanic(value, trace)
 	}
 	if exiting {
-		Goexit()
+		raiseStacklessCoroGoexit(exitTrace)
 	}
 }
 
@@ -332,9 +332,11 @@ func (h *stacklessCoroHost) driveThroughGoexit() {
 			if h.root.terminal == stacklessCoroTerminalPanic && panicking {
 				h.root.terminal = stacklessCoroTerminalNone
 				s.clearTerminalValue(h.root)
+				s.clearExitTrace(h.root)
 				unlock(&s.lock)
 				raiseStacklessCoroPanic(value, trace)
 			}
+			s.clearExitTrace(h.root)
 			unlock(&s.lock)
 		}
 	}()
@@ -410,6 +412,12 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 			throw("runtime: invalid stackless coroutine host return")
 		}
 		if exiting {
+			trace := captureStacklessCoroPanicTrace(task, p, 0, nil)
+			if trace != nil {
+				trace.goexit = true
+				p.coroTrace = trace
+			}
+			s.setExitTrace(task, trace)
 			task.terminal = stacklessCoroTerminalNone
 			s.clearTerminalValue(task)
 			task.goexit = true

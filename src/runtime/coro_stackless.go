@@ -1412,6 +1412,7 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		hasTerminalValue {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
+	s.clearExitTrace(task)
 	s.clearDeferTrace(task)
 	if uncachedLineage {
 		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) {
@@ -1467,9 +1468,11 @@ func (s *stacklessCoroScheduler) finish() {
 	goexit := s.root.goexit
 	value, ok := s.terminalValue(&s.root)
 	trace := s.terminalTrace(&s.root)
+	exitTrace := s.terminalExitTrace(&s.root)
 	s.root.terminal = stacklessCoroTerminalNone
 	s.root.goexit = false
 	s.clearTerminalValue(&s.root)
+	s.clearExitTrace(&s.root)
 	if shared {
 		unlock(&s.lock)
 	}
@@ -1480,7 +1483,7 @@ func (s *stacklessCoroScheduler) finish() {
 			throw("runtime: missing stackless coroutine panic value")
 		}
 		if goexit {
-			stacklessCoroGoexitPanic(value, trace)
+			stacklessCoroGoexitPanic(value, trace, exitTrace)
 			throw("runtime: stackless coroutine Goexit returned")
 		}
 		raiseStacklessCoroPanic(value, trace)
@@ -1488,18 +1491,18 @@ func (s *stacklessCoroScheduler) finish() {
 		throw("runtime: invalid stackless coroutine terminal outcome")
 	}
 	if goexit {
-		Goexit()
+		raiseStacklessCoroGoexit(exitTrace)
 		throw("runtime: stackless coroutine Goexit returned")
 	}
 }
 
 // stacklessCoroGoexitPanic recreates a panic layered over a pending Goexit on
 // the ordinary root stack. Recovering the panic then resumes Goexit.
-func stacklessCoroGoexitPanic(value any, trace *stacklessCoroPanicTrace) {
+func stacklessCoroGoexitPanic(value any, trace, exitTrace *stacklessCoroPanicTrace) {
 	defer func() {
 		raiseStacklessCoroPanic(value, trace)
 	}()
-	Goexit()
+	raiseStacklessCoroGoexit(exitTrace)
 }
 
 func (s *stacklessCoroScheduler) run(native, public bool) {
@@ -3257,7 +3260,7 @@ func coroDeferAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 	}
 	s.markUncachedFrameLineageLocked(task, parent, frame)
 	task.setFlag(stacklessCoroTaskDeferChild, true)
-	s.setDeferTrace(task, s.terminalTrace(parent))
+	s.setDeferTrace(task, s.terminalSourceTrace(parent))
 	parent.state = stacklessCoroTaskWaiting
 	s.readyLocked(task)
 	unlock(&s.lock)
@@ -3357,6 +3360,7 @@ func coroGoexit(ctx unsafe.Pointer) {
 	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine Goexit")
 	}
+	pc, sp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
 	s := context.scheduler
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
@@ -3365,6 +3369,11 @@ func coroGoexit(ctx unsafe.Pointer) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine Goexit transition")
 	}
+	trace := captureStacklessCoroPanicTrace(task, nil, pc, sp)
+	if trace != nil {
+		trace.goexit = true
+	}
+	s.setExitTrace(task, trace)
 	task.goexit = true
 	unlock(&s.lock)
 }
@@ -3437,7 +3446,7 @@ func enterStacklessCoroDeferScope(task *stacklessCoroTask, recoverable bool) sta
 	previous := state.deferState
 	s := task.context.scheduler
 	lock(&s.lock)
-	trace := s.terminalTrace(task)
+	trace := s.terminalSourceTrace(task)
 	unlock(&s.lock)
 	state.deferState = &stacklessCoroDeferState{task: task, trace: trace, recoverable: recoverable}
 	return stacklessCoroDeferScope{gp: gp, state: state, previous: previous, temporary: temporary}
@@ -3503,6 +3512,7 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 		raceacquire(unsafe.Pointer(&s.root))
 	}
 	trace := s.terminalTrace(&s.root)
+	exitTrace := s.terminalExitTrace(&s.root)
 	kind, goexit, value, reason :=
 		takeStacklessCoroDeferOutcome(s)
 	if reason != "" {
@@ -3518,6 +3528,16 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 		unlock(&parent.lock)
 		throw("runtime: invalid stackless coroutine defer merge")
 	}
+	if kind == stacklessCoroTerminalPanic {
+		trace = extendStacklessCoroPanicTrace(trace, task)
+	}
+	if goexit {
+		exitTrace = extendStacklessCoroPanicTrace(exitTrace, task)
+		if exitTrace != nil {
+			exitTrace.goexit = true
+		}
+		parent.setExitTrace(task, exitTrace)
+	}
 	switch kind {
 	case stacklessCoroTerminalNone:
 		if goexit {
@@ -3526,7 +3546,6 @@ func coroDeferRunFrame(token, frame unsafe.Pointer,
 			task.goexit = true
 		}
 	case stacklessCoroTerminalPanic:
-		trace = extendStacklessCoroPanicTrace(trace, task)
 		task.terminal = stacklessCoroTerminalPanic
 		task.goexit = task.goexit || goexit
 		parent.setTerminalPanic(task, value, trace)
@@ -3562,6 +3581,7 @@ func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
 	root.terminal = stacklessCoroTerminalNone
 	root.goexit = false
 	s.clearTerminalValue(root)
+	s.clearExitTrace(root)
 	return kind, goexit, value, ""
 }
 
@@ -3571,6 +3591,7 @@ func takeStacklessCoroDeferOutcome(s *stacklessCoroScheduler) (
 func coroDeferGoexit(token unsafe.Pointer) {
 	task := activeStacklessCoroDeferTask(token,
 		"runtime: invalid stackless coroutine defer Goexit")
+	pc, sp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
 	s := task.context.scheduler
 	lock(&s.lock)
 	if task.terminal != stacklessCoroTerminalNone &&
@@ -3578,6 +3599,11 @@ func coroDeferGoexit(token unsafe.Pointer) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine defer Goexit transition")
 	}
+	trace := captureStacklessCoroPanicTrace(task, nil, pc, sp)
+	if trace != nil {
+		trace.goexit = true
+	}
+	s.setExitTrace(task, trace)
 	task.terminal = stacklessCoroTerminalNone
 	s.clearTerminalValue(task)
 	task.goexit = true
@@ -4676,6 +4702,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	lock(&s.lock)
 	value, ok := s.terminalValue(task)
 	trace := s.terminalTrace(task)
+	exitTrace := s.terminalExitTrace(task)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
 		task.terminal != stacklessCoroTerminalPanic || !ok {
@@ -4719,6 +4746,9 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	s.clearTerminalValue(task)
 	parent.terminal = task.terminal
 	parent.goexit = parent.goexit || task.goexit
+	if task.goexit {
+		s.setExitTrace(parent, exitTrace)
+	}
 	task.terminal = stacklessCoroTerminalNone
 	task.goexit = false
 	s.setTerminalPanic(parent, value, trace)
@@ -4729,6 +4759,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 
 func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	lock(&s.lock)
+	exitTrace := s.terminalExitTrace(task)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || !task.goexit {
@@ -4773,6 +4804,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		s.clearTerminalValue(parent)
 	}
 	parent.goexit = true
+	s.setExitTrace(parent, exitTrace)
 	task.goexit = false
 	s.readyLocked(parent)
 	s.recycleTaskLocked(task)

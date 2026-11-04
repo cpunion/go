@@ -5090,8 +5090,9 @@ A terminal native activation releases its typed frames before its outcome is
 replayed on an ordinary stack. A bounded snapshot keeps the first and last
 50 source inline frames and the full frame count, with no frame, receiver,
 environment or panic-value pointers. It transfers separately from the panic
-value, including a present nil value. Ordinary `_panic` records own snapshots
-through recovery and stack copying. Runtime failure and system tracebacks
+value, including a present nil value. Goexit provenance is independent of an overlaid panic and survives its
+recovery. Ordinary `_panic` records own both kinds of snapshots through
+recovery and stack copying. Runtime failure and system tracebacks
 continue to use the physical unwinder.
 
 Deferred activations retain their incoming panic positions until they return,

@@ -17,6 +17,7 @@ type stacklessCoroTerminalValue struct {
 	trace      *stacklessCoroPanicTrace
 	next       *stacklessCoroTerminalValue
 	deferTrace *stacklessCoroPanicTrace
+	exitTrace  *stacklessCoroPanicTrace
 	hasValue   bool
 }
 
@@ -65,7 +66,7 @@ func (s *stacklessCoroScheduler) clearTerminalValue(task *stacklessCoroTask) {
 		entry := *link
 		if entry.task == task {
 			entry.value, entry.trace, entry.hasValue = nil, nil, false
-			if entry.deferTrace == nil {
+			if entry.deferTrace == nil && entry.exitTrace == nil {
 				*link = entry.next
 				entry.task, entry.next = nil, nil
 			}
@@ -104,7 +105,50 @@ func (s *stacklessCoroScheduler) clearDeferTrace(task *stacklessCoroTask) {
 		entry := *link
 		if entry.task == task {
 			entry.deferTrace = nil
-			if !entry.hasValue {
+			if !entry.hasValue && entry.exitTrace == nil {
+				*link = entry.next
+				entry.task, entry.next = nil, nil
+			}
+			return
+		}
+	}
+}
+
+func (s *stacklessCoroScheduler) terminalSourceTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
+	if trace := s.terminalTrace(task); trace != nil {
+		return trace
+	}
+	return s.terminalExitTrace(task)
+}
+
+func (s *stacklessCoroScheduler) terminalExitTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
+	for entry := s.terminalValues; entry != nil; entry = entry.next {
+		if entry.task == task {
+			return entry.exitTrace
+		}
+	}
+	return nil
+}
+
+func (s *stacklessCoroScheduler) setExitTrace(task *stacklessCoroTask, trace *stacklessCoroPanicTrace) {
+	if trace == nil {
+		return
+	}
+	for entry := s.terminalValues; entry != nil; entry = entry.next {
+		if entry.task == task {
+			entry.exitTrace = trace
+			return
+		}
+	}
+	s.terminalValues = &stacklessCoroTerminalValue{task: task, exitTrace: trace, next: s.terminalValues}
+}
+
+func (s *stacklessCoroScheduler) clearExitTrace(task *stacklessCoroTask) {
+	for link := &s.terminalValues; *link != nil; link = &(*link).next {
+		entry := *link
+		if entry.task == task {
+			entry.exitTrace = nil
+			if !entry.hasValue && entry.deferTrace == nil {
 				*link = entry.next
 				entry.task, entry.next = nil, nil
 			}

@@ -18,6 +18,7 @@ type stacklessCoroPanicTrace struct {
 	rootPC uintptr
 	count  int
 	frames [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
+	goexit bool
 }
 
 type stacklessCoroPanicState struct {
@@ -46,7 +47,11 @@ func (trace *stacklessCoroPanicTrace) appendTrace(previous *stacklessCoroPanicTr
 	if trace.count != 0 {
 		// Ordinary tracebacks expose the panic boundary between deferred
 		// code and the original chain. It also counts toward 50/50 elision.
-		trace.appendFrame(inlineFrame{pc: abi.FuncPCABIInternal(gopanic), index: -1})
+		pc := abi.FuncPCABIInternal(gopanic)
+		if previous.goexit {
+			pc = abi.FuncPCABIInternal(Goexit)
+		}
+		trace.appendFrame(inlineFrame{pc: pc, index: -1})
 	}
 	for i := 0; i < previous.count; i++ {
 		// Missing middle entries cannot enter our first inner frames and
@@ -61,7 +66,7 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 	for task != nil {
 		s := task.context.scheduler
 		if s != nil {
-			if previous := s.terminalTrace(task); previous != nil {
+			if previous := s.terminalSourceTrace(task); previous != nil {
 				trace.appendTrace(previous)
 				return
 			}
@@ -122,7 +127,10 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 			for u.initAt(pc, uintptr(sp), 0, gp, 0); u.valid(); u.next() {
 				f := u.frame.fn
 				info := stacklessCoroSourceFrame(f)
-				if f.funcID == abi.FuncID_gopanic {
+				if p != nil && p.goexit && uintptr(p.startSP) == u.frame.sp {
+					continue
+				}
+				if f.funcID == abi.FuncID_gopanic || funcname(f) == "runtime.Goexit" {
 					for previous := gp._panic; previous != nil; previous = previous.link {
 						if previous.coroTrace != nil && uintptr(previous.startSP) == u.frame.sp {
 							trace.appendTrace(previous.coroTrace)
@@ -205,10 +213,39 @@ func raiseStacklessCoroPanic(value any, trace *stacklessCoroPanicTrace) {
 	panic(value)
 }
 
+//go:noinline
+func raiseStacklessCoroGoexit(trace *stacklessCoroPanicTrace) {
+	if trace == nil {
+		Goexit()
+	}
+	gp := getg()
+	state := gp.stacklessCoro
+	temporary := state == nil
+	if temporary {
+		state = new(stacklessCoroGState)
+		gp.stacklessCoro = state
+	}
+	if state.deferState != nil && state.deferState.pending {
+		throw("runtime: duplicate pending coroutine Goexit trace")
+	}
+	pending := &stacklessCoroDeferState{trace: trace, previous: state.deferState, pending: true, temporary: temporary}
+	state.deferState = pending
+	defer func() {
+		if state.deferState == pending {
+			state.deferState = pending.previous
+			pending.previous, pending.trace = nil, nil
+			if temporary {
+				gp.stacklessCoro = nil
+			}
+		}
+	}()
+	Goexit()
+}
+
 func initStacklessCoroPanicTrace(p *_panic, pc uintptr) {
 	gp := getg()
 	state := gp.stacklessCoro
-	if p.goexit || p.deferreturn || state == nil || state.deferState == nil {
+	if p.deferreturn || state == nil || state.deferState == nil {
 		return
 	}
 	if !state.deferState.pending {
@@ -218,12 +255,19 @@ func initStacklessCoroPanicTrace(p *_panic, pc uintptr) {
 		if task := state.deferState.task; task != nil && state.deferState.trace != nil {
 			s := task.context.scheduler
 			lock(&s.lock)
-			p.coroTrace = captureStacklessCoroPanicTrace(task, nil, p.startPC, p.startSP)
+			p.coroTrace = captureStacklessCoroPanicTrace(task, p, p.startPC, p.startSP)
+			if p.coroTrace != nil {
+				p.coroTrace.goexit = p.goexit
+			}
 			unlock(&s.lock)
 		}
 		return
 	}
-	if funcname(findfunc(pc)) != "runtime.raiseStacklessCoroPanic" {
+	caller := "runtime.raiseStacklessCoroPanic"
+	if p.goexit {
+		caller = "runtime.raiseStacklessCoroGoexit"
+	}
+	if funcname(findfunc(pc)) != caller {
 		return
 	}
 	pending := state.deferState
