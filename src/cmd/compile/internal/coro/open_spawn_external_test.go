@@ -65,6 +65,12 @@ func produce()callback {producerCalls++;return chosen}
 func nilOwner(f func(int),arg func()int) {defer func(){if recover()!=nil{println("parent-recovered")}}();go f(arg());select{}}
 func nilEmptyOwner(f func()) {defer func(){if recover()!=nil{println("parent-recovered")}}();println("nil-go-before");go f();println("nil-go-after");select{}}
 func argument()int {println("argument-evaluated");return 9}
+type runner interface{Run()}
+type valueRunner struct{n int}
+func(v valueRunner)Run(){runtime.Gosched()}
+type promotedRunner struct{valueRunner}
+type embeddedRunner struct{*valueRunner}
+func interfaceOwner(v runner){defer func(){if recover()!=nil{println("parent-recovered")}}();go v.Run();select{}}
 
 var spawnEntry=spawnOwner
 var methodEntry=methodOwner
@@ -77,6 +83,7 @@ var snapshotEntry=snapshotOwner
 var lateVariableEntry=lateVariableOwner
 var nilEntry=nilOwner
 var nilEmptyEntry=nilEmptyOwner
+var interfaceEntry=interfaceOwner
 
 func oneParked(release <-chan struct{},ready chan<-struct{},done chan<-int,n int) {
  p:=&box{n:n};p.pad[4095]=17
@@ -89,6 +96,9 @@ func main() {
  case "nil-empty":nilEmptyEntry(nil);panic("nil go returned")
  case "panic-native":panicEntry(panicking,make(chan int));panic("child panic returned")
  case "panic-opaque":panicEntry(opaquePanic,make(chan int));panic("child panic returned")
+ case "nil-value-method":var v *valueRunner;interfaceEntry(v)
+ case "nil-promoted-method":var v *promotedRunner;interfaceEntry(v)
+ case "nil-embedded-method":interfaceEntry(&embeddedRunner{})
  }
  ch:=make(chan int)
  spawnEntry(nativeSend,ch,19);if <-ch!=19||visits!=2{panic("native go or parent replay")}
@@ -140,14 +150,14 @@ func main() {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
 			if config.experiment == "coro" {
-				for _, name := range []string{"spawnOwner", "methodOwner", "tupleOwner", "variadicOwner", "pressureOwner", "exitOwner", "snapshotOwner", "lateVariableOwner", "nilOwner", "nilEmptyOwner", "panicOwner", "panicking", "nativeSend", "tuple", "variadic", "exiting"} {
+				for _, name := range []string{"spawnOwner", "methodOwner", "tupleOwner", "variadicOwner", "pressureOwner", "exitOwner", "snapshotOwner", "lateVariableOwner", "nilOwner", "nilEmptyOwner", "panicOwner", "panicking", "nativeSend", "tuple", "variadic", "exiting", "interfaceOwner"} {
 					if linkedCoroStackUnsafe(t, executable, "main."+name+".coro.stackgate") {
 						t.Errorf("open go source lost native admission: %s", name)
 					}
 				}
 			}
 			for _, p := range []string{"1", "4"} {
-				for _, mode := range []string{"", "nil-argument", "nil-empty", "panic-native", "panic-opaque"} {
+				for _, mode := range []string{"", "nil-argument", "nil-empty", "panic-native", "panic-opaque", "nil-value-method", "nil-promoted-method", "nil-embedded-method"} {
 					ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 					run := testenv.CommandContext(t, ctx, executable)
 					run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=1", "OPEN_SPAWN_FAILURE="+mode)
@@ -164,6 +174,7 @@ func main() {
 						mode == "nil-empty" && (!strings.Contains(string(data), "go of nil func value") ||
 							!strings.Contains(string(data), "nil-go-before") || strings.Contains(string(data), "nil-go-after")) ||
 						mode == "panic-native" && !strings.Contains(string(data), "child-native-panic") ||
+						strings.HasSuffix(mode, "-method") && !strings.Contains(string(data), "panic:") ||
 						mode == "panic-opaque" && !strings.Contains(string(data), "child-opaque-panic") {
 						t.Fatalf("P%s %s changed child terminal outcome: %v\n%s", p, mode, err, data)
 					}

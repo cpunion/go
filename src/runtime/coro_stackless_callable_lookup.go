@@ -54,9 +54,10 @@ func lookupStacklessCoroInterface(table, environment unsafe.Pointer, method uint
 		return nil
 	}
 	entry = checkStacklessCoroCallable(entry.method, unsafe.Pointer(typ), deferred)
-	// A value-method wrapper must execute its original panicwrap when its
-	// pointer receiver is nil. The companion may bypass that wrapper only
-	// after proving the receiver exists, preserving the public panic text.
+	// A nil pointer receiver must execute the original wrapper's adjustment
+	// or panicwrap in the called activation, including a new go child. Bypass
+	// it only after proving the receiver exists, preserving panic ownership
+	// and the public panic text.
 	if entry != nil && entry.nilCheck != 0 && environment == nil {
 		return nil
 	}

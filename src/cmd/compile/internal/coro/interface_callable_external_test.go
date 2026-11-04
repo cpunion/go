@@ -93,6 +93,7 @@ type promoted struct{value}
 type direct struct{observed *any}
 func(v direct)Add(n int)int{return n+30}
 func(v direct)Capture(){*v.observed=recover()}
+func normal(w worker){w.Capture();runtime.Gosched()}
 type state struct{pc int;w worker;observed *any;incoming any;result int;done bool}
 func noFallback(any,bool,bool){panic("interface native defer bypassed")}
 func drive(ctx unsafe.Pointer)uint8{
@@ -125,6 +126,12 @@ func drive(ctx unsafe.Pointer)uint8{
   if action(ctx)!=2{panic("bound interface cleanup used host")};return 2
  case 4:
   if *s.observed!=s.incoming||recoverOwner(token(ctx))!=nil{panic("bound interface lost direct recover")}
+  *s.observed=nil;s.pc=5;panicking(ctx,s.incoming)
+  request:=struct{w worker}{s.w}
+  startFunction(token(ctx),normal,unsafe.Pointer(&request),noFallback)
+  if action(ctx)!=2{panic("normal interface cleanup used host")};return 2
+ case 5:
+  if *s.observed!=nil||recoverOwner(token(ctx))!=s.incoming{panic("normal interface call borrowed direct recover")}
   s.done=true;return 3
  }
  panic("invalid interface driver")
@@ -141,6 +148,8 @@ func main(){
  var absent *value;var w worker=absent;words:=(*[2]unsafe.Pointer)(unsafe.Pointer(&w))
  if p,_:=lookup(words[0],words[1],0,(func(int)int)(nil));p!=nil{panic("nil value wrapper bypassed panicwrap")}
  if p,_:=lookupFunction(w.Capture);p!=nil{panic("nil bound value wrapper bypassed panicwrap")}
+ var absentPromoted *promoted;w=absentPromoted;words=(*[2]unsafe.Pointer)(unsafe.Pointer(&w))
+ if p,_:=lookup(words[0],words[1],0,(func(int)int)(nil));p!=nil{panic("nil promoted receiver admitted before child startup")}
  w=direct{};words=(*[2]unsafe.Pointer)(unsafe.Pointer(&w))
  if p,_:=lookup(words[0],words[1],0,(func(int)int)(nil));p==nil{panic("nil direct-interface data rejected")}
 

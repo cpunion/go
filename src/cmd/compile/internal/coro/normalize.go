@@ -329,7 +329,7 @@ func directSuspensionStatement(root, operation ir.Node) bool {
 	case *ir.CallExpr:
 		return root == operation
 	case *ir.AssignStmt:
-		return root.Y == operation
+		return root.Y == operation && root.X.Op() == ir.ONAME
 	case *ir.AssignListStmt:
 		return len(root.Rhs) == 1 && root.Rhs[0] == operation
 	}

@@ -222,11 +222,18 @@ func testSwitchReturnFilesNative(t *testing.T, files map[string]string, pattern 
 		t.Run(test.name, func(t *testing.T) {
 			exe := filepath.Join(t.TempDir(), "switchreturn.exe")
 			args := []string{"build"}
-			if test.experiment == "coro" {
-				args = append(args, extraFlags...)
-			}
 			if test.name == "coro/checkptr" {
 				args = append(args, "-gcflags=all=-d=checkptr=2")
+			}
+			if test.experiment == "coro" {
+				for _, flag := range extraFlags {
+					// go build uses the last matching -gcflags argument. Keep
+					// dependency-specific lowering enabled under all-checkptr.
+					if test.name == "coro/checkptr" && strings.HasPrefix(flag, "-gcflags=") {
+						flag += " -d=checkptr=2"
+					}
+					args = append(args, flag)
+				}
 			}
 			args = append(args, "-gcflags="+pattern+test.flags, "-o", exe, file)
 			cmd := testenv.Command(t, testenv.GoToolPath(t), args...)

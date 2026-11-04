@@ -40,13 +40,39 @@ func RecordInterfaceMethodWrapper(wrapper *ir.Func, receiver ir.Node, call *ir.C
 	}
 	target := ir.StaticCalleeName(call.Fun)
 	if target == nil || target.Func == nil || target.Func.Type().HasShape() ||
-		target.Func.Type().Recv() == nil || len(call.Args) != wrapper.Type().NumParams()+1 {
+		target.Func.Type().Recv() == nil || len(call.Args) != wrapper.Type().NumParams()+1 ||
+		!interfaceReceiverAdjustment(call.Args[0], name) {
 		return
 	}
 	interfaceMethodWrappers[wrapper] = &interfaceMethodWrapper{
 		boundMethodValue: &boundMethodValue{receiver: name, argument: ir.DeepCopy(src.NoXPos, call.Args[0]), target: target.Func},
-		nilCheck:         nilCheck,
+		nilCheck:         nilCheck || name.Type().IsPtr(),
 	}
+}
+
+// Companion factories run before a go child's activation is registered. Only
+// forward receiver adjustments that cannot panic after the root nil check.
+// Dereferencing an embedded pointer requires its original wrapper on the
+// child's ordinary path, rather than faulting while its parent creates it.
+func interfaceReceiverAdjustment(node ir.Node, receiver *ir.Name) bool {
+	if node == receiver {
+		return true
+	}
+	if len(node.Init()) != 0 {
+		return false
+	}
+	switch node := node.(type) {
+	case *ir.SelectorExpr:
+		return node.Op() == ir.ODOT && interfaceReceiverAdjustment(node.X, receiver) ||
+			node.Op() == ir.ODOTPTR && node.X == receiver
+	case *ir.StarExpr:
+		return node.X == receiver
+	case *ir.AddrExpr:
+		return interfaceReceiverAdjustment(node.X, receiver)
+	case *ir.ConvExpr:
+		return node.Op() == ir.OCONVNOP && interfaceReceiverAdjustment(node.X, receiver)
+	}
+	return false
 }
 
 func RecordBoundMethodValue(wrapper *ir.Func, receiver ir.Node, call *ir.CallExpr) {
