@@ -5710,7 +5710,7 @@ func TestStacklessCoroChannelProgress(t *testing.T) {
 
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
-	baselineGoroutines := runtime.NumGoroutine()
+	baselineGoroutines := runtime.NumGoroutine() - runtime.StacklessCoroUnhostedGoroutinesForTest()
 	baselineOperations := runtime.StacklessCoroOperationCountForTest()
 
 	type senderState struct {
@@ -5760,9 +5760,12 @@ func TestStacklessCoroChannelProgress(t *testing.T) {
 					sendWaiters, recvWaiters, logicalWaiters,
 					senderCount, senderCount)
 			}
-			if goroutines := runtime.NumGoroutine(); goroutines >
+			if native := runtime.StacklessCoroUnhostedGoroutinesForTest(); native < senderCount {
+				t.Fatalf("unhosted channel senders = %d, want at least %d", native, senderCount)
+			}
+			if goroutines := runtime.NumGoroutine() - runtime.StacklessCoroUnhostedGoroutinesForTest(); goroutines >
 				baselineGoroutines+16 {
-				t.Fatalf("blocked channel operations added %d goroutines",
+				t.Fatalf("blocked channel operations added %d ordinary goroutines",
 					goroutines-baselineGoroutines)
 			}
 			rootState = 2

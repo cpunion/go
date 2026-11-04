@@ -5221,8 +5221,11 @@ labels and configured PC depth; text retains the 50/50 elision window. The
 running owner's physical resume position refines the active source leaf.
 Uncached fused-frame transitions disable preemption while publishing matching
 frame, resume and parent links, so a stopped-world reader sees a complete
-chain. Fatal signal tracebacks and physical GC/recovery scanning do not walk
-this registry.
+chain. The same snapshot captures independent hosts that are running native
+resumes or waiting between resumes, and marks their physical G records already
+satisfied for a concurrent profile. Ordinary callbacks keep their physical
+stack and current labels. Fatal signal tracebacks and physical GC/recovery
+scanning do not walk this registry.
 
 Host creation registers a pending transfer keyed by its synchronous creator
 and stable host-entry closure. `newproc1` installs the logical Go ID, creator
@@ -5240,7 +5243,12 @@ count when checking ordinary-stack allocation; their original limits remain
 unchanged. Separate semantic regressions require the full logical count,
 stable IDs across promotion, source creation and suspension lines, labels,
 deep chains, undersized profile behavior, and frame release after return,
-recovered panic and Goexit. Complete public-root source projection, native
+recovered panic and Goexit. A concurrent churn regression checks active
+resumes, recursive frame transitions, host promotion, GC, profile depth and
+registry drainage with ordinary, native, checkptr, inlining and race fallback
+builds. Internal hand-written continuations without source metadata still
+contribute a nonempty profile at their actual resume entry. Complete public-root
+source projection, native
 execution tracing, CPU profiles and native-task race instrumentation still
 require additional integration. Registry allocation and scheduling costs have
 not been optimized.

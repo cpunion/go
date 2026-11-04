@@ -24,6 +24,7 @@ type stacklessCoroGoroutine struct {
 	scheduler        *stacklessCoroScheduler
 	owner            *g
 	publicG          *g
+	hostG            *g
 	goid, parentGoid uint64
 	gopc             uintptr
 	labels           unsafe.Pointer
@@ -242,7 +243,7 @@ func stacklessCoroInitHostG(fn *funcval, caller, gp *g) uint64 {
 		if r == nil || r.public || r.hosted {
 			throw("runtime: invalid coroutine host identity transfer")
 		}
-		r.hosted = true
+		r.hosted, r.hostG = true, gp
 		stacklessCoroGoroutines.unhosted.Add(-1)
 		gp.parentGoid, gp.gopc = r.parentGoid, r.gopc
 		gp.labels, gp.ancestors = r.labels, r.ancestors
@@ -292,6 +293,16 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 				break
 			}
 		}
+		if trace.pcCount == 0 && r.leaf.resume != nil {
+			// Internal hand-written continuations have no compiler source
+			// metadata. They still represent live logical goroutines and
+			// must contribute a valid resume position to the profile.
+			f := findfunc(stacklessCoroResumeIdentity(r.leaf.resume).fn)
+			if f.valid() {
+				trace.rootPC = f.entry()
+				trace.append(f, f.entry())
+			}
+		}
 		if pass == 0 {
 			pcs := make([]uintptr, trace.pcCount)
 			*trace = stacklessCoroPanicTrace{pcs: pcs}
@@ -300,13 +311,29 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 	return trace
 }
 
-// Requires STW. Capture unhosted goroutines before a concurrent profile starts;
-// any host created afterward is already satisfied by this source snapshot.
-func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsafe.Pointer) int {
+// Requires STW. Active native resumes on an ordinary host still have their
+// source activations in heap frames. Capture them while those frames and the
+// registry are stable, instead of exposing the private resume stack during the
+// subsequent concurrent walk. Ordinary callbacks retain their physical stack.
+func stacklessCoroSnapshotHost(gp *g) bool {
+	assertWorldStopped()
+	state := stacklessCoroHostState(gp)
+	if state == nil || state.host == nil || state.ordinaryDepth != 0 {
+		return false
+	}
+	r := stacklessCoroGoroutineFor(state.host.root)
+	return r != nil && !r.public && r.hostG == gp
+}
+
+// Requires STW. A host created after this snapshot is already satisfied by
+// the unhosted source record. Existing hosts captured here are marked satisfied
+// as well, so promotion or resumption cannot produce a duplicate profile entry.
+func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsafe.Pointer, concurrent bool) int {
+	assertWorldStopped()
 	n := 0
 	for _, bucket := range stacklessCoroGoroutines.buckets {
 		for r := bucket; r != nil; r = r.next {
-			if r.public || r.hosted {
+			if r.public || r.hosted && !stacklessCoroSnapshotHost(r.hostG) {
 				continue
 			}
 			trace := stacklessCoroLogicalTrace(r)
@@ -317,6 +344,12 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 			p[n].Stack = trace.pcs[:depth]
 			if labels != nil {
 				labels[n] = r.labels
+				if r.hosted {
+					labels[n] = r.hostG.labels
+				}
+			}
+			if r.hosted && concurrent {
+				r.hostG.goroutineProfiled.Store(goroutineProfileSatisfied)
 			}
 			n++
 		}
@@ -327,9 +360,10 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 // Only runtime.Stack(all=true) invokes this while the world is stopped.
 // Fatal signal tracebacks must not allocate or inspect mutable registry links.
 func stacklessCoroTracebackGoroutines() {
+	assertWorldStopped()
 	for _, bucket := range stacklessCoroGoroutines.buckets {
 		for r := bucket; r != nil; r = r.next {
-			if r.public || r.hosted {
+			if r.public || r.hosted && !stacklessCoroSnapshotHost(r.hostG) {
 				continue
 			}
 			status := "waiting"
@@ -352,7 +386,13 @@ func stacklessCoroTracebackGoroutines() {
 				iu, _ := newInlineUnwinder(f, uf.pc)
 				sf := iu.srcFunc(uf)
 				file, line := iu.fileLine(uf)
-				printFuncName(sf.name())
+				name := sf.name()
+				if !iu.isInlined(uf) {
+					if source := stacklessCoroSourceName(f); source != "" {
+						name = source
+					}
+				}
+				printFuncName(name)
 				print("(...)\n\t", file, ":", line, "\n")
 			}
 			if f := findfunc(r.gopc); f.valid() {
