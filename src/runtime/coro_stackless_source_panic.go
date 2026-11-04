@@ -13,8 +13,9 @@ import (
 )
 
 // A terminal task releases its typed frames before its panic reaches an
-// ordinary stack. Keep only source positions, with the same inner/outer bound
-// as text tracebacks. Neither this record nor its entries retain user objects.
+// ordinary stack. Keep source positions with the same inner/outer text bound,
+// and a complete return-PC payload for Callers. Neither payload retains user
+// objects, task frames, receivers, or closure environments.
 type stacklessCoroPanicTrace struct {
 	rootPC       uintptr
 	count        int
