@@ -16,7 +16,7 @@ import (
 func TestClosedParameterDefer(t *testing.T) {
 	const source = `package main
 import (
- "runtime/metrics""runtime";"runtime/debug")
+ "runtime/metrics";"runtime";"runtime/debug")
 type box struct {n int}
 var trace []int
 func first(p *box,n int) int {trace=append(trace,p.n+n);return n}

@@ -5252,3 +5252,15 @@ source projection, native
 execution tracing, CPU profiles and native-task race instrumentation still
 require additional integration. Registry allocation and scheduling costs have
 not been optimized.
+
+Source metadata version 3 resolves code-entry cells through a relocated table
+in moduledata. An external linker can change the distance between read-only
+strings and relro code-pointer cells, so a section distance computed by the Go
+linker cannot identify the cell in the final image. The function metadata now
+contains a table index; both the table-to-cell and cell-to-code references are
+ordinary relocations. String and source-position offsets remain within their
+read-only section. The table is immutable module metadata and does not retain
+task frames or user objects. Native task, frame and executor layouts do not
+change. Regression tests exercise detached cgo children with automatic,
+internal and external linking, and source stacks with external linking,
+checkptr, inlining and no DWARF; native entry gates remain required.

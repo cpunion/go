@@ -66,7 +66,7 @@ func main(){
 func TestClosedParameterOperandsSpawn(t *testing.T) {
 	const source = `package main
 import (
- "runtime/metrics""runtime";"runtime/debug")
+ "runtime/metrics";"runtime";"runtime/debug")
 type box struct {n int}
 func first(p *box,n int,ready chan int,gate chan struct{},done chan int) {ready<-n;<-gate;runtime.Gosched();done<-p.n+n}
 func second(p *box,n int,ready chan int,gate chan struct{},done chan int) {ready<-n;<-gate;runtime.Gosched();done<-p.n+n+1}

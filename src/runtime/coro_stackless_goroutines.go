@@ -98,6 +98,9 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 			f := u.frame.fn
 			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
 				source := stacklessCoroSourceFunc(f, info)
+				if !source.valid() {
+					continue
+				}
 				file, line := funcline1(f, u.symPC(), false)
 				callerpc = stacklessCoroSourcePC(source, file, line) + sys.PCQuantum
 				break
@@ -264,6 +267,9 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 			f := u.frame.fn
 			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
 				source := stacklessCoroSourceFunc(f, info)
+				if !source.valid() {
+					continue
+				}
 				file, line := funcline1(f, u.symPC(), false)
 				leafEntry, leafPC = source.entry(), stacklessCoroSourcePC(source, file, line)
 				break

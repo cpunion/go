@@ -166,7 +166,7 @@ func main(){if imported(leaf.Text{1:10,2:20})!=63 {panic("imported map range")};
 func TestMapRangeSpawn(t *testing.T) {
 	const source = `package main
 import (
- "runtime/metrics""runtime";"runtime/debug")
+ "runtime/metrics";"runtime";"runtime/debug")
 func child(k,v int,ready chan int,gate chan struct{},done chan int) {ready<-k+v;<-gate;runtime.Gosched();done<-k+v}
 func spawn(m map[int]int,ready chan int,gate chan struct{},done chan int) {for k,v:=range m {go child(k,v,ready,gate,done);m=nil}}
 func main(){m:=make(map[int]int);for i:=0;i<128;i++ {m[i]=i+128};ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)

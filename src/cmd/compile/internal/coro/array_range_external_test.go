@@ -170,7 +170,7 @@ func main(){
 func TestArrayRangeSpawn(t *testing.T) {
 	const source = `package main
 import (
- "runtime/metrics""runtime";"runtime/debug")
+ "runtime/metrics";"runtime";"runtime/debug")
 type box struct {n int}
 func child(p *box,ready chan int,gate chan struct{},done chan int) {ready<-p.n;<-gate;runtime.Gosched();done<-p.n}
 func spawn(values [128]*box,ready chan int,gate chan struct{},done chan int) {

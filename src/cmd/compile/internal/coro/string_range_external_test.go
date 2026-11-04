@@ -149,7 +149,7 @@ func main(){if imported(leaf.Text("A¢中"))!=40484 {panic("imported string rang
 func TestStringRangeSpawn(t *testing.T) {
 	const source = `package main
 import (
- "runtime/metrics""runtime";"runtime/debug")
+ "runtime/metrics";"runtime";"runtime/debug")
 func child(k int,v rune,ready chan int,gate chan struct{},done chan int) {ready<-k+int(v);<-gate;runtime.Gosched();done<-k+int(v)}
 func spawn(s string,ready chan int,gate chan struct{},done chan int) {for k,v:=range s {go child(k,v,ready,gate,done);s=""}}
 func main(){

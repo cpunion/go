@@ -25,8 +25,9 @@ func emitCoroStackInfo(fn *ir.Func, pp *objw.Progs) {
 		objw.Uint32(info, 4, frame.Flags)
 		if frame.Source != nil {
 			// A source copy can refer into another Go module. Funcdata only
-			// permits section offsets, so reference a local ordinary RODATA
-			// cell whose code pointer also supports dynamic-import relocations.
+			// permits scalar references, so emit a local RODATA cell whose
+			// code pointer supports dynamic-import relocations. The linker
+			// replaces this reference with a relocated module-table index.
 			entry := base.Ctxt.Lookup(fn.LSym.Name + ".coro.sourceentry")
 			objw.SymPtr(entry, 0, frame.Source, 0)
 			fn.LSym.Func().CoroSourceEntry = entry

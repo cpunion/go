@@ -30,15 +30,16 @@ type pclntab struct {
 	size int64
 
 	// runtime.pclntab's symbols
-	carrier     loader.Sym
-	pclntab     loader.Sym
-	pcheader    loader.Sym
-	funcnametab loader.Sym
-	findfunctab loader.Sym
-	cutab       loader.Sym
-	filetab     loader.Sym
-	pctab       loader.Sym
-	funcdata    loader.Sym
+	carrier           loader.Sym
+	pclntab           loader.Sym
+	pcheader          loader.Sym
+	funcnametab       loader.Sym
+	findfunctab       loader.Sym
+	cutab             loader.Sym
+	filetab           loader.Sym
+	pctab             loader.Sym
+	funcdata          loader.Sym
+	coroSourceEntries loader.Sym
 
 	// The number of functions + number of TEXT sections - 1. This is such an
 	// unexpected value because platforms that have more than one TEXT section
@@ -537,6 +538,7 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 	fdSyms := make([]loader.Sym, 0, len(funcs))
 	fd := []loader.Sym{}
 	var coroSourceData map[loader.Sym]bool
+	coroSourceIndices := make(map[loader.Sym]uint32)
 	for _, s := range funcs {
 		fi := ldr.FuncInfo(s)
 		if !fi.Valid() {
@@ -556,6 +558,27 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 			}
 
 			if _, ok := seen[fdSym]; !ok {
+				if coroSourceData[fdSym] {
+					relocs := ldr.Relocs(fdSym)
+					for k := 0; k < relocs.Count(); k++ {
+						r := relocs.At(k)
+						if r.Off() != 8 {
+							continue
+						}
+						if _, ok := coroSourceIndices[r.Sym()]; ok {
+							continue
+						}
+						if state.coroSourceEntries == 0 {
+							table := ldr.CreateSymForUpdate("runtime.corosourcetab", 0)
+							table.SetType(sym.SRODATA)
+							table.SetLocal(true)
+							table.SetReachable(true)
+							state.coroSourceEntries = table.Sym()
+						}
+						coroSourceIndices[r.Sym()] = uint32(len(coroSourceIndices))
+						ldr.MakeSymbolUpdater(state.coroSourceEntries).AddAddr(ctxt.Arch, r.Sym())
+					}
+				}
 				fdSyms = append(fdSyms, fdSym)
 				seen[fdSym] = struct{}{}
 			}
@@ -620,6 +643,18 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 				return
 			}
 			rs := r.Sym()
+			if coroSourceData[fdSym] && r.Off() == 8 {
+				// Entry cells can live in a different section from strings.
+				// Keep their addresses as real relocations until the final
+				// linker has placed both sections, including external links.
+				index, ok := coroSourceIndices[rs]
+				if !ok || r.Add() != 0 {
+					ctxt.Errorf(fdSym, "invalid coroutine source entry relocation")
+					return
+				}
+				ctxt.Arch.ByteOrder.PutUint32(data[r.Off():], index)
+				continue
+			}
 			if r.Weak() && !ldr.AttrReachable(rs) {
 				return
 			}
@@ -629,10 +664,8 @@ func (state *pclntab) generateFuncdata(ctxt *Link, funcs []loader.Sym, inlsyms m
 			}
 			o := ldr.SymValue(rs)
 			if coroSourceData[fdSym] {
-				// Source metadata uses moduledata.rodata as a single base.
-				// Entry cells contain code relocations and can therefore move
-				// into .data.rel.ro for PIE or shared libraries. Their own
-				// section offset would be decoded against the wrong section.
+				// All remaining source references are immutable strings in
+				// the same read-only section as moduledata.rodata.
 				base := ldr.SymSect(ldr.Lookup("runtime.rodata", 0))
 				if base == nil {
 					ctxt.Errorf(fdSym, "missing rodata base for coroutine source metadata")
