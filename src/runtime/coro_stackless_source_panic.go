@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/stringslite"
 	"unsafe"
 )
 
@@ -20,6 +21,10 @@ type stacklessCoroPanicTrace struct {
 	frames       [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
 	goexit       bool
 	calleeFuncID abi.FuncID
+	// Callers can request positions beyond the bounded text window. Its
+	// immutable payload contains return PCs, never user or frame pointers.
+	pcs     []uintptr
+	pcCount int
 }
 
 type stacklessCoroPanicState struct {
@@ -31,11 +36,31 @@ func (trace *stacklessCoroPanicTrace) append(f funcInfo, pc uintptr) {
 		sf := iu.srcFunc(uf)
 		callee := trace.calleeFuncID
 		trace.calleeFuncID = sf.funcID
+		name := sf.name()
+		bridge := stringslite.HasPrefix(name, "runtime.stacklessCoro") ||
+			stringslite.HasPrefix(name, "runtime.(*stacklessCoro") ||
+			stringslite.HasPrefix(name, "runtime.raiseStacklessCoro") ||
+			stringslite.HasPrefix(name, "runtime.coro") && len(name) > len("runtime.coro") &&
+				name[len("runtime.coro")] >= 'A' && name[len("runtime.coro")] <= 'Z'
+		if !bridge && !(sf.funcID == abi.FuncIDWrapper && elideWrapperCalling(callee)) &&
+			!(sf.funcID == abi.FuncID_gopanic && trace.pcCount == 0) {
+			trace.appendPC(uf.pc + 1)
+		}
 		if !showfuncinfoUser(sf, trace.count == 0, callee) {
 			continue
 		}
 		trace.appendFrame(uf)
 	}
+}
+
+func (trace *stacklessCoroPanicTrace) appendPC(pc uintptr) {
+	if trace.pcs != nil {
+		if trace.pcCount >= len(trace.pcs) {
+			throw("runtime: coroutine source PC count changed during capture")
+		}
+		trace.pcs[trace.pcCount] = pc
+	}
+	trace.pcCount++
 }
 
 func (trace *stacklessCoroPanicTrace) appendFrame(uf inlineFrame) {
@@ -48,14 +73,20 @@ func (trace *stacklessCoroPanicTrace) appendFrame(uf inlineFrame) {
 }
 
 func (trace *stacklessCoroPanicTrace) appendTrace(previous *stacklessCoroPanicTrace) {
+	boundary := abi.FuncPCABIInternal(gopanic)
+	if previous.goexit {
+		boundary = abi.FuncPCABIInternal(Goexit)
+	}
+	if trace.pcCount != 0 {
+		trace.appendPC(boundary + 1)
+	}
+	for _, pc := range previous.pcs {
+		trace.appendPC(pc)
+	}
 	if trace.count != 0 {
 		// Ordinary tracebacks expose the panic boundary between deferred
 		// code and the original chain. It also counts toward 50/50 elision.
-		pc := abi.FuncPCABIInternal(gopanic)
-		if previous.goexit {
-			pc = abi.FuncPCABIInternal(Goexit)
-		}
-		trace.appendFrame(inlineFrame{pc: pc, index: -1})
+		trace.appendFrame(inlineFrame{pc: boundary, index: -1})
 	}
 	for i := 0; i < previous.count; i++ {
 		// Missing middle entries cannot enter our first inner frames and
@@ -125,49 +156,60 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 	}
 	trace := new(stacklessCoroPanicTrace)
 	gp := getg()
-	systemstack(func() {
-		var leafEntry, leafPC uintptr
-		if pc != 0 {
-			var u unwinder
-			for u.initAt(pc, uintptr(sp), 0, gp, 0); u.valid(); u.next() {
-				f := u.frame.fn
-				info := stacklessCoroSourceFrame(f)
-				if p != nil && p.goexit && uintptr(p.startSP) == u.frame.sp {
-					continue
-				}
-				if f.funcID == abi.FuncID_gopanic || funcname(f) == "runtime.Goexit" {
-					for previous := gp._panic; previous != nil; previous = previous.link {
-						if previous.coroTrace != nil && uintptr(previous.startSP) == u.frame.sp {
-							trace.appendTrace(previous.coroTrace)
-							return
+	for pass := 0; pass < 2; pass++ {
+		systemstack(func() {
+			var leafEntry, leafPC uintptr
+			if pc != 0 {
+				var u unwinder
+				for u.initAt(pc, uintptr(sp), 0, gp, 0); u.valid(); u.next() {
+					f := u.frame.fn
+					info := stacklessCoroSourceFrame(f)
+					if p != nil && p.goexit && uintptr(p.startSP) == u.frame.sp {
+						continue
+					}
+					if f.funcID == abi.FuncID_gopanic || funcname(f) == "runtime.Goexit" {
+						for previous := gp._panic; previous != nil; previous = previous.link {
+							if previous.coroTrace != nil && uintptr(previous.startSP) == u.frame.sp {
+								trace.appendTrace(previous.coroTrace)
+								return
+							}
 						}
 					}
-				}
-				if info != nil && info.flags&(abi.CoroSourceBridge|abi.CoroSourceResume) != 0 {
-					if info.flags&abi.CoroSourceResume != 0 {
+					if info != nil && info.flags&(abi.CoroSourceBridge|abi.CoroSourceResume) != 0 {
+						if info.flags&abi.CoroSourceResume != 0 {
+							source := stacklessCoroSourceFunc(f, info)
+							if source.valid() {
+								file, line := funcline1(f, u.symPC(), false)
+								leafEntry, leafPC = source.entry(), stacklessCoroSourcePC(source, file, line)
+							}
+						}
+						break
+					}
+					at := u.symPC()
+					if info != nil && info.flags&abi.CoroSourceCopy != 0 {
 						source := stacklessCoroSourceFunc(f, info)
 						if source.valid() {
-							file, line := funcline1(f, u.symPC(), false)
-							leafEntry, leafPC = source.entry(), stacklessCoroSourcePC(source, file, line)
+							file, line := funcline1(f, at, false)
+							f, at = source, stacklessCoroSourcePC(source, file, line)
 						}
 					}
-					break
+					trace.append(f, at)
 				}
-				at := u.symPC()
-				if info != nil && info.flags&abi.CoroSourceCopy != 0 {
-					source := stacklessCoroSourceFunc(f, info)
-					if source.valid() {
-						file, line := funcline1(f, at, false)
-						f, at = source, stacklessCoroSourcePC(source, file, line)
-					}
-				}
-				trace.append(f, at)
 			}
+			trace.appendLineage(task, gp, leafEntry, leafPC)
+		})
+		if trace.rootPC == 0 {
+			return nil
 		}
-		trace.appendLineage(task, gp, leafEntry, leafPC)
-	})
-	if trace.rootPC == 0 {
-		return nil
+		if pass == 0 {
+			// Count first, then allocate before reinitializing the physical
+			// cursor. Both passes retain the same logical task ownership.
+			pcs := make([]uintptr, trace.pcCount)
+			*trace = stacklessCoroPanicTrace{pcs: pcs}
+		}
+	}
+	if trace.pcCount != len(trace.pcs) {
+		throw("runtime: incomplete coroutine source PC capture")
 	}
 	return trace
 }
@@ -180,9 +222,33 @@ func extendStacklessCoroPanicTrace(trace *stacklessCoroPanicTrace, task *stackle
 	}
 	result := new(stacklessCoroPanicTrace)
 	*result = *trace
+	result.pcs = nil
 	gp := getg()
 	result.appendLineage(task, gp, 0, 0)
+	pcs := make([]uintptr, result.pcCount)
+	copy(pcs, trace.pcs)
+	*result = *trace
+	result.pcs = pcs
+	result.appendLineage(task, gp, 0, 0)
+	if result.pcCount != len(result.pcs) {
+		throw("runtime: incomplete extended coroutine source PC capture")
+	}
 	return result
+}
+
+func appendStacklessCoroPanicPCs(u *unwinder, trace *stacklessCoroPanicTrace, skip *int, buf []uintptr, n *int) {
+	for _, pc := range trace.pcs {
+		if *n == len(buf) {
+			return
+		}
+		if *skip > 0 {
+			*skip--
+		} else {
+			buf[*n] = pc
+			*n++
+		}
+	}
+	u.calleeFuncID = trace.calleeFuncID
 }
 
 // The pending record is consumed only by this immediate panic call. The
