@@ -129,7 +129,10 @@ func main(){
 `
 
 func sourceFrameFixture() string {
-	source := sourceFrameProgram
+	return sourceFrameFixtureFor(sourceFrameProgram)
+}
+
+func sourceFrameFixtureFor(source string) string {
 	for marker, token := range map[string]string{
 		"root-call": "ROOT_LINE", "inner-call": "INNER_LINE", "outer-call": "OUTER_LINE",
 		"recursive-call": "RECURSIVE_CALL_LINE", "recursive-leaf": "RECURSIVE_LEAF_LINE",
@@ -137,7 +140,7 @@ func sourceFrameFixture() string {
 		"inline-leaf": "INLINE_LEAF_LINE", "inline-wrapper": "INLINE_WRAPPER_LINE", "inline-owner": "INLINE_OWNER_LINE",
 		"closure-call": "CLOSURE_LINE",
 	} {
-		for i, line := range strings.Split(sourceFrameProgram, "\n") {
+		for i, line := range strings.Split(source, "\n") {
 			if strings.Contains(line, "// "+marker) {
 				source = strings.ReplaceAll(source, token, strconv.Itoa(i+1))
 				break
