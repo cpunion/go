@@ -211,7 +211,7 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 	n := 0
 	bridges, afterDriver, terminal := false, false, false
 	var rootPC uintptr
-	if task := stacklessCoroParkedSourceTask(u.g.ptr()); task != nil {
+	if host := stacklessCoroParkedSource(u.g.ptr()); host != nil {
 		// The private wake receive is an implementation detail, not a source
 		// operation. Locate its driver before consuming skip or buffer space,
 		// so even a one-PC profile starts with the suspended source leaf.
@@ -221,7 +221,12 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 		}
 		if probe.valid() {
 			*u = probe
-			rootPC = appendStacklessCoroSourceFrames(u, task, &skip, buf, &n)
+			if trace := host.parkedTrace; trace != nil {
+				appendStacklessCoroPanicPCs(u, trace, &skip, buf, &n)
+				rootPC = trace.rootPC
+			} else {
+				rootPC = appendStacklessCoroSourceFrames(u, host.parkedTask, &skip, buf, &n)
+			}
 			bridges = true
 		}
 	}

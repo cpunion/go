@@ -76,8 +76,15 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 		}
 	}
 	if funcname(f) == "runtime.(*stacklessCoroHost).drive" {
-		if task := stacklessCoroParkedSourceTask(u.g.ptr()); task != nil {
-			rootPC, complete := walkStacklessCoroSourceFrames(task, func(f funcInfo, pc uintptr) bool {
+		if host := stacklessCoroParkedSource(u.g.ptr()); host != nil {
+			if trace := host.parkedTrace; trace != nil {
+				if !printStacklessCoroPanicTrace(u, trace, commit) {
+					return true, true
+				}
+				state.rootPC, state.bridges = trace.rootPC, true
+				return true, false
+			}
+			rootPC, complete := walkStacklessCoroSourceFrames(host.parkedTask, func(f funcInfo, pc uintptr) bool {
 				return printStacklessCoroSourceFrame(u, f, pc, showRuntime, &first, commit)
 			})
 			if !complete {

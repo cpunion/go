@@ -34,6 +34,7 @@ type stacklessCoroHostGState struct {
 	ordinaryDepth uint32
 	activeTask    *stacklessCoroTask
 	parkedTask    *stacklessCoroTask
+	parkedTrace   *stacklessCoroPanicTrace
 }
 
 // Fixed executors retain their original self pointer. An ordinary extension
@@ -50,7 +51,7 @@ func stacklessCoroHostState(gp *g) *stacklessCoroHostGState {
 // The stopped host owns this suspended lineage even if an operation producer
 // has made it runnable. Only the host can resume or recycle its source frames.
 // Requiring its private receive excludes ordinary callbacks and active resumes.
-func stacklessCoroParkedSourceTask(gp *g) *stacklessCoroTask {
+func stacklessCoroParkedSource(gp *g) *stacklessCoroHostGState {
 	state := stacklessCoroHostState(gp)
 	if state == nil || state.host == nil || state.ordinaryDepth != 0 ||
 		state.activeTask != nil || state.parkedTask == nil || gp.waiting == nil {
@@ -60,7 +61,7 @@ func stacklessCoroParkedSourceTask(gp *g) *stacklessCoroTask {
 	if gp.waiting.channelUintptr() != wake {
 		return nil
 	}
-	return state.parkedTask
+	return state
 }
 
 func currentStacklessCoroHost() *stacklessCoroHost {
@@ -327,7 +328,7 @@ func (h *stacklessCoroHost) run() {
 	state.host = h
 	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil || state.parkedTask != nil {
+		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil || state.parkedTask != nil || state.parkedTrace != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
 		gp.stacklessCoro = previous
@@ -377,11 +378,13 @@ func (h *stacklessCoroHost) drive() {
 		lock(&s.lock)
 		if h.done {
 			state.parkedTask = nil
+			state.parkedTrace = nil
 			unlock(&s.lock)
 			return
 		}
 		if h.pendingReady {
 			state.parkedTask = nil
+			state.parkedTrace = nil
 			task, call, deferred := h.pending, h.call, h.deferred
 			h.pending, h.call, h.deferred, h.pendingReady = nil, nil, nil, false
 			if task.state != stacklessCoroTaskWaiting || task.resuming || task.readyPending {
@@ -397,12 +400,25 @@ func (h *stacklessCoroHost) drive() {
 			continue
 		}
 		ready := h.head != nil
+		if !ready && state.parkedTask != nil && state.parkedTrace == nil {
+			// Native cleanup can wait after its incoming panic or Goexit
+			// released the original frames. Capture those source positions
+			// while the metadata is locked, outside the profiler's walk.
+			// Ordinary waits retain their live frames without a snapshot.
+			for task := state.parkedTask; task != nil; task = task.parent {
+				if s.terminalSourceTrace(task) != nil || s.deferTrace(task) != nil {
+					state.parkedTrace = captureStacklessCoroPanicTrace(state.parkedTask, nil, 0, nil)
+					break
+				}
+			}
+		}
 		unlock(&s.lock)
 		if ready {
 			// Drop the old leaf before any frame can resume or be recycled.
 			// The no-work return identifies the new suspended leaf, including
 			// structured children selected during this episode.
 			state.parkedTask = nil
+			state.parkedTrace = nil
 			state.parkedTask = s.runTasks(false, false, false, false)
 		} else {
 			<-h.wake

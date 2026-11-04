@@ -5167,7 +5167,7 @@ that leaf to the cold host G-state. The host clears this reference before
 invoking ordinary code, resuming queued work or completing, so it never retains
 a recycled task or completed source frame. Other exits, including a recovered
 panic, return no suspended leaf. No native context or executor G-state field
-is added; the ordinary host extension gains one traced pointer.
+is added; the ordinary host extension gains two traced pointers.
 
 Text and PC projection use this reference only when the stopped host's waiting
 sudog identifies its private wake channel. Operation producers may ready the
@@ -5180,6 +5180,18 @@ independent roots do not acquire a creator activation chain. Physical GC,
 panic recovery and runtime-failure tracebacks keep their existing unwinder.
 Closure-shaped public entries include a `coroRun` adapter above `coroRunFrame`;
 the duplicate-root check spans that adapter before consuming the source entry.
+
+Native cleanup can suspend after the incoming panic or Goexit released its
+original frames. Before parking, the host inspects the retained terminal
+metadata under the scheduler lock. Only such a lineage needs an immutable
+snapshot combining live cleanup positions with the incoming terminal chain;
+ordinary waits keep walking their live frames without a new snapshot. This
+cold snapshot contains source PCs rather than user objects. The host clears it
+with the parked task before further execution. Profilers therefore read
+stable source data without locking or allocating during the walk, including
+the interval after a deferred function has recovered its incoming panic.
+A separate regression parks native cleanup before and after direct recover,
+checking incoming panic/Goexit chains and the cleanup source line at both waits.
 
 The regression covers native channel send and receive, public and independent
 hosts, shallow and deep source chains, return/panic/Goexit cleanup, live-frame
