@@ -1209,7 +1209,7 @@ func newLowerCandidate(plan *Plan, function *Function) (*lowerCandidate, error) 
 				return nil, fmt.Errorf("nested await site %d", site.ID)
 			}
 			edge := edges[call]
-			if plan.edgeNeedsValueHandoff(edge) {
+			if plan.edgeNeedsValueHandoff(edge) || ordinaryThreadCall(call) {
 				candidate.openCalls[call] = true
 			}
 			if edge.Callee == nil && len(edge.Targets) == 0 {

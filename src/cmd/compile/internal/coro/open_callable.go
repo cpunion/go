@@ -195,6 +195,23 @@ func openCallableCall(call *ir.CallExpr) bool {
 	return false
 }
 
+// LockOSThread must bind the logical goroutine's ordinary host, never the
+// shared fixed-stack executor. Use the same handoff as an opaque function
+// value; subsequent native activations stay on that host until the logical
+// goroutine finishes, including after UnlockOSThread.
+func ordinaryThreadCall(call *ir.CallExpr) bool {
+	if call == nil || call.Op() != ir.OCALLFUNC {
+		return false
+	}
+	name := ir.StaticCalleeName(call.Fun)
+	if name == nil || symbolName(name) != "runtime.LockOSThread" {
+		return false
+	}
+	typ := name.Type()
+	return typ != nil && typ.Kind() == types.TFUNC && typ.Recv() == nil &&
+		typ.NumParams() == 0 && typ.NumResults() == 0 && !typ.IsVariadic()
+}
+
 func openCallableSignature(call *ir.CallExpr) *types.Type {
 	if call.Op() == ir.OCALLINTER {
 		return callableMethodSignature(call.Fun.Type())

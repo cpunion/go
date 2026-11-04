@@ -15,6 +15,7 @@ func TestOpenDynamicCond(t *testing.T) {
 	const source = `package main
 import("runtime";"sync";"sync/atomic";"syscall")
 
+
 type countedLocker struct { mu *sync.Mutex; locks,unlocks *int32 }
 func(l *countedLocker)Lock(){l.mu.Lock();atomic.AddInt32(l.locks,1)}
 func(l *countedLocker)Unlock(){atomic.AddInt32(l.unlocks,1);l.mu.Unlock()}
@@ -57,7 +58,7 @@ func originalControls(){
  rw:=new(sync.RWMutex);checkCond(rw,rw);checkCond(rw.RLocker(),rw)
  counted:=&countedLocker{new(sync.Mutex),&locks,&unlocks};checkCond(counted,counted);changedLocker()
 }
-func main(){for range 1{controls();runtime.LockOSThread();controls();runtime.UnlockOSThread()};println("switch-return-ok")}
+func main(){nativeAdmission();for range 1{controls();runtime.LockOSThread();controls();runtime.UnlockOSThread()};println("switch-return-ok")}
 
 
 type parkedValue struct { value int; pad [4095]byte }
@@ -135,7 +136,35 @@ func controls(){
 		t.Skip("thread identifier unavailable")
 	}
 	thread := "func threadID()uintptr{v,_,e:=syscall.RawSyscall(syscall." + number + ",0,0,0);if e!=0{panic(e)};return v}"
+	const admission = `//go:build goexperiment.coro
+
+package main
+import("sync";"unsafe")
+//go:linkname lookupInterface runtime.coroLookupInterface
+func lookupInterface(unsafe.Pointer,unsafe.Pointer,uintptr,any)(unsafe.Pointer,unsafe.Pointer)
+func nativeAdmission(){
+ var locks,unlocks,selected int32;var observed any;var typedNil *nilLocker
+ mu:=new(sync.Mutex);after:=&countedLocker{mu,&locks,&unlocks}
+ before:=&selectedLocker{mu:mu,next:after,selected:&selected};before.cond=sync.NewCond(before)
+ lockers:=[]sync.Locker{new(sync.Mutex),new(sync.RWMutex),new(sync.RWMutex).RLocker(),after,before,panicLocker{},recoveringLocker{&observed},exitLocker{},new(affineLocker),typedNil}
+ for i,l:=range lockers{
+  words:=(*[2]unsafe.Pointer)(unsafe.Pointer(&l))
+  for method:=uintptr(0);method<2;method++{
+   p,_:=lookupInterface(words[0],words[1],method,(func())(nil))
+   if p==nil{println("missing native Locker",i,method);panic("interface method companion missing")}
+   descriptor:=(*[9]unsafe.Pointer)(p)
+   if descriptor[4]==nil||descriptor[5]==nil||*(*uintptr)(descriptor[4])!=0{println("missing native defer",i,method);panic("interface defer companion missing")}
+  }
+ }
+}
+`
+
 	required := []string{"lockerOwner", "condOwner", "pressureOwner", "panicOwner", "directRecoverOwner", "exitingOwner", "affinityOwner"}
-	testSwitchReturnFilesNative(t, map[string]string{"main.go": source + thread}, "", nil, required, required,
-		"-gcflags=sync=-l -d=coro=4", "-gcflags=internal/sync=-l -d=coro=4")
+	testSwitchReturnFilesNative(t, map[string]string{
+		"go.mod":       "module example.com/corocond\n\ngo 1.27\n",
+		"main.go":      source + thread,
+		"admission.go": admission,
+		"ordinary.go":  "//go:build !goexperiment.coro\n\npackage main\nfunc nativeAdmission(){}\n",
+	}, "example.com/corocond=", nil, required, required,
+		"-ldflags=-checklinkname=0", "-gcflags=sync=-l -d=coro=4", "-gcflags=internal/sync=-l -d=coro=4")
 }
