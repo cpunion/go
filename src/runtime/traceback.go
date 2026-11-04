@@ -981,8 +981,9 @@ func traceback1(pc, sp, lr uintptr, gp *g, flags unwindFlags) {
 	var u unwinder
 	tracebackWithRuntime := func(showRuntime bool) int {
 		const maxInt int = 0x7fffffff
+		var sourceState stacklessCoroTracebackState
 		u.initAt(pc, sp, lr, gp, flags)
-		n, lastN := traceback2(&u, showRuntime, 0, tracebackInnerFrames)
+		n, lastN := traceback2(&u, &sourceState, showRuntime, 0, tracebackInnerFrames)
 		if n < tracebackInnerFrames {
 			// We printed the whole stack.
 			return n
@@ -991,15 +992,16 @@ func traceback1(pc, sp, lr uintptr, gp *g, flags unwindFlags) {
 		// count will include any logical frames already printed for u's current
 		// physical frame.
 		u2 := u
-		remaining, _ := traceback2(&u, showRuntime, maxInt, 0)
+		sourceState2 := sourceState
+		remaining, _ := traceback2(&u, &sourceState, showRuntime, maxInt, 0)
 		elide := remaining - lastN - tracebackOuterFrames
 		if elide > 0 {
 			print("...", elide, " frames elided...\n")
-			traceback2(&u2, showRuntime, lastN+elide, tracebackOuterFrames)
+			traceback2(&u2, &sourceState2, showRuntime, lastN+elide, tracebackOuterFrames)
 		} else if elide <= 0 {
 			// There are tracebackOuterFrames or fewer frames left to print.
 			// Just print the rest of the stack.
-			traceback2(&u2, showRuntime, lastN, tracebackOuterFrames)
+			traceback2(&u2, &sourceState2, showRuntime, lastN, tracebackOuterFrames)
 		}
 		return n
 	}
@@ -1023,7 +1025,7 @@ func traceback1(pc, sp, lr uintptr, gp *g, flags unwindFlags) {
 // returns n, which is the number of logical frames skipped and printed, and
 // lastN, which is the number of logical frames skipped or printed just in the
 // physical frame that u references.
-func traceback2(u *unwinder, showRuntime bool, skip, max int) (n, lastN int) {
+func traceback2(u *unwinder, sourceState *stacklessCoroTracebackState, showRuntime bool, skip, max int) (n, lastN int) {
 	// commitFrame commits to a logical frame and returns whether this frame
 	// should be printed and whether iteration should stop.
 	commitFrame := func() (pr, stop bool) {
@@ -1045,9 +1047,20 @@ func traceback2(u *unwinder, showRuntime bool, skip, max int) (n, lastN int) {
 
 	gp := u.g.ptr()
 	level, _, _ := gotraceback()
+	// Runtime failures and explicitly requested system traces retain their
+	// physical bridge frames and addresses for diagnosing the runtime itself.
+	logicalText := level < 2 && !(gp.m != nil && gp.m.throwing >= throwTypeRuntime && gp == gp.m.curg)
 	var cgoBuf [32]uintptr
 	for ; u.valid(); u.next() {
 		lastN = 0
+		if logicalText {
+			if handled, stop := stacklessCoroTracebackText(u, sourceState, showRuntime, n == 0, commitFrame); handled {
+				if stop {
+					return
+				}
+				continue
+			}
+		}
 		f := u.frame.fn
 		for iu, uf := newInlineUnwinder(f, u.symPC()); uf.valid(); uf = iu.next(uf) {
 			sf := iu.srcFunc(uf)

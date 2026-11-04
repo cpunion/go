@@ -145,16 +145,28 @@ func appendStacklessCoroSourcePC(u *unwinder, f funcInfo, pc uintptr, skip *int,
 // until the opaque call returns, so both ordinary task links and fused frame
 // links are stable throughout the unwind. Independent go tasks have no parent.
 func appendStacklessCoroSourceFrames(u *unwinder, task *stacklessCoroTask, skip *int, buf []uintptr, n *int) uintptr {
+	rootPC, _ := walkStacklessCoroSourceFrames(task, func(f funcInfo, pc uintptr) bool {
+		appendStacklessCoroSourcePC(u, f, pc, skip, buf, n)
+		return *n < len(buf)
+	})
+	return rootPC
+}
+
+// walkStacklessCoroSourceFrames visits complete source activations until visit
+// returns false. Both PC collection and text tracebacks use this same chain.
+func walkStacklessCoroSourceFrames(task *stacklessCoroTask, visit func(funcInfo, uintptr) bool) (uintptr, bool) {
 	var rootPC uintptr
-	for task != nil && *n < len(buf) {
+	for task != nil {
 		resume := stacklessCoroResumeIdentity(task.resume)
 		frame := task.context.frame
 		fused := task.hasFlag(stacklessCoroTaskFusedFrames)
-		for resume != nil && *n < len(buf) {
+		for resume != nil {
 			f, pc := stacklessCoroResumeSourcePC(resume, frame)
 			if f.valid() {
 				rootPC = f.entry()
-				appendStacklessCoroSourcePC(u, f, pc, skip, buf, n)
+				if !visit(f, pc) {
+					return rootPC, false
+				}
 			}
 			if !fused || frame == nil {
 				break
@@ -176,7 +188,7 @@ func appendStacklessCoroSourceFrames(u *unwinder, task *stacklessCoroTask, skip 
 		}
 		task = task.parent
 	}
-	return rootPC
+	return rootPC, true
 }
 
 func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool) {

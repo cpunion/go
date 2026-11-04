@@ -6,6 +6,12 @@
 
 package runtime
 
+type stacklessCoroTracebackState struct{}
+
+func stacklessCoroTracebackText(*unwinder, *stacklessCoroTracebackState, bool, bool, func() (bool, bool)) (bool, bool) {
+	return false, false
+}
+
 func stacklessCoroSourceName(funcInfo) string { return "" }
 
 func stacklessCoroTracebackPCs(*unwinder, int, []uintptr) (int, bool) {
