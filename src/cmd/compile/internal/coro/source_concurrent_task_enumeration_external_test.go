@@ -21,6 +21,9 @@ func TestSourceConcurrentTaskEnumeration(t *testing.T) {
 	// Keep enumerating during active native resumes, frame transitions, host
 	// promotion and completion. Parked-only tests cannot expose private resume
 	// PCs on already allocated hosts.
+	// Receiving every result does not mean those goroutines have exited.
+	// Drain each cohort before creating the next, so the live-count bound
+	// remains valid while enumeration races with resumes and completion.
 	const program = `package main
 import("bytes";"context";"fmt";"os";"runtime";"runtime/metrics";"runtime/pprof";"runtime/trace";"strconv";"strings";"sync/atomic";"time")
 const children=32
@@ -36,7 +39,7 @@ func child(p *int,done chan int){if n:=left(260,p);n!=*p+260{panic("left result"
 //go:noinline
 func launch(done chan int){for i:=0;i<children;i++{p:=new(int);*p=i;go child(p,done)}}
 var entry=launch
-func producer(){goto body;body:done:=make(chan int);for batch:=0;batch<24;batch++{entry(done);var seen [children]bool;for i:=0;i<children;i++{n:=<-done;if n<0||n>=children||seen[n]{panic("batch duplicate")};seen[n]=true}};completed.Store(true)}
+func producer(){goto body;body:cohortBaseline:=runtime.NumGoroutine();done:=make(chan int);for batch:=0;batch<24;batch++{entry(done);var seen [children]bool;for i:=0;i<children;i++{n:=<-done;if n<0||n>=children||seen[n]{panic("batch duplicate")};seen[n]=true};deadline:=time.Now().Add(10*time.Second);for runtime.NumGoroutine()!=cohortBaseline{if time.Now().After(deadline){panic("task cohort did not drain")};runtime.Gosched()}};completed.Store(true)}
 func unhosted()int{samples:=[]metrics.Sample{{Name:"/sched/coro/goroutines/unhosted:goroutines"}};metrics.Read(samples);if samples[0].Value.Kind()==metrics.KindUint64{return int(samples[0].Value.Uint64())};return 0}
 func main(){goto body;body:
  if path:=os.Getenv("TRACE_FILE");path!=""{f,e:=os.Create(path);if e!=nil{panic(e)};if e=trace.Start(f);e!=nil{panic(e)};defer f.Close();defer trace.Stop()}
