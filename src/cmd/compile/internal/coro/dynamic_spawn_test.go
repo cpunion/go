@@ -169,6 +169,13 @@ func TestLowerDynamicSpawn(t *testing.T) {
 					if call, ok := node.(*ir.CallExpr); ok {
 						if name := ir.StaticCalleeName(call.Fun); name != nil {
 							calls[name.Sym().Name] = true
+							if name.Sym().Name == "coroLookupFunction" {
+								boxed, ok := call.Args[0].(*ir.ConvExpr)
+								if !ok || boxed.Op() != ir.OCONVIFACE ||
+									!types.Identical(boxed.X.Type(), callableSignature(first)) {
+									t.Error("open spawn lookup lost the frozen source function signature")
+								}
+							}
 						}
 					}
 				})

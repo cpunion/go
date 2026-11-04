@@ -5152,3 +5152,10 @@ does not add a task registry or change physical stack scanning.
 Pure-native tasks with no ordinary host, source projection while an allocated
 host waits for a native operation, creation ancestry and full native trace and
 profile integration remain separate work. Performance is deferred.
+
+Open `go` lowering uses the same saved, validated operand-wrapper target as
+closed factory dispatch. Closure reparenting changes the wrapper's capture
+ownership, so validating it again at emission can lose the source function and
+arguments and dispatch the wrapper's zero-argument ordinary entry instead.
+The saved target preserves the source signature, frozen arguments and existing
+nil-startup behavior while each native companion retains its independent gate.

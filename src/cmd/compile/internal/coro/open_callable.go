@@ -21,10 +21,11 @@ func lowerOpenAwait(call *ir.CallExpr, statement ir.Node, ctx ir.Node,
 }
 
 // A go statement has already frozen its operands in the source goroutine.
+// call is the validated target saved before reparenting its operand wrapper.
 // Both native and opaque children are independently tracked logical tasks.
 func lowerOpenSpawn(call *ir.CallExpr, ctx ir.Node, resume *ir.Func,
 	edit func(ir.Node) ir.Node) (ir.Nodes, ir.Node, error) {
-	return lowerOpenCall(unwrapGoCall(call), nil, ctx, resume, edit, true)
+	return lowerOpenCall(call, nil, ctx, resume, edit, true)
 }
 
 func lowerOpenCall(call *ir.CallExpr, statement ir.Node, ctx ir.Node,

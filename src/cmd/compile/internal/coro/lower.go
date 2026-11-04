@@ -4450,7 +4450,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						body = append(body, edit(init))
 					}
 					if candidate.openCalls[call] {
-						setup, action, err := lowerOpenSpawn(call, ctx, resume, edit)
+						// Use the operands validated before closure reparenting,
+						// just as the closed factory path does. The wrapper's
+						// captures no longer describe the original caller here.
+						setup, action, err := lowerOpenSpawn(goCalls[call], ctx, resume, edit)
 						if err != nil {
 							return err
 						}
