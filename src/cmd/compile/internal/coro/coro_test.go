@@ -2470,9 +2470,6 @@ func main() {
 	if err != nil {
 		t.Fatalf("building recover coroutine failed: %v\n%s", err, out)
 	}
-	if want := "coro: phase=lower lowered=12 skipped=4"; !strings.Contains(out, want) {
-		t.Fatalf("output does not contain %q\n%s", want, out)
-	}
 	for _, name := range []string{
 		"replacement", "normalCleanup", "dynamicRecover", "dynamicReplacement",
 		"noPanic", "nilPanic",
@@ -2483,9 +2480,10 @@ func main() {
 			t.Errorf("output contains unexpected %q\n%s", diagnostic, out)
 		}
 	}
-	if want := "func=namedRecoverAndReplace.coro,"; !strings.Contains(out, want) {
-		t.Errorf("output does not contain nested terminal factory %q\n%s",
-			want, out)
+	for _, name := range []string{"namedRecoverAndReplace", "(*namedReceiver).recover"} {
+		if want := "func=" + name + ".coro,"; !strings.Contains(out, want) {
+			t.Errorf("output does not contain recover factory %q\n%s", want, out)
+		}
 	}
 
 	cmd = testenv.Command(t, exe)

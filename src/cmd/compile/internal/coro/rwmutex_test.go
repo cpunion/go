@@ -180,14 +180,14 @@ func main() {
 				if err != nil {
 					t.Fatalf("nm: %v\n%s", err, symbols)
 				}
-				for _, name := range []string{"Lock", "Unlock", "RLock"} {
+				// Non-suspending methods also expose native activations for
+				// open Locker calls and direct recover-preserving defers.
+				for _, name := range []string{"Lock", "Unlock", "RLock", "RUnlock", "rUnlockSlow"} {
 					if !strings.Contains(string(symbols), "sync.(*RWMutex)."+name+".coro") {
 						t.Fatalf("missing native RWMutex.%s", name)
 					}
-				}
-				for _, name := range []string{"RUnlock", "rUnlockSlow"} {
-					if strings.Contains(string(symbols), "sync.(*RWMutex)."+name+".coro") {
-						t.Fatalf("non-handoff RWMutex.%s has an unnecessary coroutine entry", name)
+					if linkedCoroStackUnsafe(t, exe, "sync.(*RWMutex)."+name+".coro.stackgate") {
+						t.Fatalf("RWMutex.%s lost native admission", name)
 					}
 				}
 			}
