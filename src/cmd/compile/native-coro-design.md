@@ -5125,6 +5125,10 @@ Goexit boundaries, then elides the completed scheduler through its public
 source root. Independent go roots do not inherit the creator chain. Ordinary
 and native channel-send entry functions remain their real runtime implementation
 PCs; source-name comparison does not fabricate an ordinary entry PC for a
-native fast path. Full terminal PC storage has depth-dependent cold memory
+native fast path. A blocked native send completes through the operation
+protocol and retains its complete source chain without the ordinary physical
+`chansend` activations. Each execution's skip and buffer queries must match
+its own complete PC sequence, including these implementation differences.
+Full terminal PC storage has depth-dependent cold memory
 cost. Performance is deferred. Parked task enumeration, creation ancestry,
 complete native profiles, trace, race and long-service validation remain open.

@@ -5,10 +5,12 @@
 package coro_test
 
 import (
+	"fmt"
 	"internal/testenv"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -133,6 +135,11 @@ func main(){goto body;body:done:=make(chan struct{});go func(){defer close(done)
 		{"outer-replacement", `panic("unused")`, "", `panic("original")`, `defer func(){panic("outer")}();entry(220,replacement)`},
 		{"outer-goexit", `panic("unused")`, "", "runtime.Goexit()", `defer func(){panic("outer")}();entry(220,replacement)`},
 		{"bounds", `panic("unused")`, "", "var a []int;println(a[n])", "entry(16,replacement)"},
+		{"nil-pointer", `panic("unused")`, "", "var p *int;println(*p)", "entry(220,replacement)"},
+		{"divide-zero", `panic("unused")`, "", "println(1/n)", "entry(220,replacement)"},
+		{"negative-make", `panic("unused")`, "", "println(len(make([]int,n-1)))", "entry(220,replacement)"},
+		{"type-assert", `panic("unused")`, "", `var x any="text";println(x.(int))`, "entry(220,replacement)"},
+		{"nil-call", `panic("unused")`, "", "f()", "entry(220,nil)"},
 		{"channel", `panic("unused")`, "", "c:=make(chan int);close(c);c<-1", "entry(16,replacement)"},
 		{"bound-host", `panic("unused")`, "", "f()", "entry(220,T{}.Boom)"},
 		{"bound-native", `panic("unused")`, "", "f()", "entry(220,T{}.Native)"},
@@ -167,6 +174,95 @@ func main(){goto body;body:done:=make(chan struct{});entry(child,take,done);<-do
 	testTerminalSourcePCProgram(t, program, []string{"recursive", "child", "launch"})
 }
 
+func TestTerminalSourceCallersBlockedChannel(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native coroutine executor is not supported")
+	}
+	const program = `package main
+import("runtime";"fmt";"path/filepath";"strings";"time")
+var sendChannel chan int
+var sendReady chan struct{}
+//go:noinline
+func recursive(n int){runtime.Gosched();if n>0{recursive(n-1);return};close(sendReady);sendChannel<-1}
+var entry=recursive
+//go:noinline
+func inspect(){goto body;body:for _,q:=range [][2]int{{0,512},{1,512},{3,512},{49,7},{100,512},{219,7},{225,512},{1000,512}}{pcs:=make([]uintptr,q[1]);n:=runtime.Callers(q[0],pcs);fmt.Printf("query %d %d %d\n",q[0],q[1],n);if n==0{continue};frames:=runtime.CallersFrames(pcs[:n]);for{f,more:=frames.Next();if strings.HasPrefix(f.Function,"main."){fmt.Printf("%s %s:%d\n",f.Function,filepath.Base(f.File),f.Line)}else{fmt.Println(f.Function)};if !more{break}}}}
+func worker(){goto body;body:defer func(){inspect();if value:=recover();fmt.Sprint(value)!="send on closed channel"{panic("missing send panic")}}();sendChannel=make(chan int);sendReady=make(chan struct{});go func(){<-sendReady;runtime.GC();time.Sleep(20*time.Millisecond);close(sendChannel)}();entry(220)}
+func main(){goto body;body:done:=make(chan struct{});go func(){defer close(done);worker()}();<-done}
+`
+	testTerminalSourcePCProgramWithOracle(t, program, []string{"recursive"}, func(t *testing.T, want, got string) {
+		ordinary := terminalSourcePCQueries(t, want)
+		native := terminalSourcePCQueries(t, got)
+		// A blocked native send finishes as a pending operation. Its next
+		// task owner captures the source chain without a physical chansend
+		// activation. Preserve those real PCs instead of inventing the two
+		// private ordinary channel-send frames. Every other frame must match.
+		// If closing wins before the send parks, its synchronous private
+		// frames are valid too; scheduling must not change the source checks.
+		var expected []string
+		for _, frame := range ordinary {
+			if frame != "runtime.chansend" && frame != "runtime.<channel-send-entry>" {
+				expected = append(expected, frame)
+			}
+		}
+		if len(ordinary)-len(expected) != 2 || !slices.Equal(native, expected) && !slices.Equal(native, ordinary) {
+			t.Fatalf("blocked channel source chain differs\ngot:\n%s\nwant:\n%s", strings.Join(native, "\n"), strings.Join(expected, "\n"))
+		}
+		recursive := 0
+		for _, frame := range native {
+			if strings.HasPrefix(frame, "main.recursive ") {
+				recursive++
+			}
+		}
+		if recursive != 221 {
+			t.Fatalf("blocked channel retained %d recursive frames, want 221", recursive)
+		}
+	})
+}
+
+// Independently check skip and buffer limits against this execution's complete
+// stack. Private runtime activations can differ between ordinary synchronous
+// calls and native operation completion, while each query must remain exact.
+func terminalSourcePCQueries(t *testing.T, text string) []string {
+	t.Helper()
+	type query struct {
+		skip, size, count int
+		frames            []string
+	}
+	var queries []query
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		if strings.HasPrefix(line, "query ") {
+			var q query
+			if n, err := fmt.Sscanf(line, "query %d %d %d", &q.skip, &q.size, &q.count); err != nil || n != 3 {
+				t.Fatalf("invalid query %q: %v", line, err)
+			}
+			queries = append(queries, q)
+		} else {
+			if len(queries) == 0 || line == "" {
+				t.Fatalf("invalid frame %q", line)
+			}
+			q := &queries[len(queries)-1]
+			q.frames = append(q.frames, line)
+		}
+	}
+	if len(queries) == 0 || queries[0].skip != 0 || queries[0].size != 512 {
+		t.Fatal("missing complete terminal PC query")
+	}
+	full := queries[0].frames
+	for _, q := range queries {
+		if q.skip < 0 || q.size < 0 {
+			t.Fatal("negative query argument")
+		}
+		lo := min(q.skip, len(full))
+		hi := min(lo+q.size, len(full))
+		if q.count != len(q.frames) || !slices.Equal(q.frames, full[lo:hi]) {
+			t.Fatalf("skip %d size %d: count or complete-stack slice differs", q.skip, q.size)
+		}
+	}
+	return full
+}
+
 // Runtime channel sends have distinct ordinary and native private entry
 // functions. Keep that real implementation frame and its effect on skip and
 // buffer counts, while comparing all user function names and positions exactly.
@@ -176,6 +272,11 @@ func normalizeTerminalChannelPC(text string) string {
 }
 
 func testTerminalSourcePCProgram(t *testing.T, source string, nativeOwners []string) {
+	t.Helper()
+	testTerminalSourcePCProgramWithOracle(t, source, nativeOwners, nil)
+}
+
+func testTerminalSourcePCProgramWithOracle(t *testing.T, source string, nativeOwners []string, oracle func(*testing.T, string, string)) {
 	t.Helper()
 	dir := t.TempDir()
 	file := filepath.Join(dir, "main.go")
@@ -215,7 +316,9 @@ func testTerminalSourcePCProgram(t *testing.T, source string, nativeOwners []str
 				if config.name == "ordinary" && want == "" {
 					want = text
 				}
-				if text != want {
+				if oracle != nil && config.name != "ordinary" {
+					oracle(t, want, text)
+				} else if text != want {
 					t.Fatalf("P%s: terminal PC source and skip oracle differs\ngot:\n%s\nwant:\n%s", p, text, want)
 				}
 			}
