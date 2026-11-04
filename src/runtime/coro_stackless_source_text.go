@@ -44,6 +44,9 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 		}
 	}
 	if state.afterDriver {
+		if funcname(f) == "runtime.coroRun" {
+			return true, false
+		}
 		state.afterDriver = false
 		if source.valid() && source.entry() == state.rootPC {
 			return true, false
@@ -70,6 +73,26 @@ func stacklessCoroTracebackText(u *unwinder, state *stacklessCoroTracebackState,
 				state.panicStarted = false
 				return true, false
 			}
+		}
+	}
+	if funcname(f) == "runtime.(*stacklessCoroHost).drive" {
+		if host := stacklessCoroParkedSource(u.g.ptr()); host != nil {
+			if trace := host.parkedTrace; trace != nil {
+				if !printStacklessCoroPanicTrace(u, trace, commit) {
+					return true, true
+				}
+				state.rootPC, state.bridges = trace.rootPC, true
+				return true, false
+			}
+			rootPC, complete := walkStacklessCoroSourceFrames(host.parkedTask, func(f funcInfo, pc uintptr) bool {
+				return printStacklessCoroSourceFrame(u, f, pc, showRuntime, &first, commit)
+			})
+			if !complete {
+				// Count/print clones replay this expansion at the same driver.
+				return true, true
+			}
+			state.rootPC, state.bridges = rootPC, true
+			return true, false
 		}
 	}
 	if info == nil {

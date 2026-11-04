@@ -5149,9 +5149,8 @@ do not inherit their creator's activation chain, and completion through return,
 panic recovery or Goexit releases the user-goroutine count. This classification
 does not add a task registry or change physical stack scanning.
 
-Pure-native tasks with no ordinary host, source projection while an allocated
-host waits for a native operation, creation ancestry and full native trace and
-profile integration remain separate work. Performance is deferred.
+Pure-native tasks with no ordinary host, creation ancestry and full native
+trace and profile integration remain separate work. Performance is deferred.
 
 Open `go` lowering uses the same saved, validated operand-wrapper target as
 closed factory dispatch. Closure reparenting changes the wrapper's capture
@@ -5159,3 +5158,45 @@ ownership, so validating it again at emission can lose the source function and
 arguments and dispatch the wrapper's zero-argument ordinary entry instead.
 The saved target preserves the source signature, frozen arguments and existing
 nil-startup behavior while each native companion retains its independent gate.
+
+### Source stacks while an ordinary host waits for native work
+
+An allocated ordinary host keeps ownership of its structured lineage when a
+native operation suspends the current leaf. A no-work `runTasks` return exposes
+that leaf to the cold host G-state. The host clears this reference before
+invoking ordinary code, resuming queued work or completing, so it never retains
+a recycled task or completed source frame. Other exits, including a recovered
+panic, return no suspended leaf. No native context or executor G-state field
+is added; the ordinary host extension gains two traced pointers.
+
+Text and PC projection use this reference only when the stopped host's waiting
+sudog identifies its private wake channel. Operation producers may ready the
+task, but cannot resume or recycle its frames while this host is stopped.
+PC collection finds the physical host driver before applying skip or buffer
+limits, preventing private wake frames from filling a small profile. Text
+projection expands at that driver and preserves the existing first/last-frame
+counting and elision rules. Public roots retain their ordinary caller suffix;
+independent roots do not acquire a creator activation chain. Physical GC,
+panic recovery and runtime-failure tracebacks keep their existing unwinder.
+Closure-shaped public entries include a `coroRun` adapter above `coroRunFrame`;
+the duplicate-root check spans that adapter before consuming the source entry.
+
+Native cleanup can suspend after the incoming panic or Goexit released its
+original frames. Before parking, the host inspects the retained terminal
+metadata under the scheduler lock. Only such a lineage needs an immutable
+snapshot combining live cleanup positions with the incoming terminal chain;
+ordinary waits keep walking their live frames without a new snapshot. This
+cold snapshot contains source PCs rather than user objects. The host clears it
+with the parked task before further execution. Profilers therefore read
+stable source data without locking or allocating during the walk, including
+the interval after a deferred function has recovered its incoming panic.
+A separate regression parks native cleanup before and after direct recover,
+checking incoming panic/Goexit chains and the cleanup source line at both waits.
+
+The regression covers native channel send and receive, public and independent
+hosts, shallow and deep source chains, return/panic/Goexit cleanup, live-frame
+GC roots and finalizer release. Native-only one-PC profiles check that capacity
+is applied after removing the private receive. This covers allocated hosts;
+pure-native tasks without hosts, creation ancestry and complete native
+profiling, trace and race support remain separate work. The cold host allocation
+cost and broader performance work are deferred.
