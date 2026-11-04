@@ -5132,3 +5132,30 @@ its own complete PC sequence, including these implementation differences.
 Full terminal PC storage has depth-dependent cold memory
 cost. Performance is deferred. Parked task enumeration, creation ancestry,
 complete native profiles, trace, race and long-service validation remain open.
+
+### Independent ordinary-host enumeration
+
+An independent native `go` task that needs an ordinary callback receives its
+own Go host. That host has a dedicated, non-inlined creation helper with a
+stable entry closure. The runtime classifies this entry as a user goroutine
+from allocation through exit, so `NumGoroutine`, `Stack(all=true)` and
+`GoroutineProfile` include the host throughout the same lifetime. The trace
+summary's system-goroutine classifier uses the same entry identity.
+
+While an ordinary callback is blocked, its source continuation chain is stable
+and uses the existing logical text and PC projection. Enumeration retains the
+ordinary bounded text window and profile buffer contract. Independent hosts
+do not inherit their creator's activation chain, and completion through return,
+panic recovery or Goexit releases the user-goroutine count. This classification
+does not add a task registry or change physical stack scanning.
+
+Pure-native tasks with no ordinary host, source projection while an allocated
+host waits for a native operation, creation ancestry and full native trace and
+profile integration remain separate work. Performance is deferred.
+
+Open `go` lowering uses the same saved, validated operand-wrapper target as
+closed factory dispatch. Closure reparenting changes the wrapper's capture
+ownership, so validating it again at emission can lose the source function and
+arguments and dispatch the wrapper's zero-argument ordinary entry instead.
+The saved target preserves the source signature, frozen arguments and existing
+nil-startup behavior while each native companion retains its independent gate.

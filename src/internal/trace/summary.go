@@ -695,5 +695,5 @@ func IsSystemGoroutine(entryFn string) bool {
 	// This mimics runtime.isSystemGoroutine as closely as
 	// possible.
 	// Also, locked g in extra M (with empty entryFn) is system goroutine.
-	return entryFn == "" || entryFn != "runtime.main" && strings.HasPrefix(entryFn, "runtime.")
+	return entryFn == "" || entryFn != "runtime.main" && entryFn != "runtime.stacklessCoroHostStart.func1" && strings.HasPrefix(entryFn, "runtime.")
 }
