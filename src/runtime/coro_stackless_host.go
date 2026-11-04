@@ -216,9 +216,19 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 	task.state = stacklessCoroTaskWaiting
 	unlock(&s.lock)
 	if start {
-		go h.run()
+		stacklessCoroHostStart(h)
 	}
 	return stacklessCoroActionHost
+}
+
+// Keep the host's entry closure in one non-inlined function. Its stable entry
+// identifies a user goroutine from newproc1 through goexit, so goroutine counts
+// and concurrent profiles use the same classification for its whole lifetime.
+// Keep isSystemGoroutine and internal/trace.IsSystemGoroutine in sync.
+//
+//go:noinline
+func stacklessCoroHostStart(h *stacklessCoroHost) {
+	go func() { h.run() }()
 }
 
 func (s *stacklessCoroScheduler) hostHandoff(task *stacklessCoroTask) {

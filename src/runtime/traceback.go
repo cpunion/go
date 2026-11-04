@@ -1554,7 +1554,13 @@ func isSystemGoroutine(gp *g, fixed bool) bool {
 		}
 		return !gp.runningCleanups.Load()
 	}
-	return stringslite.HasPrefix(funcname(f), "runtime.")
+	name := funcname(f)
+	if name == "runtime.stacklessCoroHostStart.func1" {
+		// This runtime entry owns an independent source goroutine while
+		// its ordinary callbacks and structured continuations execute.
+		return false
+	}
+	return stringslite.HasPrefix(name, "runtime.")
 }
 
 // SetCgoTraceback records three C functions to use to gather
