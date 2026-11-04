@@ -630,6 +630,7 @@ func coroRun(resume stacklessCoroResume) {
 func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	frameSize uintptr) bool {
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
+	s.registerPublicGoroutine()
 	s = runStacklessCoroRoot(s)
 	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
 		if !s.drained() {
@@ -4649,6 +4650,9 @@ func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bo
 		task.terminal != stacklessCoroTerminalNone || task.goexit {
 		return false
 	}
+	// Public source records exist even when no operation or child has made
+	// this scheduler shared. Unlink before clearing or reusing its root.
+	stacklessCoroCompleteLogicalFrame(task)
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	if !task.hasFlag(stacklessCoroTaskCacheFrame) {

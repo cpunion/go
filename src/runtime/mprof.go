@@ -1625,7 +1625,7 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 
 		// Save other goroutines.
 		forEachGRace(func(gp1 *g) {
-			if !isOK(gp1) || stacklessCoroSnapshotHost(gp1) {
+			if !isOK(gp1) || stacklessCoroSnapshotGoroutine(gp1) {
 				return
 			}
 
@@ -1726,7 +1726,7 @@ func Stack(buf []byte, all bool) int {
 			traceback(pc, sp, 0, gp)
 			if all {
 				tracebacksomeothers(gp, func(other *g) bool {
-					return !stacklessCoroSnapshotHost(other)
+					return !stacklessCoroSnapshotGoroutine(other)
 				})
 				stacklessCoroTracebackGoroutines()
 			}

@@ -17,9 +17,10 @@ import (
 // Independent source go statements have an identity before they need an
 // ordinary stack. Keep this cold metadata outside the fixed task and native
 // executor layouts. Typed links root the suspended source until completion;
-// no completed record or user label is retained in a cache.
+// completed public records are cleared before bounded reuse.
 type stacklessCoroGoroutine struct {
 	next             *stacklessCoroGoroutine
+	publicNext       *stacklessCoroGoroutine
 	root, leaf       *stacklessCoroTask
 	scheduler        *stacklessCoroScheduler
 	owner            *g
@@ -33,11 +34,14 @@ type stacklessCoroGoroutine struct {
 }
 
 var stacklessCoroGoroutines struct {
-	lock     mutex
-	buckets  [256]*stacklessCoroGoroutine
-	pending  *stacklessCoroHost
-	unhosted atomic.Int64
-	records  atomic.Int64
+	lock            mutex
+	buckets         [256]*stacklessCoroGoroutine
+	publicBuckets   [256]*stacklessCoroGoroutine
+	publicFree      *stacklessCoroGoroutine
+	publicFreeCount int
+	pending         *stacklessCoroHost
+	unhosted        atomic.Int64
+	records         atomic.Int64
 }
 
 func init() {
@@ -46,6 +50,42 @@ func init() {
 
 func stacklessCoroGoroutineBucket(root *stacklessCoroTask) **stacklessCoroGoroutine {
 	return &stacklessCoroGoroutines.buckets[(uintptr(unsafe.Pointer(root))>>3)%256]
+}
+
+func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroGoroutine {
+	return &stacklessCoroGoroutines.publicBuckets[(uintptr(unsafe.Pointer(gp))>>3)%256]
+}
+
+// Register before the first native episode, including roots that never spawn
+// an independent task. The original ordinary G owns the identity and count.
+// Hand-written runtime continuations without source metadata need no record
+// until they spawn a child. Reuse only completely cleared public records.
+func (s *stacklessCoroScheduler) registerPublicGoroutine() {
+	f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
+	info := stacklessCoroSourceFrame(f)
+	if info == nil || info.flags&abi.CoroSourceResume == 0 || !stacklessCoroSourceFunc(f, info).valid() {
+		return
+	}
+	lock(&stacklessCoroGoroutines.lock)
+	s.registerPublicGoroutineLocked(getg(), &s.root)
+	unlock(&stacklessCoroGoroutines.lock)
+}
+
+func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stacklessCoroTask) *stacklessCoroGoroutine {
+	r := stacklessCoroGoroutines.publicFree
+	if r != nil {
+		stacklessCoroGoroutines.publicFree = r.next
+		stacklessCoroGoroutines.publicFreeCount--
+	} else {
+		r = new(stacklessCoroGoroutine)
+	}
+	*r = stacklessCoroGoroutine{root: &s.root, leaf: leaf, scheduler: s,
+		goid: gp.goid, parentGoid: gp.parentGoid, gopc: gp.gopc,
+		labels: gp.labels, ancestors: gp.ancestors, publicG: gp, public: true}
+	stacklessCoroInsertGoroutine(r)
+	p := stacklessCoroPublicGoroutineBucket(gp)
+	r.publicNext, *p = *p, r
+	return r
 }
 
 func stacklessCoroLogicalRoot(task *stacklessCoroTask) *stacklessCoroTask {
@@ -72,9 +112,9 @@ func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
 	stacklessCoroGoroutines.records.Add(1)
 }
 
-// Called with s.lock before publishing a newly spawned task. The first spawn
-// also remembers the public caller, which can leave the scheduler before its
-// independent children create further goroutines.
+// Called with s.lock before publishing a newly spawned task. Source roots
+// already remember their public caller; hand-written roots do so lazily here.
+// The caller can leave before independent children create further goroutines.
 func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stacklessCoroTask, callerpc uintptr, callersp unsafe.Pointer) {
 	gp := getg()
 	caller := stacklessCoroPublicCaller(gp)
@@ -85,10 +125,7 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 		if root != &s.root {
 			throw("runtime: missing coroutine creator identity")
 		}
-		creator = &stacklessCoroGoroutine{root: root, leaf: parent, scheduler: s,
-			goid: caller.goid, parentGoid: caller.parentGoid, gopc: caller.gopc,
-			labels: caller.labels, ancestors: caller.ancestors, publicG: caller, public: true}
-		stacklessCoroInsertGoroutine(creator)
+		creator = s.registerPublicGoroutineLocked(caller, parent)
 	}
 	// coroSpawn may add an adapter above the resume. Walk on g0 with a
 	// typed stack pointer so stack growth cannot invalidate the cursor.
@@ -202,7 +239,23 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 				stacklessCoroGoroutines.unhosted.Add(-1)
 			}
 			stacklessCoroGoroutines.records.Add(-1)
+			public := r.public
+			if public {
+				p := stacklessCoroPublicGoroutineBucket(r.publicG)
+				for *p != r {
+					if *p == nil {
+						throw("runtime: missing public coroutine identity")
+					}
+					p = &(*p).publicNext
+				}
+				*p = r.publicNext
+			}
 			*r = stacklessCoroGoroutine{}
+			if public && stacklessCoroGoroutines.publicFreeCount < stacklessCoroWarmExecutorCount {
+				r.next = stacklessCoroGoroutines.publicFree
+				stacklessCoroGoroutines.publicFree = r
+				stacklessCoroGoroutines.publicFreeCount++
+			}
 		}
 	}
 	unlock(&stacklessCoroGoroutines.lock)
@@ -309,6 +362,9 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 				trace.append(f, f.entry())
 			}
 		}
+		if r.public {
+			trace.appendPublicCaller(r.publicG)
+		}
 		if pass == 0 {
 			pcs := make([]uintptr, trace.pcCount)
 			*trace = stacklessCoroPanicTrace{pcs: pcs}
@@ -317,18 +373,76 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 	return trace
 }
 
-// Requires STW. Active native resumes on an ordinary host still have their
-// source activations in heap frames. Capture them while those frames and the
-// registry are stable, instead of exposing the private resume stack during the
-// subsequent concurrent walk. Ordinary callbacks retain their physical stack.
-func stacklessCoroSnapshotHost(gp *g) bool {
+// The world is stopped. Append the original ordinary caller after the
+// logical source root exactly once. The public entry and optional coroRun
+// adapter are implementation frames between that root and its caller.
+func (trace *stacklessCoroPanicTrace) appendPublicCaller(gp *g) {
+	var u unwinder
+	bridges, afterDriver := true, false
+	for u.init(gp, unwindSilentErrors); u.valid(); u.next() {
+		f, pc := u.frame.fn, u.symPC()
+		info := stacklessCoroSourceFrame(f)
+		source := stacklessCoroSourceFunc(f, info)
+		if bridges {
+			if source.valid() && source.entry() == trace.rootPC {
+				bridges = false
+				continue
+			}
+			if funcname(f) == "runtime.coroRunFrame" {
+				bridges, afterDriver = false, true
+			}
+			continue
+		}
+		if afterDriver {
+			if funcname(f) == "runtime.coroRun" {
+				continue
+			}
+			afterDriver = false
+			if source.valid() && source.entry() == trace.rootPC {
+				continue
+			}
+		}
+		if info != nil && info.flags&abi.CoroSourceCopy != 0 && source.valid() {
+			file, line := funcline1(f, pc, false)
+			f, pc = source, stacklessCoroSourcePC(source, file, line)
+		}
+		trace.append(f, pc)
+	}
+}
+
+// Requires STW. Capture heap activations while the frames and registry are
+// stable. Ordinary callbacks retain their physical stack and bridge projection.
+// Public entries use their original G even before allocating an ordinary host.
+func stacklessCoroSnapshotRecord(gp *g) *stacklessCoroGoroutine {
 	assertWorldStopped()
 	state := stacklessCoroHostState(gp)
-	if state == nil || state.host == nil || state.ordinaryDepth != 0 {
-		return false
+	if state != nil {
+		if state.ordinaryDepth != 0 {
+			return nil
+		}
+		if state.host != nil {
+			r := stacklessCoroGoroutineFor(state.host.root)
+			if r != nil && !r.public && r.hostG == gp {
+				return r
+			}
+		}
 	}
-	r := stacklessCoroGoroutineFor(state.host.root)
-	return r != nil && !r.public && r.hostG == gp
+	for r := *stacklessCoroPublicGoroutineBucket(gp); r != nil; r = r.publicNext {
+		if r.publicG != gp {
+			continue
+		}
+		f := findfunc(stacklessCoroResumeIdentity(r.root.resume).fn)
+		info := stacklessCoroSourceFrame(f)
+		if info != nil && info.flags&abi.CoroSourceResume != 0 && stacklessCoroSourceFunc(f, info).valid() {
+			return r
+		}
+		return nil
+	}
+	return nil
+}
+
+func stacklessCoroSnapshotGoroutine(gp *g) bool {
+	return stacklessCoroSnapshotRecord(gp) != nil
 }
 
 // Requires STW. A host created after this snapshot is already satisfied by
@@ -339,7 +453,11 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 	n := 0
 	for _, bucket := range stacklessCoroGoroutines.buckets {
 		for r := bucket; r != nil; r = r.next {
-			if r.public || r.hosted && !stacklessCoroSnapshotHost(r.hostG) {
+			gp := r.hostG
+			if r.public {
+				gp = r.publicG
+			}
+			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
 				continue
 			}
 			trace := stacklessCoroLogicalTrace(r)
@@ -350,12 +468,12 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 			p[n].Stack = trace.pcs[:depth]
 			if labels != nil {
 				labels[n] = r.labels
-				if r.hosted {
-					labels[n] = r.hostG.labels
+				if gp != nil {
+					labels[n] = gp.labels
 				}
 			}
-			if r.hosted && concurrent {
-				r.hostG.goroutineProfiled.Store(goroutineProfileSatisfied)
+			if gp != nil && concurrent {
+				gp.goroutineProfiled.Store(goroutineProfileSatisfied)
 			}
 			n++
 		}
@@ -369,7 +487,11 @@ func stacklessCoroTracebackGoroutines() {
 	assertWorldStopped()
 	for _, bucket := range stacklessCoroGoroutines.buckets {
 		for r := bucket; r != nil; r = r.next {
-			if r.public || r.hosted && !stacklessCoroSnapshotHost(r.hostG) {
+			gp := r.hostG
+			if r.public {
+				gp = r.publicG
+			}
+			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
 				continue
 			}
 			status := "waiting"
@@ -378,7 +500,17 @@ func stacklessCoroTracebackGoroutines() {
 			} else if r.owner != nil {
 				status = "running"
 			}
-			print("\ngoroutine ", r.goid, " [", status, "]:\n")
+			print("\ngoroutine ", r.goid, " [", status)
+			if gp != nil && gp.lockedm != 0 {
+				print(", locked to thread")
+			}
+			print("]")
+			labels := r.labels
+			if gp != nil {
+				labels = gp.labels
+			}
+			printGoroutineLabels(labels)
+			print(":\n")
 			trace := stacklessCoroLogicalTrace(r)
 			for i := 0; i < trace.count; i++ {
 				uf, ok := trace.at(i)

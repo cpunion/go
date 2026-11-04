@@ -66,6 +66,7 @@ func main(){goto body;body:
    if line:=os.Getenv("EXPECTED_GO_LINE");line!=""&&!strings.Contains(strings.Split(current,"created by ")[1],"main.go:"+line+" "){panic("wrong creator line:\n"+current)}
    if line:=os.Getenv("EXPECTED_PARK_"+strconv.Itoa(stage));line!=""&&!strings.Contains(strings.Split(current,"main.recursive(")[1],"main.go:"+line){panic("wrong suspended source line:\n"+current)}
    if strings.Contains(current,".coro.")||strings.Contains(current,"runtime.stackless")||strings.Contains(current,"main.launch("){panic("private driver or creator leaked into stack")}
+   if !strings.Contains(strings.Split(current,"\n")[0],"{\"coro-enumeration\": inherited}"){panic("independent text labels lost")}
    if strings.Contains(os.Getenv("GODEBUG"),"tracebackancestors=2")&&!strings.Contains(stack,fmt.Sprintf("[originating from goroutine %d]",parent)){panic("missing source ancestor")};if strings.Contains(os.Getenv("GODEBUG"),"tracebackancestors=2")&&!strings.Contains(stack,"main.main("){panic("missing public caller in ancestry") }
   }
   if len(ids)!=children{panic(fmt.Sprintf("source stacks %d",len(ids)))};if stage==0{original=ids}else{for id:=range ids{if !original[id]{panic("host promotion changed logical goid")}}}
@@ -132,7 +133,7 @@ func main(){goto body;body:
 						if config.experiment == "coro" && config.extra == "" {
 							expect = "1"
 						}
-						run.Env = append(run.Environ(), "EXPECT_NATIVE="+expect, "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebackancestors=2")
+						run.Env = append(run.Environ(), "EXPECT_NATIVE="+expect, "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebackancestors=2,tracebacklabels=1")
 						for key, value := range lines {
 							run.Env = append(run.Env, key+"="+value)
 						}

@@ -15,4 +15,4 @@ func stacklessCoroUnhostedGoroutines() int64                                    
 func stacklessCoroInitHostG(*funcval, *g, *g) uint64                                        { return 0 }
 func stacklessCoroGoroutineProfile([]profilerecord.StackRecord, []unsafe.Pointer, bool) int { return 0 }
 func stacklessCoroTracebackGoroutines()                                                     {}
-func stacklessCoroSnapshotHost(*g) bool                                                     { return false }
+func stacklessCoroSnapshotGoroutine(*g) bool                                                { return false }

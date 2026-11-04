@@ -5246,10 +5246,9 @@ deep chains, undersized profile behavior, and frame release after return,
 recovered panic and Goexit. A concurrent churn regression checks active
 resumes, recursive frame transitions, host promotion, GC, profile depth and
 registry drainage with ordinary, native, checkptr, inlining, static lock
-ranking and race fallback builds. Internal hand-written continuations without source metadata still
-contribute a nonempty profile at their actual resume entry. Complete public-root
-source projection, native
-execution tracing, CPU profiles and native-task race instrumentation still
+ranking and race fallback builds. Internal hand-written continuations without
+source metadata still contribute a nonempty profile at their actual resume
+entry. Native execution tracing, CPU profiles and native-task race instrumentation still
 require additional integration. Registry allocation and scheduling costs have
 not been optimized.
 
@@ -5264,3 +5263,41 @@ task frames or user objects. Native task, frame and executor layouts do not
 change. Regression tests exercise detached cgo children with automatic,
 internal and external linking, and source stacks with external linking,
 checkptr, inlining and no DWARF; native entry gates remain required.
+
+### Public entry source stacks before host allocation
+
+A compiled public entry registers its source root before its first native
+episode, including entries that never create an independent task or allocate
+an ordinary host. This record uses the existing caller's goroutine ID, creator
+and count. It does not increment the unhosted-task or created-goroutine metrics.
+A second typed bucket index finds the active record from the original ordinary
+G without changing the task, frame, G state or native-context layouts.
+
+During the initial stopped-world interval, goroutine profiles and
+`Stack(all=true)` capture that source lineage and append the original ordinary
+caller suffix once. The public entry and optional `coroRun` adapter are omitted
+after the logical root. The physical G is then satisfied or skipped, avoiding
+a duplicate entry while the concurrent profiler runs. Current labels come from
+that G, including changes made by an ordinary callback. Text headers share the
+ordinary label quoting and `tracebacklabels` switch, and retain an allocated
+host's thread-lock indicator. Active ordinary calls retain their existing
+physical stack and source-bridge projection.
+
+Normal completion, panic, Goexit and private initial-root completion unlink
+the record before any source frame or scheduler can be cleared or reused.
+Only completely cleared public records enter a bounded cache; it retains no
+task, scheduler, G, label or ancestry references. Hand-written runtime roots
+without compiler source metadata still avoid registration until they create
+an independent child. Existing root allocation and pool checks remain in place.
+
+The regressions cover direct and captured-closure public entries, source
+recursion before and after an opaque host call, original identities and
+creator positions, full and one-PC profiles, bounded
+text elision, live label changes, GC retention, and release after return,
+recovered panic and Goexit. Concurrent sampling crosses active recursive frame
+transitions, host promotion and completion. A separate quick-completion case
+checks that repeated private roots disappear before their scheduler is reused.
+Ordinary, native, checkptr, inlining, static lock ranking and race fallback
+configurations share these source and lifetime checks. Signal-driven CPU
+profiles, fatal logical identities, native execution events and native-task
+race instrumentation remain separate work.
