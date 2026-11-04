@@ -518,7 +518,7 @@ func StacklessCoroDeferOutcomeErrorsForTest() []string {
 		lockInit(&s.lock, lockRankStacklessCoro)
 		root := &s.root
 		if hasValue {
-			s.terminalValues = map[*stacklessCoroTask]any{root: "panic"}
+			s.setTerminalValue(root, "panic")
 		}
 		_, _, _, reason := takeStacklessCoroDeferOutcome(s)
 		return reason
@@ -1090,10 +1090,11 @@ func CheckStacklessCoroSharedOperationPanicForTest() bool {
 	panicStacklessCoroOperation(op, value)
 
 	lock(&s.lock)
+	stored, _ := s.terminalValue(task)
 	localValid := s.freeOperationCount == stacklessCoroOperationCacheSize &&
 		task.state == stacklessCoroTaskRunnable &&
 		task.terminal == stacklessCoroTerminalPanic &&
-		s.terminalValues[task] == value
+		stored == value
 	unlock(&s.lock)
 	lock(&stacklessCoroSharedOperations.lock)
 	sharedValid := stacklessCoroSharedOperations.head == op &&
@@ -1774,7 +1775,7 @@ func DrainedStacklessCoroSchedulerForTest(pointer unsafe.Pointer) bool {
 	s := (*stacklessCoroScheduler)(pointer)
 	lock(&s.lock)
 	drained := s.drained() && s.liveSpawns == 0 && s.head == nil &&
-		s.tail == nil && s.reservedTasks == nil && len(s.terminalValues) == 0 &&
+		s.tail == nil && s.reservedTasks == nil && s.terminalValues == nil &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit
 	unlock(&s.lock)
 	return drained && s.blockingExecutors.Load() == 0 &&

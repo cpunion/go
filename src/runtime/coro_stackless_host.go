@@ -15,6 +15,7 @@ import "unsafe"
 type stacklessCoroHost struct {
 	scheduler    *stacklessCoroScheduler
 	root         *stacklessCoroTask
+	next         *stacklessCoroHost
 	head, tail   *stacklessCoroTask
 	wake         chan struct{}
 	pending      *stacklessCoroTask
@@ -57,15 +58,11 @@ func stacklessCoroOrdinaryHostCall(gp *g) bool {
 	return state != nil && state.ordinaryDepth != 0
 }
 
-type stacklessCoroHostMap map[*stacklessCoroTask]*stacklessCoroHost
-
 // Real panic values always have a nonnil task key. This private cold slot
 // shares the existing optional metadata pointer without growing every scheduler.
-func (s *stacklessCoroScheduler) hostsLocked() stacklessCoroHostMap {
-	if s.terminalValues == nil {
-		return nil
-	}
-	hosts, _ := s.terminalValues[nil].(stacklessCoroHostMap)
+func (s *stacklessCoroScheduler) hostsLocked() *stacklessCoroHost {
+	value, _ := s.terminalValue(nil)
+	hosts, _ := value.(*stacklessCoroHost)
 	return hosts
 }
 
@@ -76,7 +73,12 @@ func (s *stacklessCoroScheduler) taskHostLocked(task *stacklessCoroTask) *stackl
 	for task.parent != nil {
 		task = task.parent
 	}
-	return s.hostsLocked()[task]
+	for h := s.hostsLocked(); h != nil; h = h.next {
+		if h.root == task {
+			return h
+		}
+	}
+	return nil
 }
 
 func (s *stacklessCoroScheduler) taskHostCurrentLocked(task *stacklessCoroTask) bool {
@@ -175,18 +177,10 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 	for root.parent != nil {
 		root = root.parent
 	}
-	hosts := s.hostsLocked()
-	if hosts == nil {
-		hosts = make(stacklessCoroHostMap)
-		if s.terminalValues == nil {
-			s.terminalValues = make(map[*stacklessCoroTask]any)
-		}
-		s.terminalValues[nil] = hosts
-	}
-	h := hosts[root]
+	h := s.taskHostLocked(root)
 	start := false
 	if h == nil {
-		h = &stacklessCoroHost{scheduler: s, root: root}
+		h = &stacklessCoroHost{scheduler: s, root: root, next: s.hostsLocked()}
 		s.lifetime.Or(stacklessCoroLifetimeHostStarted)
 		if root == &s.root {
 			h.wake = s.rootDone
@@ -195,7 +189,7 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 			h.wake = make(chan struct{}, 1)
 			start = true
 		}
-		hosts[root] = h
+		s.setTerminalValue(nil, h)
 		// A pull comparison retains its active leaf in head instead of an
 		// ordinary queue. That leaf now belongs exclusively to this host.
 		if stacklessCoroIsPullComparison(s) && s.head == task {
@@ -237,8 +231,11 @@ func (s *stacklessCoroScheduler) hostHandoff(task *stacklessCoroTask) {
 }
 
 func (s *stacklessCoroScheduler) completeHostLocked(task *stacklessCoroTask) {
-	hosts := s.hostsLocked()
-	h := hosts[task]
+	var previous *stacklessCoroHost
+	h := s.hostsLocked()
+	for h != nil && h.root != task {
+		previous, h = h, h.next
+	}
 	if h == nil {
 		return
 	}
@@ -247,17 +244,21 @@ func (s *stacklessCoroScheduler) completeHostLocked(task *stacklessCoroTask) {
 	}
 	// Set done and remove the identity before an independent task is recycled.
 	h.done = true
-	delete(hosts, task)
-	if len(hosts) == 0 {
-		delete(s.terminalValues, nil)
+	if previous != nil {
+		previous.next = h.next
+	} else if h.next != nil {
+		s.setTerminalValue(nil, h.next)
+	} else {
+		s.clearTerminalValue(nil)
 	}
+	h.next = nil
 	h.notifyLocked()
 }
 
 func (s *stacklessCoroScheduler) waitPublicRoot() {
 	for !s.rootComplete() {
 		lock(&s.lock)
-		h := s.hostsLocked()[&s.root]
+		h := s.taskHostLocked(&s.root)
 		start := h != nil && !h.started
 		unlock(&s.lock)
 		if start {
@@ -318,10 +319,10 @@ func (h *stacklessCoroHost) driveThroughGoexit() {
 			// Goexit. Consume it once even when several Goexits are unwinding.
 			s := h.scheduler
 			lock(&s.lock)
-			value, panicking := s.terminalValues[h.root]
+			value, panicking := s.terminalValue(h.root)
 			if h.root.terminal == stacklessCoroTerminalPanic && panicking {
 				h.root.terminal = stacklessCoroTerminalNone
-				delete(s.terminalValues, h.root)
+				s.clearTerminalValue(h.root)
 				unlock(&s.lock)
 				panic(value)
 			}
@@ -400,13 +401,13 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 		}
 		if exiting {
 			task.terminal = stacklessCoroTerminalNone
-			delete(s.terminalValues, task)
+			s.clearTerminalValue(task)
 			task.goexit = true
 		} else if returned && deferred != nil {
 			// An injected incoming panic returns normally only when the
 			// direct source defer recovered it. Goexit remains sticky.
 			task.terminal = stacklessCoroTerminalNone
-			delete(s.terminalValues, task)
+			s.clearTerminalValue(task)
 		}
 		if task.terminal != stacklessCoroTerminalNone || task.goexit {
 			s.discardFusedFramesLocked(task)
@@ -420,7 +421,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 	}()
 	if deferred != nil {
 		lock(&s.lock)
-		value := s.terminalValues[task]
+		value, _ := s.terminalValue(task)
 		panicking, exiting := task.terminal == stacklessCoroTerminalPanic, task.goexit
 		unlock(&s.lock)
 		deferred(value, panicking, exiting)
