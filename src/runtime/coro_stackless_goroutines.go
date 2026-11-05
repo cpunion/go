@@ -533,7 +533,7 @@ func stacklessCoroTracebackGoroutines() {
 				printFuncName(name)
 				print("(...)\n\t", file, ":", line, "\n")
 			}
-			if f := findfunc(r.gopc); f.valid() {
+			if f := findfunc(r.gopc); f.valid() && r.goid != 1 {
 				printcreatedby1(f, r.gopc, r.parentGoid)
 			}
 			if r.ancestors != nil {

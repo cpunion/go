@@ -288,3 +288,175 @@ func main() {
 		})
 	}
 }
+
+func TestSourcePublicMainCreation(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
+		t.Skip("native coroutine executor is not supported")
+	}
+	const program = `package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
+)
+
+//go:noinline
+func ordinary() {
+	goto body
+body:
+	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("main-root", "promoted")))
+	runtime.Gosched()
+}
+
+var opaque = ordinary
+
+//go:noinline
+func recursive(depth int, ready chan int, first, second chan struct{}) {
+	runtime.Gosched()
+	if depth > 0 {
+		recursive(depth-1, ready, first, second)
+		return
+	}
+	ready <- 0
+	<-first
+	opaque()
+	ready <- 1
+	<-second
+}
+
+//go:noinline
+func root(ready chan int, first, second chan struct{}) {
+	recursive(8, ready, first, second)
+}
+
+var entry = root
+
+//go:noinline
+func makeEntry(bias int) func(chan int, chan struct{}, chan struct{}) {
+	return func(ready chan int, first, second chan struct{}) {
+		if bias != 42 {
+			panic("lost main closure capture")
+		}
+		root(ready, first, second)
+	}
+}
+
+//go:noinline
+func observe(ready chan int, first, second, done chan struct{}, closure int) {
+	goto body
+body:
+	for stage := 0; stage < 2; stage++ {
+		if <-ready != stage {
+			panic("main phase mismatch")
+		}
+		for i := 0; i < 5; i++ {
+			runtime.GC()
+			b := make([]byte, 1<<20)
+			n := runtime.Stack(b, true)
+			found := 0
+			for _, stack := range strings.Split(string(b[:n]), "\n\n") {
+				if !strings.HasPrefix(stack, "goroutine 1 [") {
+					continue
+				}
+				found++
+				current := strings.Split(stack, "[originating from")[0]
+				if strings.Contains(current, "created by ") {
+					panic("main goroutine has creator:\n" + current)
+				}
+				if strings.Count(current, "main.recursive(") != 9 || strings.Count(current, "main.root(") != 1 || strings.Count(current, "main.main(") != 1 || strings.Count(current, "main.makeEntry.func1(") != closure {
+					panic("main source chain:\n" + current)
+				}
+				label := "inherited"
+				if stage == 1 {
+					label = "promoted"
+				}
+				if !strings.Contains(strings.Split(current, "\n")[0], "{\"main-root\": "+label+"}") {
+					panic("main labels:\n" + current)
+				}
+				if strings.Contains(current, ".coro.") || strings.Contains(current, "runtime.stackless") || strings.Contains(current, "runtime.coroRun") {
+					panic("private main source:\n" + current)
+				}
+			}
+			if found != 1 {
+				panic(fmt.Sprintf("main stacks %d", found))
+			}
+		}
+		if stage == 0 {
+			close(first)
+		} else {
+			close(second)
+		}
+	}
+	close(done)
+}
+
+func main() {
+	goto body
+body:
+	closure, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	if closure == 1 {
+		entry = makeEntry(42)
+	}
+	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("main-root", "inherited")))
+	ready := make(chan int)
+	first, second, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go observe(ready, first, second, done, closure)
+	entry(ready, first, second)
+	<-done
+	fmt.Println("public-main-creation-ok", closure)
+}
+`
+	dir := t.TempDir()
+	file := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(file, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, config := range []struct{ name, experiment, flags, extra string }{
+		{"ordinary", "nocoro", "-l", ""},
+		{"native", "coro", "-l -d=coro=4", ""},
+		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2", ""},
+		{"inline", "coro", "-d=coro=4", ""},
+		{"lockrank", "coro,staticlockranking", "-l -d=coro=4", ""},
+		{"ordinary-race", "nocoro", "-l", "-race"},
+		{"coro-race", "coro", "-l -d=coro=4", "-race"},
+	} {
+		t.Run(config.name, func(t *testing.T) {
+			exe := filepath.Join(dir, config.name)
+			args := []string{"build", "-gcflags=" + config.flags, "-o", exe}
+			if config.extra != "" {
+				args = append(args, config.extra)
+			}
+			build := testenv.Command(t, testenv.GoToolPath(t), append(args, file)...)
+			build.Env = append(build.Environ(), "GOEXPERIMENT="+config.experiment, "GOWORK=off")
+			if data, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("build: %v\n%s", err, data)
+			}
+			if config.experiment != "nocoro" && config.extra == "" {
+				for _, owner := range []string{"root", "recursive", "makeEntry.func1"} {
+					if linkedCoroStackUnsafe(t, exe, "main."+owner+".coro.stackgate") {
+						t.Fatalf("%s lost native admission", owner)
+					}
+				}
+			}
+			for _, p := range []string{"1", "4"} {
+				for _, closure := range []string{"0", "1"} {
+					run := testenv.Command(t, exe, closure)
+					run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebacklabels=1,tracebackancestors=3")
+					data, err := run.CombinedOutput()
+					if err != nil || string(data) != "public-main-creation-ok "+closure+"\n" {
+						t.Fatalf("P%s closure=%s: %v\n%s", p, closure, err, data)
+					}
+				}
+			}
+		})
+	}
+}
