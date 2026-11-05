@@ -123,7 +123,15 @@ func main() {
   for iteration:=0;iteration<3;iteration++ {
    runtime.GC()
    if finalized.Load()!=0 { panic("live public root lost payload") }
-   if got:=runtime.NumGoroutine();got!=baseline+roots { panic(fmt.Sprintf("count %d want %d",got,baseline+roots)) }
+   // NumGoroutine sums concurrently changing runtime counters. As in
+   // runtime's TestNumGoroutine, allow bounded convergence; all exact
+   // profile counts and source identity assertions below remain required.
+   for attempt:=0;;attempt++ {
+    got:=runtime.NumGoroutine()
+    if got==baseline+roots {break}
+    if attempt==9 {panic(fmt.Sprintf("count %d want %d after 10 observations",got,baseline+roots))}
+    runtime.Gosched()
+   }
    if unhosted()!=0 { panic("public root incremented independent-task count") }
    text:=make([]byte,2<<20);n:=runtime.Stack(text,true);ids:=make(map[uint64]bool)
    for _,stack:=range strings.Split(string(text[:n]),"\n\n") {
