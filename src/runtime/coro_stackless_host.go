@@ -24,6 +24,7 @@ type stacklessCoroHost struct {
 	pendingReady bool
 	done         bool
 	started      bool
+	terminal     bool
 	startG       *g
 	startNext    *stacklessCoroHost
 }
@@ -104,6 +105,23 @@ func (s *stacklessCoroScheduler) taskHostLocked(task *stacklessCoroTask) *stackl
 func (s *stacklessCoroScheduler) taskHostCurrentLocked(task *stacklessCoroTask) bool {
 	h := s.taskHostLocked(task)
 	return h == nil || currentStacklessCoroHost() == h
+}
+
+// The source resume has already returned its terminal action. Unlike an
+// ordinary-call handoff, no source code needs to run again on the new host.
+// Keep the task and registry identity live until the host consumes the action.
+// Requires s.lock and an independently spawned task without an existing host.
+func (s *stacklessCoroScheduler) terminalHostLocked(task *stacklessCoroTask) *stacklessCoroHost {
+	h := &stacklessCoroHost{scheduler: s, root: task, next: s.hostsLocked(),
+		wake: make(chan struct{}, 1), pending: task, pendingReady: true, terminal: true}
+	s.lifetime.Or(stacklessCoroLifetimeHostStarted)
+	s.initialRootPrivate = false
+	s.setTerminalValue(nil, h)
+	task.state, task.resuming = stacklessCoroTaskWaiting, false
+	if raceenabled {
+		racereleasemerge(unsafe.Pointer(task))
+	}
+	return h
 }
 
 func (h *stacklessCoroHost) notifyLocked() {
@@ -224,7 +242,7 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 			s.head = nil
 		}
 	}
-	if h.done || h.pending != nil || h.call != nil || h.deferred != nil {
+	if h.done || h.pending != nil || h.call != nil || h.deferred != nil || h.terminal {
 		unlock(&s.lock)
 		throw("runtime: overlapping stackless coroutine host calls")
 	}
@@ -278,7 +296,7 @@ func (s *stacklessCoroScheduler) completeHostLocked(task *stacklessCoroTask) {
 	if h == nil {
 		return
 	}
-	if h.pending != nil || h.head != nil || h.tail != nil || h.done {
+	if h.pending != nil || h.head != nil || h.tail != nil || h.done || h.terminal {
 		throw("runtime: stackless coroutine host completed with active work")
 	}
 	// Set done and remove the identity before an independent task is recycled.
@@ -389,7 +407,9 @@ func (h *stacklessCoroHost) drive() {
 			state.parkedTask = nil
 			state.parkedTrace = nil
 			task, call, deferred := h.pending, h.call, h.deferred
+			terminal := h.terminal
 			h.pending, h.call, h.deferred, h.pendingReady = nil, nil, nil, false
+			h.terminal = false
 			if task.state != stacklessCoroTaskWaiting || task.resuming || task.readyPending {
 				unlock(&s.lock)
 				throw("runtime: invalid stackless coroutine host invocation")
@@ -398,6 +418,10 @@ func (h *stacklessCoroHost) drive() {
 			unlock(&s.lock)
 			if raceenabled {
 				raceacquire(unsafe.Pointer(task))
+			}
+			if terminal {
+				s.terminate(task)
+				throw("runtime: terminal coroutine host returned")
 			}
 			h.invoke(task, call, deferred)
 			continue

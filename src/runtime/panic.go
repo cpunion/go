@@ -1035,7 +1035,7 @@ func (p *_panic) nextFrame() (ok bool) {
 				break // found a frame with open-coded defers
 			}
 
-			if p.link != nil && uintptr(u.frame.sp) == uintptr(p.link.startSP) && uintptr(p.link.sp) > u.frame.sp {
+			if p.link != nil && p.link.pc != 0 && uintptr(u.frame.sp) == uintptr(p.link.startSP) && uintptr(p.link.sp) > u.frame.sp {
 				// Skip ahead to where the next panic up the stack was last looking
 				// for defers. See issue 77062.
 				//
@@ -1043,6 +1043,10 @@ func (p *_panic) nextFrame() (ok bool) {
 				// to where the next panic up the stack started. If so, the processing
 				// of that panic has run all the defers up to its current scanning
 				// position.
+				//
+				// A zero PC means the earlier panic exhausted its defers.
+				// It is not a resume point: initAt interprets zero as a nil
+				// function call. Keep walking when a panic printer calls Goexit.
 				//
 				// The final condition is just to make sure that the line below
 				// is actually helpful.

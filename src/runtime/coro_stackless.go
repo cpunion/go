@@ -4734,6 +4734,15 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine termination")
 	}
+	if task.parent == nil && task != &s.root && s.taskHostLocked(task) == nil {
+		// An uncaught panic can invoke arbitrary Error/String methods before
+		// fatal printing. Transfer to an ordinary stack while the logical
+		// identity still exists, before releasing any terminal frames.
+		h := s.terminalHostLocked(task)
+		unlock(&s.lock)
+		stacklessCoroHostStart(h)
+		return
+	}
 	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
 	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
@@ -4758,6 +4767,9 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 			task.goexit = false
 			s.recycleTaskLocked(task)
 			unlock(&s.lock)
+			// A panic value's Error/String method may call Goexit. Complete
+			// the scheduler lifetime even if fatal printing is never reached.
+			s.logicalTaskComplete(false)
 			raiseStacklessCoroPanic(value, trace)
 		}
 		unlock(&s.lock)
