@@ -406,8 +406,13 @@ if ! awk '
 			if ($i == "live-heap-B/task" && $(i - 1) > 341) {
 				bad = 1
 			}
-			if ($i == "live-objects/task" && $(i - 1) > 1.6) {
-				bad = 1
+			if ($i == "live-objects/task") {
+				objects = $(i - 1)
+				objectSamples++
+			}
+			if ($i == "unhosted-goroutines/task") {
+				logical = $(i - 1)
+				logicalSamples++
 			}
 			if ($i == "live-stack-B/task" && $(i - 1) > 7) {
 				bad = 1
@@ -420,7 +425,12 @@ if ! awk '
 			}
 		}
 	}
-	END { exit samples == 1 && !bad ? 0 : 1 }
+	# One separately rooted identity record is required for each native go
+	# task. Retain the existing 1.6-object task/frame allowance beyond it.
+	END {
+		exit samples == 1 && objectSamples == 1 && logicalSamples == 1 &&
+			logical == 1 && objects - logical <= 1.6 && !bad ? 0 : 1
+	}
 ' "$task_footprint_output"; then
 	cat "$task_footprint_output" >&2
 	echo "parked coroutine task footprint exceeds its bound" >&2
