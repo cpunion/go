@@ -391,6 +391,7 @@ func panicPrinterRecursive(n int, value any) {
 }
 
 func GoexitPanicPrinter() {
+	baseline := runtime.NumGoroutine()
 	for _, stringer := range []bool{false, true} {
 		done := make(chan struct{})
 		var value any = goexitPanicError(done)
@@ -399,6 +400,16 @@ func GoexitPanicPrinter() {
 		}
 		go panicPrinterRecursive(8, value)
 		<-done
+		// The Error defer closes done before Goexit finishes unwinding.
+		// Wait for actual completion so a late unwind failure cannot be
+		// hidden by the test program returning from main.
+		deadline := time.Now().Add(5 * time.Second)
+		for runtime.NumGoroutine() != baseline && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if runtime.NumGoroutine() != baseline {
+			panic("panic printer Goexit did not complete")
+		}
 	}
 	println("PASS")
 }

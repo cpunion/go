@@ -4734,7 +4734,9 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine termination")
 	}
-	if task.parent == nil && task != &s.root && s.taskHostLocked(task) == nil {
+	if s.spawned() && task.parent == nil && task != &s.root && s.taskHostLocked(task) == nil {
+		// Only registered go tasks have an independent logical lifetime.
+		// Hand-written continuation drivers retain caller panic propagation.
 		// An uncaught panic can invoke arbitrary Error/String methods before
 		// fatal printing. Transfer to an ordinary stack while the logical
 		// identity still exists, before releasing any terminal frames.
