@@ -8,7 +8,6 @@ package runtime
 
 import (
 	"internal/abi"
-	"internal/goarch"
 	"unsafe"
 )
 
@@ -63,20 +62,41 @@ func stacklessCoroSourceFunc(f funcInfo, info *stacklessCoroSourceInfo) funcInfo
 // This cold path neither allocates nor calls user code on the system stack.
 func stacklessCoroSourcePC(source funcInfo, file string, line int32) uintptr {
 	entry := source.entry()
-	if file == "" || line <= 0 {
+	if file == "" || line <= 0 || source.pcfile == 0 || source.pcln == 0 {
 		return entry
 	}
-	for pc := entry; ; pc += goarch.PCQuantum {
-		f := findfunc(pc)
-		if !f.valid() || f.entry() != entry {
-			break
+
+	// File and line tables encode half-open PC ranges. Advance the two
+	// tables together so each candidate starts a new file or line range.
+	// Looking up both values separately at each instruction decodes much
+	// of the same data again, including during panic, spawn and profiling.
+	pctab := source.datap.pctab
+	files, lines := pctab[source.pcfile:], pctab[source.pcln:]
+	fileEnd, lineEnd := entry, entry
+	fileNo, lineNo := int32(-1), int32(-1)
+	for pc := entry; ; pc = min(fileEnd, lineEnd) {
+		var ok bool
+		for fileEnd <= pc {
+			files, ok = step(files, &fileEnd, &fileNo, fileEnd == entry)
+			if !ok {
+				return entry
+			}
 		}
-		atFile, atLine := funcline1(source, pc, false)
-		if atLine == line && atFile == file {
-			return pc
+		for lineEnd <= pc {
+			lines, ok = step(lines, &lineEnd, &lineNo, lineEnd == entry)
+			if !ok {
+				return entry
+			}
+		}
+		if lineNo == line && fileNo >= 0 && int(fileNo) < len(source.datap.filetab) && funcfile(source, fileNo) == file {
+			// The PC tables can include bytes beyond the function. Use the
+			// same boundary check as a forward stack lookup.
+			if findfunc(pc) == source {
+				return pc
+			}
+			return entry
 		}
 	}
-	return entry
 }
 
 func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer) (funcInfo, uintptr) {
