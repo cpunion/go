@@ -5337,6 +5337,10 @@ source chains once each, preserving their IDs, labels, creation positions and
 ancestry. It uses a bounded text scratch buffer rather than allocating the
 full return-PC payload used by goroutine profiles.
 
+The stop is time bounded so an unrelated P that cannot reach a safe point
+does not prevent the process from reporting the panic and exiting. If the
+stop cannot complete, the fatal printer uses the ordinary physical stacks.
+
 This permission is never inferred from the fatal runtime's approximate freeze
 state. Throws, fatal signals, `GOTRACEBACK=system` or `crash`, and
 `dontfreezetheworld=1` retain the existing fatal path. The normal panic path

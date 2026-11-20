@@ -164,6 +164,13 @@ body:
 	panic("resident-fatal")
 }
 
+//go:noinline
+func unpreemptible(ready chan struct{}) {
+	close(ready)
+	for {
+	}
+}
+
 func main() {
 	goto body
 body:
@@ -199,6 +206,12 @@ body:
 	}
 	if _, err := os.Stderr.WriteString("END_RESIDENTS\n"); err != nil {
 		panic(err)
+	}
+	if mode == "unpreemptible" {
+		started := make(chan struct{})
+		go unpreemptible(started)
+		<-started
+		panic("resident-fatal")
 	}
 	if mode == "cpu" {
 		if err := pprof.StartCPUProfile(io.Discard); err != nil {
@@ -265,6 +278,17 @@ body:
 						t.Fatalf("%s lost native admission", name)
 					}
 				}
+			}
+			// An unrelated goroutine can keep its P running indefinitely
+			// when async preemption is disabled. The panic must still
+			// print and exit even if logical snapshots are unavailable.
+			run := terminalPanicCommand(t, exe, "unpreemptible", "4")
+			run.Env = append(run.Environ(), "GOMAXPROCS=2", "GOTRACEBACK=all", "GODEBUG=asyncpreemptoff=1")
+			data, err := run.CombinedOutput()
+			exit, ok := err.(*exec.ExitError)
+			if !ok || exit.ExitCode() != 2 || !strings.Contains(string(data), "panic: resident-fatal") ||
+				strings.Contains(string(data), "fatal error:") {
+				t.Fatalf("unpreemptible P: expected fatal panic and exit: %v\n%s", err, data)
 			}
 			for _, mode := range []string{"plain", "independent", "gc", "profile", "churn", "cpu", "multiple"} {
 				for _, p := range []string{"1", "4"} {

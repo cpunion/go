@@ -537,15 +537,29 @@ func stacklessCoroTracebackGoroutines() {
 
 // A regular user panic may stop the world before entering the fatal printer.
 // A signal or throw must never infer this permission from global freeze state.
-// The caller is committed to fatalpanic and never resumes the stopped world.
+// The caller is committed to fatalpanic, even if another P fails to stop.
 func stacklessCoroPrepareFatalTraceback() bool {
 	level, all, crash := gotraceback()
 	if level != 1 || !all || crash || debug.dontfreezetheworld != 0 ||
 		panicking.Load() != 0 || stacklessCoroGoroutines.records.Load() == 0 {
 		return false
 	}
-	stopTheWorld(stwAllGoroutinesStack)
-	return true
+	// Fatal printing must still work when another P cannot be preempted.
+	// Avoid parking behind worldsema and bound the stop attempt itself.
+	deadline := nanotime() + 100*1000*1000 // 100 ms
+	for !cansemacquire(&worldsema) {
+		if nanotime() >= deadline || panicking.Load() != 0 {
+			return false
+		}
+		Gosched()
+	}
+	gp := getg()
+	gp.m.preemptoff = stwAllGoroutinesStack.String()
+	stopped := false
+	systemstack(func() {
+		stopped = stopTheWorldWithSemaUntil(stwAllGoroutinesStack, deadline).finishedStopping != 0
+	})
+	return stopped
 }
 
 // The caller completed a real STW for this panic. Preserve the usual physical
