@@ -5816,6 +5816,7 @@ func _LostExternalCode()          { _LostExternalCode() }
 func _GC()                        { _GC() }
 func _LostSIGPROFDuringAtomic64() { _LostSIGPROFDuringAtomic64() }
 func _LostContendedRuntimeLock()  { _LostContendedRuntimeLock() }
+func _LostCoroSourceTransition()  { _LostCoroSourceTransition() }
 func _VDSO()                      { _VDSO() }
 
 // Called if we receive a SIGPROF signal.
@@ -5895,7 +5896,14 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	} else {
 		u.initAt(pc, sp, lr, gp, unwindSilentErrors|unwindTrap|unwindJumpStack)
 	}
-	n += tracebackPCs(&u, 0, stk[n:])
+	if stacklessCoroProfileTransition(gp, mp) {
+		// Account for the CPU sample without reading a partially published
+		// logical frame chain. Signals can interrupt acquirem regions.
+		stk[n] = abi.FuncPCABIInternal(_LostCoroSourceTransition) + sys.PCQuantum
+		n++
+	} else {
+		n += tracebackPCs(&u, 0, stk[n:])
+	}
 
 	if n <= 0 {
 		// Normal traceback is impossible or has failed.
@@ -5921,7 +5929,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		// caution, but not expected to be nil in practice.
 		var tagPtr *unsafe.Pointer
 		if gp != nil && gp.m != nil && gp.m.curg != nil {
-			tagPtr = &gp.m.curg.labels
+			tagPtr = stacklessCoroProfileLabels(gp.m.curg)
 		}
 		cpuprof.add(tagPtr, stk[:n])
 

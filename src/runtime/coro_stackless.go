@@ -2258,6 +2258,7 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 // publication of a switch for runTasks to consume.
 func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 	child stacklessCoroResume, localSwitch bool) uint8 {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -2374,6 +2375,7 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 // coroCompleteSelfFrame restores a suspended homogeneous parent frame.
 // localSwitch has the same meaning as in coroAwaitSelfFrame.
 func coroCompleteSelfFrame(ctx unsafe.Pointer, localSwitch bool) uint8 {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -2688,6 +2690,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 // priority; otherwise the current executor can enter child immediately.
 func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 	child stacklessCoroResume) uint8 {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -2853,6 +2856,7 @@ func validStacklessCoroFusedFrameOwner(owner *stacklessCoroTask,
 // structured-await chain. The generated resume has already copied results and
 // cleared pointer fields that another live frame allocation can retain.
 func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || context.frame == nil ||
@@ -2948,6 +2952,7 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 // the saved resume, when present. Cached holders are recycled separately.
 func restoreStacklessCoroFusedParent(context *stacklessCoroContext,
 	task *stacklessCoroTask, header *stacklessCoroFusedFrameHeader) {
+	stacklessCoroBeginProfileTransition()
 	// The uncached caller does not hold s.lock. A stopped-world profiler
 	// must not pair the parent's resume with the child's old frame.
 	mp := acquirem()
@@ -3231,6 +3236,7 @@ func coroAwait(ctx unsafe.Pointer, child stacklessCoroResume) {
 }
 
 func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || parent == nil ||
@@ -3260,6 +3266,7 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 // child suspends. Completion resumes the owner's remaining LIFO cleanup.
 // This does not lend the child an ordinary call's right to recover its owner.
 func coroDeferAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
+	stacklessCoroBeginProfileTransition()
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || parent == nil || child == nil {

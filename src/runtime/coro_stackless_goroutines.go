@@ -30,6 +30,10 @@ type stacklessCoroGoroutine struct {
 	gopc             uintptr
 	labels           unsafe.Pointer
 	ancestors        *[]ancestorInfo
+	profileCaller    []uintptr
+	profileBoundary  *stacklessCoroTask
+	profileTrace     *stacklessCoroPanicTrace
+	profileBefore    bool
 	public, hosted   bool
 }
 
@@ -82,6 +86,12 @@ func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stac
 	*r = stacklessCoroGoroutine{root: &s.root, leaf: leaf, scheduler: s,
 		goid: gp.goid, parentGoid: gp.parentGoid, gopc: gp.gopc,
 		labels: gp.labels, ancestors: gp.ancestors, publicG: gp, public: true}
+	if gp == getg() {
+		f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
+		if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
+			r.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume)
+		}
+	}
 	stacklessCoroInsertGoroutine(r)
 	p := stacklessCoroPublicGoroutineBucket(gp)
 	r.publicNext, *p = *p, r
@@ -200,20 +210,56 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	if stacklessCoroGoroutines.records.Load() == 0 {
 		return
 	}
+	// Snapshot terminal metadata outside the signal handler. The scheduler
+	// lock protects its cold list; the retained trace is immutable. Queue
+	// publication already holds that lock and passes no owner.
+	var boundary *stacklessCoroTask
+	var trace *stacklessCoroPanicTrace
+	var before bool
+	if owner != nil {
+		s := task.context.scheduler
+		lock(&s.lock)
+		for at := task; at != nil; at = at.parent {
+			if trace = s.terminalSourceTrace(at); trace != nil {
+				boundary, before = at, true
+				break
+			}
+			if trace = s.deferTrace(at); trace != nil {
+				boundary = at
+				break
+			}
+		}
+		unlock(&s.lock)
+	}
 	lock(&stacklessCoroGoroutines.lock)
 	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil {
 		r.leaf, r.owner = task, owner
+		r.profileBoundary, r.profileTrace, r.profileBefore = boundary, trace, before
+		// Runnable tasks have no owner. Only the executing G publishes a
+		// signal-visible source record; queue publication must not touch a G.
+		if owner != nil {
+			if state := owner.stacklessCoro; state != nil {
+				state.activeSource = r
+				state.sourceTransition = false
+			}
+		}
 	}
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
 func stacklessCoroClearLogicalOwner(task *stacklessCoroTask) {
+	// Clear the signal-visible owner before any frame or record can be recycled.
+	if state := getg().stacklessCoro; state != nil {
+		state.activeSource = nil
+		state.sourceTransition = false
+	}
 	if stacklessCoroGoroutines.records.Load() == 0 {
 		return
 	}
 	lock(&stacklessCoroGoroutines.lock)
 	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil && r.owner == getg() {
 		r.owner = nil
+		r.profileBoundary, r.profileTrace, r.profileBefore = nil, nil, false
 	}
 	unlock(&stacklessCoroGoroutines.lock)
 }
@@ -313,6 +359,16 @@ func stacklessCoroInitHostG(fn *funcval, caller, gp *g) uint64 {
 // calls retain their source frame until returning to Go with a P.
 func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTrace {
 	trace := new(stacklessCoroPanicTrace)
+	trace.appendLogicalGoroutine(r)
+	pcs := make([]uintptr, trace.pcCount)
+	*trace = stacklessCoroPanicTrace{pcs: pcs}
+	trace.appendLogicalGoroutine(r)
+	return trace
+}
+
+// The world is stopped. A caller with nil pcs needs only the bounded text
+// window; collecting it does not allocate a complete return-PC payload.
+func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGoroutine) {
 	var leafEntry, leafPC uintptr
 	if r.owner != nil {
 		var u unwinder
@@ -329,48 +385,41 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 			}
 		}
 	}
-	for pass := 0; pass < 2; pass++ {
-		first := true
-		for task := r.leaf; task != nil; task = task.parent {
-			if previous := r.scheduler.terminalSourceTrace(task); previous != nil {
-				trace.appendTrace(previous)
-				break
-			}
-			pc, _ := walkStacklessCoroSourceTaskFrames(task, func(f funcInfo, pc uintptr) bool {
-				if first && f.entry() == leafEntry {
-					pc = leafPC
-				}
-				first = false
-				trace.append(f, pc)
-				return true
-			})
-			if pc != 0 {
-				trace.rootPC = pc
-			}
-			if previous := r.scheduler.deferTrace(task); previous != nil {
-				trace.appendTrace(previous)
-				break
-			}
+	first := true
+	for task := r.leaf; task != nil; task = task.parent {
+		if previous := r.scheduler.terminalSourceTrace(task); previous != nil {
+			trace.appendTrace(previous)
+			break
 		}
-		if trace.pcCount == 0 && r.leaf.resume != nil {
-			// Internal hand-written continuations have no compiler source
-			// metadata. They still represent live logical goroutines and
-			// must contribute a valid resume position to the profile.
-			f := findfunc(stacklessCoroResumeIdentity(r.leaf.resume).fn)
-			if f.valid() {
-				trace.rootPC = f.entry()
-				trace.append(f, f.entry())
+		pc, _ := walkStacklessCoroSourceTaskFrames(task, func(f funcInfo, pc uintptr) bool {
+			if first && f.entry() == leafEntry {
+				pc = leafPC
 			}
+			first = false
+			trace.append(f, pc)
+			return true
+		})
+		if pc != 0 {
+			trace.rootPC = pc
 		}
-		if r.public {
-			trace.appendPublicCaller(r.publicG)
-		}
-		if pass == 0 {
-			pcs := make([]uintptr, trace.pcCount)
-			*trace = stacklessCoroPanicTrace{pcs: pcs}
+		if previous := r.scheduler.deferTrace(task); previous != nil {
+			trace.appendTrace(previous)
+			break
 		}
 	}
-	return trace
+	if trace.pcCount == 0 && r.leaf.resume != nil {
+		// Internal hand-written continuations have no compiler source
+		// metadata. They still represent live logical goroutines and
+		// must contribute a valid resume position to the profile.
+		f := findfunc(stacklessCoroResumeIdentity(r.leaf.resume).fn)
+		if f.valid() {
+			trace.rootPC = f.entry()
+			trace.append(f, f.entry())
+		}
+	}
+	if r.public {
+		trace.appendPublicCaller(r.publicG)
+	}
 }
 
 // The world is stopped. Append the original ordinary caller after the
@@ -482,11 +531,42 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 }
 
 // Only runtime.Stack(all=true) invokes this while the world is stopped.
-// Fatal signal tracebacks must not allocate or inspect mutable registry links.
 func stacklessCoroTracebackGoroutines() {
+	stacklessCoroPrintGoroutines(0)
+}
+
+// A regular user panic may stop the world before entering the fatal printer.
+// A signal or throw must never infer this permission from global freeze state.
+// The caller is committed to fatalpanic and never resumes the stopped world.
+func stacklessCoroPrepareFatalTraceback() bool {
+	level, all, crash := gotraceback()
+	if level != 1 || !all || crash || debug.dontfreezetheworld != 0 ||
+		panicking.Load() != 0 || stacklessCoroGoroutines.records.Load() == 0 {
+		return false
+	}
+	stopTheWorld(stwAllGoroutinesStack)
+	return true
+}
+
+// The caller completed a real STW for this panic. Preserve the usual physical
+// callback stacks and print each suspended logical goroutine exactly once.
+func stacklessCoroFatalTracebackOthers(me *g) {
+	assertWorldStopped()
+	tracebacksomeothers(me, func(other *g) bool {
+		return !stacklessCoroSnapshotGoroutine(other)
+	})
+	stacklessCoroPrintGoroutines(me.goid)
+}
+
+// Use a bounded stack scratch trace, including when malloc is forbidden by
+// fatalpanic. No mutable registry link is read without a completed real STW.
+func stacklessCoroPrintGoroutines(skipID uint64) {
 	assertWorldStopped()
 	for _, bucket := range stacklessCoroGoroutines.buckets {
 		for r := bucket; r != nil; r = r.next {
+			if r.goid == skipID {
+				continue
+			}
 			gp := r.hostG
 			if r.public {
 				gp = r.publicG
@@ -511,7 +591,8 @@ func stacklessCoroTracebackGoroutines() {
 			}
 			printGoroutineLabels(labels)
 			print(":\n")
-			trace := stacklessCoroLogicalTrace(r)
+			var trace stacklessCoroPanicTrace
+			trace.appendLogicalGoroutine(r)
 			for i := 0; i < trace.count; i++ {
 				uf, ok := trace.at(i)
 				if !ok {

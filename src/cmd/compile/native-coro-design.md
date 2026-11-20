@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-10-18
+Last updated: 2026-11-20
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -5248,9 +5248,9 @@ resumes, recursive frame transitions, host promotion, GC, profile depth and
 registry drainage with ordinary, native, checkptr, inlining, static lock
 ranking and race fallback builds. Internal hand-written continuations without
 source metadata still contribute a nonempty profile at their actual resume
-entry. Native execution tracing, CPU profiles and native-task race instrumentation still
-require additional integration. Registry allocation and scheduling costs have
-not been optimized.
+entry. Native execution tracing and native-task race instrumentation still
+require additional integration. Signal-driven CPU source projection is described
+below. Registry allocation and scheduling costs have not been optimized.
 
 Source metadata version 3 resolves code-entry cells through a relocated table
 in moduledata. An external linker can change the distance between read-only
@@ -5298,6 +5298,56 @@ recovered panic and Goexit. Concurrent sampling crosses active recursive frame
 transitions, host promotion and completion. A separate quick-completion case
 checks that repeated private roots disappear before their scheduler is reused.
 Ordinary, native, checkptr, inlining, static lock ranking and race fallback
-configurations share these source and lifetime checks. Signal-driven CPU
-profiles, fatal logical identities, native execution events and native-task
-race instrumentation remain separate work.
+configurations share these source and lifetime checks. Native execution events
+and native-task race instrumentation remain separate work.
+
+### Source chains in native CPU profiles
+
+An executing native resume publishes its logical source record in its owning
+G's coroutine state. The CPU signal handler reads only the interrupted M's
+own record; it neither locks nor searches the shared goroutine registry. Public
+entries capture their ordinary caller PCs before entering the native executor,
+so later samples never unwind a different, waiting G whose stack GC may move.
+Those immutable PCs retain no caller stack pointers.
+
+Frame switches mark source publication in progress. A new resume invocation,
+or a compiler-generated local self-switch after reloading its typed frame,
+clears that marker. Samples in an incomplete publication interval are charged
+to `runtime._LostCoroSourceTransition` rather than combining a stale physical
+PC with a new logical activation. Completion clears the published record before
+releasing or reusing frames. Executor and host release checks require both the
+record and transition marker to be clear.
+
+Business samples retain recursive source activations, the ordinary public
+caller where applicable, current logical labels, and incoming panic or Goexit
+boundaries during deferred cleanup. The native context's allocation class grows
+from 208 to 224 bytes for the owner pointer and transition state. The source
+regression covers public, independent, captured, promoted, homogeneous-recursive,
+panic, Goexit and recovered-defer execution at P1/P4 with ordinary, native,
+checkptr, default-inlining and static-lock-ranking builds. Sampling on another
+running M retains the ordinary profiler path.
+
+### Suspended logical goroutines in fatal all-stack dumps
+
+An unrecovered user panic with `GOTRACEBACK=all` may complete a real
+stop-the-world operation before entering the fatal printer. The completed
+operation grants permission for that specific panic to read the logical
+registry. The printer emits ordinary callback stacks and suspended logical
+source chains once each, preserving their IDs, labels, creation positions and
+ancestry. It uses a bounded text scratch buffer rather than allocating the
+full return-PC payload used by goroutine profiles.
+
+This permission is never inferred from the fatal runtime's approximate freeze
+state. Throws, fatal signals, `GOTRACEBACK=system` or `crash`, and
+`dontfreezetheworld=1` retain the existing fatal path. The normal panic path
+finishes user-defined Error/String callbacks before stopping the world. These
+callbacks run on their logical host and may grow their stack, collect garbage,
+change thread binding or labels, block, or call Goexit.
+
+The fatal regression compares pre-panic and fatal snapshots of twelve resident
+goroutines, including native tasks, public entries, ordinary and thread-locked
+hosts, and pending panic/Goexit defers. It exercises shallow and elided chains,
+concurrent GC, goroutine profiles, CPU profiles, task churn and simultaneous
+panics with ordinary and race fallback controls. These diagnostics do not
+provide native execution tracing or native-task race instrumentation, and
+performance work remains deferred.

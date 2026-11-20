@@ -296,6 +296,11 @@ func stacklessCoroTracebackPCs(u *unwinder, skip int, buf []uintptr) (int, bool)
 				continue
 			}
 		}
+		if info != nil && info.flags&abi.CoroSourceResume != 0 && source.valid() {
+			if stacklessCoroActiveSourcePCs(u, source, &skip, buf, &n) {
+				return n, true
+			}
+		}
 		cgoN := u.cgoCallers(cgoBuf[:])
 		pc := u.symPC()
 		if info != nil && info.flags&abi.CoroSourceCopy != 0 && source.valid() {

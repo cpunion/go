@@ -16,3 +16,6 @@ func stacklessCoroInitHostG(*funcval, *g, *g) uint64                            
 func stacklessCoroGoroutineProfile([]profilerecord.StackRecord, []unsafe.Pointer, bool) int { return 0 }
 func stacklessCoroTracebackGoroutines()                                                     {}
 func stacklessCoroSnapshotGoroutine(*g) bool                                                { return false }
+
+func stacklessCoroPrepareFatalTraceback() bool { return false }
+func stacklessCoroFatalTracebackOthers(me *g)  { tracebackothers(me) }

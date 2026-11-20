@@ -166,6 +166,7 @@ var runtimeDecls = [...]struct {
 	{"coroDeferAwaitFrame", funcTag, 129},
 	{"coroAwaitSelfFrame", funcTag, 130},
 	{"coroCompleteSelfFrame", funcTag, 131},
+	{"coroProfileResume", funcTag, 9},
 	{"coroRequestFusedFrame", funcTag, 132},
 	{"coroAwaitFusedFrame", funcTag, 133},
 	{"coroCompleteFusedFrame", funcTag, 123},
