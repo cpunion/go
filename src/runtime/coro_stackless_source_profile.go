@@ -16,18 +16,18 @@ import (
 // PCs are immutable code addresses and need no stack pointer or registry lookup.
 // CPU profiles have a bounded PC buffer, so retaining this many caller PCs is
 // sufficient even when the logical source chain itself is shallow.
-func stacklessCoroCaptureProfileCaller(gp *g, resume stacklessCoroResume) []uintptr {
+func stacklessCoroCaptureProfileCaller(gp *g, resume stacklessCoroResume, reuse []uintptr) []uintptr {
 	if gp != getg() {
-		return nil
+		return reuse[:0]
 	}
 	f := findfunc(stacklessCoroResumeIdentity(resume).fn)
 	info := stacklessCoroSourceFrame(f)
 	if info == nil || info.flags&abi.CoroSourceResume == 0 {
-		return nil
+		return reuse[:0]
 	}
 	source := stacklessCoroSourceFunc(f, info)
 	if !source.valid() {
-		return nil
+		return reuse[:0]
 	}
 	rootPC := source.entry()
 	var pcs [maxCPUProfStack]uintptr
@@ -65,7 +65,10 @@ func stacklessCoroCaptureProfileCaller(gp *g, resume stacklessCoroResume) []uint
 			appendStacklessCoroSourcePC(&u, f, pc, &skip, pcs[:], &n)
 		}
 	})
-	return append([]uintptr(nil), pcs[:n]...)
+	if n != 0 && cap(reuse) == 0 {
+		reuse = make([]uintptr, 0, maxCPUProfStack)
+	}
+	return append(reuse[:0], pcs[:n]...)
 }
 
 // The executing G publishes its record before calling a source resume and

@@ -83,13 +83,15 @@ func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stac
 	} else {
 		r = new(stacklessCoroGoroutine)
 	}
+	callerPCs := r.profileCaller
 	*r = stacklessCoroGoroutine{root: &s.root, leaf: leaf, scheduler: s,
 		goid: gp.goid, parentGoid: gp.parentGoid, gopc: gp.gopc,
-		labels: gp.labels, ancestors: gp.ancestors, publicG: gp, public: true}
+		labels: gp.labels, ancestors: gp.ancestors, publicG: gp,
+		profileCaller: callerPCs[:0], public: true}
 	if gp == getg() {
 		f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
 		if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
-			r.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume)
+			r.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume, callerPCs)
 		}
 	}
 	stacklessCoroInsertGoroutine(r)
@@ -296,8 +298,13 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 				}
 				*p = r.publicNext
 			}
+			callerPCs := r.profileCaller
 			*r = stacklessCoroGoroutine{}
 			if public && stacklessCoroGoroutines.publicFreeCount < stacklessCoroWarmExecutorCount {
+				// Retain only reusable storage for code addresses. No
+				// stack pointer or caller object survives registration.
+				clear(callerPCs)
+				r.profileCaller = callerPCs[:0]
 				r.next = stacklessCoroGoroutines.publicFree
 				stacklessCoroGoroutines.publicFree = r
 				stacklessCoroGoroutines.publicFreeCount++
