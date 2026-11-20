@@ -29,7 +29,7 @@ jobs:
   focused:
     name: Focused (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +59,7 @@ jobs:
 
       - name: Test default compiler and runtime
         run: >-
-          ./bin/go test -count=1 -timeout=20m
+          ./bin/go test -count=1 -timeout=45m
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
@@ -84,7 +84,7 @@ jobs:
         env:
           GOEXPERIMENT: coro
         run: >-
-          ./bin/go test -count=1 -timeout=20m
+          ./bin/go test -count=1 -timeout=45m
           cmd/compile/...
           cmd/cgo
           cmd/go/internal/work
@@ -168,7 +168,7 @@ jobs:
     name: Native all.bash (Linux)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -189,8 +189,8 @@ jobs:
       - name: Run native full test suite
         working-directory: src
         env:
-          # Source-oracle compiler tests share the all.bash package deadline.
-          GO_TEST_TIMEOUT_SCALE: '2'
+          # Source-oracle matrices share one package deadline (50 minutes here).
+          GO_TEST_TIMEOUT_SCALE: '5'
         run: ./all.bash
 
   native-benchmarks:

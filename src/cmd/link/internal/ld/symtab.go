@@ -650,6 +650,11 @@ func (ctxt *Link) symtab(pcln *pclntab) []sym.SymKind {
 	moduledata.AddUint(ctxt.Arch, 0) // filled in by dodataSect
 	moduledata.AddAddr(ctxt.Arch, ldr.Lookup("runtime.rodata", 0))
 	moduledata.AddAddr(ctxt.Arch, ldr.Lookup("go:func.*", 0))
+	if pcln.coroSourceEntries != 0 {
+		slice(pcln.coroSourceEntries, uint64(ldr.SymSize(pcln.coroSourceEntries)/int64(ctxt.Arch.PtrSize)))
+	} else {
+		nilSlice()
+	}
 	moduledata.AddAddr(ctxt.Arch, ldr.Lookup("runtime.epclntab", 0))
 
 	if ctxt.IsAIX() && ctxt.IsExternal() {

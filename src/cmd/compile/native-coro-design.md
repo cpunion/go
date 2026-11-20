@@ -18,7 +18,7 @@ operation goroutine; channel select uses one task-owned arbitration record and
 shared wait-queue entries without a goroutine per case;
 not production-ready
 
-Last updated: 2026-10-18
+Last updated: 2026-11-20
 
 Upstream mirror: `cpunion/go:main`, which remains aligned with the Go
 development branch
@@ -5149,8 +5149,9 @@ do not inherit their creator's activation chain, and completion through return,
 panic recovery or Goexit releases the user-goroutine count. This classification
 does not add a task registry or change physical stack scanning.
 
-Pure-native tasks with no ordinary host, creation ancestry and full native
-trace and profile integration remain separate work. Performance is deferred.
+Independent tasks without hosts are enumerated by the logical registry below.
+Full native trace and profile integration remain separate work. Performance is
+deferred.
 
 Open `go` lowering uses the same saved, validated operand-wrapper target as
 closed factory dispatch. Closure reparenting changes the wrapper's capture
@@ -5196,7 +5197,161 @@ checking incoming panic/Goexit chains and the cleanup source line at both waits.
 The regression covers native channel send and receive, public and independent
 hosts, shallow and deep source chains, return/panic/Goexit cleanup, live-frame
 GC roots and finalizer release. Native-only one-PC profiles check that capacity
-is applied after removing the private receive. This covers allocated hosts;
-pure-native tasks without hosts, creation ancestry and complete native
-profiling, trace and race support remain separate work. The cold host allocation
-cost and broader performance work are deferred.
+is applied after removing the private receive. This projection covers allocated
+hosts; the logical registry below handles independent tasks before host
+allocation. Complete native profiling, trace and race support remain separate
+work. The cold host allocation cost and broader performance work are deferred.
+
+### Enumerating independent tasks before host allocation
+
+Each independent native `go` statement registers a typed logical-goroutine
+record before publishing its child. The record owns its stable Go ID, creator
+position, inherited labels, optional creation ancestors and current source
+leaf. Structured awaits change the leaf without adding goroutines. Completion
+updates the leaf or removes the independent root before recycling its frames;
+completed records and their user labels are not cached. The registry uses a
+runtime mutex and typed buckets, with scheduler-to-registry lock ordering. It
+does not use Go maps or user synchronization and does not enlarge task, frame
+or native-context layouts.
+
+`NumGoroutine` includes unhosted independent tasks. `Stack(all=true)` and both
+goroutine-profile implementations copy their source stacks during the initial
+stop-the-world interval. Profiles retain the caller-buffer contract, inherited
+labels and configured PC depth; text retains the 50/50 elision window. The
+running owner's physical resume position refines the active source leaf.
+Uncached fused-frame transitions disable preemption while publishing matching
+frame, resume and parent links, so a stopped-world reader sees a complete
+chain. The same snapshot captures independent hosts that are running native
+resumes or waiting between resumes, and marks their physical G records already
+satisfied for a concurrent profile. Ordinary callbacks keep their physical
+stack and current labels. Fatal signal tracebacks and physical GC/recovery
+scanning do not walk this registry.
+
+Host creation registers a pending transfer keyed by its synchronous creator
+and stable host-entry closure. `newproc1` installs the logical Go ID, creator
+and labels before publishing the G or emitting its ordinary `GoCreate` event;
+it does not depend on closure-environment layout. It removes the unhosted count
+in the same non-preemptible interval. A host created after a concurrent
+profile's initial snapshot is already satisfied by that logical record, so
+promotion cannot add a duplicate record. Promotion is not another source go
+statement and does not increment the created-goroutine metric again.
+
+The `/sched/coro/goroutines/unhosted:goroutines` metric reports independent live
+tasks without ordinary stacks, and is zero with the experiment disabled.
+Native-dispatch regressions subtract this value from the logical goroutine
+count when checking ordinary-stack allocation; their original limits remain
+unchanged. Separate semantic regressions require the full logical count,
+stable IDs across promotion, source creation and suspension lines, labels,
+deep chains, undersized profile behavior, and frame release after return,
+recovered panic and Goexit. A concurrent churn regression checks active
+resumes, recursive frame transitions, host promotion, GC, profile depth and
+registry drainage with ordinary, native, checkptr, inlining, static lock
+ranking and race fallback builds. Internal hand-written continuations without
+source metadata still contribute a nonempty profile at their actual resume
+entry. Native execution tracing and native-task race instrumentation still
+require additional integration. Signal-driven CPU source projection is described
+below. Registry allocation and scheduling costs have not been optimized.
+
+Source metadata version 3 resolves code-entry cells through a relocated table
+in moduledata. An external linker can change the distance between read-only
+strings and relro code-pointer cells, so a section distance computed by the Go
+linker cannot identify the cell in the final image. The function metadata now
+contains a table index; both the table-to-cell and cell-to-code references are
+ordinary relocations. String and source-position offsets remain within their
+read-only section. The table is immutable module metadata and does not retain
+task frames or user objects. Native task, frame and executor layouts do not
+change. Regression tests exercise detached cgo children with automatic,
+internal and external linking, and source stacks with external linking,
+checkptr, inlining and no DWARF; native entry gates remain required.
+
+### Public entry source stacks before host allocation
+
+A compiled public entry registers its source root before its first native
+episode, including entries that never create an independent task or allocate
+an ordinary host. This record uses the existing caller's goroutine ID, creator
+and count. It does not increment the unhosted-task or created-goroutine metrics.
+A second typed bucket index finds the active record from the original ordinary
+G without changing the task, frame, G state or native-context layouts.
+
+During the initial stopped-world interval, goroutine profiles and
+`Stack(all=true)` capture that source lineage and append the original ordinary
+caller suffix once. The public entry and optional `coroRun` adapter are omitted
+after the logical root. The physical G is then satisfied or skipped, avoiding
+a duplicate entry while the concurrent profiler runs. Current labels come from
+that G, including changes made by an ordinary callback. Text headers share the
+ordinary label quoting and `tracebacklabels` switch, and retain an allocated
+host's thread-lock indicator. Active ordinary calls retain their existing
+physical stack and source-bridge projection.
+
+Normal completion, panic, Goexit and private initial-root completion unlink
+the record before any source frame or scheduler can be cleared or reused.
+Only completely cleared public records enter a bounded cache; it retains no
+task, scheduler, G, label or ancestry references. Hand-written runtime roots
+without compiler source metadata still avoid registration until they create
+an independent child. Existing root allocation and pool checks remain in place.
+
+The regressions cover direct and captured-closure public entries, source
+recursion before and after an opaque host call, original identities and
+creator positions, full and one-PC profiles, bounded
+text elision, live label changes, GC retention, and release after return,
+recovered panic and Goexit. Concurrent sampling crosses active recursive frame
+transitions, host promotion and completion. A separate quick-completion case
+checks that repeated private roots disappear before their scheduler is reused.
+Ordinary, native, checkptr, inlining, static lock ranking and race fallback
+configurations share these source and lifetime checks. Native execution events
+and native-task race instrumentation remain separate work.
+
+### Source chains in native CPU profiles
+
+An executing native resume publishes its logical source record in its owning
+G's coroutine state. The CPU signal handler reads only the interrupted M's
+own record; it neither locks nor searches the shared goroutine registry. Public
+entries capture their ordinary caller PCs before entering the native executor,
+so later samples never unwind a different, waiting G whose stack GC may move.
+Those immutable PCs retain no caller stack pointers.
+
+Frame switches mark source publication in progress. A new resume invocation,
+or a compiler-generated local self-switch after reloading its typed frame,
+clears that marker. Samples in an incomplete publication interval are charged
+to `runtime._LostCoroSourceTransition` rather than combining a stale physical
+PC with a new logical activation. Completion clears the published record before
+releasing or reusing frames. Executor and host release checks require both the
+record and transition marker to be clear.
+
+Business samples retain recursive source activations, the ordinary public
+caller where applicable, current logical labels, and incoming panic or Goexit
+boundaries during deferred cleanup. The native context's allocation class grows
+from 208 to 224 bytes for the owner pointer and transition state. The source
+regression covers public, independent, captured, promoted, homogeneous-recursive,
+panic, Goexit and recovered-defer execution at P1/P4 with ordinary, native,
+checkptr, default-inlining and static-lock-ranking builds. Sampling on another
+running M retains the ordinary profiler path.
+
+### Suspended logical goroutines in fatal all-stack dumps
+
+An unrecovered user panic with `GOTRACEBACK=all` may complete a real
+stop-the-world operation before entering the fatal printer. The completed
+operation grants permission for that specific panic to read the logical
+registry. The printer emits ordinary callback stacks and suspended logical
+source chains once each, preserving their IDs, labels, creation positions and
+ancestry. It uses a bounded text scratch buffer rather than allocating the
+full return-PC payload used by goroutine profiles.
+
+The stop is time bounded so an unrelated P that cannot reach a safe point
+does not prevent the process from reporting the panic and exiting. If the
+stop cannot complete, the fatal printer uses the ordinary physical stacks.
+
+This permission is never inferred from the fatal runtime's approximate freeze
+state. Throws, fatal signals, `GOTRACEBACK=system` or `crash`, and
+`dontfreezetheworld=1` retain the existing fatal path. The normal panic path
+finishes user-defined Error/String callbacks before stopping the world. These
+callbacks run on their logical host and may grow their stack, collect garbage,
+change thread binding or labels, block, or call Goexit.
+
+The fatal regression compares pre-panic and fatal snapshots of twelve resident
+goroutines, including native tasks, public entries, ordinary and thread-locked
+hosts, and pending panic/Goexit defers. It exercises shallow and elided chains,
+concurrent GC, goroutine profiles, CPU profiles, task churn and simultaneous
+panics with ordinary and race fallback controls. These diagnostics do not
+provide native execution tracing or native-task race instrumentation, and
+performance work remains deferred.

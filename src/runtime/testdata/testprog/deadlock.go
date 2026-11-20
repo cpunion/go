@@ -31,6 +31,7 @@ func init() {
 	register("MainGoroutineID", MainGoroutineID)
 	register("Breakpoint", Breakpoint)
 	register("GoexitInPanic", GoexitInPanic)
+	register("GoexitPanicPrinter", GoexitPanicPrinter)
 	register("PanicAfterGoexit", PanicAfterGoexit)
 	register("RecoveredPanicAfterGoexit", RecoveredPanicAfterGoexit)
 	register("RecoverBeforePanicAfterGoexit", RecoverBeforePanicAfterGoexit)
@@ -360,4 +361,55 @@ func (*panicError) Error() string {
 
 func PanicLoop() {
 	panic(&panicError{})
+}
+
+// A panic has exhausted its defer search before calling these methods.
+// Goexit must not treat that exhausted search as a valid unwind position.
+type goexitPanicError chan struct{}
+type goexitPanicString chan struct{}
+
+func (done goexitPanicError) Error() string {
+	defer close(done)
+	runtime.GC()
+	runtime.Goexit()
+	return "unreachable"
+}
+
+func (done goexitPanicString) String() string {
+	return goexitPanicError(done).Error()
+}
+
+//go:noinline
+func panicPrinterRecursive(n int, value any) {
+	var pad [64]byte
+	pad[0] = byte(n)
+	if n == 0 {
+		panic(value)
+	}
+	panicPrinterRecursive(n-1, value)
+	runtime.KeepAlive(&pad)
+}
+
+func GoexitPanicPrinter() {
+	baseline := runtime.NumGoroutine()
+	for _, stringer := range []bool{false, true} {
+		done := make(chan struct{})
+		var value any = goexitPanicError(done)
+		if stringer {
+			value = goexitPanicString(done)
+		}
+		go panicPrinterRecursive(8, value)
+		<-done
+		// The Error defer closes done before Goexit finishes unwinding.
+		// Wait for actual completion so a late unwind failure cannot be
+		// hidden by the test program returning from main.
+		deadline := time.Now().Add(5 * time.Second)
+		for runtime.NumGoroutine() != baseline && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if runtime.NumGoroutine() != baseline {
+			panic("panic printer Goexit did not complete")
+		}
+	}
+	println("PASS")
 }

@@ -428,7 +428,8 @@ type moduledata struct {
 	types, typedesclen, etypes uintptr
 	itaboffset, itabsize       uintptr
 	rodata                     uintptr
-	gofunc                     uintptr // go.func.*
+	gofunc                     uintptr   // go.func.*
+	coroSourceEntries          []uintptr // relocated addresses of source entry cells
 	epclntab                   uintptr
 
 	textsectmap []textsect

@@ -1639,6 +1639,16 @@ var gcsema uint32 = 1
 //
 //go:systemstack
 func stopTheWorldWithSema(reason stwReason) worldStop {
+	return stopTheWorldWithSemaUntil(reason, 0)
+}
+
+// A nonzero deadline is for a caller about to terminate the process. On
+// timeout, a zero worldStop means other Ps may still be running. The caller
+// must proceed to fatal printing without inspecting stopped-world state or
+// restarting the partially stopped world.
+//
+//go:systemstack
+func stopTheWorldWithSemaUntil(reason stwReason, deadline int64) worldStop {
 	// Mark the goroutine which called stopTheWorld preemptible so its
 	// stack may be scanned by the GC or observed by the execution tracer.
 	//
@@ -1706,6 +1716,10 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 			if notetsleep(&sched.stopnote, 100*1000) {
 				noteclear(&sched.stopnote)
 				break
+			}
+			if deadline != 0 && nanotime() >= deadline {
+				casgstatus(gp.m.curg, _Gwaiting, _Grunning)
+				return worldStop{}
 			}
 			preemptall()
 		}
@@ -5435,6 +5449,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.tracking = true
 	}
 	gcController.addScannableStack(pp, int64(newg.stack.hi-newg.stack.lo))
+	logicalID := stacklessCoroInitHostG(fn, callergp, newg)
 
 	// Get a goid and switch to runnable. This needs to happen under traceAcquire
 	// since it's a goroutine transition. See tracer invariants in trace.go.
@@ -5452,9 +5467,13 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		pp.goidcache -= _GoidCacheBatch - 1
 		pp.goidcacheend = pp.goidcache + _GoidCacheBatch
 	}
-	newg.goid = pp.goidcache
+	if logicalID != 0 {
+		newg.goid = logicalID
+	} else {
+		newg.goid = pp.goidcache
+		pp.goidcache++
+	}
 	casgstatus(newg, _Gdead, status)
-	pp.goidcache++
 	newg.trace.reset()
 	if trace.ok() {
 		trace.GoCreate(newg, newg.startpc, parked)
@@ -5489,7 +5508,9 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 			racereleasemergeg(newg, unsafe.Pointer(&labelSync))
 		}
 	}
-	pp.goroutinesCreated++
+	if logicalID == 0 {
+		pp.goroutinesCreated++
+	}
 	releasem(mp)
 
 	return newg
@@ -5767,6 +5788,7 @@ func badunlockosthread() {
 
 func gcount(includeSys bool) int32 {
 	n := int32(atomic.Loaduintptr(&allglen)) - sched.gFree.stack.size - sched.gFree.noStack.size
+	n += int32(stacklessCoroUnhostedGoroutines())
 	if !includeSys {
 		n -= sched.ngsys.Load()
 	}
@@ -5808,6 +5830,7 @@ func _LostExternalCode()          { _LostExternalCode() }
 func _GC()                        { _GC() }
 func _LostSIGPROFDuringAtomic64() { _LostSIGPROFDuringAtomic64() }
 func _LostContendedRuntimeLock()  { _LostContendedRuntimeLock() }
+func _LostCoroSourceTransition()  { _LostCoroSourceTransition() }
 func _VDSO()                      { _VDSO() }
 
 // Called if we receive a SIGPROF signal.
@@ -5887,7 +5910,14 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	} else {
 		u.initAt(pc, sp, lr, gp, unwindSilentErrors|unwindTrap|unwindJumpStack)
 	}
-	n += tracebackPCs(&u, 0, stk[n:])
+	if stacklessCoroProfileTransition(gp, mp) {
+		// Account for the CPU sample without reading a partially published
+		// logical frame chain. Signals can interrupt acquirem regions.
+		stk[n] = abi.FuncPCABIInternal(_LostCoroSourceTransition) + sys.PCQuantum
+		n++
+	} else {
+		n += tracebackPCs(&u, 0, stk[n:])
+	}
 
 	if n <= 0 {
 		// Normal traceback is impossible or has failed.
@@ -5913,7 +5943,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		// caution, but not expected to be nil in practice.
 		var tagPtr *unsafe.Pointer
 		if gp != nil && gp.m != nil && gp.m.curg != nil {
-			tagPtr = &gp.m.curg.labels
+			tagPtr = stacklessCoroProfileLabels(gp.m.curg)
 		}
 		cpuprof.add(tagPtr, stk[:n])
 

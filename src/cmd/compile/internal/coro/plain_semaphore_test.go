@@ -63,6 +63,7 @@ func CoroPlainOrdinaryWait(addr *uint32, ready, done chan struct{}) {
 	const controller = `package PACKAGE_test
 
 import (
+ "runtime/metrics"
  semaphore "PACKAGEPATH"
  "runtime"
  "testing"
@@ -76,11 +77,11 @@ func TestCoroPlainSemaphoreEntry(t *testing.T) {
   semaphore.CoroPlainAcquire(&sema)
   if sema != 0 { t.Fatal("ready acquisition did not consume its token") }
   ready, done := make(chan struct{}, 129), make(chan struct{}, 129)
-  baseline := runtime.NumGoroutine()
+  baseline := ordinaryGoroutines()
   go semaphore.CoroPlainOrdinaryWait(&sema, ready, done)
   semaphore.CoroPlainSpawn(&sema, ready, done)
   for i := 0; i < 129; i++ { <-ready }
-  if NATIVE && runtime.NumGoroutine() > baseline+8 {
+  if NATIVE && ordinaryGoroutines() > baseline+8 {
    t.Fatal("logical semaphore waiters created ordinary goroutines")
   }
   runtime.GC()
@@ -88,6 +89,16 @@ func TestCoroPlainSemaphoreEntry(t *testing.T) {
   for i := 0; i < 129; i++ { <-done }
   if sema != 0 { t.Fatal("completed acquisitions retained a token") }
  }
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	for _, pkg := range []string{"sync", "internal/poll"} {

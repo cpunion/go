@@ -15,7 +15,8 @@ import (
 
 func TestClosedParameterDefer(t *testing.T) {
 	const source = `package main
-import ("runtime";"runtime/debug")
+import (
+ "runtime/metrics";"runtime";"runtime/debug")
 type box struct {n int}
 var trace []int
 func first(p *box,n int) int {trace=append(trace,p.n+n);return n}
@@ -42,11 +43,21 @@ func parked(p *box,ready chan int,gate,done chan struct{}) {defer func(){close(d
 func start(p *box,ready chan int,gate,done chan struct{}) {go parked(p,ready,gate,done)}
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
- baseline:=runtime.NumGoroutine();ready,gate:=make(chan int,128),make(chan struct{});ps:=make([]*box,128);ds:=make([]chan struct{},128)
+ baseline:=ordinaryGoroutines();ready,gate:=make(chan int,128),make(chan struct{});ps:=make([]*box,128);ds:=make([]chan struct{},128)
  for i:=range 128 {p,done:=&box{i},make(chan struct{});ps[i],ds[i]=p,done;start(p,ready,gate,done)}
- for range 128 {<-ready};if native && runtime.NumGoroutine()>baseline+12 {panic("parameter defer ordinary goroutines")};runtime.GC();close(gate)
+ for range 128 {<-ready};if native && ordinaryGoroutines()>baseline+12 {panic("parameter defer ordinary goroutines")};runtime.GC();close(gate)
  for i:=range 128 {<-ds[i];if ps[i].n!=i+7 {panic("deferred pointer GC ownership")}}
  repeated();if arguments!=4 {panic("argument evaluation count")};equal(107,5,103,1);variadic();equal(5);if named()!=10 {panic("named result defer")};println("switch-return-ok")}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
 `
 	testSwitchReturnProgram(t, source, nil, []string{"repeated", "variadic", "named", "parked", "start"})
 }

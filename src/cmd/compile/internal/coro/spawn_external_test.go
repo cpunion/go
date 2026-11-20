@@ -50,6 +50,7 @@ func Groups(p *Box, ready chan<- int, release <-chan struct{}, done chan<- int) 
 }
 `,
 		"main.go": `package main
+import "runtime/metrics"
 
 import (
  "example.com/spawncontext/helper"
@@ -75,7 +76,7 @@ func deferred(ready chan<- int, release <-chan struct{}, done chan<- int) {
 func main() {
  ready, done := make(chan int, 128), make(chan int, 128)
  release, created, finished := make(chan struct{}), make(chan int), make(chan struct{})
- baseline := runtime.NumGoroutine()
+ baseline := ordinaryGoroutines()
  go func() { launch(ready, release, done, created); close(finished) }()
  // The creator returns while every child is still waiting for release.
  if <-created != 128 { panic("creator did not return") }
@@ -86,7 +87,7 @@ func main() {
   if value < 0 || value >= 128 || seen[value] { panic("spawn argument snapshot") }
   seen[value] = true
  }
- if os.Getenv("EXPECT_NATIVE") == "1" && runtime.NumGoroutine() > baseline+12 {
+ if os.Getenv("EXPECT_NATIVE") == "1" && ordinaryGoroutines() > baseline+12 {
   panic("pure spawn helper created ordinary goroutines")
  }
  runtime.GC()
@@ -100,6 +101,16 @@ func main() {
  close(lateRelease)
  if <-lateDone != 23 { panic("deferred spawn fallback") }
  println("spawn-context-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `,
 	}

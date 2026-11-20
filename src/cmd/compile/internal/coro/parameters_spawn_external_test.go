@@ -16,6 +16,7 @@ import (
 func TestClosedParameterSpawn(t *testing.T) {
 	const source = `package main
 import (
+ "runtime/metrics"
  "runtime"
  "runtime/debug"
 )
@@ -43,13 +44,23 @@ func variable(done chan int) {go variadic(sum,done,2,3)}
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
  ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
- baseline:=runtime.NumGoroutine();spawn(ready,gate,done)
+ baseline:=ordinaryGoroutines();spawn(ready,gate,done)
  total:=0;for range 128 {total+=<-ready};if total!=8256 || arguments!=128 {panic("go parameter argument evaluation")}
- if native && runtime.NumGoroutine()>baseline+12 {panic("go parameter used ordinary goroutines")}
+ if native && ordinaryGoroutines()>baseline+12 {panic("go parameter used ordinary goroutines")}
  runtime.GC();close(gate);total=0;for range 128 {total+=<-done};if total!=16448 {panic("go parameter capture or GC")}
  nesting(ready,gate,done);if <-ready!=9 || <-done!=17 {panic("nested parameter spawn")}
  variable(done);if <-done!=5 {panic("variadic parameter spawn")}
  println("switch-return-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	testSwitchReturnProgram(t, source, nil, []string{"spawn", "nesting", "variable"})

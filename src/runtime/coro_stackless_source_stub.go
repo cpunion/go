@@ -6,6 +6,8 @@
 
 package runtime
 
+import "unsafe"
+
 type stacklessCoroTracebackState struct{}
 
 type stacklessCoroPanicState struct{}
@@ -21,3 +23,7 @@ func stacklessCoroSourceName(funcInfo) string { return "" }
 func stacklessCoroTracebackPCs(*unwinder, int, []uintptr) (int, bool) {
 	return 0, false
 }
+
+func stacklessCoroProfileTransition(*g, *m) bool { return false }
+
+func stacklessCoroProfileLabels(gp *g) *unsafe.Pointer { return &gp.labels }

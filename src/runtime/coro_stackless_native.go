@@ -981,6 +981,13 @@ func coroNativeStart(caller *g) {
 	}
 	mp.lockedg.set(executor)
 	executor.lockedm.set(mp)
+	// Direct stack switches must obey the same pending-profile protocol as
+	// execute and coroswitch, even for an excluded system executor. Install
+	// curg first so a profile record can allocate, then finish it before the
+	// target becomes running.
+	if goroutineProfile.active {
+		tryRecordGoroutineProfile(executor, nil, osyield)
+	}
 	if !canCASExecutor ||
 		!executor.atomicstatus.CompareAndSwap(_Grunnable, _Grunning) {
 		casgstatus(executor, _Grunnable, _Grunning)
@@ -1018,7 +1025,7 @@ func coroNativeFinish(executor *g) {
 	if ctx == nil || ctx.executor != executor {
 		throw("runtime: invalid stackless coroutine native finish")
 	}
-	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil {
+	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil || ctx.gState.activeSource != nil || ctx.gState.sourceTransition {
 		throw("runtime: active stackless coroutine state during native finish")
 	}
 	schedulerG := getg()
@@ -1057,6 +1064,12 @@ func coroNativeFinish(executor *g) {
 	mp.lockedInt = ctx.lockedInt
 	caller.m = mp
 
+	// The profile may have started while caller was waiting on this native
+	// episode. A status transition alone does not claim its pending record;
+	// the profiler must finish reading the stopped stack before we resume it.
+	if goroutineProfile.active {
+		tryRecordGoroutineProfile(caller, nil, osyield)
+	}
 	if !canCASCaller ||
 		!caller.atomicstatus.CompareAndSwap(_Gwaiting, _Grunning) {
 		// Preserve the ordinary runnable transition when a concurrent stack
@@ -1084,6 +1097,13 @@ func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 		return nil
 	}
 	return (*stacklessCoroNativeContext)(state.native)
+}
+
+func stacklessCoroPublicCaller(gp *g) *g {
+	if ctx := stacklessCoroNativeContextFor(gp); ctx != nil && ctx.public {
+		return ctx.caller
+	}
+	return gp
 }
 
 //go:nosplit

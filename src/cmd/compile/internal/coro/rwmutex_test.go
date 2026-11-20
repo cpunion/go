@@ -21,6 +21,7 @@ func TestRWMutex(t *testing.T) {
 	const source = `package main
 
 import (
+ "runtime/metrics"
 	"os"
 	"runtime"
 	"sync"
@@ -129,7 +130,7 @@ func main() {
 		spawnWriter()
 		spawnReaders()
 		if atomic.LoadInt32(&stage) != 0 { panic("writer passed held read lock") }
-		if native && runtime.NumGoroutine() > 32 { panic("ordinary goroutine per waiter") }
+		if native && ordinaryGoroutines() > 32 { panic("ordinary goroutine per waiter") }
 		rw.RUnlock()
 		for i := 0; i < 257; i++ { <-done }
 		if atomic.LoadInt32(&stage) != 1 { panic("detached writer lost") }
@@ -138,6 +139,16 @@ func main() {
 	if n, _ := runtime.BlockProfile(nil); n == 0 { panic("missing block profile") }
 	if n, _ := runtime.MutexProfile(nil); n == 0 { panic("missing mutex profile") }
 	println("rwmutex complete")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/cororwmutex\n\ngo 1.28\n"), 0o666); err != nil {

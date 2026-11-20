@@ -202,6 +202,7 @@ func coroAwaitFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroDeferAwaitFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8)
 func coroAwaitSelfFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8, bool) uint8
 func coroCompleteSelfFrame(unsafe.Pointer, bool) uint8
+func coroProfileResume()
 func coroRequestFusedFrame(unsafe.Pointer, bool)
 func coroAwaitFusedFrame(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
 func coroCompleteFusedFrame(unsafe.Pointer) uint8

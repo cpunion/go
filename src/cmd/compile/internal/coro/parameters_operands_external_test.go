@@ -65,7 +65,8 @@ func main(){
 
 func TestClosedParameterOperandsSpawn(t *testing.T) {
 	const source = `package main
-import ("runtime";"runtime/debug")
+import (
+ "runtime/metrics";"runtime";"runtime/debug")
 type box struct {n int}
 func first(p *box,n int,ready chan int,gate chan struct{},done chan int) {ready<-n;<-gate;runtime.Gosched();done<-p.n+n}
 func second(p *box,n int,ready chan int,gate chan struct{},done chan int) {ready<-n;<-gate;runtime.Gosched();done<-p.n+n+1}
@@ -81,12 +82,22 @@ func spawn(ready chan int,gate chan struct{},done chan int) {
 func main(){
  native:=false;if info,ok:=debug.ReadBuildInfo();ok {for _,s:=range info.Settings {if s.Key=="GOEXPERIMENT" && s.Value=="coro" {native=true}}}
  ready,gate,done:=make(chan int,128),make(chan struct{}),make(chan int,128)
- baseline:=runtime.NumGoroutine();spawn(ready,gate,done)
+ baseline:=ordinaryGoroutines();spawn(ready,gate,done)
  total:=0;for range 128 {total+=<-ready};if total!=8256 || arguments!=128 {panic("nested go operands")}
- if native && runtime.NumGoroutine()>baseline+12 {panic("ordinary callback tasks")}
+ if native && ordinaryGoroutines()>baseline+12 {panic("ordinary callback tasks")}
  runtime.GC();close(gate);total=0;for range 128 {total+=<-done};if total!=16448 {panic("callback GC or lifetime")}
  println("switch-return-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	testSwitchReturnProgram(t, source, nil, []string{"spawn"})
 }
 
