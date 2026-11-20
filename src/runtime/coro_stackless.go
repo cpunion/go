@@ -159,6 +159,7 @@ const (
 	stacklessCoroLifetimeDrained
 	stacklessCoroLifetimeHostStarted
 	stacklessCoroLifetimePublicHost
+	stacklessCoroLifetimeTerminalRecords
 )
 
 type stacklessCoroTaskState uint8
@@ -302,8 +303,8 @@ type stacklessCoroScheduler struct {
 	// initialRootPrivate is cleared once by the initial driver, under the
 	// scheduler lock, before an operation or non-root runnable is published.
 	initialRootPrivate bool
-	// lifetime publishes monotonic facts for one initialized scheduler
-	// lifetime. Root completion is published only after its outcome is ready.
+	// lifetime publishes scheduler lifecycle flags and the presence of
+	// terminal records. Root completion is published after its outcome.
 	lifetime atomic.Uint8
 	// liveSpawns counts independent logical goroutines, not structured
 	// await frames. It is protected by lock. Root completion does not end
@@ -3501,6 +3502,13 @@ func coroDeferInvokeTrace(ctx unsafe.Pointer, deferred func()) {
 	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine defer trace")
 	}
+	// A normal return without a surrounding defer scope has no terminal
+	// positions to retain and no outer recover permission to mask.
+	if state := getg().stacklessCoro; (state == nil || state.deferState == nil) &&
+		!context.scheduler.hasTerminalRecords() {
+		deferred()
+		return
+	}
 	scope := enterStacklessCoroDeferScope(task, false)
 	defer scope.leave()
 	deferred()
@@ -4458,7 +4466,12 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 		s.initialRootPrivate = false
 	}
 	task.state = stacklessCoroTaskRunnable
-	stacklessCoroSetLogicalLeaf(task, nil)
+	// A new independent task is registered with itself as the leaf, and
+	// completing a structured child restores its parent before readying it.
+	// Only a queued structured activation can change the visible leaf here.
+	if task.parent != nil {
+		stacklessCoroSetLogicalLeaf(task, nil)
+	}
 	task.next = nil
 	if h := s.taskHostLocked(task); h != nil {
 		if raceenabled {

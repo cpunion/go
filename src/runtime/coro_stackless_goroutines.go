@@ -272,18 +272,20 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	var before bool
 	if owner != nil {
 		s := task.context.scheduler
-		lock(&s.lock)
-		for at := task; at != nil; at = at.parent {
-			if trace = s.terminalSourceTrace(at); trace != nil {
-				boundary, before = at, true
-				break
+		if s.hasTerminalRecords() {
+			lock(&s.lock)
+			for at := task; at != nil; at = at.parent {
+				if trace = s.terminalSourceTrace(at); trace != nil {
+					boundary, before = at, true
+					break
+				}
+				if trace = s.deferTrace(at); trace != nil {
+					boundary = at
+					break
+				}
 			}
-			if trace = s.deferTrace(at); trace != nil {
-				boundary = at
-				break
-			}
+			unlock(&s.lock)
 		}
-		unlock(&s.lock)
 	}
 	lock(&stacklessCoroGoroutines.lock)
 	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil {
@@ -420,10 +422,11 @@ func stacklessCoroInitHostG(fn *funcval, caller, gp *g) uint64 {
 // mutations require a P with preemption disabled by a runtime mutex. Foreign
 // calls retain their source frame until returning to Go with a P.
 func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTrace {
-	trace := new(stacklessCoroPanicTrace)
+	frames := new(stacklessCoroPanicText)
+	trace := &stacklessCoroPanicTrace{frames: frames[:]}
 	trace.appendLogicalGoroutine(r)
 	pcs := make([]uintptr, trace.pcCount)
-	*trace = stacklessCoroPanicTrace{pcs: pcs}
+	*trace = stacklessCoroPanicTrace{frames: frames[:], pcs: pcs}
 	trace.appendLogicalGoroutine(r)
 	if trace.pcCount != len(pcs) {
 		throw("runtime: incomplete coroutine goroutine PC capture")
@@ -670,7 +673,8 @@ func stacklessCoroPrintGoroutines(skipID uint64) {
 			}
 			printGoroutineLabels(labels)
 			print(":\n")
-			var trace stacklessCoroPanicTrace
+			var frames stacklessCoroPanicText
+			trace := stacklessCoroPanicTrace{frames: frames[:]}
 			trace.appendLogicalGoroutine(r)
 			for i := 0; i < trace.count; i++ {
 				uf, ok := trace.at(i)

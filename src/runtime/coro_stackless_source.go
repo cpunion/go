@@ -99,7 +99,7 @@ func stacklessCoroSourcePC(source funcInfo, file string, line int32) uintptr {
 	}
 }
 
-func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer) (funcInfo, uintptr) {
+func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer, leafEntry, leafPC uintptr) (funcInfo, uintptr) {
 	f := findfunc(resume.fn)
 	info := stacklessCoroSourceFrame(f)
 	if info == nil || info.flags&abi.CoroSourceResume == 0 {
@@ -108,6 +108,9 @@ func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer) (funcInf
 	source := stacklessCoroSourceFunc(f, info)
 	if !source.valid() {
 		return funcInfo{}, 0
+	}
+	if leafEntry != 0 && source.entry() == leafEntry {
+		return source, leafPC
 	}
 	var cell unsafe.Pointer
 	switch info.pcKind {
@@ -194,13 +197,20 @@ func walkStacklessCoroSourceFrames(task *stacklessCoroTask, visit func(funcInfo,
 }
 
 func walkStacklessCoroSourceTaskFrames(task *stacklessCoroTask, visit func(funcInfo, uintptr) bool) (uintptr, bool) {
+	return walkStacklessCoroSourceTaskFramesAt(task, 0, 0, visit)
+}
+
+// A physical panic cursor has the exact position of the first source
+// activation. Use that position without decoding its saved resume state.
+func walkStacklessCoroSourceTaskFramesAt(task *stacklessCoroTask, leafEntry, leafPC uintptr, visit func(funcInfo, uintptr) bool) (uintptr, bool) {
 	var rootPC uintptr
 	resume := stacklessCoroResumeIdentity(task.resume)
 	frame := task.context.frame
 	fused := task.hasFlag(stacklessCoroTaskFusedFrames)
 	for resume != nil {
-		f, pc := stacklessCoroResumeSourcePC(resume, frame)
+		f, pc := stacklessCoroResumeSourcePC(resume, frame, leafEntry, leafPC)
 		if f.valid() {
+			leafEntry = 0
 			rootPC = f.entry()
 			if !visit(f, pc) {
 				return rootPC, false

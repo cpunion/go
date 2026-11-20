@@ -30,15 +30,23 @@ func init() {
 type stacklessCoroPanicTrace struct {
 	rootPC       uintptr
 	count        int
-	frames       [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
+	frames       []inlineFrame
 	goexit       bool
 	calleeFuncID abi.FuncID
 	// Callers can request positions beyond the bounded text window. Its
 	// immutable payload contains return PCs, never user or frame pointers.
 	pcs     []uintptr
 	pcCount int
-	// Short captures can finish without a separate allocation or walk.
-	shortPCs [8]uintptr
+}
+
+type stacklessCoroPanicText [tracebackInnerFrames + tracebackOuterFrames]inlineFrame
+
+// Keep both views in a single small object for shallow panics. In particular,
+// keep the walk's buffers off the unwinding goroutine's stack.
+type stacklessCoroShortPanicTrace struct {
+	trace  stacklessCoroPanicTrace
+	frames [8]inlineFrame
+	pcs    [8]uintptr
 }
 
 type stacklessCoroPanicState struct {
@@ -79,7 +87,9 @@ func (trace *stacklessCoroPanicTrace) appendFrame(uf inlineFrame) {
 	if i >= tracebackInnerFrames {
 		i = tracebackInnerFrames + (i-tracebackInnerFrames)%tracebackOuterFrames
 	}
-	trace.frames[i] = uf
+	if i < len(trace.frames) {
+		trace.frames[i] = uf
+	}
 	trace.count++
 }
 
@@ -122,13 +132,8 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 			trace.appendTrace(state.deferState.trace)
 			return
 		}
-		pc, _ := walkStacklessCoroSourceTaskFrames(task, func(f funcInfo, pc uintptr) bool {
-			if leafEntry != 0 {
-				if f.entry() == leafEntry {
-					pc = leafPC
-				}
-				leafEntry = 0
-			}
+		pc, _ := walkStacklessCoroSourceTaskFramesAt(task, leafEntry, leafPC, func(f funcInfo, pc uintptr) bool {
+			leafEntry = 0
 			trace.append(f, pc)
 			return true
 		})
@@ -165,8 +170,9 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 	if p != nil {
 		pc, sp = p.startPC, p.startSP
 	}
-	trace := new(stacklessCoroPanicTrace)
-	trace.pcs = trace.shortPCs[:]
+	short := new(stacklessCoroShortPanicTrace)
+	trace := &short.trace
+	trace.frames, trace.pcs = short.frames[:], short.pcs[:]
 	gp := getg()
 	for pass := 0; pass < 2; pass++ {
 		systemstack(func() {
@@ -213,19 +219,21 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 		if trace.rootPC == 0 {
 			return nil
 		}
-		if pass == 0 && trace.pcCount <= len(trace.shortPCs) {
+		if pass == 0 && trace.pcCount <= len(short.pcs) && trace.count <= len(short.frames) {
 			trace.pcs = trace.pcs[:trace.pcCount]
+			trace.frames = trace.frames[:trace.count]
 			return trace
 		}
 		if pass == 0 {
-			// The shorter buffer also counted PCs it could not retain.
-			// Allocate the full payload before reinitializing the cursor
-			// with the same logical task ownership.
-			pcs := make([]uintptr, trace.pcCount)
-			*trace = stacklessCoroPanicTrace{pcs: pcs}
+			// The first walk also counted frames and PCs it could not
+			// retain. Reserve the full payload before walking again.
+			trace = &stacklessCoroPanicTrace{
+				pcs:    make([]uintptr, trace.pcCount),
+				frames: make([]inlineFrame, min(trace.count, len(stacklessCoroPanicText{}))),
+			}
 		}
 	}
-	if trace.pcCount != len(trace.pcs) {
+	if trace.pcCount != len(trace.pcs) || min(trace.count, len(stacklessCoroPanicText{})) != len(trace.frames) {
 		throw("runtime: incomplete coroutine source PC capture")
 	}
 	return trace
@@ -238,14 +246,17 @@ func extendStacklessCoroPanicTrace(trace *stacklessCoroPanicTrace, task *stackle
 		return captureStacklessCoroPanicTrace(task, nil, 0, nil)
 	}
 	result := new(stacklessCoroPanicTrace)
+	frames := new(stacklessCoroPanicText)
 	*result = *trace
-	result.pcs = nil
+	result.frames, result.pcs = frames[:], nil
+	copy(result.frames, trace.frames)
 	gp := getg()
 	result.appendLineage(task, gp, 0, 0)
 	pcs := make([]uintptr, result.pcCount)
 	copy(pcs, trace.pcs)
 	*result = *trace
-	result.pcs = pcs
+	result.frames, result.pcs = frames[:], pcs
+	copy(result.frames, trace.frames)
 	result.appendLineage(task, gp, 0, 0)
 	if result.pcCount != len(result.pcs) {
 		throw("runtime: incomplete extended coroutine source PC capture")

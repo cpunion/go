@@ -21,6 +21,29 @@ type stacklessCoroTerminalValue struct {
 	hasValue   bool
 }
 
+// Only use this unlocked check for a task already owned by the caller.
+// Its pending terminal records are published before it can resume.
+func (s *stacklessCoroScheduler) hasTerminalRecords() bool {
+	return s.lifetime.Load()&stacklessCoroLifetimeTerminalRecords != 0
+}
+
+func (s *stacklessCoroScheduler) addTerminalRecord(entry *stacklessCoroTerminalValue) {
+	entry.next = s.terminalValues
+	s.terminalValues = entry
+	if entry.next == nil {
+		s.lifetime.Or(stacklessCoroLifetimeTerminalRecords)
+	}
+}
+
+func (s *stacklessCoroScheduler) removeTerminalRecord(link **stacklessCoroTerminalValue) {
+	entry := *link
+	*link = entry.next
+	entry.task, entry.next = nil, nil
+	if s.terminalValues == nil {
+		s.lifetime.And(^stacklessCoroLifetimeTerminalRecords)
+	}
+}
+
 func (s *stacklessCoroScheduler) terminalTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
 	for entry := s.terminalValues; entry != nil; entry = entry.next {
 		if entry.task == task {
@@ -58,7 +81,7 @@ func (s *stacklessCoroScheduler) setTerminalValue(task *stacklessCoroTask, value
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, value: value, hasValue: true, next: s.terminalValues}
+	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, value: value, hasValue: true})
 }
 
 func (s *stacklessCoroScheduler) clearTerminalValue(task *stacklessCoroTask) {
@@ -67,8 +90,7 @@ func (s *stacklessCoroScheduler) clearTerminalValue(task *stacklessCoroTask) {
 		if entry.task == task {
 			entry.value, entry.trace, entry.hasValue = nil, nil, false
 			if entry.deferTrace == nil && entry.exitTrace == nil {
-				*link = entry.next
-				entry.task, entry.next = nil, nil
+				s.removeTerminalRecord(link)
 			}
 			return
 		}
@@ -88,7 +110,7 @@ func (s *stacklessCoroScheduler) setDeferTrace(task *stacklessCoroTask, trace *s
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, deferTrace: trace, next: s.terminalValues}
+	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, deferTrace: trace})
 }
 
 func (s *stacklessCoroScheduler) deferTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
@@ -106,8 +128,7 @@ func (s *stacklessCoroScheduler) clearDeferTrace(task *stacklessCoroTask) {
 		if entry.task == task {
 			entry.deferTrace = nil
 			if !entry.hasValue && entry.exitTrace == nil {
-				*link = entry.next
-				entry.task, entry.next = nil, nil
+				s.removeTerminalRecord(link)
 			}
 			return
 		}
@@ -140,7 +161,7 @@ func (s *stacklessCoroScheduler) setExitTrace(task *stacklessCoroTask, trace *st
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, exitTrace: trace, next: s.terminalValues}
+	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, exitTrace: trace})
 }
 
 func (s *stacklessCoroScheduler) clearExitTrace(task *stacklessCoroTask) {
@@ -149,8 +170,7 @@ func (s *stacklessCoroScheduler) clearExitTrace(task *stacklessCoroTask) {
 		if entry.task == task {
 			entry.exitTrace = nil
 			if !entry.hasValue && entry.deferTrace == nil {
-				*link = entry.next
-				entry.task, entry.next = nil, nil
+				s.removeTerminalRecord(link)
 			}
 			return
 		}
