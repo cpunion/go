@@ -23,6 +23,7 @@ func TestCapturedCallableEnvironments(t *testing.T) {
 	}
 	testenv.MustHaveGoBuild(t)
 	const source = `package main
+import "runtime/metrics"
 import "runtime"
 func closed(c chan int) int {
  seed:=3
@@ -81,10 +82,10 @@ func main(){
  c:=make(chan int,16);for range 16 {c<-1}
  if closed(c)!=611 || instances(c)!=131 || choose(false,c)!=8 || choose(true,c)!=24 {panic("shared capture or instance isolation")}
  gate,ready,done:=make(chan int),make(chan int),make(chan int)
- before:=runtime.NumGoroutine()
+ before:=ordinaryGoroutines()
  spawn(gate,ready,done)
  for range 64 {<-ready}
- if NATIVE && runtime.NumGoroutine()>before+20 {panic("ordinary go per captured child")}
+ if NATIVE && ordinaryGoroutines()>before+20 {panic("ordinary go per captured child")}
  runtime.GC();for range 64 {gate<-5};for range 64 {if <-done!=12 {panic("captured spawn result")}}
  f:=recovery(20);if f()!=29 || f()!=30 {panic("captured direct recover")}
  first:=nesting(30);nested:=first();if nested()!=31 || nested()!=32 {panic("nested shared cell")}
@@ -101,6 +102,16 @@ func main(){
  for range 64 {runtime.GC();runtime.Gosched();select {case <-dead:released=true;default:};if released {break}}
  if !released {panic("completed frame retained captured object")}
  println("captured-callables-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	for _, config := range []struct{ name, experiment, flags string }{

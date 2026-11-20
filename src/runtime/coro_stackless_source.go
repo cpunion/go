@@ -12,9 +12,10 @@ import (
 	"unsafe"
 )
 
-// Every reference is relative to moduledata.rodata, including entry cells
-// that the linker places in relro. This works in PIE and without DWARF and
-// does not grant native-call capability.
+// String references are relative to moduledata.rodata. Source entry cells
+// use an index into a relocated module table: an external linker may change
+// the distance between read-only strings and relro code-pointer cells.
+// This metadata does not grant native-call capability.
 type stacklessCoroSourceInfo struct {
 	version, flags, source   uint32
 	pcKind, pcOffset, pcSize uint32
@@ -48,7 +49,10 @@ func stacklessCoroSourceFrame(f funcInfo) *stacklessCoroSourceInfo {
 
 func stacklessCoroSourceFunc(f funcInfo, info *stacklessCoroSourceInfo) funcInfo {
 	if info != nil && info.flags&(abi.CoroSourceResume|abi.CoroSourceCopy) != 0 {
-		entry := *(*uintptr)(unsafe.Pointer(f.datap.rodata + uintptr(info.source)))
+		if uint64(info.source) >= uint64(len(f.datap.coroSourceEntries)) {
+			return funcInfo{}
+		}
+		entry := *(*uintptr)(unsafe.Pointer(f.datap.coroSourceEntries[info.source]))
 		return findfunc(entry)
 	}
 	return f

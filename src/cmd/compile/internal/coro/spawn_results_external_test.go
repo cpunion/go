@@ -76,6 +76,7 @@ func Single(value int) int { runtime.Gosched(); return value }
 func Plain(out *int, done chan struct{}) int { *out = 29; close(done); return 29 }
 `,
 		"main.go": `package main
+import "runtime/metrics"
 
 import (
  "example.com/spawnresults/helper"
@@ -130,7 +131,7 @@ func main() {
  var done [128]chan struct{}
  for i := range 128 { done[i] = make(chan struct{}) }
  ready, gate, finished := make(chan int, 128), make(chan struct{}), make(chan struct{})
- baseline := runtime.NumGoroutine()
+ baseline := ordinaryGoroutines()
  // Keep this controller ordinary: the creator must return while its
  // independent children remain parked with their discarded result slots.
  go func() { spawn(ready, gate, &results, &done); close(finished) }()
@@ -142,7 +143,7 @@ func main() {
   seen[index] = true
  }
  if next != 128 { panic("argument evaluation count") }
- if os.Getenv("EXPECT_NATIVE") == "1" && runtime.NumGoroutine() > baseline+12 {
+ if os.Getenv("EXPECT_NATIVE") == "1" && ordinaryGoroutines() > baseline+12 {
   panic("discarded results retained ordinary goroutines")
  }
  runtime.GC()
@@ -164,6 +165,16 @@ func main() {
   select {}
  }
  println("spawn-results-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `,
 	}

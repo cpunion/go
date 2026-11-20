@@ -21,6 +21,7 @@ func TestCaptureFreeLiteralEntries(t *testing.T) {
 		t.Skip("native executor unavailable")
 	}
 	const source = `package main
+import "runtime/metrics"
 import "runtime"
 func direct(c chan int) int { result:=func(in chan int) int {value:=<-in;return value}(c);return result }
 func local(c chan int) int { f:=func(in chan int) int {value:=<-in;return value+1};g:=f;return g(c) }
@@ -33,15 +34,25 @@ func main() {
  c:=make(chan int,4);c<-10;c<-20;c<-30;c<-40
  if direct(c)!=10 || local(c)!=21 || nested(c)!=32 || capturing(c)!=40 {panic("wrong literal result")}
  in,out:=make(chan int,64),make(chan int)
- before:=runtime.NumGoroutine()
+ before:=ordinaryGoroutines()
  spawn(in,out)
- if NATIVE && runtime.NumGoroutine()>before+16 {panic("literal children used ordinary goroutines")}
+ if NATIVE && ordinaryGoroutines()>before+16 {panic("literal children used ordinary goroutines")}
  for i:=range 64 {in<-i}
  runtime.GC()
  total:=0;for range 64 {total+=<-out}
  if total!=2016 {panic("lost literal child")}
  done:=make(chan struct{});go exitLiteral(done);<-done
  println("literal-entries-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	for _, config := range []struct {

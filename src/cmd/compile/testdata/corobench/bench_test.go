@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -643,6 +644,7 @@ func BenchmarkTaskParkFootprint10000(b *testing.B) {
 	oldGC := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(oldGC)
 	runtime.GC()
+	beforeUnhosted := unhostedTaskCount()
 	var before, parked runtime.MemStats
 	runtime.ReadMemStats(&before)
 	b.ReportAllocs()
@@ -657,6 +659,7 @@ func BenchmarkTaskParkFootprint10000(b *testing.B) {
 		runtime.Gosched()
 	}
 	runtime.Gosched()
+	parkedUnhosted := unhostedTaskCount()
 	runtime.ReadMemStats(&parked)
 	atomic.StoreUint64(&taskParkRelease, 1)
 	completed := <-sessionDone
@@ -664,12 +667,26 @@ func BenchmarkTaskParkFootprint10000(b *testing.B) {
 	if completed != 10000 {
 		b.Fatalf("completed %d tasks, want 10000", completed)
 	}
+	// Each unhosted source goroutine owns one cold logical identity record.
+	// Report that population separately from the task/frame object budget.
+	b.ReportMetric(float64(memoryDelta(parkedUnhosted, beforeUnhosted))/10000,
+		"unhosted-goroutines/task")
 	b.ReportMetric(float64(memoryDelta(parked.HeapAlloc, before.HeapAlloc))/10000,
 		"live-heap-B/task")
 	b.ReportMetric(float64(memoryDelta(parked.HeapObjects, before.HeapObjects))/10000,
 		"live-objects/task")
 	b.ReportMetric(float64(memoryDelta(parked.StackInuse, before.StackInuse))/10000,
 		"live-stack-B/task")
+}
+
+func unhostedTaskCount() uint64 {
+	var samples [1]metrics.Sample
+	samples[0].Name = "/sched/coro/goroutines/unhosted:goroutines"
+	metrics.Read(samples[:])
+	if samples[0].Value.Kind() == metrics.KindUint64 {
+		return samples[0].Value.Uint64()
+	}
+	return 0
 }
 
 func memoryDelta(after, before uint64) uint64 {

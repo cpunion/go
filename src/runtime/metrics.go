@@ -465,6 +465,12 @@ func initMetrics() {
 				out.scalar = uint64(gomaxprocs)
 			},
 		},
+		"/sched/coro/goroutines/unhosted:goroutines": {
+			compute: func(_ *statAggregate, out *metricValue) {
+				out.kind = metricKindUint64
+				out.scalar = uint64(stacklessCoroUnhostedGoroutines())
+			},
+		},
 		"/sched/goroutines:goroutines": {
 			deps: makeStatDepSet(schedStatsDep),
 			compute: func(in *statAggregate, out *metricValue) {

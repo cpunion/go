@@ -70,7 +70,9 @@ stacklessCoro < stacklessCoroCache;
 
 # Scheduler, timers, netpoll
 NONE < allocmW, execW, cpuprof, pollCache, pollDesc, wakeableSleep;
-scavenge, sweep, testR, wakeableSleep, timerSend < hchan;
+# Host queue publication signals its private wake channel under the coroutine
+# scheduler lock. User-channel completion drops hchan before readying tasks.
+scavenge, sweep, testR, wakeableSleep, timerSend, stacklessCoro < hchan;
 assistQueue,
   cleanupQueue,
   computeMaxProcs,
@@ -88,10 +90,14 @@ assistQueue,
 # Above SCHED are things that can call into the scheduler.
 < SCHED
 # Below SCHED is the scheduler implementation.
-< allocmR,
-  execR;
-allocmR, execR, hchan < sched;
+< allocmR;
+allocmR, hchan < sched;
 sched < allg, allp;
+
+# Darwin preemption takes execLock while retake holds allpLock or
+# forEachPInternal holds sched.lock. Thread creation holds execR around
+# the OS call, without acquiring either scheduler lock.
+allp < execR;
 
 # Channels
 NONE < notifyList;

@@ -513,6 +513,12 @@ Below is the full list of supported metrics, ordered lexicographically.
 		by code called via cgo or via the syscall package. Sum of all
 		metrics in /memory/classes.
 
+	/sched/coro/goroutines/unhosted:goroutines
+		Count of live independent coroutine goroutines that have not
+		acquired an ordinary Go stack. These goroutines are included
+		in /sched/goroutines:goroutines. Always zero when the coro
+		experiment is disabled.
+
 	/sched/gomaxprocs:threads
 		The current runtime.GOMAXPROCS setting, or the number of
 		operating system threads that can execute user-level Go code

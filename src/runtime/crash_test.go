@@ -1238,3 +1238,14 @@ func TestSynctestCondSignalFromNoBubble(t *testing.T) {
 		})
 	}
 }
+
+func TestGoexitPanicPrinter(t *testing.T) {
+	for _, procs := range []string{"1", "4"} {
+		t.Run("P"+procs, func(t *testing.T) {
+			output := runTestProg(t, "testprog", "GoexitPanicPrinter", "GOMAXPROCS="+procs, "GOGC=1")
+			if output != "PASS\n" {
+				t.Fatalf("unexpected output: %s", output)
+			}
+		})
+	}
+}
