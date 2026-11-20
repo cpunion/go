@@ -21,7 +21,6 @@ func TestSourceIndependentTaskEnumeration(t *testing.T) {
 	}
 	const program = `package main
 import("bytes";"context";"fmt";"os";"runtime";"runtime/metrics";"runtime/pprof";"strconv";"strings";"sync/atomic";"time")
-const children=32
 type payload struct{id int;pad [64]byte}
 var finalized atomic.Int32
 var opaque func()
@@ -50,6 +49,7 @@ func unhosted()int{samples:=[]metrics.Sample{{Name:"/sched/coro/goroutines/unhos
 func gid(stack string)uint64{fields:=strings.Fields(stack);if len(fields)<2||fields[0]!="goroutine"{panic("goroutine header")};n,e:=strconv.ParseUint(fields[1],10,64);if e!=nil{panic(e)};return n}
 func main(){goto body;body:
  depth,e:=strconv.Atoi(os.Args[1]);if e!=nil{panic(e)};mode,e:=strconv.Atoi(os.Args[2]);if e!=nil{panic(e)};native:=os.Getenv("EXPECT_NATIVE")=="1";opaque=hold
+ children,e:=strconv.Atoi(os.Args[3]);if e!=nil{panic(e)}
  baseline:=runtime.NumGoroutine();self:=make([]byte,4096);parent:=gid(string(self[:runtime.Stack(self,false)]));ready,done:=make(chan int),make(chan int);first,second:=make(chan struct{}),make(chan struct{})
  ps:=make([]*payload,children);for i:=range ps{ps[i]=&payload{id:i};runtime.SetFinalizer(ps[i],func(*payload){finalized.Add(1)})}
  ctx:=pprof.WithLabels(context.Background(),pprof.Labels("coro-enumeration","inherited"));pprof.SetGoroutineLabels(ctx)
@@ -58,7 +58,9 @@ func main(){goto body;body:
   for i:=0;i<children;i++{if <-ready!=stage{panic("phase mismatch")}};for i:=0;i<100;i++{runtime.Gosched()};runtime.GC();runtime.GC()
   if finalized.Load()!=0{panic("live task lost payload")};if n:=runtime.NumGoroutine();n!=baseline+children{panic(fmt.Sprintf("count %d want %d",n,baseline+children))}
   wantNative:=0;if native&&stage==0{wantNative=children};if n:=unhosted();n!=wantNative{panic(fmt.Sprintf("unhosted %d want %d",n,wantNative))}
-  text:=make([]byte,2<<20);n:=runtime.Stack(text,true);ids:=make(map[uint64]bool)
+  text:=make([]byte,2<<20);n:=runtime.Stack(text,true)
+  for n==len(text){text=make([]byte,2*len(text));n=runtime.Stack(text,true)}
+  ids:=make(map[uint64]bool)
   for _,stack:=range strings.Split(string(text[:n]),"\n\n"){
    current:=strings.Split(stack,"[originating from")[0];if !strings.Contains(current,"main.recursive("){continue};id:=gid(stack);if id==parent||ids[id]{panic("logical identity reused")};ids[id]=true
    want:=depth+1;if depth>100{want=99};if got:=strings.Count(current,"main.recursive(");got!=want{panic(fmt.Sprintf("source count %d want %d\n%s",got,want,stack))}
@@ -78,8 +80,8 @@ func main(){goto body;body:
   if labelCount!=children{panic(fmt.Sprintf("inherited labels %d want %d\n%s",labelCount,children,profile.String()))}
   if stage==0{close(first)}else{close(second)}
  }
- var seen [children]bool;for i:=0;i<children;i++{id:=<-done;if id<0||id>=children||seen[id]{panic("cleanup result")};seen[id]=true}
- deadline:=time.Now().Add(10*time.Second);for runtime.NumGoroutine()!=baseline||finalized.Load()!=children||unhosted()!=0{if time.Now().After(deadline){panic(fmt.Sprintf("lifetime drain users=%d finalized=%d native=%d",runtime.NumGoroutine(),finalized.Load(),unhosted()))};runtime.GC();runtime.Gosched()}
+ seen:=make([]bool,children);for i:=0;i<children;i++{id:=<-done;if id<0||id>=children||seen[id]{panic("cleanup result")};seen[id]=true}
+ deadline:=time.Now().Add(10*time.Second);for runtime.NumGoroutine()!=baseline||int(finalized.Load())!=children||unhosted()!=0{if time.Now().After(deadline){panic(fmt.Sprintf("lifetime drain users=%d finalized=%d native=%d",runtime.NumGoroutine(),finalized.Load(),unhosted()))};runtime.GC();runtime.Gosched()}
  fmt.Println("task-enumeration-ok",depth,mode)
 }
 `
@@ -125,24 +127,33 @@ func main(){goto body;body:
 					}
 				}
 			}
+			check := func(depth, mode, p, children string) {
+				t.Helper()
+				run := testenv.Command(t, exe, depth, mode, children)
+				expect := "0"
+				if config.experiment == "coro" && config.extra == "" {
+					expect = "1"
+				}
+				run.Env = append(run.Environ(), "EXPECT_NATIVE="+expect, "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebackancestors=2,tracebacklabels=1")
+				for key, value := range lines {
+					run.Env = append(run.Env, key+"="+value)
+				}
+				data, err := run.CombinedOutput()
+				if want := "task-enumeration-ok " + depth + " " + mode + "\n"; err != nil || string(data) != want {
+					t.Fatalf("depth %s mode %s P%s children %s: %v\n%s", depth, mode, p, children, err, data)
+				}
+			}
 			for _, depth := range []string{"8", "220"} {
 				for _, mode := range []string{"0", "1", "2"} {
 					for _, p := range []string{"1", "4"} {
-						run := testenv.Command(t, exe, depth, mode)
-						expect := "0"
-						if config.experiment == "coro" && config.extra == "" {
-							expect = "1"
-						}
-						run.Env = append(run.Environ(), "EXPECT_NATIVE="+expect, "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebackancestors=2,tracebacklabels=1")
-						for key, value := range lines {
-							run.Env = append(run.Env, key+"="+value)
-						}
-						data, err := run.CombinedOutput()
-						if want := "task-enumeration-ok " + depth + " " + mode + "\n"; err != nil || string(data) != want {
-							t.Fatalf("depth %s mode %s P%s: %v\n%s", depth, mode, p, err, data)
-						}
+						check(depth, mode, p, "32")
 					}
 				}
+			}
+			if config.name == "checkptr" {
+				// Grow the logical task registry before walking the parked tasks,
+				// then drain it through its shrink thresholds.
+				check("2", "1", "4", "2048")
 			}
 		})
 	}

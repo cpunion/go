@@ -27,7 +27,7 @@ func recursive(n int){runtime.Gosched();if n>0{recursive(n-1);return};panic("ori
 var entry=recursive
 //go:noinline
 func inspect(skip,size int){goto body;body:pcs:=make([]uintptr,size);n:=runtime.Callers(skip,pcs);fmt.Printf("query %d %d %d\n",skip,size,n);if n==0{return};frames:=runtime.CallersFrames(pcs[:n]);for{f,more:=frames.Next();fmt.Printf("%s %s:%d\n",f.Function,filepath.Base(f.File),f.Line);if !more{break}}}
-func main(){goto body;body:n:=16;if os.Args[1]=="deep"{n=220};defer func(){for _,skip:=range []int{0,1,2,3,4,49,50,100,219,220,222,224,225,226,227,228,1000}{for _,size:=range []int{0,1,2,17,50,100,512}{inspect(skip,size)}};if recover()!="original"{panic("missing original")}}();entry(n)}
+func main(){goto body;body:n:=16;if os.Args[1]=="short"{n=1};if os.Args[1]=="deep"{n=220};defer func(){for _,skip:=range []int{0,1,2,3,4,49,50,100,219,220,222,224,225,226,227,228,1000}{for _,size:=range []int{0,1,2,17,50,100,512}{inspect(skip,size)}};if recover()!="original"{panic("missing original")}}();entry(n)}
 `
 	dir := t.TempDir()
 	file := filepath.Join(dir, "main.go")
@@ -57,7 +57,7 @@ func main(){goto body;body:n:=16;if os.Args[1]=="deep"{n=220};defer func(){for _
 			if config.experiment == "coro" && linkedCoroStackUnsafe(t, exe, "main.recursive.coro.stackgate") {
 				t.Fatal("terminal PC source owner lost native admission")
 			}
-			for _, depth := range []string{"shallow", "deep"} {
+			for _, depth := range []string{"short", "shallow", "deep"} {
 				for _, p := range []string{"1", "4"} {
 					run := testenv.Command(t, exe, depth)
 					run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0")

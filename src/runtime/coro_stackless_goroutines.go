@@ -62,6 +62,11 @@ func stacklessCoroGoroutineBucket(root *stacklessCoroTask) **stacklessCoroGorout
 
 func stacklessCoroGoroutineIndex(root *stacklessCoroTask, n int) uintptr {
 	addr := uintptr(unsafe.Pointer(root))
+	// Keep the cheap address index for small populations. Larger tables
+	// need to mix the address so allocator size classes use all buckets.
+	if n == stacklessCoroInlineBuckets {
+		return (addr >> 3) & (stacklessCoroInlineBuckets - 1)
+	}
 	return memhash(unsafe.Pointer(&addr), 0, unsafe.Sizeof(addr)) & uintptr(n-1)
 }
 
@@ -420,6 +425,9 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 	pcs := make([]uintptr, trace.pcCount)
 	*trace = stacklessCoroPanicTrace{pcs: pcs}
 	trace.appendLogicalGoroutine(r)
+	if trace.pcCount != len(pcs) {
+		throw("runtime: incomplete coroutine goroutine PC capture")
+	}
 	return trace
 }
 

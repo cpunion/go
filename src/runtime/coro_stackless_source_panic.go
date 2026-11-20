@@ -37,6 +37,8 @@ type stacklessCoroPanicTrace struct {
 	// immutable payload contains return PCs, never user or frame pointers.
 	pcs     []uintptr
 	pcCount int
+	// Short captures can finish without a separate allocation or walk.
+	shortPCs [8]uintptr
 }
 
 type stacklessCoroPanicState struct {
@@ -66,10 +68,7 @@ func (trace *stacklessCoroPanicTrace) append(f funcInfo, pc uintptr) {
 }
 
 func (trace *stacklessCoroPanicTrace) appendPC(pc uintptr) {
-	if trace.pcs != nil {
-		if trace.pcCount >= len(trace.pcs) {
-			throw("runtime: coroutine source PC count changed during capture")
-		}
+	if trace.pcCount < len(trace.pcs) {
 		trace.pcs[trace.pcCount] = pc
 	}
 	trace.pcCount++
@@ -167,6 +166,7 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 		pc, sp = p.startPC, p.startSP
 	}
 	trace := new(stacklessCoroPanicTrace)
+	trace.pcs = trace.shortPCs[:]
 	gp := getg()
 	for pass := 0; pass < 2; pass++ {
 		systemstack(func() {
@@ -213,9 +213,14 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 		if trace.rootPC == 0 {
 			return nil
 		}
+		if pass == 0 && trace.pcCount <= len(trace.shortPCs) {
+			trace.pcs = trace.pcs[:trace.pcCount]
+			return trace
+		}
 		if pass == 0 {
-			// Count first, then allocate before reinitializing the physical
-			// cursor. Both passes retain the same logical task ownership.
+			// The shorter buffer also counted PCs it could not retain.
+			// Allocate the full payload before reinitializing the cursor
+			// with the same logical task ownership.
 			pcs := make([]uintptr, trace.pcCount)
 			*trace = stacklessCoroPanicTrace{pcs: pcs}
 		}
