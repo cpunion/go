@@ -5,9 +5,6 @@
 package coro_test
 
 import (
-	"crypto/sha256"
-	"encoding/json"
-	"fmt"
 	"internal/testenv"
 	"os"
 	"os/exec"
@@ -47,15 +44,27 @@ body:
 	<-forever
 }
 
+var ordinaryResidentEntry = ordinaryResident
+
+//go:noinline
+func residentPark(ready, forever chan struct{}) {
+	ready <- struct{}{}
+	<-forever
+}
+
 //go:noinline
 func residentLeaf(kind int, ready, forever chan struct{}) {
 	runtime.Gosched()
-	if kind == 2 || kind == 3 {
-		ordinaryResident(ready, forever, kind == 3)
+	switch kind {
+	case 2, 3:
+		ordinaryResidentEntry(ready, forever, kind == 3)
 		return
+	case 4:
+		panic("suspended-resident-panic")
+	case 5:
+		runtime.Goexit()
 	}
-	ready <- struct{}{}
-	<-forever
+	residentPark(ready, forever)
 }
 
 //go:noinline
@@ -71,11 +80,7 @@ func residentRecursive(n, kind int, ready, forever chan struct{}) {
 //go:noinline
 func residentRoot(n, kind int, ready, forever chan struct{}) {
 	if kind == 4 || kind == 5 {
-		defer residentRecursive(n, 0, ready, forever)
-		if kind == 5 {
-			runtime.Goexit()
-		}
-		panic("suspended-resident-panic")
+		defer residentPark(ready, forever)
 	}
 	residentRecursive(n, kind, ready, forever)
 }
@@ -181,7 +186,20 @@ body:
 	pprof.SetGoroutineLabels(context.Background())
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
-	print("BEGIN_RESIDENTS\n", string(buf[:n]), "END_RESIDENTS\n")
+	if n == len(buf) {
+		panic("truncated resident snapshot")
+	}
+	// Large snapshots may exceed the subprocess pipe capacity. Unlike
+	// the runtime print builtin, os.File.Write handles partial writes.
+	if _, err := os.Stderr.WriteString("BEGIN_RESIDENTS\n"); err != nil {
+		panic(err)
+	}
+	if _, err := os.Stderr.Write(buf[:n]); err != nil {
+		panic(err)
+	}
+	if _, err := os.Stderr.WriteString("END_RESIDENTS\n"); err != nil {
+		panic(err)
+	}
 	if mode == "cpu" {
 		if err := pprof.StartCPUProfile(io.Discard); err != nil {
 			panic(err)
@@ -210,16 +228,11 @@ body:
 	panic(fatalValue{})
 }
 `
-	// -artifacts retains the actual subprocess executables and every observation.
-	dir := t.ArtifactDir()
-	save := func(t *testing.T, name string, data []byte) {
-		t.Helper()
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	dir := t.TempDir()
 	file := filepath.Join(dir, "main.go")
-	save(t, "main.go", []byte(program))
+	if err := os.WriteFile(file, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, config := range []struct {
 		name, experiment, flags, extra string
 		native                         bool
@@ -243,18 +256,11 @@ body:
 			}
 			build := testenv.Command(t, testenv.GoToolPath(t), append(args, file)...)
 			build.Env = append(build.Environ(), "GOEXPERIMENT="+config.experiment, "GOWORK=off")
-			data, err := build.CombinedOutput()
-			save(t, config.name+"-build.log", data)
-			if err != nil {
+			if data, err := build.CombinedOutput(); err != nil {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
-			binary, err := os.ReadFile(exe)
-			if err != nil {
-				t.Fatal(err)
-			}
-			binaryHash := fmt.Sprintf("%x", sha256.Sum256(binary))
 			if config.native {
-				for _, name := range []string{"residentLeaf", "residentRecursive", "residentRoot", "launchResident", "shortResident", "launchShort", "independentCrash", "launchCrash"} {
+				for _, name := range []string{"residentPark", "residentLeaf", "residentRecursive", "residentRoot", "launchResident", "shortResident", "launchShort", "independentCrash", "launchCrash"} {
 					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
 						t.Fatalf("%s lost native admission", name)
 					}
@@ -268,19 +274,6 @@ body:
 						env := []string{"GOMAXPROCS=" + p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebacklabels=1,tracebackancestors=3", "GOTRACEBACK=all"}
 						run.Env = append(run.Environ(), env...)
 						data, err := run.CombinedOutput()
-						save(t, label+".log", data)
-						metadata, jsonErr := json.MarshalIndent(struct {
-							Binary       string
-							SHA256       string
-							Args         []string
-							Overrides    []string
-							OutputSHA256 string
-							Error        string
-						}{exe, binaryHash, []string{mode, depth}, env, fmt.Sprintf("%x", sha256.Sum256(data)), fmt.Sprint(err)}, "", "  ")
-						if jsonErr != nil {
-							t.Fatal(jsonErr)
-						}
-						save(t, label+".json", metadata)
 						exit, ok := err.(*exec.ExitError)
 						text := string(data)
 						if !ok || exit.ExitCode() != 2 || !strings.Contains(text, "panic: resident-fatal") || strings.Contains(text, "fatal error:") || strings.Contains(text, "panic during panic") {
@@ -294,7 +287,7 @@ body:
 						if !ok {
 							t.Fatalf("%s: no after snapshot\n%s", label, text)
 						}
-						wants, gots := fatalIdentityStacks(before, "main.residentLeaf("), fatalIdentityStacks(after, "main.residentLeaf(")
+						wants, gots := fatalIdentityStacks(before, "main.residentRoot("), fatalIdentityStacks(after, "main.residentRoot(")
 						if len(wants) != 12 || len(gots) != 12 {
 							t.Fatalf("%s: resident counts %d/%d, want12/12\n%s", label, len(wants), len(gots), text)
 						}
