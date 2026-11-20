@@ -37,9 +37,12 @@ type stacklessCoroGoroutine struct {
 	public, hosted   bool
 }
 
+const stacklessCoroInlineBuckets = 256
+
 var stacklessCoroGoroutines struct {
 	lock            mutex
-	buckets         [256]*stacklessCoroGoroutine
+	inlineBuckets   [stacklessCoroInlineBuckets]*stacklessCoroGoroutine
+	largeBuckets    []*stacklessCoroGoroutine
 	publicBuckets   [256]*stacklessCoroGoroutine
 	publicFree      *stacklessCoroGoroutine
 	publicFreeCount int
@@ -53,7 +56,47 @@ func init() {
 }
 
 func stacklessCoroGoroutineBucket(root *stacklessCoroTask) **stacklessCoroGoroutine {
-	return &stacklessCoroGoroutines.buckets[(uintptr(unsafe.Pointer(root))>>3)%256]
+	buckets := stacklessCoroGoroutineBuckets()
+	return &buckets[stacklessCoroGoroutineIndex(root, len(buckets))]
+}
+
+func stacklessCoroGoroutineIndex(root *stacklessCoroTask, n int) uintptr {
+	addr := uintptr(unsafe.Pointer(root))
+	return memhash(unsafe.Pointer(&addr), 0, unsafe.Sizeof(addr)) & uintptr(n-1)
+}
+
+// Readers hold the registry lock or run with the world stopped.
+func stacklessCoroGoroutineBuckets() []*stacklessCoroGoroutine {
+	if b := stacklessCoroGoroutines.largeBuckets; b != nil {
+		return b
+	}
+	return stacklessCoroGoroutines.inlineBuckets[:]
+}
+
+// Rehash the typed links under the registry lock. The table grows with the
+// live population so tasks of the same allocator size cannot accumulate in a
+// few long lists. A completed burst releases its bucket storage.
+func stacklessCoroResizeGoroutineBuckets(size int) {
+	old := stacklessCoroGoroutineBuckets()
+	var buckets []*stacklessCoroGoroutine
+	if size == stacklessCoroInlineBuckets {
+		buckets = stacklessCoroGoroutines.inlineBuckets[:]
+	} else {
+		buckets = make([]*stacklessCoroGoroutine, size)
+	}
+	for i, r := range old {
+		old[i] = nil
+		for r != nil {
+			next := r.next
+			slot := &buckets[stacklessCoroGoroutineIndex(r.root, size)]
+			r.next, *slot = *slot, r
+			r = next
+		}
+	}
+	if size == stacklessCoroInlineBuckets {
+		buckets = nil
+	}
+	stacklessCoroGoroutines.largeBuckets = buckets
 }
 
 func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroGoroutine {
@@ -119,6 +162,10 @@ func stacklessCoroGoroutineFor(root *stacklessCoroTask) *stacklessCoroGoroutine 
 }
 
 func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
+	size := len(stacklessCoroGoroutineBuckets())
+	if stacklessCoroGoroutines.records.Load() >= int64(size)*2 {
+		stacklessCoroResizeGoroutineBuckets(size * 2)
+	}
 	p := stacklessCoroGoroutineBucket(r.root)
 	r.next, *p = *p, r
 	stacklessCoroGoroutines.records.Add(1)
@@ -286,7 +333,7 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 			if !r.public && !r.hosted {
 				stacklessCoroGoroutines.unhosted.Add(-1)
 			}
-			stacklessCoroGoroutines.records.Add(-1)
+			count := stacklessCoroGoroutines.records.Add(-1)
 			public := r.public
 			if public {
 				p := stacklessCoroPublicGoroutineBucket(r.publicG)
@@ -308,6 +355,9 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 				r.next = stacklessCoroGoroutines.publicFree
 				stacklessCoroGoroutines.publicFree = r
 				stacklessCoroGoroutines.publicFreeCount++
+			}
+			if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
+				stacklessCoroResizeGoroutineBuckets(size / 2)
 			}
 		}
 	}
@@ -507,7 +557,7 @@ func stacklessCoroSnapshotGoroutine(gp *g) bool {
 func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsafe.Pointer, concurrent bool) int {
 	assertWorldStopped()
 	n := 0
-	for _, bucket := range stacklessCoroGoroutines.buckets {
+	for _, bucket := range stacklessCoroGoroutineBuckets() {
 		for r := bucket; r != nil; r = r.next {
 			gp := r.hostG
 			if r.public {
@@ -583,7 +633,7 @@ func stacklessCoroFatalTracebackOthers(me *g) {
 // fatalpanic. No mutable registry link is read without a completed real STW.
 func stacklessCoroPrintGoroutines(skipID uint64) {
 	assertWorldStopped()
-	for _, bucket := range stacklessCoroGoroutines.buckets {
+	for _, bucket := range stacklessCoroGoroutineBuckets() {
 		for r := bucket; r != nil; r = r.next {
 			if r.goid == skipID {
 				continue
