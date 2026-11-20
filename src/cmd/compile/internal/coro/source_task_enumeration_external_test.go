@@ -41,7 +41,11 @@ func child(p *payload,depth int,ready chan int,first,second chan struct{},done c
 //go:noinline
 func launch(ps []*payload,depth int,ready chan int,first,second chan struct{},done chan int,mode int){
  for _,p:=range ps{
-  go child(p,depth,ready,first,second,done,mode) // SOURCE_GO
+  if p.id&1==0{
+   go child(p,depth,ready,first,second,done,mode) // SOURCE_GO_EVEN
+  }else{
+   go child(p,depth,ready,first,second,done,mode) // SOURCE_GO_ODD
+  }
  }
 }
 var entry=launch
@@ -53,25 +57,34 @@ func main(){goto body;body:
  baseline:=runtime.NumGoroutine();self:=make([]byte,4096);parent:=gid(string(self[:runtime.Stack(self,false)]));ready,done:=make(chan int),make(chan int);first,second:=make(chan struct{}),make(chan struct{})
  ps:=make([]*payload,children);for i:=range ps{ps[i]=&payload{id:i};runtime.SetFinalizer(ps[i],func(*payload){finalized.Add(1)})}
  ctx:=pprof.WithLabels(context.Background(),pprof.Labels("coro-enumeration","inherited"));pprof.SetGoroutineLabels(ctx)
- entry(ps,depth,ready,first,second,done,mode);ps=nil;pprof.SetGoroutineLabels(context.Background());var original map[uint64]bool
+ entry(ps,depth,ready,first,second,done,mode);ps=nil;pprof.SetGoroutineLabels(context.Background());var original map[uint64]int
+ goLines:=[2]string{os.Getenv("EXPECTED_GO_EVEN"),os.Getenv("EXPECTED_GO_ODD")}
  for stage:=0;stage<2;stage++{
   for i:=0;i<children;i++{if <-ready!=stage{panic("phase mismatch")}};for i:=0;i<100;i++{runtime.Gosched()};runtime.GC();runtime.GC()
   if finalized.Load()!=0{panic("live task lost payload")};if n:=runtime.NumGoroutine();n!=baseline+children{panic(fmt.Sprintf("count %d want %d",n,baseline+children))}
   wantNative:=0;if native&&stage==0{wantNative=children};if n:=unhosted();n!=wantNative{panic(fmt.Sprintf("unhosted %d want %d",n,wantNative))}
   text:=make([]byte,2<<20);n:=runtime.Stack(text,true)
   for n==len(text){text=make([]byte,2*len(text));n=runtime.Stack(text,true)}
-  ids:=make(map[uint64]bool)
+  ids:=make(map[uint64]int)
+  var sites [2]int
   for _,stack:=range strings.Split(string(text[:n]),"\n\n"){
-   current:=strings.Split(stack,"[originating from")[0];if !strings.Contains(current,"main.recursive("){continue};id:=gid(stack);if id==parent||ids[id]{panic("logical identity reused")};ids[id]=true
+   current:=strings.Split(stack,"[originating from")[0];if !strings.Contains(current,"main.recursive("){continue};id:=gid(stack);if _,exists:=ids[id];id==parent||exists{panic("logical identity reused")}
    want:=depth+1;if depth>100{want=99};if got:=strings.Count(current,"main.recursive(");got!=want{panic(fmt.Sprintf("source count %d want %d\n%s",got,want,stack))}
    if !strings.Contains(current,fmt.Sprintf("created by main.launch in goroutine %d\n",parent)){panic("wrong source creator:\n"+stack)}
-   if line:=os.Getenv("EXPECTED_GO_LINE");line!=""&&!strings.Contains(strings.Split(current,"created by ")[1],"main.go:"+line+" "){panic("wrong creator line:\n"+current)}
+   creator:=strings.Split(current,"created by ")[1]
+   switch{
+   case strings.Contains(creator,"main.go:"+goLines[0]+" "):ids[id]=0;sites[0]++
+   case strings.Contains(creator,"main.go:"+goLines[1]+" "):ids[id]=1;sites[1]++
+   default:panic("wrong creator line:\n"+current)
+   }
    if line:=os.Getenv("EXPECTED_PARK_"+strconv.Itoa(stage));line!=""&&!strings.Contains(strings.Split(current,"main.recursive(")[1],"main.go:"+line){panic("wrong suspended source line:\n"+current)}
    if strings.Contains(current,".coro.")||strings.Contains(current,"runtime.stackless")||strings.Contains(current,"main.launch("){panic("private driver or creator leaked into stack")}
    if !strings.Contains(strings.Split(current,"\n")[0],"{\"coro-enumeration\": inherited}"){panic("independent text labels lost")}
    if strings.Contains(os.Getenv("GODEBUG"),"tracebackancestors=2")&&!strings.Contains(stack,fmt.Sprintf("[originating from goroutine %d]",parent)){panic("missing source ancestor")};if strings.Contains(os.Getenv("GODEBUG"),"tracebackancestors=2")&&!strings.Contains(stack,"main.main("){panic("missing public caller in ancestry") }
   }
-  if len(ids)!=children{panic(fmt.Sprintf("source stacks %d",len(ids)))};if stage==0{original=ids}else{for id:=range ids{if !original[id]{panic("host promotion changed logical goid")}}}
+  if len(ids)!=children{panic(fmt.Sprintf("source stacks %d",len(ids)))}
+  if sites!=[2]int{(children+1)/2,children/2}{panic(fmt.Sprintf("creation sites %v",sites))}
+  if stage==0{original=ids}else{for id,site:=range ids{if old,ok:=original[id];!ok||old!=site{panic("host promotion changed logical goid or creator")}}}
   records:=make([]runtime.StackRecord,baseline+children+8);n,ok:=runtime.GoroutineProfile(records);if !ok||n!=baseline+children{panic("profile count")};sources:=0
   for _,r:=range records[:n]{frames:=runtime.CallersFrames(r.Stack());for{f,more:=frames.Next();if f.Function=="main.recursive"{sources++;break};if !more{break}}};if sources!=children{panic(fmt.Sprintf("profile sources %d",sources))}
   small:=make([]runtime.StackRecord,baseline+children-1);for i:=range small{small[i].Stack0[0]=1};saved:=append([]runtime.StackRecord(nil),small...);n,ok=runtime.GoroutineProfile(small);if ok||n!=baseline+children{panic("undersized profile count")};for i:=range small{if small[i]!=saved[i]{panic("undersized profile wrote records")}}
@@ -87,13 +100,16 @@ func main(){goto body;body:
 `
 	lines := map[string]string{}
 	for i, line := range strings.Split(program, "\n") {
-		for marker, env := range map[string]string{"SOURCE_GO": "EXPECTED_GO_LINE", "PARK_FIRST": "EXPECTED_PARK_0", "PARK_SECOND": "EXPECTED_PARK_1"} {
+		for marker, env := range map[string]string{
+			"SOURCE_GO_EVEN": "EXPECTED_GO_EVEN", "SOURCE_GO_ODD": "EXPECTED_GO_ODD",
+			"PARK_FIRST": "EXPECTED_PARK_0", "PARK_SECOND": "EXPECTED_PARK_1",
+		} {
 			if strings.Contains(line, "// "+marker) {
 				lines[env] = strconv.Itoa(i + 1)
 			}
 		}
 	}
-	if len(lines) != 3 {
+	if len(lines) != 4 {
 		t.Fatal("missing source markers")
 	}
 	dir := t.TempDir()

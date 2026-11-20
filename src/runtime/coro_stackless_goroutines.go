@@ -39,6 +39,10 @@ type stacklessCoroGoroutine struct {
 
 const stacklessCoroInlineBuckets = 256
 
+type stacklessCoroSpawnSite struct {
+	returnPC, sourcePC uintptr
+}
+
 var stacklessCoroGoroutines struct {
 	lock            mutex
 	inlineBuckets   [stacklessCoroInlineBuckets]*stacklessCoroGoroutine
@@ -46,7 +50,10 @@ var stacklessCoroGoroutines struct {
 	publicBuckets   [256]*stacklessCoroGoroutine
 	publicFree      *stacklessCoroGoroutine
 	publicFreeCount int
+	taskFree        *stacklessCoroGoroutine
+	taskFreeCount   int
 	pending         *stacklessCoroHost
+	spawnSites      [128]stacklessCoroSpawnSite
 	unhosted        atomic.Int64
 	records         atomic.Int64
 }
@@ -191,27 +198,18 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 		}
 		creator = s.registerPublicGoroutineLocked(caller, parent)
 	}
-	// coroSpawn may add an adapter above the resume. Walk on g0 with a
-	// typed stack pointer so stack growth cannot invalidate the cursor.
-	systemstack(func() {
-		var u unwinder
-		for u.initAt(callerpc, uintptr(callersp), 0, gp, unwindSilentErrors); u.valid(); u.next() {
-			f := u.frame.fn
-			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
-				source := stacklessCoroSourceFunc(f, info)
-				if !source.valid() {
-					continue
-				}
-				file, line := funcline1(f, u.symPC(), false)
-				callerpc = stacklessCoroSourcePC(source, file, line) + sys.PCQuantum
-				break
-			}
-		}
-	})
+	callerpc = stacklessCoroSpawnSourcePC(gp, callerpc, callersp)
 	if h := currentStacklessCoroHost(); h != nil && h.root == root {
 		creator.labels = gp.labels
 	}
-	r := &stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
+	r := stacklessCoroGoroutines.taskFree
+	if r == nil {
+		r = new(stacklessCoroGoroutine)
+	} else {
+		stacklessCoroGoroutines.taskFree = r.next
+		stacklessCoroGoroutines.taskFreeCount--
+	}
+	*r = stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
 		goid: sched.goidgen.Add(1), parentGoid: creator.goid, gopc: callerpc,
 		labels: creator.labels}
 	if debug.tracebackancestors > 0 {
@@ -258,6 +256,47 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 	stacklessCoroGoroutines.unhosted.Add(1)
 	sched.goroutinesCreated.Add(1)
 	unlock(&stacklessCoroGoroutines.lock)
+}
+
+// Requires the registry lock. A direct call from a resume has a stable
+// relationship between its machine return PC and its original go statement.
+// An adapter can have many source callers and cannot share that cache key.
+func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer) uintptr {
+	sites := &stacklessCoroGoroutines.spawnSites
+	site := &sites[(callerPC/sys.PCQuantum)%uintptr(len(sites))]
+	if site.returnPC == callerPC && site.sourcePC != 0 {
+		return site.sourcePC
+	}
+	f := findfunc(callerPC)
+	if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
+		source := stacklessCoroSourceFunc(f, info)
+		if source.valid() {
+			pc := callerPC
+			if pc > f.entry() {
+				pc--
+			}
+			file, line := funcline1(f, pc, false)
+			sourcePC := stacklessCoroSourcePC(source, file, line) + sys.PCQuantum
+			*site = stacklessCoroSpawnSite{returnPC: callerPC, sourcePC: sourcePC}
+			return sourcePC
+		}
+	}
+	// Walk through adapters on g0 with a typed stack pointer.
+	systemstack(func() {
+		var u unwinder
+		for u.initAt(callerPC, uintptr(callerSP), 0, gp, unwindSilentErrors); u.valid(); u.next() {
+			f := u.frame.fn
+			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
+				source := stacklessCoroSourceFunc(f, info)
+				if source.valid() {
+					file, line := funcline1(f, u.symPC(), false)
+					callerPC = stacklessCoroSourcePC(source, file, line) + sys.PCQuantum
+					break
+				}
+			}
+		}
+	})
+	return callerPC
 }
 
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
@@ -342,6 +381,7 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 			}
 			count := stacklessCoroGoroutines.records.Add(-1)
 			public := r.public
+			reusable := !public && !r.hosted && r.owner == nil
 			if public {
 				p := stacklessCoroPublicGoroutineBucket(r.publicG)
 				for *p != r {
@@ -362,6 +402,12 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 				r.next = stacklessCoroGoroutines.publicFree
 				stacklessCoroGoroutines.publicFree = r
 				stacklessCoroGoroutines.publicFreeCount++
+			} else if reusable && stacklessCoroGoroutines.taskFreeCount < stacklessCoroTaskCacheSize {
+				// Completion has detached the root and cleared the signal-
+				// visible owner. Retain only the empty record for another go.
+				r.next = stacklessCoroGoroutines.taskFree
+				stacklessCoroGoroutines.taskFree = r
+				stacklessCoroGoroutines.taskFreeCount++
 			}
 			if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
 				stacklessCoroResizeGoroutineBuckets(size / 2)
