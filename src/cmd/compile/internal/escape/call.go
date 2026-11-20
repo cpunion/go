@@ -413,6 +413,18 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 		return e.addr(param.Nname.(*ir.Name))
 	}
 
+	// These compiler-generated runtime calls invoke the cleanup closure
+	// synchronously. The runtime may retain the task or token while
+	// cleanup runs, but never retains the closure itself.
+	if sym := fn.Sym(); sym != nil && sym.Pkg == ir.Pkgs.Runtime {
+		switch sym.Name {
+		case "coroDeferInvokeTrace", "coroDeferCall":
+			if param == fn.Type().Param(1) {
+				return e.teeHole(e.mutatorHole(), e.calleeHole())
+			}
+		}
+	}
+
 	// Call to previously tagged function.
 
 	var tagKs []hole

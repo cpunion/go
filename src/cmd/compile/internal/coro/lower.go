@@ -2979,8 +2979,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A source declaration may execute repeatedly. Its cell is allocated at
 	// that declaration; each nested closure snapshots the cell pointer when
 	// created, rather than sharing the next iteration's pointer slot.
+	fixedDeferWrappers := candidate.fixedDeferArgumentWrappers()
 	ir.Visit(fn, func(node ir.Node) {
-		if closure, ok := node.(*ir.ClosureExpr); ok {
+		if closure, ok := node.(*ir.ClosureExpr); ok && !fixedDeferWrappers[closure.Func] {
 			for _, variable := range closure.Func.ClosureVars {
 				source := variable.Canonical()
 				if source.Curfn == fn && source.Sym().Name != typecheck.LocalDictName {

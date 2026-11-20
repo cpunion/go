@@ -1288,6 +1288,8 @@ import "runtime"
 var trace [6]int
 var traceIndex int
 var evaluated int
+var retainedTargets [2]*int
+var retainedTargetCount int
 
 //go:noinline
 func argument(value int) int {
@@ -1304,6 +1306,8 @@ func record(value int) {
 //go:noinline
 func add(target *int, value int) {
 	*target += value
+	retainedTargets[retainedTargetCount] = target
+	retainedTargetCount++
 }
 
 //go:noinline
@@ -1331,10 +1335,15 @@ func main() {
 	first := fixed(true)
 	second := fixed(false)
 	earlyResult := early()
+	runtime.GC()
 	if first != 42 || second != 42 || earlyResult != 7 ||
 		evaluated != 123134 || traceIndex != len(trace) ||
 		trace != [6]int{3, 2, 1, 3, 1, 4} {
 		panic("bad fixed defer result")
+	}
+	if retainedTargetCount != 2 || retainedTargets[0] == retainedTargets[1] ||
+		*retainedTargets[0] != 42 || *retainedTargets[1] != 42 {
+		panic("fixed defer lost its escaped result cell")
 	}
 	println("stackless-coro-defer-ok")
 }
@@ -1346,7 +1355,7 @@ func main() {
 	exe := filepath.Join(tmp, "coro-defer")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=command-line-arguments=-l -d=coro=4",
+		"-gcflags=command-line-arguments=-l -d=coro=4,checkptr=2",
 		src)
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
