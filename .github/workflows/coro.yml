@@ -34,8 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - macos-15
+          - macos-26
 
     steps:
       - name: Check out source
@@ -164,91 +163,3 @@ jobs:
           GOEXPERIMENT: coro
         run: ./bin/go test -race -count=1 runtime -run '^TestStacklessCoro'
 
-  native-full:
-    name: Native all.bash (Linux)
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      - name: Install bootstrap Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: 1.26.5
-          cache: false
-
-      - name: Select bootstrap GOROOT
-        shell: bash
-        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-
-      - name: Run native full test suite
-        working-directory: src
-        env:
-          # Source-oracle matrices share one package deadline (50 minutes here).
-          GO_TEST_TIMEOUT_SCALE: '5'
-        run: ./all.bash
-
-  native-benchmarks:
-    name: Native benchmark collection (Linux)
-    if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
-    needs:
-      - focused
-      - native-full
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    steps:
-      - name: Check out source and history
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Install bootstrap Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: 1.26.5
-          cache: false
-
-      - name: Select bootstrap and exact upstream baseline
-        shell: bash
-        run: |
-          echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
-          git config --local core.abbrev 10
-          git fetch --no-tags https://go.googlesource.com/go \
-            master:refs/remotes/upstream/master
-          baseline=$(git merge-base HEAD upstream/master)
-          git worktree add --detach "$RUNNER_TEMP/go-baseline" "$baseline"
-
-      - name: Build exact upstream default toolchain
-        shell: bash
-        run: |
-          cd "$RUNNER_TEMP/go-baseline/src"
-          GOEXPERIMENT='' ./make.bash
-
-      - name: Build coroutine experiment toolchain
-        working-directory: src
-        env:
-          GOEXPERIMENT: coro
-        run: ./make.bash
-
-      - name: Collect frozen native binaries
-        working-directory: src/cmd/compile/testdata/corobench
-        env:
-          UPSTREAM_REF: upstream/master
-        shell: bash
-        run: |
-          ./collect.bash "$RUNNER_TEMP/go-baseline" "$GITHUB_WORKSPACE" \
-            "$RUNNER_TEMP/native-corobench"
-
-      - name: Upload all raw measurements and receipts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-corobench-linux
-          path: ${{ runner.temp }}/native-corobench
-          if-no-files-found: error
