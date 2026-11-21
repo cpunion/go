@@ -180,18 +180,31 @@ func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroPublicGoroutine {
 // an independent task. The original ordinary G owns the identity and count.
 // Hand-written runtime continuations without source metadata need no record
 // until they spawn a child. Reuse only completely cleared public records.
-func (s *stacklessCoroScheduler) registerPublicGoroutine() {
-	f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
-	info := stacklessCoroSourceFrame(f)
-	if info == nil || info.flags&abi.CoroSourceResume == 0 || !stacklessCoroSourceFunc(f, info).valid() {
+func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, callerSP unsafe.Pointer) {
+	source := s.publicSourceFunc()
+	if !source.valid() {
 		return
 	}
+	gp := getg()
+	var pcs [maxCPUProfStack]uintptr
+	// The caller still owns its stack. Walk it before locking the registry.
+	n := stacklessCoroCaptureProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
 	lock(&stacklessCoroGoroutines.lock)
-	s.registerPublicGoroutineLocked(getg(), &s.root)
+	s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
-func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stacklessCoroTask) *stacklessCoroGoroutine {
+func (s *stacklessCoroScheduler) publicSourceFunc() funcInfo {
+	f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
+	info := stacklessCoroSourceFrame(f)
+	if info == nil || info.flags&abi.CoroSourceResume == 0 {
+		return funcInfo{}
+	}
+	return stacklessCoroSourceFunc(f, info)
+}
+
+// A nil pcs indicates lazy registration without a saved public caller.
+func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stacklessCoroTask, pcs []uintptr) *stacklessCoroGoroutine {
 	public := stacklessCoroGoroutines.publicFree
 	if public != nil {
 		stacklessCoroGoroutines.publicFree = public.nextPublic
@@ -203,16 +216,31 @@ func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stac
 	*r = stacklessCoroGoroutine{root: &s.root, leaf: leaf, scheduler: s,
 		goid: gp.goid, parentGoid: gp.parentGoid, gopc: gp.gopc,
 		labels: gp.labels, ancestors: gp.ancestors, physicalG: gp, public: true}
-	if gp == getg() {
-		f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
-		if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
-			public.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume, public.profileCaller)
+	if pcs == nil && gp == getg() {
+		if source := s.publicSourceFunc(); source.valid() {
+			public.captureProfileCaller(gp, source.entry())
 		}
+	} else {
+		public.setProfileCaller(pcs)
 	}
 	stacklessCoroInsertGoroutine(r)
 	p := stacklessCoroPublicGoroutineBucket(gp)
 	public.nextPublic, *p = *p, public
 	return r
+}
+
+//go:noinline
+func (public *stacklessCoroPublicGoroutine) captureProfileCaller(gp *g, rootPC uintptr) {
+	var pcs [maxCPUProfStack]uintptr
+	n := stacklessCoroCaptureProfileCaller(gp, rootPC, 0, nil, pcs[:])
+	public.setProfileCaller(pcs[:n])
+}
+
+func (public *stacklessCoroPublicGoroutine) setProfileCaller(pcs []uintptr) {
+	if len(pcs) != 0 && cap(public.profileCaller) == 0 {
+		public.profileCaller = make([]uintptr, 0, maxCPUProfStack)
+	}
+	public.profileCaller = append(public.profileCaller[:0], pcs...)
 }
 
 func stacklessCoroLogicalRoot(task *stacklessCoroTask) *stacklessCoroTask {
@@ -261,7 +289,7 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 		if root != &s.root {
 			throw("runtime: missing coroutine creator identity")
 		}
-		creator = s.registerPublicGoroutineLocked(caller, parent)
+		creator = s.registerPublicGoroutineLocked(caller, parent, nil)
 	}
 	callerpc = stacklessCoroSpawnSourcePC(gp, callerpc, callersp)
 	if h := currentStacklessCoroHost(); h != nil && h.root == root {

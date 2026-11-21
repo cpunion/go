@@ -16,26 +16,20 @@ import (
 // PCs are immutable code addresses and need no stack pointer or registry lookup.
 // CPU profiles have a bounded PC buffer, so retaining this many caller PCs is
 // sufficient even when the logical source chain itself is shallow.
-func stacklessCoroCaptureProfileCaller(gp *g, resume stacklessCoroResume, reuse []uintptr) []uintptr {
-	if gp != getg() {
-		return reuse[:0]
-	}
-	f := findfunc(stacklessCoroResumeIdentity(resume).fn)
-	info := stacklessCoroSourceFrame(f)
-	if info == nil || info.flags&abi.CoroSourceResume == 0 {
-		return reuse[:0]
-	}
-	source := stacklessCoroSourceFunc(f, info)
-	if !source.valid() {
-		return reuse[:0]
-	}
-	rootPC := source.entry()
-	var pcs [maxCPUProfStack]uintptr
+func stacklessCoroCaptureProfileCaller(gp *g, rootPC, callerPC uintptr, callerSP unsafe.Pointer, pcs []uintptr) int {
 	n, skip := 0, 0
 	systemstack(func() {
 		var u unwinder
-		bridges, afterDriver := true, false
-		for u.init(gp, unwindSilentErrors); u.valid() && n < len(pcs); u.next() {
+		bridges := callerPC == 0
+		afterDriver := !bridges
+		if bridges {
+			u.init(gp, unwindSilentErrors)
+		} else {
+			// callerSP remains a pointer until we are on g0, so a stack
+			// move between the entry and this call can adjust it.
+			u.initAt(callerPC, uintptr(callerSP), 0, gp, unwindSilentErrors)
+		}
+		for ; u.valid() && n < len(pcs); u.next() {
 			f, pc := u.frame.fn, u.symPC()
 			info := stacklessCoroSourceFrame(f)
 			source := stacklessCoroSourceFunc(f, info)
@@ -62,13 +56,10 @@ func stacklessCoroCaptureProfileCaller(gp *g, resume stacklessCoroResume, reuse 
 				file, line := funcline1(f, pc, false)
 				f, pc = source, stacklessCoroSourcePC(source, file, line)
 			}
-			appendStacklessCoroSourcePC(&u, f, pc, &skip, pcs[:], &n)
+			appendStacklessCoroSourcePC(&u, f, pc, &skip, pcs, &n)
 		}
 	})
-	if n != 0 && cap(reuse) == 0 {
-		reuse = make([]uintptr, 0, maxCPUProfStack)
-	}
-	return append(reuse[:0], pcs[:n]...)
+	return n
 }
 
 // The executing G publishes its record before calling a source resume and

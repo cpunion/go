@@ -98,7 +98,7 @@ body:
  pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(),pprof.Labels("cpu-root","source")))
  if err:=pprof.StartCPUProfile(os.Stdout);err!=nil {panic(err)}
  switch os.Args[1] {
- case "public": entry(32,false)
+ case "public": entry(32,false) // PUBLIC_CALL
  case "self": selfEntry(32)
  case "promoted": entry(32,true)
  case "closure": makeEntry(32)()
@@ -111,10 +111,13 @@ body:
  pprof.StopCPUProfile()
 }
 `
-	selfLine := 0
+	selfLine, publicLine := 0, 0
 	for i, line := range strings.Split(source, "\n") {
 		if strings.Contains(line, "SELF_BUSY") {
 			selfLine = i + 1
+		}
+		if strings.Contains(line, "PUBLIC_CALL") {
+			publicLine = i + 1
 		}
 	}
 	dir := t.TempDir()
@@ -164,7 +167,7 @@ body:
 						for _, sample := range prof.Sample {
 							var names []string
 							busy, parents, mains := false, 0, 0
-							panics, exits := 0, 0
+							panics, exits, callerLine := 0, 0, 0
 							for _, location := range sample.Location {
 								for _, line := range location.Line {
 									if line.Function == nil {
@@ -185,6 +188,7 @@ body:
 									}
 									if name == "main.main" {
 										mains++
+										callerLine = int(line.Line)
 									}
 								}
 							}
@@ -198,6 +202,9 @@ body:
 							}
 							if parents != 33 || mains != wantMain {
 								t.Fatalf("%s/P%s: recursive=%d main=%d want 33/%d: %v", mode, p, parents, mains, wantMain, names)
+							}
+							if mode == "public" && callerLine != publicLine {
+								t.Fatalf("%s/P%s: caller line=%d want %d: %v", mode, p, callerLine, publicLine, names)
 							}
 							wantPanics, wantExits := 0, 0
 							if mode == "panic" || mode == "recovered" || mode == "public-panic" {
