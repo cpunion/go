@@ -216,8 +216,8 @@ func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stac
 }
 
 func stacklessCoroLogicalRoot(task *stacklessCoroTask) *stacklessCoroTask {
-	for task.parent != nil {
-		task = task.parent
+	for task.parent() != nil {
+		task = task.parent()
 	}
 	return task
 }
@@ -321,6 +321,7 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 			r.ancestors = new([]ancestorInfo)
 			*r.ancestors = ancestors
 		}
+		task.setSource(r)
 		stacklessCoroInsertGoroutine(r)
 	}
 	stacklessCoroGoroutines.unhosted.Add(int64(len(tasks)))
@@ -370,6 +371,19 @@ func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer
 }
 
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
+	if !raceenabled && owner != nil && owner.stackIsFixed() {
+		if record := task.source(); record != nil && !task.context.scheduler.hasTerminalRecords() {
+			// Registration and structured completion already made the
+			// independent task the leaf. It keeps the record alive until
+			// this executor clears ownership and completes the task.
+			record.owner.Store(owner)
+			state := owner.stacklessCoro
+			state.activeSource = record
+			state.activeTerminalSource = false
+			state.sourceTransition = false
+			return
+		}
+	}
 	if stacklessCoroGoroutines.records.Load() == 0 {
 		return
 	}
@@ -383,7 +397,7 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 		s := task.context.scheduler
 		if s.hasTerminalRecords() {
 			lock(&s.lock)
-			for at := task; at != nil; at = at.parent {
+			for at := task; at != nil; at = at.parent() {
 				if trace = s.terminalSourceTrace(at); trace != nil {
 					boundary, before = at, true
 					break
@@ -454,11 +468,12 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 		p = &(*p).next
 	}
 	if r := *p; r != nil {
-		if task.parent != nil {
-			r.leaf = task.parent
+		if task.parent() != nil {
+			r.leaf = task.parent()
 			r.owner.Store(nil)
 		} else {
 			*p = r.next
+			task.parentOrSource = nil
 			if r.physicalG == nil {
 				stacklessCoroGoroutines.unhosted.Add(-1)
 			}
@@ -586,7 +601,7 @@ func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGor
 		}
 	}
 	first := true
-	for task := r.leaf; task != nil; task = task.parent {
+	for task := r.leaf; task != nil; task = task.parent() {
 		if previous := r.scheduler.terminalSourceTrace(task); previous != nil {
 			trace.appendTrace(previous)
 			break

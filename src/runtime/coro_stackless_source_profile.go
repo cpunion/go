@@ -201,7 +201,7 @@ func stacklessCoroActiveSourcePCs(u *unwinder, source funcInfo, skip *int, buf [
 // and immutable terminal PCs were published before this resume started; no
 // scheduler list lookup or lock is permitted here.
 func walkStacklessCoroProfileFrames(r *stacklessCoroGoroutine, visit func(funcInfo, uintptr) bool) {
-	for task := r.leaf; task != nil; task = task.parent {
+	for task := r.leaf; task != nil; task = task.parent() {
 		if task == r.profileBoundary && r.profileBefore {
 			return
 		}

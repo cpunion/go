@@ -49,7 +49,7 @@ func CheckStacklessCoroLocalFusedAwaitForTest(allocation uint8,
 		task.flags &^= stacklessCoroTaskFusedChunk
 		if mode == "cached-child" {
 			owner = &stacklessCoroTask{
-				parent: task, resume: childResume, flags: stacklessCoroTaskCacheFrame,
+				parentOrSource: unsafe.Pointer(task), resume: childResume, flags: stacklessCoroTaskCacheFrame,
 				context: stacklessCoroContext{frame: unsafe.Pointer(child)},
 			}
 			reserved.next = owner
@@ -135,7 +135,7 @@ func CheckStacklessCoroLocalFusedAwaitForTest(allocation uint8,
 		(mode == "same-resume" && child.resume != nil) ||
 		(mode != "same-resume" && child.resume != stacklessCoroResumeIdentity(parentResume)) ||
 		*parent != wantParent || s.freeTasks != free || s.reservedTasks != reserved ||
-		reserved.next != nil || (owner != nil && (owner.parent != nil || owner.next != nil)) ||
+		reserved.next != nil || (owner != nil && (owner.parent() != nil || owner.next != nil)) ||
 		s.head != sibling || s.tail != sibling ||
 		s.runnableState.Load() != uint32(bool2int(runnable)) {
 		return false

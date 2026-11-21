@@ -75,7 +75,7 @@ func CheckStacklessCoroScalarTaskCacheForTest() bool {
 			seen[chunk] = true
 			for j := range chunk.tasks {
 				member := &chunk.tasks[j]
-				if member.resume != nil || member.parent != nil || member.next != nil || member.state != stacklessCoroTaskNew || member.terminal != stacklessCoroTerminalNone || member.goexit || member.resuming || member.readyPending || member.flags != 0 || member.frameSize != 0 || member.context.frame != nil || member.context.scheduler != nil {
+				if member.resume != nil || member.parent() != nil || member.next != nil || member.state != stacklessCoroTaskNew || member.terminal != stacklessCoroTerminalNone || member.goexit || member.resuming || member.readyPending || member.flags != 0 || member.frameSize != 0 || member.context.frame != nil || member.context.scheduler != nil {
 					return false
 				}
 			}
@@ -106,7 +106,7 @@ func CheckStacklessCoroScalarTaskCacheForTest() bool {
 		var switched *uint32
 		switch kind {
 		case 0:
-			bad.parent = new(stacklessCoroTask)
+			bad.setParent(new(stacklessCoroTask))
 		case 1:
 			bad.flags = 0
 		case 2:

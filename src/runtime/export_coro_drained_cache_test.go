@@ -154,7 +154,7 @@ func CheckStacklessCoroFrameBudgetReplacementForTest(typed, active bool) bool {
 		unlock(&s.lock)
 		return false
 	}
-	task.parent = nil
+	task.setParent(nil)
 	task.state = stacklessCoroTaskComplete
 	s.recycleTaskLocked(task)
 	unlock(&s.lock)

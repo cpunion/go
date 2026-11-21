@@ -181,7 +181,7 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 				return
 			}
 		}
-		task = task.parent
+		task = task.parent()
 	}
 }
 
@@ -199,9 +199,9 @@ func (trace *stacklessCoroPanicTrace) at(i int) (inlineFrame, bool) {
 // coroPanic. That state identifies the active source frame directly.
 func captureStacklessCoroResumePanicTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
 	gp := getg()
-	parent := task.parent
+	parent := task.parent()
 	shallow := !task.hasFlag(stacklessCoroTaskFusedFrames) &&
-		(parent == nil || parent.parent == nil && !parent.hasFlag(stacklessCoroTaskFusedFrames))
+		(parent == nil || parent.parent() == nil && !parent.hasFlag(stacklessCoroTaskFusedFrames))
 	if task.hasFlag(stacklessCoroTaskFusedFrames) && parent == nil && task.context.frame != nil {
 		header := (*stacklessCoroFusedFrameHeader)(task.context.frame)
 		// The active leaf switches resume entries directly above a root.

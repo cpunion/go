@@ -91,8 +91,8 @@ func (s *stacklessCoroScheduler) taskHostLocked(task *stacklessCoroTask) *stackl
 	if s.terminalValues == nil {
 		return nil
 	}
-	for task.parent != nil {
-		task = task.parent
+	for task.parent() != nil {
+		task = task.parent()
 	}
 	for h := s.hostsLocked(); h != nil; h = h.next {
 		if h.root == task {
@@ -220,8 +220,8 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 		throw("runtime: stackless coroutine host call outside resume")
 	}
 	root := task
-	for root.parent != nil {
-		root = root.parent
+	for root.parent() != nil {
+		root = root.parent()
 	}
 	h := s.taskHostLocked(root)
 	start := false
@@ -432,7 +432,7 @@ func (h *stacklessCoroHost) drive() {
 			// released the original frames. Capture those source positions
 			// while the metadata is locked, outside the profiler's walk.
 			// Ordinary waits retain their live frames without a snapshot.
-			for task := state.parkedTask; task != nil; task = task.parent {
+			for task := state.parkedTask; task != nil; task = task.parent() {
 				if s.terminalSourceTrace(task) != nil || s.deferTrace(task) != nil {
 					state.parkedTrace = captureStacklessCoroPanicTrace(state.parkedTask, nil, 0, nil)
 					break

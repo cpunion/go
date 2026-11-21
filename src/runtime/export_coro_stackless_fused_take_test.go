@@ -136,7 +136,7 @@ func CheckStacklessCoroLocalFusedTakeForTest(element int, shortChunk,
 		return child == free.context.frame &&
 			task.flags == stacklessCoroTaskFusedFrames|stacklessCoroTaskFusedPending &&
 			s.freeTasks == nil && s.reservedTasks == free && free.next == reserved &&
-			free.parent == task && s.freeFrameBytes == 0 &&
+			free.parent() == task && s.freeFrameBytes == 0 &&
 			header.marker == wantMarker && header.parent == wantParent && header.owner == wantOwner &&
 			task.context.frame == frame && s.head == sibling && s.tail == sibling
 	}

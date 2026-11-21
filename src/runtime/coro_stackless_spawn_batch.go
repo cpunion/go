@@ -49,7 +49,7 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, pc uint
 		if task == nil {
 			task = s.newTaskLocked(frame, child, nil)
 		} else {
-			task.parent = nil
+			task.setParent(nil)
 			task.context.frame = frame
 		}
 		s.markUncachedFrameLineageLocked(task, parent, frame)
