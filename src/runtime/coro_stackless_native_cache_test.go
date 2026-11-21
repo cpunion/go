@@ -159,6 +159,42 @@ func TestStacklessCoroNativeBurstCacheContexts(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroNativeCompactBurstCache(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	gcPercent := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPercent)
+	runtime.StacklessCoroClearNativeTaskCachesForTest()
+	defer runtime.StacklessCoroClearNativeTaskCachesForTest()
+
+	_, _, _, ordinary := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	size := unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{})
+	direct := uintptr(runtime.StacklessCoroFrameChunkDirectCount) * size
+	depth := int(ordinary/size) + 512
+	run := func() {
+		runStacklessCoroSelfFrames(t, &stacklessCoroSelfFrameTracker{rootDepth: depth})
+	}
+	run()
+	burst, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if burst <= ordinary+direct || burst > (384<<10)+direct || overflow != 0 {
+		t.Fatalf("compact cache = (%d, %d), want a bounded warm burst", burst, overflow)
+	}
+	if n := testing.AllocsPerRun(3, run); n > 32 {
+		t.Fatalf("warm compact burst allocated %.0f objects, want <=32", n)
+	}
+	runtime.GC()
+	first, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if first == 0 || first > ordinary+direct || overflow != 0 {
+		t.Fatalf("first idle GC cache = (%d, %d), ordinary budget %d", first, overflow, ordinary)
+	}
+	runtime.GC()
+	second, overflow, _, _ := runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+	if second != 0 || overflow != 0 {
+		t.Fatalf("second idle GC cache = (%d, %d), want empty", second, overflow)
+	}
+	run()
+}
+
 func TestStacklessCoroNativeBurstReservationContention(t *testing.T) {
 	previous := runtime.GOMAXPROCS(4)
 	defer runtime.GOMAXPROCS(previous)
@@ -167,7 +203,7 @@ func TestStacklessCoroNativeBurstReservationContention(t *testing.T) {
 	runtime.StacklessCoroClearNativeTaskCachesForTest()
 	for range 3 {
 		held, granted, remaining := runtime.StacklessCoroNativeBurstContendForTest()
-		if held != 4 || granted != 4 || remaining != 0 {
+		if held != [2]uint32{4, 4} || granted != [2]uint32{4, 4} || remaining != [2]uint32{} {
 			t.Fatalf("held=%d granted=%d remaining=%d", held, granted, remaining)
 		}
 	}

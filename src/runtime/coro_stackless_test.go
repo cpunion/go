@@ -1815,8 +1815,7 @@ func TestStacklessCoroSelfFrameFusion(t *testing.T) {
 		}
 		runtime.StacklessCoroClearNativeTaskCachesForTest()
 		defer runtime.StacklessCoroClearNativeTaskCachesForTest()
-		_, _, _, chunkLimit :=
-			runtime.StacklessCoroNativePoolSelfFrameCacheForTest()
+		const chunkLimit = 384 << 10
 		frameSize := unsafe.Sizeof(runtime.StacklessCoroSelfFrameForTest{})
 		chunkSize := frameSize * runtime.StacklessCoroFrameChunkSize
 		chunkCount := chunkLimit / chunkSize

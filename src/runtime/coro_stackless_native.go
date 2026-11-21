@@ -28,11 +28,22 @@ const (
 	// Bounded parked-cache slots let GC expire storage during longer waits.
 	stacklessCoroSelfFrameBurstCacheSize = 4 << 20
 	stacklessCoroSelfFrameBurstMinSize   = 1024
+	// Compact frames get a separate, smaller burst so recurring deep
+	// lineages can retain their chunks without occupying large-frame slots.
+	stacklessCoroCompactFrameBurstCacheSize = 384 << 10
 
 	// coroNativeStart runs in a frame entered by mcall on the original g0
 	// stack. Leave that frame and its caller above the executor's synthetic
 	// stack root.
 	stacklessCoroBootstrapReserve = 4 << 10
+)
+
+type stacklessCoroFrameBurst uint8
+
+const (
+	stacklessCoroFrameBurstNone stacklessCoroFrameBurst = iota
+	stacklessCoroFrameBurstCompact
+	stacklessCoroFrameBurstLarge
 )
 
 type stacklessCoroNativeContext struct {
@@ -51,7 +62,7 @@ type stacklessCoroNativeContext struct {
 	cachedFrameBytes    uint16
 	selfFrameChunkCount uint16
 	selfFrameCount      uint8
-	selfFrameBurst      bool // occupies padding before cacheIdleCycle
+	selfFrameBurst      stacklessCoroFrameBurst
 	cacheIdleCycle      uint32
 	selfFrameMissResume *funcval
 	selfFrameMissType   *_type
@@ -90,9 +101,10 @@ type stacklessCoroDrainCacheAge struct{ cycle uint32 }
 
 func (age *stacklessCoroDrainCacheAge) complete() { age.cycle = work.cycles.Load() }
 
-// At most four contexts, active or idle, may exceed the ordinary chunk budget.
-// Other active contexts retain the existing256KiB limit.
+// At most four active or idle contexts in each size class may exceed the
+// ordinary chunk budget. Compact reservations add at most 512 KiB in total.
 var stacklessCoroNativeBurstContexts atomic.Uint32
+var stacklessCoroNativeCompactBurstContexts atomic.Uint32
 
 // Registered contexts have no running native episode. Their ordinary driver
 // removes them before resuming native work. Only this bounded set retains
@@ -221,7 +233,7 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 	}
 	// No native episode is running on this context while its driver waits.
 	// Do not retain a completed burst for the lifetime of a parked root.
-	if ctx.selfFrameBurst {
+	if ctx.selfFrameBurst != stacklessCoroFrameBurstNone {
 		trimStacklessCoroNativeSelfFrameChunks(ctx)
 		releaseStacklessCoroNativeBurst(ctx)
 	}
@@ -505,6 +517,7 @@ func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 	ctx.cachedFrameBytes = 0
 	ctx.selfFrames = nil
 	ctx.selfFrameChunks = nil
+	releaseStacklessCoroNativeBurst(ctx)
 	ctx.selfFrameResume = nil
 	ctx.selfFrameChunkType = nil
 	ctx.selfFrameSize = 0
@@ -517,7 +530,6 @@ func clearStacklessCoroNativePayloadCache(ctx *stacklessCoroNativeContext) {
 	ctx.selfFrameMissRoots = 0
 	ctx.selfFrameMissedRoot = false
 	ctx.selfFrameCacheUsed = false
-	releaseStacklessCoroNativeBurst(ctx)
 }
 
 // clearStacklessCoroNativeCaches runs with the world stopped, before the GC
@@ -565,37 +577,51 @@ func clearStacklessCoroNativeCaches(coalescePayload bool) {
 }
 
 // stacklessCoroSelfFrameChunkBudget bounds chunks by their allocator class.
-// Small recursive frames keep the ordinary cache bound.
 func stacklessCoroSelfFrameChunkBudget(ctx *stacklessCoroNativeContext) uintptr {
-	if ctx.selfFrameBurst {
+	switch ctx.selfFrameBurst {
+	case stacklessCoroFrameBurstCompact:
+		return stacklessCoroCompactFrameBurstCacheSize
+	case stacklessCoroFrameBurstLarge:
 		return stacklessCoroSelfFrameBurstCacheSize
 	}
 	return stacklessCoroSelfFrameChunkCacheSize
+}
+
+func stacklessCoroNativeBurstCounter(class stacklessCoroFrameBurst) *atomic.Uint32 {
+	if class == stacklessCoroFrameBurstCompact {
+		return &stacklessCoroNativeCompactBurstContexts
+	}
+	return &stacklessCoroNativeBurstContexts
 }
 
 // takeStacklessCoroNativeBurst reserves only additional cache capacity. Live
 // frames do not consume this quota. The context remains single-owner; only
 // the global reservation count needs atomic operations.
 func takeStacklessCoroNativeBurst(ctx *stacklessCoroNativeContext) {
-	if ctx.selfFrameBurst {
+	if ctx.selfFrameBurst != stacklessCoroFrameBurstNone {
 		return
 	}
+	class := stacklessCoroFrameBurstLarge
+	if ctx.selfFrameSize < stacklessCoroSelfFrameBurstMinSize {
+		class = stacklessCoroFrameBurstCompact
+	}
+	reservations := stacklessCoroNativeBurstCounter(class)
 	for {
-		n := stacklessCoroNativeBurstContexts.Load()
+		n := reservations.Load()
 		if n >= stacklessCoroWarmExecutorCount {
 			return
 		}
-		if stacklessCoroNativeBurstContexts.CompareAndSwap(n, n+1) {
-			ctx.selfFrameBurst = true
+		if reservations.CompareAndSwap(n, n+1) {
+			ctx.selfFrameBurst = class
 			return
 		}
 	}
 }
 
 func releaseStacklessCoroNativeBurst(ctx *stacklessCoroNativeContext) {
-	if ctx.selfFrameBurst {
-		ctx.selfFrameBurst = false
-		stacklessCoroNativeBurstContexts.Add(-1)
+	if class := ctx.selfFrameBurst; class != stacklessCoroFrameBurstNone {
+		ctx.selfFrameBurst = stacklessCoroFrameBurstNone
+		stacklessCoroNativeBurstCounter(class).Add(-1)
 	}
 }
 
@@ -689,6 +715,7 @@ func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		ctx.selfFrameChunkType != chunkType {
 		ctx.selfFrames = nil
 		ctx.selfFrameChunks = nil
+		releaseStacklessCoroNativeBurst(ctx)
 		ctx.selfFrameResume = identity
 		ctx.selfFrameChunkType = chunkType
 		ctx.selfFrameSize = frameSize
@@ -700,9 +727,6 @@ func takeStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 		}
 		ctx.selfFrameChunkCount = 0
 		ctx.selfFrameCount = 0
-		if frameSize < stacklessCoroSelfFrameBurstMinSize {
-			releaseStacklessCoroNativeBurst(ctx)
-		}
 		return nil
 	}
 	link := &ctx.selfFrames
@@ -765,14 +789,14 @@ func cacheStacklessCoroNativeSelfFrame(resume stacklessCoroResume,
 	case allocation == stacklessCoroFusedFrameChunkFirst:
 		// Reserve extra capacity only when completed chunks actually exceed
 		// the ordinary bound. Shallow live lineages must not hold a quota.
-		if ctx.selfFrameSize >= stacklessCoroSelfFrameBurstMinSize &&
-			!ctx.selfFrameBurst && uintptr(ctx.selfFrameChunkCount) >=
-			stacklessCoroSelfFrameChunkCacheSize/ctx.selfFrameChunkSize {
-			takeStacklessCoroNativeBurst(ctx)
-		}
-		if uintptr(ctx.selfFrameChunkCount) >=
-			stacklessCoroSelfFrameChunkBudget(ctx)/ctx.selfFrameChunkSize {
-			return
+		count := uintptr(ctx.selfFrameChunkCount)
+		if count >= stacklessCoroSelfFrameChunkCacheSize/ctx.selfFrameChunkSize {
+			if ctx.selfFrameBurst == stacklessCoroFrameBurstNone {
+				takeStacklessCoroNativeBurst(ctx)
+			}
+			if count >= stacklessCoroSelfFrameChunkBudget(ctx)/ctx.selfFrameChunkSize {
+				return
+			}
 		}
 		header.parent = ctx.selfFrameChunks
 		ctx.selfFrameChunks = frame

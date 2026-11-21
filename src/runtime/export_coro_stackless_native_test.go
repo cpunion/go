@@ -185,20 +185,7 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 			if !slot.CompareAndSwap(ctx, nil) {
 				continue
 			}
-			ctx.freeTasks = nil
-			ctx.freePlainTaskCount = 0
-			ctx.freeFrameBytes = 0
-			ctx.cachedFrameTasks = 0
-			ctx.cachedFrameBytes = 0
-			ctx.selfFrames = nil
-			ctx.selfFrameChunks = nil
-			ctx.selfFrameResume = nil
-			ctx.selfFrameChunkType = nil
-			ctx.selfFrameSize = 0
-			ctx.selfFrameChunkSize = 0
-			ctx.selfFrameChunkCount = 0
-			ctx.selfFrameCount = 0
-			releaseStacklessCoroNativeBurst(ctx)
+			clearStacklessCoroNativePayloadCache(ctx)
 			if !slot.CompareAndSwap(nil, ctx) {
 				releaseStacklessCoroNativeContext(ctx)
 			}
@@ -340,32 +327,41 @@ func StacklessCoroNativeBurstReservationsForTest() uint32 {
 	return stacklessCoroNativeBurstContexts.Load()
 }
 
-func StacklessCoroNativeBurstContendForTest() (held, granted, remaining uint32) {
+func StacklessCoroNativeBurstContendForTest() (held, granted, remaining [2]uint32) {
 	const n = 64
-	results := make(chan bool, n)
-	release, done := make(chan struct{}), make(chan struct{}, n)
-	for range n {
-		go func() {
-			ctx := new(stacklessCoroNativeContext)
-			takeStacklessCoroNativeBurst(ctx)
-			results <- ctx.selfFrameBurst
-			<-release
-			releaseStacklessCoroNativeBurst(ctx)
-			done <- struct{}{}
-		}()
-	}
-	for range n {
-		if <-results {
-			granted++
+	results := make(chan int, 2*n)
+	release, done := make(chan struct{}), make(chan struct{}, 2*n)
+	for class := range held {
+		for range n {
+			go stacklessCoroNativeBurstContenderForTest(class, results, release, done)
 		}
 	}
-	held = stacklessCoroNativeBurstContexts.Load()
+	for range 2 * n {
+		if class := <-results; class >= 0 {
+			granted[class]++
+		}
+	}
+	held = [2]uint32{stacklessCoroNativeCompactBurstContexts.Load(), stacklessCoroNativeBurstContexts.Load()}
 	close(release)
-	for range n {
+	for range 2 * n {
 		<-done
 	}
-	remaining = stacklessCoroNativeBurstContexts.Load()
+	remaining = [2]uint32{stacklessCoroNativeCompactBurstContexts.Load(), stacklessCoroNativeBurstContexts.Load()}
 	return
+}
+
+func stacklessCoroNativeBurstContenderForTest(class int, results chan<- int, release <-chan struct{}, done chan<- struct{}) {
+	ctx := new(stacklessCoroNativeContext)
+	ctx.selfFrameSize = uintptr(class+1) * (stacklessCoroSelfFrameBurstMinSize / 2)
+	takeStacklessCoroNativeBurst(ctx)
+	result := -1
+	if ctx.selfFrameBurst != stacklessCoroFrameBurstNone {
+		result = class
+	}
+	results <- result
+	<-release
+	releaseStacklessCoroNativeBurst(ctx)
+	done <- struct{}{}
 }
 
 // A parked public root keeps its driver. Its completed chunks must nevertheless
