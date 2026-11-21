@@ -82,7 +82,8 @@ type stacklessCoroNativeContext struct {
 	deferredYield       bool
 	poolNext            *stacklessCoroNativeContext
 	// deferredSleep is owned by the driver between adjacent fixed-stack
-	// episodes. Keeping it here avoids growing the shared logical scheduler.
+	// episodes. A deadline without an operation belongs to the private root.
+	// Keeping this here avoids growing the shared logical scheduler.
 	deferredSleep     *stacklessCoroOperation
 	deferredSleepWhen int64
 }
@@ -213,6 +214,14 @@ again:
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
+	if ctx.deferredSleepWhen != 0 && ctx.deferredSleep == nil {
+		if !d.waitForWork(scheduler) {
+			throw("runtime: stopped private stackless coroutine sleep")
+		}
+		s = scheduler
+		initial = true
+		goto again
+	}
 	if ctx.deferredYield && !public {
 		ctx.deferredYield = false
 		// The ordinary driver has its original G and M state back. It
@@ -265,7 +274,7 @@ func (d *stacklessCoroNativeDriver) releasePrivateWaitContext(s *stacklessCoroSc
 	ctx := d.context
 	if !d.root || !ctx.public ||
 		s.executorState.Load() != stacklessCoroExecutorStateOff ||
-		ctx.deferredYield || ctx.deferredSleep != nil {
+		ctx.deferredYield || ctx.deferredSleepWhen != 0 {
 		return false
 	}
 	ctx.scheduler = nil
@@ -328,14 +337,18 @@ func clearStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) {
 
 func (d *stacklessCoroNativeDriver) waitForOperation(s *stacklessCoroScheduler) bool {
 	ctx := d.context
-	op := ctx.deferredSleep
-	if op == nil {
+	when := ctx.deferredSleepWhen
+	if when == 0 {
 		return s.waitForWork()
 	}
-	when := ctx.deferredSleepWhen
+	op := ctx.deferredSleep
 	ctx.deferredSleep = nil
 	ctx.deferredSleepWhen = 0
 
+	if op == nil {
+		waitForStacklessCoroPrivateSleep(s, when)
+		return true
+	}
 	if when > nanotime() {
 		armStacklessCoroTimerAt(op, when)
 		return s.waitForWork()
@@ -1174,12 +1187,92 @@ func stacklessCoroNativeSchedulerFor(gp *g) *stacklessCoroScheduler {
 	return ctx.scheduler
 }
 
+func stacklessCoroDeferPrivateSleep(context *stacklessCoroContext, when int64) bool {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.executor != gp || !ctx.public || ctx.caller.bubble != nil ||
+		context.scheduler != ctx.scheduler || ctx.deferredSleepWhen != 0 {
+		return false
+	}
+	s := context.scheduler
+	task := context.task()
+	if !s.privateRoot(task) || stacklessCoroIsPullComparison(s) {
+		return false
+	}
+	if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending ||
+		task.terminal != stacklessCoroTerminalNone || task.goexit {
+		throw("runtime: private stackless coroutine sleep outside resume")
+	}
+	ctx.deferredSleepWhen = when
+	task.state = stacklessCoroTaskWaiting
+	return true
+}
+
+func stacklessCoroPrivateSleep(s *stacklessCoroScheduler, task *stacklessCoroTask) (resume, suspend bool) {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.deferredSleepWhen == 0 || ctx.deferredSleep != nil {
+		return false, false
+	}
+	if !s.privateRoot(task) || task.state != stacklessCoroTaskWaiting || !task.resuming {
+		throw("runtime: invalid private stackless coroutine sleep")
+	}
+	when := ctx.deferredSleepWhen
+	now := nanotime()
+	if when <= now && stacklessCoroSkipPrivateSleepSwitch(gp, now) {
+		ctx.deferredSleepWhen = 0
+		task.state = stacklessCoroTaskRunning
+		return true, false
+	}
+	task.resuming = false
+	return false, true
+}
+
+// An expired private sleep can resume the sole logical task directly if
+// the host scheduler has no work to service. A poll waiter need not already
+// be runnable, so let the host poll even when its run queues are empty.
+func stacklessCoroSkipPrivateSleepSwitch(gp *g, now int64) bool {
+	pp := gp.m.p.ptr()
+	if pp == nil || gp.preempt || sched.gcwaiting.Load() || atomic.Load(&pp.runSafePointFn) != 0 ||
+		!runqempty(pp) || !sched.runq.empty() || gcBlackenEnabled != 0 ||
+		fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake || gcCleanups.needsWake() ||
+		traceEnabled() || traceShuttingDown() || netpollAnyWaiters() {
+		return false
+	}
+	next := pp.timers.wakeTime()
+	return next == 0 || next > now
+}
+
+func waitForStacklessCoroPrivateSleep(s *stacklessCoroScheduler, when int64) {
+	if when <= nanotime() {
+		// An expired positive sleep still gives runnable work a turn.
+		Gosched()
+	} else {
+		// The ordinary caller's timer can wake this sole owner directly.
+		// Use the deadline recorded on the native stack.
+		gp := getg()
+		if gp.timer == nil {
+			t := new(timer)
+			t.init(goroutineReady, gp)
+			gp.timer = t
+		}
+		gp.sleepWhen = when
+		gopark(resetForSleep, nil, waitReasonSleep, traceBlockSleep, 1)
+	}
+	// The ordinary timer readies the driver G. Only this driver can queue
+	// its private logical root before starting the next native episode.
+	task := &s.root
+	task.state = stacklessCoroTaskRunnable
+	s.head, s.tail = task, task
+	s.runnableState.Store(1)
+}
+
 func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
 	op *stacklessCoroOperation, when int64) bool {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
 	if ctx == nil || ctx.executor != gp || ctx.scheduler != s ||
-		ctx.deferredSleep != nil {
+		ctx.deferredSleepWhen != 0 {
 		return false
 	}
 	lock(&s.lock)

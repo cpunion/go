@@ -62,6 +62,12 @@ func stacklessCoroNativeSchedulerFor(*g) *stacklessCoroScheduler {
 	return nil
 }
 
+func stacklessCoroDeferPrivateSleep(*stacklessCoroContext, int64) bool { return false }
+
+func stacklessCoroPrivateSleep(*stacklessCoroScheduler, *stacklessCoroTask) (resume, suspend bool) {
+	return false, false
+}
+
 func stacklessCoroDeferSleep(*stacklessCoroScheduler,
 	*stacklessCoroOperation, int64) bool {
 	return false

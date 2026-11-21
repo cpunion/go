@@ -1801,6 +1801,16 @@ resumeOwned:
 		}
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
+		if native {
+			resume, suspend := stacklessCoroPrivateSleep(s, task)
+			if resume {
+				idlePollSkip = nil
+				goto resumeActive
+			}
+			if suspend {
+				return task
+			}
+		}
 		rotate := state != nil && state.channelRotate
 		if rotate {
 			state.channelRotate = false
@@ -2673,7 +2683,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	// front of the private root's cache. Share the general reservation
 	// representation so a miss keeps the bounded allocation policy.
 	if request == stacklessCoroTaskFusedRequested && !sameResume &&
-		s.privateFusedRoot(parent) && !stacklessCoroIsPullComparison(s) &&
+		s.privateRoot(parent) && !stacklessCoroIsPullComparison(s) &&
 		s.reservedTasks == nil && size <= stacklessCoroFrameCacheSize {
 		if owner := s.freeTasks; owner != nil &&
 			owner.flags == stacklessCoroTaskCacheFrame && owner.frameSize == uint16(size) &&
@@ -2941,7 +2951,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 		throw("runtime: invalid stackless coroutine fused-frame await")
 	}
 	s := context.scheduler
-	if !raceenabled && s.privateFusedRoot(parent) &&
+	if !raceenabled && s.privateRoot(parent) &&
 		parent.flags&stacklessCoroTaskFusedTransitionMask == stacklessCoroTaskFusedPending &&
 		!stacklessCoroIsPullComparison(s) {
 		if owner := s.reservedTasks; owner != nil && owner.next == nil && owner.parent() == parent &&
@@ -3125,11 +3135,11 @@ func awaitStacklessCoroFusedFrame(context *stacklessCoroContext, frame unsafe.Po
 	return stacklessCoroActionYield
 }
 
-// privateFusedRoot reports whether this activation owns the scheduler's
-// frame-holder lists. Check atomic lifetime flags before reading the
+// privateRoot reports whether this activation still owns its scheduler
+// exclusively. Check atomic lifetime flags before reading the
 // private bit: after publication an independent task can clear that bit
 // while the root is still running.
-func (s *stacklessCoroScheduler) privateFusedRoot(task *stacklessCoroTask) bool {
+func (s *stacklessCoroScheduler) privateRoot(task *stacklessCoroTask) bool {
 	return task == &s.root && s.lifetime.Load() == 0 && s.initialRootPrivate
 }
 
@@ -3155,7 +3165,7 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 	s := context.scheduler
 	frame := context.frame
 	header := (*stacklessCoroFusedFrameHeader)(frame)
-	if !raceenabled && s.privateFusedRoot(task) &&
+	if !raceenabled && s.privateRoot(task) &&
 		header.marker&^stacklessCoroFusedFrameParent == stacklessCoroFusedFrameResume &&
 		validStacklessCoroFusedFrameOwner(header.owner, frame) && header.parent != nil &&
 		!stacklessCoroIsPullComparison(s) {
@@ -4165,14 +4175,16 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 	if ns <= 0 {
 		return false
 	}
-	startStacklessCoroSleep(ctx, ns)
+	when := stacklessCoroTimerWhen(ns)
+	if !stacklessCoroDeferPrivateSleep((*stacklessCoroContext)(ctx), when) {
+		startStacklessCoroSleepAt(ctx, when)
+	}
 	return true
 }
 
-func startStacklessCoroSleep(ctx unsafe.Pointer, ns int64) {
+func startStacklessCoroSleepAt(ctx unsafe.Pointer, when int64) {
 	op := stacklessCoroStartOperation(ctx, "sleep")
 	s := op.scheduler()
-	when := stacklessCoroTimerWhen(ns)
 	op.id = stacklessCoroDeferredSleepOperationID
 	if stacklessCoroIsPullComparison(s) || !stacklessCoroDeferSleep(s, op, when) {
 		armStacklessCoroTimerAt(op, when)

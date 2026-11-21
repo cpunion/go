@@ -89,3 +89,45 @@ func TestStacklessCoroSleepHostProgress(t *testing.T) {
 		t.Fatalf("host goroutine did not run during %d coroutine sleeps", sleeps)
 	}
 }
+
+func TestStacklessCoroSleepDueHostTimer(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	fired := make(chan struct{})
+	var timer *time.Timer
+	var sleeps int
+	var observed, started bool
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if timer == nil {
+			timer = time.AfterFunc(time.Nanosecond, func() { close(fired) })
+		} else {
+			select {
+			case <-fired:
+				observed = true
+				return runtime.StacklessCoroActionComplete
+			default:
+			}
+		}
+		if sleeps == 32 {
+			return runtime.StacklessCoroActionComplete
+		}
+		sleeps++
+		started = runtime.SleepStacklessCoroForTest(ctx, int64(time.Nanosecond))
+		if !started {
+			return runtime.StacklessCoroActionComplete
+		}
+		// Make the coroutine's deadline expire before returning Wait.
+		// The ordinary timer still has to run when there is no runnable G.
+		until := time.Now().Add(time.Microsecond)
+		for time.Now().Before(until) {
+		}
+		return runtime.StacklessCoroActionWait
+	})
+	if timer != nil {
+		timer.Stop()
+	}
+	if !started || !observed {
+		t.Fatalf("after %d short sleeps, started = %v, host timer fired = %v", sleeps, started, observed)
+	}
+}
