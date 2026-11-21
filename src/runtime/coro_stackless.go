@@ -1626,7 +1626,12 @@ next:
 	if s.driverDone(public) {
 		return nil
 	}
-	task = s.take()
+	task = nil
+	// Native drivers use only the shared ready queue. Producers publish its
+	// count before ringing wake, so an empty snapshot can skip the queue lock.
+	if !native || raceenabled || stacklessCoroIsPullComparison(s) || s.runnableState.Load() != 0 {
+		task = s.take()
+	}
 	if task == nil {
 		if native {
 			task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
