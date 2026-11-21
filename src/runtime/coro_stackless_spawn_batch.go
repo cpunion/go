@@ -78,8 +78,12 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_t
 	s.registerGoroutinesLocked(tasks[:count], parent, callerpc, callersp)
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
 	var queued int32
-	for _, task := range tasks[:count] {
-		s.publishReadyLocked(task, &queued)
+	if !raceenabled && !stacklessCoroIsPullComparison(s) && s.terminalValues == nil {
+		queued = s.publishSpawnBatchLocked(tasks[:count])
+	} else {
+		for _, task := range tasks[:count] {
+			s.publishReadyLocked(task, &queued)
+		}
 	}
 	var runnable uint32
 	if queued != 0 {
@@ -92,4 +96,38 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_t
 	}
 	s.wakeReplacementExecutor(live, runnable)
 	return count, yield
+}
+
+// publishSpawnBatchLocked appends new independent tasks to the shared FIFO
+// in spawn order. The caller holds s.lock, has ruled out host routing, and
+// publishes the ready count before releasing the lock.
+func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroTask) int32 {
+	var first *stacklessCoroTask
+	for i := len(tasks) - 1; i >= 0; i-- {
+		task := tasks[i]
+		if task.state != stacklessCoroTaskNew || task.resuming || task.readyPending || task.next != nil {
+			throw("runtime: invalid stackless coroutine spawn batch ready transition")
+		}
+		task.state = stacklessCoroTaskRunnable
+		task.next = first
+		first = task
+	}
+	if s.tail == nil {
+		s.head = first
+	} else {
+		s.tail.next = first
+	}
+	s.tail = tasks[len(tasks)-1]
+	if s.initialRootPrivate {
+		s.initialRootPrivate = false
+	}
+	s.queueProgress += uint16(len(tasks))
+	if s.executorMonitorIdle {
+		s.executorMonitorIdle = false
+		select {
+		case s.executorGrow <- struct{}{}:
+		default:
+		}
+	}
+	return int32(len(tasks))
 }
