@@ -4763,16 +4763,21 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			if terminalAware && !localSelfFrames && !directTerminal {
 				terminalAction := typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
-				body = append(body, ir.NewAssignStmt(pos, terminalAction,
-					typecheck.Call(pos, typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)))
+				query := ir.NewAssignStmt(pos, terminalAction,
+					typecheck.Call(pos, typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false))
 				hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
 					typedInt(pos, types.Types[types.TUINT8],
 						int64(actionInvalid)))
-				body = append(body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
+				finish := ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
 					ir.NewReturnStmt(pos, []ir.Node{
 						terminalAction,
 					}),
-				}, nil))
+				}, nil)
+				if candidate.factoryABI == FactoryABI3 {
+					body = append(body, ir.NewIfStmt(pos, resumeTerminalPending(pos, ctx), ir.Nodes{query, finish}, nil))
+				} else {
+					body = append(body, query, finish)
+				}
 			}
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
@@ -5237,21 +5242,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)
 		setCleanup := ir.NewAssignStmt(pos, resumePC, typedInt(pos, types.Types[types.TUINT32], cleanupState))
 		if directTerminal {
-			// The runtime owns the context and its aligned terminal bytes.
-			// Decode pending state through the runtime's validated query.
-			statusType := types.Types[types.TUINT16]
-			addr := typecheck.Expr(ir.NewBinaryExpr(pos, ir.OUNSAFEADD, ctx,
-				typedInt(pos, types.Types[types.TINT], abi.CoroResumeTerminalOffset)))
-			status := typedDeref(pos, typecheck.ConvNop(addr, types.NewPtr(statusType)), statusType)
-			pending := ir.NewBinaryExpr(pos, ir.ONE, status, typedInt(pos, statusType, 0))
-			resume.Body.Append(ir.NewIfStmt(pos, pending, ir.Nodes{
+			resume.Body.Append(ir.NewIfStmt(pos, resumeTerminalPending(pos, ctx), ir.Nodes{
 				setCleanup,
 				ir.NewReturnStmt(pos, ir.Nodes{terminalAction}),
 			}, nil))
 		} else {
 			hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
 				typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
-			resume.Body.Append(ir.NewIfStmt(pos, hasTerminal, ir.Nodes{setCleanup}, nil))
+			var cleanup ir.Node = ir.NewIfStmt(pos, hasTerminal, ir.Nodes{setCleanup}, nil)
+			if candidate.factoryABI == FactoryABI3 {
+				cleanup = ir.NewIfStmt(pos, resumeTerminalPending(pos, ctx), ir.Nodes{cleanup}, nil)
+			}
+			resume.Body.Append(cleanup)
 		}
 	}
 	resume.Body = append(resume.Body,
@@ -5263,6 +5265,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	finishLowering(candidate, resume, declarations)
 	return nil
+}
+
+// The runtime owns the explicit context and its aligned terminal bytes.
+// Only pending state needs decoding through its validated query.
+func resumeTerminalPending(pos src.XPos, ctx ir.Node) ir.Node {
+	statusType := types.Types[types.TUINT16]
+	addr := typecheck.Expr(ir.NewBinaryExpr(pos, ir.OUNSAFEADD, ctx,
+		typedInt(pos, types.Types[types.TINT], abi.CoroResumeTerminalOffset)))
+	status := typedDeref(pos, typecheck.ConvNop(addr, types.NewPtr(statusType)), statusType)
+	return ir.NewBinaryExpr(pos, ir.ONE, status, typedInt(pos, statusType, 0))
 }
 
 func finishLowering(candidate *lowerCandidate, resume *ir.Func,

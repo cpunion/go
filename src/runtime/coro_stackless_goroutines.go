@@ -198,7 +198,10 @@ func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, calle
 		n = stacklessCoroCachedProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
 	}
 	lock(&stacklessCoroGoroutines.lock)
-	s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
+	r := s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
+	if !raceenabled {
+		s.root.setSource(r)
+	}
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
@@ -408,10 +411,12 @@ func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer
 
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	if !raceenabled && owner != nil && owner.stackIsFixed() {
-		if record := task.source(); record != nil && !task.context.scheduler.hasTerminalRecords() {
-			// Registration and structured completion already made the
-			// independent task the leaf. It keeps the record alive until
-			// this executor clears ownership and completes the task.
+		s := task.context.scheduler
+		if record := task.source(); record != nil &&
+			(!record.public && !s.hasTerminalRecords() || record.public && s.privateRoot(task)) {
+			// Registration and structured completion already made this
+			// task the leaf. A private public root keeps that leaf until
+			// it publishes work or terminal metadata.
 			record.owner.Store(owner)
 			state := owner.stacklessCoro
 			state.activeSource = record

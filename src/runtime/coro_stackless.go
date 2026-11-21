@@ -232,7 +232,7 @@ type stacklessCoroScalarTaskChunk struct {
 	frames [stacklessCoroTaskChunkSize]uint32
 }
 
-// A structured task retains its parent. An independent task uses the
+// A structured task retains its parent. A root task uses the
 // same GC pointer to retain its source record. The tag is an interior
 // pointer one byte into that record, so the GC traces the entire object.
 const stacklessCoroTaskSourceOffset = 1
@@ -684,7 +684,15 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 	s.registerPublicGoroutine(sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
 	s = runStacklessCoroRoot(s)
-	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
+	lifetime := s.lifetime.Load()
+	// Successful private completion has already unlinked the root. No
+	// replacement executor, shared cache, or terminal outcome needs finishing.
+	if !raceenabled && lifetime == stacklessCoroLifetimeRootComplete|stacklessCoroLifetimeDrained &&
+		s.initialRootPrivate && s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit && s.terminalValues == nil {
+		return releaseStacklessCoroRootScheduler(s)
+	}
+	if lifetime&stacklessCoroLifetimePublicHost != 0 {
 		if !s.drained() {
 			go s.runOwner()
 		}
@@ -1738,30 +1746,30 @@ resumeOwned:
 		}
 		// A validated frame switch keeps this running task on the same
 		// executor. Retain its scheduler link as for private yields.
-		if native && !raceenabled && state != nil && state.activeSource != nil &&
-			!state.activeTerminalSource && !s.hasTerminalRecords() &&
-			state.activeSource.owner.Load() == getg() {
+		if native && !raceenabled && s.retainLogicalOwner(state) {
 			// This is a new frame of the same running task. Its registry
 			// leaf and its owner do not change across the resume switch.
-			state.sourceTransition = false
 			goto resumeOwned
 		}
 		stacklessCoroClearLogicalOwner(task, native)
 		goto resumeActive
 	}
-	stacklessCoroClearLogicalOwner(task, native)
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
 		hostYieldCheck++
-		if hostYieldCheck == 0 || getg().preempt {
-			if stacklessCoroHostRunnable() {
-				if yieldStacklessCoroNative(s, task) {
-					return nil
-				}
+		if (hostYieldCheck == 0 || getg().preempt) && stacklessCoroHostRunnable() {
+			stacklessCoroClearLogicalOwner(task, native)
+			if yieldStacklessCoroNative(s, task) {
+				return nil
 			}
+		} else if s.retainLogicalOwner(state) {
+			goto resumeOwned
+		} else {
+			stacklessCoroClearLogicalOwner(task, native)
 		}
 		goto resumeActive
 	}
+	stacklessCoroClearLogicalOwner(task, native)
 	// A waiting source retains its scheduler through this context. The
 	// source owns task until completion, then the ready queue owns it until
 	// its next resume. Non-wait actions keep the active-context cleanup.
@@ -1879,6 +1887,17 @@ resumeOwned:
 	initial = false
 	directInitialRoot = false
 	goto next
+}
+
+// A local resume can reuse its current profile owner while the logical leaf
+// stays on this executor. Terminal transitions still refresh its trace.
+func (s *stacklessCoroScheduler) retainLogicalOwner(state *stacklessCoroGState) bool {
+	if state == nil || state.activeSource == nil || state.activeTerminalSource ||
+		s.hasTerminalRecords() || state.activeSource.owner.Load() != getg() {
+		return false
+	}
+	state.sourceTransition = false
+	return true
 }
 
 // waitForWork parks the current ordinary G until work is ready. It reports
