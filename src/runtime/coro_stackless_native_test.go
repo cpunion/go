@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -331,9 +332,19 @@ func TestStacklessCoroNativeFusedChunkReuse(t *testing.T) {
 			t.Fatalf("fused chain = %+v, want %d completed frames and typed chunks", tracker, depth+1)
 		}
 	}
-	// Warm the cache, then require reuse of chunks beyond the scheduler-owned
-	// prefix. The six direct frames and test entry may still allocate.
+	// Warm the cache, then require reuse of chunks before consuming the
+	// scheduler's frame budget. Disable automatic collections during this
+	// warm check so idle cache expiry does not affect the assertion.
+	oldGC := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(oldGC)
 	allocations := testing.AllocsPerRun(3, run)
+	tracker := new(stacklessCoroFusedResumeDeepTracker)
+	runStacklessCoroFusedResumeDeep(depth, tracker)
+	// The ordinary root may reserve its first child and a second child may
+	// use a holder before the alternating resume key matches the chunk.
+	if tracker.ownedFrames > 2 {
+		t.Fatalf("warm heterogeneous chain used %d shared frames, want at most 2", tracker.ownedFrames)
+	}
 	t.Logf("warm heterogeneous chain allocations = %.0f", allocations)
 	if allocations > 32 {
 		t.Fatalf("warm heterogeneous chain allocated %.0f objects, want at most 32", allocations)

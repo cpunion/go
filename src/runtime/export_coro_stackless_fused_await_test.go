@@ -110,7 +110,7 @@ func CheckStacklessCoroLocalFusedAwaitForTest(allocation uint8,
 	default:
 		current := parent.marker & stacklessCoroFusedFrameAllocationMask
 		next := current + 1
-		if current == stacklessCoroFusedFrameDirectLast ||
+		if current <= stacklessCoroFusedFrameDirectLast ||
 			current == stacklessCoroFusedFrameChunkLastFor(parent.marker) {
 			next = stacklessCoroFusedFrameChunkFirst
 		}

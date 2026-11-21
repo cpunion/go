@@ -677,6 +677,17 @@ func trimStacklessCoroNativeSelfFrameChunks(ctx *stacklessCoroNativeContext) {
 	ctx.selfFrameChunkCount = uint16(keep)
 }
 
+// hasStacklessCoroNativeFusedChunk checks the executor's own cache
+// without changing its phase or taking a chunk from it.
+func hasStacklessCoroNativeFusedChunk(resume stacklessCoroResume,
+	frameSize uintptr, chunkType *_type) bool {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	return ctx != nil && ctx.executor == gp && ctx.selfFrameChunks != nil &&
+		ctx.selfFrameResume == stacklessCoroResumeIdentity(resume) &&
+		ctx.selfFrameSize == frameSize && ctx.selfFrameChunkType == chunkType
+}
+
 // takeStacklessCoroNativeFusedChunk opportunistically reuses compatible chunks
 // without replacing an established cache identity during a running lineage.
 // Record repeated misses for phase replacement after the executor is idle;

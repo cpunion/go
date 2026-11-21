@@ -2134,6 +2134,7 @@ type stacklessCoroFusedResumeDeepTracker struct {
 	coldStart     bool
 	completed     int
 	uncached      int
+	ownedFrames   int
 	panicLeaf     bool
 	firstAction   uint8
 	firstFused    bool
@@ -2160,6 +2161,9 @@ func stacklessCoroFusedResumeDeep(ctx unsafe.Pointer,
 			runtime.StacklessCoroLargeFrameChunkSize-1
 	switch frame.State {
 	case 0:
+		if frame.Owner != nil {
+			tracker.ownedFrames++
+		}
 		if frame.Depth == 0 {
 			if tracker.panicLeaf {
 				panic("stackless coroutine heterogeneous fused-frame panic")
@@ -2247,9 +2251,8 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	defer func() { stacklessCoroFusedResumeDeepActive = nil }()
-	// The exact direct-prefix count is a cold-cache contract. A warm native
-	// chunk from an earlier root can legitimately reduce that count.
-
+	// Start cold so only the scheduler-owned frames require individual
+	// allocations. Compatible unowned frames should come from typed chunks.
 	depth := runtime.StacklessCoroTaskCacheSize + 32
 	tracker := &stacklessCoroFusedResumeDeepTracker{coldStart: true}
 	runStacklessCoroFusedResumeDeep(depth, tracker)
@@ -2260,8 +2263,7 @@ func TestStacklessCoroFusedResumeDeep(t *testing.T) {
 	if tracker.uncached == 0 {
 		t.Fatal("deep heterogeneous fusion did not cross the frame cache")
 	}
-	wantUncached := runtime.StacklessCoroTaskCacheSize +
-		runtime.StacklessCoroFrameChunkDirectCount
+	wantUncached := runtime.StacklessCoroTaskCacheSize
 	if !race.Enabled && (tracker.uncached != wantUncached ||
 		!tracker.sawChunkFirst || !tracker.sawChunkLast) {
 		t.Fatalf("compatible heterogeneous chunks = %+v, want %d direct frames and complete chunks",

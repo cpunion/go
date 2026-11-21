@@ -82,8 +82,7 @@ const stacklessCoroSharedOperationCacheSize = stacklessCoroTaskCacheSize -
 // concurrent sets remain correct through per-bucket chains.
 const stacklessCoroOperationRegistryBucketCount = 16
 
-// A fused structured-await chain uses the same direct prefix as ordinary
-// recursive frame chunks. The low four bits describe allocation. The next two
+// The low four bits of a fused frame marker describe allocation. The next two
 // cache typed-chunk validation and its four-element class; runtime-created
 // child frames inherit both, so later self-frame transitions need not repeat
 // the validation. The top two bits retain suspended-frame state when resumes
@@ -2600,8 +2599,8 @@ func coroRequestFusedFrame(ctx unsafe.Pointer, chunkCompatible bool) {
 // coroTakeFusedFrame extends typed-frame reuse for a compiler-proven
 // structured await. A fused child shares the active logical task, so only a
 // cache-owned frame holder is reserved. Homogeneous recursion additionally
-// uses the direct prefix and typed frame chunks after the cache fills. Chunk
-// compatibility is validated only when no cache-owned holder is available.
+// uses a direct prefix and typed chunks after the shared cache fills. A
+// compatible heterogeneous chain can also use the executor's warm chunks.
 func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, chunkType *_type, self bool) unsafe.Pointer {
 	if ctx == nil || raceenabled {
@@ -2692,22 +2691,29 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
-	task := s.takeCachedFrameTaskLocked(child, uint16(size))
-	if task == nil {
-		for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
-			uintptr(s.cachedFrameBytes)+size > stacklessCoroFrameCacheSize) &&
-			s.discardFreeCachedFrameTaskLocked() {
+	// A compatible warm chunk replaces multiple scheduler-cache
+	// reservations. Prefer it while this executor already owns the storage.
+	warmChunk := requestedChunk && !sameResume &&
+		hasStacklessCoroNativeFusedChunk(child, size, chunkType)
+	var task *stacklessCoroTask
+	if !warmChunk {
+		task = s.takeCachedFrameTaskLocked(child, uint16(size))
+		if task == nil {
+			for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
+				uintptr(s.cachedFrameBytes)+size > stacklessCoroFrameCacheSize) &&
+				s.discardFreeCachedFrameTaskLocked() {
+			}
 		}
-	}
-	if task == nil && s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
-		uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
-		task = s.newFrameReservationTaskLocked(child, parent, size)
-		task.setFlag(stacklessCoroTaskCacheFrame, true)
-		task.frameSize = uint16(size)
-		s.cachedFrameTasks++
-		s.cachedFrameBytes += uint16(size)
-	} else if task != nil {
-		task.parent = parent
+		if task == nil && s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
+			uintptr(s.cachedFrameBytes)+size <= stacklessCoroFrameCacheSize {
+			task = s.newFrameReservationTaskLocked(child, parent, size)
+			task.setFlag(stacklessCoroTaskCacheFrame, true)
+			task.frameSize = uint16(size)
+			s.cachedFrameTasks++
+			s.cachedFrameBytes += uint16(size)
+		} else if task != nil {
+			task.parent = parent
+		}
 	}
 	if task != nil {
 		parent.flags |= stacklessCoroTaskFusedPending
@@ -2758,12 +2764,12 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	unlock(&s.lock)
 
 	switch {
-	case marker == 0 || marker < stacklessCoroFusedFrameDirectLast:
+	case sameResume && marker < stacklessCoroFusedFrameDirectLast:
 		return nil
-	case marker == stacklessCoroFusedFrameDirectLast ||
-		marker == chunkLast:
-		// Alternating the direct prefix's resume identities would evict
-		// this single-key cache on every root. Reuse only whole chunks.
+	case marker <= stacklessCoroFusedFrameDirectLast || marker == chunkLast:
+		// Compatible heterogeneous awaits start with a whole chunk after
+		// exhausting the shared cache. Alternating direct allocations
+		// cannot reuse the executor's single-resume cache.
 		return stacklessCoroTakeWholeFusedChunk(child, size, chunkType)
 	case marker >= stacklessCoroFusedFrameChunkFirst &&
 		marker < chunkLast:
@@ -2860,7 +2866,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 			header := (*stacklessCoroFusedResumeFrameHeader)(frame)
 			if header.parent == nil && header.owner == nil && header.marker == 0 && header.resume == nil {
 				next := allocation + 1
-				if allocation == stacklessCoroFusedFrameDirectLast ||
+				if allocation <= stacklessCoroFusedFrameDirectLast ||
 					allocation == stacklessCoroFusedFrameChunkLastFor(parentHeader.marker) {
 					next = stacklessCoroFusedFrameChunkFirst
 				}
@@ -2946,14 +2952,12 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 			stacklessCoroFusedFrameAllocationMask
 		chunkLast := stacklessCoroFusedFrameChunkLastFor(parentHeader.marker)
 		switch {
-		case parentMarker == 0:
-			marker |= stacklessCoroFusedFrameDirectFirst
-		case parentMarker >= stacklessCoroFusedFrameDirectFirst &&
-			parentMarker < stacklessCoroFusedFrameDirectLast:
-			marker |= parentMarker + 1
-		case parentMarker == stacklessCoroFusedFrameDirectLast ||
-			parentMarker == chunkLast:
+		case parentMarker == chunkLast,
+			parentMarker == stacklessCoroFusedFrameDirectLast,
+			pendingChunk && parentMarker < stacklessCoroFusedFrameDirectLast:
 			marker |= stacklessCoroFusedFrameChunkFirst
+		case parentMarker < stacklessCoroFusedFrameDirectLast:
+			marker |= parentMarker + 1
 		case parentMarker >= stacklessCoroFusedFrameChunkFirst &&
 			parentMarker < chunkLast:
 			marker |= parentMarker + 1

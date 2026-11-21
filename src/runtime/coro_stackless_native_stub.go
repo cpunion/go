@@ -44,6 +44,10 @@ func takeStacklessCoroNativeSelfFrame(stacklessCoroResume,
 	return nil
 }
 
+func hasStacklessCoroNativeFusedChunk(stacklessCoroResume, uintptr, *_type) bool {
+	return false
+}
+
 func takeStacklessCoroNativeFusedChunk(stacklessCoroResume,
 	uintptr, *_type) unsafe.Pointer {
 	return nil

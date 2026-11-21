@@ -22,7 +22,7 @@ func TestStacklessCoroLocalFusedAwait(t *testing.T) {
 	locked := os.Getenv(helper) == "1"
 	for mode := 0; mode < 4; mode++ {
 		short, runnable := mode&1 != 0, mode&2 != 0
-		last := 14 // Six direct frames followed by eight chunk elements.
+		last := 14 // Largest allocation marker for an eight-slot chunk.
 		if short {
 			last = 10
 		}
