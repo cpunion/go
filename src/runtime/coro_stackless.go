@@ -3485,12 +3485,36 @@ func enterStacklessCoroDeferScope(task *stacklessCoroTask, recoverable bool) sta
 	lock(&s.lock)
 	trace := s.terminalSourceTrace(task)
 	unlock(&s.lock)
-	state.deferState = &stacklessCoroDeferState{task: task, trace: trace, recoverable: recoverable}
+	var deferState *stacklessCoroDeferState
+	if previous == nil && gp.stackIsFixed() {
+		mp := acquirem()
+		if pp := mp.p.ptr(); pp != nil {
+			deferState = pp.deferRecord
+			pp.deferRecord = nil
+		}
+		releasem(mp)
+	}
+	if deferState == nil {
+		deferState = new(stacklessCoroDeferState)
+	}
+	*deferState = stacklessCoroDeferState{task: task, trace: trace, recoverable: recoverable}
+	state.deferState = deferState
 	return stacklessCoroDeferScope{gp: gp, state: state, previous: previous, temporary: temporary}
 }
 
 func (scope *stacklessCoroDeferScope) leave() {
+	current := scope.state.deferState
 	scope.state.deferState = scope.previous
+	if scope.previous == nil && scope.gp.stackIsFixed() {
+		// The scope owns current even if its defer temporarily released the
+		// P. Return only the cleared record to the current P's free slot.
+		*current = stacklessCoroDeferState{}
+		mp := acquirem()
+		if pp := mp.p.ptr(); pp != nil && pp.deferRecord == nil {
+			pp.deferRecord = current
+		}
+		releasem(mp)
+	}
 	if scope.temporary {
 		scope.gp.stacklessCoro = nil
 	}

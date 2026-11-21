@@ -27,7 +27,20 @@ func (s *stacklessCoroScheduler) hasTerminalRecords() bool {
 	return s.lifetime.Load()&stacklessCoroLifetimeTerminalRecords != 0
 }
 
-func (s *stacklessCoroScheduler) addTerminalRecord(entry *stacklessCoroTerminalValue) {
+func (s *stacklessCoroScheduler) addTerminalRecord(value stacklessCoroTerminalValue) {
+	// Terminal metadata has no user-visible synchronization identity. A P
+	// retains at most one cleared record, independent of scheduler lifetime.
+	mp := acquirem()
+	var entry *stacklessCoroTerminalValue
+	if pp := mp.p.ptr(); pp != nil {
+		entry = pp.terminalRecord
+		pp.terminalRecord = nil
+	}
+	releasem(mp)
+	if entry == nil {
+		entry = new(stacklessCoroTerminalValue)
+	}
+	*entry = value
 	entry.next = s.terminalValues
 	s.terminalValues = entry
 	if entry.next == nil {
@@ -38,10 +51,15 @@ func (s *stacklessCoroScheduler) addTerminalRecord(entry *stacklessCoroTerminalV
 func (s *stacklessCoroScheduler) removeTerminalRecord(link **stacklessCoroTerminalValue) {
 	entry := *link
 	*link = entry.next
-	entry.task, entry.next = nil, nil
+	*entry = stacklessCoroTerminalValue{}
 	if s.terminalValues == nil {
 		s.lifetime.And(^stacklessCoroLifetimeTerminalRecords)
 	}
+	mp := acquirem()
+	if pp := mp.p.ptr(); pp != nil && pp.terminalRecord == nil {
+		pp.terminalRecord = entry
+	}
+	releasem(mp)
 }
 
 func (s *stacklessCoroScheduler) terminalTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
@@ -54,13 +72,13 @@ func (s *stacklessCoroScheduler) terminalTrace(task *stacklessCoroTask) *stackle
 }
 
 func (s *stacklessCoroScheduler) setTerminalPanic(task *stacklessCoroTask, value any, trace *stacklessCoroPanicTrace) {
-	s.setTerminalValue(task, value)
 	for entry := s.terminalValues; entry != nil; entry = entry.next {
 		if entry.task == task {
-			entry.trace = trace
+			entry.value, entry.hasValue, entry.trace = value, true, trace
 			return
 		}
 	}
+	s.addTerminalRecord(stacklessCoroTerminalValue{task: task, value: value, hasValue: true, trace: trace})
 }
 
 // Callers hold s.lock, or exclusively own a private or completed scheduler.
@@ -81,7 +99,7 @@ func (s *stacklessCoroScheduler) setTerminalValue(task *stacklessCoroTask, value
 			return
 		}
 	}
-	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, value: value, hasValue: true})
+	s.addTerminalRecord(stacklessCoroTerminalValue{task: task, value: value, hasValue: true})
 }
 
 func (s *stacklessCoroScheduler) clearTerminalValue(task *stacklessCoroTask) {
@@ -110,7 +128,7 @@ func (s *stacklessCoroScheduler) setDeferTrace(task *stacklessCoroTask, trace *s
 			return
 		}
 	}
-	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, deferTrace: trace})
+	s.addTerminalRecord(stacklessCoroTerminalValue{task: task, deferTrace: trace})
 }
 
 func (s *stacklessCoroScheduler) deferTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
@@ -161,7 +179,7 @@ func (s *stacklessCoroScheduler) setExitTrace(task *stacklessCoroTask, trace *st
 			return
 		}
 	}
-	s.addTerminalRecord(&stacklessCoroTerminalValue{task: task, exitTrace: trace})
+	s.addTerminalRecord(stacklessCoroTerminalValue{task: task, exitTrace: trace})
 }
 
 func (s *stacklessCoroScheduler) clearExitTrace(task *stacklessCoroTask) {

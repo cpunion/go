@@ -36,7 +36,10 @@ type stacklessCoroSourcePosition struct {
 }
 
 type stacklessCoroP struct {
-	sourcePCs stacklessCoroSourcePCCache
+	sourcePCs      stacklessCoroSourcePCCache
+	panicTraces    [4]stacklessCoroResumePanicCacheEntry
+	terminalRecord *stacklessCoroTerminalValue
+	deferRecord    *stacklessCoroDeferState
 }
 
 type stacklessCoroSourcePCCache struct {
@@ -175,32 +178,7 @@ func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer, leafEntr
 	if leafEntry != 0 && source.entry() == leafEntry {
 		return source, leafPC
 	}
-	var cell unsafe.Pointer
-	switch info.pcKind {
-	case abi.CoroSourcePCFrame:
-		if frame != nil {
-			cell = add(frame, uintptr(info.pcOffset))
-		}
-	case abi.CoroSourcePCClosure, abi.CoroSourcePCClosureIndirect:
-		cell = add(unsafe.Pointer(resume), uintptr(info.pcOffset))
-		if info.pcKind == abi.CoroSourcePCClosureIndirect {
-			cell = *(*unsafe.Pointer)(cell)
-		}
-	}
-	if cell == nil {
-		return source, source.entry()
-	}
-	var state uint32
-	switch info.pcSize {
-	case 1:
-		state = uint32(*(*uint8)(cell))
-	case 2:
-		state = uint32(*(*uint16)(cell))
-	case 4:
-		state = readUnaligned32(cell)
-	default:
-		return source, source.entry()
-	}
+	state := stacklessCoroSavedSourceState(resume, frame, info)
 	if state >= info.positions {
 		return source, source.entry()
 	}
@@ -214,6 +192,34 @@ func stacklessCoroResumeSourcePC(resume *funcval, frame unsafe.Pointer, leafEntr
 		file = *(*string)(unsafe.Pointer(&header))
 	}
 	return source, stacklessCoroSourcePC(source, file, int32(at.line))
+}
+
+func stacklessCoroSavedSourceState(resume *funcval, frame unsafe.Pointer, info *stacklessCoroSourceInfo) uint32 {
+	var cell unsafe.Pointer
+	switch info.pcKind {
+	case abi.CoroSourcePCFrame:
+		if frame != nil {
+			cell = add(frame, uintptr(info.pcOffset))
+		}
+	case abi.CoroSourcePCClosure, abi.CoroSourcePCClosureIndirect:
+		cell = add(unsafe.Pointer(resume), uintptr(info.pcOffset))
+		if info.pcKind == abi.CoroSourcePCClosureIndirect {
+			cell = *(*unsafe.Pointer)(cell)
+		}
+	}
+	if cell == nil {
+		return ^uint32(0)
+	}
+	switch info.pcSize {
+	case 1:
+		return uint32(*(*uint8)(cell))
+	case 2:
+		return uint32(*(*uint16)(cell))
+	case 4:
+		return readUnaligned32(cell)
+	default:
+		return ^uint32(0)
+	}
 }
 
 func appendStacklessCoroSourcePC(u *unwinder, f funcInfo, pc uintptr, skip *int, buf []uintptr, n *int) {

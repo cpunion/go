@@ -40,7 +40,7 @@ var positionsEntry = positions
 //go:noinline
 func inspect(skip,size int){goto body;body:pcs:=make([]uintptr,size);n:=runtime.Callers(skip,pcs);fmt.Printf("query %d %d %d\n",skip,size,n);if n==0{return};frames:=runtime.CallersFrames(pcs[:n]);for{f,more:=frames.Next();fmt.Printf("%s %s:%d\n",f.Function,filepath.Base(f.File),f.Line);if !more{break}}}
 func observePositions() {
-	for _, first := range []bool{true, false, true, false} {
+	for _, first := range []bool{true, true, false, false, true, false} {
 		func() {
 			goto body
 		body:
@@ -99,8 +99,8 @@ func main(){goto body;body:if os.Args[1]=="positions"{observePositions();return}
 					}
 					if config.name == "ordinary" && want[depth] == "" {
 						if depth == "positions" &&
-							(strings.Count(text, "main.positions first.go:40") != 2 ||
-								strings.Count(text, "main.positions second.go:40") != 2) {
+							(strings.Count(text, "main.positions first.go:40") != 3 ||
+								strings.Count(text, "main.positions second.go:40") != 3) {
 							t.Fatalf("ordinary oracle lost alternating positions\n%s", text)
 						}
 						want[depth] = text

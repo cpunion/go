@@ -55,6 +55,35 @@ type stacklessCoroShallowPanicTrace struct {
 	pcs    [2]uintptr
 }
 
+type stacklessCoroResumePanicCacheEntry struct {
+	leaf, parent stacklessCoroPanicSite
+	trace        *stacklessCoroPanicTrace
+}
+
+type stacklessCoroPanicSite struct {
+	entry uintptr
+	info  *stacklessCoroSourceInfo
+	state uint32
+}
+
+func (site stacklessCoroPanicSite) matches(resume *funcval, frame unsafe.Pointer) bool {
+	if resume == nil {
+		return site.entry == 0
+	}
+	return site.entry == resume.fn && stacklessCoroSavedSourceState(resume, frame, site.info) == site.state
+}
+
+func stacklessCoroPanicSiteFor(resume *funcval, frame unsafe.Pointer) (stacklessCoroPanicSite, bool) {
+	if resume == nil {
+		return stacklessCoroPanicSite{}, true
+	}
+	info := stacklessCoroSourceFrame(findfunc(resume.fn))
+	if info == nil || info.flags&abi.CoroSourceResume == 0 {
+		return stacklessCoroPanicSite{}, false
+	}
+	return stacklessCoroPanicSite{resume.fn, info, stacklessCoroSavedSourceState(resume, frame, info)}, true
+}
+
 type stacklessCoroPanicState struct {
 	coroTrace *stacklessCoroPanicTrace
 }
@@ -179,9 +208,51 @@ func captureStacklessCoroResumePanicTrace(task *stacklessCoroTask) *stacklessCor
 		shallow = header.marker&(stacklessCoroFusedFrameResume|stacklessCoroFusedFrameParent) ==
 			stacklessCoroFusedFrameResume
 	}
+	if shallow && parent == nil && !task.context.scheduler.hasTerminalRecords() &&
+		(gp.stacklessCoro == nil || gp.stacklessCoro.deferState == nil) {
+		if trace := cachedStacklessCoroResumePanicTrace(task); trace != nil {
+			return trace
+		}
+	}
 	return collectStacklessCoroPanicTrace(shallow, func(trace *stacklessCoroPanicTrace) {
 		trace.appendLineage(task, gp, 0, 0)
 	})
+}
+
+// A shallow chain without a previous terminal trace is determined by its
+// resume entries and saved states. Cache snapshots, never activation pointers.
+// The scheduler lock pins the P and signal handlers do not fill this cache.
+func cachedStacklessCoroResumePanicTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
+	pp, resume := getg().m.p.ptr(), stacklessCoroResumeIdentity(task.resume)
+	if pp == nil || resume == nil {
+		return nil
+	}
+	frame := task.context.frame
+	var parent *funcval
+	var parentFrame unsafe.Pointer
+	if task.hasFlag(stacklessCoroTaskFusedFrames) && frame != nil {
+		header := (*stacklessCoroFusedResumeFrameHeader)(frame)
+		if header.parent != nil {
+			parent, parentFrame = header.resume, header.parent
+		}
+	}
+	slot := &pp.panicTraces[(resume.fn>>4)%uintptr(len(pp.panicTraces))]
+	if slot.trace != nil && slot.leaf.matches(resume, frame) && slot.parent.matches(parent, parentFrame) {
+		return slot.trace
+	}
+	leafSite, ok := stacklessCoroPanicSiteFor(resume, frame)
+	if !ok {
+		return nil
+	}
+	parentSite, ok := stacklessCoroPanicSiteFor(parent, parentFrame)
+	if !ok {
+		return nil
+	}
+	trace := collectStacklessCoroPanicTrace(true, func(trace *stacklessCoroPanicTrace) {
+		trace.appendLineage(task, getg(), 0, 0)
+	})
+	*slot = stacklessCoroResumePanicCacheEntry{leaf: leafSite, parent: parentSite, trace: trace}
+	return trace
 }
 
 // The resuming task owns its complete structured lineage. An operation panic
