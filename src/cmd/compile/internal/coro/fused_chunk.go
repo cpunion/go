@@ -23,26 +23,9 @@ type fusedChunkProof struct {
 // arguments. A reservation miss reuses the original factory and await ABI.
 func newFusedChunkFactory(candidate *lowerCandidate, resume *ir.Func,
 	oldFrame, oldZero *ir.Name, prologue, initializers ir.Nodes) *ir.Func {
-	locals := make(map[*ir.Name]ir.Node)
-	for _, stmt := range prologue {
-		switch stmt := stmt.(type) {
-		case *ir.Decl:
-			if stmt.X.Class != ir.PAUTO || len(stmt.Init()) != 0 {
-				return nil
-			}
-			locals[stmt.X] = nil
-		case *ir.AssignStmt:
-			name, ok := stmt.X.(*ir.Name)
-			_, declared := locals[name]
-			_, literal := stmt.Y.(*ir.BasicLit)
-			if !ok || !declared || (!literal && stmt.Y != nil && !ir.IsZero(stmt.Y)) ||
-				ir.Any(stmt, func(n ir.Node) bool { return len(n.Init()) != 0 }) {
-				return nil
-			}
-			locals[name] = stmt.Y
-		default:
-			return nil
-		}
+	locals := chunkFactoryLocals(prologue)
+	if locals == nil || !chunkFactoryStoresKnown(candidate.factory, oldFrame, oldZero, locals, initializers) {
+		return nil
 	}
 	source := candidate.function.Func
 	factory := candidate.factory
@@ -50,28 +33,6 @@ func newFusedChunkFactory(candidate *lowerCandidate, resume *ir.Func,
 	params := make([]*types.Field, factory.Type().NumParams())
 	for i, field := range factory.Type().Params() {
 		params[i] = types.NewField(field.Pos, field.Sym, field.Type)
-	}
-	known := func(name *ir.Name) bool {
-		if name == oldFrame || name == oldZero {
-			return true
-		}
-		if _, ok := locals[name]; ok {
-			return true
-		}
-		for _, field := range factory.Type().Params() {
-			if name == field.Nname {
-				return true
-			}
-		}
-		return false
-	}
-	for _, stmt := range initializers {
-		if ir.Any(stmt, func(n ir.Node) bool {
-			name, ok := n.(*ir.Name)
-			return ok && !known(name)
-		}) {
-			return nil
-		}
 	}
 	action := types.Types[types.TUINT8]
 	t := types.NewSignature(nil, params, []*types.Field{types.NewField(pos, nil, action)})
@@ -107,22 +68,7 @@ func newFusedChunkFactory(candidate *lowerCandidate, resume *ir.Func,
 			ir.NewDecl(pos, ir.ODCL, frame),
 			ir.NewAssignStmt(pos, frame, typecheck.ConvNop(take, frame.Type())),
 		}
-		var copyStores func(ir.Node) ir.Node
-		copyStores = func(n ir.Node) ir.Node {
-			if name, ok := n.(*ir.Name); ok {
-				if replacement := bindings[name]; replacement != nil {
-					return ir.DeepCopy(name.Pos(), replacement)
-				}
-				return n
-			}
-			copy := ir.Copy(n)
-			ir.EditChildren(copy, copyStores)
-			return copy
-		}
-		reuse := make(ir.Nodes, 0, len(initializers)+1)
-		for _, stmt := range initializers {
-			reuse = append(reuse, copyStores(stmt))
-		}
+		reuse := copyChunkFactoryStores(initializers, bindings)
 		enter := typecheck.Call(pos, typecheck.LookupRuntime("coroEnterCompatibleFusedChunk"),
 			ir.Nodes{ctx, typecheck.ConvNop(frame, unsafePointer), ir.Copy(resume.OClosure)}, false)
 		reuse = append(reuse, ir.NewReturnStmt(pos, ir.Nodes{enter}))
@@ -145,4 +91,78 @@ func newFusedChunkFactory(candidate *lowerCandidate, resume *ir.Func,
 	})
 	typecheck.Target.Funcs = append(typecheck.Target.Funcs, fast)
 	return fast
+}
+
+// chunkFactoryLocals accepts only implicit zero values and constant assignments.
+// These locals can be substituted into the identical stores for a reused slot.
+func chunkFactoryLocals(prologue ir.Nodes) map[*ir.Name]ir.Node {
+	locals := make(map[*ir.Name]ir.Node)
+	for _, stmt := range prologue {
+		switch stmt := stmt.(type) {
+		case *ir.Decl:
+			if stmt.X.Class != ir.PAUTO || len(stmt.Init()) != 0 {
+				return nil
+			}
+			locals[stmt.X] = nil
+		case *ir.AssignStmt:
+			name, ok := stmt.X.(*ir.Name)
+			_, declared := locals[name]
+			_, literal := stmt.Y.(*ir.BasicLit)
+			if !ok || !declared || (!literal && stmt.Y != nil && !ir.IsZero(stmt.Y)) ||
+				ir.Any(stmt, func(n ir.Node) bool { return len(n.Init()) != 0 }) {
+				return nil
+			}
+			locals[name] = stmt.Y
+		default:
+			return nil
+		}
+	}
+	return locals
+}
+
+func chunkFactoryStoresKnown(factory *ir.Func, oldFrame, oldZero *ir.Name,
+	locals map[*ir.Name]ir.Node, initializers ir.Nodes) bool {
+	known := func(name *ir.Name) bool {
+		if name == oldFrame || name == oldZero {
+			return true
+		}
+		if _, ok := locals[name]; ok {
+			return true
+		}
+		for _, field := range factory.Type().Params() {
+			if name == field.Nname {
+				return true
+			}
+		}
+		return false
+	}
+	for _, stmt := range initializers {
+		if ir.Any(stmt, func(n ir.Node) bool {
+			name, ok := n.(*ir.Name)
+			return ok && !known(name)
+		}) {
+			return false
+		}
+	}
+	return true
+}
+
+func copyChunkFactoryStores(initializers ir.Nodes, bindings map[*ir.Name]ir.Node) ir.Nodes {
+	var copyStore func(ir.Node) ir.Node
+	copyStore = func(n ir.Node) ir.Node {
+		if name, ok := n.(*ir.Name); ok {
+			if replacement := bindings[name]; replacement != nil {
+				return ir.DeepCopy(name.Pos(), replacement)
+			}
+			return n
+		}
+		copy := ir.Copy(n)
+		ir.EditChildren(copy, copyStore)
+		return copy
+	}
+	stores := make(ir.Nodes, len(initializers))
+	for i, stmt := range initializers {
+		stores[i] = copyStore(stmt)
+	}
+	return stores
 }

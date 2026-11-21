@@ -41,8 +41,8 @@ const stacklessCoroTaskChunkSize = 4
 // frequency. Larger frames retain four-element chunks so each typed allocation
 // remains within the small-object bound after its malloc header. Both sizes fit
 // after the six direct markers in the four-bit fused-frame allocation field.
-const stacklessCoroFrameChunkSize = 8
-const stacklessCoroLargeFrameChunkSize = 4
+const stacklessCoroFrameChunkSize = abi.CoroFrameChunkSize
+const stacklessCoroLargeFrameChunkSize = abi.CoroLargeFrameChunkSize
 const stacklessCoroFrameChunkByteLimit = maxSmallSize - mallocHeaderSize
 
 const (
@@ -66,7 +66,7 @@ const stacklessCoroTypedTaskFrameAllocationMode = stacklessCoroDirectBatchedTask
 // Start typed-frame chunks two tasks after the task-chunk boundary. The
 // stagger keeps their first-element allocation charges from occurring at the
 // same recursive depth.
-const stacklessCoroFrameChunkDirectCount = 6
+const stacklessCoroFrameChunkDirectCount = abi.CoroFrameChunkFirst - 1
 const stacklessCoroFrameCacheSize = 32 << 10
 const stacklessCoroOperationCacheSize = 64
 
@@ -94,8 +94,8 @@ const (
 	stacklessCoroFusedFrameChunkLast         = stacklessCoroFusedFrameChunkFirst +
 		stacklessCoroFrameChunkSize - 1
 	stacklessCoroFusedFrameAllocationMask uint8 = 1<<4 - 1
-	stacklessCoroFusedFrameChunkValidated uint8 = 1 << 4
-	stacklessCoroFusedFrameShortChunk     uint8 = 1 << 5
+	stacklessCoroFusedFrameChunkValidated uint8 = abi.CoroFrameChunkValidated
+	stacklessCoroFusedFrameShortChunk     uint8 = abi.CoroFrameShortChunk
 	stacklessCoroFusedFrameParent         uint8 = 1 << 6
 	stacklessCoroFusedFrameResume         uint8 = 1 << 7
 )
@@ -2118,22 +2118,7 @@ func allocateStacklessCoroSelfFrame(frame unsafe.Pointer, size uintptr,
 		return nil
 	case allocation == stacklessCoroFusedFrameDirectLast ||
 		allocation == chunkLast:
-		if reuse {
-			if frame := takeStacklessCoroNativeSelfFrame(resume, size, chunkType,
-				true); frame != nil {
-				return frame
-			}
-		}
-		frame := newobject(chunkType)
-		if size >= abi.CoroFrameZeroMinBytes {
-			// Every slot is still allocator-zeroed. Unused tail slots keep
-			// this construction-only mark across chunk reuse, until their
-			// first factory consumes it. Completed slots lose the mark.
-			for offset := uintptr(0); offset < chunkType.Size_; offset += size {
-				(*stacklessCoroFusedFrameHeader)(add(frame, offset)).marker = abi.CoroFrameFresh
-			}
-		}
-		return frame
+		return takeStacklessCoroWholeSelfChunk(resume, size, chunkType, reuse)
 	case allocation >= stacklessCoroFusedFrameChunkFirst &&
 		allocation < chunkLast:
 		return add(frame, size)
@@ -2141,6 +2126,25 @@ func allocateStacklessCoroSelfFrame(frame unsafe.Pointer, size uintptr,
 		throw("runtime: invalid stackless coroutine self-frame allocation")
 		return nil
 	}
+}
+
+func takeStacklessCoroWholeSelfChunk(resume stacklessCoroResume, size uintptr,
+	chunkType *_type, reuse bool) unsafe.Pointer {
+	if reuse {
+		if frame := takeStacklessCoroNativeSelfFrame(resume, size, chunkType, true); frame != nil {
+			return frame
+		}
+	}
+	frame := newobject(chunkType)
+	if size >= abi.CoroFrameZeroMinBytes {
+		// Every slot is still allocator-zeroed. Unused tail slots keep
+		// this construction-only mark across chunk reuse, until their
+		// first factory consumes it. Completed slots lose the mark.
+		for offset := uintptr(0); offset < chunkType.Size_; offset += size {
+			(*stacklessCoroFusedFrameHeader)(add(frame, offset)).marker = abi.CoroFrameFresh
+		}
+	}
+	return frame
 }
 
 func nextStacklessCoroSelfFrameMarker(marker uint8) uint8 {
@@ -2402,6 +2406,48 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 		return stacklessCoroActionSwitch
 	}
 	unlock(&s.lock)
+	return stacklessCoroActionYield
+}
+
+// coroTakeSelfChunk obtains typed storage for a compiler-proven local
+// self-await when the active slot is the last element of its chunk.
+func coroTakeSelfChunk(ctx unsafe.Pointer, size uintptr, chunkType *_type) unsafe.Pointer {
+	task := (*stacklessCoroContext)(ctx).task()
+	return takeStacklessCoroWholeSelfChunk(task.resume, size, chunkType, true)
+}
+
+// coroAdvanceSelfChunk publishes the next slot in a validated homogeneous
+// lineage. The generated resume initializes that slot with its factory's
+// typed stores before passing it here.
+// The logical task retains its resume and its fused-frame flag. Publish the
+// complete new chain with a single pointer store.
+func coroAdvanceSelfChunk(ctx, frame unsafe.Pointer, marker uint8) uint8 {
+	context := (*stacklessCoroContext)(ctx)
+	header := (*stacklessCoroFusedFrameHeader)(frame)
+	header.marker = marker
+	header.parent = context.frame
+	stacklessCoroBeginProfileTransition()
+	context.frame = frame
+	if context.scheduler.runnableState.Load() == 0 {
+		return stacklessCoroActionSwitch
+	}
+	return stacklessCoroActionYield
+}
+
+// coroPopSelfChunk gives a completed interior slot back to its typed chunk.
+// The generated guard proves the new leaf is its fused parent in this chunk.
+// Publish that parent before clearing the old slot, so stopping the world
+// always sees a complete logical chain from context.frame.
+func coroPopSelfChunk(ctx unsafe.Pointer) uint8 {
+	context := (*stacklessCoroContext)(ctx)
+	header := (*stacklessCoroFusedFrameHeader)(context.frame)
+	stacklessCoroBeginProfileTransition()
+	context.frame = header.parent
+	header.parent = nil
+	header.marker = 0
+	if context.scheduler.runnableState.Load() == 0 {
+		return stacklessCoroActionSwitch
+	}
 	return stacklessCoroActionYield
 }
 

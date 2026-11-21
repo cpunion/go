@@ -22,3 +22,14 @@ const (
 	CoroTaskFrameHeaderPointerMask = 0x37
 	CoroTaskFrameMaxBytes          = 208
 )
+
+// The fused frame marker starts with direct allocations, followed by
+// validated typed chunk elements. The self-await compiler path borrows only
+// an interior element whose successor belongs to the same typed allocation.
+const (
+	CoroFrameChunkSize            = 8
+	CoroLargeFrameChunkSize       = 4
+	CoroFrameChunkFirst           = 7
+	CoroFrameChunkValidated uint8 = 1 << 4
+	CoroFrameShortChunk     uint8 = 1 << 5
+)

@@ -581,6 +581,8 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		"runtime.coroTakeSelfFrame",
 		"runtime.coroAwaitSelfFrame",
 		"runtime.coroCompleteSelfFrame",
+		"runtime.coroAdvanceSelfChunk",
+		"runtime.coroPopSelfChunk",
 		"runtime.coroProfileResume",
 	} {
 		if runtimeCalls[name] != 1 {
@@ -655,8 +657,8 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 			}
 		})
 	}
-	if localLabels != 1 || localGotos != 2 {
-		t.Errorf("lowered recursive function has %d local reload labels and %d branches, want one and two",
+	if localLabels != 1 || localGotos != 4 {
+		t.Errorf("lowered recursive function has %d local reload labels and %d branches, want one and four",
 			localLabels, localGotos)
 	}
 	for _, generated := range typecheck.Target.Funcs {

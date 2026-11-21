@@ -25,6 +25,19 @@ import "runtime"
 var gcRequest = make(chan bool)
 var gcDone = make(chan bool)
 var after int
+var operands int
+var wrongOrder bool
+
+func operand(index, value int) int {
+	if index != operands%2 { wrongOrder = true }
+	operands++
+	return value
+}
+
+func pointerOperand(index int, value *int) *int {
+	operand(index, 0)
+	return value
+}
 
 func collect() {
 	for range gcRequest { runtime.GC(); gcDone <- true }
@@ -59,7 +72,7 @@ func pointer(n int, value *int) *int {
 		runtime.Gosched()
 		return value
 	}
-	result := pointer(n-1, value)
+	result := pointer(operand(0, n-1), pointerOperand(1, value))
 	return result
 }
 
@@ -78,7 +91,9 @@ func main() {
 		for _, depth := range []int{0, 1, 64, 256, 262, 263, 264, 4096} {
 			value := new(int)
 			*value = depth
+			operands, wrongOrder = 0, false
 			result := pointer(depth, value)
+			if wrongOrder || operands != 2*depth { panic("self-frame operands") }
 			runtime.GC()
 			if result != value || *result != depth { panic("self-frame pointer result") }
 			for kind := 0; kind < 3; kind++ {
@@ -123,10 +138,12 @@ func main() {
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("build failed: %v\n%s", err, out)
 			}
-			cmd = testenv.Command(t, exe)
-			cmd.Env = append(cmd.Environ(), "GOGC=1", "GOMAXPROCS=1")
-			if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "self-frame-terminal-ok" {
-				t.Fatalf("execution = (%v, %q), want self-frame-terminal-ok", err, out)
+			for _, procs := range []string{"1", "4"} {
+				cmd = testenv.Command(t, exe)
+				cmd.Env = append(cmd.Environ(), "GOGC=1", "GOMAXPROCS="+procs)
+				if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "self-frame-terminal-ok" {
+					t.Fatalf("P%s execution = (%v, %q), want self-frame-terminal-ok", procs, err, out)
+				}
 			}
 			if test.experiment != "coro" {
 				return
@@ -143,9 +160,20 @@ func main() {
 					"runtime.coroTakeSelfFrame(SB)",
 					"runtime.coroAwaitSelfFrame(SB)",
 					"runtime.coroCompleteSelfFrame(SB)",
+					"runtime.coroPopSelfChunk(SB)",
 				} {
 					if !strings.Contains(assembly, helper) {
 						t.Fatalf("missing %s; self-frame path was not selected:\n%s", helper, assembly)
+					}
+				}
+				if name == "pointer" {
+					for _, helper := range []string{"runtime.coroAdvanceSelfChunk(SB)", "runtime.coroTakeSelfChunk(SB)"} {
+						if !strings.Contains(assembly, helper) {
+							t.Fatalf("missing %s in recursive pointer resume:\n%s", helper, assembly)
+						}
+					}
+					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+						t.Fatal("recursive pointer resume exceeded its native stack budget")
 					}
 				}
 				if strings.Contains(assembly, "runtime.coroContinueSelfFrame(SB)") {

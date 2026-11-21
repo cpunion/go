@@ -31,11 +31,9 @@ const (
 	actionHost
 )
 
-// Keep these in sync with runtime's stackless coroutine frame chunk sizes. The
-// array length is part of compiler-generated typed storage rather than the
-// factory ABI.
-const explicitFrameChunkSize = 8
-const explicitLargeFrameChunkSize = 4
+// The array length is part of compiler-generated typed storage.
+const explicitFrameChunkSize = abi.CoroFrameChunkSize
+const explicitLargeFrameChunkSize = abi.CoroLargeFrameChunkSize
 const explicitFrameChunkByteLimit = gc.MaxSmallSize - gc.MallocHeaderSize
 
 func explicitFrameChunkLength(frameSize int64) int64 {
@@ -118,6 +116,7 @@ type lowerCandidate struct {
 	fusedAwaits       map[*ir.CallExpr]bool
 	fusedRequests     map[*ir.CallExpr]bool
 	fusedChunkProofs  map[*ir.CallExpr]*fusedChunkProof
+	selfChunkAwaits   []*fusedChunkProof
 	buildChunkFactory func() *ir.Func
 	fusedFrame        bool
 	fusedResume       bool
@@ -139,9 +138,10 @@ type lowerDirectCall struct {
 }
 
 type lowerFactoryCall struct {
-	setup  ir.Nodes
-	frame  ir.Node
-	resume ir.Node
+	setup     ir.Nodes
+	frame     ir.Node
+	resume    ir.Node
+	selfChunk *fusedChunkProof
 	// Dynamic spawn dispatch executes only for a non-nil frozen callee.
 	// The nil branch retains the frontend's ordinary go startup semantics.
 	spawnGuard ir.Node
@@ -4004,10 +4004,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			candidate.fusedChunkProofs[call] = proof
 			setup = append(setup, request)
 		}
+		var selfChunk *fusedChunkProof
+		if localSelfFrames && candidate.rootArray == nil && edge.Callee == fn &&
+			candidate.fusedAwaits[call] && len(edge.Targets) == 0 && frozenArgs == nil {
+			selfChunk = &fusedChunkProof{factory: factoryCall.(*ir.CallExpr)}
+		}
 		setup = append(setup, assignment)
 		return lowerFactoryCall{
 			setup: setup,
-			frame: frame, resume: childResume,
+			frame: frame, resume: childResume, selfChunk: selfChunk,
 		}, nil
 	}
 	factoryCall := func(call *ir.CallExpr,
@@ -4856,6 +4861,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					chunkProof = candidate.fusedChunkProofs[state.call]
 					edge := edgeForCall(function, state.call)
 					if edge.Callee == fn && localSelfFrames {
+						if child.selfChunk != nil {
+							chunkProof = child.selfChunk
+							candidate.selfChunkAwaits = append(candidate.selfChunkAwaits, chunkProof)
+						}
 						helper = "coroAwaitSelfFrame"
 						args = append(args, ir.NewBool(pos, true))
 					}
@@ -5252,6 +5261,8 @@ func rewriteSelfFrameSwitches(resume *ir.Func,
 	action *ir.Name, reload *types.Sym) {
 	await := typecheck.LookupRuntime("coroAwaitSelfFrame").Sym()
 	complete := typecheck.LookupRuntime("coroCompleteSelfFrame").Sym()
+	advance := typecheck.LookupRuntime("coroAdvanceSelfChunk").Sym()
+	pop := typecheck.LookupRuntime("coroPopSelfChunk").Sym()
 	var rewrite func(ir.Node) ir.Node
 	rewrite = func(node ir.Node) ir.Node {
 		ret, ok := node.(*ir.ReturnStmt)
@@ -5265,7 +5276,7 @@ func rewriteSelfFrameSwitches(resume *ir.Func,
 			return node
 		}
 		name, ok := call.Fun.(*ir.Name)
-		if !ok || name.Sym() != await && name.Sym() != complete {
+		if !ok || name.Sym() != await && name.Sym() != complete && name.Sym() != advance && name.Sym() != pop {
 			ir.EditChildren(node, rewrite)
 			return node
 		}
@@ -5361,6 +5372,15 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	frameType.SetNoalg(true)
 	types.CalcSize(frameType)
 	candidate.frameType = frameType
+	if fusedFrame {
+		candidate.frameChunkLength = explicitFrameChunkLength(frameType.Size())
+		if candidate.fusedResume && !candidate.fusedSelf {
+			candidate.frameChunkLength = explicitLargeFrameChunkSize
+		}
+	}
+	// Self awaits reuse a chunk the runtime already admitted. Its size
+	// need only satisfy the runtime's existing typed-allocation limit.
+	localChunk := selfOnly && frameType.Size() <= explicitFrameChunkByteLimit/candidate.frameChunkLength
 	if source := nativeSourceFrames[resume]; source != nil {
 		source.Field = replacements[candidate.resumePC]
 		if fusedFrame && len(candidate.defers) != 0 {
@@ -5469,6 +5489,16 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				completion = append(completion,
 					ir.NewIfStmt(ret.Pos(), needsClear, clears, nil))
 			}
+			if localChunk {
+				length := candidate.frameChunkLength
+				first := selfChunkFirstMarker(length)
+				marker := explicitFrameField(ret.Pos(), frame, fusedMarkerField)
+				inChunk := markerInSelfChunk(ret.Pos(), marker, first+1, first+uint8(length))
+				pop := typecheck.Call(ret.Pos(), typecheck.LookupRuntime("coroPopSelfChunk"),
+					ir.Nodes{resume.Dcl[0]}, false)
+				completion = append(completion, ir.NewIfStmt(ret.Pos(), inChunk,
+					ir.Nodes{ir.NewReturnStmt(ret.Pos(), ir.Nodes{pop})}, nil))
+			}
 			if fusedFrame {
 				parent := explicitFrameField(ret.Pos(), frame,
 					fusedParentField)
@@ -5508,7 +5538,6 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		reloadFrame = resume.Sym().Pkg.LookupNum(".coroReload",
 			int(resume.Label))
 		resume.Label++
-		rewriteSelfFrameSwitches(resume, switchAction, reloadFrame)
 	}
 	unsafePointerType := types.Types[types.TUNSAFEPTR]
 	packetPointer := typecheck.ConvNop(ctx, types.NewPtr(unsafePointerType))
@@ -5597,10 +5626,6 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
 	if fusedFrame {
-		candidate.frameChunkLength = explicitFrameChunkLength(frameType.Size())
-		if candidate.fusedResume && !candidate.fusedSelf {
-			candidate.frameChunkLength = explicitLargeFrameChunkSize
-		}
 		frameChunkType := types.NewArray(frameType, candidate.frameChunkLength)
 		takeHelper := "coroTakeFusedFrame"
 		takeArgs := ir.Nodes{
@@ -5737,15 +5762,22 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	}
 
 	oldCurFunc := ir.CurFunc
-	ir.CurFunc = resume
-	typecheck.Stmts(resume.Body)
-
 	ir.CurFunc = factory
 	frameResult := typecheck.ConvNop(factoryFrame, unsafePointerType)
 	factory.Body = append(declarations, ir.NewReturnStmt(pos, []ir.Node{
 		frameResult, factoryResume,
 	}))
 	typecheck.Stmts(factory.Body)
+
+	ir.CurFunc = resume
+	if selfOnly {
+		if localChunk && len(candidate.selfChunkAwaits) != 0 {
+			inlineSelfChunkAwaits(candidate, resume, frame, fusedMarkerField,
+				factoryFrame, needsArrayZero, factoryPrologue, declarations[initializers:])
+		}
+		rewriteSelfFrameSwitches(resume, switchAction, reloadFrame)
+	}
+	typecheck.Stmts(resume.Body)
 
 	if fusedResumeField != nil && candidate.rootArray == nil && candidate.frameChunkLength == explicitLargeFrameChunkSize {
 		// Older frames from this typed array were reset when they completed.

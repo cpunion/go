@@ -401,3 +401,7 @@ func coroUseOrdinary() bool
 // stackless coroutine channel handoff
 func coroChanSendLocal(unsafe.Pointer, chan<- any, *any, bool) bool
 func coroChanRecvLocal(unsafe.Pointer, <-chan any, *any, *bool, bool) bool
+
+func coroAdvanceSelfChunk(unsafe.Pointer, unsafe.Pointer, uint8) uint8
+func coroPopSelfChunk(unsafe.Pointer) uint8
+func coroTakeSelfChunk(unsafe.Pointer, uintptr, *byte) unsafe.Pointer
