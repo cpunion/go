@@ -79,39 +79,60 @@ func (factory *frameChunkFactory) inlineAwait(proof *fusedChunkProof, frame *ir.
 	}
 	prefix = append(prefix, ir.NewDecl(pos, ir.ODCL, marker),
 		ir.NewAssignStmt(pos, marker, explicitFrameField(pos, frame, markerField)))
-	inChunk := markerInFrameChunk(pos, marker, first, last+1)
 	frameType := next.Type().Elem()
 	size := typedInt(pos, types.Types[types.TUINTPTR], frameType.Size())
 	chunkType := reflectdata.TypePtrAt(pos, types.NewArray(frameType, factory.length))
 	addr := typecheck.Expr(ir.NewBinaryExpr(pos, ir.OUNSAFEADD,
 		typecheck.ConvNop(frame, unsafePointer), size))
-	nextMarker := typecheck.TempAt(pos, resume, markerType)
 	takeHelper, advanceHelper := "coroTakeSelfChunk", "coroAdvanceSelfChunk"
 	takeArgs := ir.Nodes{ctx, size, chunkType}
-	advanceArgs := ir.Nodes{ctx, typecheck.ConvNop(next, unsafePointer), nextMarker}
 	if heterogeneous {
 		takeHelper, advanceHelper = "coroTakeFusedChunkBoundary", "coroAdvanceFusedChunk"
 		// Explicit resumes have no captured variables. A named reference
 		// uses the same funcval as their capture-free closure expression.
 		takeArgs[0] = factory.resume.Nname
-		advanceArgs = append(advanceArgs, factory.resume.Nname)
 	}
 	take := typecheck.Call(pos, typecheck.LookupRuntime(takeHelper), takeArgs, false)
+	firstMarker := typedInt(pos, markerType, int64(first))
 	atEnd := ir.NewBinaryExpr(pos, ir.OEQ, marker, typedInt(pos, markerType, int64(last)))
-	useNext := ir.Nodes{
-		ir.NewDecl(pos, ir.ODCL, next), ir.NewDecl(pos, ir.ODCL, nextMarker),
-		ir.NewIfStmt(pos, atEnd, ir.Nodes{
-			ir.NewAssignStmt(pos, next, typecheck.ConvNop(take, next.Type())),
-			ir.NewAssignStmt(pos, nextMarker, typedInt(pos, markerType, int64(first))),
-		}, ir.Nodes{
-			ir.NewAssignStmt(pos, next, typecheck.ConvNop(addr, next.Type())),
-			ir.NewAssignStmt(pos, nextMarker, ir.NewBinaryExpr(pos, ir.OADD, marker, typedInt(pos, markerType, 1))),
-		}),
+	incremented := ir.NewBinaryExpr(pos, ir.OADD, marker, typedInt(pos, markerType, 1))
+	initialize := func(slotMarker ir.Node) ir.Nodes {
+		args := ir.Nodes{ctx, typecheck.ConvNop(next, unsafePointer), slotMarker}
+		if heterogeneous {
+			args = append(args, factory.resume.Nname)
+		}
+		enter := typecheck.Call(pos, typecheck.LookupRuntime(advanceHelper), args, false)
+		return append(copyChunkFactoryStores(factory.stores, bindings),
+			ir.NewReturnStmt(pos, ir.Nodes{enter}))
 	}
-	useNext = append(useNext, copyChunkFactoryStores(factory.stores, bindings)...)
-	enter := typecheck.Call(pos, typecheck.LookupRuntime(advanceHelper), advanceArgs, false)
-	useNext = append(useNext, ir.NewReturnStmt(pos, ir.Nodes{enter}))
-	proof.await.List = append(append(prefix, ir.NewIfStmt(pos, inChunk, useNext, nil)), proof.await.List...)
+	if heterogeneous {
+		// Keep the interior path's operands out of the boundary allocation.
+		useSlot := func(slot, slotMarker ir.Node) ir.Nodes {
+			return append(ir.Nodes{ir.NewAssignStmt(pos, next, typecheck.ConvNop(slot, next.Type()))},
+				initialize(slotMarker)...)
+		}
+		interior := markerInFrameChunk(pos, marker, first, last)
+		prefix = append(prefix, ir.NewDecl(pos, ir.ODCL, next),
+			ir.NewIfStmt(pos, interior, useSlot(addr, incremented), nil),
+			ir.NewIfStmt(pos, atEnd, useSlot(take, firstMarker), nil))
+	} else {
+		// The local self-frame loop needs one common reload edge.
+		nextMarker := typecheck.TempAt(pos, resume, markerType)
+		useNext := ir.Nodes{
+			ir.NewDecl(pos, ir.ODCL, next), ir.NewDecl(pos, ir.ODCL, nextMarker),
+			ir.NewIfStmt(pos, atEnd, ir.Nodes{
+				ir.NewAssignStmt(pos, next, typecheck.ConvNop(take, next.Type())),
+				ir.NewAssignStmt(pos, nextMarker, firstMarker),
+			}, ir.Nodes{
+				ir.NewAssignStmt(pos, next, typecheck.ConvNop(addr, next.Type())),
+				ir.NewAssignStmt(pos, nextMarker, incremented),
+			}),
+		}
+		useNext = append(useNext, initialize(nextMarker)...)
+		inChunk := markerInFrameChunk(pos, marker, first, last+1)
+		prefix = append(prefix, ir.NewIfStmt(pos, inChunk, useNext, nil))
+	}
+	proof.await.List = append(prefix, proof.await.List...)
 }
 
 func frameChunkFirstMarker(length int64, heterogeneous bool) uint8 {
