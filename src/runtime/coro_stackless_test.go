@@ -4068,17 +4068,20 @@ func TestStacklessCoroResumeFrames(t *testing.T) {
 
 func TestStacklessCoroParallelSpawn(t *testing.T) {
 	t.Run("burst", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, false)
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, false, false)
 	})
 	t.Run("staggered", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true)
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true, false)
 	})
 	t.Run("staggered-two-P", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, 2, true)
+		testStacklessCoroParallelSpawn(t, 2, true, false)
+	})
+	t.Run("after-idle", func(t *testing.T) {
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true, true)
 	})
 }
 
-func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered bool) {
+func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered, afterIdle bool) {
 	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 
 	oldProcs := runtime.GOMAXPROCS(procs)
@@ -4095,9 +4098,25 @@ func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered bool) {
 		return runtime.StacklessCoroActionComplete
 	}
 
+	var idleGate chan int
+	if afterIdle {
+		idleGate = make(chan int)
+	}
 	var state int
 	var stalled bool
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if state == 0 && idleGate != nil {
+			// Start the manager, then leave no runnable tasks until
+			// an ordinary goroutine closes the gate.
+			runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+				return runtime.StacklessCoroActionComplete
+			})
+			gate := idleGate
+			idleGate = nil
+			time.AfterFunc(10*time.Millisecond, func() { close(gate) })
+			runtime.StartStacklessCoroRecvIntForTest(ctx, gate, nil, nil)
+			return runtime.StacklessCoroActionWait
+		}
 		switch state {
 		case 0:
 			deadline := time.Now().Add(5 * time.Second)

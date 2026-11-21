@@ -160,6 +160,8 @@ const (
 	stacklessCoroLifetimeHostStarted
 	stacklessCoroLifetimePublicHost
 	stacklessCoroLifetimeTerminalRecords
+	// Cleared by the manager before admitting a replacement.
+	stacklessCoroLifetimeDeferredExecutors
 )
 
 type stacklessCoroTaskState uint8
@@ -335,6 +337,12 @@ type stacklessCoroScheduler struct {
 	// lifetime publishes scheduler lifecycle flags and the presence of
 	// terminal records. Root completion is published after its outcome.
 	lifetime atomic.Uint8
+	// executorMonitorIdle is protected by lock. The next ready insertion
+	// wakes the manager to restart its timer.
+	executorMonitorIdle bool
+	// queueProgress counts ready queue changes under lock. The manager
+	// samples short intervals using the modular difference.
+	queueProgress uint16
 	// liveSpawns counts independent logical goroutines, not structured
 	// await frames. It is protected by lock. Root completion does not end
 	// their lifetime; Drained is published only when this count is zero.
@@ -4942,10 +4950,18 @@ func (s *stacklessCoroScheduler) publishReadyLocked(task *stacklessCoroTask, que
 			s.tail.next = task
 		}
 		s.tail = task
+		s.queueProgress++
 		if queued == nil {
 			runnable = s.runnableState.Add(1)
 		} else {
 			(*queued)++
+		}
+		if s.executorMonitorIdle {
+			s.executorMonitorIdle = false
+			select {
+			case s.executorGrow <- struct{}{}:
+			default:
+			}
 		}
 	}
 	if raceenabled {
@@ -4988,6 +5004,7 @@ func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 					s.tail = nil
 				}
 				s.runnableState.Add(-1)
+				s.queueProgress++
 			}
 			task.next = nil
 			if h := s.taskHostLocked(task); h != nil {
@@ -5394,6 +5411,9 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor(live uint
 		}
 	}
 	s.signal()
+	if s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
+		return
+	}
 	select {
 	case s.executorWake <- struct{}{}:
 	default:
@@ -5439,7 +5459,7 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		s.executorState.Store(stacklessCoroExecutorStateSingleP)
 		return
 	}
-	s.startReplacementExecutors()
+	s.startReplacementExecutors(getg().stackIsFixed())
 }
 
 // Before promotion there is only the original driver. The active task keeps
@@ -5452,11 +5472,11 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 func (s *stacklessCoroScheduler) promoteSinglePExecutors() {
 	if s.executorState.CompareAndSwap(stacklessCoroExecutorStateSingleP,
 		stacklessCoroExecutorStatePreparing) {
-		s.startReplacementExecutors()
+		s.startReplacementExecutors(false)
 	}
 }
 
-func (s *stacklessCoroScheduler) startReplacementExecutors() {
+func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
 	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
 	// The initial replacements and manager can all report completion without
 	// parking. Growth beyond the warm set retains the ordinary join fallback.
@@ -5466,6 +5486,9 @@ func (s *stacklessCoroScheduler) startReplacementExecutors() {
 	count := uint32(stacklessCoroInitialExecutorCount)
 	if raceenabled || stacklessCoroIsPullComparison(s) {
 		count = stacklessCoroWarmExecutorCount
+	} else if deferWorkers {
+		count = 1
+		s.lifetime.Or(stacklessCoroLifetimeDeferredExecutors)
 	}
 	s.executorCount.Store(count)
 	for range count - 1 {
@@ -5475,7 +5498,111 @@ func (s *stacklessCoroScheduler) startReplacementExecutors() {
 	s.executorState.Store(stacklessCoroExecutorStateRunning)
 }
 
+// awaitExecutorDemand runs on the ordinary manager G. A stream of small
+// resumes can keep the queue moving with one driver, avoiding lock migration
+// between Ps. Start replacements when ready work accumulates behind a slow
+// or blocked driver, or when the same task has waited at the queue head.
+func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
+	const (
+		interval      = 1_000_000 // One millisecond in nanoseconds.
+		serviceTarget = 750       // Target nanoseconds per ready-queue change.
+		headLimit     = 25 * interval
+	)
+	lock(&s.lock)
+	progress, head := s.queueProgress, s.head
+	unlock(&s.lock)
+	started := nanotime()
+	headSince := started
+	// The initial replacement doorbell is idle until this manager widens
+	// the scheduler. Warm replacements admitted afterwards start directly.
+	t := newTimer(started+interval, interval, func(arg any, _ uintptr, _ int64) {
+		select {
+		case arg.(chan struct{}) <- struct{}{}:
+		default:
+		}
+	}, s.executorWake, nil)
+	defer stopTimer(t)
+	ticks := s.executorWake
+	slow := 0
+	for {
+		select {
+		case <-ticks:
+			now := nanotime()
+			// A delayed manager can receive several accumulated ticks.
+			// Require a fresh observation interval before sampling again.
+			if now-started < interval/2 {
+				continue
+			}
+			lock(&s.lock)
+			next, nextHead := s.queueProgress, s.head
+			if nextHead == nil {
+				// Publish the idle observation under the queue lock.
+				// The next producer cannot miss the request to rearm.
+				s.executorMonitorIdle = true
+			}
+			unlock(&s.lock)
+			if nextHead == nil {
+				stopTimer(t)
+				head = nil
+				ticks = nil
+				continue
+			}
+			if nextHead != head {
+				head, headSince = nextHead, now
+			}
+			if now-headSince >= headLimit {
+				return true
+			}
+			if int64(next-progress)*serviceTarget < now-started {
+				slow++
+				if slow >= 2 {
+					return true
+				}
+			} else {
+				slow = 0
+			}
+			progress, started = next, now
+		case <-s.executorGrow:
+			// Foreign calls can hand off their P immediately.
+			if s.blockingExecutors.Load() >= s.executorCount.Load() {
+				return true
+			}
+			if ticks == nil {
+				lock(&s.lock)
+				progress, head = s.queueProgress, s.head
+				s.executorMonitorIdle = head == nil
+				unlock(&s.lock)
+				if head == nil {
+					continue
+				}
+				started = nanotime()
+				headSince = started
+				slow = 0
+				resetTimer(t, started+interval, interval)
+				ticks = s.executorWake
+			}
+		case <-s.executorStop:
+			return false
+		}
+	}
+}
+
 func (s *stacklessCoroScheduler) manageReplacementExecutors() {
+	if s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
+		grow := s.awaitExecutorDemand()
+		lock(&s.lock)
+		s.executorMonitorIdle = false
+		unlock(&s.lock)
+		s.lifetime.And(^stacklessCoroLifetimeDeferredExecutors)
+		if !grow {
+			s.executorDone <- true
+			return
+		}
+		select {
+		case s.executorGrow <- struct{}{}:
+		default:
+		}
+	}
 	for {
 		select {
 		case <-s.executorGrow:
