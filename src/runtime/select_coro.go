@@ -166,9 +166,17 @@ func tryStacklessCoroSelect(ctx unsafe.Pointer, cases []scase, nsends int,
 		return false
 	}
 
-	var order [2 * stacklessCoroSelectCaseCacheSize]uint16
-	casi, recvOK := selectgo(&cases[0], &order[0], nil, nsends,
-		len(cases)-nsends, false)
+	var casi int
+	var recvOK, handled bool
+	if !asanenabled && !msanenabled && len(cases) == 2 && nsends == 0 {
+		casi, handled = tryStacklessCoroBufferedRecvPair(cases)
+		recvOK = casi >= 0
+	}
+	if !handled {
+		var order [2 * stacklessCoroSelectCaseCacheSize]uint16
+		casi, recvOK = selectgo(&cases[0], &order[0], nil, nsends,
+			len(cases)-nsends, false)
+	}
 	if casi < 0 && block {
 		return false
 	}
@@ -176,6 +184,49 @@ func tryStacklessCoroSelect(ctx unsafe.Pointer, cases []scase, nsends int,
 	*chosen = casi
 	*received = recvOK
 	return true
+}
+
+// tryStacklessCoroBufferedRecvPair picks a ready buffered receive while both
+// channels are locked. Peer waiters and closed channels need the full select.
+func tryStacklessCoroBufferedRecvPair(cases []scase) (chosen int, handled bool) {
+	left, right := cases[0].c, cases[1].c
+	if left == nil || right == nil || left == right ||
+		left.dataqsiz == 0 || right.dataqsiz == 0 ||
+		left.timer != nil || right.timer != nil || left.bubble != nil || right.bubble != nil {
+		return -1, false
+	}
+
+	first, second := left, right
+	if first.sortkey() > second.sortkey() {
+		first, second = second, first
+	}
+	lock(&first.lock)
+	lock(&second.lock)
+	chosen = -1
+	if left.closed == 0 && right.closed == 0 && left.sendq.first == nil && right.sendq.first == nil {
+		handled = true
+		if left.qcount != 0 || right.qcount != 0 {
+			chosen = 0
+			if left.qcount == 0 || (right.qcount != 0 && cheaprand()&1 != 0) {
+				chosen = 1
+			}
+			selected := cases[chosen]
+			c := selected.c
+			qp := chanbuf(c, c.recvx)
+			if selected.elem != nil {
+				typedmemmove(c.elemtype, selected.elem, qp)
+			}
+			typedmemclr(c.elemtype, qp)
+			c.recvx++
+			if c.recvx == c.dataqsiz {
+				c.recvx = 0
+			}
+			c.qcount--
+		}
+	}
+	unlock(&first.lock)
+	unlock(&second.lock)
+	return chosen, handled
 }
 
 func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,

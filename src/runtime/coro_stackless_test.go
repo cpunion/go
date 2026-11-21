@@ -4801,6 +4801,47 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 		}
 	})
 
+	t.Run("BufferedPair", func(t *testing.T) {
+		left, right := make(chan *int, 2), make(chan *int, 2)
+		n, m := 41, 43
+		wins := [2]int{}
+		for range 64 {
+			left <- &n
+			right <- &m
+			chosen := -2
+			var values [2]*int
+			received := false
+			cases := runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{left, right},
+				[]unsafe.Pointer{unsafe.Pointer(&values[0]), unsafe.Pointer(&values[1])}, 0)
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				if runtime.SelectStacklessCoroForTest(ctx, cases, true, &chosen, &received) {
+					t.Fatal("ready buffered select waited")
+				}
+				return runtime.StacklessCoroActionComplete
+			})
+			if !received {
+				t.Fatal("ready buffered select reported a closed channel")
+			}
+			switch chosen {
+			case 0:
+				if values[0] != &n || values[1] != nil || len(left) != 0 || len(right) != 1 || <-right != &m {
+					t.Fatal("left receive changed the wrong buffer or result")
+				}
+			case 1:
+				if values[1] != &m || values[0] != nil || len(right) != 0 || len(left) != 1 || <-left != &n {
+					t.Fatal("right receive changed the wrong buffer or result")
+				}
+			default:
+				t.Fatalf("ready buffered select chose %d", chosen)
+			}
+			wins[chosen]++
+		}
+		if wins[0] == 0 || wins[1] == 0 {
+			t.Fatalf("both buffered channels remained ready, selections = %v", wins)
+		}
+	})
+
 	t.Run("BufferedSend", func(t *testing.T) {
 		channel := make(chan int, 1)
 		value := 43
@@ -4826,12 +4867,13 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 	})
 
 	t.Run("Default", func(t *testing.T) {
-		channel := make(chan int)
+		channel := make(chan int, 1)
+		other := make(chan int, 1)
 		value := -1
 		chosen := -2
 		received := true
 		cases := runtime.NewStacklessCoroSelectCasesForTest(
-			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+			[]any{channel, other}, []unsafe.Pointer{unsafe.Pointer(&value), nil}, 0)
 
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			if runtime.SelectStacklessCoroForTest(ctx, cases, false,
@@ -4847,13 +4889,14 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 	})
 
 	t.Run("ClosedReceive", func(t *testing.T) {
-		channel := make(chan int)
+		channel := make(chan int, 1)
+		other := make(chan int, 1)
 		close(channel)
 		value := -1
 		chosen := -2
 		received := true
 		cases := runtime.NewStacklessCoroSelectCasesForTest(
-			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+			[]any{channel, other}, []unsafe.Pointer{unsafe.Pointer(&value), nil}, 0)
 
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
@@ -4869,7 +4912,9 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 	})
 
 	t.Run("ReadyPeer", func(t *testing.T) {
-		channel := make(chan int)
+		channel := make(chan int, 1)
+		other := make(chan int, 1)
+		channel <- 44
 		peerDone := make(chan struct{})
 		go func() {
 			channel <- 45
@@ -4892,19 +4937,25 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 		chosen := -2
 		received := false
 		cases := runtime.NewStacklessCoroSelectCasesForTest(
-			[]any{channel}, []unsafe.Pointer{unsafe.Pointer(&value)}, 0)
+			[]any{channel, other}, []unsafe.Pointer{unsafe.Pointer(&value), nil}, 0)
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 			if runtime.SelectStacklessCoroForTest(ctx, cases, true,
 				&chosen, &received) {
 				t.Fatal("ready peer select waited")
 			}
-			if chosen != 0 || !received || value != 45 {
-				t.Fatalf("ready peer select = (%d, %t, %d), want (0, true, 45)",
+			if chosen != 0 || !received || value != 44 {
+				t.Fatalf("ready peer select = (%d, %t, %d), want (0, true, 44)",
 					chosen, received, value)
 			}
 			return runtime.StacklessCoroActionComplete
 		})
 		<-peerDone
+		if len(channel) != 1 {
+			t.Fatal("woken sender did not refill the channel buffer")
+		}
+		if got := <-channel; got != 45 {
+			t.Fatalf("buffer after waking sender = %d, want 45", got)
+		}
 	})
 }
 
