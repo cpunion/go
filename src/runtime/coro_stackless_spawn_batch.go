@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -14,11 +15,14 @@ import (
 const stacklessCoroSpawnBatchSize = 16
 
 // coroSpawnScalarBatch runs a bounded portion of a compiler-proven counting
-// loop whose only effect is starting identical scalar-frame goroutines.
-func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, pc uint32, remaining int) (int, bool) {
+// loop whose only effect is starting identical pointer-free goroutine frames.
+func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_type, pcOffset uintptr, pc uint32, remaining int) (int, bool) {
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
-	if parent == nil || context.scheduler == nil || child == nil || remaining <= 0 {
+	if parent == nil || context.scheduler == nil || child == nil || remaining <= 0 ||
+		typ == nil || typ.Pointers() || typ.Size_ < unsafe.Sizeof(pc) ||
+		typ.Size_ > abi.CoroSpawnBatchFrameBytes ||
+		pcOffset > typ.Size_-unsafe.Sizeof(pc) || pcOffset%unsafe.Alignof(pc) != 0 {
 		throw("runtime: invalid stackless coroutine spawn batch")
 	}
 	callerpc, callersp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
@@ -32,20 +36,23 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, pc uint
 	var tasks [stacklessCoroSpawnBatchSize]*stacklessCoroTask
 	count := 0
 	yield := false
-	limit := min(remaining, len(tasks))
+	size := typ.Size_
+	limit := min(remaining, len(tasks), abi.CoroSpawnBatchFrameBytes/int(size))
 	ready := s.runnableState.Load() &^ stacklessCoroForeignReturnerBit
 	reserve := !raceenabled && !isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	for count < limit {
 		var task *stacklessCoroTask
 		var frame unsafe.Pointer
 		if reserve {
-			task = s.reserveFrameTaskLocked(parent, child, unsafe.Sizeof(pc))
+			task = s.reserveFrameTaskLocked(parent, child, size)
 			frame = task.context.frame
 		}
 		if frame == nil {
-			frame = unsafe.Pointer(new(uint32))
+			frame = newobject(typ)
+		} else if size != unsafe.Sizeof(pc) {
+			memclrNoHeapPointers(frame, size)
 		}
-		*(*uint32)(frame) = pc
+		*(*uint32)(add(frame, pcOffset)) = pc
 		if task == nil {
 			task = s.newTaskLocked(frame, child, nil)
 		} else {

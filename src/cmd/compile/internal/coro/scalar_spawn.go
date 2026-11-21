@@ -7,13 +7,17 @@ package coro
 import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"go/constant"
+	"internal/abi"
 )
 
 type scalarSpawnFactory struct {
 	resume *ir.Func
+	typ    *types.Type
+	offset int64
 	pc     int64
 }
 
@@ -25,27 +29,48 @@ type scalarSpawnSite struct {
 	index, limit ir.Node
 }
 
-// newScalarSpawnFactory admits local explicit factories with no captures,
-// arguments or destinations, whose whole frame is an initialized uint32 PC.
-func newScalarSpawnFactory(candidate *lowerCandidate, resume *ir.Func, pc *types.Field, prologue, stores ir.Nodes) *scalarSpawnFactory {
+// newScalarSpawnFactory admits local factories whose pointer-free frame
+// needs only zero initialization and an initial resume PC.
+func newScalarSpawnFactory(candidate *lowerCandidate, resume *ir.Func, factoryFrame *ir.Name, pc *types.Field, prologue, stores ir.Nodes) *scalarSpawnFactory {
 	frame := candidate.frameType
-	if base.Flag.Cfg.Instrumenting || frame.NumFields() != 1 || frame.Field(0) != pc || pc.Type != types.Types[types.TUINT32] ||
-		candidate.factory.Type().NumParams() != 1 || len(stores) != 1 {
+	if base.Flag.Cfg.Instrumenting || frame.Size() > abi.CoroSpawnBatchFrameBytes || frame.HasPointers() || pc == nil ||
+		pc.Type != types.Types[types.TUINT32] || candidate.factory.Type().NumParams() != 1 {
 		return nil
 	}
-	store, ok := stores[0].(*ir.AssignStmt)
-	if !ok {
+	locals := chunkFactoryLocals(prologue)
+	if locals == nil {
 		return nil
 	}
-	name, ok := store.Y.(*ir.Name)
-	if !ok {
+	var initialPC ir.Node
+	for _, entry := range stores {
+		store, ok := entry.(*ir.AssignStmt)
+		if !ok || len(store.Init()) != 0 || store.Y == nil || len(store.Y.Init()) != 0 {
+			return nil
+		}
+		dst, ok := store.X.(*ir.SelectorExpr)
+		if !ok || dst.X != factoryFrame || dst.Selection == nil || len(dst.Init()) != 0 {
+			return nil
+		}
+		value := store.Y
+		if name, ok := value.(*ir.Name); ok {
+			value = locals[name]
+		}
+		if value == nil {
+			return nil
+		}
+		if dst.Selection == pc {
+			if initialPC != nil || !ir.IsConst(value, constant.Int) {
+				return nil
+			}
+			initialPC = value
+		} else if !ir.IsZero(value) {
+			return nil
+		}
+	}
+	if initialPC == nil {
 		return nil
 	}
-	value := chunkFactoryLocals(prologue)[name]
-	if value == nil || !ir.IsConst(value, constant.Int) {
-		return nil
-	}
-	return &scalarSpawnFactory{resume, ir.Int64Val(value)}
+	return &scalarSpawnFactory{resume: resume, typ: frame, offset: pc.Offset, pc: ir.Int64Val(initialPC)}
 }
 
 type scalarSpawnLoop struct{ index, limit *ir.Name }
@@ -103,7 +128,9 @@ func resolveScalarSpawnSites(candidates map[*ir.Func]*lowerCandidate) {
 				yield := typecheck.TempAt(pos, site.resume, types.Types[types.TBOOL])
 				remaining := ir.NewBinaryExpr(pos, ir.OSUB, site.limit, ir.DeepCopy(pos, site.index))
 				spawn := typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnScalarBatch"), ir.Nodes{
-					site.resume.Dcl[0], frame.resume.Nname, typedInt(pos, types.Types[types.TUINT32], frame.pc), remaining,
+					site.resume.Dcl[0], frame.resume.Nname, reflectdata.TypePtrAt(pos, frame.typ),
+					typedInt(pos, types.Types[types.TUINTPTR], frame.offset),
+					typedInt(pos, types.Types[types.TUINT32], frame.pc), remaining,
 				}, false)
 				block := ir.Nodes{
 					ir.NewDecl(pos, ir.ODCL, started),

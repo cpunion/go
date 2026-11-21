@@ -14,6 +14,9 @@ const CoroFrameFresh uint8 = 1 << 6
 // zero-only payloads; small frame initializers remain straight-line stores.
 const CoroFrameZeroMinBytes = 1024
 
+// CoroSpawnBatchFrameBytes bounds frame initialization under the ready lock.
+const CoroSpawnBatchFrameBytes = 256
+
 // CoroResumeTerminalOffset locates the aligned pair of terminal bytes just
 // before a resume context. A zero uint16 means normal execution on either
 // byte order. The runtime interprets nonzero terminal state.

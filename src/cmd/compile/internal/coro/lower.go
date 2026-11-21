@@ -5905,7 +5905,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.Nodes{rootResult}, ir.Nodes{childResult}))
 	}
 
-	candidate.scalarSpawn = newScalarSpawnFactory(candidate, resume, replacements[candidate.resumePC], factoryPrologue, declarations[initializers:])
+	candidate.scalarSpawn = newScalarSpawnFactory(candidate, resume, factoryFrame, replacements[candidate.resumePC], factoryPrologue, declarations[initializers:])
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = factory
 	frameResult := typecheck.ConvNop(factoryFrame, unsafePointerType)
