@@ -8,6 +8,8 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goexperiment"
+	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -104,6 +106,9 @@ func tryStacklessCoroChanSend(ctx unsafe.Pointer, channel *hchan,
 		stacklessCoroIsPullComparison(context.scheduler) {
 		return false
 	}
+	if channel != nil && channel.dataqsiz != 0 {
+		return coroEntryChanSend(channel, element)
+	}
 	return chansend(channel, element, false, sys.GetCallerPC())
 }
 
@@ -118,7 +123,12 @@ func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
 		stacklessCoroIsPullComparison(context.scheduler) {
 		return false
 	}
-	selected, success := chanrecv(channel, element, false)
+	var selected, success bool
+	if channel != nil && channel.dataqsiz != 0 {
+		selected, success = coroEntryChanRecv(element, channel)
+	} else {
+		selected, success = chanrecv(channel, element, false)
+	}
 	if !selected {
 		return false
 	}
@@ -128,16 +138,26 @@ func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
 	return true
 }
 
-// Public entries can perform a ready operation before creating a scheduler.
-// The locked buffer path applies when no peer or channel instrumentation
-// needs the general channel transition.
+// Public entries and native executors share the non-blocking buffered path.
+// A full or empty open buffer can report a miss before acquiring the lock,
+// using the same observations as the ordinary channel implementation.
+// While holding the lock the GC write barrier phase cannot change. Keep the
+// typed operations when the barrier or cgo pointer checking is enabled.
 func coroEntryChanSend(c *hchan, element unsafe.Pointer) bool {
 	if !raceenabled && !debugChan && c != nil && c.dataqsiz != 0 && c.bubble == nil {
+		if c.closed == 0 && c.qcount == c.dataqsiz {
+			return false
+		}
 		lock(&c.lock)
 		if c.closed == 0 && c.recvq.first == nil {
 			if c.qcount < c.dataqsiz {
 				if c.elemsize != 0 {
-					typedmemmove(c.elemtype, chanbuf(c, c.sendx), element)
+					slot := chanbuf(c, c.sendx)
+					if writeBarrier.enabled || goexperiment.CgoCheck2 {
+						typedmemmove(c.elemtype, slot, element)
+					} else {
+						memmove(slot, element, uintptr(c.elemsize))
+					}
 				}
 				advanceStacklessCoroSend(c)
 				unlock(&c.lock)
@@ -146,6 +166,9 @@ func coroEntryChanSend(c *hchan, element unsafe.Pointer) bool {
 			unlock(&c.lock)
 			return false
 		}
+		if c.closed == 0 {
+			return coroBufferedSendPeer(c, element, sys.GetCallerPC())
+		}
 		unlock(&c.lock)
 	}
 	return chansend(c, element, false, sys.GetCallerPC())
@@ -153,15 +176,25 @@ func coroEntryChanSend(c *hchan, element unsafe.Pointer) bool {
 
 func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
 	if !raceenabled && !debugChan && c != nil && c.dataqsiz != 0 && c.bubble == nil && c.timer == nil {
+		if atomic.Loaduint(&c.qcount) == 0 && atomic.Load(&c.closed) == 0 {
+			return false, false
+		}
 		lock(&c.lock)
 		if c.sendq.first == nil && (c.qcount != 0 || c.closed == 0) {
 			if c.qcount != 0 {
 				if c.elemsize != 0 {
 					slot := chanbuf(c, c.recvx)
-					if element != nil {
-						typedmemmove(c.elemtype, element, slot)
+					if writeBarrier.enabled || goexperiment.CgoCheck2 {
+						if element != nil {
+							typedmemmove(c.elemtype, element, slot)
+						}
+						typedmemclr(c.elemtype, slot)
+					} else {
+						if element != nil {
+							memmove(element, slot, uintptr(c.elemsize))
+						}
+						memclrNoHeapPointers(slot, uintptr(c.elemsize))
 					}
-					typedmemclr(c.elemtype, slot)
 				}
 				advanceStacklessCoroRecv(c)
 				unlock(&c.lock)
@@ -170,8 +203,30 @@ func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
 			unlock(&c.lock)
 			return false, false
 		}
+		if c.closed == 0 {
+			return coroBufferedRecvPeer(c, element)
+		}
 		unlock(&c.lock)
 	}
+	return chanrecv(c, element, false)
+}
+
+// The caller holds the channel lock and has observed a real or stale waiter.
+func coroBufferedSendPeer(c *hchan, element unsafe.Pointer, callerPC uintptr) bool {
+	if sg := c.recvq.dequeue(); sg != nil {
+		send(c, sg, element, func() { unlock(&c.lock) }, 3)
+		return true
+	}
+	unlock(&c.lock)
+	return chansend(c, element, false, callerPC)
+}
+
+func coroBufferedRecvPeer(c *hchan, element unsafe.Pointer) (bool, bool) {
+	if sg := c.sendq.dequeue(); sg != nil {
+		recv(c, sg, element, func() { unlock(&c.lock) }, 3)
+		return true, true
+	}
+	unlock(&c.lock)
 	return chanrecv(c, element, false)
 }
 

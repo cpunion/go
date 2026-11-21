@@ -3821,6 +3821,15 @@ func sendPointer() {
 }
 
 //go:noinline
+func bufferedPointer(ch chan *int) (*int, bool) {
+	ch <- newPointer()
+	runtime.GC()
+	close(ch)
+	value, ok := <-ch
+	return value, ok
+}
+
+//go:noinline
 func directionalSend(ch chan<- int) {
 	ch <- 23
 }
@@ -3962,6 +3971,15 @@ func main() {
 		panic("channel send value was not kept alive")
 	}
 
+	pointerBuffer := make(chan *int, 1)
+	bufferedValue, ok := bufferedPointer(pointerBuffer)
+	if !ok || bufferedValue == nil || *bufferedValue != 29 {
+		panic("buffered pointer did not survive GC and close")
+	}
+	if value, ok := <-pointerBuffer; value != nil || ok {
+		panic("closed pointer buffer was not drained")
+	}
+
 	discarded := make(chan int, 1)
 	discarded <- 1
 	discard(discarded)
@@ -4002,7 +4020,7 @@ func main() {
 		t.Fatalf("building channel coroutine failed: %v\n%s", err, out)
 	}
 	for _, name := range []string{
-		"send", "sendOne", "sendPointer", "directionalSend",
+		"send", "sendOne", "sendPointer", "bufferedPointer", "directionalSend",
 		"directionalRecv", "receive", "discard", "timerReceive",
 		"closedSend", "many", "main",
 	} {

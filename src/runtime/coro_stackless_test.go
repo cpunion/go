@@ -4299,8 +4299,13 @@ func TestStacklessCoroChannelFastPath(t *testing.T) {
 		})
 	})
 
-	t.Run("OrdinaryPeers", func(t *testing.T) {
-		receiveChannel := make(chan int)
+	ordinaryPeers := func(t *testing.T, capacity int) {
+		receiveChannel := make(chan int, capacity)
+		want := 43
+		if capacity != 0 {
+			receiveChannel <- 41
+			want = 41
+		}
 		senderDone := make(chan struct{})
 		go func() {
 			receiveChannel <- 43
@@ -4317,12 +4322,22 @@ func TestStacklessCoroChannelFastPath(t *testing.T) {
 			return runtime.StacklessCoroActionComplete
 		})
 		<-senderDone
-		if value != 43 || !received {
-			t.Fatalf("ordinary sender receive = (%d, %t), want (43, true)",
-				value, received)
+		if value != want || !received {
+			t.Fatalf("ordinary sender receive = (%d, %t), want (%d, true)",
+				value, received, want)
+		}
+		if capacity != 0 {
+			select {
+			case got := <-receiveChannel:
+				if got != 43 {
+					t.Fatalf("refilled buffer = %d, want 43", got)
+				}
+			default:
+				t.Fatal("queued sender did not refill the buffer")
+			}
 		}
 
-		sendChannel := make(chan int)
+		sendChannel := make(chan int, capacity)
 		receiverDone := make(chan int, 1)
 		go func() {
 			receiverDone <- <-sendChannel
@@ -4339,7 +4354,12 @@ func TestStacklessCoroChannelFastPath(t *testing.T) {
 		if got := <-receiverDone; got != sendValue {
 			t.Fatalf("ordinary receiver value = %d, want %d", got, sendValue)
 		}
-	})
+		if len(sendChannel) != 0 {
+			t.Fatal("direct send to a waiting receiver left an element in the buffer")
+		}
+	}
+	t.Run("OrdinaryPeers", func(t *testing.T) { ordinaryPeers(t, 0) })
+	t.Run("BufferedOrdinaryPeers", func(t *testing.T) { ordinaryPeers(t, 1) })
 
 	t.Run("StacklessReceiver", func(t *testing.T) {
 		channel := make(chan int)
