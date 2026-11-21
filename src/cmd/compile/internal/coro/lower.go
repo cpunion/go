@@ -2013,14 +2013,15 @@ func (candidate *lowerCandidate) localSelfFrameLoop() bool {
 		!candidate.fusedResume && len(candidate.defers) == 0
 }
 
-// stableTerminalAction reports whether a fused resume can reuse its entry
-// query during completion. Await and yield return to the scheduler before a
+// stableTerminalAction reports whether a fused resume handles terminal
+// outcomes at entry. Await and yield return to the scheduler before a
 // child can publish a terminal outcome. An ordinary Go panic also unwinds the
-// resume; its next invocation makes a fresh query. Other operation sites and
-// deferred calls can update the outcome within this invocation.
+// resume and its next invocation checks the outcome. A pending outcome can
+// return directly when this frame owns no deferred cleanup.
 func (candidate *lowerCandidate) stableTerminalAction() bool {
 	if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
-		len(candidate.defers) != 0 || candidate.function.Terminal != 0 ||
+		len(candidate.defers) != 0 || candidate.dynamicDefers || candidate.rangeOwner != nil ||
+		candidate.function.Terminal != 0 ||
 		len(candidate.function.Sites) == 0 {
 		return false
 	}
@@ -3195,10 +3196,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
-	var entryTerminalAction *ir.Name
-	if terminalAware && !localSelfFrames && candidate.stableTerminalAction() {
-		entryTerminalAction = typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
-	}
+	directTerminal := terminalAware && !localSelfFrames && candidate.stableTerminalAction()
 	for _, name := range resumeLocals {
 		name.Curfn = resume
 		resume.Dcl = append(resume.Dcl, name)
@@ -4742,16 +4740,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					body = append(body, ir.NewIfStmt(deferred.statement.Pos(), armed, invoke, nil))
 				}
 			}
-			if terminalAware && !localSelfFrames {
-				terminalAction := entryTerminalAction
-				if terminalAction == nil {
-					terminalAction = typecheck.TempAt(pos, resume,
-						types.Types[types.TUINT8])
-					body = append(body, ir.NewAssignStmt(pos, terminalAction,
-						typecheck.Call(pos,
-							typecheck.LookupRuntime("coroTerminalAction"),
-							ir.Nodes{ctx}, false)))
-				}
+			if terminalAware && !localSelfFrames && !directTerminal {
+				terminalAction := typecheck.TempAt(pos, resume, types.Types[types.TUINT8])
+				body = append(body, ir.NewAssignStmt(pos, terminalAction,
+					typecheck.Call(pos, typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)))
 				hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
 					typedInt(pos, types.Types[types.TUINT8],
 						int64(actionInvalid)))
@@ -5220,19 +5212,26 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			ir.NewAssignStmt(pos, resumeDeferToken, token))
 	}
 	if terminalAware && !localSelfFrames {
-		var terminalAction ir.Node = typecheck.Call(pos,
+		terminalAction := typecheck.Call(pos,
 			typecheck.LookupRuntime("coroTerminalAction"), ir.Nodes{ctx}, false)
-		if entryTerminalAction != nil {
-			resume.Body = append(resume.Body,
-				ir.NewAssignStmt(pos, entryTerminalAction, terminalAction))
-			terminalAction = entryTerminalAction
+		setCleanup := ir.NewAssignStmt(pos, resumePC, typedInt(pos, types.Types[types.TUINT32], cleanupState))
+		if directTerminal {
+			// The runtime owns the context and its aligned terminal bytes.
+			// Decode pending state through the runtime's validated query.
+			statusType := types.Types[types.TUINT16]
+			addr := typecheck.Expr(ir.NewBinaryExpr(pos, ir.OUNSAFEADD, ctx,
+				typedInt(pos, types.Types[types.TINT], abi.CoroResumeTerminalOffset)))
+			status := typedDeref(pos, typecheck.ConvNop(addr, types.NewPtr(statusType)), statusType)
+			pending := ir.NewBinaryExpr(pos, ir.ONE, status, typedInt(pos, statusType, 0))
+			resume.Body.Append(ir.NewIfStmt(pos, pending, ir.Nodes{
+				setCleanup,
+				ir.NewReturnStmt(pos, ir.Nodes{terminalAction}),
+			}, nil))
+		} else {
+			hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
+				typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
+			resume.Body.Append(ir.NewIfStmt(pos, hasTerminal, ir.Nodes{setCleanup}, nil))
 		}
-		hasTerminal := ir.NewBinaryExpr(pos, ir.ONE, terminalAction,
-			typedInt(pos, types.Types[types.TUINT8], int64(actionInvalid)))
-		resume.Body = append(resume.Body, ir.NewIfStmt(pos, hasTerminal, ir.Nodes{
-			ir.NewAssignStmt(pos, resumePC,
-				typedInt(pos, types.Types[types.TUINT32], cleanupState)),
-		}, nil))
 	}
 	resume.Body = append(resume.Body,
 		dispatch,

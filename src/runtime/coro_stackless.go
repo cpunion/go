@@ -203,14 +203,25 @@ type stacklessCoroTask struct {
 	parentOrSource unsafe.Pointer
 	next           *stacklessCoroTask
 	state          stacklessCoroTaskState
+	resuming       bool
 	terminal       stacklessCoroTerminalKind
 	goexit         bool
-	resuming       bool
 	readyPending   bool
 	flags          stacklessCoroTaskFlags
 	frameSize      uint16
 	context        stacklessCoroContext
 }
+
+// Generated resumes use one aligned load for the terminal and Goexit bytes.
+const stacklessCoroTerminalOffset = int(unsafe.Offsetof(stacklessCoroTask{}.terminal))
+const stacklessCoroContextOffset = int(unsafe.Offsetof(stacklessCoroTask{}.context))
+
+var (
+	_ [0]byte = [stacklessCoroTerminalOffset - stacklessCoroContextOffset - abi.CoroResumeTerminalOffset]byte{}
+	_ [0]byte = [int(unsafe.Offsetof(stacklessCoroTask{}.goexit)) - stacklessCoroTerminalOffset - 1]byte{}
+	_ [0]byte = [stacklessCoroTerminalOffset % 2]byte{}
+	_ [0]byte = [int(stacklessCoroTerminalNone)]byte{}
+)
 
 // stacklessCoroScalarTaskChunk pairs task identities with pointer-free frames.
 // The scalar slots are used only when a complete generated frame fits in one

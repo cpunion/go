@@ -14,6 +14,11 @@ const CoroFrameFresh uint8 = 1 << 6
 // zero-only payloads; small frame initializers remain straight-line stores.
 const CoroFrameZeroMinBytes = 1024
 
+// CoroResumeTerminalOffset locates the aligned pair of terminal bytes just
+// before a resume context. A zero uint16 means normal execution on either
+// byte order. The runtime interprets nonzero terminal state.
+const CoroResumeTerminalOffset = -6
+
 // The optional 64-bit task/frame allocation has six task words. Word three
 // contains scalar task state; the other five words are GC pointers. These
 // describe private allocation metadata, not the frame factory ABI.
