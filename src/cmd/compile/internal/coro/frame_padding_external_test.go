@@ -128,7 +128,7 @@ func TestFrameStatePaddingFusedBoundary(t *testing.T) {
 	const descend = `
 func FIRST(a uint16, b uint8, p *int, n int) int {
 	var data [SIZE]byte
-	data[0] = byte(n)
+	data[WRITE] = byte(n)
 	if n == 0 { runtime.Gosched(); return int(a)+int(b)+*p+consume(&data) }
 	child := SECOND(a,b,p,n-1)
 	return child + int(a)+int(b)+*p+consume(&data)
@@ -155,9 +155,10 @@ func main() {
 	} {
 		t.Run(strconv.Itoa(test.array), func(t *testing.T) {
 			program := main
-			for _, pair := range [][2]string{{"first", "second"}, {"second", "first"}} {
-				program += strings.NewReplacer("FIRST", pair[0], "SECOND", pair[1]).Replace(descend)
-			}
+			// Different write offsets keep both typed arrays in their frames
+			// so this fixture exercises the original allocator boundaries.
+			program += strings.NewReplacer("FIRST", "first", "SECOND", "second", "WRITE", "0").Replace(descend)
+			program += strings.NewReplacer("FIRST", "second", "SECOND", "first", "WRITE", "1").Replace(descend)
 			program = strings.ReplaceAll(program, "SIZE", strconv.Itoa(test.array))
 			source := filepath.Join(t.TempDir(), "main.go")
 			if err := os.WriteFile(source, []byte(program), 0o666); err != nil {
