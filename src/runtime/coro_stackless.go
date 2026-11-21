@@ -332,7 +332,10 @@ type stacklessCoroReplacementState struct {
 	wake chan struct{}
 	// Completed independent tasks remain charged to liveSpawns until the
 	// publisher of the first task recycles the batch under the scheduler lock.
-	completed atomic.Pointer[stacklessCoroTask]
+	completed           atomic.Pointer[stacklessCoroTask]
+	lane                atomic.Pointer[stacklessCoroAssistLane]
+	yields, completions uint16 // protected by the scheduler lock
+
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -1601,13 +1604,13 @@ func (s *stacklessCoroScheduler) run(native, public bool) {
 func (s *stacklessCoroScheduler) runInitial() {
 	scope := enterStacklessCoroRunScope()
 	defer scope.leave()
-	s.runTasks(false, true, true, true)
+	s.runTasks(false, true, true, true, false)
 	s.runLoop(false, true)
 }
 
 func (s *stacklessCoroScheduler) runLoop(native, public bool) {
 	for !s.driverDone(public) {
-		s.runTasks(native, true, false, public)
+		s.runTasks(native, true, false, public, false)
 	}
 }
 
@@ -1653,10 +1656,14 @@ func stacklessCoroHostRunnable() bool {
 // initial is valid only while the scheduler remains private. A no-work exit
 // returns the last suspended task for an ordinary host to project while parked;
 // all other exits, including a recovered panic, return nil.
-func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *stacklessCoroTask {
+func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist bool) *stacklessCoroTask {
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
-	var directInitialRoot bool
+	var directInitialRoot, fromAssist bool
+	var lane *stacklessCoroAssistLane
+	if assist {
+		lane = s.replacements.Load().lane.Load()
+	}
 	// Check the host queues at most 256 logical yields apart. Public
 	// entries also check their first yield. Shared drivers already give
 	// ordinary Gs an opportunity when they park or leave a native episode.
@@ -1667,6 +1674,10 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 	}
 	defer func() {
 		stacklessCoroAbortChannelPair(s)
+		if lane != nil {
+			s.flushAssistCompletions(lane)
+			s.returnAssistReady(lane)
+		}
 		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
 		}
@@ -1704,6 +1715,22 @@ next:
 		return nil
 	}
 	task = nil
+	fromAssist = false
+	if lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
+		return nil
+	}
+	if lane != nil && (!s.canAssist() || !s.canParkAssistant()) {
+		s.flushAssistCompletions(lane)
+		s.returnAssistReady(lane)
+		lane = nil
+	}
+	if lane != nil {
+		task = s.takeAssistBatch(lane)
+		if task != nil {
+			fromAssist = true
+			goto resume
+		}
+	}
 	// Native drivers use only the shared ready queue. Producers publish its
 	// count before ringing wake, so an empty snapshot can skip the queue lock.
 	if native && !raceenabled && !stacklessCoroIsPullComparison(s) {
@@ -1823,10 +1850,21 @@ resumeOwned:
 		task.context.scheduler = nil
 	}
 
+	if lane != nil && action != stacklessCoroActionYield && action != stacklessCoroActionComplete {
+		s.flushAssistCompletions(lane)
+	}
 	switch action {
 	case stacklessCoroActionYield, stacklessCoroActionHandoff:
 		idlePollSkip = nil
 		directInitialRoot = false
+		if fromAssist && action == stacklessCoroActionYield && s.requeueAssist(lane, task) {
+			hostYieldCheck++
+			if hostYieldCheck != 0 || !stacklessCoroHostRunnable() || !yieldStacklessCoroNative(s, nil) {
+				goto next
+			}
+			return nil
+		}
+		fromAssist = false
 		// The ordinary host and public driver must get their scheduling
 		// checks before reserving the next logical task.
 		dispatch := native && !public && action == stacklessCoroActionYield &&
@@ -1877,6 +1915,7 @@ resumeOwned:
 		}
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
+		fromAssist = false
 		if native {
 			resume, suspend := stacklessCoroPrivateSleep(s, task)
 			if resume {
@@ -1915,8 +1954,11 @@ resumeOwned:
 		if initial && s.completeInitialRoot(task) {
 			return nil
 		}
+		if fromAssist && s.retireAssistTask(lane, task) {
+			goto next
+		}
 		dispatch := native && !public && !raceenabled && !stacklessCoroIsPullComparison(s)
-		task = s.complete(task, dispatch)
+		task = s.complete(task, dispatch && lane == nil)
 		if task != nil {
 			initial, directInitialRoot = false, false
 			goto resume
@@ -1997,6 +2039,9 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 			throw("runtime: stackless coroutine spawn count underflow")
 		}
 		s.liveSpawns--
+		if s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
+			s.replacements.Load().completions++
+		}
 	}
 	if s.rootComplete() && s.liveSpawns == 0 {
 		s.drainCacheAge.complete()
@@ -5118,7 +5163,13 @@ func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 		} else {
 			pull := stacklessCoroIsPullComparison(s)
 			task = s.head
-			if task == nil || pull && task.state != stacklessCoroTaskRunnable {
+			if task == nil {
+				if !pull {
+					return s.takeAssistReady()
+				}
+				return nil
+			}
+			if pull && task.state != stacklessCoroTaskRunnable {
 				return nil
 			}
 			if !pull {
@@ -5150,10 +5201,11 @@ func (s *stacklessCoroScheduler) takeNativeLocked() *stacklessCoroTask {
 		return s.takeLocked()
 	}
 	task := s.head
-	if task != nil {
-		s.popSharedReadyLocked(task)
-		stacklessCoroStartReady(task)
+	if task == nil {
+		return s.takeAssistReady()
 	}
+	s.popSharedReadyLocked(task)
+	stacklessCoroStartReady(task)
 	return task
 }
 
@@ -5218,9 +5270,10 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 	}
 	// Native FIFO rotation keeps the same ready count. Hosts and structured
 	// publications retain their routing and source metadata updates.
+	lifetime := s.lifetime.Load()
 	if dispatch && !getg().preempt && s.head != nil &&
 		!s.initialRootPrivate && !s.executorMonitorIdle && task.parent() == nil &&
-		s.lifetime.Load()&stacklessCoroLifetimeHostStarted == 0 &&
+		lifetime&stacklessCoroLifetimeHostStarted == 0 &&
 		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
 		next = s.head
 		if next.state != stacklessCoroTaskRunnable || next.resuming || next.readyPending {
@@ -5232,8 +5285,20 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		s.head = next.next
 		next.state, next.resuming, next.next = stacklessCoroTaskRunning, true, nil
 		s.queueProgress += 2
+		if lifetime&stacklessCoroLifetimeDeferredExecutors != 0 && task != &s.root {
+			s.replacements.Load().yields++
+		}
 		unlock(&s.lock)
 		return next, false, false
+	}
+	if dispatch && s.head == nil && !getg().preempt &&
+		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
+		if next := s.takeAssistReady(); next != nil {
+			task.resuming = false
+			s.readyLocked(task)
+			unlock(&s.lock)
+			return next, false, false
+		}
 	}
 	task.resuming = false
 	runnable := s.readyLocked(task)
@@ -5753,13 +5818,25 @@ func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
 // or blocked driver, or when the same task has waited at the queue head.
 func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 	const (
-		interval      = 1_000_000 // One millisecond in nanoseconds.
-		serviceTarget = 750       // Target nanoseconds per ready-queue change.
-		headLimit     = 25 * interval
+		// Measure the time per independent yield. A helper pays its own
+		// dispatch costs. Slow queues use the regular growth policy.
+		assistMinYieldTime = 240
+		assistMaxYieldTime = 1200
+		assistGainPercent  = 104
+		interval           = 1_000_000 // One millisecond in nanoseconds.
+		serviceTarget      = 750       // Target nanoseconds per ready-queue change.
+		headLimit          = 25 * interval
 	)
 	lock(&s.lock)
 	progress, head := s.queueProgress, s.head
+	replacements := s.replacements.Load()
+	yieldProgress := replacements.yields
+	completionProgress := replacements.completions
 	unlock(&s.lock)
+	var lane *stacklessCoroAssistLane
+	var baselineRate int64
+	trialTicks, quietTicks := 0, 0
+	stable := false
 	started := nanotime()
 	headSince := started
 	// The initial replacement doorbell is idle until this manager widens
@@ -5785,13 +5862,25 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			}
 			lock(&s.lock)
 			next, nextHead := s.queueProgress, s.head
-			if nextHead == nil {
+			moved := int(next - progress)
+			yields := int(replacements.yields - yieldProgress)
+			yieldProgress = replacements.yields
+			completed := replacements.completions - completionProgress
+			completionProgress = replacements.completions
+			// A repeatedly yielded ready suffix can use one spare P before
+			// the slow-progress policy admits the full replacement set.
+			elapsed := now - started
+			canAssist := lane == nil && elapsed < 2*interval && nextHead != nil &&
+				gomaxprocs >= 2 && s.canAssist() && completed != 0 && moved >= 128 && yields*5 >= moved &&
+				int64(yields)*assistMinYieldTime <= elapsed && elapsed <= int64(yields)*assistMaxYieldTime
+			idle := nextHead == nil && (lane == nil || !lane.enabled.Load())
+			if idle {
 				// Publish the idle observation under the queue lock.
 				// The next producer cannot miss the request to rearm.
 				s.executorMonitorIdle = true
 			}
 			unlock(&s.lock)
-			if nextHead == nil {
+			if idle {
 				stopTimer(t)
 				head = nil
 				ticks = nil
@@ -5800,10 +5889,40 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if nextHead != head {
 				head, headSince = nextHead, now
 			}
+			admit := stable && canAssist
+			stable = canAssist
+			if lane == nil && admit && gomaxprocs > 1 && !stacklessCoroHostRunnable() {
+				// The manager can give up its own P when it parks.
+				lane = new(stacklessCoroAssistLane)
+				lockInit(&lane.lock, lockRankStacklessCoroCache)
+				lane.wake = make(chan struct{}, 1)
+				lane.enabled.Store(true)
+				baselineRate = int64(completed) * interval / elapsed
+				replacements.lane.Store(lane)
+				s.executorCount.Add(1)
+				go s.runReplacementExecutor(true, true)
+			} else if lane != nil && lane.enabled.Load() {
+				rate := int64(completed) * interval / elapsed
+				trialTicks++
+				// Give the helper one full interval to start before comparing
+				// progress. Two samples below the target stop early assistance.
+				if trialTicks > 1 && rate*100 < baselineRate*assistGainPercent {
+					quietTicks++
+					if quietTicks == 2 {
+						lane.enabled.Store(false)
+					}
+				} else {
+					quietTicks = 0
+				}
+			}
+			if nextHead == nil {
+				progress, started = next, now
+				continue
+			}
 			if now-headSince >= headLimit {
 				return true
 			}
-			if int64(next-progress)*serviceTarget < now-started {
+			if int64(moved)*serviceTarget < now-started {
 				slow++
 				if slow >= 2 {
 					return true
@@ -5820,6 +5939,9 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if ticks == nil {
 				lock(&s.lock)
 				progress, head = s.queueProgress, s.head
+				yieldProgress = replacements.yields
+				completionProgress = replacements.completions
+				stable = false
 				s.executorMonitorIdle = head == nil
 				unlock(&s.lock)
 				if head == nil {
@@ -5844,6 +5966,9 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 		s.executorMonitorIdle = false
 		unlock(&s.lock)
 		s.lifetime.And(^stacklessCoroLifetimeDeferredExecutors)
+		if lane := s.replacements.Load().lane.Load(); lane != nil {
+			lane.signal()
+		}
 		if !grow {
 			s.executorDone <- true
 			return
@@ -5874,22 +5999,41 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 }
 
 func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
+	s.runReplacementExecutor(start, false)
+}
+
+func (s *stacklessCoroScheduler) runReplacementExecutor(start, assist bool) {
 	if !start {
 		select {
 		case <-s.executorWake():
 		case <-s.executorStop:
 		}
 	}
+	var lane *stacklessCoroAssistLane
+	if assist {
+		lane = s.replacements.Load().lane.Load()
+	}
 	for !s.drained() {
+		if lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
+			select {
+			case <-lane.wake:
+				continue
+			case <-s.executorStop:
+			}
+			break
+		}
 		// Run ready work on the fixed native stack, but park this ordinary G
 		// between episodes. Keeping an idle synthetic executor locked to its M
 		// would make every blocking-call handoff pay stoplockedm/startlockedm.
-		if coroRunOnNativeStack(s) == nil {
+		if coroRunReplacementOnNativeStack(s, lane != nil && lane.enabled.Load() && s.canParkAssistant() && s.canAssist()) == nil {
 			s.run(false, false)
 			break
 		}
 		if s.drained() {
 			break
+		}
+		if lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
+			continue
 		}
 		select {
 		case <-s.wake:
@@ -5916,6 +6060,12 @@ func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
 		s.promoteSinglePExecutors()
 	}
 	blocked := s.blockingExecutors.Add(1)
+	if replacements := s.replacements.Load(); replacements != nil {
+		if lane := replacements.lane.Load(); lane != nil {
+			s.returnAssistReady(lane)
+			lane.signal()
+		}
+	}
 	shortage := blocked >= s.executorCount.Load()
 	if shortage {
 		select {

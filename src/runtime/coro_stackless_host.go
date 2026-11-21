@@ -446,7 +446,7 @@ func (h *stacklessCoroHost) drive() {
 			// structured children selected during this episode.
 			state.parkedTask = nil
 			state.parkedTrace = nil
-			state.parkedTask = s.runTasks(false, false, false, false)
+			state.parkedTask = s.runTasks(false, false, false, false, false)
 		} else {
 			<-h.wake
 		}

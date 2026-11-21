@@ -70,6 +70,7 @@ type stacklessCoroNativeContext struct {
 	selfFrameMissRoots  uint8
 	selfFrameMissedRoot bool
 	selfFrameCacheUsed  bool
+	assist              bool // Uses padding before schedulerG.
 	schedulerG          *g
 	executor            *g
 	caller              *g
@@ -94,6 +95,7 @@ type stacklessCoroNativeContext struct {
 type stacklessCoroNativeDriver struct {
 	context *stacklessCoroNativeContext
 	root    bool
+	assist  bool
 }
 
 // This stamp occupies the scheduler's existing scalar padding. Completion,
@@ -193,6 +195,7 @@ again:
 	ctx.caller = gp
 	ctx.initialRoot = initial
 	ctx.public = public
+	ctx.assist = d.assist
 	gp.param = unsafe.Pointer(ctx)
 	mcall(coroNativeStart)
 	mp := gp.m
@@ -445,7 +448,11 @@ func cacheStacklessCoroDrainedTasks(s *stacklessCoroScheduler) {
 // coroRunOnNativeStack drives one replacement episode with a short-lived
 // driver. Public roots keep their driver across idle episodes instead.
 func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
-	var native stacklessCoroNativeDriver
+	return coroRunReplacementOnNativeStack(s, false)
+}
+
+func coroRunReplacementOnNativeStack(s *stacklessCoroScheduler, assist bool) *stacklessCoroScheduler {
+	native := stacklessCoroNativeDriver{assist: assist}
 	scheduler := native.run(s, false, false)
 	if scheduler != nil {
 		native.close(scheduler, false)
@@ -1076,7 +1083,7 @@ func coroNativeMain() {
 	initial := ctx.initialRoot
 	ctx.initialRoot = false
 	ctx.gState.channelHandoffs = 0
-	ctx.scheduler.runTasks(true, false, initial, ctx.public)
+	ctx.scheduler.runTasks(true, false, initial, ctx.public, ctx.assist)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
 }

@@ -74,3 +74,7 @@ func stacklessCoroDeferSleep(*stacklessCoroScheduler,
 }
 
 func stacklessCoroUseActiveLockSpin(*g, *mutex) bool { return false }
+
+func coroRunReplacementOnNativeStack(*stacklessCoroScheduler, bool) *stacklessCoroScheduler {
+	return nil
+}
