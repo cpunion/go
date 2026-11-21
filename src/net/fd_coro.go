@@ -40,6 +40,7 @@ func (c *conn) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, d
 		*direct = true
 		return true
 	}
+	runtime.KeepAlive(c.fd)
 	*err = c.coroReadError(wrapSyscallError(readSyscallName, e))
 	return false
 }

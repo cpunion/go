@@ -100,8 +100,9 @@ func TestStacklessCoroSocketDuplex(t *testing.T) {
 	sibling := func(ctx unsafe.Pointer) uint8 {
 		if readState == 0 {
 			readState = 1
-			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], readBuffer[:], &readN, &readStatus)
-			return runtime.StacklessCoroActionWait
+			if runtime.SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], readBuffer[:], &readN, &readStatus) {
+				return runtime.StacklessCoroActionWait
+			}
 		}
 		readDone = true
 		return runtime.StacklessCoroActionComplete

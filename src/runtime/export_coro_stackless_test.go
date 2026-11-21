@@ -1576,7 +1576,7 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 }
 
 func PublicFileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	poll_runtime_coroFileRead(ctx, fd, buffer, n, errno)
+	*n, *errno = poll_runtime_coroFileRead(ctx, fd, buffer)
 }
 
 func FileWriteStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, status *uintptr) {
@@ -1629,8 +1629,8 @@ func ExpireReadStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
 }
 
 func SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
-	fd int, buffer []byte, n *int, errno *uintptr) {
-	poll_runtime_coroSocketRead(ctx, uintptr(descriptor), fd, buffer, n, errno)
+	fd int, buffer []byte, n *int, errno *uintptr) bool {
+	return poll_runtime_coroSocketRead(ctx, uintptr(descriptor), fd, buffer, n, errno)
 }
 
 func StacklessCoroPollErrorStatusForTest(pollErr int) uintptr {

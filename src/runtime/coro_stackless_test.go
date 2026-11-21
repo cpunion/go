@@ -7138,9 +7138,10 @@ func TestStacklessCoroFileReadError(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		read func(unsafe.Pointer, int, []byte, *int, *uintptr)
+		wait bool
 	}{
-		{"explicit", runtime.FileReadStacklessCoroForTest},
-		{"public", runtime.PublicFileReadStacklessCoroForTest},
+		{"explicit", runtime.FileReadStacklessCoroForTest, true},
+		{"public", runtime.PublicFileReadStacklessCoroForTest, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cgoCalls := runtime.NumCgoCall()
@@ -7152,6 +7153,9 @@ func TestStacklessCoroFileReadError(t *testing.T) {
 				case 0:
 					state = 1
 					test.read(ctx, -1, buffer, &n, &errno)
+					if !test.wait {
+						return runtime.StacklessCoroActionComplete
+					}
 					return runtime.StacklessCoroActionWait
 				case 1:
 					state = 2
@@ -7404,15 +7408,17 @@ func TestStacklessCoroSocketReadEmpty(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		if borrowedState == 0 {
 			borrowedState = 1
-			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
-				nil, -1, nil, &borrowedN, &borrowedErrno)
-			return runtime.StacklessCoroActionWait
+			if runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+				nil, -1, nil, &borrowedN, &borrowedErrno) {
+				borrowedState = 2
+				return runtime.StacklessCoroActionWait
+			}
 		}
 		return runtime.StacklessCoroActionComplete
 	})
-	if borrowedN != 0 || borrowedErrno != 0 {
-		t.Fatalf("empty borrowed socket read = (%d, %d), want (0, 0)",
-			borrowedN, borrowedErrno)
+	if borrowedState != 1 || borrowedN != 0 || borrowedErrno != 0 {
+		t.Fatalf("empty borrowed socket read = (state %d, %d, %d), want (1, 0, 0)",
+			borrowedState, borrowedN, borrowedErrno)
 	}
 }
 
@@ -7444,24 +7450,22 @@ func TestStacklessCoroSocketReadBorrowedPollDesc(t *testing.T) {
 	var state, n int
 	var readErrno uintptr
 	buffer := make([]byte, 2)
+	waited := false
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-		switch state {
-		case 0, 1:
+		for state < len(buffer) {
 			index := state
 			state++
-			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
-				descriptor, fds[0], buffer[index:index+1], &n, &readErrno)
-			return runtime.StacklessCoroActionWait
-		case 2:
-			state = 3
-			return runtime.StacklessCoroActionComplete
-		default:
-			return runtime.StacklessCoroActionInvalid
+			if runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+				descriptor, fds[0], buffer[index:index+1], &n, &readErrno) {
+				waited = true
+				return runtime.StacklessCoroActionWait
+			}
 		}
+		return runtime.StacklessCoroActionComplete
 	})
-	if state != 3 || n != 1 || readErrno != 0 || string(buffer) != "ok" {
-		t.Fatalf("borrowed reads = (state %d, %d, %d, %q), want (3, 1, 0, %q)",
-			state, n, readErrno, buffer, "ok")
+	if waited || state != 2 || n != 1 || readErrno != 0 || string(buffer) != "ok" {
+		t.Fatalf("borrowed reads = (waited %t, state %d, %d, %d, %q), want (false, 2, 1, 0, %q)",
+			waited, state, n, readErrno, buffer, "ok")
 	}
 }
 
@@ -7499,9 +7503,11 @@ func testStacklessCoroSocketReadBorrowedPollDescWake(t *testing.T, deadline bool
 			switch state {
 			case 0:
 				state = 1
-				runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
-					descriptor, fds[0], buffer, &n, &readErrno)
-				return runtime.StacklessCoroActionWait
+				if runtime.SocketReadWithPollDescStacklessCoroForTest(ctx,
+					descriptor, fds[0], buffer, &n, &readErrno) {
+					return runtime.StacklessCoroActionWait
+				}
+				return runtime.StacklessCoroActionComplete
 			case 1:
 				state = 2
 				return runtime.StacklessCoroActionComplete
