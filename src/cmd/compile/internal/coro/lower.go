@@ -4489,18 +4489,25 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	recordSourceResume(resume, fn, resumePC, positions)
 	labels := make([]*types.Sym, len(states))
-	cases := make([]*ir.CaseClause, len(states))
 	for i := range states {
 		// Lower is also called directly by tests, where ir.CurFunc is unset, so
 		// allocate labels from resume instead of using typecheck.AutoLabel.
 		labels[i] = resume.Sym().Pkg.LookupNum(".coro", int(resume.Label))
 		resume.Label++
-		label := typedInt(pos, types.Types[types.TUINT32], int64(i))
-		cases[i] = ir.NewCaseStmt(pos, []ir.Node{label}, ir.Nodes{
-			ir.NewBranchStmt(pos, ir.OGOTO, labels[i]),
-		})
+	}
+	// The factory, the frozen public channel entry, and the continuation
+	// stores can enter the dispatcher. Other states keep their direct edges
+	// and source positions, but need no case in fused resumes.
+	persisted := make([]bool, len(states))
+	persisted[entryState] = true
+	if terminalAware {
+		persisted[cleanupState] = true
+	}
+	if entry := candidate.channelEntry; entry != nil && entry.freeze {
+		persisted[entry.waitState] = true
 	}
 	assignResumePC := func(state int) ir.Node {
+		persisted[state] = true
 		return ir.NewAssignStmt(pos, resumePC,
 			typedInt(pos, types.Types[types.TUINT32], int64(state)))
 	}
@@ -5250,6 +5257,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		stateBodies = append(stateBodies, ir.NewLabelStmt(pos, labels[i]))
 		stateBodies = append(stateBodies, body...)
+	}
+	cases := make([]*ir.CaseClause, 0, len(states))
+	for state := range states {
+		if candidate.fusedFrame && !persisted[state] {
+			continue
+		}
+		value := typedInt(pos, types.Types[types.TUINT32], int64(state))
+		cases = append(cases, ir.NewCaseStmt(pos, []ir.Node{value}, ir.Nodes{gotoState(state)}))
 	}
 	dispatch := ir.NewSwitchStmt(pos, resumePC, cases)
 	resume.Body = ir.Nodes{}
