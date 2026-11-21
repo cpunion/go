@@ -551,6 +551,40 @@ func StacklessCoroOperationSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroOperation{})
 }
 
+func CheckStacklessCoroChannelPairWakeForTest() bool {
+	s := &stacklessCoroScheduler{wake: make(chan struct{}, 1)}
+	state := new(stacklessCoroGState)
+	state.channelPair, state.channelWake = true, true
+	stacklessCoroEndChannelPair(state, s, false, false)
+	if state.channelPair || !state.channelWake || len(s.wake) != 0 {
+		return false
+	}
+	stacklessCoroEndChannelPair(state, s, true, true)
+	if state.channelWake || len(s.wake) != 0 {
+		return false
+	}
+	state.channelWake = true
+	stacklessCoroEndChannelPair(state, s, true, false)
+	if state.channelWake || len(s.wake) != 1 {
+		return false
+	}
+	<-s.wake
+	state.channelHandoffs = ^uint8(0)
+	state.channelWake = true
+	stacklessCoroEndChannelPair(state, s, true, true)
+	if !state.channelRotate || state.channelWake || len(s.wake) != 1 {
+		return false
+	}
+	<-s.wake
+	gp := getg()
+	previous := gp.stacklessCoro
+	gp.stacklessCoro = state
+	defer func() { gp.stacklessCoro = previous }()
+	state.channelPair, state.channelWake = true, true
+	stacklessCoroAbortChannelPair(s)
+	return !state.channelPair && !state.channelWake && !state.channelRotate && len(s.wake) == 1
+}
+
 func StacklessCoroChannelOperationSizeForTest() uintptr {
 	return unsafe.Sizeof(stacklessCoroChannelOperation{})
 }

@@ -4369,6 +4369,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			positions[i] = states[i].panicValue.Pos()
 		}
 	}
+	channelPairs := lowerChannelPairs(states, candidate)
 	awaitPCs := make(map[int]int)
 	for i, state := range states {
 		var sourcePos src.XPos
@@ -4910,11 +4911,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					value = capture(value)
 					body = append(body, ir.NewAssignStmt(channel.node.Pos(),
 						value, edit(channel.sendValue)))
+					name := "coroChanSend"
+					args := ir.Nodes{ctx, channelValue, typecheck.NodAddr(value)}
+					if pair := channelPairs[i]; pair != 0 {
+						name = "coroChanSendLocal"
+						args = append(args, ir.NewBool(channel.node.Pos(), pair&channelPairFirst != 0))
+					}
 					wait = typecheck.Call(channel.node.Pos(),
-						typecheck.LookupRuntime("coroChanSend",
+						typecheck.LookupRuntime(name,
 							elementType, elementType),
-						ir.Nodes{ctx, channelValue,
-							typecheck.NodAddr(value)}, false)
+						args, false)
 				} else {
 					resultPointer := ir.Node(typecheck.NodNil())
 					if channel.recvValue != nil &&
@@ -4930,11 +4936,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						}
 						okPointer = typecheck.NodAddr(edit(target))
 					}
+					name := "coroChanRecv"
+					args := ir.Nodes{ctx, channelValue, resultPointer, okPointer}
+					if pair := channelPairs[i]; pair != 0 {
+						name = "coroChanRecvLocal"
+						args = append(args, ir.NewBool(channel.node.Pos(), pair&channelPairFirst != 0))
+					}
 					wait = typecheck.Call(channel.node.Pos(),
-						typecheck.LookupRuntime("coroChanRecv",
+						typecheck.LookupRuntime(name,
 							elementType, elementType),
-						ir.Nodes{ctx, channelValue, resultPointer,
-							okPointer}, false)
+						args, false)
 				}
 				body = append(body,
 					ir.NewIfStmt(channel.node.Pos(), wait, ir.Nodes{

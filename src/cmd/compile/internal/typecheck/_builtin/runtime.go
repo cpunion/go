@@ -395,3 +395,7 @@ func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool
 
 // stackless coroutine entry selection
 func coroUseOrdinary() bool
+
+// stackless coroutine channel handoff
+func coroChanSendLocal(unsafe.Pointer, chan<- any, *any, bool) bool
+func coroChanRecvLocal(unsafe.Pointer, <-chan any, *any, *bool, bool) bool

@@ -15,6 +15,10 @@ type stacklessCoroGState struct {
 	activeSource         *stacklessCoroGoroutine
 	sourceTransition     bool
 	activeTerminalSource bool
+	channelPair          bool
+	channelWake          bool
+	channelRotate        bool
+	channelHandoffs      uint8
 }
 
 // Cold defer state lives behind a separate word from the active source record.

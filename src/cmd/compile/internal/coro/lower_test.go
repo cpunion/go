@@ -6775,7 +6775,7 @@ func TestLowerChannelOperations(t *testing.T) {
 					break
 				}
 				switch name.Sym().Name {
-				case "coroChanSend", "coroChanRecv":
+				case "coroChanSend", "coroChanRecv", "coroChanSendLocal", "coroChanRecvLocal":
 					conditionalChannels++
 				}
 			}
@@ -6788,9 +6788,9 @@ func TestLowerChannelOperations(t *testing.T) {
 				return
 			}
 			switch name.Sym().Name {
-			case "coroChanSend":
+			case "coroChanSend", "coroChanSendLocal":
 				sends++
-			case "coroChanRecv":
+			case "coroChanRecv", "coroChanRecvLocal":
 				receives++
 			}
 		})

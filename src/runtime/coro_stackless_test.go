@@ -4114,6 +4114,12 @@ func TestStacklessCoroParallelSpawn(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroChannelPairWake(t *testing.T) {
+	if !runtime.CheckStacklessCoroChannelPairWakeForTest() {
+		t.Fatal("paired channel wake was lost or unnecessarily signaled")
+	}
+}
+
 func TestStacklessCoroChannel(t *testing.T) {
 	channel := make(chan int, 1)
 	discard := make(chan int, 1)

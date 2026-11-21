@@ -4432,11 +4432,13 @@ func consume() {
 }
 
 //go:noinline
-func selectedSend(ch chan int) int {
+func selectedSend(ch, disabled chan int) int {
 	produced = ch
 	consumed = make(chan int, 1)
 	go consume()
 	select {
+	case disabled <- 43:
+		return -1
 	case ch <- 41:
 		result := <-consumed
 		return result
@@ -4453,22 +4455,25 @@ func bufferedSend(ch chan int) int {
 }
 
 //go:noinline
-func closedReceive(ch chan int) (int, bool) {
+func closedReceive(ch, disabled chan int) (int, bool) {
 	result := 43
 	ok := true
 	select {
 	case result, ok = <-ch:
+	case <-disabled:
+		return -1, true
 	}
 	return result, ok
 }
 
 //go:noinline
-func closedSend(ch chan int) (recovered any) {
+func closedSend(ch, disabled chan int) (recovered any) {
 	defer func() {
 		recovered = recover()
 	}()
 	select {
 	case ch <- 47:
+	case <-disabled:
 	}
 	return nil
 }
@@ -4555,7 +4560,7 @@ func main() {
 	if result := blocked(nil, make(chan int)); result != 37 {
 		panic("blocked select stalled the scheduler")
 	}
-	if result := selectedSend(make(chan int)); result != 41 {
+	if result := selectedSend(make(chan int), nil); result != 41 {
 		panic("bad selected send")
 	}
 	if result := bufferedSend(make(chan int, 1)); result != 42 {
@@ -4564,11 +4569,11 @@ func main() {
 
 	closed := make(chan int)
 	close(closed)
-	result, ok = closedReceive(closed)
+	result, ok = closedReceive(closed, nil)
 	if result != 0 || ok {
 		panic("bad closed receive")
 	}
-	if closedSend(closed) == nil {
+	if closedSend(closed, nil) == nil {
 		panic("send on closed channel did not panic")
 	}
 

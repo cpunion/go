@@ -1590,6 +1590,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 	// logical yields apart. A pending preemption bypasses that delay.
 	hostYieldCheck := ^uint8(0)
 	defer func() {
+		stacklessCoroAbortChannelPair(s)
 		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
 		}
@@ -1664,6 +1665,13 @@ resume:
 resumeActive:
 	stacklessCoroSetLogicalLeaf(task, getg())
 	action := task.resume(unsafe.Pointer(&task.context))
+	state := getg().stacklessCoro
+	if state != nil && state.channelWake {
+		state.channelWake = false
+		if action != stacklessCoroActionWait && action != stacklessCoroActionComplete {
+			s.signal()
+		}
+	}
 	stacklessCoroClearLogicalOwner(task, native)
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
@@ -1738,11 +1746,20 @@ resumeActive:
 		}
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
+		rotate := state != nil && state.channelRotate
+		if rotate {
+			state.channelRotate = false
+		}
 		if s.waiting(task, native) {
 			idlePollSkip = nil
 			initial = false
 			directInitialRoot = false
 			goto resume
+		}
+		if rotate && s.runnableState.Load() != 0 {
+			// This activation has released the task and already rang
+			// wake. Let an ordinary driver compete for the next episode.
+			return nil
 		}
 		idlePollSkip = task
 	case stacklessCoroActionComplete:
@@ -3889,11 +3906,102 @@ func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, re
 	return true
 }
 
+// The compiler marks an operation as more when its successful continuation
+// quickly reaches another channel operation or returns to the scheduler.
+func coroChanSendLocal(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, more bool) bool {
+	state, pending := stacklessCoroBeginChannelPair(channel, more)
+	wait := !tryStacklessCoroChanSend(ctx, channel, element)
+	if wait {
+		startStacklessCoroChannel(ctx, channel, element, nil, true)
+	}
+	stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, pending, wait)
+	return wait
+}
+
+func coroChanRecvLocal(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool, more bool) bool {
+	state, pending := stacklessCoroBeginChannelPair(channel, more)
+	wait := !tryStacklessCoroChanRecv(ctx, channel, element, received)
+	if wait {
+		startStacklessCoroChannel(ctx, channel, element, received, false)
+	}
+	stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, pending, wait)
+	return wait
+}
+
+func stacklessCoroBeginChannelPair(channel *hchan, more bool) (*stacklessCoroGState, bool) {
+	gp := getg()
+	state := gp.stacklessCoro
+	if state == nil {
+		return nil, false
+	}
+	pending := state.channelWake
+	if !raceenabled && more && !pending && channel != nil && channel.dataqsiz == 0 &&
+		gomaxprocs > 1 && state.native == unsafe.Pointer(state) {
+		state.channelPair = true
+	}
+	return state, pending
+}
+
+func stacklessCoroEndChannelPair(state *stacklessCoroGState, s *stacklessCoroScheduler, pending, wait bool) {
+	if state == nil {
+		return
+	}
+	state.channelPair = false
+	if state.channelWake && (wait || pending) {
+		// A waiting activation gives this executor a chance to run its
+		// peer. A second successful operation must ring the earlier wake.
+		state.channelWake = false
+		if wait {
+			// Periodically offer the ready peer to another executor.
+			// A fixed-stack driver can otherwise retain one OS thread
+			// through a long sequence of local handoffs.
+			state.channelHandoffs++
+			if state.channelHandoffs != 0 {
+				return
+			}
+			state.channelRotate = true
+		}
+		s.signal()
+	}
+}
+
+// A closed send can unwind the resume before reaching its paired operation.
+// Flush the outstanding wake before releasing the executor.
+func stacklessCoroAbortChannelPair(s *stacklessCoroScheduler) {
+	if state := getg().stacklessCoro; state != nil &&
+		(state.channelPair || state.channelWake || state.channelRotate) {
+		state.channelPair = false
+		state.channelRotate = false
+		if state.channelWake {
+			state.channelWake = false
+			s.signal()
+		}
+	}
+}
+
 // coroSelect starts a channel select for a stackless logical goroutine and
 // reports whether the task must wait for it.
 func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool,
 	chosen *int, received *bool) bool {
 	selection := stacklessCoroSelectCases(cases, nsends, nrecvs, chosen, received)
+	if !raceenabled && block && len(selection) == 2 {
+		i := 0
+		if selection[0].c == nil {
+			i = 1
+		}
+		c := selection[i]
+		if c.c != nil && selection[1-i].c == nil && c.c.timer == nil && c.c.bubble == nil {
+			// A nil channel cannot win. The sole active case needs only
+			// the ordinary channel waiter, with no select arbitration.
+			clear(selection)
+			*chosen = i
+			if i < nsends {
+				*received = false
+				return coroChanSend(ctx, c.c, c.elem)
+			}
+			return coroChanRecv(ctx, c.c, c.elem, received)
+		}
+	}
 	if tryStacklessCoroSelect(ctx, selection, nsends, block, chosen, received) {
 		return false
 	}
@@ -3965,7 +4073,7 @@ func finishStacklessCoroChannel(owner unsafe.Pointer, waiter *channelWaiter, suc
 		panicStacklessCoroOperation(op, plainError("send on closed channel"))
 		return
 	}
-	completeStacklessCoroOperation(op)
+	completeStacklessCoroOperationWithWake(op, waiter != nil)
 }
 
 func startStacklessCoroTimer(ctx unsafe.Pointer, ns int64) stacklessCoroTimerToken {
@@ -4263,7 +4371,9 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 	if s.initialRootPrivate {
 		s.initialRootPrivate = false
 	}
-	s.lifetime.Or(stacklessCoroLifetimeOperationStarted)
+	if s.lifetime.Load()&stacklessCoroLifetimeOperationStarted == 0 {
+		s.lifetime.Or(stacklessCoroLifetimeOperationStarted)
+	}
 	op := s.freeOperations
 	if op == nil {
 		if s.freeOperationCount != 0 {
@@ -4437,16 +4547,28 @@ func cacheStacklessCoroSharedOperationLocked(op *stacklessCoroOperation) {
 }
 
 func completeStacklessCoroOperation(op *stacklessCoroOperation) {
+	completeStacklessCoroOperationWithWake(op, false)
+}
+
+func completeStacklessCoroOperationWithWake(op *stacklessCoroOperation, canPair bool) {
 	s, task := clearStacklessCoroOperation(op)
 	lock(&s.lock)
 	completedDuringResume := task.resuming
-	s.readyLocked(task)
+	runnable := s.readyLocked(task)
 	cachedLocally := s.recycleOperationLocked(op)
 	unlock(&s.lock)
 	if !cachedLocally {
 		cacheStacklessCoroSharedOperation(op)
 	}
 	if !completedDuringResume {
+		if canPair && runnable == 1 {
+			gp := getg()
+			if state := gp.stacklessCoro; state != nil && state.channelPair &&
+				stacklessCoroCanPairChannel(gp, s) {
+				state.channelWake = true
+				return
+			}
+		}
 		s.signal()
 	}
 }

@@ -1013,6 +1013,7 @@ func coroNativeMain() {
 	gp.m.g0StackAccurate = true
 	initial := ctx.initialRoot
 	ctx.initialRoot = false
+	ctx.gState.channelHandoffs = 0
 	ctx.scheduler.runTasks(true, false, initial, ctx.public)
 	mcall(coroNativeFinish)
 	throw("runtime: stackless coroutine native finish returned")
@@ -1025,7 +1026,8 @@ func coroNativeFinish(executor *g) {
 	if ctx == nil || ctx.executor != executor {
 		throw("runtime: invalid stackless coroutine native finish")
 	}
-	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil || ctx.gState.activeSource != nil || ctx.gState.sourceTransition {
+	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil || ctx.gState.activeSource != nil ||
+		ctx.gState.sourceTransition || ctx.gState.channelPair || ctx.gState.channelWake || ctx.gState.channelRotate {
 		throw("runtime: active stackless coroutine state during native finish")
 	}
 	schedulerG := getg()
@@ -1097,6 +1099,11 @@ func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 		return nil
 	}
 	return (*stacklessCoroNativeContext)(state.native)
+}
+
+func stacklessCoroCanPairChannel(gp *g, s *stacklessCoroScheduler) bool {
+	ctx := stacklessCoroNativeContextFor(gp)
+	return ctx != nil && !ctx.public && ctx.scheduler == s && !raceenabled
 }
 
 func stacklessCoroPublicCaller(gp *g) *g {
