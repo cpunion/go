@@ -188,6 +188,11 @@ func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 //go:noinline
 func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 	exclude *stacklessCoroTask) *stacklessCoroTask {
+	// Every armed poll token contributes to the waiter count. With none
+	// installed, there is nothing to claim from the operation registry.
+	if !netpollAnyWaiters() {
+		return nil
+	}
 	var previous *stacklessCoroTask
 	for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
 		claimed := stacklessCoroPollIOAtIdle(s, exclude, previous)
