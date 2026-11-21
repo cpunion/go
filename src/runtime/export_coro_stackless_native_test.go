@@ -14,7 +14,7 @@ import (
 )
 
 func StacklessCoroNativeYieldUnsupportedForTest() bool {
-	return yieldStacklessCoroNativeRoot(nil, nil)
+	return yieldStacklessCoroNative(nil, nil)
 }
 
 func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {

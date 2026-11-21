@@ -12,7 +12,7 @@ func stacklessCoroPublicCaller(gp *g) *g { return gp }
 
 func stacklessCoroCanPairChannel(*g, *stacklessCoroScheduler) bool { return false }
 
-func yieldStacklessCoroNativeRoot(*stacklessCoroScheduler, *stacklessCoroTask) bool {
+func yieldStacklessCoroNative(*stacklessCoroScheduler, *stacklessCoroTask) bool {
 	Gosched()
 	return false
 }

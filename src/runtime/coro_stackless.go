@@ -1561,15 +1561,6 @@ func (scope *stacklessCoroRunScope) leave() {
 	}
 }
 
-// stacklessCoroGoschedIfRunnable yields the host G only when another ordinary
-// G can use its P. Otherwise, the logical scheduler can continue running
-// ready tasks without a host-scheduler round trip.
-func stacklessCoroGoschedIfRunnable() {
-	if stacklessCoroHostRunnable() {
-		Gosched()
-	}
-}
-
 func stacklessCoroHostRunnable() bool {
 	gp := getg()
 	pp := gp.m.p.ptr()
@@ -1587,9 +1578,14 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot bool
-	// Check the host queues on the first logical yield and then at most 256
-	// logical yields apart. A pending preemption bypasses that delay.
+	// Check the host queues at most 256 logical yields apart. Public
+	// entries also check their first yield. Shared drivers already give
+	// ordinary Gs an opportunity when they park or leave a native episode.
+	// A pending preemption bypasses the periodic interval.
 	hostYieldCheck := ^uint8(0)
+	if native && !public {
+		hostYieldCheck = 0
+	}
 	defer func() {
 		stacklessCoroAbortChannelPair(s)
 		if task == nil || task.context.scheduler != s || !task.resuming {
@@ -1701,7 +1697,7 @@ resumeOwned:
 		hostYieldCheck++
 		if hostYieldCheck == 0 || getg().preempt {
 			if stacklessCoroHostRunnable() {
-				if yieldStacklessCoroNativeRoot(s, task) {
+				if yieldStacklessCoroNative(s, task) {
 					return nil
 				}
 			}
@@ -1732,33 +1728,35 @@ resumeOwned:
 		}
 		if resumeDirectly {
 			// The logical queue is empty, but an ordinary goroutine may be
-			// runnable on the host scheduler. A public structured lineage
-			// must leave its thread-bound episode before the caller yields.
-			// Other drivers retain task ownership across the host yield.
+			// runnable on the host scheduler. Republish this task and
+			// leave the thread-bound episode before yielding the P.
 			hostYieldCheck++
 			if action == stacklessCoroActionHandoff || hostYieldCheck == 0 || getg().preempt {
 				if stacklessCoroHostRunnable() {
-					if yieldStacklessCoroNativeRoot(s, task) {
+					if yieldStacklessCoroNative(s, task) {
 						return nil
 					}
 				}
 			}
 			goto resume
 		}
-		if !native || foreignReturner {
-			// Cooperate with the host scheduler when this target has no
-			// native executor implementation or a foreign-call executor
-			// needs a P to return from syscall state.
+		if !native {
 			Gosched()
-		} else if action == stacklessCoroActionHandoff {
-			// Starvation handoff may have readied an ordinary waiter.
-			// Do not defer its chance to run to the periodic yield check.
-			stacklessCoroGoschedIfRunnable()
-		} else if !raceenabled && !stacklessCoroIsPullComparison(s) {
-			hostYieldCheck++
-			if hostYieldCheck == 0 || getg().preempt {
-				stacklessCoroGoschedIfRunnable()
+			break
+		}
+		// A foreign returner needs a P even if the ordinary run queue
+		// looks empty. An explicit handoff checks the host immediately.
+		if !foreignReturner && action != stacklessCoroActionHandoff {
+			if raceenabled || stacklessCoroIsPullComparison(s) {
+				break
 			}
+			hostYieldCheck++
+			if hostYieldCheck != 0 && !getg().preempt {
+				break
+			}
+		}
+		if (foreignReturner || stacklessCoroHostRunnable()) && yieldStacklessCoroNative(s, nil) {
+			return nil
 		}
 	case stacklessCoroActionHost:
 		s.hostHandoff(task)

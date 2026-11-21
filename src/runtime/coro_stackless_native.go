@@ -176,6 +176,7 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	}
 
 	ctx := d.context
+again:
 	gp := getg()
 	if gp != gp.m.curg || gp == gp.m.g0 || gp == gp.m.gsignal {
 		return nil
@@ -212,6 +213,16 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
+	if ctx.deferredYield && !public {
+		ctx.deferredYield = false
+		// The ordinary driver has its original G and M state back. It
+		// can share its P without parking a thread-bound executor.
+		Gosched()
+		if scheduler.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0 {
+			s = scheduler
+			goto again
+		}
+	}
 	return scheduler
 }
 
@@ -488,22 +499,25 @@ func releaseStacklessCoroNativeContextAt(ctx *stacklessCoroNativeContext, idleCy
 	unlock(&stacklessCoroNativePool.lock)
 }
 
-// yieldStacklessCoroNativeRoot ends a public episode before a host yield,
-// including structured children of its root. Yielding a thread-bound executor
-// could otherwise require a new M for every runnable public root. Keep spawned
-// roots on their existing handoff: their public driver closes without waiting
-// and cannot consume deferred work. The ordinary driver consumes the queued wake.
-func yieldStacklessCoroNativeRoot(s *stacklessCoroScheduler, task *stacklessCoroTask) bool {
+// yieldStacklessCoroNative ends an episode before yielding on the ordinary
+// driver stack. A nonnil task still owns its running slot and must be queued.
+// Public drivers use their existing wait-and-wake protocol for a retained
+// task. Shared drivers check the ready queue again after yielding.
+func yieldStacklessCoroNative(s *stacklessCoroScheduler, task *stacklessCoroTask) bool {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
-	if ctx == nil || ctx.executor != gp || !ctx.public || s.publicDriverDone() {
+	if ctx == nil || ctx.executor != gp || ctx.public && (task == nil || s.publicDriverDone()) {
 		Gosched()
 		return false
 	}
-	task.context.scheduler = nil
-	s.yield(task, false, false)
+	if task != nil {
+		task.context.scheduler = nil
+		s.yield(task, false, false)
+	}
 	ctx.deferredYield = true
-	s.signal()
+	if ctx.public {
+		s.signal()
+	}
 	return true
 }
 
