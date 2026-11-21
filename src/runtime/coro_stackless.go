@@ -1664,6 +1664,7 @@ resume:
 	// can observe or resume this task.
 resumeActive:
 	stacklessCoroSetLogicalLeaf(task, getg())
+resumeOwned:
 	action := task.resume(unsafe.Pointer(&task.context))
 	state := getg().stacklessCoro
 	if state != nil && state.channelWake {
@@ -1671,6 +1672,27 @@ resumeActive:
 		if action != stacklessCoroActionWait && action != stacklessCoroActionComplete {
 			s.signal()
 		}
+	}
+	if action == stacklessCoroActionSwitch {
+		idlePollSkip = nil
+		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
+			task.state != stacklessCoroTaskRunning || !task.resuming ||
+			task.readyPending {
+			throw("runtime: invalid stackless coroutine frame switch")
+		}
+		task.setFlag(stacklessCoroTaskSwitchPending, false)
+		// A validated frame switch keeps this running task on the same
+		// executor. Retain its scheduler link as for private yields.
+		if native && !raceenabled && state != nil && state.activeSource != nil &&
+			!state.activeTerminalSource && !s.hasTerminalRecords() &&
+			state.activeSource.owner.Load() == getg() {
+			// This is a new frame of the same running task. Its registry
+			// leaf and its owner do not change across the resume switch.
+			state.sourceTransition = false
+			goto resumeOwned
+		}
+		stacklessCoroClearLogicalOwner(task, native)
+		goto resumeActive
 	}
 	stacklessCoroClearLogicalOwner(task, native)
 	if directInitialRoot && action == stacklessCoroActionYield &&
@@ -1683,18 +1705,6 @@ resumeActive:
 				}
 			}
 		}
-		goto resumeActive
-	}
-	if action == stacklessCoroActionSwitch {
-		idlePollSkip = nil
-		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
-			task.state != stacklessCoroTaskRunning || !task.resuming ||
-			task.readyPending {
-			throw("runtime: invalid stackless coroutine frame switch")
-		}
-		task.setFlag(stacklessCoroTaskSwitchPending, false)
-		// A validated frame switch keeps this running task on the same
-		// executor. Retain its scheduler link as for private yields.
 		goto resumeActive
 	}
 	// A waiting source retains its scheduler through this context. The
