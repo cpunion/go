@@ -10,7 +10,7 @@ import (
 	"cmd/compile/internal/types"
 )
 
-// channelEntry is the first source operation of a public explicit-frame entry.
+// channelEntry is the first channel operation of a public explicit-frame entry.
 // On a miss, a private resume state can take the already evaluated operands.
 // Factory callers continue to enter the original initial state.
 type channelEntry struct {
@@ -34,7 +34,7 @@ func planChannelEntry(candidate *lowerCandidate, states []lowerState) *channelEn
 	if candidate.factoryABI != FactoryABI3 || ordinary == nil || len(ordinary.Body) == 0 ||
 		len(candidate.defers) != 0 || candidate.dynamicDefers || candidate.rangeOwner != nil ||
 		candidate.rangeBody != nil || candidate.rootArray != nil || candidate.affineRoot != nil ||
-		len(candidate.function.Sites) != 1 || len(candidate.channels) != 1 {
+		len(candidate.channels) != 1 {
 		return nil
 	}
 	// The native entry can skip operand evaluation without having to copy
@@ -46,11 +46,20 @@ func planChannelEntry(candidate *lowerCandidate, states []lowerState) *channelEn
 			}
 		}
 	}
-	firstIndex := 0
-	for firstIndex < len(ordinary.Body) && channelEntryDeclaration(ordinary.Body[firstIndex]) {
+	// The public entry already owns an ordinary goroutine. A leading
+	// Gosched can yield that goroutine before it evaluates channel operands.
+	// Only declarations and these yields may precede the channel operation.
+	firstIndex, yields := 0, 0
+	for _, stmt := range ordinary.Body {
+		if !channelEntryDeclaration(stmt) {
+			if sourceGosched(stmt) == nil {
+				break
+			}
+			yields++
+		}
 		firstIndex++
 	}
-	if firstIndex == len(ordinary.Body) {
+	if firstIndex == len(ordinary.Body) || len(candidate.function.Sites) != yields+1 {
 		return nil
 	}
 	first := ordinary.Body[firstIndex]
@@ -127,15 +136,15 @@ func planChannelEntry(candidate *lowerCandidate, states []lowerState) *channelEn
 		return nil
 	}
 
-	// The ordinary body places the operation first. Any earlier native
-	// states only normalize its operands and introduce declarations.
+	// All earlier native states correspond to the declarations, yields
+	// and operand evaluations already performed by the public entry.
 	for i := range states {
 		op := states[i].channel
 		if op == nil || op.rangeStmt != nil || (op.sendValue == nil) != (send == nil) {
 			continue
 		}
 		entry.waitState = i
-		entry.freeze = !stableChannelEntryOperand(channel) ||
+		entry.freeze = yields != 0 || !stableChannelEntryOperand(channel) ||
 			send != nil && !stableChannelEntryOperand(send)
 		entry.channel = typecheck.TempAt(first.Pos(), fn, channel.Type())
 		if send != nil || entry.receive != operation {

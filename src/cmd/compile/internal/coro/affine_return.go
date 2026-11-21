@@ -39,7 +39,7 @@ func affineInput(node ir.Node, input *ir.Name) bool {
 	return ok && name.Canonical() == input.Canonical()
 }
 
-func affineYield(node ir.Node) *ir.CallExpr {
+func sourceGosched(node ir.Node) *ir.CallExpr {
 	yield, ok := node.(*ir.CallExpr)
 	if !ok || yield.Op() != ir.OCALLFUNC || len(yield.Args) != 0 || len(yield.Init()) != 0 {
 		return nil
@@ -83,7 +83,7 @@ func planAffineReturn(f *Function) *affineReturnPlan {
 	if !ok || zero != 0 {
 		return nil
 	}
-	yield := affineYield(branch.Body[0])
+	yield := sourceGosched(branch.Body[0])
 	if yield == nil {
 		return nil
 	}

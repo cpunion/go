@@ -4,7 +4,10 @@
 
 package coro_test
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPublicChannelEntry(t *testing.T) {
 	const source = `package main
@@ -24,19 +27,23 @@ func value(v *int) *int {
 }
 //go:noinline
 func send(c chan *int, v *int) {
+ /*yield*/
  channel(c) <- value(v)
  phase.Add(100)
 }
 //go:noinline
-func receive(c chan *int) *int { return <-channel(c) }
+func receive(c chan *int) *int { /*yield*/ return <-channel(c) }
 type received bool
 //go:noinline
 func pair(c chan *int) (*int, received) {
+ /*yield*/ /*yield*/
  v, ok := <-channel(c)
  return v, received(ok)
 }
 //go:noinline
 func discard(c chan *int) { <-channel(c) }
+//go:noinline
+func stable(c chan int, v int) { /*yield*/ c <- v }
 
 func waitForPhase(want int32) {
  for phase.Load()==0 || phase.Load()==1 && want==12 {runtime.Gosched()}
@@ -97,6 +104,12 @@ body:
   send(full,&a)
  }()
 
+ stableSend:=make(chan int)
+ stableDone:=make(chan struct{})
+ go func(){goto body;body:stable(stableSend,42);close(stableDone)}()
+ if <-stableSend!=42 {panic("blocked send with stable operands")}
+ <-stableDone
+
  phase.Store(0)
  locked:=make(chan *int)
  go func(){waitForPhase(1);locked<-&a}()
@@ -107,6 +120,10 @@ body:
  println("switch-return-ok")
 }
 `
-	names := []string{"send", "receive", "pair", "discard"}
+	names := []string{"send", "receive", "pair", "discard", "stable"}
 	testSwitchReturnProgram(t, source, nil, names, names...)
+	t.Run("after-yield", func(t *testing.T) {
+		withYield := strings.ReplaceAll(source, "/*yield*/", "runtime.Gosched();")
+		testSwitchReturnProgram(t, withYield, nil, names, names...)
+	})
 }

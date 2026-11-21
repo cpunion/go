@@ -87,7 +87,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 	if invariant.depth == 0 {
 		return nil
 	}
-	yield := affineYield(branch.Body[0])
+	yield := sourceGosched(branch.Body[0])
 	baseResult, ok := branch.Body[1].(*ir.ReturnStmt)
 	if yield == nil || !ok || len(baseResult.Results) != 1 ||
 		!appendInvariantSum(&invariant.base, baseResult.Results[0], params, 0, nil) {
