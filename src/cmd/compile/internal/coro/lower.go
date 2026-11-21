@@ -293,7 +293,11 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 	affinePlans := make(map[*ir.Func]*affineReturnPlan)
 	for _, function := range functions {
-		if p := planAffineReturn(function); p != nil {
+		p := planAffineReturn(function)
+		if p == nil {
+			p = planInvariantReturn(function)
+		}
+		if p != nil {
 			affinePlans[function.Func] = p
 		}
 	}

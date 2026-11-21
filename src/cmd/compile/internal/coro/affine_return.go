@@ -24,6 +24,7 @@ type affineReturnPlan struct {
 	yield      *ir.CallExpr
 	base, step int64
 	source     *Function
+	invariant  *invariantReturn
 }
 
 func affineLiteral(node ir.Node) (int64, bool) {
@@ -36,6 +37,18 @@ func affineLiteral(node ir.Node) (int64, bool) {
 func affineInput(node ir.Node, input *ir.Name) bool {
 	name, ok := node.(*ir.Name)
 	return ok && name.Canonical() == input.Canonical()
+}
+
+func affineYield(node ir.Node) *ir.CallExpr {
+	yield, ok := node.(*ir.CallExpr)
+	if !ok || yield.Op() != ir.OCALLFUNC || len(yield.Args) != 0 || len(yield.Init()) != 0 {
+		return nil
+	}
+	name, ok := yield.Fun.(*ir.Name)
+	if !ok || name.Sym() == nil || name.Sym().Pkg == nil || name.Sym().Pkg.Path != "runtime" || name.Sym().Name != "Gosched" {
+		return nil
+	}
+	return yield
 }
 func planAffineReturn(f *Function) *affineReturnPlan {
 	if f == nil || f.Func == nil || f.Primary != CoroPrimary {
@@ -70,12 +83,8 @@ func planAffineReturn(f *Function) *affineReturnPlan {
 	if !ok || zero != 0 {
 		return nil
 	}
-	yield, ok := branch.Body[0].(*ir.CallExpr)
-	if !ok || yield.Op() != ir.OCALLFUNC || len(yield.Args) != 0 || len(yield.Init()) != 0 {
-		return nil
-	}
-	name, ok := yield.Fun.(*ir.Name)
-	if !ok || name.Sym() == nil || name.Sym().Pkg == nil || name.Sym().Pkg.Path != "runtime" || name.Sym().Name != "Gosched" {
+	yield := affineYield(branch.Body[0])
+	if yield == nil {
 		return nil
 	}
 	baseRet, ok := branch.Body[1].(*ir.ReturnStmt)
@@ -126,7 +135,8 @@ func affineReturnClosed(p *affineReturnPlan, plans map[*ir.Func]*affineReturnPla
 	for fn := p.source.Func; !seen[fn]; {
 		seen[fn] = true
 		q := plans[fn]
-		if q == nil || candidates[fn] == nil || q.base != p.base || q.step != p.step {
+		if q == nil || candidates[fn] == nil || q.base != p.base || q.step != p.step ||
+			!sameInvariantReturn(p, q) {
 			return false
 		}
 		fn = q.target
@@ -136,6 +146,9 @@ func affineReturnClosed(p *affineReturnPlan, plans map[*ir.Func]*affineReturnPla
 func applyAffineReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) *lowerCandidate {
 	if old.ordinary == nil {
 		return old
+	}
+	if p.invariant != nil {
+		return applyInvariantReturn(plan, old, p)
 	}
 	fn := old.function.Func
 	pos := fn.Pos()
