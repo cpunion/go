@@ -26,8 +26,35 @@ import("runtime";"fmt";"path/filepath";"os")
 func recursive(n int){runtime.Gosched();if n>0{recursive(n-1);return};panic("original")}
 var entry=recursive
 //go:noinline
+func positions(first bool) {
+	runtime.Gosched()
+	if first {
+//line first.go:40
+		panic("original")
+	}
+//line second.go:40
+	panic("original")
+}
+//line main.go:50
+var positionsEntry = positions
+//go:noinline
 func inspect(skip,size int){goto body;body:pcs:=make([]uintptr,size);n:=runtime.Callers(skip,pcs);fmt.Printf("query %d %d %d\n",skip,size,n);if n==0{return};frames:=runtime.CallersFrames(pcs[:n]);for{f,more:=frames.Next();fmt.Printf("%s %s:%d\n",f.Function,filepath.Base(f.File),f.Line);if !more{break}}}
-func main(){goto body;body:n:=16;if os.Args[1]=="short"{n=1};if os.Args[1]=="deep"{n=220};defer func(){for _,skip:=range []int{0,1,2,3,4,49,50,100,219,220,222,224,225,226,227,228,1000}{for _,size:=range []int{0,1,2,17,50,100,512}{inspect(skip,size)}};if recover()!="original"{panic("missing original")}}();entry(n)}
+func observePositions() {
+	for _, first := range []bool{true, false, true, false} {
+		func() {
+			goto body
+		body:
+			defer func() {
+				inspect(0, 20)
+				if recover() != "original" {
+					panic("missing original")
+				}
+			}()
+			positionsEntry(first)
+		}()
+	}
+}
+func main(){goto body;body:if os.Args[1]=="positions"{observePositions();return};n:=16;if os.Args[1]=="short"{n=1};if os.Args[1]=="deep"{n=220};defer func(){for _,skip:=range []int{0,1,2,3,4,49,50,100,219,220,222,224,225,226,227,228,1000}{for _,size:=range []int{0,1,2,17,50,100,512}{inspect(skip,size)}};if recover()!="original"{panic("missing original")}}();entry(n)}
 `
 	dir := t.TempDir()
 	file := filepath.Join(dir, "main.go")
@@ -54,10 +81,14 @@ func main(){goto body;body:n:=16;if os.Args[1]=="short"{n=1};if os.Args[1]=="dee
 			if data, err := build.CombinedOutput(); err != nil {
 				t.Fatalf("build: %v\n%s", err, data)
 			}
-			if config.experiment == "coro" && linkedCoroStackUnsafe(t, exe, "main.recursive.coro.stackgate") {
-				t.Fatal("terminal PC source owner lost native admission")
+			if config.experiment == "coro" {
+				for _, owner := range []string{"recursive", "positions"} {
+					if linkedCoroStackUnsafe(t, exe, "main."+owner+".coro.stackgate") {
+						t.Fatalf("terminal PC source owner %s lost native admission", owner)
+					}
+				}
 			}
-			for _, depth := range []string{"short", "shallow", "deep"} {
+			for _, depth := range []string{"short", "shallow", "deep", "positions"} {
 				for _, p := range []string{"1", "4"} {
 					run := testenv.Command(t, exe, depth)
 					run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0")
@@ -67,6 +98,11 @@ func main(){goto body;body:n:=16;if os.Args[1]=="short"{n=1};if os.Args[1]=="dee
 						t.Fatalf("%s P%s: %v\n%s", depth, p, err, text)
 					}
 					if config.name == "ordinary" && want[depth] == "" {
+						if depth == "positions" &&
+							(strings.Count(text, "main.positions first.go:40") != 2 ||
+								strings.Count(text, "main.positions second.go:40") != 2) {
+							t.Fatalf("ordinary oracle lost alternating positions\n%s", text)
+						}
 						want[depth] = text
 					}
 					if text != want[depth] {

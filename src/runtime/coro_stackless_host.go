@@ -481,7 +481,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 		state.deferState = oldDefer
 		state.activeTask = oldTask
 		if panicking {
-			recordStacklessCoroPanic(s, task, value, true, p)
+			recordStacklessCoroPanic(s, task, value, true, p, 0)
 		}
 		lock(&s.lock)
 		if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {

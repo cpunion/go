@@ -35,6 +35,27 @@ type stacklessCoroSourcePosition struct {
 	file, fileSize, line uint32
 }
 
+type stacklessCoroP struct {
+	sourcePCs stacklessCoroSourcePCCache
+}
+
+type stacklessCoroSourcePCCache struct {
+	entries [8]stacklessCoroSourcePCCacheEntry
+	inUse   bool
+}
+
+type stacklessCoroSourcePCCacheKey struct {
+	entry uintptr
+	file  uintptr
+	size  int
+	line  int32
+}
+
+type stacklessCoroSourcePCCacheEntry struct {
+	key stacklessCoroSourcePCCacheKey
+	pc  uintptr
+}
+
 func stacklessCoroSourceFrame(f funcInfo) *stacklessCoroSourceInfo {
 	if !f.valid() {
 		return nil
@@ -57,15 +78,57 @@ func stacklessCoroSourceFunc(f funcInfo, info *stacklessCoroSourceInfo) funcInfo
 	return f
 }
 
-// Source entries retain their ordinary code and pclntab. Select the original
-// instruction for this file/line rather than reporting a private helper PC.
-// This cold path neither allocates nor calls user code on the system stack.
+// Source entries retain their ordinary code and pclntab. The caller's file
+// string always points into immutable linker metadata, so its address and
+// length identify it for the lifetime of the cache without a GC reference.
 func stacklessCoroSourcePC(source funcInfo, file string, line int32) uintptr {
 	entry := source.entry()
 	if file == "" || line <= 0 || source.pcfile == 0 || source.pcln == 0 {
 		return entry
 	}
+	key := stacklessCoroSourcePCCacheKey{
+		entry: entry,
+		file:  uintptr(unsafe.Pointer(unsafe.StringData(file))),
+		size:  len(file),
+		line:  line,
+	}
+	slot := (entry>>4 ^ uintptr(line)) % uintptr(len(stacklessCoroSourcePCCache{}.entries))
 
+	// Pin the current P during cache access. Its profiling signal can
+	// interrupt a lookup or store, so use the same reentrancy rule as
+	// pcvalue. Keep the scan preemptible.
+	mp := acquirem()
+	if pp := mp.p.ptr(); pp != nil {
+		cache := &pp.sourcePCs
+		if !cache.inUse {
+			cache.inUse = true
+			saved := cache.entries[slot]
+			cache.inUse = false
+			if saved.key == key {
+				releasem(mp)
+				return saved.pc
+			}
+		}
+	}
+	releasem(mp)
+
+	pc := findStacklessCoroSourcePC(source, entry, file, line)
+	mp = acquirem()
+	if pp := mp.p.ptr(); pp != nil {
+		cache := &pp.sourcePCs
+		if !cache.inUse {
+			cache.inUse = true
+			cache.entries[slot] = stacklessCoroSourcePCCacheEntry{key: key, pc: pc}
+			cache.inUse = false
+		}
+	}
+	releasem(mp)
+	return pc
+}
+
+// Match the ordinary instruction for a source file and line. This walk may
+// run on the system or signal stack and does not allocate.
+func findStacklessCoroSourcePC(source funcInfo, entry uintptr, file string, line int32) uintptr {
 	// File and line tables encode half-open PC ranges. Advance the two
 	// tables together so each candidate starts a new file or line range.
 	// Looking up both values separately at each instruction decodes much

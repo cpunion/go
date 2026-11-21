@@ -9,6 +9,7 @@ package runtime
 import "unsafe"
 
 type stacklessCoroG struct{}
+type stacklessCoroP struct{}
 
 const stacklessCoroChannelWaiterScanning = false
 

@@ -1601,7 +1601,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 		value := recover()
 		// A native panic can begin normal cleanup or replace a panic already
 		// being unwound. Replacement also preserves a pending Goexit.
-		recordStacklessCoroPanic(s, task, value, true, p)
+		recordStacklessCoroPanic(s, task, value, true, p, 0)
 		task.context.scheduler = nil
 		s.readyAfterPanic(task)
 	}()
@@ -3343,11 +3343,11 @@ func coroPanic(ctx unsafe.Pointer, value any) {
 	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine panic")
 	}
-	recordStacklessCoroPanic(context.scheduler, task, value, false, nil)
+	recordStacklessCoroPanic(context.scheduler, task, value, false, nil, sys.GetCallerPC())
 }
 
 func recordStacklessCoroPanic(s *stacklessCoroScheduler,
-	task *stacklessCoroTask, value any, replace bool, p *_panic) {
+	task *stacklessCoroTask, value any, replace bool, p *_panic, resumePC uintptr) {
 	pc, sp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
@@ -3359,7 +3359,13 @@ func recordStacklessCoroPanic(s *stacklessCoroScheduler,
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine panic transition")
 	}
-	trace := captureStacklessCoroPanicTrace(task, p, pc, sp)
+	var trace *stacklessCoroPanicTrace
+	if resumePC != 0 {
+		trace = captureStacklessCoroResumePanicTrace(task, resumePC)
+	}
+	if trace == nil {
+		trace = captureStacklessCoroPanicTrace(task, p, pc, sp)
+	}
 	task.terminal = stacklessCoroTerminalPanic
 	s.setTerminalPanic(task, value, trace)
 	unlock(&s.lock)
@@ -3650,7 +3656,7 @@ func coroDeferPanic(token unsafe.Pointer, value any) {
 	if task == nil || task.context.scheduler == nil {
 		throw("runtime: invalid stackless coroutine defer panic")
 	}
-	recordStacklessCoroPanic(task.context.scheduler, task, value, true, nil)
+	recordStacklessCoroPanic(task.context.scheduler, task, value, true, nil, 0)
 }
 
 // coroDeferRecover takes the panic owned by a running task. The compiler only

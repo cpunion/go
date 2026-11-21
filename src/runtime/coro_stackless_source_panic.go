@@ -49,6 +49,12 @@ type stacklessCoroShortPanicTrace struct {
 	pcs    [8]uintptr
 }
 
+type stacklessCoroShallowPanicTrace struct {
+	trace  stacklessCoroPanicTrace
+	frames [2]inlineFrame
+	pcs    [2]uintptr
+}
+
 type stacklessCoroPanicState struct {
 	coroTrace *stacklessCoroPanicTrace
 }
@@ -160,6 +166,33 @@ func (trace *stacklessCoroPanicTrace) at(i int) (inlineFrame, bool) {
 	return trace.frames[i], true
 }
 
+// A language-level panic emitted by the compiler calls coroPanic directly
+// from the active resume. Its return PC already identifies the first
+// logical frame, without unwinding the native stack to find the frame.
+func captureStacklessCoroResumePanicTrace(task *stacklessCoroTask, pc uintptr) *stacklessCoroPanicTrace {
+	f := findfunc(pc)
+	info := stacklessCoroSourceFrame(f)
+	if info == nil || info.flags&abi.CoroSourceResume == 0 {
+		return nil
+	}
+	source := stacklessCoroSourceFunc(f, info)
+	if !source.valid() {
+		return nil
+	}
+	if pc > f.entry() {
+		pc--
+	}
+	file, line := funcline1(f, pc, false)
+	entry, leafPC := source.entry(), stacklessCoroSourcePC(source, file, line)
+	gp := getg()
+	parent := task.parent
+	shallow := !task.hasFlag(stacklessCoroTaskFusedFrames) &&
+		(parent == nil || parent.parent == nil && !parent.hasFlag(stacklessCoroTaskFusedFrames))
+	return collectStacklessCoroPanicTrace(shallow, func(trace *stacklessCoroPanicTrace) {
+		trace.appendLineage(task, gp, entry, leafPC)
+	})
+}
+
 // The resuming task owns its complete structured lineage. An operation panic
 // instead holds its scheduler lock and passes no physical cursor. Allocate
 // before walking, and walk on g0 so stack copying cannot invalidate u.
@@ -170,11 +203,8 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 	if p != nil {
 		pc, sp = p.startPC, p.startSP
 	}
-	short := new(stacklessCoroShortPanicTrace)
-	trace := &short.trace
-	trace.frames, trace.pcs = short.frames[:], short.pcs[:]
 	gp := getg()
-	for pass := 0; pass < 2; pass++ {
+	return collectStacklessCoroPanicTrace(false, func(trace *stacklessCoroPanicTrace) {
 		systemstack(func() {
 			var leafEntry, leafPC uintptr
 			if pc != 0 {
@@ -216,10 +246,26 @@ func captureStacklessCoroPanicTrace(task *stacklessCoroTask, p *_panic, pc uintp
 			}
 			trace.appendLineage(task, gp, leafEntry, leafPC)
 		})
+	})
+}
+
+func collectStacklessCoroPanicTrace(shallow bool, walk func(*stacklessCoroPanicTrace)) *stacklessCoroPanicTrace {
+	var trace *stacklessCoroPanicTrace
+	if shallow {
+		short := new(stacklessCoroShallowPanicTrace)
+		trace = &short.trace
+		trace.frames, trace.pcs = short.frames[:], short.pcs[:]
+	} else {
+		short := new(stacklessCoroShortPanicTrace)
+		trace = &short.trace
+		trace.frames, trace.pcs = short.frames[:], short.pcs[:]
+	}
+	for pass := 0; pass < 2; pass++ {
+		walk(trace)
 		if trace.rootPC == 0 {
 			return nil
 		}
-		if pass == 0 && trace.pcCount <= len(short.pcs) && trace.count <= len(short.frames) {
+		if pass == 0 && trace.pcCount <= len(trace.pcs) && trace.count <= len(trace.frames) {
 			trace.pcs = trace.pcs[:trace.pcCount]
 			trace.frames = trace.frames[:trace.count]
 			return trace
