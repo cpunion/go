@@ -375,7 +375,6 @@ type stacklessCoroComparisonFileFrame struct {
 	armed     chan<- struct{}
 	remaining int
 	completed int
-	pending   bool
 	n         int
 	errno     uintptr
 }
@@ -394,26 +393,21 @@ type stacklessCoroComparisonSocketFrame struct {
 func stacklessCoroComparisonFileResume(ctx unsafe.Pointer) uint8 {
 	frame := (*stacklessCoroComparisonFileFrame)(
 		runtime.FrameStacklessCoroForTest(ctx))
-	if frame.pending {
+	for frame.remaining != 0 {
+		frame.n = -1
+		frame.errno = ^uintptr(0)
+		if frame.armed != nil {
+			frame.armed <- struct{}{}
+		}
+		runtime.PublicFileReadStacklessCoroForTest(ctx, frame.fd, frame.buffer,
+			&frame.n, &frame.errno)
 		if frame.n != 1 || frame.errno != 0 {
 			return runtime.StacklessCoroActionInvalid
 		}
-		frame.pending = false
 		frame.completed++
 		frame.remaining--
 	}
-	if frame.remaining == 0 {
-		return runtime.StacklessCoroActionComplete
-	}
-	frame.n = -1
-	frame.errno = ^uintptr(0)
-	frame.pending = true
-	if frame.armed != nil {
-		frame.armed <- struct{}{}
-	}
-	runtime.PublicFileReadStacklessCoroForTest(ctx, frame.fd, frame.buffer,
-		&frame.n, &frame.errno)
-	return runtime.StacklessCoroActionWait
+	return runtime.StacklessCoroActionComplete
 }
 
 func stacklessCoroComparisonSocketResume(ctx unsafe.Pointer) uint8 {
