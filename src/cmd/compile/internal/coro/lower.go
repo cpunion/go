@@ -114,7 +114,7 @@ type lowerCandidate struct {
 	resultPtrs        []*ir.Name
 	factory           *ir.Func
 	factoryABI        FactoryABI
-	frameWrappers     map[*ir.Func]bool
+	frameDefers       map[*ir.Func]bool
 	fusedAwaits       map[*ir.CallExpr]bool
 	fusedRequests     map[*ir.CallExpr]bool
 	fusedChunkProofs  map[*ir.CallExpr]ir.Node
@@ -565,7 +565,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			installRangeHybridRegistrations(body)
 		}
 	}
-	markFusedFrameCandidates(candidates)
+	markFusedFrameCandidates(plan, candidates)
 	preferRootArrayFrames(candidates)
 	for _, function := range functions {
 		if candidate := candidates[function.Func]; candidate != nil {
@@ -1953,26 +1953,23 @@ func resumeFactoryABI(factory, fn *ir.Func) FactoryABI {
 }
 
 // explicitFrameFactorySupported limits explicit-frame lowering to functions
-// whose storage can move into one generated frame. Fixed argument
-// wrappers can copy their saved operands when cleanup invokes them.
+// whose storage can move into one generated frame. Fixed cleanup can
+// copy its saved operands or borrow nonescaping activation slots.
 func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	if candidate == nil ||
 		candidate.function.Defer != NoDeferABI ||
-		len(candidate.iterationVars) != 0 || candidate.function.Terminal != 0 {
+		len(candidate.iterationVars) != 0 {
 		return false
 	}
-	var wrappers map[*ir.Func]bool
-	if len(candidate.defers) != 0 {
-		wrappers = candidate.fixedDeferArgumentWrappers()
-		if !candidate.explicitFrameDefers(wrappers) {
-			return false
-		}
+	defers, ok := candidate.explicitFrameDefers()
+	if !ok {
+		return false
 	}
 	runToCompletion := canLowerRunToCompletion(candidate)
 	for _, site := range candidate.function.Sites {
 		switch site.Kind {
 		// These transitions keep their suspended state in the resume frame.
-		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify, SiteGC:
+		case SiteYield, SiteAwait, SiteChannel, SiteTimer, SiteFile, SitePoll, SiteSemaphore, SiteNotify, SiteGC, SitePanic:
 		case SiteForeign:
 			if !runToCompletion {
 				return false
@@ -1983,12 +1980,12 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	}
 	supported := true
 	ir.Visit(candidate.function.Func, func(node ir.Node) {
-		if closure, ok := node.(*ir.ClosureExpr); ok && !wrappers[closure.Func] {
+		if closure, ok := node.(*ir.ClosureExpr); ok && !defers[closure.Func] {
 			supported = false
 		}
 	})
 	if supported {
-		candidate.frameWrappers = wrappers
+		candidate.frameDefers = defers
 	}
 	return supported
 }
@@ -2024,7 +2021,7 @@ func (candidate *lowerCandidate) stableTerminalAction() bool {
 // frames can share one logical task. Cross-package factories retain the
 // ordinary task path until their export ABI describes the extended frame
 // header required when the resume entry changes.
-func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
+func markFusedFrameCandidates(plan *Plan, candidates map[*ir.Func]*lowerCandidate) {
 	for _, candidate := range candidates {
 		// A terminal child discards the suspended fused lineage. A
 		// registration remains runnable only on the active leaf, so
@@ -2039,9 +2036,7 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 			}
 			edge := edgeForCall(candidate.function, call)
 			child := candidates[edge.Callee]
-			// A normal call to a function containing recover must not inherit
-			// the calling task's deferred activation identity.
-			if child == nil || child.factoryABI != FactoryABI3 || child.function.Terminal&UsesRecover != 0 {
+			if child == nil || child.factoryABI != FactoryABI3 || !canFuseRecover(plan, child.function) {
 				continue
 			}
 			self := edge.Callee == candidate.function.Func
@@ -2064,6 +2059,26 @@ func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 			}
 		}
 	}
+}
+
+func canFuseRecover(plan *Plan, function *Function) bool {
+	if function.Terminal&UsesRecover == 0 {
+		return true
+	}
+	// Direct calls must never inherit the caller's deferred activation
+	// identity. The admitted defer literals recover using their own token.
+	if function.LocalTerminal&UsesRecover != 0 {
+		return false
+	}
+	for _, edge := range function.Edges {
+		if edge.Kind == DirectCall {
+			summary, known := plan.edgeSummary(edge)
+			if !known || summary.Terminal&UsesRecover != 0 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // resolveFusedFrameChunkProofs enables chunk reuse across different resume
@@ -2994,14 +3009,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A source declaration may execute repeatedly. Its cell is allocated at
 	// that declaration; each nested closure snapshots the cell pointer when
 	// created, rather than sharing the next iteration's pointer slot.
-	fixedDeferWrappers := candidate.frameWrappers
+	fixedDeferWrappers := candidate.frameDefers
 	if candidate.factoryABI != FactoryABI3 {
 		fixedDeferWrappers = candidate.fixedDeferArgumentWrappers()
 	}
 	ir.Visit(fn, func(node ir.Node) {
-		if closure, ok := node.(*ir.ClosureExpr); ok && !fixedDeferWrappers[closure.Func] {
+		if closure, ok := node.(*ir.ClosureExpr); ok {
+			if closure.Func.Wrapper() && fixedDeferWrappers[closure.Func] {
+				return
+			}
 			for _, variable := range closure.Func.ClosureVars {
 				source := variable.Canonical()
+				if candidate.frameDefers[closure.Func] && candidate.borrowDeferCapture(source) {
+					continue
+				}
 				if source.Curfn == fn && source.Sym().Name != typecheck.LocalDictName {
 					addCaptureCell(source)
 				}
@@ -4218,6 +4239,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 		for _, variable := range closureVars {
 			outer := edit(variable.Outer)
+			if candidate.frameDefers[closure.Func] && !closure.Func.Wrapper() &&
+				candidate.borrowDeferCapture(variable) {
+				snapshot := typecheck.TempAt(variable.Pos(), resume, types.NewPtr(variable.Type()))
+				assign := ir.NewAssignStmt(variable.Pos(), snapshot, typecheck.NodAddr(outer))
+				assign.Def, snapshot.Defn = true, assign
+				ir.WithFunc(resume, func() {
+					closure.PtrInit().Append(typecheck.Stmt(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot)),
+						typecheck.Stmt(assign))
+				})
+				replaceCapturedCell(closure.Func, variable, snapshot)
+				continue
+			}
 			if deref, ok := outer.(*ir.StarExpr); ok {
 				if cell, ok := deref.X.(*ir.Name); ok {
 					snapshot := typecheck.TempAt(variable.Pos(), resume, cell.Type())
@@ -4332,6 +4365,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	for i := range positions {
 		positions[i] = pos
 		if states[i].panicValue != nil {
+			// coroPanic reads this saved position when capturing the trace.
 			positions[i] = states[i].panicValue.Pos()
 		}
 	}
@@ -5311,10 +5345,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			}
 		}
 		ir.EditChildren(node, rewrite)
-		if closure, ok := node.(*ir.ClosureExpr); ok && candidate.frameWrappers[closure.Func] {
-			// The operand slots belong to this registration alone. Pass
-			// their values via resume locals so the wrapper never captures
-			// the frame or an address into its operand storage.
+		if closure, ok := node.(*ir.ClosureExpr); ok && candidate.frameDefers[closure.Func] {
+			// Snapshot stored operands and capture pointers into resume
+			// locals. Nonescaping borrowed slots were addressed in Init.
 			ir.WithFunc(resume, func() {
 				for _, variable := range closure.Func.ClosureVars {
 					field := replacements[variable.Outer]

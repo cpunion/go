@@ -7,9 +7,13 @@ package coro
 import "cmd/compile/internal/ir"
 
 func (deferred *lowerDefer) plainDeferCall() bool {
+	return deferred.synchronousDeferCall() && deferred.rewriteTerminal == 0
+}
+
+func (deferred *lowerDefer) synchronousDeferCall() bool {
 	return !deferred.sourceLiteral && !deferred.open && deferred.rangeAnchor == nil &&
 		!deferred.namedRecover && !deferred.directGoexit && !deferred.runTerminal &&
-		deferred.rewriteTerminal == 0 && len(deferred.resumable) == 0 &&
+		len(deferred.resumable) == 0 &&
 		len(deferred.terminalTargets) == 0
 }
 
@@ -52,26 +56,58 @@ func (candidate *lowerCandidate) fixedDeferArgumentWrappers() map[*ir.Func]bool 
 	return wrappers
 }
 
-// explicitFrameDefers only admits fixed registrations whose cleanup can
-// use values from frame slots. Mutable and escaping capture cells in
-// deferred literals still need the closure factory.
-func (candidate *lowerCandidate) explicitFrameDefers(wrappers map[*ir.Func]bool) bool {
-	if candidate.dynamicDefers || candidate.rangeOwner != nil {
-		return false
+// explicitFrameDefers proves that each registration can store its operands
+// or capture cells in explicit frame slots. Direct recover literals still
+// invoke cleanup with their own task token.
+func (candidate *lowerCandidate) explicitFrameDefers() (map[*ir.Func]bool, bool) {
+	function := candidate.function
+	if len(candidate.defers) == 0 {
+		// A caller can receive a terminal outcome from its children without
+		// running cleanup itself. Its normal terminal entry propagates it.
+		return nil, function.LocalTerminal == 0 && function.Terminal&^(MayPanic|UsesRecover) == 0
 	}
+	if candidate.dynamicDefers || candidate.rangeOwner != nil {
+		return nil, false
+	}
+	defers := candidate.fixedDeferArgumentWrappers()
+	ownRecover := false
 	for _, deferred := range candidate.defers {
-		if !deferred.plainDeferCall() || deferred.snapshotCallee {
-			return false
+		if !deferred.synchronousDeferCall() || deferred.snapshotCallee {
+			return nil, false
 		}
 		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
-			if !wrappers[closure.Func] {
-				return false
+			if closure.Func.Wrapper() {
+				if !defers[closure.Func] {
+					return nil, false
+				}
+				continue
 			}
-		} else if ir.StaticCalleeName(deferred.call.Fun) == nil {
-			return false
+			if deferred.rewriteTerminal&^UsesRecover != 0 {
+				return nil, false
+			}
+			if defers == nil {
+				defers = make(map[*ir.Func]bool)
+			}
+			defers[closure.Func] = true
+			ownRecover = ownRecover || deferred.rewriteTerminal == UsesRecover
+		} else if !deferred.plainDeferCall() || ir.StaticCalleeName(deferred.call.Fun) == nil {
+			return nil, false
 		}
 	}
-	return true
+	if function.Terminal != 0 && (!ownRecover || function.Terminal&^(MayPanic|UsesRecover) != 0 ||
+		function.LocalTerminal&UsesRecover != 0) {
+		return nil, false
+	}
+	return defers, true
+}
+
+// Only parameters and results live for the whole activation regardless of
+// control flow. Other captures keep their per-declaration cells so cleanup
+// can reference an earlier execution of a source declaration.
+func (candidate *lowerCandidate) borrowDeferCapture(name *ir.Name) bool {
+	source := name.Canonical()
+	return candidate.heapLocals != nil && !candidate.heapLocals[source] &&
+		(candidate.parameters[source] != nil || candidate.results[source] != nil)
 }
 
 // refreshNestedClosureCaptures follows the new canonical owner after an

@@ -1030,9 +1030,14 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 		t.Error("range candidate supports an explicit frame")
 	}
 	terminal := candidate(SiteYield)
-	terminal.function.Terminal = MayPanic
+	terminal.function.LocalTerminal, terminal.function.Terminal = MayPanic, MayPanic
 	if explicitFrameFactorySupported(terminal) {
 		t.Error("terminal candidate supports an explicit frame")
+	}
+	inherited := candidate(SiteAwait)
+	inherited.function.Terminal = MayPanic | UsesRecover
+	if !explicitFrameFactorySupported(inherited) {
+		t.Error("terminal-propagating caller does not support an explicit frame")
 	}
 
 	closure := candidate(SiteYield)
@@ -4582,7 +4587,8 @@ func TestLowerRequiresDeferSafeTransitiveFactory(t *testing.T) {
 		t.Fatalf("Lower result = %+v, want only ordinary target factory",
 			result)
 	}
-	if targetFunction.Factory != FactoryABI1 ||
+	// The ordinary typed factory does not confer a synchronous defer entry.
+	if targetFunction.Factory != FactoryABI3 ||
 		targetFunction.Defer != NoDeferABI {
 		t.Fatalf("target capabilities = factory %v, defer %v",
 			targetFunction.Factory, targetFunction.Defer)

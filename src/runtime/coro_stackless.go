@@ -1601,7 +1601,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 		value := recover()
 		// A native panic can begin normal cleanup or replace a panic already
 		// being unwound. Replacement also preserves a pending Goexit.
-		recordStacklessCoroPanic(s, task, value, true, p, 0)
+		recordStacklessCoroPanic(s, task, value, true, p)
 		task.context.scheduler = nil
 		s.readyAfterPanic(task)
 	}()
@@ -3335,19 +3335,18 @@ func coroDeferAction(ctx unsafe.Pointer) uint8 {
 }
 
 // coroPanic records a panic value before the compiler-generated resume enters
-// its frame-owned cleanup state.
+// cleanup. The compiler has already saved the source state of the panic.
 func coroPanic(ctx unsafe.Pointer, value any) {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	if context == nil || context.scheduler == nil || task == nil {
 		throw("runtime: invalid stackless coroutine panic")
 	}
-	recordStacklessCoroPanic(context.scheduler, task, value, false, nil, sys.GetCallerPC())
+	recordStacklessCoroPanic(context.scheduler, task, value, false, nil)
 }
 
 func recordStacklessCoroPanic(s *stacklessCoroScheduler,
-	task *stacklessCoroTask, value any, replace bool, p *_panic, resumePC uintptr) {
-	pc, sp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
+	task *stacklessCoroTask, value any, replace bool, p *_panic) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -3359,10 +3358,11 @@ func recordStacklessCoroPanic(s *stacklessCoroScheduler,
 		throw("runtime: invalid stackless coroutine panic transition")
 	}
 	var trace *stacklessCoroPanicTrace
-	if resumePC != 0 {
-		trace = captureStacklessCoroResumePanicTrace(task, resumePC)
+	if !replace {
+		trace = captureStacklessCoroResumePanicTrace(task)
 	}
 	if trace == nil {
+		pc, sp := sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP())
 		trace = captureStacklessCoroPanicTrace(task, p, pc, sp)
 	}
 	task.terminal = stacklessCoroTerminalPanic
@@ -3655,7 +3655,7 @@ func coroDeferPanic(token unsafe.Pointer, value any) {
 	if task == nil || task.context.scheduler == nil {
 		throw("runtime: invalid stackless coroutine defer panic")
 	}
-	recordStacklessCoroPanic(task.context.scheduler, task, value, true, nil, 0)
+	recordStacklessCoroPanic(task.context.scheduler, task, value, true, nil)
 }
 
 // coroDeferRecover takes the panic owned by a running task. The compiler only

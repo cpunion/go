@@ -2302,6 +2302,7 @@ var namedDynamicValue [3]any
 var namedOriginal any
 var namedMethodValue any
 var namedMethodTag int
+var retainedRecovered [2]*any
 
 //go:noinline
 func record(value int) {
@@ -2388,6 +2389,27 @@ func nilPanic() (recovered any) {
 }
 
 //go:noinline
+func retainRecover(slot int) (recovered any) {
+	defer func() {
+		recovered = recover()
+		retainedRecovered[slot] = &recovered
+	}()
+	runtime.Gosched()
+	panic(slot)
+}
+
+//go:noinline
+func retainedRecoveryOK() bool {
+	first := retainRecover(0)
+	second := retainRecover(1)
+	runtime.GC()
+	return first == 0 && second == 1 &&
+		retainedRecovered[0] != nil && retainedRecovered[1] != nil &&
+		retainedRecovered[0] != retainedRecovered[1] &&
+		*retainedRecovered[0] == 0 && *retainedRecovered[1] == 1
+}
+
+//go:noinline
 func namedRecover() {
 	namedValue = recover()
 }
@@ -2470,6 +2492,7 @@ func main() {
 	namedDynamicRecover()
 	namedReplacementValue := namedReplacement()
 	namedMethod()
+	retained := retainedRecoveryOK()
 	expectNil := os.Getenv("EXPECT_PANICNIL") == "1"
 	if original != "original" ||
 		replacement != "replacement" ||
@@ -2483,7 +2506,7 @@ func main() {
 		namedDynamicValue != [3]any{nil, nil, "named-dynamic"} ||
 		namedOriginal != "named-original" ||
 		namedReplacementValue != "named-replacement" ||
-		namedMethodValue != "named-method" || namedMethodTag != 29 ||
+		namedMethodValue != "named-method" || namedMethodTag != 29 || !retained ||
 		traceIndex != len(trace) ||
 		trace != [7]int{2, 1, 4, 3, 12, 11, 10} {
 		panic("bad recover or replacement panic result")
@@ -2498,7 +2521,7 @@ func main() {
 	exe := filepath.Join(tmp, "coro-recover")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=command-line-arguments=-l -d=coro=4",
+		"-gcflags=command-line-arguments=-l -d=coro=4,checkptr=2",
 		src)
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
@@ -2512,7 +2535,7 @@ func main() {
 	}
 	for _, name := range []string{
 		"replacement", "normalCleanup", "dynamicRecover", "dynamicReplacement",
-		"noPanic", "nilPanic",
+		"noPanic", "nilPanic", "retainRecover", "retainedRecoveryOK",
 		"namedFallback", "namedArg", "namedDynamicRecover",
 		"namedReplacement", "namedMethod",
 	} {
@@ -2547,6 +2570,22 @@ func main() {
 	}
 	if want := "stackless-coro-recover-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("legacy panicnil output does not contain %q\n%s", want, data)
+	}
+
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		for _, name := range []string{"retainRecover", "retainedRecoveryOK"} {
+			if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+				t.Errorf("%s lost native admission", name)
+			}
+		}
+	}
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
+		"-s", `main\.(retainRecover\.coro|retainedRecoveryOK\.coro\.func[0-9]+)$`, exe)
+	data, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(data), "runtime.coroTakeFusedFrame") ||
+		!strings.Contains(string(data), "runtime.coroAwaitFusedFrame") {
+		t.Fatalf("retained recovery does not use a fused frame: %v\n%s", err, data)
 	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",

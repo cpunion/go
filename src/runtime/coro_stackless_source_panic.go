@@ -166,30 +166,21 @@ func (trace *stacklessCoroPanicTrace) at(i int) (inlineFrame, bool) {
 	return trace.frames[i], true
 }
 
-// A language-level panic emitted by the compiler calls coroPanic directly
-// from the active resume. Its return PC already identifies the first
-// logical frame, without unwinding the native stack to find the frame.
-func captureStacklessCoroResumePanicTrace(task *stacklessCoroTask, pc uintptr) *stacklessCoroPanicTrace {
-	f := findfunc(pc)
-	info := stacklessCoroSourceFrame(f)
-	if info == nil || info.flags&abi.CoroSourceResume == 0 {
-		return nil
-	}
-	source := stacklessCoroSourceFunc(f, info)
-	if !source.valid() {
-		return nil
-	}
-	if pc > f.entry() {
-		pc--
-	}
-	file, line := funcline1(f, pc, false)
-	entry, leafPC := source.entry(), stacklessCoroSourcePC(source, file, line)
+// The compiler saves a state with the exact panic position before calling
+// coroPanic. That state identifies the active source frame directly.
+func captureStacklessCoroResumePanicTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
 	gp := getg()
 	parent := task.parent
 	shallow := !task.hasFlag(stacklessCoroTaskFusedFrames) &&
 		(parent == nil || parent.parent == nil && !parent.hasFlag(stacklessCoroTaskFusedFrames))
+	if task.hasFlag(stacklessCoroTaskFusedFrames) && parent == nil && task.context.frame != nil {
+		header := (*stacklessCoroFusedFrameHeader)(task.context.frame)
+		// The active leaf switches resume entries directly above a root.
+		shallow = header.marker&(stacklessCoroFusedFrameResume|stacklessCoroFusedFrameParent) ==
+			stacklessCoroFusedFrameResume
+	}
 	return collectStacklessCoroPanicTrace(shallow, func(trace *stacklessCoroPanicTrace) {
-		trace.appendLineage(task, gp, entry, leafPC)
+		trace.appendLineage(task, gp, 0, 0)
 	})
 }
 
