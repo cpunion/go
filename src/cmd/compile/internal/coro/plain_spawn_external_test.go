@@ -225,7 +225,7 @@ func main() {
 				for _, pattern := range []string{`^main\.launch\.coro(\.func[0-9]+)?$`, `^main\.imported\.coro(\.func[0-9]+)?$`} {
 					cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s", pattern, exe)
 					data, err := cmd.CombinedOutput()
-					if err != nil || !strings.Contains(string(data), "runtime.coroSpawn(SB)") || strings.Contains(string(data), "runtime.newproc(SB)") {
+					if err != nil || !strings.Contains(string(data), "runtime.coroSpawnFrameTail(SB)") || strings.Contains(string(data), "runtime.newproc(SB)") {
 						t.Fatalf("plain target did not use native spawn: %v\n%s", err, data)
 					}
 				}

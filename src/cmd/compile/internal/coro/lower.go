@@ -4433,6 +4433,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			positions[i] = states[i].panicValue.Pos()
 		}
 	}
+	// Completion from this resume must end its frame without executing
+	// user code, publishing results, or returning to a fused parent.
+	tailSpawn := !candidate.fusedFrame &&
+		len(candidate.defers) == 0 && !candidate.dynamicDefers && candidate.rangeOwner == nil &&
+		len(candidate.resultValues) == 0
 	channelPairs := lowerChannelPairs(states, candidate)
 	awaitPCs := make(map[int]int)
 	for i, state := range states {
@@ -4478,7 +4483,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	var stateBodies ir.Nodes
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
-		for _, stmt := range state.body {
+		for stmtIndex, stmt := range state.body {
 			if assignment, ok := stmt.(*ir.AssignStmt); ok && candidate.rangeMarkers[assignment] != nil {
 				anchor := edit(assignment.X)
 				assignment.Y = typecheck.Call(assignment.Pos(), typecheck.LookupRuntime("coroRangeDefer"), ir.Nodes{ctx}, false)
@@ -4603,6 +4608,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					if child.frame != nil {
 						name = "coroSpawnFrame"
 						args = ir.Nodes{ctx, child.frame, child.resume}
+					}
+					if tailSpawn && stmtIndex == len(state.body)-1 && state.next == completeState &&
+						child.spawnGuard == nil {
+						name = "coroSpawnFrameTail"
+						frame := child.frame
+						if frame == nil {
+							frame = ir.NewNilExpr(goStmt.Pos(), types.Types[types.TUNSAFEPTR])
+						}
+						args = ir.Nodes{ctx, frame, child.resume}
 					}
 					var spawn ir.Node = typecheck.Call(goStmt.Pos(),
 						typecheck.LookupRuntime(name), args, false)

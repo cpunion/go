@@ -172,6 +172,7 @@ var runtimeDecls = [...]struct {
 	{"coroCompleteFusedFrame", funcTag, 123},
 	{"coroSpawn", funcTag, 134},
 	{"coroSpawnFrame", funcTag, 135},
+	{"coroSpawnFrameTail", funcTag, 135},
 	{"coroSpawnOpaque", funcTag, 136},
 	{"coroPanic", funcTag, 137},
 	{"coroPanicPending", funcTag, 138},

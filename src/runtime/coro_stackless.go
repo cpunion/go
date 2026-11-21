@@ -4138,6 +4138,17 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) bool {
 }
 
 func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
+	return stacklessCoroSpawnFrame(ctx, frame, child, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()), false)
+}
+
+// coroSpawnFrameTail is emitted when a successful spawn is immediately
+// followed by completion of the current resume's frame.
+func coroSpawnFrameTail(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
+	return stacklessCoroSpawnFrame(ctx, frame, child, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()), true)
+}
+
+func stacklessCoroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume,
+	callerPC uintptr, callerSP unsafe.Pointer, tail bool) bool {
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || parent == nil ||
@@ -4152,6 +4163,13 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine spawn outside resume")
 	}
+	// This root still has the sole driver, and its proven next action is
+	// completion. The public caller will start the detached owner without
+	// waiting for the root. A later spawn or host call will prepare
+	// replacement executors if the detached child needs them.
+	privateTail := tail && !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		s.privateRoot(parent) && !parent.hasFlag(stacklessCoroTaskFusedFrames) &&
+		s.executorState.Load() == stacklessCoroExecutorStateOff
 	task := s.takeReservedFrameTaskLocked(parent, frame, child)
 	if task == nil {
 		task = s.newTaskLocked(frame, child, nil)
@@ -4167,7 +4185,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	}
 	s.liveSpawns++
 	live := s.liveSpawns
-	s.registerGoroutineLocked(task, parent, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
+	s.registerGoroutineLocked(task, parent, callerPC, callerSP)
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
 	runnable := s.readyLocked(task)
 	// Give ready children an execution opportunity before a producer grows
@@ -4179,6 +4197,9 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
 		live <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
+	if privateTail {
+		return false
+	}
 	s.prepareReplacementExecutors()
 	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
 		// A host does not consume the scheduler's ordinary task queue. Its

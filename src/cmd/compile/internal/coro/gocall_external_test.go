@@ -246,7 +246,7 @@ func main() { check(); println("go-call-argument-panic-ok") }
 	}
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
 		"-s", `^main\.spawn\.coro(\.func[0-9]+)?$`, exe)
-	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "runtime.coroSpawnFrame(SB)") {
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "runtime.coroSpawnFrameTail(SB)") {
 		t.Fatalf("missing native frame spawn: %v\n%s", err, out)
 	}
 }
