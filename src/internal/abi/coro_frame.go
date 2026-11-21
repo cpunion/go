@@ -24,12 +24,14 @@ const (
 )
 
 // The fused frame marker starts with direct allocations, followed by
-// validated typed chunk elements. The self-await compiler path borrows only
-// an interior element whose successor belongs to the same typed allocation.
+// validated typed chunk elements. Heterogeneous frames also record the
+// suspended parent's resume and whether that parent has a fused header.
 const (
 	CoroFrameChunkSize            = 8
 	CoroLargeFrameChunkSize       = 4
 	CoroFrameChunkFirst           = 7
 	CoroFrameChunkValidated uint8 = 1 << 4
 	CoroFrameShortChunk     uint8 = 1 << 5
+	CoroFrameFusedParent    uint8 = 1 << 6
+	CoroFrameSavedResume    uint8 = 1 << 7
 )

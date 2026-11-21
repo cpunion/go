@@ -320,8 +320,6 @@ var runtimeDecls = [...]struct {
 	{"coroTakeFrameChunk", funcTag, 207},
 	{"coroTakeSelfFrame", funcTag, 207},
 	{"coroTakeFusedFrame", funcTag, 208},
-	{"coroPrepareCompatibleFusedChunk", funcTag, 207},
-	{"coroEnterCompatibleFusedChunk", funcTag, 133},
 	{"coroSemacquireMutex", funcTag, 211},
 	{"coroSemacquire", funcTag, 212},
 	{"coroSemacquireWaitGroup", funcTag, 213},
@@ -334,10 +332,13 @@ var runtimeDecls = [...]struct {
 	{"coroAdvanceSelfChunk", funcTag, 220},
 	{"coroPopSelfChunk", funcTag, 123},
 	{"coroTakeSelfChunk", funcTag, 221},
+	{"coroTakeFusedChunkBoundary", funcTag, 222},
+	{"coroAdvanceFusedChunk", funcTag, 223},
+	{"coroPopFusedChunk", funcTag, 123},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [222]*types.Type
+	var typs [224]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -560,6 +561,8 @@ func runtimeTypes() []*types.Type {
 	typs[219] = newSig(params(typs[7], typs[107], typs[3], typs[141], typs[6]), params(typs[6]))
 	typs[220] = newSig(params(typs[7], typs[7], typs[71]), params(typs[71]))
 	typs[221] = newSig(params(typs[7], typs[5], typs[1]), params(typs[7]))
+	typs[222] = newSig(params(typs[123], typs[5], typs[1]), params(typs[7]))
+	typs[223] = newSig(params(typs[7], typs[7], typs[71], typs[123]), params(typs[71]))
 	return typs[:]
 }
 

@@ -32,7 +32,7 @@ func FIRST(n, kind int) int {
 		if kind == 1 { var missing *int; return *missing }
 		return *p
 	}
-	child := SECOND(n-1, kind)
+	child := SECOND(operand(0, n-1), operand(1, kind))
 	after++
 	return child + *p
 }
@@ -42,6 +42,13 @@ import "runtime"
 var gcRequest = make(chan bool)
 var gcDone = make(chan bool)
 var after int
+var operands int
+var wrongOrder bool
+func operand(index, value int) int {
+	if index != operands%2 { wrongOrder = true }
+	operands++
+	return value
+}
 func collect() { for range gcRequest { runtime.GC(); gcDone <- true } }
 func invoke(n, kind int) (result int, recovered any) {
 	defer func() { recovered = recover() }()
@@ -54,7 +61,9 @@ func main() {
 		for _, depth := range []int{0, 1, 64, 256, 262, 263, 264, 267, 268, 4096} {
 			for kind := 0; kind < 2; kind++ {
 				after = 0
+				operands, wrongOrder = 0, false
 				got, recovered := invoke(depth, kind)
+				if wrongOrder || operands != 2*depth { panic("fused await operands") }
 				if kind == 0 {
 					if recovered != nil || got != depth*(depth+1)/2 || after != depth {
 						panic("normal fused completion")
@@ -89,14 +98,14 @@ func main() {
 			if config.experiment == "coro" {
 				for _, name := range []string{"first", "second"} {
 					cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-						"-s", `^main\.`+name+`\.coro(\.func[0-9]+|\.chunk)?$`, exe)
+						"-s", `^main\.`+name+`\.coro(\.func[0-9]+)?$`, exe)
 					out, err := cmd.CombinedOutput()
 					if err != nil {
 						t.Fatalf("objdump: %v\n%s", err, out)
 					}
 					for _, helper := range []string{
 						"coroRequestFusedFrame", "coroTakeFusedFrame", "coroAwaitFusedFrame", "coroCompleteFusedFrame",
-						"coroPrepareCompatibleFusedChunk", "coroEnterCompatibleFusedChunk",
+						"coroTakeFusedChunkBoundary", "coroAdvanceFusedChunk", "coroPopFusedChunk",
 					} {
 						if !strings.Contains(string(out), "runtime."+helper+"(SB)") {
 							t.Fatalf("%s missing %s:\n%s", name, helper, out)

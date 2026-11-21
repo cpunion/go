@@ -96,8 +96,8 @@ const (
 	stacklessCoroFusedFrameAllocationMask uint8 = 1<<4 - 1
 	stacklessCoroFusedFrameChunkValidated uint8 = abi.CoroFrameChunkValidated
 	stacklessCoroFusedFrameShortChunk     uint8 = abi.CoroFrameShortChunk
-	stacklessCoroFusedFrameParent         uint8 = 1 << 6
-	stacklessCoroFusedFrameResume         uint8 = 1 << 7
+	stacklessCoroFusedFrameParent         uint8 = abi.CoroFrameFusedParent
+	stacklessCoroFusedFrameResume         uint8 = abi.CoroFrameSavedResume
 )
 
 // A short bounded retry window covers local pipe and loopback delivery without
@@ -2772,66 +2772,51 @@ func stacklessCoroTakeWholeFusedChunk(child stacklessCoroResume, size uintptr, c
 	return newobject(chunkType)
 }
 
-// coroPrepareCompatibleFusedChunk reserves the next slot of a validated
-// short chunk for a compiler-proven identical frame type. The active task
-// owns its chunk. A native executor can also take the next typed chunk from
-// its own cache. Direct frames and distinct tasks use the ordinary factory.
-func coroPrepareCompatibleFusedChunk(ctx unsafe.Pointer, child stacklessCoroResume, size uintptr, chunkType *_type) unsafe.Pointer {
-	if raceenabled || ctx == nil {
-		return nil
-	}
-	context := (*stacklessCoroContext)(ctx)
-	parent := context.task()
-	s := context.scheduler
-	if s == nil || stacklessCoroIsPullComparison(s) ||
-		parent.flags&stacklessCoroTaskCompletionMask != stacklessCoroTaskFusedFrames ||
-		parent.state != stacklessCoroTaskRunning || !parent.resuming || parent.readyPending ||
-		parent.terminal != stacklessCoroTerminalNone || parent.goexit || context.frame == nil || parent.resume == nil {
-		return nil
-	}
-	oldFrame := context.frame
-	old := (*stacklessCoroFusedFrameHeader)(oldFrame)
-	const chunkMask = stacklessCoroFusedFrameChunkValidated | stacklessCoroFusedFrameShortChunk
-	const last = stacklessCoroFusedFrameChunkFirst + stacklessCoroLargeFrameChunkSize - 1
-	marker := old.marker
-	index := marker & stacklessCoroFusedFrameAllocationMask
-	if marker&chunkMask != chunkMask || index < stacklessCoroFusedFrameChunkFirst || index > last ||
-		old.owner != nil || old.parent == nil {
-		return nil
-	}
-	var frame unsafe.Pointer
-	next := index + 1
-	if index == last {
-		if !getg().stackIsFixed() {
-			return nil
-		}
-		frame = stacklessCoroTakeWholeFusedChunk(child, size, chunkType)
-		next = stacklessCoroFusedFrameChunkFirst
-	} else {
-		frame = add(oldFrame, size)
-	}
-	header := (*stacklessCoroFusedResumeFrameHeader)(frame)
-	header.resume = stacklessCoroResumeIdentity(parent.resume)
-	header.parent = oldFrame
-	header.marker = next | chunkMask | stacklessCoroFusedFrameParent | stacklessCoroFusedFrameResume
-	return frame
+// coroTakeFusedChunkBoundary allocates the next typed chunk of a local
+// structured await whose active slot is at the end of its compatible chunk.
+func coroTakeFusedChunkBoundary(child stacklessCoroResume, size uintptr, chunkType *_type) unsafe.Pointer {
+	return stacklessCoroTakeWholeFusedChunk(child, size, chunkType)
 }
 
-// coroEnterCompatibleFusedChunk publishes a reserved slot after the generated
-// factory has initialized its fields. The factory performs only stores between
-// the two calls, so ownership and the active task cannot change.
-func coroEnterCompatibleFusedChunk(ctx, frame unsafe.Pointer, child stacklessCoroResume) uint8 {
-	stacklessCoroBeginProfileTransition()
+// coroAdvanceFusedChunk installs an initialized compatible frame. Its
+// parent is already fused, so only the active frame and resume change.
+func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stacklessCoroResume) uint8 {
 	context := (*stacklessCoroContext)(ctx)
-	parent := context.task()
+	task := context.task()
+	header := (*stacklessCoroFusedResumeFrameHeader)(frame)
+	header.parent = context.frame
+	header.resume = stacklessCoroResumeIdentity(task.resume)
+	header.marker = marker
+	stacklessCoroBeginProfileTransition()
 	mp := acquirem()
 	context.frame = frame
-	parent.resume = child
+	task.resume = child
 	releasem(mp)
+	return switchStacklessCoroFusedChunk(context, task)
+}
+
+// coroPopFusedChunk returns an interior slot to its chunk. The parent is
+// still fused. Publish the saved parent pair before clearing the old slot.
+func coroPopFusedChunk(ctx unsafe.Pointer) uint8 {
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	header := (*stacklessCoroFusedResumeFrameHeader)(context.frame)
+	stacklessCoroBeginProfileTransition()
+	mp := acquirem()
+	context.frame = header.parent
+	task.resume = *(*stacklessCoroResume)(unsafe.Pointer(&header.resume))
+	releasem(mp)
+	header.parent = nil
+	header.resume = nil
+	header.marker = 0
+	return switchStacklessCoroFusedChunk(context, task)
+}
+
+func switchStacklessCoroFusedChunk(context *stacklessCoroContext, task *stacklessCoroTask) uint8 {
 	if context.scheduler.runnableState.Load() != 0 {
 		return stacklessCoroActionYield
 	}
-	parent.setFlag(stacklessCoroTaskSwitchPending, true)
+	task.setFlag(stacklessCoroTaskSwitchPending, true)
 	return stacklessCoroActionSwitch
 }
 
