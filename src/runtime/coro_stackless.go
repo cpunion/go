@@ -740,6 +740,12 @@ func runStacklessCoroRoot(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 // caller can return, panic, or Goexit as soon as rootDone closes; this owner
 // and the existing replacement executors remain until all spawned tasks end.
 func (s *stacklessCoroScheduler) runOwner() {
+	// A short detached episode can get its P from runnext and wake the
+	// same producer in runnext before an ordinary goroutine runs. Yield
+	// on the owner's ordinary stack when there is local competition.
+	if gomaxprocs == 1 && stacklessCoroHostRunnable() {
+		Gosched()
+	}
 	var native stacklessCoroNativeDriver
 	for !s.drained() {
 		next := native.run(s, false, false)
