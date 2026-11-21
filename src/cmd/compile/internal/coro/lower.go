@@ -117,7 +117,8 @@ type lowerCandidate struct {
 	frameDefers       map[*ir.Func]bool
 	fusedAwaits       map[*ir.CallExpr]bool
 	fusedRequests     map[*ir.CallExpr]bool
-	fusedChunkProofs  map[*ir.CallExpr]ir.Node
+	fusedChunkProofs  map[*ir.CallExpr]*fusedChunkProof
+	buildChunkFactory func() *ir.Func
 	fusedFrame        bool
 	fusedResume       bool
 	fusedSelf         bool
@@ -2086,6 +2087,7 @@ func canFuseRecover(plan *Plan, function *Function) bool {
 // identity proves the allocation has the same pointer bitmap, while the
 // allocator check prevents each complete chunk from increasing heap bytes.
 func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
+	firstFactory := len(typecheck.Target.Funcs)
 	for _, parent := range candidates {
 		for call, proof := range parent.fusedChunkProofs {
 			edge := edgeForCall(parent.function, call)
@@ -2097,11 +2099,30 @@ func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 				types.Identical(parent.frameType, child.frameType) &&
 				explicitFrameChunkFitsAllocation(child.frameType.Size(),
 					child.frameChunkLength)
-			if compatible {
-				proof.SetVal(constant.MakeBool(true))
+			if !compatible {
+				continue
 			}
+			proof.literal.SetVal(constant.MakeBool(true))
+			if proof.await == nil || child.buildChunkFactory == nil {
+				continue
+			}
+			fast := child.buildChunkFactory()
+			if fast == nil {
+				continue
+			}
+			pos := proof.factory.Pos()
+			ir.WithFunc(proof.resume, func() {
+				call := typecheck.Call(pos, fast.Nname, proof.factory.Args, false)
+				proof.await.List = ir.Nodes{ir.NewReturnStmt(pos, ir.Nodes{call})}
+				typecheck.Stmts(proof.await.List)
+			})
 		}
 	}
+	// Factories are created on demand while visiting maps. Keep backend order
+	// deterministic when several independent compatible chains are present.
+	slices.SortFunc(typecheck.Target.Funcs[firstFactory:], func(a, b *ir.Func) int {
+		return strings.Compare(a.Sym().Name, b.Sym().Name)
+	})
 }
 
 func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
@@ -3969,14 +3990,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			ir.NewDecl(call.Pos(), ir.ODCL, frame),
 			ir.NewDecl(call.Pos(), ir.ODCL, childResume))
 		if candidate.fusedRequests[call] {
-			proof := ir.NewBool(call.Pos(), false)
+			literal := ir.NewBool(call.Pos(), false)
 			request := typecheck.Call(call.Pos(),
 				typecheck.LookupRuntime("coroRequestFusedFrame"),
-				ir.Nodes{ctx, proof}, false)
+				ir.Nodes{ctx, literal}, false)
 			if candidate.fusedChunkProofs == nil {
-				candidate.fusedChunkProofs = make(map[*ir.CallExpr]ir.Node)
+				candidate.fusedChunkProofs = make(map[*ir.CallExpr]*fusedChunkProof)
 			}
-			candidate.fusedChunkProofs[call] = request.(*ir.CallExpr).Args[1]
+			proof := &fusedChunkProof{literal: request.(*ir.CallExpr).Args[1]}
+			if len(edge.Targets) == 0 && frozenArgs == nil {
+				proof.factory = factoryCall.(*ir.CallExpr)
+			}
+			candidate.fusedChunkProofs[call] = proof
 			setup = append(setup, request)
 		}
 		setup = append(setup, assignment)
@@ -4760,6 +4785,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, assignResumePC(returnPC))
 			action := actionInvalid
 			var actionResult ir.Node
+			var fusedAwaitSetup int
+			var chunkProof *fusedChunkProof
 			switch state.transition {
 			case SiteSemaphore, SiteNotify:
 				if wait := state.wait; wait != nil {
@@ -4814,6 +4841,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				if err != nil {
 					return err
 				}
+				fusedAwaitSetup = len(body)
 				body = append(body, child.setup...)
 				name := "coroAwait"
 				args := ir.Nodes{ctx, child.resume}
@@ -4825,6 +4853,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					candidate.fusedAwaits[state.call]
 				if fusedAwait {
 					helper := "coroAwaitFusedFrame"
+					chunkProof = candidate.fusedChunkProofs[state.call]
 					edge := edgeForCall(function, state.call)
 					if edge.Callee == fn && localSelfFrames {
 						helper = "coroAwaitSelfFrame"
@@ -5064,8 +5093,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				actionResult = typedInt(pos, types.Types[types.TUINT8],
 					int64(action))
 			}
-			body = append(body, ir.NewReturnStmt(pos,
-				[]ir.Node{actionResult}))
+			ret := ir.NewReturnStmt(pos, ir.Nodes{actionResult})
+			if chunkProof != nil && chunkProof.factory != nil {
+				chunkProof.resume = resume
+				chunkProof.await = ir.NewBlockStmt(ret.Pos(), append(body[fusedAwaitSetup:], ret))
+				body = append(body[:fusedAwaitSetup:fusedAwaitSetup], chunkProof.await)
+			} else {
+				body = append(body, ret)
+			}
 		} else if state.switchStmt != nil {
 			// Let the ordinary switch lowering evaluate the tag and cases.
 			// Only selected bodies move into continuation states, so resuming
@@ -5527,6 +5562,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		}
 	}
 	declarations = initializedDeclarations
+	factoryPrologue := declarations
 	zeroLocals := zeroInitializedFrameLocals(declarations)
 	var zeroBytes int64
 	for _, variable := range closureVars {
@@ -5653,6 +5689,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				ir.NewNilExpr(pos, fusedResumeField.Type)))
 		}
 	}
+	initializers := len(declarations)
 	for i, variable := range closureVars {
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
 		if array := candidate.rootArray; array != nil && variable.Outer.Canonical() == array.buffer {
@@ -5709,6 +5746,16 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		frameResult, factoryResume,
 	}))
 	typecheck.Stmts(factory.Body)
+
+	if fusedResumeField != nil && candidate.rootArray == nil && candidate.frameChunkLength == explicitLargeFrameChunkSize {
+		// Older frames from this typed array were reset when they completed.
+		// Reuse the ordinary operand initialization, including array clears.
+		candidate.buildChunkFactory = func() *ir.Func {
+			fast := newFusedChunkFactory(candidate, resume, factoryFrame, needsArrayZero, factoryPrologue, declarations[initializers:])
+			candidate.buildChunkFactory = func() *ir.Func { return fast }
+			return fast
+		}
+	}
 
 	ir.CurFunc = fn
 	inputs := fn.Type().RecvParams()

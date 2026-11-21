@@ -320,6 +320,8 @@ var runtimeDecls = [...]struct {
 	{"coroTakeFrameChunk", funcTag, 207},
 	{"coroTakeSelfFrame", funcTag, 207},
 	{"coroTakeFusedFrame", funcTag, 208},
+	{"coroPrepareCompatibleFusedChunk", funcTag, 207},
+	{"coroEnterCompatibleFusedChunk", funcTag, 133},
 	{"coroSemacquireMutex", funcTag, 211},
 	{"coroSemacquire", funcTag, 212},
 	{"coroSemacquireWaitGroup", funcTag, 213},

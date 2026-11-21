@@ -89,15 +89,21 @@ func main() {
 			if config.experiment == "coro" {
 				for _, name := range []string{"first", "second"} {
 					cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-						"-s", `^main\.`+name+`\.coro(\.func[0-9]+)?$`, exe)
+						"-s", `^main\.`+name+`\.coro(\.func[0-9]+|\.chunk)?$`, exe)
 					out, err := cmd.CombinedOutput()
 					if err != nil {
 						t.Fatalf("objdump: %v\n%s", err, out)
 					}
-					for _, helper := range []string{"coroRequestFusedFrame", "coroTakeFusedFrame", "coroAwaitFusedFrame", "coroCompleteFusedFrame"} {
+					for _, helper := range []string{
+						"coroRequestFusedFrame", "coroTakeFusedFrame", "coroAwaitFusedFrame", "coroCompleteFusedFrame",
+						"coroPrepareCompatibleFusedChunk", "coroEnterCompatibleFusedChunk",
+					} {
 						if !strings.Contains(string(out), "runtime."+helper+"(SB)") {
 							t.Fatalf("%s missing %s:\n%s", name, helper, out)
 						}
+					}
+					if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+						t.Fatalf("%s exceeded the native stack budget", name)
 					}
 				}
 			}

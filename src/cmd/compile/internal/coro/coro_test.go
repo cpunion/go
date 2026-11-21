@@ -11,6 +11,7 @@ import (
 	"internal/testenv"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -6451,8 +6452,9 @@ func main() {
 			true,
 		},
 	} {
+		resumeSymbols := test.resume + "|^" + regexp.QuoteMeta(test.factory+".chunk") + "$"
 		cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-			"-s", test.resume, exe)
+			"-s", resumeSymbols, exe)
 		data, err = cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("objdump of %s failed: %v\n%s",

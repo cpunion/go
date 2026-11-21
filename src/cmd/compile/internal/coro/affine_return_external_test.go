@@ -73,7 +73,7 @@ func TestAffineReturnNativeAndOrdinaryBodies(t *testing.T) {
 		if err != nil || len(out) == 0 {
 			t.Fatalf("missing native body %s: %v %s", name, err, out)
 		}
-		recursive := false
+		recursive := strings.Contains(string(out), ".coro.chunk(SB)")
 		for _, symbol := range []string{"coroTakeSelfFrame", "coroAwaitSelfFrame", "coroTakeFusedFrame", "coroAwaitFusedFrame"} {
 			recursive = recursive || strings.Contains(string(out), symbol)
 		}

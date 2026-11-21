@@ -2726,6 +2726,69 @@ func stacklessCoroTakeWholeFusedChunk(child stacklessCoroResume, size uintptr, c
 	return newobject(chunkType)
 }
 
+// coroPrepareCompatibleFusedChunk reserves the next slot of a validated
+// short chunk for a compiler-proven identical frame type. The active task
+// owns its chunk. A native executor can also take the next typed chunk from
+// its own cache. Direct frames and distinct tasks use the ordinary factory.
+func coroPrepareCompatibleFusedChunk(ctx unsafe.Pointer, child stacklessCoroResume, size uintptr, chunkType *_type) unsafe.Pointer {
+	if raceenabled || ctx == nil {
+		return nil
+	}
+	context := (*stacklessCoroContext)(ctx)
+	parent := context.task()
+	s := context.scheduler
+	if s == nil || stacklessCoroIsPullComparison(s) ||
+		parent.flags&stacklessCoroTaskCompletionMask != stacklessCoroTaskFusedFrames ||
+		parent.state != stacklessCoroTaskRunning || !parent.resuming || parent.readyPending ||
+		parent.terminal != stacklessCoroTerminalNone || parent.goexit || context.frame == nil || parent.resume == nil {
+		return nil
+	}
+	oldFrame := context.frame
+	old := (*stacklessCoroFusedFrameHeader)(oldFrame)
+	const chunkMask = stacklessCoroFusedFrameChunkValidated | stacklessCoroFusedFrameShortChunk
+	const last = stacklessCoroFusedFrameChunkFirst + stacklessCoroLargeFrameChunkSize - 1
+	marker := old.marker
+	index := marker & stacklessCoroFusedFrameAllocationMask
+	if marker&chunkMask != chunkMask || index < stacklessCoroFusedFrameChunkFirst || index > last ||
+		old.owner != nil || old.parent == nil {
+		return nil
+	}
+	var frame unsafe.Pointer
+	next := index + 1
+	if index == last {
+		if !getg().stackIsFixed() {
+			return nil
+		}
+		frame = stacklessCoroTakeWholeFusedChunk(child, size, chunkType)
+		next = stacklessCoroFusedFrameChunkFirst
+	} else {
+		frame = add(oldFrame, size)
+	}
+	header := (*stacklessCoroFusedResumeFrameHeader)(frame)
+	header.resume = stacklessCoroResumeIdentity(parent.resume)
+	header.parent = oldFrame
+	header.marker = next | chunkMask | stacklessCoroFusedFrameParent | stacklessCoroFusedFrameResume
+	return frame
+}
+
+// coroEnterCompatibleFusedChunk publishes a reserved slot after the generated
+// factory has initialized its fields. The factory performs only stores between
+// the two calls, so ownership and the active task cannot change.
+func coroEnterCompatibleFusedChunk(ctx, frame unsafe.Pointer, child stacklessCoroResume) uint8 {
+	stacklessCoroBeginProfileTransition()
+	context := (*stacklessCoroContext)(ctx)
+	parent := context.task()
+	mp := acquirem()
+	context.frame = frame
+	parent.resume = child
+	releasem(mp)
+	if context.scheduler.runnableState.Load() != 0 {
+		return stacklessCoroActionYield
+	}
+	parent.setFlag(stacklessCoroTaskSwitchPending, true)
+	return stacklessCoroActionSwitch
+}
+
 // coroAwaitFusedFrame switches a compiler-proven structured await to child
 // without creating a logical task. An already-runnable sibling keeps queue
 // priority; otherwise the current executor can enter child immediately.

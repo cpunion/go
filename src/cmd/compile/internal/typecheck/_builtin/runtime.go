@@ -384,6 +384,8 @@ func coroTakeTypedTaskFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr,
 func coroTakeFrameChunk(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeSelfFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroTakeFusedFrame(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte, bool) unsafe.Pointer
+func coroPrepareCompatibleFusedChunk(unsafe.Pointer, func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
+func coroEnterCompatibleFusedChunk(unsafe.Pointer, unsafe.Pointer, func(unsafe.Pointer) uint8) uint8
 
 // stackless coroutine synchronization
 func coroSemacquireMutex(unsafe.Pointer, *uint32, bool, int, *unsafe.Pointer) bool
