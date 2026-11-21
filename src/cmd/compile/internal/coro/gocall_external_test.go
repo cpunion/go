@@ -217,7 +217,7 @@ import "runtime"
 var started bool
 func argument() int { panic(42) }
 func worker(value int) { started = true; runtime.Gosched() }
-func spawn() { go worker(argument()) }
+func spawn() { runtime.Gosched(); go worker(argument()) }
 func check() {
 	defer func() {
 		if recover() != 42 || started { panic("argument panic escaped its caller or spawned a child") }

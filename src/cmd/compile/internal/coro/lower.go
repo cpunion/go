@@ -664,7 +664,14 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 		lowerAffineRootEntry(candidate)
 		if candidate.ordinary != nil {
-			addOrdinaryBody(function.Func, candidate.ordinary, rangeBodyEntryAnchors(candidate)...)
+			if directSpawnEntrySupported(plan, candidates, candidate) {
+				fn := function.Func
+				remapOrdinaryBody(fn, candidate.ordinary)
+				fn.Body = candidate.ordinary.Body
+				ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+			} else {
+				addOrdinaryBody(function.Func, candidate.ordinary, rangeBodyEntryAnchors(candidate)...)
+			}
 		}
 		if resumeFactorySupported(function.Func) {
 			function.Factory = candidate.factoryABI

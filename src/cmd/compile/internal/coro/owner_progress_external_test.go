@@ -28,6 +28,7 @@ import (
 )
 
 var stop atomic.Bool
+var launched int
 
 //go:noinline
 func wakeProducer(done chan<- struct{}) {
@@ -36,7 +37,10 @@ func wakeProducer(done chan<- struct{}) {
 }
 
 //go:noinline
-func startWorker(done chan<- struct{}) { go wakeProducer(done) }
+func startWorker(done chan<- struct{}) {
+	launched++
+	go wakeProducer(done)
+}
 
 //go:noinline
 func churn(ready chan<- struct{}, rounds chan<- int) {
@@ -49,6 +53,7 @@ body:
 		startWorker(done)
 		<-done
 	}
+	if launched != n { panic("incorrect launch count") }
 	rounds <- n
 }
 

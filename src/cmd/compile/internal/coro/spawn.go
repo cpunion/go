@@ -32,6 +32,52 @@ func (p *Plan) PreserveGoCalls() {
 	}
 }
 
+// directSpawnEntrySupported keeps the public source go statement when the
+// caller has no continuation work of its own. The ordinary goroutine created
+// by go enters the child's public entry, which still checks its native gate
+// and execution context. Calls from an active native frame use the producer's
+// existing factory.
+func directSpawnEntrySupported(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
+	candidate *lowerCandidate) bool {
+	fn := candidate.function
+	if fn.Effect != NoSuspend || fn.Func.Type().NumResults() != 0 ||
+		len(fn.Sites) != 1 || fn.Sites[0].Kind != SiteSpawn ||
+		candidate.rangeOwner != nil || candidate.rangeBody != nil {
+		return false
+	}
+	body := candidate.ordinary.Body
+	if len(body) == 2 {
+		if ret, ok := body[1].(*ir.ReturnStmt); ok && len(ret.Init()) == 0 && len(ret.Results) == 0 {
+			body = body[:1]
+		}
+	}
+	if len(body) != 1 || body[0].Op() != ir.OGO {
+		return false
+	}
+	call, ok := fn.Sites[0].Node.(*ir.CallExpr)
+	if !ok {
+		return false
+	}
+	edge := edgeForCall(fn, call)
+	if edge.Kind != GoCall || edge.Callee == nil || edge.ValueCall || len(edge.Targets) != 0 {
+		return false
+	}
+	// Reading the source body also copies any local closure literal. Only
+	// a named entry still refers to the same lowered child in that copy.
+	if edge.Callee.OClosure != nil {
+		return false
+	}
+	if child := candidates[edge.Callee]; child != nil {
+		return child.function.Effect == MaySuspend
+	}
+	if plan.Functions[edge.Callee] != nil {
+		return false
+	}
+	summary, known := plan.edgeSummary(edge)
+	return known && summary.Primary() == CoroPrimary &&
+		summary.Effect == MaySuspend && summary.Factory != NoFactory
+}
+
 // plainSpawnFactorySupported admits a static go target that can finish on the
 // executor without yielding or requiring terminal-control rewriting. Until
 // execution summaries describe bounded plain calls, reject calls and loops.
