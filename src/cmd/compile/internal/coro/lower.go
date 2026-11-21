@@ -3229,6 +3229,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	resumePC := capture(pc)
 	candidate.resumePC = resumePC
+	var returnValue *ir.Name
+	if keepsReturnInResume(candidate) && captureCell(candidate.resultValues[0]) == nil {
+		returnValue = typecheck.TempAt(pos, resume, candidate.resultValues[0].Type())
+		resumeLocals = append(resumeLocals, returnValue)
+	}
 	var resumeDeferToken *ir.Name
 	if deferToken != nil {
 		resumeDeferToken = capture(deferToken)
@@ -3534,6 +3539,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body := make(ir.Nodes, 0, len(stmt.Results))
 			for i, value := range stmt.Results {
 				result, _ := fn.Type().Result(i).Nname.(*ir.Name)
+				if returnValue != nil {
+					result = returnValue
+				}
 				body = append(body, ir.NewAssignStmt(stmt.Pos(), result, value))
 			}
 			entry := lowerStatements(body, completeState)
@@ -4808,7 +4816,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
-				result := edit(value)
+				var result ir.Node = returnValue
+				if returnValue != nil {
+					// Keep the public root's typed result slot in the layout.
+					capture(value)
+				} else {
+					result = edit(value)
+				}
 				if candidate.factoryABI == FactoryABI3 && captureCell(value) != nil {
 					// The root entry reads results from fixed frame slots. A
 					// boxed named result must keep its independently owned cell,
@@ -5308,6 +5322,40 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 
 	finishLowering(candidate, resume, declarations)
 	return nil
+}
+
+// keepsReturnInResume recognizes a result assigned only by an explicit
+// return. Resumption can occur while evaluating that expression. Its
+// assignment and publication follow in one invocation once evaluation
+// finishes. Deferred cleanup can suspend after assignment, and named or
+// otherwise referenced results can be updated before return.
+func keepsReturnInResume(candidate *lowerCandidate) bool {
+	if !candidate.fusedFrame || candidate.factoryABI != FactoryABI3 || len(candidate.resultValues) != 1 ||
+		len(candidate.defers) != 0 || candidate.dynamicDefers || candidate.rangeOwner != nil {
+		return false
+	}
+	fn := candidate.function.Func
+	field := fn.Type().Result(0)
+	result, ok := field.Nname.(*ir.Name)
+	if !ok || result.Sym() == nil || !strings.HasPrefix(result.Sym().Name, "~r") ||
+		field.Type.HasPointers() || field.Type.Size() > int64(types.PtrSize) {
+		return false
+	}
+	result = result.Canonical()
+	for _, statement := range fn.Body {
+		if ir.Any(statement, func(n ir.Node) bool {
+			switch n := n.(type) {
+			case *ir.Name:
+				return n.Canonical() == result
+			case *ir.ReturnStmt:
+				return len(n.Results) != 1
+			}
+			return false
+		}) {
+			return false
+		}
+	}
+	return true
 }
 
 // The runtime owns the explicit context and its aligned terminal bytes.
