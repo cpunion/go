@@ -58,6 +58,11 @@ func clearRewrittenVariableDefinitions(funcs []*ir.Func) {
 // Native factories bypass this entry and never execute the ordinary body.
 func addOrdinaryBody(fn, ordinary *ir.Func, anchors ...*ir.Name) {
 	remapOrdinaryBody(fn, ordinary)
+	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), ordinaryEntryCondition(fn, anchors), ordinary.Body, fn.Body)}
+	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+}
+
+func ordinaryEntryCondition(fn *ir.Func, anchors []*ir.Name) ir.Node {
 	condition := typecheck.Call(fn.Pos(), typecheck.LookupRuntime("coroUseOrdinary"), nil, false)
 	gate := ir.NewIndexExpr(fn.Pos(), nativeSourceGates[fn], ir.NewInt(fn.Pos(), 0))
 	condition = ir.NewLogicalExpr(fn.Pos(), ir.OOROR, condition,
@@ -71,8 +76,7 @@ func addOrdinaryBody(fn, ordinary *ir.Func, anchors ...*ir.Name) {
 	if base.Flag.Dynlink != nil && *base.Flag.Dynlink || base.Flag.LinkShared != nil && *base.Flag.LinkShared {
 		condition = ir.NewBool(fn.Pos(), true)
 	}
-	fn.Body = ir.Nodes{ir.NewIfStmt(fn.Pos(), condition, ordinary.Body, fn.Body)}
-	ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
+	return condition
 }
 
 // remapOrdinaryBody installs independent declarations and captures without

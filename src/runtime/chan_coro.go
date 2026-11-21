@@ -128,6 +128,70 @@ func tryStacklessCoroChanRecv(ctx unsafe.Pointer, channel *hchan,
 	return true
 }
 
+// Public entries can perform a ready operation before creating a scheduler.
+// The locked buffer path applies when no peer or channel instrumentation
+// needs the general channel transition.
+func coroEntryChanSend(c *hchan, element unsafe.Pointer) bool {
+	if !raceenabled && !debugChan && c != nil && c.dataqsiz != 0 && c.bubble == nil {
+		lock(&c.lock)
+		if c.closed == 0 && c.recvq.first == nil {
+			if c.qcount < c.dataqsiz {
+				if c.elemsize != 0 {
+					typedmemmove(c.elemtype, chanbuf(c, c.sendx), element)
+				}
+				advanceStacklessCoroSend(c)
+				unlock(&c.lock)
+				return true
+			}
+			unlock(&c.lock)
+			return false
+		}
+		unlock(&c.lock)
+	}
+	return chansend(c, element, false, sys.GetCallerPC())
+}
+
+func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
+	if !raceenabled && !debugChan && c != nil && c.dataqsiz != 0 && c.bubble == nil && c.timer == nil {
+		lock(&c.lock)
+		if c.sendq.first == nil && (c.qcount != 0 || c.closed == 0) {
+			if c.qcount != 0 {
+				if c.elemsize != 0 {
+					slot := chanbuf(c, c.recvx)
+					if element != nil {
+						typedmemmove(c.elemtype, element, slot)
+					}
+					typedmemclr(c.elemtype, slot)
+				}
+				advanceStacklessCoroRecv(c)
+				unlock(&c.lock)
+				return true, true
+			}
+			unlock(&c.lock)
+			return false, false
+		}
+		unlock(&c.lock)
+	}
+	return chanrecv(c, element, false)
+}
+
+// Callers move the slot's contents and advance its index while holding c.lock.
+func advanceStacklessCoroSend(c *hchan) {
+	c.sendx++
+	if c.sendx == c.dataqsiz {
+		c.sendx = 0
+	}
+	c.qcount++
+}
+
+func advanceStacklessCoroRecv(c *hchan) {
+	c.recvx++
+	if c.recvx == c.dataqsiz {
+		c.recvx = 0
+	}
+	c.qcount--
+}
+
 // chansendStackless starts op without parking the executor goroutine.
 func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Pointer) {
 	if c == nil {
@@ -159,11 +223,7 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 			racenotify(c, c.sendx, nil)
 		}
 		typedmemmove(c.elemtype, qp, element)
-		c.sendx++
-		if c.sendx == c.dataqsiz {
-			c.sendx = 0
-		}
-		c.qcount++
+		advanceStacklessCoroSend(c)
 		unlock(&c.lock)
 		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return
@@ -221,11 +281,7 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 			typedmemmove(c.elemtype, element, qp)
 		}
 		typedmemclr(c.elemtype, qp)
-		c.recvx++
-		if c.recvx == c.dataqsiz {
-			c.recvx = 0
-		}
-		c.qcount--
+		advanceStacklessCoroRecv(c)
 		unlock(&c.lock)
 		finishStacklessCoroChannel(unsafe.Pointer(op), nil, true)
 		return

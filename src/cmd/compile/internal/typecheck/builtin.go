@@ -328,6 +328,8 @@ var runtimeDecls = [...]struct {
 	{"coroSemreleasePoll", funcTag, 215},
 	{"coroSemrelease", funcTag, 216},
 	{"coroUseOrdinary", funcTag, 217},
+	{"coroEntryChanSend", funcTag, 119},
+	{"coroEntryChanRecv", funcTag, 120},
 	{"coroChanSendLocal", funcTag, 218},
 	{"coroChanRecvLocal", funcTag, 219},
 	{"coroAdvanceSelfChunk", funcTag, 220},

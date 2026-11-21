@@ -138,6 +138,7 @@ type lowerCandidate struct {
 	scalarSpawn       *scalarSpawnFactory
 	scalarSpawnSites  []scalarSpawnSite
 	affineRoot        *affineReturnPlan
+	channelEntry      *channelEntry
 }
 
 type lowerDirectCall struct {
@@ -664,7 +665,9 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		}
 		lowerAffineRootEntry(candidate)
 		if candidate.ordinary != nil {
-			if directSpawnEntrySupported(plan, candidates, candidate) {
+			if candidate.channelEntry != nil {
+				installChannelEntry(candidate, rangeBodyEntryAnchors(candidate)...)
+			} else if directSpawnEntrySupported(plan, candidates, candidate) {
 				fn := function.Func
 				remapOrdinaryBody(fn, candidate.ordinary)
 				fn.Body = candidate.ordinary.Body
@@ -3914,6 +3917,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	})
 	entryState := lowerStatements(fn.Body, completeState)
+	if entry := planChannelEntry(candidate, states); entry != nil {
+		candidate.channelEntry = entry
+		if entry.freeze {
+			wait := states[entry.waitState]
+			channel := *wait.channel
+			entry.frameChannel = typecheck.TempAt(channel.node.Pos(), factory, channel.channel.Type())
+			addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL, entry.frameChannel))
+			channel.channel = entry.frameChannel
+			if channel.sendValue != nil {
+				entry.frameValue = typecheck.TempAt(channel.node.Pos(), factory, channel.channel.Type().Elem())
+				addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL, entry.frameValue))
+				channel.sendValue = entry.frameValue
+			}
+			wait.channel = &channel
+			entry.waitState = addState(wait)
+		}
+	}
 	entry := states[entryState].body
 	candidate.entryZeroed = entryZeroedFrameLocals(entry)
 	if array := candidate.reusedArray; array != nil &&
@@ -5003,15 +5023,23 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				body = append(body, ir.NewAssignStmt(channel.node.Pos(),
 					channelValue, edit(operationChannel)))
+				frozenEntry := candidate.channelEntry != nil && candidate.channelEntry.freeze &&
+					candidate.channelEntry.waitState == i
+				if frozenEntry {
+					body = append(body, ir.NewAssignStmt(channel.node.Pos(),
+						edit(operationChannel), ir.NewZero(channel.node.Pos(), operationChannel.Type())))
+				}
 				var wait ir.Node
 				if channel.sendValue != nil {
-					value := typecheck.TempAt(channel.node.Pos(), factory,
-						elementType)
-					addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL,
-						value))
-					value = capture(value)
-					body = append(body, ir.NewAssignStmt(channel.node.Pos(),
-						value, edit(channel.sendValue)))
+					value := ir.Node(nil)
+					if frozenEntry {
+						value = edit(channel.sendValue)
+					} else {
+						slot := typecheck.TempAt(channel.node.Pos(), factory, elementType)
+						addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL, slot))
+						value = capture(slot)
+						body = append(body, ir.NewAssignStmt(channel.node.Pos(), value, edit(channel.sendValue)))
+					}
 					name := "coroChanSend"
 					args := ir.Nodes{ctx, channelValue, typecheck.NodAddr(value)}
 					if pair := channelPairs[i]; pair != 0 {
@@ -5962,8 +5990,20 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		ir.NewDecl(pos, ir.ODCL, newResume),
 		ir.NewDecl(pos, ir.ODCL, quiescentRoot),
 		assignFrame,
-		runFrame,
 	}
+	if entry := candidate.channelEntry; entry != nil && entry.freeze {
+		frame := typecheck.ConvNop(newFrame, framePointerType)
+		fn.Body.Append(ir.NewAssignStmt(pos,
+			explicitFrameField(pos, frame, outerFields[entry.frameChannel]), entry.channel))
+		if entry.frameValue != nil {
+			fn.Body.Append(ir.NewAssignStmt(pos,
+				explicitFrameField(pos, frame, outerFields[entry.frameValue]), entry.value))
+		}
+		fn.Body.Append(ir.NewAssignStmt(pos,
+			explicitFrameField(pos, frame, replacements[candidate.resumePC]),
+			typedInt(pos, types.Types[types.TUINT32], int64(entry.waitState))))
+	}
+	fn.Body.Append(runFrame)
 	fn.Body = append(fn.Body, copyResults...)
 	fn.Body = append(fn.Body, clearResultPointers...)
 	fn.Body = append(fn.Body,
