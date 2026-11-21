@@ -141,8 +141,16 @@ import (
 var entered, observed atomic.Bool
 
 //go:noinline
-func cachedLeaf(value *int) int {
-	runtime.Gosched()
+func cachedLeaf(value *int, inspect bool) int {
+	if inspect {
+		// Keep the warmed leaf active until the ordinary observer snapshots it.
+		entered.Store(true)
+		for !observed.Load() {
+			runtime.Gosched()
+		}
+	} else {
+		runtime.Gosched()
+	}
 	return *value
 }
 
@@ -156,20 +164,17 @@ func privateRoot(done chan int) int {
 	value := 9
 	total := 0
 	for i := 0; i < 32; i++ {
-		total += cachedLeaf(&value)
+		total += cachedLeaf(&value, false)
 	}
-	entered.Store(true)
-	for !observed.Load() {
-		if cachedLeaf(&value) != 9 {
-			panic("lost value across yield")
-		}
+	if cachedLeaf(&value, true) != 9 {
+		panic("lost value across yield")
 	}
 
 	// Start sharing the same scheduler after warming its fused holder cache.
 	// Later awaits must still interleave with siblings.
 	go worker(done)
 	for i := 0; i < 32; i++ {
-		total += cachedLeaf(&value)
+		total += cachedLeaf(&value, false)
 	}
 	return total + <-done
 }
