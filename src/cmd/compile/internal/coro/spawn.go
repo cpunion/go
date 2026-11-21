@@ -37,7 +37,7 @@ func (p *Plan) PreserveGoCalls() {
 // by go enters the child's public entry, which still checks its native gate
 // and execution context. Calls from an active native frame use the producer's
 // existing factory.
-func directSpawnEntrySupported(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
+func directSpawnEntrySupported(candidates map[*ir.Func]*lowerCandidate,
 	candidate *lowerCandidate) bool {
 	fn := candidate.function
 	if fn.Effect != NoSuspend || fn.Func.Type().NumResults() != 0 ||
@@ -67,15 +67,12 @@ func directSpawnEntrySupported(plan *Plan, candidates map[*ir.Func]*lowerCandida
 	if edge.Callee.OClosure != nil {
 		return false
 	}
-	if child := candidates[edge.Callee]; child != nil {
-		return child.function.Effect == MaySuspend
-	}
-	if plan.Functions[edge.Callee] != nil {
-		return false
-	}
-	summary, known := plan.edgeSummary(edge)
-	return known && summary.Primary() == CoroPrimary &&
-		summary.Effect == MaySuspend && summary.Factory != NoFactory
+	// A worker with deferred cleanup can remain parked while it owns
+	// captured arguments. Keep that worker on the logical scheduler.
+	// An imported summary does not establish this property.
+	child := candidates[edge.Callee]
+	return child != nil && child.function.Effect == MaySuspend &&
+		len(child.defers) == 0 && !child.dynamicDefers
 }
 
 // plainSpawnFactorySupported admits a static go target that can finish on the

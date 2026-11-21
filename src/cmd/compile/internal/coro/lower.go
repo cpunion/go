@@ -667,7 +667,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		if candidate.ordinary != nil {
 			if candidate.channelEntry != nil {
 				installChannelEntry(candidate, rangeBodyEntryAnchors(candidate)...)
-			} else if directSpawnEntrySupported(plan, candidates, candidate) {
+			} else if directSpawnEntrySupported(candidates, candidate) {
 				fn := function.Func
 				remapOrdinaryBody(fn, candidate.ordinary)
 				fn.Body = candidate.ordinary.Body
