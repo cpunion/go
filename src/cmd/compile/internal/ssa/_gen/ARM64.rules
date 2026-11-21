@@ -699,6 +699,10 @@
 (MOVDload [off1] {sym} (ADDconst [off2] ptr) mem) && ssa.Is32Bit(int64(off1)+off2)
 	&& (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink) =>
 	(MOVDload [off1+int32(off2)] {sym} ptr mem)
+// Negative address adjustments lower to SUBconst before the load is folded.
+(MOV(B|BU|H|HU|W|WU|D)load [off1] {sym} (SUBconst [off2] ptr) mem)
+	&& ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink) =>
+	(MOV(B|BU|H|HU|W|WU|D)load [off1-int32(off2)] {sym} ptr mem)
 (LDP [off1] {sym} (ADDconst [off2] ptr) mem) && ssa.Is32Bit(int64(off1)+off2)
 	&& (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink) =>
 	(LDP [off1+int32(off2)] {sym} ptr mem)
