@@ -42,25 +42,35 @@ func startStacklessCoroSocketRead(ctx unsafe.Pointer, fd int, buffer []byte, n *
 	stacklessCoroSocketReadStart(op, pd, true)
 }
 
-func startStacklessCoroSocketReadWithPollDesc(ctx unsafe.Pointer, pd uintptr,
-	fd int, buffer []byte, n *int, errno *uintptr) {
-	descriptor := (*pollDesc)(unsafe.Pointer(pd))
-	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
+//go:linkname poll_runtime_coroSocketRead internal/poll.runtime_coroSocketRead
+func poll_runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr,
+	fd int, buffer []byte, n *int, errno *uintptr) bool {
 	if len(buffer) == 0 {
-		registerStacklessCoroOperation(op)
-		stacklessCoroSocketReadFinish(op, 0, 0)
-		return
+		*n, *errno = 0, 0
+		return false
 	}
+	descriptor := (*pollDesc)(unsafe.Pointer(pd))
 	if descriptor == nil {
 		throw("runtime: nil stackless coroutine poll descriptor")
 	}
-	stacklessCoroSocketReadStart(op, descriptor, false)
-}
-
-//go:linkname poll_runtime_coroSocketRead internal/poll.runtime_coroSocketRead
-func poll_runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr,
-	fd int, buffer []byte, n *int, errno *uintptr) {
-	startStacklessCoroSocketReadWithPollDesc(ctx, pd, fd, buffer, n, errno)
+	if resetErr := poll_runtime_pollReset(descriptor, 'r'); resetErr != pollNoError {
+		*n, *errno = -1, stacklessCoroPollErrorTag|uintptr(resetErr)
+		return false
+	}
+	count := stacklessCoroRead(int32(fd), unsafe.Pointer(&buffer[0]), stacklessCoroReadLength(len(buffer)), true)
+	KeepAlive(buffer)
+	if count != -_EAGAIN {
+		*n, *errno = stacklessCoroReadResult(count)
+		return false
+	}
+	// The read lock keeps the descriptor borrowed until the caller finishes.
+	// Only a read that would block needs a registered operation.
+	op := newStacklessCoroSocketReadOperation(ctx, fd, buffer, n, errno)
+	registerStacklessCoroSocketRead(op, descriptor, false)
+	if !stacklessCoroSocketReadArm(op, descriptor) {
+		stacklessCoroSocketReadAttempt(op)
+	}
+	return true
 }
 
 func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
@@ -74,10 +84,14 @@ func newStacklessCoroSocketReadOperation(ctx unsafe.Pointer, fd int,
 }
 
 func stacklessCoroSocketReadStart(op *stacklessCoroOperation, pd *pollDesc, ownsPollDesc bool) {
+	registerStacklessCoroSocketRead(op, pd, ownsPollDesc)
+	stacklessCoroSocketReadAttempt(op)
+}
+
+func registerStacklessCoroSocketRead(op *stacklessCoroOperation, pd *pollDesc, ownsPollDesc bool) {
 	op.resourceState().packet[stacklessCoroPollDescWord] = uint64(uintptr(unsafe.Pointer(pd)))
 	op.resourceState().ownsPollDesc = ownsPollDesc
 	registerStacklessCoroOperation(op)
-	stacklessCoroSocketReadAttempt(op)
 }
 
 func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
@@ -104,16 +118,24 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 			stacklessCoroSocketReadFinish(op, count, readErrno)
 			return
 		}
-		waiting, waitErr := netpollCoroReadArm(pd, op)
-		if waitErr != pollNoError {
-			stacklessCoroSocketReadPollFinish(op, waitErr)
-			return
-		}
-		if waiting {
-			stacklessCoroNetpollInit()
+		if stacklessCoroSocketReadArm(op, pd) {
 			return
 		}
 	}
+}
+
+// stacklessCoroSocketReadArm reports whether the operation was armed or
+// completed with an error. If readiness raced with arming, the caller retries.
+func stacklessCoroSocketReadArm(op *stacklessCoroOperation, pd *pollDesc) bool {
+	waiting, waitErr := netpollCoroReadArm(pd, op)
+	if waitErr != pollNoError {
+		stacklessCoroSocketReadPollFinish(op, waitErr)
+		return true
+	}
+	if waiting {
+		stacklessCoroNetpollInit()
+	}
+	return waiting
 }
 
 // stacklessCoroPollIOAtIdle claims one I/O operation that belongs to s and does
