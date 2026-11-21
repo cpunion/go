@@ -34,6 +34,17 @@ func leaf(mode int) int {
 	return 42
 }
 
+func separateLeaf(mode int) int {
+	runtime.Gosched()
+	if mode == 2 { return *pointer }
+	return 37
+}
+
+func separate(mode int) (value int, recovered any) {
+	defer func() { recovered = recover() }()
+	return separateLeaf(mode), nil
+}
+
 func first(depth, mode int) int {
 	if depth == 0 {
 		value := leaf(mode)
@@ -91,6 +102,9 @@ func exiting(done chan bool) {
 
 func main() {
 	for range 10 {
+		if value, p := separate(0); value != 37 || p != nil { panic("ordinary child result changed") }
+		_, p := separate(2)
+		if _, ok := p.(runtime.Error); !ok { panic("ordinary child panic changed") }
 		if first(4096, 0) != 4138 { panic("normal result changed") }
 		if recovered(1) != 42 { panic("child panic was lost") }
 		if _, ok := recovered(2).(runtime.Error); !ok { panic("implicit panic was lost") }
@@ -134,7 +148,7 @@ func main() {
 				t.Fatalf("nm: %v\n%s", err, symbols)
 			}
 			native := config.experiment == "coro" && config.name != "race"
-			for _, name := range []string{"first", "second", "leaf", "third", "fourth", "terminalLeaf"} {
+			for _, name := range []string{"first", "second", "leaf", "third", "fourth", "terminalLeaf", "separateLeaf"} {
 				if got := strings.Contains(string(symbols), "main."+name+".coro"); got != native {
 					t.Errorf("%s native factory = %v, want %v\n%s", name, got, native, out)
 				}

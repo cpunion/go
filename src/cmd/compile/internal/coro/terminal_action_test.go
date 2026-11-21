@@ -13,6 +13,7 @@ func TestStableTerminalAction(t *testing.T) {
 		want   bool
 	}{
 		{"await", func(*lowerCandidate) {}, true},
+		{"separate", func(c *lowerCandidate) { c.fusedResume = false }, true},
 		{"yield", func(c *lowerCandidate) { c.function.Sites = append(c.function.Sites, Site{Kind: SiteYield}) }, true},
 		{"child-terminal", func(c *lowerCandidate) { c.function.Terminal = MayPanic | MayGoexit }, false},
 		{"no-factory", func(c *lowerCandidate) { c.factoryABI = NoFactory }, false},

@@ -2013,13 +2013,13 @@ func (candidate *lowerCandidate) localSelfFrameLoop() bool {
 		!candidate.fusedResume && len(candidate.defers) == 0
 }
 
-// stableTerminalAction reports whether a fused resume handles terminal
+// stableTerminalAction reports whether an explicit resume handles terminal
 // outcomes at entry. Await and yield return to the scheduler before a
 // child can publish a terminal outcome. An ordinary Go panic also unwinds the
 // resume and its next invocation checks the outcome. A pending outcome can
 // return directly when this frame owns no deferred cleanup.
 func (candidate *lowerCandidate) stableTerminalAction() bool {
-	if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
+	if candidate.factoryABI != FactoryABI3 || candidate.localSelfFrameLoop() ||
 		len(candidate.defers) != 0 || candidate.dynamicDefers || candidate.rangeOwner != nil ||
 		candidate.function.Terminal != 0 ||
 		len(candidate.function.Sites) == 0 {
@@ -3196,7 +3196,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resume.DeclareParams(true)
 	recordNativeStackEntry(resume, nativeStackGates[factory])
 	ctx := resume.Dcl[0]
-	directTerminal := terminalAware && !localSelfFrames && candidate.stableTerminalAction()
+	directTerminal := terminalAware && candidate.stableTerminalAction()
 	for _, name := range resumeLocals {
 		name.Curfn = resume
 		resume.Dcl = append(resume.Dcl, name)

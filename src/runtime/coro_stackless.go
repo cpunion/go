@@ -5098,6 +5098,25 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		unlock(&s.lock)
 		return nil, true, false
 	}
+	// Native FIFO rotation keeps the same ready count. Hosts and structured
+	// publications retain their routing and source metadata updates.
+	if dispatch && !getg().preempt && s.head != nil &&
+		!s.initialRootPrivate && !s.executorMonitorIdle && task.parent() == nil &&
+		s.lifetime.Load()&stacklessCoroLifetimeHostStarted == 0 &&
+		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
+		next = s.head
+		if next.state != stacklessCoroTaskRunnable || next.resuming || next.readyPending {
+			throw("runtime: dequeued non-runnable stackless coroutine")
+		}
+		task.state, task.resuming, task.next = stacklessCoroTaskRunnable, false, nil
+		s.tail.next = task
+		s.tail = task
+		s.head = next.next
+		next.state, next.resuming, next.next = stacklessCoroTaskRunning, true, nil
+		s.queueProgress += 2
+		unlock(&s.lock)
+		return next, false, false
+	}
 	task.resuming = false
 	runnable := s.readyLocked(task)
 	foreignReturner = runnable&stacklessCoroForeignReturnerBit != 0
