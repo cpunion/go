@@ -1740,6 +1740,19 @@ resumeActive:
 resumeOwned:
 	action := task.resume(unsafe.Pointer(&task.context))
 	state := getg().stacklessCoro
+	// Each chunk switch publishes the next frame and resume. Drive the
+	// lineage directly while the current executor owns its source and
+	// no deferred channel wake needs to be delivered.
+	if action == stacklessCoroActionChunkSwitch && native && !raceenabled {
+		idlePollSkip = nil
+		for state != nil && !state.channelWake && s.retainLogicalOwner(state) {
+			action = task.resume(unsafe.Pointer(&task.context))
+			state = getg().stacklessCoro
+			if action != stacklessCoroActionChunkSwitch {
+				break
+			}
+		}
+	}
 	if state != nil && state.channelWake {
 		state.channelWake = false
 		if action != stacklessCoroActionWait && action != stacklessCoroActionComplete {
