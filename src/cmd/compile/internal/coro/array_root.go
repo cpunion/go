@@ -166,7 +166,7 @@ func prepareRootArray(candidate *lowerCandidate) {
 // stronger property in addition to an ordinary escape-analysis result.
 func planRootArray(function *Function) *rootArrayPlan {
 	fn := function.Func
-	if len(fn.Body) < 3 || len(fn.Type().RecvParams()) > 4 || fn.Type().NumResults() != 1 ||
+	if len(fn.Type().RecvParams()) > 4 || fn.Type().NumResults() != 1 ||
 		!fn.Type().Result(0).Type.IsInteger() {
 		return nil
 	}
@@ -179,6 +179,16 @@ func planRootArray(function *Function) *rootArrayPlan {
 			return nil
 		}
 	}
+	return planFrameArray(function, 512)
+}
+
+// planFrameArray proves that the initial zero and one constant-index
+// assignment are the only writes, and that calls cannot retain the array.
+func planFrameArray(function *Function, minSize int64) *rootArrayPlan {
+	fn := function.Func
+	if len(fn.Body) < 3 {
+		return nil
+	}
 	zero, ok := fn.Body[0].(*ir.AssignStmt)
 	if !ok {
 		return nil
@@ -189,7 +199,7 @@ func planRootArray(function *Function) *rootArrayPlan {
 		return nil
 	}
 	types.CalcSize(array.Type())
-	if size := array.Type().Size(); size < 512 || size > 8<<10 {
+	if size := array.Type().Size(); size < minSize || size > 8<<10 {
 		return nil
 	}
 	write, ok := fn.Body[1].(*ir.AssignStmt)

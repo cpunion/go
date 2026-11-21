@@ -5,6 +5,7 @@
 package coro
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/typecheck"
@@ -131,6 +132,7 @@ type lowerCandidate struct {
 	selfSpawn         bool
 	heapLocals        map[*ir.Name]bool
 	rootArray         *rootArrayLowering
+	reusedArray       *frameArrayReuse
 	affineRoot        *affineReturnPlan
 }
 
@@ -2108,6 +2110,7 @@ func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 				continue
 			}
 			proof.literal.SetVal(constant.MakeBool(true))
+			pairFrameArrayReuse(parent.reusedArray, child.reusedArray)
 		}
 		if parent.chunkFrame == nil {
 			continue
@@ -2126,6 +2129,7 @@ func resolveFusedFrameChunkProofs(candidates map[*ir.Func]*lowerCandidate) {
 			})
 		}
 	}
+	resolveFrameArrayReuse(candidates)
 }
 
 func hasResumeFactory(plan *Plan, candidates map[*ir.Func]*lowerCandidate,
@@ -2948,6 +2952,11 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) error {
 	function := candidate.function
 	fn := function.Func
+	if candidate.fusedResume && !base.Flag.Cfg.Instrumenting {
+		if plan := planFrameArray(function, 128); plan != nil {
+			candidate.reusedArray = &frameArrayReuse{plan: plan}
+		}
+	}
 	recordFreshOperandAssignments(fn)
 	// Save validated wrapper operands before reparenting closures into resume.
 	// Dynamic callee snapshots belong to the source caller during validation;
@@ -3888,7 +3897,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		}
 	})
 	entryState := lowerStatements(fn.Body, completeState)
-	candidate.entryZeroed = entryZeroedFrameLocals(states[entryState].body)
+	entry := states[entryState].body
+	candidate.entryZeroed = entryZeroedFrameLocals(entry)
+	if array := candidate.reusedArray; array != nil &&
+		(!candidate.entryZeroed[array.plan.array] || !slices.Contains(entry, ir.Node(array.plan.zero))) {
+		candidate.reusedArray = nil
+	}
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
 		typedInt(pos, types.Types[types.TUINT32], int64(entryState))))
 
@@ -5406,6 +5420,15 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		rootType.SetNoalg(true)
 		types.CalcSize(rootType)
 	}
+	var zeroArray *ir.AssignStmt
+	if array := candidate.reusedArray; array != nil {
+		if field := outerFields[array.plan.array]; field != nil {
+			array.offset = field.Offset
+			zeroArray = array.plan.zero
+		} else {
+			candidate.reusedArray = nil
+		}
+	}
 	frame := typecheck.TempAt(pos, resume, framePointerType)
 	if compatibleChunk {
 		candidate.chunkFrame = frame
@@ -5442,10 +5465,18 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 				}
 			})
 		}
+		if zeroArray != nil && node == zeroArray {
+			block := ir.NewBlockStmt(node.Pos(), ir.Nodes{node})
+			candidate.reusedArray.clear = block
+			return block
+		}
 		return node
 	}
 	for i, stmt := range resume.Body {
 		resume.Body[i] = rewrite(stmt)
+	}
+	if array := candidate.reusedArray; array != nil && array.clear == nil {
+		candidate.reusedArray = nil
 	}
 	resume.ClosureVars = nil
 	var pointerClears ir.Nodes

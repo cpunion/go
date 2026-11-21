@@ -137,7 +137,7 @@ func FIRST(a uint16, b uint8, p *int, n int) int {
 	const main = `package main
 import "runtime"
 //go:noinline
-func consume(data *[SIZE]byte) int { return int(data[0]) }
+func consume(data *[SIZE]byte) int { return int(data[0]) + int(data[1]) + int(data[SIZE-1]) }
 func main() {
 	value := 11
 	for _, depth := range []int{1,64,256,4096} {
