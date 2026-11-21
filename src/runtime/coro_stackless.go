@@ -27,6 +27,9 @@ const (
 	stacklessCoroActionSwitch
 	stacklessCoroActionHandoff
 	stacklessCoroActionHost
+	// The compatible-chunk helpers publish both parts of the resume pair
+	// before returning this action to the running task's executor.
+	stacklessCoroActionChunkSwitch
 )
 
 const stacklessCoroWarmExecutorCount = 4
@@ -1706,14 +1709,16 @@ resumeOwned:
 			s.signal()
 		}
 	}
-	if action == stacklessCoroActionSwitch {
+	if action == stacklessCoroActionSwitch || action == stacklessCoroActionChunkSwitch {
 		idlePollSkip = nil
-		if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
-			task.state != stacklessCoroTaskRunning || !task.resuming ||
-			task.readyPending {
-			throw("runtime: invalid stackless coroutine frame switch")
+		if action == stacklessCoroActionSwitch {
+			if !task.hasFlag(stacklessCoroTaskSwitchPending) ||
+				task.state != stacklessCoroTaskRunning || !task.resuming ||
+				task.readyPending {
+				throw("runtime: invalid stackless coroutine frame switch")
+			}
+			task.setFlag(stacklessCoroTaskSwitchPending, false)
 		}
-		task.setFlag(stacklessCoroTaskSwitchPending, false)
 		// A validated frame switch keeps this running task on the same
 		// executor. Retain its scheduler link as for private yields.
 		if native && !raceenabled && state != nil && state.activeSource != nil &&
@@ -2907,7 +2912,7 @@ func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stackl
 	stacklessCoroBeginProfileTransition()
 	context.frame = frame
 	task.resume = child
-	return switchStacklessCoroFusedChunk(context, task)
+	return switchStacklessCoroFusedChunk(context)
 }
 
 // coroPopFusedChunk returns an interior slot to its chunk. The parent is
@@ -2925,15 +2930,14 @@ func coroPopFusedChunk(ctx unsafe.Pointer) uint8 {
 	header.parent = nil
 	header.resume = nil
 	header.marker = 0
-	return switchStacklessCoroFusedChunk(context, task)
+	return switchStacklessCoroFusedChunk(context)
 }
 
-func switchStacklessCoroFusedChunk(context *stacklessCoroContext, task *stacklessCoroTask) uint8 {
+func switchStacklessCoroFusedChunk(context *stacklessCoroContext) uint8 {
 	if context.scheduler.runnableState.Load() != 0 {
 		return stacklessCoroActionYield
 	}
-	task.setFlag(stacklessCoroTaskSwitchPending, true)
-	return stacklessCoroActionSwitch
+	return stacklessCoroActionChunkSwitch
 }
 
 // coroAwaitFusedFrame switches a compiler-proven structured await to child
@@ -3736,6 +3740,8 @@ func coroGoexit(ctx unsafe.Pointer) {
 }
 
 // coroTerminalAction reports the pending terminal action for a running task.
+//
+//go:nosplit
 func coroTerminalAction(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
