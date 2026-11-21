@@ -8,8 +8,81 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goarch"
+	"internal/runtime/sys"
 	"unsafe"
 )
+
+const stacklessCoroGoStartProfileDepth = 2 * (abi.StackSmall + goarch.PtrSize)
+
+// A freshly launched goroutine may enter its source root directly or through
+// an elided go wrapper. Verify both the return PCs and the actual stack top
+// before recording goexit as its entire ordinary ancestry. A recursive call
+// may have the same PCs as the initial call but has a different stack depth.
+func stacklessCoroProfileGoStart(gp *g, source funcInfo, callerPC uintptr, callerSP unsafe.Pointer) uintptr {
+	if GOARCH != "amd64" && GOARCH != "arm64" {
+		return 0
+	}
+	if findfunc(callerPC) != source || source.funcID != abi.FuncIDNormal {
+		return 0
+	}
+	goexitPC := abi.FuncPCABI0(goexit) + sys.PCQuantum
+	pc, atTop, sp := stacklessCoroProfileCallerLink(gp, source, callerPC, callerSP)
+	if atTop && pc == goexitPC {
+		return pc
+	}
+	f := findfunc(pc)
+	if !f.valid() || f.funcID != abi.FuncIDWrapper || f.entry() != gp.startpc {
+		return 0
+	}
+	// The ordinary profile path translates source copies before eliding
+	// wrappers. An inlined caller must still appear in the profile.
+	profileFunc := f
+	if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceCopy != 0 {
+		if source := stacklessCoroSourceFunc(f, info); source.valid() {
+			profileFunc = source
+		}
+	}
+	if profileFunc.funcID != abi.FuncIDWrapper || funcdata(profileFunc, abi.FUNCDATA_InlTree) != nil {
+		return 0
+	}
+	pc, atTop, _ = stacklessCoroProfileCallerLink(gp, f, pc, sp)
+	if atTop && pc == goexitPC {
+		return pc
+	}
+	return 0
+}
+
+// Read the link of a regular Go call frame using the same saved PC and SP
+// rules as the unwinder. Keep the SP typed across the pcsp lookup and read
+// stack bounds and the link together while the running G cannot be preempted.
+func stacklessCoroProfileCallerLink(gp *g, f funcInfo, pc uintptr, sp unsafe.Pointer) (uintptr, bool, unsafe.Pointer) {
+	if f.pcsp == 0 || f.flag&(abi.FuncFlagTopFrame|abi.FuncFlagSPWrite|abi.FuncFlagAsm) != 0 {
+		return 0, false, nil
+	}
+	delta := funcspdelta(f, pc)
+	if delta <= 0 {
+		return 0, false, nil
+	}
+	size := uintptr(delta)
+	if !usesLR {
+		size += goarch.PtrSize
+	}
+	mp := acquirem()
+	addr, top := uintptr(sp), gp.stktopsp
+	if addr < gp.stack.lo || addr >= top || size > top-addr || top >= gp.stack.hi {
+		releasem(mp)
+		return 0, false, nil
+	}
+	callerSP := unsafe.Add(sp, size)
+	if !usesLR {
+		sp = unsafe.Add(sp, size-goarch.PtrSize)
+	}
+	returnPC := *(*uintptr)(sp)
+	atTop := uintptr(callerSP) == top
+	releasem(mp)
+	return returnPC, atTop, callerSP
+}
 
 // Capture the public caller while it owns its ordinary stack. A later CPU
 // signal must not unwind that waiting G: concurrent GC may be moving its stack.

@@ -188,7 +188,15 @@ func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, calle
 	gp := getg()
 	var pcs [maxCPUProfStack]uintptr
 	// The caller still owns its stack. Walk it before locking the registry.
-	n := stacklessCoroCaptureProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
+	// Most starts fit in two small Go frames. Skip the speculative walk
+	// when the current stack already extends beyond them.
+	if gp.stktopsp-uintptr(callerSP) <= stacklessCoroGoStartProfileDepth {
+		pcs[0] = stacklessCoroProfileGoStart(gp, source, callerPC, callerSP)
+	}
+	n := 1
+	if pcs[0] == 0 {
+		n = stacklessCoroCaptureProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
+	}
 	lock(&stacklessCoroGoroutines.lock)
 	s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
 	unlock(&stacklessCoroGoroutines.lock)
