@@ -505,9 +505,7 @@ func (h *stacklessCoroHost) invoke(task *stacklessCoroTask, call func(), deferre
 			s.clearTerminalValue(task)
 		}
 		if task.terminal != stacklessCoroTerminalNone || task.goexit {
-			s.discardFusedFramesLocked(task)
-			task.flags &^= stacklessCoroTaskFusedTransitionMask
-			s.cancelReservedFrameTasksLocked(task)
+			s.prepareTerminalResumeLocked(task)
 		}
 		task.context.scheduler = nil
 		task.resuming = false

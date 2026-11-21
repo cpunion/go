@@ -2972,10 +2972,9 @@ func restoreStacklessCoroFusedParent(context *stacklessCoroContext,
 	releasem(mp)
 }
 
-// discardFusedFramesLocked drops every fused child after a terminal outcome.
-// Compiler eligibility excludes cleanup in these frames, so restoring the
-// chain root preserves the terminal behavior while cached holders must be
-// discarded rather than retaining uncleared pointers.
+// discardFusedFramesLocked drops a terminal lineage after any leaf cleanup.
+// Suspended fused ancestors have no defers. Cached holders are discarded
+// because normal completion may never have cleared their pointer slots.
 func (s *stacklessCoroScheduler) discardFusedFramesLocked(
 	task *stacklessCoroTask) {
 	for task.hasFlag(stacklessCoroTaskFusedFrames) {
@@ -4650,13 +4649,25 @@ func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine panic recovery")
 	}
-	s.discardFusedFramesLocked(task)
-	task.flags &^= stacklessCoroTaskFusedTransitionMask
-	s.cancelReservedFrameTasksLocked(task)
+	s.prepareTerminalResumeLocked(task)
 	task.resuming = false
 	s.readyLocked(task)
 	unlock(&s.lock)
 	s.signal()
+}
+
+// Keep a fused leaf that owns defers until its terminal resume has run
+// those defers. All other fused frames can be discarded before re-entry.
+func (s *stacklessCoroScheduler) prepareTerminalResumeLocked(task *stacklessCoroTask) {
+	if task.hasFlag(stacklessCoroTaskFusedFrames) {
+		entry := stacklessCoroResumeIdentity(task.resume)
+		info := stacklessCoroSourceFrame(findfunc(entry.fn))
+		if info == nil || info.flags&abi.CoroSourceDeferCleanup == 0 {
+			s.discardFusedFramesLocked(task)
+		}
+	}
+	task.flags &^= stacklessCoroTaskFusedTransitionMask
+	s.cancelReservedFrameTasksLocked(task)
 }
 
 // completeInitialRoot completes a root that has remained private since its

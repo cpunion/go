@@ -114,6 +114,7 @@ type lowerCandidate struct {
 	resultPtrs        []*ir.Name
 	factory           *ir.Func
 	factoryABI        FactoryABI
+	frameWrappers     map[*ir.Func]bool
 	fusedAwaits       map[*ir.CallExpr]bool
 	fusedRequests     map[*ir.CallExpr]bool
 	fusedChunkProofs  map[*ir.CallExpr]ir.Node
@@ -1952,13 +1953,20 @@ func resumeFactoryABI(factory, fn *ir.Func) FactoryABI {
 }
 
 // explicitFrameFactorySupported limits explicit-frame lowering to functions
-// whose storage can move into one generated frame without rewriting nested
-// closure or defer capture ownership.
+// whose storage can move into one generated frame. Fixed argument
+// wrappers can copy their saved operands when cleanup invokes them.
 func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	if candidate == nil ||
-		candidate.function.Defer != NoDeferABI || len(candidate.defers) != 0 ||
+		candidate.function.Defer != NoDeferABI ||
 		len(candidate.iterationVars) != 0 || candidate.function.Terminal != 0 {
 		return false
+	}
+	var wrappers map[*ir.Func]bool
+	if len(candidate.defers) != 0 {
+		wrappers = candidate.fixedDeferArgumentWrappers()
+		if !candidate.explicitFrameDefers(wrappers) {
+			return false
+		}
 	}
 	runToCompletion := canLowerRunToCompletion(candidate)
 	for _, site := range candidate.function.Sites {
@@ -1975,10 +1983,13 @@ func explicitFrameFactorySupported(candidate *lowerCandidate) bool {
 	}
 	supported := true
 	ir.Visit(candidate.function.Func, func(node ir.Node) {
-		if _, ok := node.(*ir.ClosureExpr); ok {
+		if closure, ok := node.(*ir.ClosureExpr); ok && !wrappers[closure.Func] {
 			supported = false
 		}
 	})
+	if supported {
+		candidate.frameWrappers = wrappers
+	}
 	return supported
 }
 
@@ -2015,7 +2026,11 @@ func (candidate *lowerCandidate) stableTerminalAction() bool {
 // header required when the resume entry changes.
 func markFusedFrameCandidates(candidates map[*ir.Func]*lowerCandidate) {
 	for _, candidate := range candidates {
-		if candidate.factoryABI != FactoryABI3 {
+		// A terminal child discards the suspended fused lineage. A
+		// registration remains runnable only on the active leaf, so
+		// functions with cleanup must await children in separate tasks.
+		if candidate.factoryABI != FactoryABI3 || len(candidate.defers) != 0 ||
+			candidate.rangeOwner != nil {
 			continue
 		}
 		for call, transition := range candidate.transitions {
@@ -2979,7 +2994,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A source declaration may execute repeatedly. Its cell is allocated at
 	// that declaration; each nested closure snapshots the cell pointer when
 	// created, rather than sharing the next iteration's pointer slot.
-	fixedDeferWrappers := candidate.fixedDeferArgumentWrappers()
+	fixedDeferWrappers := candidate.frameWrappers
+	if candidate.factoryABI != FactoryABI3 {
+		fixedDeferWrappers = candidate.fixedDeferArgumentWrappers()
+	}
 	ir.Visit(fn, func(node ir.Node) {
 		if closure, ok := node.(*ir.ClosureExpr); ok && !fixedDeferWrappers[closure.Func] {
 			for _, variable := range closure.Func.ClosureVars {
@@ -5265,6 +5283,9 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	candidate.frameType = frameType
 	if source := nativeSourceFrames[resume]; source != nil {
 		source.Field = replacements[candidate.resumePC]
+		if fusedFrame && len(candidate.defers) != 0 {
+			source.Flags |= abi.CoroSourceDeferCleanup
+		}
 	}
 	framePointerType := types.NewPtr(frameType)
 	rootType := frameType
@@ -5290,6 +5311,29 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			}
 		}
 		ir.EditChildren(node, rewrite)
+		if closure, ok := node.(*ir.ClosureExpr); ok && candidate.frameWrappers[closure.Func] {
+			// The operand slots belong to this registration alone. Pass
+			// their values via resume locals so the wrapper never captures
+			// the frame or an address into its operand storage.
+			ir.WithFunc(resume, func() {
+				for _, variable := range closure.Func.ClosureVars {
+					field := replacements[variable.Outer]
+					if field == nil {
+						continue
+					}
+					snapshot := typecheck.TempAt(variable.Pos(), resume, variable.Type())
+					value := explicitFrameField(variable.Pos(), frame, field)
+					assign := ir.NewAssignStmt(variable.Pos(), snapshot, value)
+					assign.Def = true
+					snapshot.Defn = assign
+					closure.PtrInit().Append(
+						typecheck.Stmt(ir.NewDecl(variable.Pos(), ir.ODCL, snapshot)),
+						typecheck.Stmt(assign))
+					variable.Outer = snapshot
+					variable.Defn = snapshot
+				}
+			})
+		}
 		return node
 	}
 	for i, stmt := range resume.Body {

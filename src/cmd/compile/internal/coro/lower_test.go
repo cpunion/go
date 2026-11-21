@@ -1015,9 +1015,13 @@ func TestExplicitFrameFactorySupported(t *testing.T) {
 		t.Error("defer ABI candidate supports an explicit frame")
 	}
 	deferred := candidate(SiteYield)
-	deferred.defers = []*lowerDefer{{}}
+	deferred.defers = []*lowerDefer{{call: newLowerTestCall(newLowerTestFunc(pkg, "callback"))}}
+	if !explicitFrameFactorySupported(deferred) {
+		t.Error("fixed named defer candidate does not support an explicit frame")
+	}
+	deferred.dynamicDefers = true
 	if explicitFrameFactorySupported(deferred) {
-		t.Error("defer candidate supports an explicit frame")
+		t.Error("dynamic defer candidate supports an explicit frame")
 	}
 	ranged := candidate(SiteYield)
 	ranged.iterationVars = []*ir.Name{ir.NewNameAt(src.NoXPos,

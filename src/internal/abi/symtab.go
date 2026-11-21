@@ -140,6 +140,8 @@ const (
 	CoroSourceResume uint32 = 1 << iota
 	CoroSourceCopy
 	CoroSourceBridge
+	// A fused leaf must run its defers before discarding its lineage.
+	CoroSourceDeferCleanup
 )
 
 const (

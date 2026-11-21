@@ -1371,17 +1371,29 @@ func main() {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 
-	cmd = testenv.Command(t, exe)
-	data, err = cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("fixed defer coroutine failed: %v\n%s", err, data)
+	native := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
+	for _, procs := range []string{"1", "4"} {
+		cmd = testenv.Command(t, exe)
+		cmd.Env = append(cmd.Environ(), "GOMAXPROCS="+procs, "GOGC=1")
+		data, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("P%s fixed defer coroutine failed: %v\n%s", procs, err, data)
+		}
+		if want := "stackless-coro-defer-ok"; !strings.Contains(string(data), want) {
+			t.Fatalf("P%s output does not contain %q\n%s", procs, want, data)
+		}
 	}
-	if want := "stackless-coro-defer-ok"; !strings.Contains(string(data), want) {
-		t.Fatalf("output does not contain %q\n%s", want, data)
+	if native {
+		for _, function := range []string{"fixed", "early"} {
+			if linkedCoroStackUnsafe(t, exe, "main."+function+".coro.stackgate") {
+				t.Errorf("%s lost native admission", function)
+			}
+		}
 	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `main\.(fixed|early)\.coro\.func[0-9]+$`, exe)
+		"-s", `main\.(fixed|early)\.coro(\.func[0-9]+)?$`, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("objdump of fixed defer resume functions failed: %v\n%s",
@@ -1391,6 +1403,9 @@ func main() {
 	if !strings.Contains(disassembly, ".coro.func") {
 		t.Fatalf("objdump did not find fixed defer resume functions\n%s",
 			disassembly)
+	}
+	if !strings.Contains(disassembly, "runtime.coroTakeRootFrame") {
+		t.Fatalf("fixed defer factory does not use typed frames\n%s", disassembly)
 	}
 	for _, forbidden := range []string{"runtime.deferproc", "runtime.deferreturn"} {
 		if strings.Contains(disassembly, forbidden) {
@@ -2073,9 +2088,14 @@ func fault(kind int) int {
 }
 
 //go:noinline
+func relay(kind int) int {
+	return fault(kind)
+}
+
+//go:noinline
 func middle(kind int) int {
 	defer record(2)
-	return fault(kind)
+	return relay(kind)
 }
 
 //go:noinline
@@ -2119,7 +2139,7 @@ func main() {
 	exe := filepath.Join(tmp, "coro-implicit-panic")
 	cmd := testenv.Command(t, testenv.GoToolPath(t), "build",
 		"-o", exe,
-		"-gcflags=command-line-arguments=-l -d=coro=4",
+		"-gcflags=command-line-arguments=-l -d=coro=4,checkptr=2",
 		src)
 	cmd.Env = append(cmd.Environ(),
 		"GOEXPERIMENT=coro",
@@ -2131,7 +2151,7 @@ func main() {
 	if err != nil {
 		t.Fatalf("building implicit panic coroutine failed: %v\n%s", err, out)
 	}
-	for _, name := range []string{"fault", "middle", "root", "invoke", "check"} {
+	for _, name := range []string{"fault", "relay", "middle", "root", "invoke", "check"} {
 		want := "coro: func=main." + name + " "
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not contain %q\n%s", want, out)
@@ -2146,9 +2166,17 @@ func main() {
 	if want := "stackless-coro-implicit-panic-ok"; !strings.Contains(string(data), want) {
 		t.Fatalf("output does not contain %q\n%s", want, data)
 	}
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		for _, name := range []string{"fault", "relay"} {
+			if linkedCoroStackUnsafe(t, exe, "main."+name+".coro.stackgate") {
+				t.Errorf("%s lost native admission", name)
+			}
+		}
+	}
 
 	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump",
-		"-s", `main\.(fault|middle|root|invoke)\.coro\.func[0-9]+$`, exe)
+		"-s", `main\.(fault|relay|middle|root|invoke)\.coro\.func[0-9]+$`, exe)
 	data, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("objdump of implicit panic resume functions failed: %v\n%s",
@@ -2156,6 +2184,9 @@ func main() {
 	}
 	if want := "runtime.coroTerminalAction"; !strings.Contains(string(data), want) {
 		t.Errorf("implicit panic resume does not contain %q\n%s", want, data)
+	}
+	if want := "runtime.coroAwaitFusedFrame"; !strings.Contains(string(data), want) {
+		t.Errorf("implicit panic resume does not fuse the defer leaf\n%s", data)
 	}
 }
 
