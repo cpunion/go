@@ -114,6 +114,7 @@ func batchProduce(n int, typed bool) {
 }
 func main() {
  for _,n:=range []int{0,1,7,8,9,127,128,129,255,256,257,1031} {batchProduce(n,false);batchProduce(n,true)}
+ if runtime.GOMAXPROCS(0)>=8 {batchProduce(100000,false)}
  for _,n:=range []int{0,1,127,128,129,255,256,1000,10000} {
   arguments=0;atomic.StoreUint64(&completed,0);atomic.StoreUint64(&sum,0)
   want:=n*(n-1)/2

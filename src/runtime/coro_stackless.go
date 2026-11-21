@@ -5320,7 +5320,6 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pe
 	}
 	stacklessCoroCompleteLogicalFrame(task)
 	task.setParent(nil)
-	task.finishNormal()
 
 	for {
 		head := pending.Load()
@@ -5340,6 +5339,10 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pe
 	for at != nil {
 		next := at.next
 		at.next = nil
+		// Publish completion in recycle order. A scalar chunk can be reused
+		// once all its members are complete, so pending siblings must remain
+		// running until removed from this list under the scheduler lock.
+		at.finishNormal()
 		s.completeLogicalTaskLocked(at)
 		s.recycleTaskLocked(at)
 		at = next
