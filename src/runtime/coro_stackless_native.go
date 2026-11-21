@@ -1163,6 +1163,14 @@ func stacklessCoroNativeContextFor(gp *g) *stacklessCoroNativeContext {
 	return (*stacklessCoroNativeContext)(state.native)
 }
 
+func stacklessCoroUseActiveLockSpin(gp *g, lock *mutex) bool {
+	if GOOS != "darwin" || raceenabled || gomaxprocs <= stacklessCoroWarmExecutorCount {
+		return false
+	}
+	ctx := stacklessCoroNativeContextFor(gp)
+	return ctx != nil && ctx.scheduler != nil && &ctx.scheduler.lock == lock
+}
+
 func stacklessCoroCanPairChannel(gp *g, s *stacklessCoroScheduler) bool {
 	ctx := stacklessCoroNativeContextFor(gp)
 	return ctx != nil && !ctx.public && ctx.scheduler == s && !raceenabled

@@ -72,3 +72,5 @@ func stacklessCoroDeferSleep(*stacklessCoroScheduler,
 	*stacklessCoroOperation, int64) bool {
 	return false
 }
+
+func stacklessCoroUseActiveLockSpin(*g, *mutex) bool { return false }

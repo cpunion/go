@@ -190,3 +190,5 @@ type channelWaiter = sudog
 func (sg *sudog) channelWaiter() *channelWaiter { return sg }
 func (sg *sudog) fullSudog() *sudog             { return sg }
 func (sg *sudog) channelSelect() bool           { return sg.isSelect }
+
+func stacklessCoroUseActiveLockSpin(*g, *mutex) bool { return false }

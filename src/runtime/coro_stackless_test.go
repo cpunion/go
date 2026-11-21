@@ -4067,22 +4067,28 @@ func TestStacklessCoroResumeFrames(t *testing.T) {
 }
 
 func TestStacklessCoroParallelSpawn(t *testing.T) {
+	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 	t.Run("burst", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, false, false)
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, workers, false, false)
 	})
 	t.Run("staggered", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true, false)
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, workers, true, false)
 	})
 	t.Run("staggered-two-P", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, 2, true, false)
+		testStacklessCoroParallelSpawn(t, 2, workers, true, false)
 	})
 	t.Run("after-idle", func(t *testing.T) {
-		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true, true)
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, workers, true, true)
+	})
+	t.Run("eight-P", func(t *testing.T) {
+		if race.Enabled {
+			t.Skip("race builds retain the smaller executor set")
+		}
+		testStacklessCoroParallelSpawn(t, 8, 7, true, false)
 	})
 }
 
-func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered, afterIdle bool) {
-	const workers = runtime.StacklessCoroWarmExecutorCount - 1
+func testStacklessCoroParallelSpawn(t *testing.T, procs int, workers int32, staggered, afterIdle bool) {
 
 	oldProcs := runtime.GOMAXPROCS(procs)
 	defer runtime.GOMAXPROCS(oldProcs)
@@ -4123,7 +4129,7 @@ func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered, afterIdl
 			for i := range workers {
 				runtime.SpawnStacklessCoroForTest(ctx, worker)
 				if staggered {
-					for started.Load() < int32(i+1) && time.Now().Before(deadline) {
+					for started.Load() < i+1 && time.Now().Before(deadline) {
 						runtime.Gosched()
 					}
 				}

@@ -188,6 +188,13 @@ func lock2(l *mutex) {
 		spin = mutexActiveSpinCount
 	}
 
+	passiveSpin := mutexPassiveSpinCount
+	if spin != 0 && stacklessCoroUseActiveLockSpin(gp, l) {
+		// Darwin's passive yield enters the kernel and can outlast a short
+		// queue transition while the native executor still holds its P.
+		spin = 16
+		passiveSpin = 0
+	}
 	var weSpin, atTail, haveTimers bool
 	v := atomic.Loaduintptr(&l.key)
 tryAcquire:
@@ -225,7 +232,7 @@ tryAcquire:
 				procyield(mutexActiveSpinSize)
 				v = atomic.Loaduintptr(&l.key)
 				continue tryAcquire
-			} else if i < spin+mutexPassiveSpinCount {
+			} else if i < spin+passiveSpin {
 				osyield() // TODO: Consider removing this step. See https://go.dev/issue/69268.
 				v = atomic.Loaduintptr(&l.key)
 				continue tryAcquire

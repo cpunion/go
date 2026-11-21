@@ -34,6 +34,10 @@ const (
 
 const stacklessCoroWarmExecutorCount = 4
 const stacklessCoroInitialExecutorCount = 2
+
+// Concurrent completion can amortize access to the shared queue across a
+// wider set of executors. Keep the caches sized for the common small set.
+const stacklessCoroMaxWarmExecutors = 8
 const stacklessCoroTaskCacheSize = 256
 
 // Four tasks occupy the exact 192-byte size class on 64-bit targets and the
@@ -389,6 +393,9 @@ type stacklessCoroScheduler struct {
 	runnableState    atomic.Uint32
 	drainCacheAge    stacklessCoroDrainCacheAge
 	foreignReturners atomic.Uint32
+	// Completed independent tasks remain charged to liveSpawns until the
+	// executor that published the first task recycles the batch under lock.
+	completed atomic.Pointer[stacklessCoroTask]
 }
 
 // stacklessCoroOperationResources retains reusable resources after clearing the state
@@ -1768,6 +1775,18 @@ resumeOwned:
 			stacklessCoroClearLogicalOwner(task, native)
 		}
 		goto resumeActive
+	}
+	// A zero runnable-state snapshot includes the absence of a foreign
+	// returner. Keep this active task on its executor until other work is
+	// published. The periodic host check still gives ordinary Gs a turn.
+	if native && !public && !raceenabled && action == stacklessCoroActionYield &&
+		!stacklessCoroIsPullComparison(s) && s.runnableState.Load() == 0 &&
+		task.state == stacklessCoroTaskRunning && task.resuming && !task.readyPending &&
+		task.terminal == stacklessCoroTerminalNone && !task.goexit &&
+		((hostYieldCheck+1 != 0 && !getg().preempt) || !stacklessCoroHostRunnable()) &&
+		s.retainLogicalOwner(state) {
+		hostYieldCheck++
+		goto resumeOwned
 	}
 	stacklessCoroClearLogicalOwner(task, native)
 	// A waiting source retains its scheduler through this context. The
@@ -5272,12 +5291,71 @@ func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bo
 	return true
 }
 
-func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask, dispatch bool) *stacklessCoroTask {
+func (task *stacklessCoroTask) canComplete() bool {
+	return task.state == stacklessCoroTaskRunning && task.resuming &&
+		!task.readyPending && task.flags&stacklessCoroTaskCompletionMask == 0 &&
+		task.terminal == stacklessCoroTerminalNone && !task.goexit
+}
+
+func (task *stacklessCoroTask) finishNormal() {
+	task.resuming = false
+	task.state = stacklessCoroTaskComplete
+	if !task.hasFlag(stacklessCoroTaskCacheFrame) {
+		clearStacklessCoroTaskFrame(task)
+	}
+}
+
+// completeIndependent uses the active executor's exclusive ownership of an
+// unhosted task to retire its source record before acquiring the scheduler lock.
+// The empty-to-nonempty publisher owns the pending batch. It takes the whole
+// list under lock so concurrent publishers can share one cache and count update.
+func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask) *stacklessCoroTask {
+	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
+		throw("runtime: invalid stackless coroutine completion")
+	}
+	stacklessCoroCompleteLogicalFrame(task)
+	task.setParent(nil)
+	task.finishNormal()
+
+	for {
+		head := s.completed.Load()
+		task.next = head
+		if s.completed.CompareAndSwap(head, task) {
+			if head != nil {
+				return nil
+			}
+			break
+		}
+	}
 	lock(&s.lock)
-	if task.state != stacklessCoroTaskRunning || !task.resuming ||
-		task.readyPending ||
-		task.flags&stacklessCoroTaskCompletionMask != 0 ||
-		task.terminal != stacklessCoroTerminalNone || task.goexit {
+	at := s.completed.Load()
+	for !s.completed.CompareAndSwap(at, nil) {
+		at = s.completed.Load()
+	}
+	for at != nil {
+		next := at.next
+		at.next = nil
+		s.completeLogicalTaskLocked(at)
+		s.recycleTaskLocked(at)
+		at = next
+	}
+	var next *stacklessCoroTask
+	if s.head != nil && !getg().preempt &&
+		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
+		next = s.takeLocked()
+	}
+	unlock(&s.lock)
+	s.logicalTaskComplete(false)
+	return next
+}
+
+func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask, dispatch bool) *stacklessCoroTask {
+	if dispatch && s.executorCount.Load() > 1 && task != &s.root &&
+		task.parent() == nil && !s.hasTerminalRecords() {
+		return s.completeIndependent(task)
+	}
+	lock(&s.lock)
+	if !task.canComplete() {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
 	}
@@ -5286,11 +5364,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask, dispatch bool
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
-	task.resuming = false
-	task.state = stacklessCoroTaskComplete
-	if !task.hasFlag(stacklessCoroTaskCacheFrame) {
-		clearStacklessCoroTaskFrame(task)
-	}
+	task.finishNormal()
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -5513,7 +5587,7 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor(live uint
 	default:
 	}
 	count := s.executorCount.Load()
-	if count < stacklessCoroWarmExecutorCount &&
+	if count < s.warmExecutorLimit() &&
 		(live >= uint64(count) || runnable&^stacklessCoroForeignReturnerBit >= count) &&
 		s.executorState.Load() == stacklessCoroExecutorStateRunning {
 		select {
@@ -5523,9 +5597,16 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor(live uint
 	}
 }
 
+func (s *stacklessCoroScheduler) warmExecutorLimit() uint32 {
+	if raceenabled || stacklessCoroIsPullComparison(s) {
+		return stacklessCoroWarmExecutorCount
+	}
+	return uint32(max(stacklessCoroWarmExecutorCount, min(gomaxprocs, stacklessCoroMaxWarmExecutors)))
+}
+
 func (s *stacklessCoroScheduler) needsWarmExecutor(count uint32) bool {
 	runnable := s.runnableState.Load() &^ stacklessCoroForeignReturnerBit
-	if count >= stacklessCoroWarmExecutorCount || runnable == 0 {
+	if count >= s.warmExecutorLimit() || runnable == 0 {
 		return false
 	}
 	if runnable >= count {
