@@ -126,3 +126,85 @@ func main() {
 		})
 	}
 }
+
+// A warmed private coroutine keeps its fused child visible across GC and
+// source enumeration. Its later spawn publishes the scheduler to siblings.
+func TestPrivateFusedAwaitReuse(t *testing.T) {
+	const program = `package main
+
+import (
+	"bytes"
+	"runtime"
+	"sync/atomic"
+)
+
+var entered, observed atomic.Bool
+
+//go:noinline
+func cachedLeaf(value *int) int {
+	runtime.Gosched()
+	return *value
+}
+
+func worker(done chan int) {
+	runtime.Gosched()
+	done <- 7
+}
+
+//go:noinline
+func privateRoot(done chan int) int {
+	value := 9
+	total := 0
+	for i := 0; i < 32; i++ {
+		total += cachedLeaf(&value)
+	}
+	entered.Store(true)
+	for !observed.Load() {
+		if cachedLeaf(&value) != 9 {
+			panic("lost value across yield")
+		}
+	}
+
+	// Start sharing the same scheduler after warming its fused holder cache.
+	// Later awaits must still interleave with siblings.
+	go worker(done)
+	for i := 0; i < 32; i++ {
+		total += cachedLeaf(&value)
+	}
+	return total + <-done
+}
+
+func observe(seen chan bool) {
+	for !entered.Load() {
+		runtime.Gosched()
+	}
+	buf := make([]byte, 64<<10)
+	runtime.GC()
+	found := false
+	for i := 0; i < 32 && !found; i++ {
+		n := runtime.Stack(buf, true)
+		found = bytes.Contains(buf[:n], []byte("main.cachedLeaf(")) &&
+			bytes.Contains(buf[:n], []byte("main.privateRoot("))
+		runtime.Gosched()
+	}
+	observed.Store(true)
+	seen <- found
+}
+
+func main() {
+	// The observer must run as an ordinary G, independently of the root.
+	var entry [2048]byte
+	if runtime.Stack(entry[:], false) == 0 {
+		panic("missing ordinary entry")
+	}
+	done, seen := make(chan int), make(chan bool, 1)
+	go observe(seen)
+	if privateRoot(done) != 64*9+7 || !<-seen {
+		panic("fused frame reuse lost values or source frames")
+	}
+	println("switch-return-ok")
+}
+`
+	testSwitchReturnProgram(t, program, nil,
+		[]string{"cachedLeaf", "privateRoot"}, "cachedLeaf", "privateRoot")
+}
