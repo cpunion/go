@@ -5098,14 +5098,10 @@ func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 				return nil
 			}
 			if !pull {
-				s.head = task.next
-				if s.head == nil {
-					s.tail = nil
-				}
-				s.runnableState.Add(-1)
-				s.queueProgress++
+				s.popSharedReadyLocked(task)
+			} else {
+				task.next = nil
 			}
-			task.next = nil
 			if h := s.taskHostLocked(task); h != nil {
 				if pull {
 					s.head = nil
@@ -5119,11 +5115,25 @@ func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 		}
 		break
 	}
+	stacklessCoroStartReady(task)
+	return task
+}
+
+func (s *stacklessCoroScheduler) popSharedReadyLocked(task *stacklessCoroTask) {
+	s.head = task.next
+	if s.head == nil {
+		s.tail = nil
+	}
+	s.runnableState.Add(-1)
+	s.queueProgress++
+	task.next = nil
+}
+
+func stacklessCoroStartReady(task *stacklessCoroTask) {
 	if task.state != stacklessCoroTaskRunnable || task.resuming || task.readyPending {
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
 	task.state, task.resuming = stacklessCoroTaskRunning, true
-	return task
 }
 
 // takeInitialRoot consumes the queue entry installed while the scheduler was
@@ -5310,17 +5320,14 @@ func (task *stacklessCoroTask) finishNormal() {
 	}
 }
 
-// completeIndependent uses the active executor's exclusive ownership of an
-// unhosted task to retire its source record before acquiring the scheduler lock.
-// The empty-to-nonempty publisher owns the pending batch. It takes the whole
-// list under lock so concurrent publishers can share one cache and count update.
+// completeIndependent publishes the finished task with its source frames
+// intact. The first publisher detaches the batch under the registry lock,
+// retiring every source before any frame can be recycled. Release that lock
+// before taking the scheduler lock, since creation nests them in the other order.
 func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pending *atomic.Pointer[stacklessCoroTask]) *stacklessCoroTask {
 	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
 		throw("runtime: invalid stackless coroutine completion")
 	}
-	stacklessCoroCompleteLogicalFrame(task)
-	task.setParent(nil)
-
 	for {
 		head := pending.Load()
 		task.next = head
@@ -5331,14 +5338,24 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pe
 			break
 		}
 	}
-	lock(&s.lock)
+	lock(&stacklessCoroGoroutines.lock)
 	at := pending.Load()
 	for !pending.CompareAndSwap(at, nil) {
 		at = pending.Load()
 	}
+	var records, unhosted int64
+	for retired := at; retired != nil; retired = retired.next {
+		r, u := stacklessCoroCompleteLogicalFrameLocked(retired)
+		records += r
+		unhosted += u
+	}
+	stacklessCoroFinishLogicalRetirementLocked(records, unhosted)
+	unlock(&stacklessCoroGoroutines.lock)
+	lock(&s.lock)
 	for at != nil {
 		next := at.next
 		at.next = nil
+		at.setParent(nil)
 		// Publish completion in recycle order. A scalar chunk can be reused
 		// once all its members are complete, so pending siblings must remain
 		// running until removed from this list under the scheduler lock.
@@ -5350,7 +5367,15 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pe
 	var next *stacklessCoroTask
 	if s.head != nil && !getg().preempt &&
 		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
-		next = s.takeLocked()
+		if s.terminalValues == nil {
+			// All ready tasks belong to the shared queue when no ordinary
+			// host routing is present. This is a native dispatch.
+			next = s.head
+			s.popSharedReadyLocked(next)
+			stacklessCoroStartReady(next)
+		} else {
+			next = s.takeLocked()
+		}
 	}
 	unlock(&s.lock)
 	s.logicalTaskComplete(false)

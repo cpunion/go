@@ -503,6 +503,12 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 		return
 	}
 	lock(&stacklessCoroGoroutines.lock)
+	removed, unhosted := stacklessCoroCompleteLogicalFrameLocked(task)
+	stacklessCoroFinishLogicalRetirementLocked(removed, unhosted)
+	unlock(&stacklessCoroGoroutines.lock)
+}
+
+func stacklessCoroCompleteLogicalFrameLocked(task *stacklessCoroTask) (removed, unhosted int64) {
 	root := stacklessCoroLogicalRoot(task)
 	p := stacklessCoroGoroutineBucket(root)
 	for *p != nil && (*p).root != root {
@@ -515,10 +521,10 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 		} else {
 			*p = r.next
 			task.parentOrSource = nil
+			removed = 1
 			if r.physicalG == nil {
-				stacklessCoroGoroutines.unhosted.Add(-1)
+				unhosted = 1
 			}
-			count := stacklessCoroGoroutines.records.Add(-1)
 			public := r.public
 			reusable := r.physicalG == nil && r.owner.Load() == nil
 			if public {
@@ -551,12 +557,24 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 			} else if reusable {
 				cacheStacklessCoroRecordLocked(r)
 			}
-			if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
-				stacklessCoroResizeGoroutineBuckets(size / 2)
-			}
 		}
 	}
-	unlock(&stacklessCoroGoroutines.lock)
+	return removed, unhosted
+}
+
+// Publish the entire batch's counts before releasing the registry lock.
+// The live count can cross more than one resize threshold in one drain.
+func stacklessCoroFinishLogicalRetirementLocked(removed, unhosted int64) {
+	if unhosted != 0 {
+		stacklessCoroGoroutines.unhosted.Add(-unhosted)
+	}
+	if removed == 0 {
+		return
+	}
+	count := stacklessCoroGoroutines.records.Add(-removed)
+	for size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4); size = len(stacklessCoroGoroutines.largeBuckets) {
+		stacklessCoroResizeGoroutineBuckets(size / 2)
+	}
 }
 
 func stacklessCoroUnhostedGoroutines() int64 {
