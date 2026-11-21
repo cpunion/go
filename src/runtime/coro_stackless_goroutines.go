@@ -20,24 +20,37 @@ import (
 // completed public records are cleared before bounded reuse.
 type stacklessCoroGoroutine struct {
 	next             *stacklessCoroGoroutine
-	publicNext       *stacklessCoroGoroutine
 	root, leaf       *stacklessCoroTask
 	scheduler        *stacklessCoroScheduler
-	owner            *g
-	publicG          *g
-	hostG            *g
+	owner            atomic.Pointer[g]
+	physicalG        *g // public caller or promoted ordinary host
 	goid, parentGoid uint64
 	gopc             uintptr
 	labels           unsafe.Pointer
 	ancestors        *[]ancestorInfo
-	profileCaller    []uintptr
 	profileBoundary  *stacklessCoroTask
 	profileTrace     *stacklessCoroPanicTrace
 	profileBefore    bool
-	public, hosted   bool
+	public           bool
 }
 
-const stacklessCoroInlineBuckets = 256
+// Only public entries need caller PCs or a link in the public-G index.
+// Independent go tasks keep just the common source record.
+type stacklessCoroPublicGoroutine struct {
+	stacklessCoroGoroutine
+	nextPublic    *stacklessCoroPublicGoroutine
+	profileCaller []uintptr
+}
+
+// The caller has identified r as a public record.
+func (r *stacklessCoroGoroutine) publicRecord() *stacklessCoroPublicGoroutine {
+	return (*stacklessCoroPublicGoroutine)(unsafe.Pointer(r))
+}
+
+const (
+	stacklessCoroInlineBuckets      = 256
+	stacklessCoroMaxRetainedBuckets = 1 << 16
+)
 
 type stacklessCoroSpawnSite struct {
 	returnPC, sourcePC uintptr
@@ -47,8 +60,9 @@ var stacklessCoroGoroutines struct {
 	lock            mutex
 	inlineBuckets   [stacklessCoroInlineBuckets]*stacklessCoroGoroutine
 	largeBuckets    []*stacklessCoroGoroutine
-	publicBuckets   [256]*stacklessCoroGoroutine
-	publicFree      *stacklessCoroGoroutine
+	bucketsIdle     bool
+	publicBuckets   [256]*stacklessCoroPublicGoroutine
+	publicFree      *stacklessCoroPublicGoroutine
 	publicFreeCount int
 	taskFree        *stacklessCoroGoroutine
 	taskFreeCount   int
@@ -79,7 +93,7 @@ func stacklessCoroGoroutineIndex(root *stacklessCoroTask, n int) uintptr {
 
 // Readers hold the registry lock or run with the world stopped.
 func stacklessCoroGoroutineBuckets() []*stacklessCoroGoroutine {
-	if b := stacklessCoroGoroutines.largeBuckets; b != nil {
+	if b := stacklessCoroGoroutines.largeBuckets; len(b) != 0 {
 		return b
 	}
 	return stacklessCoroGoroutines.inlineBuckets[:]
@@ -87,13 +101,22 @@ func stacklessCoroGoroutineBuckets() []*stacklessCoroGoroutine {
 
 // Rehash the typed links under the registry lock. The table grows with the
 // live population so tasks of the same allocator size cannot accumulate in a
-// few long lists. A completed burst releases its bucket storage.
+// few long lists. Keep a bounded backing array for successive bursts.
 func stacklessCoroResizeGoroutineBuckets(size int) {
 	old := stacklessCoroGoroutineBuckets()
+	large := stacklessCoroGoroutines.largeBuckets
 	var buckets []*stacklessCoroGoroutine
-	if size == stacklessCoroInlineBuckets {
+	switch {
+	case size == stacklessCoroInlineBuckets:
 		buckets = stacklessCoroGoroutines.inlineBuckets[:]
-	} else {
+	case size <= cap(large) && (size >= len(large) || cap(large) <= stacklessCoroMaxRetainedBuckets):
+		buckets = large[:size]
+		if len(large) != 0 {
+			stacklessCoroResizeLargeBuckets(large, buckets)
+			stacklessCoroGoroutines.largeBuckets = buckets
+			return
+		}
+	default:
 		buckets = make([]*stacklessCoroGoroutine, size)
 	}
 	for i, r := range old {
@@ -106,12 +129,50 @@ func stacklessCoroResizeGoroutineBuckets(size int) {
 		}
 	}
 	if size == stacklessCoroInlineBuckets {
-		buckets = nil
+		buckets = large[:0]
+		if cap(buckets) > stacklessCoroMaxRetainedBuckets {
+			buckets = nil
+		}
+		stacklessCoroGoroutines.bucketsIdle = false
 	}
 	stacklessCoroGoroutines.largeBuckets = buckets
 }
 
-func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroGoroutine {
+// In-place resizing uses the same hash at either power of two. Growing
+// moves only links whose extra index bit is set. Shrinking joins the two
+// buckets with the same low bits, leaving the unused part of the array nil.
+func stacklessCoroResizeLargeBuckets(old, buckets []*stacklessCoroGoroutine) {
+	if len(buckets) > len(old) {
+		for i := range old {
+			for link := &old[i]; *link != nil; {
+				r := *link
+				at := stacklessCoroGoroutineIndex(r.root, len(buckets))
+				if at == uintptr(i) {
+					link = &r.next
+				} else {
+					*link = r.next
+					r.next, buckets[at] = buckets[at], r
+				}
+			}
+		}
+		return
+	}
+	for i := len(buckets); i < len(old); i++ {
+		head := old[i]
+		old[i] = nil
+		if head == nil {
+			continue
+		}
+		tail := head
+		for tail.next != nil {
+			tail = tail.next
+		}
+		at := i & (len(buckets) - 1)
+		tail.next, buckets[at] = buckets[at], head
+	}
+}
+
+func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroPublicGoroutine {
 	return &stacklessCoroGoroutines.publicBuckets[(uintptr(unsafe.Pointer(gp))>>3)%256]
 }
 
@@ -131,27 +192,26 @@ func (s *stacklessCoroScheduler) registerPublicGoroutine() {
 }
 
 func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stacklessCoroTask) *stacklessCoroGoroutine {
-	r := stacklessCoroGoroutines.publicFree
-	if r != nil {
-		stacklessCoroGoroutines.publicFree = r.next
+	public := stacklessCoroGoroutines.publicFree
+	if public != nil {
+		stacklessCoroGoroutines.publicFree = public.nextPublic
 		stacklessCoroGoroutines.publicFreeCount--
 	} else {
-		r = new(stacklessCoroGoroutine)
+		public = new(stacklessCoroPublicGoroutine)
 	}
-	callerPCs := r.profileCaller
+	r := &public.stacklessCoroGoroutine
 	*r = stacklessCoroGoroutine{root: &s.root, leaf: leaf, scheduler: s,
 		goid: gp.goid, parentGoid: gp.parentGoid, gopc: gp.gopc,
-		labels: gp.labels, ancestors: gp.ancestors, publicG: gp,
-		profileCaller: callerPCs[:0], public: true}
+		labels: gp.labels, ancestors: gp.ancestors, physicalG: gp, public: true}
 	if gp == getg() {
 		f := findfunc(stacklessCoroResumeIdentity(s.root.resume).fn)
 		if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
-			r.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume, callerPCs)
+			public.profileCaller = stacklessCoroCaptureProfileCaller(gp, s.root.resume, public.profileCaller)
 		}
 	}
 	stacklessCoroInsertGoroutine(r)
 	p := stacklessCoroPublicGoroutineBucket(gp)
-	r.publicNext, *p = *p, r
+	public.nextPublic, *p = *p, public
 	return r
 }
 
@@ -204,7 +264,10 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 	}
 	r := stacklessCoroGoroutines.taskFree
 	if r == nil {
-		r = new(stacklessCoroGoroutine)
+		r = takeStacklessCoroCachedRecordLocked()
+		if r == nil {
+			r = new(stacklessCoroGoroutine)
+		}
 	} else {
 		stacklessCoroGoroutines.taskFree = r.next
 		stacklessCoroGoroutines.taskFreeCount--
@@ -227,11 +290,11 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 		if count != 0 {
 			pcs[0] = callerpc - sys.PCQuantum + 1
 		}
-		if creator.publicG != nil && count < len(pcs) {
+		if creator.public && count < len(pcs) {
 			systemstack(func() {
 				var physical unwinder
 				found := false
-				for physical.init(creator.publicG, unwindSilentErrors); physical.valid() && count < len(pcs); physical.next() {
+				for physical.init(creator.physicalG, unwindSilentErrors); physical.valid() && count < len(pcs); physical.next() {
 					f := physical.frame.fn
 					info := stacklessCoroSourceFrame(f)
 					if !found {
@@ -328,13 +391,15 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	}
 	lock(&stacklessCoroGoroutines.lock)
 	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil {
-		r.leaf, r.owner = task, owner
+		r.owner.Store(owner)
+		r.leaf = task
 		r.profileBoundary, r.profileTrace, r.profileBefore = boundary, trace, before
 		// Runnable tasks have no owner. Only the executing G publishes a
 		// signal-visible source record; queue publication must not touch a G.
 		if owner != nil {
 			if state := owner.stacklessCoro; state != nil {
 				state.activeSource = r
+				state.activeTerminalSource = trace != nil
 				state.sourceTransition = false
 			}
 		}
@@ -342,18 +407,28 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
-func stacklessCoroClearLogicalOwner(task *stacklessCoroTask) {
-	// Clear the signal-visible owner before any frame or record can be recycled.
-	if state := getg().stacklessCoro; state != nil {
+func stacklessCoroClearLogicalOwner(task *stacklessCoroTask, native bool) {
+	gp := getg()
+	// Detach the signal-visible reference before a record can be recycled.
+	if state := gp.stacklessCoro; state != nil {
+		record, terminal := state.activeSource, state.activeTerminalSource
 		state.activeSource = nil
+		state.activeTerminalSource = false
 		state.sourceTransition = false
+		if native && record != nil && !terminal {
+			// A structured child may have taken ownership while the parent
+			// was returning Wait. Only clear our own publication; the
+			// parent's active resume keeps this record live until then.
+			record.owner.CompareAndSwap(gp, nil)
+			return
+		}
 	}
 	if stacklessCoroGoroutines.records.Load() == 0 {
 		return
 	}
 	lock(&stacklessCoroGoroutines.lock)
-	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil && r.owner == getg() {
-		r.owner = nil
+	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil && r.owner.Load() == gp {
+		r.owner.Store(nil)
 		r.profileBoundary, r.profileTrace, r.profileBefore = nil, nil, false
 	}
 	unlock(&stacklessCoroGoroutines.lock)
@@ -373,34 +448,36 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 	}
 	if r := *p; r != nil {
 		if task.parent != nil {
-			r.leaf, r.owner = task.parent, nil
+			r.leaf = task.parent
+			r.owner.Store(nil)
 		} else {
 			*p = r.next
-			if !r.public && !r.hosted {
+			if r.physicalG == nil {
 				stacklessCoroGoroutines.unhosted.Add(-1)
 			}
 			count := stacklessCoroGoroutines.records.Add(-1)
 			public := r.public
-			reusable := !public && !r.hosted && r.owner == nil
+			reusable := r.physicalG == nil && r.owner.Load() == nil
 			if public {
-				p := stacklessCoroPublicGoroutineBucket(r.publicG)
-				for *p != r {
+				record := r.publicRecord()
+				p := stacklessCoroPublicGoroutineBucket(r.physicalG)
+				for *p != record {
 					if *p == nil {
 						throw("runtime: missing public coroutine identity")
 					}
-					p = &(*p).publicNext
+					p = &(*p).nextPublic
 				}
-				*p = r.publicNext
+				*p = record.nextPublic
+				record.nextPublic = nil
 			}
-			callerPCs := r.profileCaller
 			*r = stacklessCoroGoroutine{}
 			if public && stacklessCoroGoroutines.publicFreeCount < stacklessCoroWarmExecutorCount {
-				// Retain only reusable storage for code addresses. No
-				// stack pointer or caller object survives registration.
-				clear(callerPCs)
-				r.profileCaller = callerPCs[:0]
-				r.next = stacklessCoroGoroutines.publicFree
-				stacklessCoroGoroutines.publicFree = r
+				// Retain only reusable storage for code addresses.
+				record := r.publicRecord()
+				clear(record.profileCaller)
+				record.profileCaller = record.profileCaller[:0]
+				record.nextPublic = stacklessCoroGoroutines.publicFree
+				stacklessCoroGoroutines.publicFree = record
 				stacklessCoroGoroutines.publicFreeCount++
 			} else if reusable && stacklessCoroGoroutines.taskFreeCount < stacklessCoroTaskCacheSize {
 				// Completion has detached the root and cleared the signal-
@@ -408,6 +485,8 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 				r.next = stacklessCoroGoroutines.taskFree
 				stacklessCoroGoroutines.taskFree = r
 				stacklessCoroGoroutines.taskFreeCount++
+			} else if reusable {
+				cacheStacklessCoroRecordLocked(r)
 			}
 			if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
 				stacklessCoroResizeGoroutineBuckets(size / 2)
@@ -452,10 +531,10 @@ func stacklessCoroInitHostG(fn *funcval, caller, gp *g) uint64 {
 		*p = h.startNext
 		h.startNext, h.startG = nil, nil
 		r := stacklessCoroGoroutineFor(h.root)
-		if r == nil || r.public || r.hosted {
+		if r == nil || r.physicalG != nil {
 			throw("runtime: invalid coroutine host identity transfer")
 		}
-		r.hosted, r.hostG = true, gp
+		r.physicalG = gp
 		stacklessCoroGoroutines.unhosted.Add(-1)
 		gp.parentGoid, gp.gopc = r.parentGoid, r.gopc
 		gp.labels, gp.ancestors = r.labels, r.ancestors
@@ -484,9 +563,9 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 // window; collecting it does not allocate a complete return-PC payload.
 func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGoroutine) {
 	var leafEntry, leafPC uintptr
-	if r.owner != nil {
+	if owner := r.owner.Load(); owner != nil {
 		var u unwinder
-		for u.init(r.owner, unwindSilentErrors); u.valid(); u.next() {
+		for u.init(owner, unwindSilentErrors); u.valid(); u.next() {
 			f := u.frame.fn
 			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
 				source := stacklessCoroSourceFunc(f, info)
@@ -532,7 +611,7 @@ func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGor
 		}
 	}
 	if r.public {
-		trace.appendPublicCaller(r.publicG)
+		trace.appendPublicCaller(r.physicalG)
 	}
 }
 
@@ -585,13 +664,14 @@ func stacklessCoroSnapshotRecord(gp *g) *stacklessCoroGoroutine {
 		}
 		if state.host != nil {
 			r := stacklessCoroGoroutineFor(state.host.root)
-			if r != nil && !r.public && r.hostG == gp {
+			if r != nil && !r.public && r.physicalG == gp {
 				return r
 			}
 		}
 	}
-	for r := *stacklessCoroPublicGoroutineBucket(gp); r != nil; r = r.publicNext {
-		if r.publicG != gp {
+	for record := *stacklessCoroPublicGoroutineBucket(gp); record != nil; record = record.nextPublic {
+		r := &record.stacklessCoroGoroutine
+		if r.physicalG != gp {
 			continue
 		}
 		f := findfunc(stacklessCoroResumeIdentity(r.root.resume).fn)
@@ -616,10 +696,7 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 	n := 0
 	for _, bucket := range stacklessCoroGoroutineBuckets() {
 		for r := bucket; r != nil; r = r.next {
-			gp := r.hostG
-			if r.public {
-				gp = r.publicG
-			}
+			gp := r.physicalG
 			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
 				continue
 			}
@@ -695,17 +772,14 @@ func stacklessCoroPrintGoroutines(skipID uint64) {
 			if r.goid == skipID {
 				continue
 			}
-			gp := r.hostG
-			if r.public {
-				gp = r.publicG
-			}
+			gp := r.physicalG
 			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
 				continue
 			}
 			status := "waiting"
 			if r.leaf.state == stacklessCoroTaskRunnable || r.leaf.state == stacklessCoroTaskNew {
 				status = "runnable"
-			} else if r.owner != nil {
+			} else if r.owner.Load() != nil {
 				status = "running"
 			}
 			print("\ngoroutine ", r.goid, " [", status)

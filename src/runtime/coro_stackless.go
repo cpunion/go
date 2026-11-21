@@ -1593,7 +1593,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
 		}
-		stacklessCoroClearLogicalOwner(task)
+		stacklessCoroClearLogicalOwner(task, native)
 		p := getg()._panic
 		if p == nil || p.goexit {
 			return
@@ -1664,7 +1664,7 @@ resume:
 resumeActive:
 	stacklessCoroSetLogicalLeaf(task, getg())
 	action := task.resume(unsafe.Pointer(&task.context))
-	stacklessCoroClearLogicalOwner(task)
+	stacklessCoroClearLogicalOwner(task, native)
 	if directInitialRoot && action == stacklessCoroActionYield &&
 		s.initialRootPrivate {
 		hostYieldCheck++

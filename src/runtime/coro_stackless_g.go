@@ -9,11 +9,12 @@ package runtime
 import "unsafe"
 
 type stacklessCoroGState struct {
-	native            unsafe.Pointer
-	deferState        *stacklessCoroDeferState
-	blockingScheduler *stacklessCoroScheduler
-	activeSource      *stacklessCoroGoroutine
-	sourceTransition  bool
+	native               unsafe.Pointer
+	deferState           *stacklessCoroDeferState
+	blockingScheduler    *stacklessCoroScheduler
+	activeSource         *stacklessCoroGoroutine
+	sourceTransition     bool
+	activeTerminalSource bool
 }
 
 // Cold defer state lives behind a separate word from the active source record.

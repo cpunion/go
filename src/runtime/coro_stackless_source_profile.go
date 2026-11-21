@@ -81,7 +81,7 @@ func stacklessCoroActiveSource(gp *g) *stacklessCoroGoroutine {
 		return nil
 	}
 	r := gp.stacklessCoro.activeSource
-	if r == nil || r.owner != gp || gp.stacklessCoro.sourceTransition {
+	if r == nil || r.owner.Load() != gp || gp.stacklessCoro.sourceTransition {
 		return nil
 	}
 	return r
@@ -99,7 +99,7 @@ func stacklessCoroProfileTransition(gp *g, mp *m) bool {
 	}
 	state := gp.stacklessCoro
 	return state.activeSource != nil && (mp.locks != 0 ||
-		state.sourceTransition || state.activeSource.owner != gp)
+		state.sourceTransition || state.activeSource.owner.Load() != gp)
 }
 
 // A helper can finish publishing a different activation before returning to
@@ -126,11 +126,8 @@ func coroProfileResume() {
 
 func stacklessCoroProfileLabels(gp *g) *unsafe.Pointer {
 	if r := stacklessCoroActiveSource(gp); r != nil {
-		if gp == r.hostG {
-			return &gp.labels
-		}
-		if r.publicG != nil {
-			return &r.publicG.labels
+		if r.public || gp == r.physicalG {
+			return &r.physicalG.labels
 		}
 		return &r.labels
 	}
@@ -184,15 +181,17 @@ func stacklessCoroActiveSourcePCs(u *unwinder, source funcInfo, skip *int, buf [
 		appendStacklessCoroSourcePC(u, findfunc(boundary), boundary, skip, buf, n)
 		appendStacklessCoroPanicPCs(u, trace, skip, buf, n)
 	}
-	for _, pc := range r.profileCaller {
-		if *n == len(buf) {
-			break
-		}
-		if *skip != 0 {
-			*skip--
-		} else {
-			buf[*n] = pc
-			*n++
+	if r.public {
+		for _, pc := range r.publicRecord().profileCaller {
+			if *n == len(buf) {
+				break
+			}
+			if *skip != 0 {
+				*skip--
+			} else {
+				buf[*n] = pc
+				*n++
+			}
 		}
 	}
 	return true
