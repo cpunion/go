@@ -256,7 +256,7 @@ func stacklessCoroActiveSource(gp *g) *stacklessCoroGoroutine {
 	return r
 }
 
-func stacklessCoroProfileTransition(gp *g, mp *m) bool {
+func stacklessCoroProfileTransition(gp *g, mp *m, sampled funcInfo) bool {
 	if mp == nil || mp != getg().m {
 		return false
 	}
@@ -267,8 +267,35 @@ func stacklessCoroProfileTransition(gp *g, mp *m) bool {
 		return false
 	}
 	state := gp.stacklessCoro
-	return state.activeSource != nil && (mp.locks != 0 ||
-		state.sourceTransition || state.activeSource.owner.Load() != gp)
+	if state.activeSource == nil {
+		return false
+	}
+	if mp.locks != 0 || state.sourceTransition || state.activeSource.owner.Load() != gp {
+		return true
+	}
+	if !sampled.valid() {
+		return false
+	}
+	// Signals can arrive in the helper's prologue before the transition
+	// marker is set, or after clearing it on return to the generated resume.
+	// These PCs still belong to the transition.
+	switch sampled.entry() {
+	case abi.FuncPCABIInternal(coroAwaitSelfFrame),
+		abi.FuncPCABIInternal(coroAdvanceSelfChunk),
+		abi.FuncPCABIInternal(coroPopSelfChunk),
+		abi.FuncPCABIInternal(coroCompleteSelfFrame),
+		abi.FuncPCABIInternal(coroAdvanceFusedChunk),
+		abi.FuncPCABIInternal(coroPopFusedChunk),
+		abi.FuncPCABIInternal(coroAwaitFusedFrame),
+		abi.FuncPCABIInternal(coroCompleteFusedFrame),
+		abi.FuncPCABIInternal(restoreStacklessCoroFusedParent),
+		abi.FuncPCABIInternal(coroAwaitFrame),
+		abi.FuncPCABIInternal(coroDeferAwaitFrame),
+		abi.FuncPCABIInternal(stacklessCoroBeginProfileTransition),
+		abi.FuncPCABIInternal(coroProfileResume):
+		return true
+	}
+	return false
 }
 
 // A helper can finish publishing a different activation before returning to

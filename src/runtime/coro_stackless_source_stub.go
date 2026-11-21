@@ -24,6 +24,6 @@ func stacklessCoroTracebackPCs(*unwinder, int, []uintptr) (int, bool) {
 	return 0, false
 }
 
-func stacklessCoroProfileTransition(*g, *m) bool { return false }
+func stacklessCoroProfileTransition(*g, *m, funcInfo) bool { return false }
 
 func stacklessCoroProfileLabels(gp *g) *unsafe.Pointer { return &gp.labels }

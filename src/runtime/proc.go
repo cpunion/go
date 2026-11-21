@@ -5910,7 +5910,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	} else {
 		u.initAt(pc, sp, lr, gp, unwindSilentErrors|unwindTrap|unwindJumpStack)
 	}
-	if stacklessCoroProfileTransition(gp, mp) {
+	if stacklessCoroProfileTransition(gp, mp, u.frame.fn) {
 		// Account for the CPU sample without reading a partially published
 		// logical frame chain. Signals can interrupt acquirem regions.
 		stk[n] = abi.FuncPCABIInternal(_LostCoroSourceTransition) + sys.PCQuantum
