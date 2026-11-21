@@ -30,6 +30,7 @@ const (
 )
 
 const stacklessCoroWarmExecutorCount = 4
+const stacklessCoroInitialExecutorCount = 2
 const stacklessCoroTaskCacheSize = 256
 
 // Four tasks occupy the exact 192-byte size class on 64-bit targets and the
@@ -316,8 +317,8 @@ type stacklessCoroScheduler struct {
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
 	rootDone chan struct{}
-	// executorWake admits the initial warm replacements. executorGrow asks
-	// the manager for capacity beyond that warm set, and executorStop
+	// executorWake admits the initial replacement. executorGrow asks the
+	// manager to expand for runnable work or blocking calls, and executorStop
 	// broadcasts scheduler drainage to every admitted or waiting replacement.
 	// These channels remain nil until a root first needs replacement
 	// executors.
@@ -1718,7 +1719,17 @@ resumeOwned:
 	case stacklessCoroActionYield, stacklessCoroActionHandoff:
 		idlePollSkip = nil
 		directInitialRoot = false
-		resumeDirectly, foreignReturner := s.yield(task, native)
+		// The ordinary host and public driver must get their scheduling
+		// checks before reserving the next logical task.
+		dispatch := native && !public && action == stacklessCoroActionYield &&
+			!raceenabled && !stacklessCoroIsPullComparison(s) && hostYieldCheck != ^uint8(0)
+		next, resumeDirectly, foreignReturner := s.yield(task, native, dispatch)
+		if next != nil {
+			hostYieldCheck++
+			initial = false
+			task = next
+			goto resume
+		}
 		if resumeDirectly {
 			// The logical queue is empty, but an ordinary goroutine may be
 			// runnable on the host scheduler. A public structured lineage
@@ -3952,6 +3963,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		task.setFlag(stacklessCoroTaskTypedSpawn, true)
 	}
 	s.liveSpawns++
+	live := s.liveSpawns
 	s.registerGoroutineLocked(task, parent, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
 	s.lifetime.Or(stacklessCoroLifetimeSpawned)
 	runnable := s.readyLocked(task)
@@ -3962,7 +3974,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	// unlikely to replenish that cache; let the producer reach its next
 	// source suspension instead. Completing ready children keep this count low.
 	yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
-		s.liveSpawns <= stacklessCoroTaskCacheSize
+		live <= stacklessCoroTaskCacheSize
 	unlock(&s.lock)
 	s.prepareReplacementExecutors()
 	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
@@ -3973,7 +3985,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		// to select it when its current resume yields.
 		s.signal()
 	}
-	s.wakeReplacementExecutor()
+	s.wakeReplacementExecutor(live, runnable)
 	return yield
 }
 
@@ -4775,6 +4787,15 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	lock(&s.lock)
+	task := s.takeLocked()
+	unlock(&s.lock)
+	if raceenabled && task != nil {
+		raceacquire(unsafe.Pointer(task))
+	}
+	return task
+}
+
+func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 	current := currentStacklessCoroHost()
 	if current != nil && current.scheduler != s {
 		current = nil
@@ -4787,7 +4808,6 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 			pull := stacklessCoroIsPullComparison(s)
 			task = s.head
 			if task == nil || pull && task.state != stacklessCoroTaskRunnable {
-				unlock(&s.lock)
 				return nil
 			}
 			if !pull {
@@ -4807,20 +4827,14 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 			}
 		}
 		if task == nil {
-			unlock(&s.lock)
 			return nil
 		}
 		break
 	}
 	if task.state != stacklessCoroTaskRunnable || task.resuming || task.readyPending {
-		unlock(&s.lock)
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
 	task.state, task.resuming = stacklessCoroTaskRunning, true
-	unlock(&s.lock)
-	if raceenabled {
-		raceacquire(unsafe.Pointer(task))
-	}
 	return task
 }
 
@@ -4849,7 +4863,9 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 	return task
 }
 
-func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (resumeDirectly, foreignReturner bool) {
+// dispatch allows a native driver to reserve the FIFO successor while it
+// still holds the ready lock. Foreign returners must first get a chance at P.
+func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch bool) (next *stacklessCoroTask, resumeDirectly, foreignReturner bool) {
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -4862,12 +4878,16 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native bool) (re
 		// With no competing work, a queue round trip would select this task
 		// again. Keep its running ownership on the current native executor.
 		unlock(&s.lock)
-		return true, false
+		return nil, true, false
 	}
 	task.resuming = false
 	runnable := s.readyLocked(task)
+	foreignReturner = runnable&stacklessCoroForeignReturnerBit != 0
+	if dispatch && !foreignReturner && !getg().preempt {
+		next = s.takeLocked()
+	}
 	unlock(&s.lock)
-	return false, runnable&stacklessCoroForeignReturnerBit != 0
+	return next, false, foreignReturner
 }
 
 func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
@@ -5170,18 +5190,18 @@ func (s *stacklessCoroScheduler) signalAll() {
 // continues to run, so the executor driving that function cannot consume the
 // new task yet. With one P, admission would only add contention; blocking
 // foreign calls admit replacement capacity through their own path.
-func (s *stacklessCoroScheduler) wakeReplacementExecutor() {
+func (s *stacklessCoroScheduler) wakeReplacementExecutor(live uint64, runnable uint32) {
 	if gomaxprocs <= 1 {
 		return
 	}
-	s.wakeMultiprocessorReplacementExecutor()
+	s.wakeMultiprocessorReplacementExecutor(live, runnable)
 }
 
 // Keep the single-P guard small enough to inline into every spawn. This
 // allocating admission work only runs after that existing guard succeeds.
 //
 //go:noinline
-func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor() {
+func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor(live uint64, runnable uint32) {
 	// Spawn already checks the current P count here. Promote only after
 	// that guard, keeping repeated single-P preparation on its old fast path.
 	if s.executorState.Load() == stacklessCoroExecutorStateSingleP {
@@ -5195,6 +5215,32 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor() {
 	case s.executorWake <- struct{}{}:
 	default:
 	}
+	count := s.executorCount.Load()
+	if count < stacklessCoroWarmExecutorCount &&
+		(live >= uint64(count) || runnable&^stacklessCoroForeignReturnerBit >= count) &&
+		s.executorState.Load() == stacklessCoroExecutorStateRunning {
+		select {
+		case s.executorGrow <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *stacklessCoroScheduler) needsWarmExecutor(count uint32) bool {
+	runnable := s.runnableState.Load() &^ stacklessCoroForeignReturnerBit
+	if count >= stacklessCoroWarmExecutorCount || runnable == 0 {
+		return false
+	}
+	if runnable >= count {
+		return true
+	}
+	// Earlier children can occupy every replacement while a later spawn
+	// is the only runnable task. Recheck under the lock as another driver
+	// may already have taken that task or completed an earlier child.
+	lock(&s.lock)
+	warm := s.head != nil && s.liveSpawns >= uint64(count)
+	unlock(&s.lock)
+	return warm
 }
 
 func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
@@ -5234,8 +5280,12 @@ func (s *stacklessCoroScheduler) startReplacementExecutors() {
 	s.executorDone = make(chan bool, stacklessCoroWarmExecutorCount)
 	s.executorGrow = make(chan struct{}, 1)
 	s.executorStop = make(chan struct{})
-	s.executorCount.Store(stacklessCoroWarmExecutorCount)
-	for range stacklessCoroWarmExecutorCount - 1 {
+	count := uint32(stacklessCoroInitialExecutorCount)
+	if raceenabled || stacklessCoroIsPullComparison(s) {
+		count = stacklessCoroWarmExecutorCount
+	}
+	s.executorCount.Store(count)
+	for range count - 1 {
 		go s.replacementExecutor(false)
 	}
 	go s.manageReplacementExecutors()
@@ -5248,7 +5298,7 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 		case <-s.executorGrow:
 			for !s.drained() {
 				count := s.executorCount.Load()
-				if s.blockingExecutors.Load() < count {
+				if s.blockingExecutors.Load() < count && !s.needsWarmExecutor(count) {
 					break
 				}
 				if s.executorCount.Add(1) == 0 {

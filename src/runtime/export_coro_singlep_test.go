@@ -43,12 +43,16 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 		previous := GOMAXPROCS(4)
 		defer GOMAXPROCS(previous)
 		s.prepareReplacementExecutors()
-		s.wakeReplacementExecutor()
+		s.wakeReplacementExecutor(0, 0)
 	}
 	if !lazy || mode != 0 {
+		count := uint32(stacklessCoroInitialExecutorCount)
+		if !lazy {
+			count = stacklessCoroWarmExecutorCount
+		}
 		valid = valid && s.executorState.Load() ==
 			stacklessCoroExecutorStateRunning &&
-			s.executorCount.Load() == stacklessCoroWarmExecutorCount &&
+			s.executorCount.Load() == count &&
 			s.executorWake != nil && s.executorDone != nil &&
 			s.executorGrow != nil && s.executorStop != nil
 	}

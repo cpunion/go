@@ -501,7 +501,7 @@ func yieldStacklessCoroNativeRoot(s *stacklessCoroScheduler, task *stacklessCoro
 		return false
 	}
 	task.context.scheduler = nil
-	s.yield(task, false)
+	s.yield(task, false, false)
 	ctx.deferredYield = true
 	s.signal()
 	return true

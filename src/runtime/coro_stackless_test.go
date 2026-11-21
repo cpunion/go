@@ -4065,9 +4065,21 @@ func TestStacklessCoroResumeFrames(t *testing.T) {
 }
 
 func TestStacklessCoroParallelSpawn(t *testing.T) {
+	t.Run("burst", func(t *testing.T) {
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, false)
+	})
+	t.Run("staggered", func(t *testing.T) {
+		testStacklessCoroParallelSpawn(t, runtime.StacklessCoroWarmExecutorCount, true)
+	})
+	t.Run("staggered-two-P", func(t *testing.T) {
+		testStacklessCoroParallelSpawn(t, 2, true)
+	})
+}
+
+func testStacklessCoroParallelSpawn(t *testing.T, procs int, staggered bool) {
 	const workers = runtime.StacklessCoroWarmExecutorCount - 1
 
-	oldProcs := runtime.GOMAXPROCS(runtime.StacklessCoroWarmExecutorCount)
+	oldProcs := runtime.GOMAXPROCS(procs)
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	var started, completed atomic.Int32
@@ -4086,10 +4098,15 @@ func TestStacklessCoroParallelSpawn(t *testing.T) {
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
-			for range workers {
-				runtime.SpawnStacklessCoroForTest(ctx, worker)
-			}
 			deadline := time.Now().Add(5 * time.Second)
+			for i := range workers {
+				runtime.SpawnStacklessCoroForTest(ctx, worker)
+				if staggered {
+					for started.Load() < int32(i+1) && time.Now().Before(deadline) {
+						runtime.Gosched()
+					}
+				}
+			}
 			for started.Load() != workers && time.Now().Before(deadline) {
 				runtime.Gosched()
 			}
