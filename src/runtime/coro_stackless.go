@@ -1469,7 +1469,6 @@ func (s *stacklessCoroScheduler) discardCachedFrameTaskLocked(
 // task address is also a race-detector synchronization identity, so race
 // builds must not reuse it for an unrelated logical goroutine.
 func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
-	_, hasTerminalValue := s.terminalValue(task)
 	uncachedLineage := !task.hasFlag(stacklessCoroTaskCacheFrame) &&
 		isStacklessCoroUncachedFrameLineage(task.frameSize)
 	validFrame := !task.hasFlag(stacklessCoroTaskCacheFrame) &&
@@ -1487,12 +1486,16 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
 		task.flags&stacklessCoroTaskCompletionMask != 0 ||
 		task.resuming || task.readyPending ||
-		task.context.scheduler != nil ||
-		hasTerminalValue {
+		task.context.scheduler != nil {
 		throw("runtime: invalid stackless coroutine task recycle")
 	}
-	s.clearExitTrace(task)
-	s.clearDeferTrace(task)
+	if s.terminalValues != nil {
+		if _, hasTerminalValue := s.terminalValue(task); hasTerminalValue {
+			throw("runtime: invalid stackless coroutine task recycle")
+		}
+		s.clearExitTrace(task)
+		s.clearDeferTrace(task)
+	}
 	if uncachedLineage {
 		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) {
 			if task.frameSize <= stacklessCoroScalarTaskCacheFirst {
@@ -1703,7 +1706,13 @@ next:
 	task = nil
 	// Native drivers use only the shared ready queue. Producers publish its
 	// count before ringing wake, so an empty snapshot can skip the queue lock.
-	if !native || raceenabled || stacklessCoroIsPullComparison(s) || s.runnableState.Load() != 0 {
+	if native && !raceenabled && !stacklessCoroIsPullComparison(s) {
+		if s.runnableState.Load() != 0 {
+			lock(&s.lock)
+			task = s.takeNativeLocked()
+			unlock(&s.lock)
+		}
+	} else {
 		task = s.take()
 	}
 	if task == nil {
@@ -1978,7 +1987,9 @@ func (s *stacklessCoroScheduler) driverDone(public bool) bool {
 // completeLogicalTaskLocked ends one root or independently spawned logical
 // goroutine. Structured await children keep their parent's count unchanged.
 func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTask) {
-	s.completeHostLocked(task)
+	if s.terminalValues != nil {
+		s.completeHostLocked(task)
+	}
 	if task == &s.root {
 		s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 	} else {
@@ -5132,6 +5143,20 @@ func (s *stacklessCoroScheduler) takeLocked() *stacklessCoroTask {
 	return task
 }
 
+// Native dispatch uses the shared queue. Terminal metadata can be needed
+// to route a queued task to its ordinary host.
+func (s *stacklessCoroScheduler) takeNativeLocked() *stacklessCoroTask {
+	if s.terminalValues != nil {
+		return s.takeLocked()
+	}
+	task := s.head
+	if task != nil {
+		s.popSharedReadyLocked(task)
+		stacklessCoroStartReady(task)
+	}
+	return task
+}
+
 func (s *stacklessCoroScheduler) popSharedReadyLocked(task *stacklessCoroTask) {
 	s.head = task.next
 	if s.head == nil {
@@ -5380,15 +5405,7 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pe
 	var next *stacklessCoroTask
 	if s.head != nil && !getg().preempt &&
 		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
-		if s.terminalValues == nil {
-			// All ready tasks belong to the shared queue when no ordinary
-			// host routing is present. This is a native dispatch.
-			next = s.head
-			s.popSharedReadyLocked(next)
-			stacklessCoroStartReady(next)
-		} else {
-			next = s.takeLocked()
-		}
+		next = s.takeNativeLocked()
 	}
 	unlock(&s.lock)
 	s.logicalTaskComplete(false)
@@ -5426,7 +5443,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask, dispatch bool
 			s.recycleTaskLocked(task)
 			if dispatch && s.head != nil && !getg().preempt &&
 				s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
-				next = s.takeLocked()
+				next = s.takeNativeLocked()
 			}
 		}
 		unlock(&s.lock)
