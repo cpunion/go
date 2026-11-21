@@ -1747,7 +1747,7 @@ func ExecutorStateStacklessCoroForTest(ctx unsafe.Pointer) (uint32, uint32) {
 func ExecutorChannelsStacklessCoroForTest(ctx unsafe.Pointer) (bool, bool, bool) {
 	context := (*stacklessCoroContext)(ctx)
 	scheduler := context.scheduler
-	return scheduler.wake != nil, scheduler.executorWake != nil,
+	return scheduler.wake != nil, scheduler.executorWake() != nil,
 		scheduler.executorDone != nil
 }
 

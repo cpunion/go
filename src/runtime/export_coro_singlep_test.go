@@ -33,7 +33,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 		stacklessCoroExecutorStateSingleP) == lazy)
 	if lazy {
 		valid = valid && s.executorCount.Load() == 1 &&
-			s.executorWake == nil && s.executorDone == nil &&
+			s.executorWake() == nil && s.executorDone == nil &&
 			s.executorGrow == nil && s.executorStop == nil
 	}
 	switch mode {
@@ -53,7 +53,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 		valid = valid && s.executorState.Load() ==
 			stacklessCoroExecutorStateRunning &&
 			s.executorCount.Load() == count &&
-			s.executorWake != nil && s.executorDone != nil &&
+			s.executorWake() != nil && s.executorDone != nil &&
 			s.executorGrow != nil && s.executorStop != nil
 	}
 	valid = valid && s.rootDone == done

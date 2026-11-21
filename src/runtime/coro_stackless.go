@@ -326,6 +326,15 @@ func (context *stacklessCoroContext) task() *stacklessCoroTask {
 			unsafe.Offsetof(stacklessCoroTask{}.context)))
 }
 
+// Replacement state is allocated with the executor channels. Schedulers
+// without replacements keep their original layout and need no completion queue.
+type stacklessCoroReplacementState struct {
+	wake chan struct{}
+	// Completed independent tasks remain charged to liveSpawns until the
+	// publisher of the first task recycles the batch under the scheduler lock.
+	completed atomic.Pointer[stacklessCoroTask]
+}
+
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
 // work through scheduler operations; they never invoke a continuation.
 type stacklessCoroScheduler struct {
@@ -371,12 +380,11 @@ type stacklessCoroScheduler struct {
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
 	rootDone chan struct{}
-	// executorWake admits the initial replacement. executorGrow asks the
-	// manager to expand for runnable work or blocking calls, and executorStop
-	// broadcasts scheduler drainage to every admitted or waiting replacement.
-	// These channels remain nil until a root first needs replacement
-	// executors.
-	executorWake chan struct{}
+	// replacements holds the initial replacement wake channel and any
+	// completions awaiting recycling. executorGrow asks the manager to
+	// expand for runnable work or blocking calls. executorStop broadcasts
+	// drainage to every replacement.
+	replacements atomic.Pointer[stacklessCoroReplacementState]
 	// executorDone reports false for a replacement and true for the manager.
 	// Receiving the manager's marker freezes executorCount for the final join.
 	executorDone  chan bool
@@ -393,9 +401,6 @@ type stacklessCoroScheduler struct {
 	runnableState    atomic.Uint32
 	drainCacheAge    stacklessCoroDrainCacheAge
 	foreignReturners atomic.Uint32
-	// Completed independent tasks remain charged to liveSpawns until the
-	// executor that published the first task recycles the batch under lock.
-	completed atomic.Pointer[stacklessCoroTask]
 }
 
 // stacklessCoroOperationResources retains reusable resources after clearing the state
@@ -5309,7 +5314,7 @@ func (task *stacklessCoroTask) finishNormal() {
 // unhosted task to retire its source record before acquiring the scheduler lock.
 // The empty-to-nonempty publisher owns the pending batch. It takes the whole
 // list under lock so concurrent publishers can share one cache and count update.
-func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask) *stacklessCoroTask {
+func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pending *atomic.Pointer[stacklessCoroTask]) *stacklessCoroTask {
 	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
 		throw("runtime: invalid stackless coroutine completion")
 	}
@@ -5318,9 +5323,9 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask) *s
 	task.finishNormal()
 
 	for {
-		head := s.completed.Load()
+		head := pending.Load()
 		task.next = head
-		if s.completed.CompareAndSwap(head, task) {
+		if pending.CompareAndSwap(head, task) {
 			if head != nil {
 				return nil
 			}
@@ -5328,9 +5333,9 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask) *s
 		}
 	}
 	lock(&s.lock)
-	at := s.completed.Load()
-	for !s.completed.CompareAndSwap(at, nil) {
-		at = s.completed.Load()
+	at := pending.Load()
+	for !pending.CompareAndSwap(at, nil) {
+		at = pending.Load()
 	}
 	for at != nil {
 		next := at.next
@@ -5352,7 +5357,9 @@ func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask) *s
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask, dispatch bool) *stacklessCoroTask {
 	if dispatch && s.executorCount.Load() > 1 && task != &s.root &&
 		task.parent() == nil && !s.hasTerminalRecords() {
-		return s.completeIndependent(task)
+		if state := s.replacements.Load(); state != nil {
+			return s.completeIndependent(task, &state.completed)
+		}
 	}
 	lock(&s.lock)
 	if !task.canComplete() {
@@ -5583,7 +5590,7 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor(live uint
 		return
 	}
 	select {
-	case s.executorWake <- struct{}{}:
+	case s.executorWake() <- struct{}{}:
 	default:
 	}
 	count := s.executorCount.Load()
@@ -5651,8 +5658,17 @@ func (s *stacklessCoroScheduler) promoteSinglePExecutors() {
 	}
 }
 
+func (s *stacklessCoroScheduler) executorWake() chan struct{} {
+	if state := s.replacements.Load(); state != nil {
+		return state.wake
+	}
+	return nil
+}
+
 func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
-	s.executorWake = make(chan struct{}, stacklessCoroWarmExecutorCount-1)
+	s.replacements.Store(&stacklessCoroReplacementState{
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount-1),
+	})
 	// The initial replacements and manager can all report completion without
 	// parking. Growth beyond the warm set retains the ordinary join fallback.
 	s.executorDone = make(chan bool, stacklessCoroWarmExecutorCount)
@@ -5690,14 +5706,15 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 	headSince := started
 	// The initial replacement doorbell is idle until this manager widens
 	// the scheduler. Warm replacements admitted afterwards start directly.
+	wake := s.executorWake()
 	t := newTimer(started+interval, interval, func(arg any, _ uintptr, _ int64) {
 		select {
 		case arg.(chan struct{}) <- struct{}{}:
 		default:
 		}
-	}, s.executorWake, nil)
+	}, wake, nil)
 	defer stopTimer(t)
-	ticks := s.executorWake
+	ticks := wake
 	slow := 0
 	for {
 		select {
@@ -5754,7 +5771,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 				headSince = started
 				slow = 0
 				resetTimer(t, started+interval, interval)
-				ticks = s.executorWake
+				ticks = wake
 			}
 		case <-s.executorStop:
 			return false
@@ -5801,7 +5818,7 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 	if !start {
 		select {
-		case <-s.executorWake:
+		case <-s.executorWake():
 		case <-s.executorStop:
 		}
 	}
@@ -5856,7 +5873,7 @@ func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
 	default:
 	}
 	select {
-	case s.executorWake <- struct{}{}:
+	case s.executorWake() <- struct{}{}:
 	default:
 	}
 	return handoff
