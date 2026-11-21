@@ -37,6 +37,9 @@ type stacklessCoroSourcePosition struct {
 
 type stacklessCoroP struct {
 	sourcePCs      stacklessCoroSourcePCCache
+	callerProfiles [4]stacklessCoroCallerProfile
+	nextProfile    uint8
+	profileMisses  uint8
 	panicTraces    [4]stacklessCoroResumePanicCacheEntry
 	terminalRecord *stacklessCoroTerminalValue
 	deferRecord    *stacklessCoroDeferState

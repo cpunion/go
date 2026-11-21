@@ -195,7 +195,7 @@ func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, calle
 	}
 	n := 1
 	if pcs[0] == 0 {
-		n = stacklessCoroCaptureProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
+		n = stacklessCoroCachedProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
 	}
 	lock(&stacklessCoroGoroutines.lock)
 	s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
@@ -240,7 +240,7 @@ func (s *stacklessCoroScheduler) registerPublicGoroutineLocked(gp *g, leaf *stac
 //go:noinline
 func (public *stacklessCoroPublicGoroutine) captureProfileCaller(gp *g, rootPC uintptr) {
 	var pcs [maxCPUProfStack]uintptr
-	n := stacklessCoroCaptureProfileCaller(gp, rootPC, 0, nil, pcs[:])
+	n := stacklessCoroCaptureProfileCaller(gp, rootPC, 0, nil, pcs[:], nil)
 	public.setProfileCaller(pcs[:n])
 }
 

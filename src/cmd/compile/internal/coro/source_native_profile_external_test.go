@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -90,6 +91,16 @@ var selfEntry=self
 var entry=recursive
 var spawnEntry=spawn
 var terminalEntry=terminal
+//go:noinline
+func profileSharedCaller() {
+ goto body
+body:
+ entry(32,false)
+}
+//go:noinline
+func profileLeft() {goto body;body:profileSharedCaller()}
+//go:noinline
+func profileRight() {goto body;body:profileSharedCaller()}
 func main() {
  promoteEntry=promote
  if text:=os.Getenv("CORO_PROFILE_ROUNDS");text!="" {var err error;rounds,err=strconv.Atoi(text);if err!=nil||rounds<1 {panic("rounds")}}
@@ -99,6 +110,16 @@ body:
  if err:=pprof.StartCPUProfile(os.Stdout);err!=nil {panic(err)}
  switch os.Args[1] {
  case "public": entry(32,false) // PUBLIC_CALL
+ case "cached":
+  rounds=(rounds+3)/4
+  left:=pprof.WithLabels(context.Background(),pprof.Labels("cpu-root","left"))
+  right:=pprof.WithLabels(context.Background(),pprof.Labels("cpu-root","right"))
+  for i:=0;i<2;i++ {
+   pprof.SetGoroutineLabels(left)
+   profileLeft()
+   pprof.SetGoroutineLabels(right)
+   profileRight()
+  }
  case "self": selfEntry(32)
  case "promoted": entry(32,true)
  case "closure": makeEntry(32)()
@@ -146,7 +167,11 @@ body:
 					}
 				}
 			}
-			for _, mode := range []string{"public", "self", "promoted", "closure", "independent", "panic", "goexit", "recovered", "public-panic"} {
+			modes := []string{"public", "self", "promoted", "closure", "independent", "panic", "goexit", "recovered", "public-panic"}
+			if config.name == "checkptr" {
+				modes = append(modes, "cached")
+			}
+			for _, mode := range modes {
 				for _, p := range []string{"1", "4"} {
 					// As in runtime/pprof, increase work only when no business
 					// samples arrived. Every observed semantic mismatch is fatal.
@@ -164,6 +189,7 @@ body:
 							t.Fatalf("%s/P%s: parse: %v", mode, p, err)
 						}
 						matched := 0
+						seenLeft, seenRight := false, false
 						for _, sample := range prof.Sample {
 							var names []string
 							busy, parents, mains := false, 0, 0
@@ -225,20 +251,34 @@ body:
 							if mode == "promoted" {
 								wantLabel = "promoted"
 							}
+							if mode == "cached" {
+								left := slices.Contains(names, "main.profileLeft")
+								right := slices.Contains(names, "main.profileRight")
+								if left == right || !slices.Contains(names, "main.profileSharedCaller") {
+									t.Fatalf("%s/P%s: unexpected caller chain: %v", mode, p, names)
+								}
+								if left {
+									wantLabel = "left"
+									seenLeft = true
+								} else {
+									wantLabel = "right"
+									seenRight = true
+								}
+							}
 							labels := sample.Label["cpu-root"]
 							if len(labels) != 1 || labels[0] != wantLabel {
 								t.Fatalf("%s/P%s: labels=%v want %q", mode, p, labels, wantLabel)
 							}
 						}
-						if matched != 0 {
+						if matched != 0 && (mode != "cached" || seenLeft && seenRight) {
 							t.Logf("%s/P%s rounds=%d: %d busy sample records retain 33 recursive activations, caller and labels", mode, p, rounds, matched)
 							break
 						}
 						// Preserve the exact compressed profile in the test log,
 						// including on a later successful sampling attempt.
-						t.Logf("%s/P%s rounds=%d: no busy samples; profile=%x", mode, p, rounds, data)
+						t.Logf("%s/P%s rounds=%d: insufficient busy samples; profile=%x", mode, p, rounds, data)
 						if rounds == 8192 {
-							t.Fatalf("%s/P%s: no busy source samples after bounded work increase", mode, p)
+							t.Fatalf("%s/P%s: insufficient busy source samples after bounded work increase", mode, p)
 						}
 					}
 				}
