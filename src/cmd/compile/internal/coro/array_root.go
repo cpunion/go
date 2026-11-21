@@ -26,11 +26,11 @@ type rootArrayPlan struct {
 // private array inside its physical root. Borrowed pointer fields use the
 // existing clearing paths; root caches account for the complete allocation.
 type rootArrayLowering struct {
-	plan     *rootArrayPlan
-	public   *ir.Func
-	root     *ir.Name
-	buffer   *ir.Name
-	snapshot *ir.Name
+	plan      *rootArrayPlan
+	public    *ir.Func
+	inherited *ir.Name
+	buffer    *ir.Name
+	snapshot  *ir.Name
 }
 
 // preferRootArrayFrames chooses an ordinary task boundary when entering a
@@ -63,11 +63,56 @@ func preferRootArrayFrames(candidates map[*ir.Func]*lowerCandidate) {
 	}
 }
 
-func prepareRootArray(candidate *lowerCandidate) {
-	if !candidate.localSelfFrameLoop() || candidate.selfSpawn {
-		return
+// markSharedArrayAwaits identifies serial awaits where the caller and callee
+// can reconstruct one private buffer. Sharing starts at an array-bearing
+// root and follows only directly resolved fused awaits with the same array
+// type and write index. Public factories always start a separate buffer.
+func markSharedArrayAwaits(candidates map[*ir.Func]*lowerCandidate) {
+	plans := make(map[*lowerCandidate]*rootArrayPlan)
+	for _, candidate := range candidates {
+		if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
+			candidate.fusedSelf || candidate.selfSpawn || !candidate.function.Recursive ||
+			len(candidate.defers) != 0 || !validRootArraySignature(candidate.function.Func) {
+			continue
+		}
+		// Share only substantial arrays. Smaller frames already fit compact
+		// typed chunks without adding a borrowed pointer.
+		if plan := planFrameArray(candidate.function, 384); plan != nil {
+			plans[candidate] = plan
+		}
 	}
-	plan := planRootArray(candidate.function)
+	for parent, plan := range plans {
+		for call := range parent.fusedAwaits {
+			edge := edgeForCall(parent.function, call)
+			child := candidates[edge.Callee]
+			other := plans[child]
+			if edge.Kind != DirectCall || len(edge.Targets) != 0 || other == nil ||
+				plan.writeIndex != other.writeIndex || !types.Identical(plan.array.Type(), other.array.Type()) {
+				continue
+			}
+			if parent.sharedArrayAwaits == nil {
+				parent.sharedArrayAwaits = make(map[*ir.CallExpr]*lowerCandidate)
+			}
+			parent.sharedArrayAwaits[call] = child
+			parent.sharedArrayPlan, child.sharedArrayPlan = plan, other
+		}
+	}
+	for _, parent := range candidates {
+		for call := range parent.fusedAwaits {
+			child := candidates[edgeForCall(parent.function, call).Callee]
+			if child != nil && child.sharedArrayPlan != nil && parent.sharedArrayAwaits[call] == nil {
+				delete(parent.fusedAwaits, call)
+				delete(parent.fusedRequests, call)
+			}
+		}
+	}
+}
+
+func prepareRootArray(candidate *lowerCandidate) {
+	plan := candidate.sharedArrayPlan
+	if plan == nil && candidate.localSelfFrameLoop() && !candidate.selfSpawn {
+		plan = planRootArray(candidate.function)
+	}
 	if plan == nil {
 		return
 	}
@@ -80,7 +125,8 @@ func prepareRootArray(candidate *lowerCandidate) {
 	for _, field := range public.Type().Params() {
 		params = append(params, types.NewField(field.Pos, field.Sym, field.Type))
 	}
-	params = append(params, types.NewField(pos, typecheck.Lookup(".arrayRoot"), types.Types[types.TBOOL]))
+	bufferType := types.NewPtr(plan.array.Type())
+	params = append(params, types.NewField(pos, typecheck.Lookup(".arrayBuffer"), bufferType))
 	results := make([]*types.Field, 0, public.Type().NumResults())
 	for _, field := range public.Type().Results() {
 		results = append(results, types.NewField(field.Pos, nil, field.Type))
@@ -99,7 +145,7 @@ func prepareRootArray(candidate *lowerCandidate) {
 		remap[old] = implementation.Type().Param(i).Nname.(*ir.Name)
 		args = append(args, old)
 	}
-	args = append(args, ir.NewBool(pos, true))
+	args = append(args, ir.NewNilExpr(pos, bufferType))
 	ir.WithFunc(public, func() {
 		public.Body = ir.Nodes{ir.NewReturnStmt(pos, ir.Nodes{
 			typecheck.Call(pos, implementation.Nname, args, false),
@@ -129,10 +175,10 @@ func prepareRootArray(candidate *lowerCandidate) {
 		}
 	}
 	candidate.factory = implementation
-	root := implementation.Type().Param(len(params) - 1).Nname.(*ir.Name)
-	buffer := typecheck.TempAt(pos, implementation, types.NewPtr(plan.array.Type()))
+	inherited := implementation.Type().Param(len(params) - 1).Nname.(*ir.Name)
+	buffer := typecheck.TempAt(pos, implementation, bufferType)
 	snapshot := typecheck.TempAt(plan.write.Pos(), fn, types.Types[types.TUINT8])
-	candidate.rootArray = &rootArrayLowering{plan, public, root, buffer, snapshot}
+	candidate.rootArray = &rootArrayLowering{plan, public, inherited, buffer, snapshot}
 
 	// Keep the original byte conversion at its source evaluation point. The
 	// original zero has no effects, and the array's only write is this one.
@@ -165,21 +211,27 @@ func prepareRootArray(candidate *lowerCandidate) {
 // Sharing reconstructed storage along a serial self-await lineage needs this
 // stronger property in addition to an ordinary escape-analysis result.
 func planRootArray(function *Function) *rootArrayPlan {
-	fn := function.Func
-	if len(fn.Type().RecvParams()) > 4 || fn.Type().NumResults() != 1 ||
-		!fn.Type().Result(0).Type.IsInteger() {
+	if !validRootArraySignature(function.Func) {
 		return nil
 	}
-	// Bound the extra private factory selector to register-sized arguments;
+	return planFrameArray(function, 512)
+}
+
+func validRootArraySignature(fn *ir.Func) bool {
+	if len(fn.Type().RecvParams()) > 4 || fn.Type().NumResults() != 1 ||
+		!fn.Type().Result(0).Type.IsInteger() {
+		return false
+	}
+	// Leave room for the private factory's buffer argument;
 	// aggregate transfers retain the existing lowering and budget checks.
 	for _, input := range fn.Type().RecvParams() {
 		typ := input.Type
 		types.CalcSize(typ)
 		if typ.Size() > int64(types.PtrSize) || !(typ.IsInteger() || typ.IsBoolean() || typ.IsPtr() || typ.IsChan()) {
-			return nil
+			return false
 		}
 	}
-	return planFrameArray(function, 512)
+	return true
 }
 
 // planFrameArray proves that the initial zero and one constant-index

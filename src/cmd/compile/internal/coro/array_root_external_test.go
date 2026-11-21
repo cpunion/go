@@ -55,3 +55,144 @@ func main(){
 `
 	testSwitchReturnProgram(t, source, nil, []string{"sequence", "independent"})
 }
+
+func TestMutualRootArrayLineage(t *testing.T) {
+	testSwitchReturnProgram(t, mutualRootArraySource, nil,
+		[]string{"even", "odd", "outside", "differentA", "differentB"},
+		"even", "odd", "outside", "differentA", "differentB")
+}
+
+const mutualRootArraySource = `package main
+
+import "runtime"
+
+var ready = make(chan struct{})
+var release = make(chan struct{})
+
+//go:noinline
+func readPair(p *[440]byte) int { return int(p[0]) + int(p[121]) + 2*int(p[439]) }
+
+func bottom(mode int) {
+	switch mode {
+	case 1:
+		ready <- struct{}{}
+		<-release
+	case 2:
+		panic("array unwind")
+	}
+	runtime.Gosched()
+}
+
+func even(n, seed, mode int) int {
+	var data [440]byte
+	data[439] = byte(seed)
+	seed += 7
+	if n == 0 {
+		bottom(mode)
+		return readPair(&data) + readPair(&data)
+	}
+	result := odd(n-1, seed, mode)
+	return result + readPair(&data) + readPair(&data)
+}
+
+func odd(n, seed, mode int) int {
+	var data [440]byte
+	data[439] = byte(seed)
+	seed += 7
+	if n == 0 {
+		bottom(mode)
+		return readPair(&data) + readPair(&data)
+	}
+	result := even(n-1, seed, mode)
+	return result + readPair(&data) + readPair(&data)
+}
+
+func outside(n, seed, mode int) int {
+	a := even(n, seed, mode)
+	b := odd(n, seed+3, mode)
+	return a + b
+}
+
+func spawn(done chan int, n, seed int) {
+	go worker(done, n, seed)
+}
+
+func worker(done chan int, n, seed int) {
+	done <- outside(n, seed, 1)
+}
+
+func differentA(n, seed int) int {
+	var data [440]byte
+	data[0] = byte(seed)
+	if n == 0 {
+		runtime.Gosched()
+		return readPair(&data)
+	}
+	child := differentB(n-1, seed+7)
+	return child + readPair(&data)
+}
+
+func differentB(n, seed int) int {
+	var data [440]byte
+	data[439] = byte(seed)
+	if n == 0 {
+		runtime.Gosched()
+		return readPair(&data)
+	}
+	child := differentA(n-1, seed+7)
+	return child + readPair(&data)
+}
+
+func collect() {
+	for range ready {
+		runtime.GC()
+		release <- struct{}{}
+	}
+}
+
+func want(n, seed int) int {
+	total := 0
+	for i := 0; i <= n; i++ {
+		total += 4 * int(byte(seed+7*i))
+	}
+	return total
+}
+
+func catch(n int) (caught bool) {
+	defer func() { caught = recover() == "array unwind" }()
+	even(n, 11, 2)
+	return false
+}
+
+func main() {
+	go collect()
+	runtime.LockOSThread()
+	if outside(13, 251, 0) != want(13, 251)+want(13, 254) {
+		panic("locked-thread fallback")
+	}
+	runtime.UnlockOSThread()
+	for _, n := range []int{0, 1, 7, 8, 63, 513} {
+		if outside(n, 251, 0) != want(n, 251)+want(n, 254) {
+			panic("ordinary caller snapshot")
+		}
+		if !catch(n) || outside(n, 39, 0) != want(n, 39)+want(n, 42) {
+			panic("root reuse after unwind")
+		}
+		done := make(chan int, 4)
+		wantTotal := 0
+		for seed := 0; seed < 4; seed++ {
+			spawn(done, n, seed)
+			wantTotal += want(n, seed) + want(n, seed+3)
+		}
+		total := 0
+		for range 4 { total += <-done }
+		if total != wantTotal { panic("concurrent array roots") }
+		different := 0
+		for i := 0; i <= n; i++ {
+			different += (1+i%2)*int(byte(33+7*i))
+		}
+		if differentA(n, 33) != different { panic("incompatible write indices") }
+	}
+	println("switch-return-ok")
+}
+`

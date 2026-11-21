@@ -157,8 +157,8 @@ func TestRootArrayReconstructionProof(t *testing.T) {
 			if lowered == nil || candidate.factory == public || resumeFactoryABI(public, fn) != FactoryABI3 {
 				t.Fatal("lost private implementation or changed the public factory ABI")
 			}
-			if candidate.factory.Type().NumParams() != public.Type().NumParams()+1 || !lowered.root.Type().IsBoolean() {
-				t.Fatal("missing explicit independent-lineage selector")
+			if candidate.factory.Type().NumParams() != public.Type().NumParams()+1 || !types.Identical(lowered.inherited.Type(), types.NewPtr(arrayType)) {
+				t.Fatal("missing the typed borrowed-buffer parameter")
 			}
 			if write.X != lowered.snapshot || write.Y == nil || fn.Body[0] != write || value.Curfn != candidate.factory {
 				t.Fatal("lost the source conversion/evaluation point or result owner")

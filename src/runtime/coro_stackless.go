@@ -2734,12 +2734,22 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return coroTakeFrameChunk(ctx, child, size, chunkType)
 	}
-	// A compatible warm chunk replaces multiple scheduler-cache
-	// reservations. Prefer it while this executor already owns the storage.
-	warmChunk := requestedChunk && !sameResume &&
-		hasStacklessCoroNativeFusedChunk(child, size, chunkType)
+	// Reuse an executor's warm chunk before consulting the holder cache.
+	// On a cold compact lineage, a live prefix of eight frames is enough
+	// demand to start a whole typed chunk instead of filling the cache
+	// with individual allocations.
+	useChunk := false
+	if requestedChunk && !sameResume {
+		useChunk = hasStacklessCoroNativeFusedChunk(child, size, chunkType)
+		if !useChunk && getg().stackIsFixed() &&
+			uintptr(s.cachedFrameBytes) >= uintptr(s.freeFrameBytes)+stacklessCoroFrameChunkSize*size {
+			if class, ok := stacklessCoroFrameChunkClass(chunkType, size); ok && class == 0 {
+				useChunk = true
+			}
+		}
+	}
 	var task *stacklessCoroTask
-	if !warmChunk {
+	if !useChunk {
 		task = s.takeCachedFrameTaskLocked(child, uint16(size))
 		if task == nil {
 			for (s.cachedFrameTasks >= stacklessCoroTaskCacheSize ||
@@ -2838,6 +2848,10 @@ func coroTakeFusedChunkBoundary(child stacklessCoroResume, size uintptr, chunkTy
 
 // coroAdvanceFusedChunk installs an initialized compatible frame. Its
 // parent is already fused, so only the active frame and resume change.
+// Keep those stores together without a scheduler safepoint. The write
+// barrier may flush on the system stack.
+//
+//go:nosplit
 func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stacklessCoroResume) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
@@ -2846,24 +2860,23 @@ func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stackl
 	header.resume = stacklessCoroResumeIdentity(task.resume)
 	header.marker = marker
 	stacklessCoroBeginProfileTransition()
-	mp := acquirem()
 	context.frame = frame
 	task.resume = child
-	releasem(mp)
 	return switchStacklessCoroFusedChunk(context, task)
 }
 
 // coroPopFusedChunk returns an interior slot to its chunk. The parent is
-// still fused. Publish the saved parent pair before clearing the old slot.
+// still fused. Publish the saved parent pair without a scheduler safepoint
+// before clearing the old slot.
+//
+//go:nosplit
 func coroPopFusedChunk(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
 	task := context.task()
 	header := (*stacklessCoroFusedResumeFrameHeader)(context.frame)
 	stacklessCoroBeginProfileTransition()
-	mp := acquirem()
 	context.frame = header.parent
 	task.resume = *(*stacklessCoroResume)(unsafe.Pointer(&header.resume))
-	releasem(mp)
 	header.parent = nil
 	header.resume = nil
 	header.marker = 0
