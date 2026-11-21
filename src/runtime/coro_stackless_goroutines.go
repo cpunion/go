@@ -247,6 +247,11 @@ func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
 // already remember their public caller; hand-written roots do so lazily here.
 // The caller can leave before independent children create further goroutines.
 func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stacklessCoroTask, callerpc uintptr, callersp unsafe.Pointer) {
+	tasks := [1]*stacklessCoroTask{task}
+	s.registerGoroutinesLocked(tasks[:], parent, callerpc, callersp)
+}
+
+func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoroTask, parent *stacklessCoroTask, callerpc uintptr, callersp unsafe.Pointer) {
 	gp := getg()
 	caller := stacklessCoroPublicCaller(gp)
 	lock(&stacklessCoroGoroutines.lock)
@@ -262,62 +267,64 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 	if h := currentStacklessCoroHost(); h != nil && h.root == root {
 		creator.labels = gp.labels
 	}
-	r := stacklessCoroGoroutines.taskFree
-	if r == nil {
-		r = takeStacklessCoroCachedRecordLocked()
+	for _, task := range tasks {
+		r := stacklessCoroGoroutines.taskFree
 		if r == nil {
-			r = new(stacklessCoroGoroutine)
+			r = takeStacklessCoroCachedRecordLocked()
+			if r == nil {
+				r = new(stacklessCoroGoroutine)
+			}
+		} else {
+			stacklessCoroGoroutines.taskFree = r.next
+			stacklessCoroGoroutines.taskFreeCount--
 		}
-	} else {
-		stacklessCoroGoroutines.taskFree = r.next
-		stacklessCoroGoroutines.taskFreeCount--
-	}
-	*r = stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
-		goid: sched.goidgen.Add(1), parentGoid: creator.goid, gopc: callerpc,
-		labels: creator.labels}
-	if debug.tracebackancestors > 0 {
-		var previous []ancestorInfo
-		if creator.ancestors != nil {
-			previous = *creator.ancestors
-		}
-		n := min(len(previous)+1, int(debug.tracebackancestors))
-		ancestors := make([]ancestorInfo, n)
-		copy(ancestors[1:], previous)
-		pcs := make([]uintptr, tracebackInnerFrames)
-		var u unwinder
-		skip, count := 0, 0
-		rootPC := appendStacklessCoroSourceFrames(&u, parent, &skip, pcs, &count)
-		if count != 0 {
-			pcs[0] = callerpc - sys.PCQuantum + 1
-		}
-		if creator.public && count < len(pcs) {
-			systemstack(func() {
-				var physical unwinder
-				found := false
-				for physical.init(creator.physicalG, unwindSilentErrors); physical.valid() && count < len(pcs); physical.next() {
-					f := physical.frame.fn
-					info := stacklessCoroSourceFrame(f)
-					if !found {
-						found = f.entry() == rootPC
-						continue
+		*r = stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
+			goid: sched.goidgen.Add(1), parentGoid: creator.goid, gopc: callerpc,
+			labels: creator.labels}
+		if debug.tracebackancestors > 0 {
+			var previous []ancestorInfo
+			if creator.ancestors != nil {
+				previous = *creator.ancestors
+			}
+			n := min(len(previous)+1, int(debug.tracebackancestors))
+			ancestors := make([]ancestorInfo, n)
+			copy(ancestors[1:], previous)
+			pcs := make([]uintptr, tracebackInnerFrames)
+			var u unwinder
+			skip, count := 0, 0
+			rootPC := appendStacklessCoroSourceFrames(&u, parent, &skip, pcs, &count)
+			if count != 0 {
+				pcs[0] = callerpc - sys.PCQuantum + 1
+			}
+			if creator.public && count < len(pcs) {
+				systemstack(func() {
+					var physical unwinder
+					found := false
+					for physical.init(creator.physicalG, unwindSilentErrors); physical.valid() && count < len(pcs); physical.next() {
+						f := physical.frame.fn
+						info := stacklessCoroSourceFrame(f)
+						if !found {
+							found = f.entry() == rootPC
+							continue
+						}
+						pc := physical.symPC()
+						if info != nil && info.flags&abi.CoroSourceCopy != 0 {
+							source := stacklessCoroSourceFunc(f, info)
+							file, line := funcline1(f, pc, false)
+							f, pc = source, stacklessCoroSourcePC(source, file, line)
+						}
+						appendStacklessCoroSourcePC(&u, f, pc, &skip, pcs, &count)
 					}
-					pc := physical.symPC()
-					if info != nil && info.flags&abi.CoroSourceCopy != 0 {
-						source := stacklessCoroSourceFunc(f, info)
-						file, line := funcline1(f, pc, false)
-						f, pc = source, stacklessCoroSourcePC(source, file, line)
-					}
-					appendStacklessCoroSourcePC(&u, f, pc, &skip, pcs, &count)
-				}
-			})
+				})
+			}
+			ancestors[0] = ancestorInfo{pcs: pcs[:count], goid: creator.goid, gopc: creator.gopc}
+			r.ancestors = new([]ancestorInfo)
+			*r.ancestors = ancestors
 		}
-		ancestors[0] = ancestorInfo{pcs: pcs[:count], goid: creator.goid, gopc: creator.gopc}
-		r.ancestors = new([]ancestorInfo)
-		*r.ancestors = ancestors
+		stacklessCoroInsertGoroutine(r)
 	}
-	stacklessCoroInsertGoroutine(r)
-	stacklessCoroGoroutines.unhosted.Add(1)
-	sched.goroutinesCreated.Add(1)
+	stacklessCoroGoroutines.unhosted.Add(int64(len(tasks)))
+	sched.goroutinesCreated.Add(int64(len(tasks)))
 	unlock(&stacklessCoroGoroutines.lock)
 }
 

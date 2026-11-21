@@ -335,10 +335,11 @@ var runtimeDecls = [...]struct {
 	{"coroTakeFusedChunkBoundary", funcTag, 222},
 	{"coroAdvanceFusedChunk", funcTag, 223},
 	{"coroPopFusedChunk", funcTag, 123},
+	{"coroSpawnScalarBatch", funcTag, 224},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [224]*types.Type
+	var typs [225]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -563,6 +564,7 @@ func runtimeTypes() []*types.Type {
 	typs[221] = newSig(params(typs[7], typs[5], typs[1]), params(typs[7]))
 	typs[222] = newSig(params(typs[123], typs[5], typs[1]), params(typs[7]))
 	typs[223] = newSig(params(typs[7], typs[7], typs[71], typs[123]), params(typs[71]))
+	typs[224] = newSig(params(typs[7], typs[123], typs[67], typs[13]), params(typs[13], typs[6]))
 	return typs[:]
 }
 

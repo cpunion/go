@@ -1853,7 +1853,7 @@ func CheckEarlyReadyStacklessCoroForTest() bool {
 		return false
 	}
 
-	direct := s.waiting(task, true)
+	_, direct := s.waiting(task, true, false)
 	if raceenabled {
 		return !direct && len(s.wake) == 1 && s.take() == task &&
 			task.state == stacklessCoroTaskRunning && task.resuming &&
@@ -1868,7 +1868,8 @@ func CheckEarlyReadyStacklessCoroForTest() bool {
 func CheckEarlyReadyManagedFallbackStacklessCoroForTest() bool {
 	s, task, op := newEarlyReadyStacklessCoroForTest()
 	completeStacklessCoroOperation(op)
-	return !s.waiting(task, false) && len(s.wake) == 1 &&
+	_, direct := s.waiting(task, false, false)
+	return !direct && len(s.wake) == 1 &&
 		s.take() == task && task.state == stacklessCoroTaskRunning &&
 		task.resuming && !task.readyPending
 }
@@ -1880,7 +1881,7 @@ func CheckEarlyReadyOrderingStacklessCoroForTest() bool {
 	s.readyLocked(other)
 	unlock(&s.lock)
 	completeStacklessCoroOperation(op)
-	if s.waiting(task, true) || len(s.wake) != 1 {
+	if _, direct := s.waiting(task, true, false); direct || len(s.wake) != 1 {
 		return false
 	}
 	return s.take() == other && s.take() == task && s.head == nil &&
@@ -1889,7 +1890,7 @@ func CheckEarlyReadyOrderingStacklessCoroForTest() bool {
 
 func CheckDelayedReadySignalStacklessCoroForTest() bool {
 	s, task, op := newEarlyReadyStacklessCoroForTest()
-	if s.waiting(task, true) || len(s.wake) != 0 {
+	if _, direct := s.waiting(task, true, false); direct || len(s.wake) != 0 {
 		return false
 	}
 	completeStacklessCoroOperation(op)
@@ -1919,7 +1920,7 @@ func CheckCompletionHandoffStacklessCoroForTest(parentResuming,
 		s.readyLocked(readyTask)
 		unlock(&s.lock)
 	}
-	next := s.complete(child)
+	next := s.complete(child, false)
 	lock(&s.lock)
 	direct = next == parent && parent.state == stacklessCoroTaskRunning &&
 		parent.resuming

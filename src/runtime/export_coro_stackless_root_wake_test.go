@@ -10,7 +10,7 @@ import "unsafe"
 
 func CheckStacklessCoroLateRootSignalForTest(spawned, concurrent bool) bool {
 	s, task, op := newEarlyReadyStacklessCoroForTest()
-	s.waiting(task, false)
+	s.waiting(task, false, false)
 	if spawned {
 		// Model children that have already completed before the public
 		// driver decides whether it needs to transfer to an owner.

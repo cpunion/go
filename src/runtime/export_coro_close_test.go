@@ -98,7 +98,7 @@ func StacklessCoroClosePublicationForTest(count, schedulers int,
 					frame.index > last[i] && frame.index%len(states) == i
 				last[i] = frame.index
 				task.context.scheduler = nil
-				s.complete(task)
+				s.complete(task, false)
 				completed++
 				progress = true
 			}
@@ -163,7 +163,7 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	first, last := new(stacklessCoroTask), new(stacklessCoroTask)
 	first.state, last.state = stacklessCoroTaskRunning, stacklessCoroTaskRunning
 	first.resuming, last.resuming = true, true
-	s.complete(first)
+	s.complete(first, false)
 	if s.liveSpawns != 1 || s.rootComplete() || s.drained() {
 		return false
 	}
@@ -192,7 +192,7 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	if !stacklessCoroWakeReceiverForTest(s.wake) {
 		return false
 	}
-	s.complete(&s.root)
+	s.complete(&s.root, false)
 	valid := <-events == 5
 	select {
 	case <-s.rootDone:
@@ -203,7 +203,7 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	if !stacklessCoroWakeReceiverForTest(s.wake) {
 		return false
 	}
-	s.complete(last)
+	s.complete(last, false)
 	state := <-events
 	valid = valid && state&3 == 3 && (executors || state&4 != 0)
 	<-done

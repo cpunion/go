@@ -57,7 +57,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 			s.executorGrow != nil && s.executorStop != nil
 	}
 	valid = valid && s.rootDone == done
-	s.complete(&s.root)
+	s.complete(&s.root, false)
 	s.stopReplacementExecutors()
 	select {
 	case <-done:

@@ -406,3 +406,5 @@ func coroTakeSelfChunk(unsafe.Pointer, uintptr, *byte) unsafe.Pointer
 func coroTakeFusedChunkBoundary(func(unsafe.Pointer) uint8, uintptr, *byte) unsafe.Pointer
 func coroAdvanceFusedChunk(unsafe.Pointer, unsafe.Pointer, uint8, func(unsafe.Pointer) uint8) uint8
 func coroPopFusedChunk(unsafe.Pointer) uint8
+
+func coroSpawnScalarBatch(unsafe.Pointer, func(unsafe.Pointer) uint8, uint32, int) (int, bool)

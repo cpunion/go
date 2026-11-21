@@ -133,6 +133,8 @@ type lowerCandidate struct {
 	heapLocals        map[*ir.Name]bool
 	rootArray         *rootArrayLowering
 	reusedArray       *frameArrayReuse
+	scalarSpawn       *scalarSpawnFactory
+	scalarSpawnSites  []scalarSpawnSite
 	affineRoot        *affineReturnPlan
 }
 
@@ -668,6 +670,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 	retainCapturedEntries(candidates)
 	resolveFusedFrameChunkProofs(candidates)
+	resolveScalarSpawnSites(candidates)
 	for _, function := range functions {
 		if ordinary := rejectedBodies[function.Func]; ordinary != nil {
 			remapOrdinaryBody(function.Func, ordinary)
@@ -3430,7 +3433,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	continueStates := make(map[ir.Node]int)
 	var lowerStatements func(ir.Nodes, int) int
 	var lowerStatement func(ir.Node, int) int
+	spawnLoops := make(map[*ir.GoDeferStmt]scalarSpawnLoop)
 	lowerLoop := func(target ir.Node, loop *ir.ForStmt, next int) int {
+		if spawn, batch := planScalarSpawnLoop(loop); spawn != nil {
+			spawnLoops[spawn] = batch
+		}
 		conditionState := addState(lowerState{
 			condition: loop.Cond,
 			next:      -1,
@@ -4582,7 +4589,6 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					if err != nil {
 						return err
 					}
-					body = append(body, child.setup...)
 					name := "coroSpawn"
 					args := ir.Nodes{ctx, child.resume}
 					if child.frame != nil {
@@ -4599,6 +4605,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							}),
 						}, nil)
 					}
+					edge := edgeForCall(function, call)
+					if loop, ok := spawnLoops[goStmt]; ok && child.frame != nil && child.spawnGuard == nil && len(edge.Targets) == 0 {
+						block := ir.NewBlockStmt(goStmt.Pos(), append(child.setup, spawn))
+						candidate.scalarSpawnSites = append(candidate.scalarSpawnSites, scalarSpawnSite{
+							block: block, spawn: spawn, resume: resume, callee: edge.Callee,
+							index: edit(loop.index), limit: edit(loop.limit),
+						})
+						body = append(body, block)
+						continue
+					}
+					body = append(body, child.setup...)
 					if child.spawnGuard != nil {
 						invoke := append(child.spawnSetup, spawn)
 						body = append(body, ir.NewIfStmt(goStmt.Pos(), child.spawnGuard,
@@ -5475,6 +5492,10 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	for i, stmt := range resume.Body {
 		resume.Body[i] = rewrite(stmt)
 	}
+	for i := range candidate.scalarSpawnSites {
+		site := &candidate.scalarSpawnSites[i]
+		site.index, site.limit = rewrite(site.index), rewrite(site.limit)
+	}
 	if array := candidate.reusedArray; array != nil && array.clear == nil {
 		candidate.reusedArray = nil
 	}
@@ -5805,6 +5826,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.Nodes{rootResult}, ir.Nodes{childResult}))
 	}
 
+	candidate.scalarSpawn = newScalarSpawnFactory(candidate, resume, replacements[candidate.resumePC], factoryPrologue, declarations[initializers:])
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = factory
 	frameResult := typecheck.ConvNop(factoryFrame, unsafePointerType)

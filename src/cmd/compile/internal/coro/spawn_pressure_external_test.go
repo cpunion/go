@@ -81,7 +81,27 @@ func blocked(n int) {
  close(gate)
  for atomic.LoadUint64(&completed)<uint64(n) { runtime.Gosched() }
 }
+var batchGate chan struct{}
+var batchReady, batchDone uint64
+func batchWorker() {
+ atomic.AddUint64(&batchReady,1)
+ <-batchGate
+ atomic.AddUint64(&batchDone,1)
+}
+func batchProduce(n int) {
+ batchGate=make(chan struct{})
+ atomic.StoreUint64(&batchReady,0)
+ atomic.StoreUint64(&batchDone,0)
+ for i:=0; i<n; i++ { go batchWorker() }
+ for atomic.LoadUint64(&batchReady)<uint64(n) { runtime.Gosched() }
+ close(batchGate)
+ for atomic.LoadUint64(&batchDone)<uint64(n) { runtime.Gosched() }
+ if atomic.LoadUint64(&batchReady)!=uint64(n) || atomic.LoadUint64(&batchDone)!=uint64(n) {
+  panic("batch spawn incorrect child count")
+ }
+}
 func main() {
+ for _,n:=range []int{0,1,7,8,9,127,128,129,255,256,257,1031} {batchProduce(n)}
  for _,n:=range []int{0,1,127,128,129,255,256,1000,10000} {
   arguments=0;atomic.StoreUint64(&completed,0);atomic.StoreUint64(&sum,0)
   want:=n*(n-1)/2
@@ -146,6 +166,10 @@ func TestSpawnReadyPressure(t *testing.T) {
 			out, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.produce\.coro\.func1$`, program).CombinedOutput()
 			if err != nil || strings.Contains(string(out), "runtime.coroSpawnFrame(SB)") != native {
 				t.Fatalf("producer native path = %t: %v\n%s", native, err, out)
+			}
+			batch, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.batchProduce\.coro\.func1$`, program).CombinedOutput()
+			if err != nil || strings.Contains(string(batch), "runtime.coroSpawnScalarBatch(SB)") != native {
+				t.Fatalf("batched producer native path = %t: %v\n%s", native, err, batch)
 			}
 			for _, procs := range []string{"1", "4"} {
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
