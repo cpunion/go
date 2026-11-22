@@ -17,9 +17,6 @@ import (
 // contention uses the bounded blocking-read worker pool.
 func (f *File) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
 	*n = 0
-	*err = nil
-	*direct = false
-	*status = 0
 	if e := f.checkValid("read"); e != nil {
 		*err = e
 		return false
@@ -27,6 +24,7 @@ func (f *File) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, d
 
 	state, e := f.pfd.CoroReadStart(ctx, b, n, status)
 	if state == poll.CoroReadFallback {
+		*direct = false
 		poll.CoroCallRead(ctx, func() {
 			count, readErr := f.read(b)
 			*n = count
@@ -39,6 +37,10 @@ func (f *File) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, d
 		return true
 	}
 	runtime.KeepAlive(f)
+	if e == nil {
+		*err = nil
+		return false
+	}
 	*err = f.wrapErr("read", e)
 	return false
 }
