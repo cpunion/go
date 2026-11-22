@@ -131,13 +131,8 @@ func TestStacklessCoroFileWriteError(t *testing.T) {
 	for _, buffer := range [][]byte{nil, []byte("x")} {
 		var n int
 		var status uintptr
-		started := false
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if !started {
-				started = true
-				runtime.FileWriteStacklessCoroForTest(ctx, -1, buffer, &n, &status)
-				return runtime.StacklessCoroActionWait
-			}
+			runtime.FileWriteStacklessCoroForTest(ctx, -1, buffer, &n, &status)
 			return runtime.StacklessCoroActionComplete
 		})
 		if n != 0 || status != uintptr(syscall.EBADF) {
@@ -165,13 +160,8 @@ func TestStacklessCoroFileWriteLarge(t *testing.T) {
 	defer syscall.Close(fd)
 	var n int
 	var status uintptr
-	started := false
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-		if !started {
-			started = true
-			runtime.FileWriteStacklessCoroForTest(ctx, fd, buffer, &n, &status)
-			return runtime.StacklessCoroActionWait
-		}
+		runtime.FileWriteStacklessCoroForTest(ctx, fd, buffer, &n, &status)
 		return runtime.StacklessCoroActionComplete
 	})
 	if n != len(buffer) || status != 0 {
@@ -251,10 +241,9 @@ func TestStacklessCoroWriteProgress(t *testing.T) {
 					})
 					if pollable {
 						runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &n, &status)
-					} else {
-						runtime.FileWriteStacklessCoroForTest(ctx, fds[0], payload, &n, &status)
+						return runtime.StacklessCoroActionWait
 					}
-					return runtime.StacklessCoroActionWait
+					runtime.FileWriteStacklessCoroForTest(ctx, fds[0], payload, &n, &status)
 				}
 				return runtime.StacklessCoroActionComplete
 			})

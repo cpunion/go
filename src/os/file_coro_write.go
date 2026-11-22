@@ -13,12 +13,9 @@ import (
 )
 
 // coroWriteStart is the compiler-private entry used for a Write suspension.
-// The direct path retains the file's write lock until coroWriteFinish.
+// A pending poll-backed write retains the lock until coroWriteFinish.
 func (f *File) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
 	*n = 0
-	*err = nil
-	*direct = false
-	*status = 0
 	if e := f.checkValid("write"); e != nil {
 		*err = e
 		return false
@@ -26,6 +23,7 @@ func (f *File) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, 
 
 	state, e := f.pfd.CoroWriteStart(ctx, b, n, status)
 	if state == poll.CoroWriteFallback {
+		*direct = false
 		poll.CoroCallWrite(ctx, func() {
 			*n, *err = f.Write(b)
 		})
@@ -34,6 +32,11 @@ func (f *File) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, 
 	if state == poll.CoroWriteWait {
 		*direct = true
 		return true
+	}
+	runtime.KeepAlive(f)
+	if e == nil {
+		*err = nil
+		return false
 	}
 	epipecheck(f, e)
 	*err = f.wrapErr("write", e)
