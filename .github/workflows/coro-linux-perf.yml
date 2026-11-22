@@ -1,4 +1,4 @@
-name: Coroutine Linux frame optimization
+name: Coroutine Linux frame switch validation
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare frame initialization (Linux amd64)
+    name: Compare grouped frame switches (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure the frame initialization change
+      - name: Measure and validate grouped frame switches
         shell: bash
-        run: bash .github/coro-linux-perf/measure-candidate.sh
+        run: bash .github/coro-linux-perf/measure-combined.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-frame-candidate
+          name: coroutine-linux-frame-combined
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
