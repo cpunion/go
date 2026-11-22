@@ -2919,11 +2919,11 @@ func lowerRunToCompletion(candidate *lowerCandidate) error {
 }
 
 func reparentClosureCaptures(fn, resume *ir.Func,
-	deferClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node, detached ...ir.Node) error {
+	skipClosures map[*ir.Func]bool, edit func(ir.Node) ir.Node, detached ...ir.Node) error {
 	// Source function literals now execute inside resume. Reparent them and
 	// route their captures through resume's copy of each factory local.
-	// Defer wrappers need specialized snapshot and terminal rewriting, so
-	// leave those closures alone here.
+	// Deferred calls reparent their own captures. Lowered go wrappers
+	// are replaced by direct use of the frozen operands.
 	var captureErr error
 	visit := func(node ir.Node) {
 		if captureErr != nil {
@@ -2931,7 +2931,7 @@ func reparentClosureCaptures(fn, resume *ir.Func,
 		}
 		closure, ok := node.(*ir.ClosureExpr)
 		if !ok || closure.Func.ClosureParent != fn ||
-			deferClosures[closure.Func] {
+			skipClosures[closure.Func] {
 			return
 		}
 		closure.Func.ClosureParent = resume
@@ -2991,9 +2991,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Dynamic callee snapshots belong to the source caller during validation;
 	// rechecking that relationship after reparenting would lose their arguments.
 	goCalls := make(map[*ir.CallExpr]*ir.CallExpr)
+	loweredSpawnWrappers := make(map[*ir.Func]bool)
 	for _, edge := range function.Edges {
-		if edge.Kind == GoCall {
-			goCalls[edge.Node] = unwrapGoCall(edge.Node)
+		if edge.Kind != GoCall {
+			continue
+		}
+		call := unwrapGoCall(edge.Node)
+		goCalls[edge.Node] = call
+		if call != edge.Node && candidate.transitions[edge.Node] == SiteSpawn {
+			loweredSpawnWrappers[edge.Node.Fun.(*ir.ClosureExpr).Func] = true
 		}
 	}
 	// Keep NoSuspend adapters unchanged. Both explicit frames and closure
@@ -3086,7 +3092,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	ir.Visit(fn, func(node ir.Node) {
 		if closure, ok := node.(*ir.ClosureExpr); ok {
-			if closure.Func.Wrapper() && fixedDeferWrappers[closure.Func] {
+			// Native spawns read the frozen operands directly. Only the
+			// independent ordinary body creates the frontend wrapper.
+			if loweredSpawnWrappers[closure.Func] || closure.Func.Wrapper() && fixedDeferWrappers[closure.Func] {
 				return
 			}
 			for _, variable := range closure.Func.ClosureVars {
@@ -4253,13 +4261,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return node
 	}
 
-	deferClosures := make(map[*ir.Func]bool, len(candidate.defers))
+	skipClosures := loweredSpawnWrappers
 	for _, deferred := range candidate.defers {
 		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
-			deferClosures[closure.Func] = true
+			skipClosures[closure.Func] = true
 		}
 	}
-	if err := reparentClosureCaptures(fn, resume, deferClosures, edit, sourceLiterals...); err != nil {
+	if err := reparentClosureCaptures(fn, resume, skipClosures, edit, sourceLiterals...); err != nil {
 		return err
 	}
 

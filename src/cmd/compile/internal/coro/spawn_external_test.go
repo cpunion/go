@@ -199,6 +199,17 @@ func ordinaryGoroutines() int {
 					strings.Contains(string(data), "runtime.newproc(SB)") {
 					t.Fatalf("native helper retained ordinary spawn: %v\n%s", err, data)
 				}
+				// Only the factory itself may allocate a task frame. The
+				// resume passes the frontend operands directly to the child.
+				resume := testenv.Command(t, testenv.GoToolPath(t), "tool", "objdump", "-s",
+					`^example.com/spawncontext/helper\.Spawn\.coro\.func[0-9]+$`, exe)
+				data, err = resume.CombinedOutput()
+				if err != nil || !strings.Contains(string(data), "runtime.coroSpawnFrame(SB)") {
+					t.Fatalf("missing native spawn resume: %v\n%s", err, data)
+				}
+				if strings.Contains(string(data), "runtime.newobject") || strings.Contains(string(data), "runtime.mallocgc") {
+					t.Fatalf("native spawn resume allocated a capture cell:\n%s", data)
+				}
 			}
 			for _, procs := range []string{"1", "4"} {
 				run := testenv.Command(t, exe)
