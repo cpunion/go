@@ -682,7 +682,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				remapOrdinaryBody(fn, candidate.ordinary)
 				fn.Body = candidate.ordinary.Body
 				ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
-			} else {
+			} else if !installBufferedChannelExchangeEntry(candidate, rangeBodyEntryAnchors(candidate)...) {
 				addOrdinaryBody(function.Func, candidate.ordinary, rangeBodyEntryAnchors(candidate)...)
 			}
 		}

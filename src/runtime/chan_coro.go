@@ -212,15 +212,18 @@ func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
 // coroTryChanExchange linearizes a buffered send immediately followed by a
 // receive. With room in the buffer and no waiters the send cannot block,
 // and its own value makes the receive ready even when the buffer was empty.
+// The public entry passes a nil context before it starts an executor.
 // A miss leaves the channel and the caller's result slots untouched.
 func coroTryChanExchange(ctx unsafe.Pointer, c *hchan, source, result unsafe.Pointer, received *bool) bool {
 	if raceenabled || asanenabled || msanenabled || debugChan ||
 		c == nil || c.dataqsiz == 0 || c.bubble != nil || c.timer != nil {
 		return false
 	}
-	context := (*stacklessCoroContext)(ctx)
-	if context == nil || context.scheduler == nil || stacklessCoroIsPullComparison(context.scheduler) {
-		return false
+	if ctx != nil {
+		context := (*stacklessCoroContext)(ctx)
+		if context.scheduler == nil || stacklessCoroIsPullComparison(context.scheduler) {
+			return false
+		}
 	}
 	if state := getg().stacklessCoro; state != nil && (state.channelPair || state.channelWake) {
 		return false

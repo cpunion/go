@@ -32,6 +32,12 @@ func pointerExchange(ch chan *int, value *int) (any, verdict) {
 	return result, ok
 }
 
+func exchangeOnce(ch chan *int, value *int) *int {
+	ch <- value
+	result := <-ch
+	return result
+}
+
 func differentChannels(send, receive chan int, value int) int {
 	send <- value
 	result := <-receive
@@ -82,6 +88,7 @@ func checkReady() {
 	left, right := new(int), new(int)
 	*left, *right = 57, 59
 	pointers := make(chan *int, 2)
+	check(exchangeOnce(pointers, left) == left && len(pointers) == 0)
 	result, ok := pointerExchange(pointers, left)
 	check(bool(ok) && result.(*int) == left && len(pointers) == 0)
 	pointers <- left
@@ -103,6 +110,14 @@ func main() {
 	}()
 	value, ok := exchange(ch, 9)
 	check(ok && value == 109)
+
+	ptrs := make(chan *int)
+	sent, answer := 61, 67
+	go func() {
+		check(<-ptrs == &sent)
+		ptrs <- &answer
+	}()
+	check(exchangeOnce(ptrs, &sent) == &answer)
 
 	full := make(chan int, 1)
 	full <- 7
@@ -146,5 +161,10 @@ func TestBufferedChannelExchange(t *testing.T) {
 		if got, want := strings.Contains(string(out), "runtime.coroTryChanExchange"), name != "differentChannels"; got != want {
 			t.Fatalf("%s calls buffered exchange=%t, want %t\n%s", name, got, want, out)
 		}
+	}
+	out, err := testenv.Command(t, goTool, "tool", "objdump", "-s", "^main[.]exchangeOnce$", program).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "runtime.coroTryChanExchange") ||
+		!strings.Contains(string(out), "runtime.coroRunFrame") {
+		t.Fatalf("public entry has no ready exchange or fallback: %v\n%s", err, out)
 	}
 }
