@@ -1691,10 +1691,12 @@ func (s *stacklessCoroScheduler) resumeWithWorkProbe(task *stacklessCoroTask, pr
 		r.workProbe.Store(stacklessCoroWorkParallel)
 		// While the manager is still observing demand, admit replacements
 		// on spare Ps without waiting for it to process this signal.
-		if gomaxprocs >= 3 && s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 &&
-			s.executorCount.CompareAndSwap(1, 3) {
-			go s.replacementExecutor(true)
-			go s.replacementExecutor(true)
+		count := uint32(min(gomaxprocs, 3))
+		if count >= 2 && s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 &&
+			s.executorCount.CompareAndSwap(1, count) {
+			for range count - 1 {
+				go s.replacementExecutor(true)
+			}
 		}
 		select {
 		case r.wake <- struct{}{}:
@@ -1718,7 +1720,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	var lane *stacklessCoroAssistLane
 	var useWide bool
 	var probe stacklessCoroWorkProbe
-	if native && !public && !assist && gomaxprocs >= 3 &&
+	if native && !public && !assist && gomaxprocs >= 2 &&
 		s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
 		if r := s.replacements.Load(); r.workProbe.Load() == stacklessCoroWorkUnmeasured {
 			probe.replacements = r
@@ -5960,6 +5962,9 @@ func (s *stacklessCoroScheduler) warmExecutorLimit() uint32 {
 		if limit := replacements.shortLimit.Load(); limit != 0 && s.canAssist() {
 			return uint32(limit)
 		}
+		if replacements.workProbe.Load() == stacklessCoroWorkParallel && s.canAssist() {
+			return uint32(min(gomaxprocs, stacklessCoroMaxWarmExecutors))
+		}
 	}
 	return uint32(max(stacklessCoroWarmExecutorCount, min(gomaxprocs, stacklessCoroMaxWarmExecutors)))
 }
@@ -6095,8 +6100,9 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if now-started < interval/2 {
 				// A yield or completion can ring the doorbell before the first
 				// timer tick. A failed probe leaves the regular window intact.
-				observedWork := replacements.workProbe.Load() == stacklessCoroWorkParallel
-				if lane == nil && gomaxprocs >= 3 && (observedWork || now-started >= earlyProbeInterval) && s.canAssist() {
+				observedWork := gomaxprocs >= 2 && replacements.workProbe.Load() == stacklessCoroWorkParallel
+				legacyProbe := gomaxprocs >= 3 && now-started >= earlyProbeInterval
+				if lane == nil && (observedWork || legacyProbe) && s.canAssist() {
 					lock(&s.lock)
 					moved := int(s.queueProgress - progress)
 					yields := int(replacements.yields - yieldProgress)
