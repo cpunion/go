@@ -1,4 +1,4 @@
-name: Coroutine Linux performance receipt
+name: Coroutine Linux frame profiles
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Same-source benchmarks (Linux amd64)
+    name: Same-source frame profiles (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure exact coroutine revision and official Go
+      - name: Measure and profile frame boundaries
         shell: bash
-        run: bash .github/coro-linux-perf/measure.sh
+        run: bash .github/coro-linux-perf/measure-frame.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-perf
+          name: coroutine-linux-frames
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
