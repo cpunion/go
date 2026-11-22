@@ -1,0 +1,31 @@
+name: Coroutine spawn batches
+
+on:
+  push:
+    branches:
+      - coro/measure-spawn-batching-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Validate coroutine spawn batches on Linux amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and measure exact baseline and candidate SDKs
+        run: bash .github/perf-coro-spawn/measure.sh 63746d7012c5283e48e8aea85e3339be6e0a333d 0f3d981395c1f24c6ea15f128a83a1bc62a2f9b2
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coroutine-spawn-batching
+          path: ${{ runner.temp }}/coro-spawn-batching
+          if-no-files-found: error
