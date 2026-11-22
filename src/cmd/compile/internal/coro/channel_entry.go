@@ -10,62 +10,120 @@ import (
 	"cmd/compile/internal/types"
 )
 
-// installBufferedChannelExchangeEntry completes a function consisting of a
-// send immediately followed by a receive and return without creating a root.
-// Its operands are stable, so the existing entry can handle a miss.
+// installBufferedChannelExchangeEntry attempts the two channel operations
+// before creating a root. The ordinary path and a successful exchange both
+// produce raw results for the original receive projection and return.
 func installBufferedChannelExchangeEntry(candidate *lowerCandidate, anchors ...*ir.Name) bool {
 	fn, ordinary := candidate.function.Func, candidate.ordinary
-	if candidate.factoryABI != FactoryABI3 || len(ordinary.Body) != 3 || len(candidate.function.Sites) != 2 {
+	if candidate.factoryABI != FactoryABI3 || len(candidate.function.Sites) != 2 {
 		return false
 	}
-	send, ok := ordinary.Body[0].(*ir.SendStmt)
+	first := 0
+	for first < len(ordinary.Body) && privateChannelPairDeclaration(ordinary.Body[first]) {
+		first++
+	}
+	if len(ordinary.Body)-first != 3 {
+		return false
+	}
+	send, ok := ordinary.Body[first].(*ir.SendStmt)
 	if !ok || len(send.Init()) != 0 ||
 		!stableChannelEntryOperand(send.Chan) || !stableChannelEntryOperand(send.Value) ||
 		send.Chan.Type().Elem().Size() > 16 {
 		return false
 	}
-	assign, ok := ordinary.Body[1].(*ir.AssignStmt)
-	if !ok || !assign.Def {
+	projection := ordinary.Body[first+1]
+	if !localChannelExchangeProjection(projection) {
 		return false
 	}
-	received, ok := assign.X.(*ir.Name)
-	if !ok || received.Class != ir.PAUTO || received.Addrtaken() {
+	receive, commaOK := channelReceiveProjection(projection)
+	if receive == nil || receive.X != send.Chan {
 		return false
 	}
-	for _, init := range assign.Init() {
-		decl, ok := init.(*ir.Decl)
-		if !ok || decl.X != received {
+	ret, ok := ordinary.Body[first+2].(*ir.ReturnStmt)
+	if !ok || len(ret.Init()) != 0 {
+		return false
+	}
+	for _, result := range ret.Results {
+		if !shortChannelPairExpr(result, 0) {
 			return false
 		}
 	}
-	receive, ok := assign.Y.(*ir.UnaryExpr)
-	if !ok || receive.Op() != ir.ORECV || receive.X != send.Chan || len(receive.Init()) != 0 {
-		return false
-	}
-	ret, ok := ordinary.Body[2].(*ir.ReturnStmt)
-	if !ok || len(ret.Init()) != 0 || len(ret.Results) != 1 || ret.Results[0] != received {
-		return false
-	}
 
-	addOrdinaryBody(fn, ordinary, anchors...)
+	native := fn.Body
+	remapOrdinaryBody(fn, ordinary)
 	ir.WithFunc(fn, func() {
 		pos := send.Pos()
 		elem := send.Chan.Type().Elem()
 		source := typecheck.TempAt(pos, fn, elem)
 		result := typecheck.TempAt(pos, fn, elem)
-		exchanged := typecheck.Call(pos, typecheck.LookupRuntime("coroTryChanExchange", elem, elem, elem),
-			ir.Nodes{typecheck.NodNil(), send.Chan, typecheck.NodAddr(source), typecheck.NodAddr(result), typecheck.NodNil()}, false)
-		prefix := ir.Nodes{
+		body := ordinary.Body[:first:first]
+		body.Append(
 			ir.NewDecl(pos, ir.ODCL, source),
 			ir.NewDecl(pos, ir.ODCL, result),
 			ir.NewAssignStmt(pos, source, send.Value),
 			ir.NewAssignStmt(pos, result, ir.NewZero(pos, elem)),
-			ir.NewIfStmt(pos, exchanged, ir.Nodes{ir.NewReturnStmt(ret.Pos(), ir.Nodes{result})}, nil),
-		}
-		typecheck.Stmts(prefix)
+		)
 		send.Value = source
-		fn.Body = append(prefix, fn.Body...)
+		recv := ir.NewUnaryExpr(pos, ir.ORECV, send.Chan)
+		var blocking, receivedPointer ir.Node
+		if commaOK == nil {
+			blocking = ir.NewAssignStmt(pos, result, recv)
+			receivedPointer = typecheck.NodNil()
+			replaceChannelReceive(projection, receive, result)
+		} else {
+			boolType := types.Types[types.TBOOL]
+			received := typecheck.TempAt(pos, fn, boolType)
+			body.Append(ir.NewDecl(pos, ir.ODCL, received),
+				ir.NewAssignStmt(pos, received, ir.NewZero(pos, boolType)))
+			receivedPointer = typecheck.NodAddr(received)
+			blocking = ir.NewAssignListStmt(pos, ir.OAS2, ir.Nodes{result, received}, ir.Nodes{recv})
+			var projectedOK ir.Node = received
+			if target := commaOK.Lhs[1]; !ir.IsBlank(target) && !types.Identical(target.Type(), boolType) {
+				projectedOK = typecheck.Conv(received, target.Type())
+			}
+			commaOK.SetOp(ir.OAS2)
+			commaOK.Rhs = ir.Nodes{result, projectedOK}
+			commaOK.SetTypecheck(0)
+			typecheck.Stmt(commaOK)
+		}
+		exchanged := typecheck.Call(pos, typecheck.LookupRuntime("coroTryChanExchange", elem, elem, elem),
+			ir.Nodes{typecheck.NodNil(), send.Chan, typecheck.NodAddr(source), typecheck.NodAddr(result), receivedPointer}, false)
+		miss := ir.NewIfStmt(pos, ordinaryEntryCondition(fn, anchors), ir.Nodes{send, blocking}, native)
+		body.Append(ir.NewIfStmt(pos, ir.NewUnaryExpr(pos, ir.ONOT, exchanged), ir.Nodes{miss}, nil),
+			projection, ret)
+		fn.Body = body
+		typecheck.Stmts(fn.Body)
 	})
+	return true
+}
+
+func localChannelExchangeProjection(stmt ir.Node) bool {
+	var targets []ir.Node
+	switch n := stmt.(type) {
+	case *ir.AssignStmt:
+		targets = []ir.Node{n.X}
+	case *ir.AssignListStmt:
+		if len(n.Lhs) != 2 || n.Op() != ir.OAS2 && n.Op() != ir.OAS2RECV {
+			return false
+		}
+		targets = n.Lhs
+	default:
+		return false
+	}
+	for _, target := range targets {
+		if ir.IsBlank(target) {
+			continue
+		}
+		name, ok := target.(*ir.Name)
+		if !ok || name.Class != ir.PAUTO || name.IsClosureVar() || name.Addrtaken() {
+			return false
+		}
+	}
+	for _, init := range stmt.Init() {
+		if !channelEntryDeclaration(init) {
+			return false
+		}
+	}
 	return true
 }
 

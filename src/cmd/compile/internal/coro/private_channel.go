@@ -71,7 +71,7 @@ func FoldPrivateChannelPairs(fn *ir.Func) {
 			if j == len(body) {
 				continue
 			}
-			recv, commaOK := privateChannelReceive(body[j])
+			recv, commaOK := channelReceiveProjection(body[j])
 			if recv != nil && recv.X == name {
 				ch := channels[name]
 				ch.pairs = append(ch.pairs, privateChannelPair{body, i, j, send, recv, commaOK})
@@ -141,7 +141,7 @@ func privateChannelPairDeclaration(stmt ir.Node) bool {
 	return ok && decl.X == assign.X && decl.X.Class == ir.PAUTO
 }
 
-func privateChannelReceive(stmt ir.Node) (*ir.UnaryExpr, *ir.AssignListStmt) {
+func channelReceiveProjection(stmt ir.Node) (*ir.UnaryExpr, *ir.AssignListStmt) {
 	var value ir.Node
 	switch n := stmt.(type) {
 	case *ir.UnaryExpr:
@@ -195,9 +195,13 @@ func (pair privateChannelPair) fold(fn *ir.Func) {
 		typecheck.Stmt(assign)
 		return
 	}
+	replaceChannelReceive(stmt, pair.receive, value)
+}
+
+func replaceChannelReceive(stmt ir.Node, receive *ir.UnaryExpr, value ir.Node) {
 	var edit func(ir.Node) ir.Node
 	edit = func(node ir.Node) ir.Node {
-		if node == pair.receive {
+		if node == receive {
 			return value
 		}
 		ir.EditChildren(node, edit)
