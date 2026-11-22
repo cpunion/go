@@ -117,6 +117,14 @@ func prepareRootArray(candidate *lowerCandidate) {
 		return
 	}
 	fn, public := candidate.function.Func, candidate.factory
+	if candidate.scalarArrayReads != nil {
+		snapshot := prepareArraySnapshot(fn, plan)
+		for _, read := range candidate.scalarArrayReads {
+			call := (*read).(*ir.CallExpr)
+			*read = scalarArrayRead(plan, call, snapshot)
+		}
+		return
+	}
 	pos := fn.Pos()
 	// Preserve the exported factory signature. A public factory always starts
 	// a new lineage; testing ctx alone would incorrectly share storage across
@@ -177,7 +185,7 @@ func prepareRootArray(candidate *lowerCandidate) {
 	candidate.factory = implementation
 	inherited := implementation.Type().Param(len(params) - 1).Nname.(*ir.Name)
 	buffer := typecheck.TempAt(pos, implementation, bufferType)
-	snapshot := typecheck.TempAt(plan.write.Pos(), fn, types.Types[types.TUINT8])
+	snapshot := prepareArraySnapshot(fn, plan)
 	candidate.rootArray = &rootArrayLowering{plan, public, inherited, buffer, snapshot}
 
 	// Keep the original byte conversion at its source evaluation point. The
@@ -185,9 +193,6 @@ func prepareRootArray(candidate *lowerCandidate) {
 	// Fresh root storage is zero; restoring this byte before each proven leaf
 	// read therefore reconstructs the complete original array without another
 	// full-size zero. The leaf itself, including its full array type, is kept.
-	plan.write.X = snapshot
-	plan.write.SetInit(ir.Nodes{ir.NewDecl(snapshot.Pos(), ir.ODCL, snapshot)})
-	fn.Body = fn.Body[1:]
 	for call := range plan.uses {
 		index := ir.NewIndexExpr(call.Pos(), buffer,
 			typedInt(call.Pos(), types.Types[types.TINT], plan.writeIndex))
@@ -196,12 +201,20 @@ func prepareRootArray(candidate *lowerCandidate) {
 			call.SetInit(ir.Nodes{typecheck.Stmt(ir.NewAssignStmt(call.Pos(), index, snapshot))})
 		})
 	}
+}
+
+func prepareArraySnapshot(fn *ir.Func, plan *rootArrayPlan) *ir.Name {
+	snapshot := typecheck.TempAt(plan.write.Pos(), fn, plan.array.Type().Elem())
+	plan.write.X = snapshot
+	plan.write.SetInit(ir.Nodes{ir.NewDecl(snapshot.Pos(), ir.ODCL, snapshot)})
+	fn.Body = fn.Body[1:]
 	for i, name := range fn.Dcl {
 		if name.Canonical() == plan.array {
 			fn.Dcl = append(fn.Dcl[:i], fn.Dcl[i+1:]...)
 			break
 		}
 	}
+	return snapshot
 }
 
 // planRootArray recognizes an entry-zeroed byte array followed by one pure

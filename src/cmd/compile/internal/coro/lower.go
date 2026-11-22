@@ -135,6 +135,7 @@ type lowerCandidate struct {
 	sharedArrayPlan   *rootArrayPlan
 	sharedArrayAwaits map[*ir.CallExpr]*lowerCandidate
 	rootOnlyResult    bool
+	scalarArrayReads  []*ir.Node
 	reusedAwaitInput  *awaitInputReuse
 	reusedArray       *frameArrayReuse
 	scalarSpawn       *scalarSpawnFactory
@@ -584,6 +585,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	markFusedFrameCandidates(plan, candidates)
 	preferRootArrayFrames(candidates)
 	markSharedArrayAwaits(candidates)
+	planScalarSharedArrays(candidates)
 	for _, function := range functions {
 		if candidate := candidates[function.Func]; candidate != nil {
 			prepareRootArray(candidate)
@@ -5595,6 +5597,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			rootFields = append(rootFields, resultValueFields[0])
 		}
 		rootType = types.NewStruct(rootFields)
+	} else if candidate.rootOnlyResult {
+		rootType = types.NewStruct([]*types.Field{
+			types.NewField(pos, typecheck.Lookup(".frame"), frameType), resultValueFields[0],
+		})
+	}
+	if rootType != frameType {
 		rootType.SetNoalg(true)
 		types.CalcSize(rootType)
 	}
@@ -5908,9 +5916,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	missingFrame := ir.NewBinaryExpr(pos, ir.OEQ, factoryFrame,
 		ir.NewNilExpr(pos, framePointerType))
 	allocation := ir.Node(ir.NewAssignStmt(pos, factoryFrame, typedNew(pos, frameType)))
-	if array := candidate.rootArray; array != nil {
+	if rootType != frameType {
 		rootAllocation := typecheck.ConvNop(typecheck.ConvNop(typedNew(pos, rootType), unsafePointerType), framePointerType)
-		allocation = ir.NewIfStmt(pos, isArrayRoot(), ir.Nodes{
+		root := ir.Node(isRootFactory())
+		if candidate.rootArray != nil {
+			root = isArrayRoot()
+		}
+		allocation = ir.NewIfStmt(pos, root, ir.Nodes{
 			ir.NewAssignStmt(pos, factoryFrame, rootAllocation),
 		}, ir.Nodes{allocation})
 	}
