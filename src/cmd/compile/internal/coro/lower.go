@@ -134,6 +134,8 @@ type lowerCandidate struct {
 	rootArray         *rootArrayLowering
 	sharedArrayPlan   *rootArrayPlan
 	sharedArrayAwaits map[*ir.CallExpr]*lowerCandidate
+	rootOnlyResult    bool
+	reusedAwaitInput  *awaitInputReuse
 	reusedArray       *frameArrayReuse
 	scalarSpawn       *scalarSpawnFactory
 	scalarSpawnSites  []scalarSpawnSite
@@ -587,6 +589,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 			prepareRootArray(candidate)
 		}
 	}
+	planSharedArrayAwaitInputs(candidates)
 	// Lowering an enclosing function can replace a closure's captures with
 	// explicit pointer cells. Materialize every remaining source fallback
 	// before that changes the layout expected by its serialized body.
@@ -3234,6 +3237,11 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		returnValue = typecheck.TempAt(pos, resume, candidate.resultValues[0].Type())
 		resumeLocals = append(resumeLocals, returnValue)
 	}
+	var resultSlot, resultInput *ir.Name
+	if slot := candidate.reusedAwaitInput; returnValue != nil && slot != nil {
+		resultSlot, resultInput = slot.result, slot.input
+		candidate.rootOnlyResult = true
+	}
 	var resumeDeferToken *ir.Name
 	if deferToken != nil {
 		resumeDeferToken = capture(deferToken)
@@ -4205,6 +4213,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			}
 		}
 		if name, ok := node.(*ir.Name); ok {
+			if name.Canonical() == resultSlot {
+				return capture(resultInput)
+			}
 			if cell := captureCell(name); cell != nil {
 				return typedDeref(name.Pos(), capture(cell), name.Type())
 			}
@@ -4817,11 +4828,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			for j, value := range candidate.resultValues {
 				pointer := capture(candidate.resultPtrs[j])
 				var result ir.Node = returnValue
-				if returnValue != nil {
-					// Keep the public root's typed result slot in the layout.
-					capture(value)
-				} else {
+				if returnValue == nil {
 					result = edit(value)
+				} else if !candidate.rootOnlyResult {
+					capture(value)
 				}
 				if candidate.factoryABI == FactoryABI3 && captureCell(value) != nil {
 					// The root entry reads results from fixed frame slots. A
@@ -5495,8 +5505,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	rootResultTargets := make(map[*ir.Name]*types.Field,
 		len(candidate.resultPtrs))
 	for i, value := range candidate.resultValues {
-		resultValueFields[i] = outerFields[value.Canonical()]
-		rootResultValueFields[resultValueFields[i]] = true
+		if candidate.rootOnlyResult {
+			resultValueFields[i] = types.NewField(value.Pos(), typecheck.Lookup(".result"), value.Type())
+		} else {
+			resultValueFields[i] = outerFields[value.Canonical()]
+			rootResultValueFields[resultValueFields[i]] = true
+		}
 		rootResultTargets[candidate.resultPtrs[i].Canonical()] =
 			resultValueFields[i]
 	}
@@ -5574,9 +5588,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		// small prefix is the same typed frame used by borrowing children.
 		// Cache sizes and GC descriptors must describe the complete root.
 		rootArrayField = types.NewField(pos, typecheck.Lookup(".array"), array.plan.array.Type())
-		rootType = types.NewStruct([]*types.Field{
+		rootFields := []*types.Field{
 			types.NewField(pos, typecheck.Lookup(".frame"), frameType), rootArrayField,
-		})
+		}
+		if candidate.rootOnlyResult {
+			rootFields = append(rootFields, resultValueFields[0])
+		}
+		rootType = types.NewStruct(rootFields)
 		rootType.SetNoalg(true)
 		types.CalcSize(rootType)
 	}
@@ -5977,12 +5995,19 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			recordChunkStore(fields[i], initialize)
 			continue
 		}
-		selfTarget := typecheck.NodAddr(explicitFrameField(variable.Pos(),
-			factoryFrame, resultField))
-		rootResult := ir.NewAssignStmt(pos, target, selfTarget)
+		var resultFrame ir.Node = factoryFrame
+		if candidate.rootOnlyResult {
+			resultFrame = typecheck.ConvNop(typecheck.ConvNop(factoryFrame, unsafePointerType), types.NewPtr(rootType))
+		}
+		resultSlot := explicitFrameField(variable.Pos(), resultFrame, resultField)
+		rootStores := ir.Nodes{ir.NewAssignStmt(pos, target, typecheck.NodAddr(resultSlot))}
+		if candidate.rootOnlyResult {
+			// This slot belongs to the complete, possibly cached root only.
+			zero := ir.NewAssignStmt(pos, ir.DeepCopy(pos, resultSlot), ir.NewZero(pos, resultField.Type))
+			rootStores = append(ir.Nodes{zero}, rootStores...)
+		}
 		childResult := ir.NewAssignStmt(pos, target, variable.Outer)
-		declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(),
-			ir.Nodes{rootResult}, ir.Nodes{childResult}))
+		declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(), rootStores, ir.Nodes{childResult}))
 		recordChunkStore(fields[i], childResult)
 	}
 
@@ -6054,9 +6079,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	runFrame := ir.NewAssignStmt(pos, quiescentRoot, run)
 	copyResults := make(ir.Nodes, 0, len(resultValueFields))
 	var clearResultPointers ir.Nodes
+	resultFrameType := framePointerType
+	if candidate.rootOnlyResult {
+		resultFrameType = types.NewPtr(rootType)
+	}
 	for i, field := range fn.Type().Results() {
 		result, _ := field.Nname.(ir.Node)
-		typedFrame := typecheck.ConvNop(newFrame, framePointerType)
+		typedFrame := typecheck.ConvNop(newFrame, resultFrameType)
 		copyResults = append(copyResults, ir.NewAssignStmt(pos, result,
 			explicitFrameField(pos, typedFrame, resultValueFields[i])))
 		if resultValueFields[i].Type.HasPointers() {

@@ -58,8 +58,8 @@ func main(){
 
 func TestMutualRootArrayLineage(t *testing.T) {
 	testSwitchReturnProgram(t, mutualRootArraySource, nil,
-		[]string{"even", "odd", "outside", "differentA", "differentB"},
-		"even", "odd", "outside", "differentA", "differentB")
+		[]string{"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB"},
+		"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB")
 }
 
 const mutualRootArraySource = `package main
@@ -143,6 +143,30 @@ func differentB(n, seed int) int {
 	return child + readPair(&data)
 }
 
+// Only one peer needs its original depth after the await. Keep that live
+// input out of the result destination on both paths through the lineage.
+func liveA(n int) int {
+	var data [440]byte
+	data[439] = byte(n)
+	if n == 0 {
+		runtime.Gosched()
+		return readPair(&data)
+	}
+	child := liveB(n-1)
+	return child + n + readPair(&data)
+}
+
+func liveB(n int) int {
+	var data [440]byte
+	data[439] = byte(n)
+	if n == 0 {
+		runtime.Gosched()
+		return readPair(&data)
+	}
+	child := liveA(n-1)
+	return child + readPair(&data)
+}
+
 func collect() {
 	for range ready {
 		runtime.GC()
@@ -192,6 +216,14 @@ func main() {
 			different += (1+i%2)*int(byte(33+7*i))
 		}
 		if differentA(n, 33) != different { panic("incompatible write indices") }
+		wantA, wantB := 0, 0
+		for i := 0; i <= n; i++ {
+			value := 2 * int(byte(i))
+			wantA += value
+			wantB += value
+			if (n-i)%2 == 0 { wantA += i } else { wantB += i }
+		}
+		if liveA(n) != wantA || liveB(n) != wantB { panic("live input across await") }
 	}
 	println("switch-return-ok")
 }
