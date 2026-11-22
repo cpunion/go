@@ -28,7 +28,7 @@ git -C "$repo" worktree add --detach "$sdk" "$baseline"
 (cd "$sdk/src" && ./make.bash) > "$evidence/base-bootstrap.log" 2>&1
 test "$(git -C "$sdk" rev-parse HEAD)" = "$baseline"
 "$sdk/bin/go" version > "$evidence/toolchains.txt"
-grep -F "go1.28-devel_f7607ac52c" "$evidence/toolchains.txt"
+grep -F "go1.28-devel_${baseline:0:8}" "$evidence/toolchains.txt"
 mkdir -p "$samples/probe"
 cp "$sdk/src/runtime/chan_coro.go" "$samples/probe/chan_coro.go"
 patch "$samples/probe/chan_coro.go" < "$fixture/receive-buffered.patch" > "$evidence/patch.log"
