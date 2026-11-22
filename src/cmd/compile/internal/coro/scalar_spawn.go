@@ -78,31 +78,40 @@ type scalarSpawnLoop struct{ index, limit *ir.Name }
 // planScalarSpawnLoop admits a zero-based loop with a private counter and
 // bound. The resolved callee must also have no arguments or captures, so
 // finishing several iterations together cannot skip any operand evaluation.
-func planScalarSpawnLoop(loop *ir.ForStmt) (*ir.GoDeferStmt, scalarSpawnLoop) {
+func planScalarSpawnLoop(source ir.Node, loop *ir.ForStmt) (*ir.GoDeferStmt, scalarSpawnLoop) {
 	if base.Flag.Cfg.Instrumenting || len(loop.Body) != 1 || loop.Cond == nil ||
-		len(loop.Cond.Init()) != 0 || len(loop.Init()) != 1 {
+		len(loop.Cond.Init()) != 0 {
 		return nil, scalarSpawnLoop{}
 	}
 	spawn, ok := loop.Body[0].(*ir.GoDeferStmt)
 	if !ok || spawn.Op() != ir.OGO || len(spawn.Init()) != 0 {
 		return nil, scalarSpawnLoop{}
 	}
-	init, ok := loop.Init()[0].(*ir.AssignStmt)
-	if !ok || !init.Def || init.Y == nil || !ir.IsConst(init.Y, constant.Int) || ir.Int64Val(init.Y) != 0 {
+	cond, ok := loop.Cond.(*ir.BinaryExpr)
+	if !ok || cond.Op() != ir.OLT {
 		return nil, scalarSpawnLoop{}
 	}
-	index, ok := init.X.(*ir.Name)
+	index, ok := cond.X.(*ir.Name)
 	if !ok || index.Class != ir.PAUTO || index.Addrtaken() || index.IsClosureVar() ||
 		index.Type() != types.Types[types.TINT] {
-		return nil, scalarSpawnLoop{}
-	}
-	cond, ok := loop.Cond.(*ir.BinaryExpr)
-	if !ok || cond.Op() != ir.OLT || cond.X != index {
 		return nil, scalarSpawnLoop{}
 	}
 	limit, ok := cond.Y.(*ir.Name)
 	if !ok || limit != limit.Canonical() || (limit.Class != ir.PPARAM && limit.Class != ir.PAUTO) ||
 		limit.Addrtaken() || limit.IsClosureVar() || limit.Type() != index.Type() {
+		return nil, scalarSpawnLoop{}
+	}
+	if r, ok := source.(*ir.RangeStmt); ok && r.X.Type() == index.Type() {
+		// integerRangeLoop initializes the private counter to zero and
+		// saves the range operand once, even across suspension.
+		return spawn, scalarSpawnLoop{index, limit}
+	}
+	if len(loop.Init()) != 1 {
+		return nil, scalarSpawnLoop{}
+	}
+	init, ok := loop.Init()[0].(*ir.AssignStmt)
+	if !ok || !init.Def || init.X != index || init.Y == nil ||
+		!ir.IsConst(init.Y, constant.Int) || ir.Int64Val(init.Y) != 0 {
 		return nil, scalarSpawnLoop{}
 	}
 	post, ok := loop.Post.(*ir.AssignOpStmt)

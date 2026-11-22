@@ -112,7 +112,23 @@ func batchProduce(n int, typed bool) {
  }
  if typed && atomic.LoadUint64(&batchSum)!=uint64(n*(n+1)/2) {panic("batch spawn lost typed frame")}
 }
+var rangeBoundCalls int
+func rangeBound(n int) int {
+ rangeBoundCalls++
+ return n
+}
+func rangeProduce(n int) {
+ rangeBoundCalls=0
+ atomic.StoreUint64(&closureDone,0)
+ for range rangeBound(n) { go closureWorker() }
+ want:=uint64(max(n,0))
+ for atomic.LoadUint64(&closureDone)<want { runtime.Gosched() }
+ if atomic.LoadUint64(&closureDone)!=want || rangeBoundCalls!=1 {
+  panic("integer range changed its bound evaluation or child count")
+ }
+}
 func main() {
+ for _,n:=range []int{-7,0,1,9,127,128,129,1031} {rangeProduce(n)}
  for _,n:=range []int{0,1,7,8,9,127,128,129,255,256,257,1031} {batchProduce(n,false);batchProduce(n,true)}
  if runtime.GOMAXPROCS(0)>=8 {batchProduce(100000,false)}
  for _,n:=range []int{0,1,127,128,129,255,256,1000,10000} {
@@ -187,6 +203,10 @@ func TestSpawnReadyPressure(t *testing.T) {
 			}
 			if err != nil || strings.Count(string(batch), "runtime.coroSpawnScalarBatch(SB)") != wantBatches {
 				t.Fatalf("batched producer native path = %t: %v\n%s", native, err, batch)
+			}
+			ranged, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.rangeProduce\.coro\.func1$`, program).CombinedOutput()
+			if err != nil || strings.Contains(string(ranged), "runtime.coroSpawnScalarBatch(SB)") != native {
+				t.Fatalf("integer range batch path = %t: %v\n%s", native, err, ranged)
 			}
 			procsList := []string{"1", "4"}
 			if mode == "checkptr" || mode == "noinline" {

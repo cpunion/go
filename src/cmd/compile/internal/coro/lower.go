@@ -3453,7 +3453,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	var lowerStatement func(ir.Node, int) int
 	spawnLoops := make(map[*ir.GoDeferStmt]scalarSpawnLoop)
 	lowerLoop := func(target ir.Node, loop *ir.ForStmt, next int) int {
-		if spawn, batch := planScalarSpawnLoop(loop); spawn != nil {
+		if spawn, batch := planScalarSpawnLoop(target, loop); spawn != nil {
 			spawnLoops[spawn] = batch
 		}
 		conditionState := addState(lowerState{
