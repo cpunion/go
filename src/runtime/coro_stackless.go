@@ -5438,7 +5438,11 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		if lifetime&stacklessCoroLifetimeDeferredExecutors != 0 && task != &s.root {
 			replacements := s.replacements.Load()
 			replacements.yields++
-			if (replacements.yields == 24 || replacements.yields == 48) && gomaxprocs >= 3 {
+			switch replacements.yields {
+			case 4, 8, 16, 24, 48:
+				if gomaxprocs < 3 {
+					break
+				}
 				select {
 				case replacements.wake <- struct{}{}:
 				default:
@@ -5989,6 +5993,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 		interval           = 1_000_000 // One millisecond in nanoseconds.
 		serviceTarget      = 750       // Target nanoseconds per ready-queue change.
 		headLimit          = 25 * interval
+		earlyProbeInterval = interval / 32
 	)
 	lock(&s.lock)
 	progress, head := s.queueProgress, s.head
@@ -6027,15 +6032,22 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if now-started < interval/2 {
 				// A yield or completion can ring the doorbell before the first
 				// timer tick. A failed probe leaves the regular window intact.
-				if lane == nil && gomaxprocs >= 3 && now-started >= interval/8 && s.canAssist() {
+				if lane == nil && gomaxprocs >= 3 && now-started >= earlyProbeInterval && s.canAssist() {
 					lock(&s.lock)
 					moved := int(s.queueProgress - progress)
 					yields := int(replacements.yields - yieldProgress)
 					completed := replacements.completions - completionProgress
+					live := s.liveSpawns
 					ready := s.head != nil
 					unlock(&s.lock)
-					if ready && (completed >= 4 || yields >= 24) && yields >= 16 && yields*5 >= moved &&
-						now-started >= int64(yields)*assistMaxYieldTime {
+					// A sizeable backlog with slow independent yields can
+					// finish within one timer interval. Admit helpers while
+					// it still has enough runnable work to share.
+					earlyBacklog := live >= 32 && yields >= 4 && yields*16 >= moved &&
+						now-started >= int64(yields)*assistMaxYieldTime*2
+					sustainedBacklog := (completed >= 4 || yields >= 24) && yields >= 16 && yields*5 >= moved &&
+						now-started >= int64(yields)*assistMaxYieldTime
+					if ready && (earlyBacklog || sustainedBacklog) {
 						replacements.enableDispatchBatching()
 						return true
 					}
