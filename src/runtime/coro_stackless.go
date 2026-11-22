@@ -342,7 +342,8 @@ type stacklessCoroReplacementState struct {
 	shortLimit          atomic.Uint8
 	shortRate           uint16 // completions per millisecond before widening
 	workProbe           atomic.Uint32
-	managerPending      atomic.Uint32
+	pendingManager      atomic.Pointer[stacklessCoroScheduler]
+	managerTimer        *timeTimer
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -6050,9 +6051,12 @@ func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
 	}
 	gp := getg()
 	if deferWorkers && count == 1 && stacklessCoroPublicCaller(gp) != gp {
-		// The public driver stops at the first spawn. If its resume enters
-		// a blocking call first, enterBlockingExecutor starts the manager.
-		replacements.managerPending.Store(1)
+		// Usually the public driver hands off as soon as this resume ends.
+		// If the resume keeps running, start the manager independently.
+		// A blocking call can start it sooner via enterBlockingExecutor.
+		replacements.pendingManager.Store(s)
+		const delay = 100_000 // nanoseconds
+		replacements.managerTimer = newTimer(nanotime()+delay, 0, startStacklessCoroTimedManager, replacements, nil)
 	} else {
 		go s.manageReplacementExecutors()
 	}
@@ -6062,7 +6066,17 @@ func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
 //go:noinline
 func (s *stacklessCoroScheduler) startPendingReplacementManager() {
 	if r := s.replacements.Load(); r != nil &&
-		r.managerPending.Load() != 0 && r.managerPending.CompareAndSwap(1, 0) {
+		r.pendingManager.Load() == s && r.pendingManager.CompareAndSwap(s, nil) {
+		stopTimer(r.managerTimer)
+		go s.manageReplacementExecutors()
+	}
+}
+
+func startStacklessCoroTimedManager(arg any, _ uintptr, _ int64) {
+	// Claim this replacement state, since a normal handoff could already
+	// have completed while the timer callback was waiting to run.
+	r := arg.(*stacklessCoroReplacementState)
+	if s := r.pendingManager.Load(); s != nil && r.pendingManager.CompareAndSwap(s, nil) {
 		go s.manageReplacementExecutors()
 	}
 }
@@ -6434,7 +6448,7 @@ func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
 	}
 	blocked := s.blockingExecutors.Add(1)
 	if replacements := s.replacements.Load(); replacements != nil {
-		if replacements.managerPending.Load() != 0 {
+		if replacements.pendingManager.Load() != nil {
 			s.startPendingReplacementManager()
 		}
 		if dispatch := replacements.dispatch.Load(); dispatch != nil {
