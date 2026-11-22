@@ -321,9 +321,13 @@ func (context *stacklessCoroContext) task() *stacklessCoroTask {
 	if context == nil {
 		return nil
 	}
-	return (*stacklessCoroTask)(unsafe.Pointer(
-		uintptr(unsafe.Pointer(context)) -
-			unsafe.Offsetof(stacklessCoroTask{}.context)))
+	return context.enclosingTask()
+}
+
+// enclosingTask takes a nonnil pointer to a task's context field.
+func (context *stacklessCoroContext) enclosingTask() *stacklessCoroTask {
+	return (*stacklessCoroTask)(unsafe.Add(unsafe.Pointer(context),
+		-int(unsafe.Offsetof(stacklessCoroTask{}.context))))
 }
 
 // Replacement state is allocated with the executor channels. Schedulers
@@ -3060,12 +3064,14 @@ func coroTakeFusedChunkBoundary(child stacklessCoroResume, size uintptr, chunkTy
 //go:nosplit
 func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stacklessCoroResume) uint8 {
 	context := (*stacklessCoroContext)(ctx)
-	task := context.task()
+	parentFrame := context.frame
+	task := context.enclosingTask()
+	parentResume := stacklessCoroResumeIdentity(task.resume)
 	header := (*stacklessCoroFusedResumeFrameHeader)(frame)
-	header.parent = context.frame
-	header.resume = stacklessCoroResumeIdentity(task.resume)
 	header.marker = marker
 	stacklessCoroBeginProfileTransition()
+	header.parent = parentFrame
+	header.resume = parentResume
 	context.frame = frame
 	task.resume = child
 	return switchStacklessCoroFusedChunk(context)
@@ -3078,11 +3084,13 @@ func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stackl
 //go:nosplit
 func coroPopFusedChunk(ctx unsafe.Pointer) uint8 {
 	context := (*stacklessCoroContext)(ctx)
-	task := context.task()
 	header := (*stacklessCoroFusedResumeFrameHeader)(context.frame)
+	task := context.enclosingTask()
+	parentFrame := header.parent
+	parentResume := *(*stacklessCoroResume)(unsafe.Pointer(&header.resume))
 	stacklessCoroBeginProfileTransition()
-	context.frame = header.parent
-	task.resume = *(*stacklessCoroResume)(unsafe.Pointer(&header.resume))
+	task.resume = parentResume
+	context.frame = parentFrame
 	header.parent = nil
 	header.resume = nil
 	header.marker = 0
