@@ -11,6 +11,12 @@ import (
 	"testing"
 )
 
+func TestStacklessCoroPendingRetirement(t *testing.T) {
+	if !runtime.StacklessCoroPendingRetirementForTest() {
+		t.Fatal("completed source remains visible while waiting for the batch drainer")
+	}
+}
+
 func TestStacklessCoroNativeProfileTransitions(t *testing.T) {
 	for _, test := range []struct {
 		name    string

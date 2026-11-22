@@ -5460,14 +5460,15 @@ func (task *stacklessCoroTask) finishNormal() {
 	}
 }
 
-// completeIndependent publishes the finished task with its source frames
-// intact. The first publisher detaches the batch under the registry lock,
-// retiring every source before any frame can be recycled. Release that lock
-// before taking the scheduler lock, since creation nests them in the other order.
+// completeIndependent retires the logical source before publishing the
+// finished task. The first publisher unlinks the batch under the registry
+// lock before recycling its frames. Release that lock before taking the
+// scheduler lock, since creation nests them in the other order.
 func (s *stacklessCoroScheduler) completeIndependent(task *stacklessCoroTask, pending *atomic.Pointer[stacklessCoroTask]) *stacklessCoroTask {
 	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
 		throw("runtime: invalid stackless coroutine completion")
 	}
+	stacklessCoroMarkRetired(task)
 	for {
 		head := pending.Load()
 		task.next = head

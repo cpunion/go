@@ -8,8 +8,33 @@ package runtime
 
 import (
 	"internal/profilerecord"
+	"internal/runtime/atomic"
 	"unsafe"
 )
+
+func StacklessCoroPendingRetirementForTest() bool {
+	s := new(stacklessCoroScheduler)
+	task := &stacklessCoroTask{state: stacklessCoroTaskRunning, resuming: true}
+	record := &stacklessCoroGoroutine{root: task, leaf: task, scheduler: s}
+	task.setSource(record)
+	pending := new(atomic.Pointer[stacklessCoroTask])
+	first := new(stacklessCoroTask)
+	pending.Store(first)
+
+	// Keep the synthetic source private to this test. A nonempty pending
+	// list models a drainer that has yet to obtain the registry lock.
+	lock(&stacklessCoroGoroutines.lock)
+	bucket := stacklessCoroGoroutineBucket(task)
+	record.next, *bucket = *bucket, record
+	stacklessCoroGoroutines.records.Add(1)
+	stacklessCoroGoroutines.unhosted.Add(1)
+	s.completeIndependent(task, pending)
+	retired := record.retired.Load() && pending.Load() == task && task.next == first
+	removed, unhosted := stacklessCoroCompleteLogicalFrameLocked(task)
+	stacklessCoroFinishLogicalRetirementLocked(removed, unhosted)
+	unlock(&stacklessCoroGoroutines.lock)
+	return retired
+}
 
 type StacklessCoroNativeProfileTransitionResult struct {
 	Native, Reused bool
