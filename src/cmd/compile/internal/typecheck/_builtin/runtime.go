@@ -411,3 +411,5 @@ func coroAdvanceFusedChunk(unsafe.Pointer, unsafe.Pointer, uint8, func(unsafe.Po
 func coroPopFusedChunk(unsafe.Pointer) uint8
 
 func coroSpawnScalarBatch(unsafe.Pointer, func(unsafe.Pointer) uint8, *byte, uintptr, uint32, int) (int, bool)
+
+func coroTryChanExchange(unsafe.Pointer, chan any, *any, *any, *bool) bool

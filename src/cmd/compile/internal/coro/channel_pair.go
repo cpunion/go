@@ -9,6 +9,28 @@ import (
 	"go/constant"
 )
 
+// bufferedChannelExchange finds a receive that immediately follows a send
+// on the same variable. Neither selecting the channel nor evaluating the
+// send value can change the variable or execute a call. The runtime still
+// checks readiness while holding the channel lock.
+func bufferedChannelExchange(states []lowerState, send lowerState, entry *channelEntry) *lowerChannel {
+	if send.channel == nil || send.channel.sendValue == nil || send.next < 0 ||
+		!shortChannelPairExpr(send.channel.sendValue, 0) {
+		return nil
+	}
+	ch, ok := send.channel.channel.(*ir.Name)
+	if !ok || ch.IsClosureVar() || ch.Addrtaken() || (ch.Class != ir.PAUTO && ch.Class != ir.PPARAM) {
+		return nil
+	}
+	next := states[send.next]
+	if next.transition != SiteChannel || next.channel == nil || next.channel.sendValue != nil ||
+		next.channel.rangeStmt != nil || next.channel.channel != ch || len(next.body) != 0 ||
+		(entry != nil && entry.freeze && entry.waitState == send.next) {
+		return nil
+	}
+	return next.channel
+}
+
 const (
 	channelPairFirst = 1
 	channelPairLast  = 2

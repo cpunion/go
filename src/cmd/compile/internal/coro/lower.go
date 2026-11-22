@@ -4556,6 +4556,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	gotoState := func(state int) ir.Node {
 		return ir.NewBranchStmt(pos, ir.OGOTO, labels[state])
 	}
+	receivePointers := func(channel *lowerChannel) (value, ok ir.Node) {
+		value, ok = typecheck.NodNil(), typecheck.NodNil()
+		if channel.recvValue != nil && !ir.IsBlank(channel.recvValue) {
+			value = typecheck.NodAddr(edit(channel.recvValue))
+		}
+		if channel.recvOK != nil && !ir.IsBlank(channel.recvOK) {
+			target := channel.recvOK
+			if channel.recvOKTemp != nil {
+				target = channel.recvOKTemp
+			}
+			ok = typecheck.NodAddr(edit(target))
+		}
+		return
+	}
 	var stateBodies ir.Nodes
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
@@ -5086,6 +5100,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 				var wait ir.Node
 				if channel.sendValue != nil {
+					var receive *lowerChannel
+					if !frozenEntry {
+						receive = bufferedChannelExchange(states, state, candidate.channelEntry)
+					}
 					value := ir.Node(nil)
 					if frozenEntry {
 						value = edit(channel.sendValue)
@@ -5094,6 +5112,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						addDeclaration(ir.NewDecl(channel.node.Pos(), ir.ODCL, slot))
 						value = capture(slot)
 						body = append(body, ir.NewAssignStmt(channel.node.Pos(), value, edit(channel.sendValue)))
+					}
+					if receive != nil {
+						resultPointer, okPointer := receivePointers(receive)
+						exchanged := typecheck.Call(channel.node.Pos(),
+							typecheck.LookupRuntime("coroTryChanExchange", elementType, elementType, elementType),
+							ir.Nodes{ctx, channelValue, typecheck.NodAddr(value), resultPointer, okPointer}, false)
+						body = append(body, ir.NewIfStmt(channel.node.Pos(), exchanged, ir.Nodes{
+							assignResumePC(awaitPCs[state.next]),
+							gotoState(states[state.next].next),
+						}, nil))
 					}
 					name := "coroChanSend"
 					args := ir.Nodes{ctx, channelValue, typecheck.NodAddr(value)}
@@ -5106,20 +5134,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							elementType, elementType),
 						args, false)
 				} else {
-					resultPointer := ir.Node(typecheck.NodNil())
-					if channel.recvValue != nil &&
-						!ir.IsBlank(channel.recvValue) {
-						resultPointer = typecheck.NodAddr(
-							edit(channel.recvValue))
-					}
-					okPointer := ir.Node(typecheck.NodNil())
-					if channel.recvOK != nil && !ir.IsBlank(channel.recvOK) {
-						target := channel.recvOK
-						if channel.recvOKTemp != nil {
-							target = channel.recvOKTemp
-						}
-						okPointer = typecheck.NodAddr(edit(target))
-					}
+					resultPointer, okPointer := receivePointers(channel)
 					name := "coroChanRecv"
 					args := ir.Nodes{ctx, channelValue, resultPointer, okPointer}
 					if pair := channelPairs[i]; pair != 0 {
