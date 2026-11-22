@@ -1,4 +1,4 @@
-name: Coroutine Linux paired channel waits
+name: Coroutine Linux effectful unwind profile
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare paired coroutine channel waits (Linux amd64)
+    name: Profile effectful coroutine unwinds (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and validate paired waits
+      - name: Measure and profile effectful unwinds
         shell: bash
-        run: bash .github/coro-linux-perf/measure-driver.sh
+        run: bash .github/coro-linux-perf/profile-effects.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-paired-waits
+          name: coroutine-linux-effectful-unwind-profile
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
