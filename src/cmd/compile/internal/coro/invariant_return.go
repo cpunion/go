@@ -14,7 +14,7 @@ import (
 
 // An invariant return has one yield at depth zero. Each recursive edge
 // forwards every parameter unchanged except for subtracting one from depth.
-// The unwind adds a sum that depends only on those invariant parameters.
+// Each unwind step adds invariant terms or sums of the current depth.
 type invariantReturn struct {
 	depth      int
 	base, step []invariantReturnTerm
@@ -22,9 +22,25 @@ type invariantReturn struct {
 
 // Parameter indices are one-based; zero denotes a literal or no condition.
 type invariantReturnTerm struct {
-	param, condition int
-	deref            bool
-	literal          int64
+	param, condition   int
+	deref, integerCast bool
+	depth              invariantDepth
+	literal            int64
+}
+
+type invariantDepth uint8
+
+const (
+	invariantNoDepth invariantDepth = iota
+	invariantFullDepth
+	invariantByteDepth
+	invariantDepthCount
+)
+
+type invariantReturnOperands struct {
+	depth  *ir.Name
+	params map[*ir.Name]int
+	array  *rootArrayPlan
 }
 
 func planInvariantReturn(f *Function) *affineReturnPlan {
@@ -39,10 +55,19 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		sig.NumResults() != 1 || sig.Result(0).Type != integer || len(fn.Body) < 2 {
 		return nil
 	}
+	body := fn.Body
+	var array *rootArrayPlan
+	if _, startsWithTest := body[0].(*ir.IfStmt); !startsWithTest {
+		array = planFrameArray(f, 1)
+		if array == nil || len(body) < 4 {
+			return nil
+		}
+		body = body[2:]
+	}
 	// The only permitted Init is the declaration of the local that receives
 	// the recursive result when the call stands in its own statement.
-	assign, _ := fn.Body[1].(*ir.AssignStmt)
-	for _, stmt := range fn.Body {
+	assign, _ := body[1].(*ir.AssignStmt)
+	for _, stmt := range body {
 		if ir.Any(stmt, func(n ir.Node) bool {
 			if len(n.Init()) == 0 {
 				return false
@@ -56,7 +81,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 			return nil
 		}
 	}
-	branch, ok := fn.Body[0].(*ir.IfStmt)
+	branch, ok := body[0].(*ir.IfStmt)
 	if !ok || len(branch.Else) != 0 || len(branch.Body) != 2 {
 		return nil
 	}
@@ -72,7 +97,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		return nil
 	}
 	invariant := &invariantReturn{}
-	params := make(map[*ir.Name]int)
+	operands := invariantReturnOperands{depth: depth, params: make(map[*ir.Name]int), array: array}
 	for i, field := range sig.Params() {
 		name, ok := field.Nname.(*ir.Name)
 		if !ok {
@@ -82,24 +107,24 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 			invariant.depth = i + 1
 			continue
 		}
-		params[name.Canonical()] = i + 1
+		operands.params[name.Canonical()] = i + 1
 	}
-	if invariant.depth == 0 {
+	if invariant.depth == 0 || array != nil && !isInvariantDepthByte(array.write.Y, depth) {
 		return nil
 	}
 	yield := sourceGosched(branch.Body[0])
 	baseResult, ok := branch.Body[1].(*ir.ReturnStmt)
 	if yield == nil || !ok || len(baseResult.Results) != 1 ||
-		!appendInvariantSum(&invariant.base, baseResult.Results[0], params, 0, nil) {
+		!operands.appendSum(&invariant.base, baseResult.Results[0], 0, nil) {
 		return nil
 	}
-	ret, ok := fn.Body[len(fn.Body)-1].(*ir.ReturnStmt)
+	ret, ok := body[len(body)-1].(*ir.ReturnStmt)
 	if !ok || len(ret.Results) != 1 {
 		return nil
 	}
 	var child *ir.Name
 	var call *ir.CallExpr
-	if len(fn.Body) > 2 {
+	if len(body) > 2 {
 		if assign == nil || !assign.Def {
 			return nil
 		}
@@ -108,8 +133,8 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		if child == nil || child.Class != ir.PAUTO || child.Type() != integer || call == nil {
 			return nil
 		}
-		for _, stmt := range fn.Body[2 : len(fn.Body)-1] {
-			if !appendInvariantAdd(&invariant.step, stmt, child, params) {
+		for _, stmt := range body[2 : len(body)-1] {
+			if !operands.appendAdd(&invariant.step, stmt, child) {
 				return nil
 			}
 		}
@@ -130,7 +155,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		found = true
 		return true
 	}
-	if !appendInvariantSum(&invariant.step, ret.Results[0], params, 0, takeResult) ||
+	if !operands.appendSum(&invariant.step, ret.Results[0], 0, takeResult) ||
 		!found || call.Op() != ir.OCALLFUNC || len(call.Args) != sig.NumParams() {
 		return nil
 	}
@@ -161,14 +186,55 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 	return &affineReturnPlan{input: depth, target: target, yield: yield, source: f, invariant: invariant}
 }
 
-func appendInvariantSum(terms *[]invariantReturnTerm, n ir.Node, params map[*ir.Name]int,
+func invariantIntegerCast(n ir.Node) (*ir.ConvExpr, bool) {
+	conv, ok := n.(*ir.ConvExpr)
+	return conv, ok && (conv.Op() == ir.OCONV || conv.Op() == ir.OCONVNOP) &&
+		conv.Type().IsInteger() && conv.X.Type().IsInteger()
+}
+
+func isInvariantDepthByte(n ir.Node, depth *ir.Name) bool {
+	conv, ok := invariantIntegerCast(n)
+	return ok && conv.Type().Kind() == types.TUINT8 && affineInput(conv.X, depth)
+}
+
+func (operands invariantReturnOperands) depthTerm(n ir.Node) invariantDepth {
+	if affineInput(n, operands.depth) {
+		return invariantFullDepth
+	}
+	if conv, ok := invariantIntegerCast(n); ok && isInvariantDepthByte(conv.X, operands.depth) {
+		return invariantByteDepth
+	}
+	call, ok := n.(*ir.CallExpr)
+	if !ok || operands.array == nil {
+		return invariantNoDepth
+	}
+	leaf := operands.array.uses[call]
+	if leaf == nil {
+		return invariantNoDepth
+	}
+	// The array proof already establishes purity, a constant index, and an
+	// in-bounds read from the private buffer with one byte initialized.
+	result := leaf.Body[0].(*ir.ReturnStmt).Results[0]
+	if conv, ok := invariantIntegerCast(result); ok {
+		if index, ok := conv.X.(*ir.IndexExpr); ok && ir.Int64Val(index.Index) == operands.array.writeIndex {
+			return invariantByteDepth
+		}
+	}
+	return invariantNoDepth
+}
+
+func (operands invariantReturnOperands) appendSum(terms *[]invariantReturnTerm, n ir.Node,
 	condition int, takeResult func(ir.Node) bool) bool {
 	if n.Type() != types.Types[types.TINT] {
 		return false
 	}
 	if add, ok := n.(*ir.BinaryExpr); ok && add.Op() == ir.OADD {
-		return appendInvariantSum(terms, add.X, params, condition, takeResult) &&
-			appendInvariantSum(terms, add.Y, params, condition, takeResult)
+		return operands.appendSum(terms, add.X, condition, takeResult) &&
+			operands.appendSum(terms, add.Y, condition, takeResult)
+	}
+	if depth := operands.depthTerm(n); depth != invariantNoDepth {
+		*terms = append(*terms, invariantReturnTerm{depth: depth, condition: condition})
+		return true
 	}
 	if takeResult != nil && takeResult(n) {
 		return true
@@ -177,33 +243,37 @@ func appendInvariantSum(terms *[]invariantReturnTerm, n ir.Node, params map[*ir.
 	if value, ok := affineLiteral(n); ok {
 		term.literal = value
 	} else {
+		if conv, ok := invariantIntegerCast(n); ok {
+			term.integerCast = true
+			n = conv.X
+		}
 		if load, ok := n.(*ir.StarExpr); ok && load.Op() == ir.ODEREF {
 			term.deref = true
 			n = load.X
 		}
 		name, ok := n.(*ir.Name)
-		if !ok || params[name.Canonical()] == 0 {
+		if !ok || operands.params[name.Canonical()] == 0 {
 			return false
 		}
-		term.param = params[name.Canonical()]
+		term.param = operands.params[name.Canonical()]
 	}
 	*terms = append(*terms, term)
 	return true
 }
 
-func appendInvariantAdd(terms *[]invariantReturnTerm, stmt ir.Node, child *ir.Name, params map[*ir.Name]int) bool {
+func (operands invariantReturnOperands) appendAdd(terms *[]invariantReturnTerm, stmt ir.Node, child *ir.Name) bool {
 	condition := 0
 	if branch, ok := stmt.(*ir.IfStmt); ok {
 		test, ok := branch.Cond.(*ir.Name)
-		if !ok || test.Type() != types.Types[types.TBOOL] || params[test.Canonical()] == 0 ||
+		if !ok || test.Type() != types.Types[types.TBOOL] || operands.params[test.Canonical()] == 0 ||
 			len(branch.Body) != 1 || len(branch.Else) != 0 {
 			return false
 		}
-		condition, stmt = params[test.Canonical()], branch.Body[0]
+		condition, stmt = operands.params[test.Canonical()], branch.Body[0]
 	}
 	add, ok := stmt.(*ir.AssignOpStmt)
 	return ok && add.AsOp == ir.OADD && affineInput(add.X, child) &&
-		appendInvariantSum(terms, add.Y, params, condition, nil)
+		operands.appendSum(terms, add.Y, condition, nil)
 }
 
 func sameInvariantReturn(p, q *affineReturnPlan) bool {
@@ -243,7 +313,10 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 		}
 		n := param(term.param)
 		if term.deref {
-			n = typedDeref(pos, n, integer)
+			n = typedDeref(pos, n, n.Type().Elem())
+		}
+		if term.integerCast {
+			n = ir.NewConvExpr(pos, ir.OCONV, integer, n)
 		}
 		return n
 	}
@@ -254,15 +327,36 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 	baseValue := typecheck.TempAt(pos, fn, integer)
 	step := typecheck.TempAt(pos, fn, integer)
 	positive := ir.Nodes{ir.NewDecl(pos, ir.ODCL, step), ir.NewAssignStmt(pos, step, zero())}
-	for _, term := range invariant.step {
-		var add ir.Node = ir.NewAssignOpStmt(pos, ir.OADD, step, value(term))
-		if term.condition != 0 {
-			add = ir.NewIfStmt(pos, param(term.condition), ir.Nodes{add}, nil)
+	addTerm := func(target *ir.Name, input ir.Node, condition int) {
+		var add ir.Node = ir.NewAssignOpStmt(pos, ir.OADD, target, input)
+		if condition != 0 {
+			add = ir.NewIfStmt(pos, param(condition), ir.Nodes{add}, nil)
 		}
 		positive.Append(add)
 	}
+	var depthTerms []invariantReturnTerm
+	for _, term := range invariant.step {
+		if term.depth != invariantNoDepth {
+			depthTerms = append(depthTerms, term)
+		} else {
+			addTerm(step, value(term), term.condition)
+		}
+	}
 	product := ir.NewBinaryExpr(pos, ir.OMUL, p.input, step)
-	positive.Append(ir.NewReturnStmt(pos, ir.Nodes{ir.NewBinaryExpr(pos, ir.OADD, baseValue, product)}))
+	var total ir.Node = ir.NewBinaryExpr(pos, ir.OADD, baseValue, product)
+	if len(depthTerms) != 0 {
+		result := typecheck.TempAt(pos, fn, integer)
+		positive.Append(ir.NewDecl(pos, ir.ODCL, result), ir.NewAssignStmt(pos, result, total))
+		var sums [invariantDepthCount]*ir.Name
+		for _, term := range depthTerms {
+			if sums[term.depth] == nil {
+				sums[term.depth] = invariantDepthSum(fn, p.input, term.depth, &positive)
+			}
+			addTerm(result, sums[term.depth], term.condition)
+		}
+		total = result
+	}
+	positive.Append(ir.NewReturnStmt(pos, ir.Nodes{total}))
 	fast := ir.NewIfStmt(pos, checks, ir.Nodes{
 		yield,
 		ir.NewDecl(pos, ir.ODCL, baseValue),
@@ -294,4 +388,35 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 	candidate.ordinary = old.ordinary
 	candidate.heapLocals = old.heapLocals
 	return candidate
+}
+
+// invariantDepthSum emits the sum of a depth projection from one to n.
+// The fast entry checks that n is nonnegative before reaching this code.
+func invariantDepthSum(fn *ir.Func, depth *ir.Name, kind invariantDepth, body *ir.Nodes) *ir.Name {
+	pos, integer := fn.Pos(), types.Types[types.TINT]
+	literal := func(v int64) ir.Node { return typedInt(pos, integer, v) }
+	binary := func(op ir.Op, left, right ir.Node) ir.Node { return ir.NewBinaryExpr(pos, op, left, right) }
+	local := func(value ir.Node) *ir.Name {
+		name := typecheck.TempAt(pos, fn, integer)
+		body.Append(ir.NewDecl(pos, ir.ODCL, name), ir.NewAssignStmt(pos, name, value))
+		return name
+	}
+	var value ir.Node
+	switch kind {
+	case invariantFullDepth:
+		// Divide before multiplying to preserve the sum even when n+1
+		// or n*(n+1) exceeds the machine int range.
+		half := local(binary(ir.ORSH, depth, literal(1)))
+		pairs := binary(ir.OMUL, half, binary(ir.OADD, depth, literal(1)))
+		odd := binary(ir.OMUL, binary(ir.OAND, depth, literal(1)), binary(ir.OADD, half, literal(1)))
+		value = binary(ir.OADD, pairs, odd)
+	case invariantByteDepth:
+		const period = 1 << 8
+		cycles := binary(ir.ORSH, depth, literal(8))
+		whole := binary(ir.OMUL, cycles, literal(period*(period-1)/2))
+		remainder := local(binary(ir.OAND, depth, literal(period-1)))
+		partial := binary(ir.OMUL, remainder, binary(ir.OADD, remainder, literal(1)))
+		value = binary(ir.OADD, whole, binary(ir.ORSH, partial, literal(1)))
+	}
+	return local(value)
 }
