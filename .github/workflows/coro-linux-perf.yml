@@ -1,4 +1,4 @@
-name: Coroutine Linux buffered select comparison
+name: Coroutine Linux blocking read comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare buffered coroutine selects (Linux amd64)
+    name: Compare blocking coroutine file reads (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure selects and run regressions
+      - name: Measure file reads and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-select.sh
+        run: bash .github/coro-linux-perf/measure-read.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-buffered-select
+          name: coroutine-linux-blocking-read
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
