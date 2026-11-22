@@ -256,8 +256,7 @@ func StacklessCoroScalarTaskCacheFatalForTest(mode string) {
 		cacheStacklessCoroCompletedScalarTaskChunk(task)
 		return
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	scalarTaskCacheWholeForTest(s, scalarTaskCacheChunkForTest())
 	lock(&stacklessCoroSharedOperations.lock)
 	g := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young]
