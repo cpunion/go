@@ -415,7 +415,7 @@ func StacklessCoroNativeRegisteredCacheForTest(ready chan<- uintptr, release <-c
 	ctx.selfFrameChunkCount = 1
 	// Cache expiry must leave pending driver state intact.
 	sentinel := new(stacklessCoroOperation)
-	ctx.deferredSleep = sentinel
+	ctx.deferredOperation = sentinel
 	ctx.deferredSleepWhen = 7
 	slot := registerStacklessCoroNativeParkedCache(ctx)
 	ready <- stacklessCoroNativeSelfFrameCacheBytes(ctx)
@@ -423,8 +423,8 @@ func StacklessCoroNativeRegisteredCacheForTest(ready chan<- uintptr, release <-c
 	if slot != nil {
 		slot.Store(nil)
 	}
-	valid := ctx.selfFrameChunks == nil && ctx.selfFrameChunkCount == 0 && ctx.deferredSleep == sentinel && ctx.deferredSleepWhen == 7 && ctx.gState.native == unsafe.Pointer(ctx)
-	ctx.deferredSleep = nil
+	valid := ctx.selfFrameChunks == nil && ctx.selfFrameChunkCount == 0 && ctx.deferredOperation == sentinel && ctx.deferredSleepWhen == 7 && ctx.gState.native == unsafe.Pointer(ctx)
+	ctx.deferredOperation = nil
 	ctx.deferredSleepWhen = 0
 	releaseStacklessCoroNativeContext(ctx)
 	done <- valid
@@ -458,4 +458,26 @@ func (r *StacklessCoroNativeParkRoundTrip) Close() {
 
 func StacklessCoroAsyncPreemptOffForTest() bool {
 	return debug.asyncpreemptoff != 0
+}
+
+func CheckStacklessCoroDeferredChannelStorageForTest() bool {
+	s := new(stacklessCoroScheduler)
+	ctx := &stacklessCoroNativeContext{scheduler: s}
+	ctx.gState.native = unsafe.Pointer(ctx)
+	gp := new(g)
+	gp.stacklessCoro = &ctx.gState
+	timer := new(stacklessCoroOperation)
+	channel := new(stacklessCoroOperation)
+	ctx.deferredOperation, ctx.deferredSleepWhen = timer, 7
+	if stacklessCoroDeferChannel(gp, s, channel) || popStacklessCoroDeferredChannel(&ctx.gState) != nil ||
+		ctx.deferredOperation != timer || ctx.deferredSleepWhen != 7 {
+		return false
+	}
+	ctx.deferredOperation, ctx.deferredSleepWhen = nil, 0
+	if !stacklessCoroDeferChannel(gp, s, channel) || stacklessCoroDeferChannel(gp, s, timer) ||
+		popStacklessCoroDeferredChannel(&ctx.gState) != channel || ctx.deferredOperation != nil {
+		return false
+	}
+	ctx.public = true
+	return !stacklessCoroDeferChannel(gp, s, channel)
 }

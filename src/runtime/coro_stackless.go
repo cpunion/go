@@ -1809,7 +1809,7 @@ resumeOwned:
 			action = stacklessCoroActionYield
 		}
 	}
-	if state != nil && state.channelWake {
+	if state != nil && state.channelWake && !stacklessCoroFlushPendingChannel(state) {
 		state.channelWake = false
 		if action != stacklessCoroActionWait && action != stacklessCoroActionComplete {
 			s.signal()
@@ -1944,7 +1944,7 @@ resumeOwned:
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
 		fromAssist = false
-		if native {
+		if native && public {
 			resume, suspend := stacklessCoroPrivateSleep(s, task)
 			if resume {
 				idlePollSkip = nil
@@ -4406,8 +4406,24 @@ func coroChanRecv(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, re
 // quickly reaches another channel operation or returns to the scheduler.
 func coroChanSendLocal(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, more bool) bool {
 	state, pending := stacklessCoroBeginChannelPair(channel, more)
+	if pending {
+		if stacklessCoroMayBatchWait(channel) && full(channel) {
+			if op := stacklessCoroTakePendingChannel(ctx, state); op != nil {
+				stacklessCoroQueueChannel(op, channel, element, nil, true)
+				stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, true, true)
+				return true
+			}
+		} else if stacklessCoroFlushPendingChannel(state) {
+			pending = false
+		}
+	}
 	wait := !tryStacklessCoroChanSend(ctx, channel, element)
 	if wait {
+		// A peer found during registration has no following operation
+		// in this resume to consume a deferred completion.
+		if state != nil {
+			state.channelPair = false
+		}
 		startStacklessCoroChannel(ctx, channel, element, nil, true)
 	}
 	stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, pending, wait)
@@ -4416,12 +4432,35 @@ func coroChanSendLocal(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointe
 
 func coroChanRecvLocal(ctx unsafe.Pointer, channel *hchan, element unsafe.Pointer, received *bool, more bool) bool {
 	state, pending := stacklessCoroBeginChannelPair(channel, more)
+	if pending {
+		if stacklessCoroMayBatchWait(channel) && empty(channel) {
+			if op := stacklessCoroTakePendingChannel(ctx, state); op != nil {
+				stacklessCoroQueueChannel(op, channel, element, received, false)
+				stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, true, true)
+				return true
+			}
+		} else if stacklessCoroFlushPendingChannel(state) {
+			pending = false
+		}
+	}
 	wait := !tryStacklessCoroChanRecv(ctx, channel, element, received)
 	if wait {
+		// A peer found during registration has no following operation
+		// in this resume to consume a deferred completion.
+		if state != nil {
+			state.channelPair = false
+		}
 		startStacklessCoroChannel(ctx, channel, element, received, false)
 	}
 	stacklessCoroEndChannelPair(state, (*stacklessCoroContext)(ctx).scheduler, pending, wait)
 	return wait
+}
+
+// A ready or buffered second operation still uses its direct path. An
+// unbuffered miss can publish its predecessor under the next wait's lock.
+func stacklessCoroMayBatchWait(channel *hchan) bool {
+	return channel != nil && channel.dataqsiz == 0 && channel.closed == 0 &&
+		channel.timer == nil && channel.bubble == nil
 }
 
 func stacklessCoroBeginChannelPair(channel *hchan, more bool) (*stacklessCoroGState, bool) {
@@ -4432,7 +4471,7 @@ func stacklessCoroBeginChannelPair(channel *hchan, more bool) (*stacklessCoroGSt
 	}
 	pending := state.channelWake
 	if !raceenabled && more && !pending && channel != nil && channel.dataqsiz == 0 &&
-		gomaxprocs > 1 && state.native == unsafe.Pointer(state) {
+		state.native == unsafe.Pointer(state) {
 		state.channelPair = true
 	}
 	return state, pending
@@ -4466,6 +4505,7 @@ func stacklessCoroEndChannelPair(state *stacklessCoroGState, s *stacklessCoroSch
 func stacklessCoroAbortChannelPair(s *stacklessCoroScheduler) {
 	if state := getg().stacklessCoro; state != nil &&
 		(state.channelPair || state.channelWake || state.channelRotate) {
+		stacklessCoroFlushPendingChannel(state)
 		state.channelPair = false
 		state.channelRotate = false
 		if state.channelWake {
@@ -4508,6 +4548,60 @@ func coroSelect(ctx unsafe.Pointer, cases *scase, nsends, nrecvs int, block bool
 func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	element unsafe.Pointer, received *bool, send bool) *stacklessCoroOperation {
 	op := stacklessCoroStartChannelOperation(ctx)
+	stacklessCoroQueueChannel(op, channel, element, received, send)
+	return op
+}
+
+// A bounded pair publishes the prior peer and reserves this wait under
+// the same scheduler lock. The peer's detached waiter can be reused directly.
+// Starting the peer's operation already marked this scheduler as shared.
+func stacklessCoroTakePendingChannel(ctx unsafe.Pointer, state *stacklessCoroGState) *stacklessCoroOperation {
+	op := popStacklessCoroDeferredChannel(state)
+	if op == nil {
+		return nil
+	}
+	state.channelWake = false
+	s, peer := clearStacklessCoroOperation(op)
+	context := (*stacklessCoroContext)(ctx)
+	task := context.task()
+	if s != context.scheduler || task == nil || peer == task {
+		throw("runtime: invalid pending stackless coroutine channel pair")
+	}
+	lock(&s.lock)
+	if task.state != stacklessCoroTaskRunning || !task.resuming ||
+		task.readyPending || task.terminal != stacklessCoroTerminalNone || task.goexit {
+		unlock(&s.lock)
+		throw("runtime: stackless coroutine channel pair outside resume")
+	}
+	resuming := peer.resuming
+	runnable := s.readyLocked(peer)
+	task.state = stacklessCoroTaskWaiting
+	unlock(&s.lock)
+	if !resuming {
+		if runnable == 1 {
+			state.channelWake = true
+		} else {
+			s.signal()
+		}
+	}
+	op.task = task
+	return op
+}
+
+// Complete a pending peer before leaving the proven straight-line region,
+// including on panic. Neither the peer nor its detached waiter can be lost.
+func stacklessCoroFlushPendingChannel(state *stacklessCoroGState) bool {
+	op := popStacklessCoroDeferredChannel(state)
+	if op == nil {
+		return false
+	}
+	state.channelWake = false
+	completeStacklessCoroOperationWithWake(op, false)
+	return true
+}
+
+func stacklessCoroQueueChannel(op *stacklessCoroOperation, channel *hchan,
+	element unsafe.Pointer, received *bool, send bool) {
 	if received != nil {
 		op.setReceived(received)
 	}
@@ -4524,7 +4618,6 @@ func startStacklessCoroChannel(ctx unsafe.Pointer, channel *hchan,
 	} else {
 		chanrecvStackless(op, channel, element)
 	}
-	return op
 }
 
 // stacklessCoroChannelWaiterRooted reports whether the channel allocation is
@@ -5047,6 +5140,17 @@ func completeStacklessCoroOperation(op *stacklessCoroOperation) {
 }
 
 func completeStacklessCoroOperationWithWake(op *stacklessCoroOperation, canPair bool) {
+	if canPair && !raceenabled {
+		gp := getg()
+		if state := gp.stacklessCoro; state != nil && state.channelPair {
+			s := op.scheduler()
+			if s != nil && s.runnableState.Load() == 0 && !stacklessCoroIsPullComparison(s) &&
+				stacklessCoroDeferChannel(gp, s, op) {
+				state.channelWake = true
+				return
+			}
+		}
+	}
 	s, task := clearStacklessCoroOperation(op)
 	lock(&s.lock)
 	completedDuringResume := task.resuming

@@ -136,3 +136,9 @@ func TestStacklessCoroSleepDueHostTimer(t *testing.T) {
 		t.Fatalf("after %d short sleeps, started = %v, host timer fired = %v", sleeps, started, observed)
 	}
 }
+
+func TestStacklessCoroDeferredChannelStorage(t *testing.T) {
+	if !runtime.CheckStacklessCoroDeferredChannelStorageForTest() {
+		t.Fatal("deferred channel and timer storage overlapped")
+	}
+}
