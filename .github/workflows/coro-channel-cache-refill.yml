@@ -1,0 +1,31 @@
+name: Coroutine channel operation cache refill
+
+on:
+  push:
+    branches:
+      - coro/measure-channel-cache-refill-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Validate and compare channel operation cache refill on Linux amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and measure exact baseline and candidate SDKs
+        run: bash .github/perf-coro-channel-cache/measure.sh 63746d7012c5283e48e8aea85e3339be6e0a333d 21e34c77b817cbacd2d1eb5a64b16db4cc520d97
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coroutine-channel-cache-refill
+          path: ${{ runner.temp }}/channel-cache-refill
+          if-no-files-found: error
