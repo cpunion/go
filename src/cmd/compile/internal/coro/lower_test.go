@@ -2782,12 +2782,29 @@ func TestLowerOrdinaryIO(t *testing.T) {
 						t.Fatalf("Lower = %+v, want one lowered function", result)
 					}
 					var starts, finishes, ordinaryCalls int
+					var skipFinish bool
 					for _, generated := range typecheck.Target.Funcs {
 						if generated.OClosure == nil || generated.ClosureParent == nil ||
 							generated.ClosureParent.Sym().Name != "run.coro" {
 							continue
 						}
+						var completed *types.Sym
+						for i, stmt := range generated.Body {
+							call, ok := stmt.(*ir.CallExpr)
+							if !ok {
+								continue
+							}
+							if selector, ok := call.Fun.(*ir.SelectorExpr); ok && selector.Sel.Name == finishName && i+1 < len(generated.Body) {
+								if label, ok := generated.Body[i+1].(*ir.LabelStmt); ok {
+									completed = label.Label
+								}
+							}
+						}
 						ir.Visit(generated, func(node ir.Node) {
+							if branch, ok := node.(*ir.BranchStmt); ok && branch.Op() == ir.OGOTO &&
+								completed != nil && branch.Label == completed {
+								skipFinish = true
+							}
 							call, ok := node.(*ir.CallExpr)
 							if !ok {
 								return
@@ -2804,6 +2821,9 @@ func TestLowerOrdinaryIO(t *testing.T) {
 								ordinaryCalls++
 							}
 						})
+					}
+					if !skipFinish {
+						t.Error("synchronous I/O must branch past the finish call")
 					}
 					if starts != 1 || finishes != 1 || ordinaryCalls != 0 {
 						t.Errorf("calls = (%d starts, %d finishes, %d ordinary), want (1, 1, 0)",
