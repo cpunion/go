@@ -21,7 +21,7 @@ jobs:
           go-version: '1.27.3'
           cache: false
       - name: Test the manager handoff and compare exact SDKs
-        run: bash .github/perf-coro-manager-handoff/measure.sh 0e7a225e9c309e9d5c3bc40c55378acd4ffaf79b ba4c4a20f0e17aa5ea7e943bc163b7b9a56ea4e9
+        run: bash .github/perf-coro-manager-handoff/measure.sh 0e7a225e9c309e9d5c3bc40c55378acd4ffaf79b 435e07371d700fc0d84a9090ee4ec5e73a360320
       - uses: actions/upload-artifact@v7
         if: always()
         with:

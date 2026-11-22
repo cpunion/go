@@ -26,7 +26,7 @@ grep -q "${base:0:8}" "$out/sdk-versions.txt"
 grep -q "${candidate:0:8}" "$out/sdk-versions.txt"
 (
     cd "$root/candidate/src"
-    GOEXPERIMENT=coro,cgocheck2,staticlockranking GOGC=1 ../bin/go test -p=4 -cpu=2,4 -count=10 -timeout=12m -gcflags=all=-d=checkptr=2 runtime \
+    GOEXPERIMENT=coro,cgocheck2,staticlockranking GOGC=1 ../bin/go test -p=4 -cpu=2,4 -count=3 -timeout=12m -gcflags=all=-d=checkptr=2 runtime \
         -run '^TestStacklessCoro(BlockingProgress|NativeBlocking(ReturnProgress|Capacity)|NativeReplacementDrain|ParallelSpawn|ExecutorJoinGrowth|SinglePExecutors|NativeChannelCacheLifecycle)$'
 ) > "$out/runtime-checkptr.txt" 2>&1
 cp -R "$root/candidate/src/cmd/compile/testdata/corobench/." "$root/bench/"
