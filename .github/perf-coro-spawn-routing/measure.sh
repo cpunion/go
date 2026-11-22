@@ -4,6 +4,9 @@ source_revision="$1"
 files="$(cd "$(dirname "$0")" && pwd -P)"
 root="$RUNNER_TEMP/coro-spawn-routing"
 mkdir -p "$root/bench" "$root/cache" "$root/overlays" "$root/validation"
+if ! git cat-file -e "$source_revision^{commit}"; then
+    git fetch --depth=1 --no-tags origin "$source_revision"
+fi
 git worktree add --detach "$root/sdk" "$source_revision"
 export GOENV=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=1 GOMAXPROCS=6
 export GOCACHE="$root/cache"
