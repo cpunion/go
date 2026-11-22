@@ -28,10 +28,15 @@ func TestStacklessCoroSleepStorage(t *testing.T) {
 }
 
 func TestStacklessCoroSleepHostProgress(t *testing.T) {
-	const (
-		delay     = time.Nanosecond
-		maxSleeps = 1000
-	)
+	for _, delay := range []time.Duration{time.Nanosecond, time.Microsecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			testStacklessCoroSleepHostProgress(t, delay)
+		})
+	}
+}
+
+func testStacklessCoroSleepHostProgress(t *testing.T, delay time.Duration) {
+	const maxSleeps = 1000
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
 

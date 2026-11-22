@@ -1234,6 +1234,15 @@ func stacklessCoroPrivateSleep(s *stacklessCoroScheduler, task *stacklessCoroTas
 	}
 	when := ctx.deferredSleepWhen
 	now := nanotime()
+	// Stay on the native executor for an imminent deadline when the
+	// host scheduler is idle. Recheck host work before resuming.
+	const spinLimit = 1024 // ns
+	if when > now && uint64(when)-uint64(now) <= spinLimit &&
+		stacklessCoroSkipPrivateSleepSwitch(gp, now) {
+		for now < when {
+			now = nanotime()
+		}
+	}
 	if when <= now && stacklessCoroSkipPrivateSleepSwitch(gp, now) {
 		ctx.deferredSleepWhen = 0
 		task.state = stacklessCoroTaskRunning

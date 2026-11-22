@@ -6629,13 +6629,21 @@ func TestStacklessCoroTimerChannel(t *testing.T) {
 }
 
 func TestStacklessCoroSleep(t *testing.T) {
-	const delay = 5 * time.Millisecond
+	for _, delay := range []time.Duration{time.Microsecond, 5 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			testStacklessCoroSleep(t, delay)
+		})
+	}
+}
+
+func testStacklessCoroSleep(t *testing.T, delay time.Duration) {
 	var state int
-	start := time.Now()
+	var start time.Time
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch state {
 		case 0:
 			state = 1
+			start = time.Now()
 			if !runtime.SleepStacklessCoroForTest(ctx, int64(delay)) {
 				t.Fatal("positive sleep did not start a timer")
 			}
