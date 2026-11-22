@@ -1,0 +1,29 @@
+--- a/src/runtime/coro_stackless_close.go
++++ b/src/runtime/coro_stackless_close.go
+@@ -69 +69 @@
+-	signals := 0
++	var queued int32
+@@ -73,4 +73 @@
+-		if !entry.task.resuming {
+-			signals++
+-		}
+-		s.readyLocked(entry.task)
++		s.publishReadyLocked(entry.task, &queued)
+@@ -99,0 +97,3 @@
++	if queued != 0 {
++		s.runnableState.Add(queued)
++	}
+@@ -101,4 +101,9 @@
+-	// Keep one wake attempt per completed non-resuming task. A scheduler
+-	// may have several admitted executors waiting for work on other Ps.
+-	for range signals {
+-		s.signal()
++	// Publish a wake for each shared runnable task until the wake buffer
++	// is full. At that point there are no receivers asleep on it, and an
++	// executor parking after this point can take a buffered wake.
++	for range queued {
++		select {
++		case s.wake <- struct{}{}:
++		default:
++			return
++		}
