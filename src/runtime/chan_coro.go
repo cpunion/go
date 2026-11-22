@@ -209,6 +209,52 @@ func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
 	return chanrecv(c, element, false)
 }
 
+// coroTryChanExchange linearizes a buffered send immediately followed by a
+// receive. With room in the buffer and no waiters the send cannot block,
+// and its own value makes the receive ready even when the buffer was empty.
+// A miss leaves the channel and the caller's result slots untouched.
+func coroTryChanExchange(ctx unsafe.Pointer, c *hchan, source, result unsafe.Pointer, received *bool) bool {
+	if raceenabled || asanenabled || msanenabled || debugChan ||
+		c == nil || c.dataqsiz == 0 || c.bubble != nil || c.timer != nil {
+		return false
+	}
+	context := (*stacklessCoroContext)(ctx)
+	if context == nil || context.scheduler == nil || stacklessCoroIsPullComparison(context.scheduler) {
+		return false
+	}
+	if state := getg().stacklessCoro; state != nil && (state.channelPair || state.channelWake) {
+		return false
+	}
+
+	lock(&c.lock)
+	if c.closed != 0 || c.qcount == c.dataqsiz || c.sendq.first != nil || c.recvq.first != nil {
+		unlock(&c.lock)
+		return false
+	}
+	if c.qcount == 0 {
+		// The receive takes the just-sent value. The buffer stays empty,
+		// so leaving the matching cursors in place preserves its order.
+		if result != nil && c.elemsize != 0 {
+			if writeBarrier.enabled || goexperiment.CgoCheck2 {
+				typedmemmove(c.elemtype, result, source)
+			} else {
+				memmove(result, source, uintptr(c.elemsize))
+			}
+		}
+	} else {
+		if c.elemsize != 0 {
+			typedmemmove(c.elemtype, chanbuf(c, c.sendx), source)
+		}
+		advanceStacklessCoroSend(c)
+		stacklessCoroSelectReceiveBuffered(c, result)
+	}
+	unlock(&c.lock)
+	if received != nil {
+		*received = true
+	}
+	return true
+}
+
 // The caller holds the channel lock and has observed a real or stale waiter.
 func coroBufferedSendPeer(c *hchan, element unsafe.Pointer, callerPC uintptr) bool {
 	if sg := c.recvq.dequeue(); sg != nil {
