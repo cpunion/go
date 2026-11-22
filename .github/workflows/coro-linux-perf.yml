@@ -1,4 +1,4 @@
-name: Coroutine Linux channel handoff profile
+name: Coroutine Linux paired channel waits
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Profile coroutine channel handoff (Linux amd64)
+    name: Compare paired coroutine channel waits (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and profile channel handoff
+      - name: Measure and validate paired waits
         shell: bash
-        run: bash .github/coro-linux-perf/profile-channel.sh
+        run: bash .github/coro-linux-perf/measure-driver.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-channel-handoff
+          name: coroutine-linux-paired-waits
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7

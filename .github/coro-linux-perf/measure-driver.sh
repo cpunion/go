@@ -3,8 +3,8 @@ set -euo pipefail
 
 fixture="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(git -C "$fixture" rev-parse --show-toplevel)"
-base=86dfe67ed562b9307e91560c160c9b56e9e67b4b
-candidate=793581ad80cd1333cc74f640179f061ae90f2cd1
+base=793581ad80cd1333cc74f640179f061ae90f2cd1
+candidate=85a81577d3d75375d1e0ca5af3552fbebc23b038
 official="$(go env GOROOT)"
 samples="$RUNNER_TEMP/coro-frame-comparison"
 evidence="$RUNNER_TEMP/coro-linux-perf-evidence"
@@ -48,13 +48,13 @@ cd "$samples/broad"
 "$official/bin/go" test -c -mod=mod -buildmode=pie -o stock.test . > "$evidence/stock-build.log" 2>&1
 for mode in base candidate; do
     GOEXPERIMENT=coro "$samples/$mode/bin/go" test -c -mod=mod -buildmode=pie -gcflags=-d=coro=4 -o "$mode.test" . > "$evidence/$mode-build.log" 2>&1
-    "$samples/verify-gates" "$mode.test" corosurvey.packedBoundary432A corosurvey.packedBoundary440A corosurvey.packedBoundary448A corosurvey.packedMutualA corosurvey.taskBursts corosurvey.effectfulByteA corosurvey.callerEffectA > "$evidence/$mode-gates.txt"
+    "$samples/verify-gates" "$mode.test" corosurvey.channelRoundTrips corosurvey.readySelects corosurvey.blockedSelects corosurvey.packedBoundary440A corosurvey.taskBursts corosurvey.effectfulByteA corosurvey.callerEffectA > "$evidence/$mode-gates.txt"
     GOMAXPROCS=1 GOGC=1 "./$mode.test" -test.run='^TestPackedWorkloads$' -test.count=24 > "$evidence/$mode-stress.txt"
 done
 "$samples/base/bin/go" version -m stock.test base.test candidate.test > "$evidence/versions.txt"
 sha256sum ./*.go ./*.test > "$evidence/input-hashes.txt"
 uptime >> "$evidence/load.txt"
-python3 "$fixture/bench.py" run 24 PackedBoundary432:1:6500,PackedBoundary440:1:6500,PackedBoundary448:1:6500,PackedMutual4096:1:400,PackedSelf4096:1:400,ChannelRoundTrip:4:200000,TaskBurst100000:4:6,PackedArrayReaderEffect440:1:1000,PackedArrayCallerEffect440:1:3000 stock base candidate > "$evidence/frames.jsonl"
+python3 "$fixture/bench.py" run 24 ChannelRoundTrip:1:200000,ChannelRoundTrip:4:200000,ReadySelect:4:100000,BlockedSelect:4:100000,TaskBurst100000:4:6,PackedArrayReaderEffect440:1:1500,PackedArrayCallerEffect440:1:3000,SleepNanosecond:1:12000,PackedBoundary440:1:10000 stock base candidate > "$evidence/frames.jsonl"
 uptime >> "$evidence/load.txt"
 test "$(wc -l < "$evidence/frames.jsonl")" -eq 648
 
@@ -62,13 +62,13 @@ sdk="$samples/candidate"
 (
     cd "$sdk/src"
     GOEXPERIMENT=coro,staticlockranking GOGC=1 "$sdk/bin/go" test -count=5 -gcflags=-d=checkptr=2 runtime \
-        -run 'TestStacklessCoro(NativeFusedChunk|Fused(ChunkInline|Resume)|LocalFused|UncachedFusedCompletion|FrameChunkInvariants|NativeProfileTransitions|NativePreemption|ChunkSwitchRunsReadyTask|QueuedYieldRunsOrdinaryGoroutine)'
+        -run '^TestStacklessCoro.*(Channel|Select|Operation|Sleep|NativeProfile|FusedChunk|Drain)'
 ) > "$evidence/candidate-runtime-checkptr.txt" 2>&1
 
 (
     cd "$sdk/src"
     GOEXPERIMENT=coro GO_TEST_TIMEOUT_SCALE=5 "$sdk/bin/go" test -count=1 cmd/compile/internal/coro \
-        -run '^Test(InvariantReturn|RootArrayReconstructionProof|MutualRootArrayLineage|RootArrayCallerBoundary|FrameArrayReuseChunkPeers)$'
+        -run '^Test(NativeChannelPairWake|TerminalSourceCallersBlockedChannel|InvariantReturn|RootArrayReconstructionProof)$'
 ) > "$evidence/candidate-compiler-lineage.txt" 2>&1
 
 # Run this separate diagnostic binary after the measured samples. Attribute
@@ -86,5 +86,5 @@ proc.write_text(body.replace(needle, "stk[n] = pc + sys.PCQuantum"))
 (out / "diagnostic.json").write_text(json.dumps({"Replace": {str(original): str(proc)}}))
 PY
 GOEXPERIMENT=coro "$sdk/bin/go" test -c -mod=mod -buildmode=pie -gcflags=-d=coro=4 -overlay "$samples/diagnostic.json" -o diagnostic.test . > "$evidence/diagnostic-build.log" 2>&1
-GOMAXPROCS=1 ./diagnostic.test -test.run='^$' -test.bench='^BenchmarkPackedArrayReaderEffect440$' -test.benchtime=3s -test.cpuprofile="$samples/machine.pprof" > "$evidence/diagnostic-profile-bench.txt"
+GOMAXPROCS=4 ./diagnostic.test -test.run='^$' -test.bench='^BenchmarkChannelRoundTrip$' -test.benchtime=3s -test.cpuprofile="$samples/machine.pprof" > "$evidence/diagnostic-profile-bench.txt"
 "$sdk/bin/go" tool pprof -top -nodecount=40 diagnostic.test "$samples/machine.pprof" > "$evidence/diagnostic-profile-top.txt"
