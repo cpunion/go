@@ -5929,6 +5929,17 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	initializers := len(declarations)
 	arrayInitializer := -1
 	var inheritedBufferStore ir.Node
+	var chunkPointerStores, chunkScalarStores ir.Nodes
+	recordChunkStore := func(field *types.Field, store ir.Node) {
+		if !compatibleChunk {
+			return
+		}
+		if field.Type.HasPointers() {
+			chunkPointerStores = append(chunkPointerStores, store)
+		} else {
+			chunkScalarStores = append(chunkScalarStores, store)
+		}
+	}
 	for i, variable := range closureVars {
 		target := explicitFrameField(variable.Pos(), factoryFrame, fields[i])
 		if array := candidate.rootArray; array != nil && variable.Outer.Canonical() == array.buffer {
@@ -5939,6 +5950,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			rootBuffer := typecheck.NodAddr(explicitFrameField(pos, rootFrame, rootArrayField))
 			arrayInitializer = len(declarations)
 			inheritedBufferStore = ir.NewAssignStmt(pos, target, array.inherited)
+			recordChunkStore(fields[i], inheritedBufferStore)
 			declarations = append(declarations, ir.NewIfStmt(pos, isArrayRoot(),
 				ir.Nodes{ir.NewAssignStmt(pos, target, rootBuffer)},
 				ir.Nodes{inheritedBufferStore}))
@@ -5956,14 +5968,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			if zeroLocals[variable.Outer.Canonical()] {
 				value = ir.NewZero(pos, fields[i].Type)
 			}
-			initialize := ir.NewAssignStmt(pos, target, value)
+			var initialize ir.Node = ir.NewAssignStmt(pos, target, value)
 			if needsArrayZero != nil && zeroLocals[variable.Outer.Canonical()] &&
 				fields[i].Type.IsArray() {
-				declarations = append(declarations,
-					ir.NewIfStmt(pos, needsArrayZero, ir.Nodes{initialize}, nil))
-			} else {
-				declarations = append(declarations, initialize)
+				initialize = ir.NewIfStmt(pos, needsArrayZero, ir.Nodes{initialize}, nil)
 			}
+			declarations = append(declarations, initialize)
+			recordChunkStore(fields[i], initialize)
 			continue
 		}
 		selfTarget := typecheck.NodAddr(explicitFrameField(variable.Pos(),
@@ -5972,6 +5983,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		childResult := ir.NewAssignStmt(pos, target, variable.Outer)
 		declarations = append(declarations, ir.NewIfStmt(pos, isRootFactory(),
 			ir.Nodes{rootResult}, ir.Nodes{childResult}))
+		recordChunkStore(fields[i], childResult)
 	}
 
 	candidate.scalarSpawn = newScalarSpawnFactory(candidate, resume, factoryFrame, replacements[candidate.resumePC], factoryPrologue, declarations[initializers:])
@@ -5986,7 +5998,12 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	ir.CurFunc = resume
 	if compatibleChunk || localChunk && len(candidate.chunkAwaits) != 0 {
 		stores := declarations[initializers:]
-		if inheritedBufferStore != nil {
+		if compatibleChunk {
+			// Inline awaits evaluate the operands before initializing the
+			// unpublished child slot. Those stores address disjoint fields,
+			// so grouping pointers lets SSA share a write-barrier check.
+			stores = append(chunkScalarStores, chunkPointerStores...)
+		} else if inheritedBufferStore != nil {
 			// Inline constructors are selected only on proven borrowing
 			// awaits, where the inherited buffer is always nonnil.
 			stores = slices.Clone(stores)
