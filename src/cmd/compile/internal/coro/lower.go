@@ -141,7 +141,7 @@ type lowerCandidate struct {
 	scalarSpawn       *scalarSpawnFactory
 	scalarSpawnSites  []scalarSpawnSite
 	affineRoot        *affineReturnPlan
-	invariantFast     *ir.IfStmt
+	singleYieldFast   *ir.IfStmt
 	channelEntry      *channelEntry
 }
 
@@ -307,6 +307,9 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		p := planAffineReturn(function)
 		if p == nil {
 			p = planInvariantReturn(function)
+		}
+		if p == nil {
+			p = planOrderedReturn(function)
 		}
 		if p != nil {
 			affinePlans[function.Func] = p
@@ -3008,7 +3011,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resumeType := stacklessResumeType()
 	pos := fn.Pos()
 	localVariables := invocationLocals(function)
-	if fast := candidate.invariantFast; fast != nil {
+	if fast := candidate.singleYieldFast; fast != nil {
 		// The generated fast branch declares its temporaries after its
 		// sole suspension and returns before entering the source fallback.
 		ir.VisitList(fast.Body[1:], func(node ir.Node) {
