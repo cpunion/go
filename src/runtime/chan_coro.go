@@ -212,12 +212,15 @@ func coroEntryChanRecv(element unsafe.Pointer, c *hchan) (bool, bool) {
 // coroTryChanExchange linearizes a buffered send immediately followed by a
 // receive. With room in the buffer and no waiters the send cannot block,
 // and its own value makes the receive ready even when the buffer was empty.
-// The public entry passes a nil context before it starts an executor.
-// A miss leaves the channel and the caller's result slots untouched.
+// The public entry passes a nil context. On a miss, an ordinary goroutine
+// can finish the pair using its own stack and the channel waiters.
+// A false result leaves the channel and the caller's result slots untouched.
 func coroTryChanExchange(ctx unsafe.Pointer, c *hchan, source, result unsafe.Pointer, received *bool) bool {
-	if raceenabled || asanenabled || msanenabled || debugChan ||
-		c == nil || c.dataqsiz == 0 || c.bubble != nil || c.timer != nil {
+	if raceenabled || asanenabled || msanenabled || debugChan {
 		return false
+	}
+	if c == nil || c.dataqsiz == 0 || c.bubble != nil || c.timer != nil {
+		goto block
 	}
 	if ctx != nil {
 		context := (*stacklessCoroContext)(ctx)
@@ -232,7 +235,7 @@ func coroTryChanExchange(ctx unsafe.Pointer, c *hchan, source, result unsafe.Poi
 	lock(&c.lock)
 	if c.closed != 0 || c.qcount == c.dataqsiz || c.sendq.first != nil || c.recvq.first != nil {
 		unlock(&c.lock)
-		return false
+		goto block
 	}
 	if c.qcount == 0 {
 		// The receive takes the just-sent value. The buffer stays empty,
@@ -254,6 +257,19 @@ func coroTryChanExchange(ctx unsafe.Pointer, c *hchan, source, result unsafe.Poi
 	unlock(&c.lock)
 	if received != nil {
 		*received = true
+	}
+	return true
+
+block:
+	// Native activations need the executor to run other tasks while waiting.
+	// A public invocation on an ordinary goroutine can use its own stack.
+	if ctx != nil || getg().stacklessCoro != nil {
+		return false
+	}
+	chansend(c, source, true, sys.GetCallerPC())
+	_, ok := chanrecv(c, result, true)
+	if received != nil {
+		*received = ok
 	}
 	return true
 }
