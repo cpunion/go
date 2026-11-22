@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"go/constant"
+	"slices"
 )
 
 // rootArrayPlan records a deliberately narrow reconstruction proof. It does
@@ -17,6 +18,7 @@ import (
 type rootArrayPlan struct {
 	array      *ir.Name
 	zero       *ir.AssignStmt
+	zeroIndex  int
 	write      *ir.AssignStmt
 	writeIndex int64
 	uses       map[*ir.CallExpr]*ir.Func
@@ -45,7 +47,7 @@ func preferRootArrayFrames(candidates map[*ir.Func]*lowerCandidate) {
 	for fn, candidate := range candidates {
 		if candidate.factoryABI == FactoryABI3 && candidate.fusedSelf &&
 			candidate.fusedResume && len(candidate.defers) == 0 && !candidate.selfSpawn &&
-			planRootArray(candidate.function) != nil {
+			candidate.planRootArray() != nil {
 			roots[fn] = true
 		}
 	}
@@ -77,7 +79,7 @@ func markSharedArrayAwaits(candidates map[*ir.Func]*lowerCandidate) {
 		}
 		// Share only substantial arrays. Smaller frames already fit compact
 		// typed chunks without adding a borrowed pointer.
-		if plan := planFrameArray(candidate.function, 384); plan != nil {
+		if plan := candidate.planFrameArray(384); plan != nil {
 			plans[candidate] = plan
 		}
 	}
@@ -111,7 +113,7 @@ func markSharedArrayAwaits(candidates map[*ir.Func]*lowerCandidate) {
 func prepareRootArray(candidate *lowerCandidate) {
 	plan := candidate.sharedArrayPlan
 	if plan == nil && candidate.localSelfFrameLoop() && !candidate.selfSpawn {
-		plan = planRootArray(candidate.function)
+		plan = candidate.planRootArray()
 	}
 	if plan == nil {
 		return
@@ -207,7 +209,7 @@ func prepareArraySnapshot(fn *ir.Func, plan *rootArrayPlan) *ir.Name {
 	snapshot := typecheck.TempAt(plan.write.Pos(), fn, plan.array.Type().Elem())
 	plan.write.X = snapshot
 	plan.write.SetInit(ir.Nodes{ir.NewDecl(snapshot.Pos(), ir.ODCL, snapshot)})
-	fn.Body = fn.Body[1:]
+	fn.Body = slices.Delete(fn.Body, plan.zeroIndex, plan.zeroIndex+1)
 	for i, name := range fn.Dcl {
 		if name.Canonical() == plan.array {
 			fn.Dcl = append(fn.Dcl[:i], fn.Dcl[i+1:]...)
@@ -223,11 +225,19 @@ func prepareArraySnapshot(fn *ir.Func, plan *rootArrayPlan) *ir.Name {
 // cannot publish or compare the array's identity, mutate it, or retain it.
 // Sharing reconstructed storage along a serial self-await lineage needs this
 // stronger property in addition to an ordinary escape-analysis result.
-func planRootArray(function *Function) *rootArrayPlan {
-	if !validRootArraySignature(function.Func) {
+func (candidate *lowerCandidate) planRootArray() *rootArrayPlan {
+	if !validRootArraySignature(candidate.function.Func) {
 		return nil
 	}
-	return planFrameArray(function, 512)
+	return candidate.planFrameArray(512)
+}
+
+func (candidate *lowerCandidate) planFrameArray(minSize int64) *rootArrayPlan {
+	start := 0
+	if candidate.invariantFast != nil {
+		start = 1
+	}
+	return planFrameArray(candidate.function, minSize, start)
 }
 
 func validRootArraySignature(fn *ir.Func) bool {
@@ -249,17 +259,18 @@ func validRootArraySignature(fn *ir.Func) bool {
 
 // planFrameArray proves that the initial zero and one constant-index
 // assignment are the only writes, and that calls cannot retain the array.
-func planFrameArray(function *Function, minSize int64) *rootArrayPlan {
+func planFrameArray(function *Function, minSize int64, start int) *rootArrayPlan {
 	fn := function.Func
-	if len(fn.Body) < 3 {
+	body := fn.Body[start:]
+	if len(body) < 3 {
 		return nil
 	}
-	zero, ok := fn.Body[0].(*ir.AssignStmt)
+	zero, ok := body[0].(*ir.AssignStmt)
 	if !ok {
 		return nil
 	}
 	array, ok := zero.X.(*ir.Name)
-	if !ok || !entryZeroedFrameLocals(fn.Body)[array.Canonical()] ||
+	if !ok || !entryZeroedFrameLocals(body)[array.Canonical()] ||
 		array.Type().Elem().Kind() != types.TUINT8 {
 		return nil
 	}
@@ -267,7 +278,7 @@ func planFrameArray(function *Function, minSize int64) *rootArrayPlan {
 	if size := array.Type().Size(); size < minSize || size > 8<<10 {
 		return nil
 	}
-	write, ok := fn.Body[1].(*ir.AssignStmt)
+	write, ok := body[1].(*ir.AssignStmt)
 	if !ok || len(write.Init()) != 0 {
 		return nil
 	}
@@ -281,7 +292,7 @@ func planFrameArray(function *Function, minSize int64) *rootArrayPlan {
 	if offset < 0 || offset >= array.Type().NumElem() {
 		return nil
 	}
-	plan := &rootArrayPlan{array: array.Canonical(), zero: zero, write: write,
+	plan := &rootArrayPlan{array: array.Canonical(), zero: zero, zeroIndex: start, write: write,
 		writeIndex: offset, uses: make(map[*ir.CallExpr]*ir.Func)}
 	var inspect func(ir.Node) bool
 	inspect = func(node ir.Node) bool {

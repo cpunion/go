@@ -134,7 +134,7 @@ func TestRootArrayReconstructionProof(t *testing.T) {
 				fn.Body[2] = ret(x)
 				function.Edges = append(function.Edges, Edge{Kind: DirectCall, Node: second, Callee: helper})
 			}
-			plan := planRootArray(function)
+			plan := (&lowerCandidate{function: function}).planRootArray()
 			if (plan != nil) != tc.want {
 				t.Fatalf("planRootArray present = %v, want %v", plan != nil, tc.want)
 			}

@@ -58,7 +58,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 	body := fn.Body
 	var array *rootArrayPlan
 	if _, startsWithTest := body[0].(*ir.IfStmt); !startsWithTest {
-		array = planFrameArray(f, 1)
+		array = planFrameArray(f, 1, 0)
 		if array == nil || len(body) < 4 {
 			return nil
 		}
@@ -387,6 +387,7 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 	}
 	candidate.ordinary = old.ordinary
 	candidate.heapLocals = old.heapLocals
+	candidate.invariantFast = fast
 	return candidate
 }
 

@@ -141,6 +141,7 @@ type lowerCandidate struct {
 	scalarSpawn       *scalarSpawnFactory
 	scalarSpawnSites  []scalarSpawnSite
 	affineRoot        *affineReturnPlan
+	invariantFast     *ir.IfStmt
 	channelEntry      *channelEntry
 }
 
@@ -2977,7 +2978,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	function := candidate.function
 	fn := function.Func
 	if candidate.fusedResume && !base.Flag.Cfg.Instrumenting {
-		if plan := planFrameArray(function, 128); plan != nil {
+		if plan := candidate.planFrameArray(128); plan != nil {
 			candidate.reusedArray = &frameArrayReuse{plan: plan}
 		}
 	}
@@ -3007,6 +3008,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	resumeType := stacklessResumeType()
 	pos := fn.Pos()
 	localVariables := invocationLocals(function)
+	if fast := candidate.invariantFast; fast != nil {
+		// The generated fast branch declares its temporaries after its
+		// sole suspension and returns before entering the source fallback.
+		ir.VisitList(fast.Body[1:], func(node ir.Node) {
+			if declaration, ok := node.(*ir.Decl); ok {
+				localVariables[declaration.X.Canonical()] = true
+			}
+		})
+	}
 	if candidate.rootArray != nil {
 		delete(localVariables, candidate.rootArray.snapshot)
 	}

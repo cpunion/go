@@ -60,7 +60,7 @@ func nilPanic(n int, p *int) (recovered any) {
 //go:noinline
 func readLeftDepth(buf *[448]byte) int { return int(buf[445]) }
 //go:noinline
-func readRightDepth(buf *[512]byte) int { return int(buf[503]) }
+func readRightDepth(buf *[448]byte) int { return int(buf[445]) }
 
 func leftDepth(fixed uint16, p *int, n int) int {
 	var buf [448]byte
@@ -70,8 +70,8 @@ func leftDepth(fixed uint16, p *int, n int) int {
 	return child + int(fixed) + *p + readLeftDepth(&buf)
 }
 func rightDepth(fixed uint16, p *int, n int) int {
-	var buf [512]byte
-	buf[503] = byte(n)
+	var buf [448]byte
+	buf[445] = byte(n)
 	if n == 0 { runtime.Gosched(); return int(fixed) + *p + readRightDepth(&buf) }
 	child := leftDepth(fixed, p, n-1)
 	return child + int(fixed) + *p + readRightDepth(&buf)
@@ -132,7 +132,7 @@ func main() {
 				projected += i + int(byte(i))
 			}
 			if got := leftDepth(65535, &p, n); got != want { panic("wrapped byte depth") }
-			if got := rightDepth(65535, &p, n); got != want { panic("different private array") }
+			if got := rightDepth(65535, &p, n); got != want { panic("second private array") }
 			if got := projectedDepth(true, p, n); got != p+projected { panic("conditioned byte depth") }
 			if got := projectedDepth(false, p, n); got != p+n*(n+1)/2 { panic("untaken byte depth") }
 			if got := offsetDepth(&p, n); got != offset { panic("changed array write") }
@@ -188,6 +188,10 @@ func TestInvariantReturn(t *testing.T) {
 			name == "leftDepth" || name == "rightDepth" || name == "projectedDepth"
 		if folded := multiply.Match(out); folded != want {
 			t.Fatalf("%s invariant return=%v want %v\n%s", name, folded, want, out)
+		}
+		if (name == "leftDepth" || name == "rightDepth") &&
+			regexp.MustCompile("CALL main[.]read(Left|Right)Depth[(]SB[)]").Match(out) {
+			t.Fatalf("%s lost scalar array reads in its recursive fallback\n%s", name, out)
 		}
 	}
 }
