@@ -1,4 +1,4 @@
-name: Coroutine Linux buffered channel exchange comparison
+name: Coroutine Linux public channel exchange comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare buffered channel exchange (Linux amd64)
+    name: Compare public channel exchange (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure channel exchange and run regressions
+      - name: Measure public channel exchange and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-exchange.sh
+        run: bash .github/coro-linux-perf/measure-public-exchange.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-buffered-exchange
+          name: coroutine-linux-public-exchange
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
