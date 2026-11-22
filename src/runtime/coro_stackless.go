@@ -341,6 +341,7 @@ type stacklessCoroReplacementState struct {
 	yields, completions uint16 // protected by the scheduler lock
 	shortLimit          atomic.Uint8
 	shortRate           uint16 // completions per millisecond before widening
+	workProbe           atomic.Uint32
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -1654,6 +1655,55 @@ func stacklessCoroHostRunnable() bool {
 	return gp.preempt || pp == nil || !runqempty(pp) || !sched.runq.empty()
 }
 
+const (
+	stacklessCoroWorkUnmeasured uint32 = iota
+	stacklessCoroWorkMeasuring
+	stacklessCoroWorkParallel
+)
+
+// A driver samples at most two independent resumes. Measure the callback
+// itself so that frame allocation, queue traffic, and a slow wake of the
+// replacement manager cannot make a cheap yield look like computation.
+type stacklessCoroWorkProbe struct {
+	replacements *stacklessCoroReplacementState
+	samples      int
+}
+
+func (s *stacklessCoroScheduler) resumeWithWorkProbe(task *stacklessCoroTask, probe *stacklessCoroWorkProbe) uint8 {
+	r := probe.replacements
+	if probe.samples == 0 && (!s.canAssist() ||
+		!r.workProbe.CompareAndSwap(stacklessCoroWorkUnmeasured, stacklessCoroWorkMeasuring)) {
+		probe.replacements = nil
+		return task.resume(unsafe.Pointer(&task.context))
+	}
+	start := nanotime()
+	action := task.resume(unsafe.Pointer(&task.context))
+	elapsed := nanotime() - start
+	const minWork = 120 // nanoseconds
+	const sustainedWork = 1_200
+	if action != stacklessCoroActionYield || elapsed < minWork || getg().preempt || !s.canAssist() {
+		probe.replacements = nil
+		return action
+	}
+	probe.samples++
+	if probe.samples == 2 || elapsed >= sustainedWork {
+		probe.replacements = nil
+		r.workProbe.Store(stacklessCoroWorkParallel)
+		// While the manager is still observing demand, admit replacements
+		// on spare Ps without waiting for it to process this signal.
+		if gomaxprocs >= 3 && s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 &&
+			s.executorCount.CompareAndSwap(1, 3) {
+			go s.replacementExecutor(true)
+			go s.replacementExecutor(true)
+		}
+		select {
+		case r.wake <- struct{}{}:
+		default:
+		}
+	}
+	return action
+}
+
 // runTasks drives the ready queue until this driver is done, one resume panics,
 // or a non-parking episode exhausts ready work. Public drivers stop after the
 // first spawn; owners and replacements stop only after every task completes.
@@ -1667,6 +1717,13 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	var directInitialRoot, fromAssist bool
 	var lane *stacklessCoroAssistLane
 	var useWide bool
+	var probe stacklessCoroWorkProbe
+	if native && !public && !assist && gomaxprocs >= 3 &&
+		s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
+		if r := s.replacements.Load(); r.workProbe.Load() == stacklessCoroWorkUnmeasured {
+			probe.replacements = r
+		}
+	}
 	if assist {
 		lane = s.replacements.Load().assistant()
 	} else {
@@ -1788,7 +1845,13 @@ resume:
 resumeActive:
 	stacklessCoroSetLogicalLeaf(task, getg())
 resumeOwned:
-	action := task.resume(unsafe.Pointer(&task.context))
+	var action uint8
+	if probe.replacements != nil && task != &s.root && task.parent() == nil &&
+		s.runnableState.Load()&^stacklessCoroForeignReturnerBit >= 3 {
+		action = s.resumeWithWorkProbe(task, &probe)
+	} else {
+		action = task.resume(unsafe.Pointer(&task.context))
+	}
 	state := getg().stacklessCoro
 	// Each chunk switch publishes the next frame and resume. Check the
 	// ready queue here, where the scheduler is already available. Only
@@ -6032,7 +6095,8 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if now-started < interval/2 {
 				// A yield or completion can ring the doorbell before the first
 				// timer tick. A failed probe leaves the regular window intact.
-				if lane == nil && gomaxprocs >= 3 && now-started >= earlyProbeInterval && s.canAssist() {
+				observedWork := replacements.workProbe.Load() == stacklessCoroWorkParallel
+				if lane == nil && gomaxprocs >= 3 && (observedWork || now-started >= earlyProbeInterval) && s.canAssist() {
 					lock(&s.lock)
 					moved := int(s.queueProgress - progress)
 					yields := int(replacements.yields - yieldProgress)
@@ -6047,7 +6111,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 						now-started >= int64(yields)*assistMaxYieldTime*2
 					sustainedBacklog := (completed >= 4 || yields >= 24) && yields >= 16 && yields*5 >= moved &&
 						now-started >= int64(yields)*assistMaxYieldTime
-					if ready && (earlyBacklog || sustainedBacklog) {
+					if ready && (observedWork && live >= 8 || earlyBacklog || sustainedBacklog) {
 						replacements.enableDispatchBatching()
 						return true
 					}
