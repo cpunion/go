@@ -15,6 +15,7 @@ const (
 	stacklessCoroChannelCacheBudget    = 16 << 20
 	stacklessCoroChannelCacheGroups    = 2048
 	stacklessCoroChannelCacheGroupSize = 64
+	stacklessCoroChannelCacheRefill    = 8
 )
 
 // Protected by stacklessCoroSharedOperations.lock. Short independently
@@ -93,7 +94,7 @@ func cacheableStacklessCoroChannel(op *stacklessCoroOperation) bool {
 		op.next == nil && validReleasedStacklessCoroSudog(op, waiter)
 }
 
-func takeStacklessCoroChannelCacheLocked() *stacklessCoroOperation {
+func takeStacklessCoroChannelCacheLocked(refill *stacklessCoroScheduler) *stacklessCoroOperation {
 	if raceenabled {
 		return nil
 	}
@@ -108,6 +109,18 @@ func takeStacklessCoroChannelCacheLocked() *stacklessCoroOperation {
 			g.heads[index] = op.next
 			g.count--
 			op.next = nil
+			if refill != nil {
+				// Transfer a bounded prefix from this group under the same lock.
+				// Keep other groups available for concurrent large schedulers.
+				for range min(g.count%stacklessCoroChannelCacheGroupSize, stacklessCoroChannelCacheRefill-1) {
+					next := g.heads[index]
+					g.heads[index] = next.next
+					next.next = refill.freeOperations
+					refill.freeOperations = next
+					refill.freeOperationCount++
+					g.count--
+				}
+			}
 			return op
 		}
 	}

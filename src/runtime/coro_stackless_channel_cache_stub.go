@@ -8,6 +8,6 @@ package runtime
 
 func initStacklessCoroPayloadCache() {}
 
-func takeStacklessCoroChannelCacheLocked() *stacklessCoroOperation { return nil }
+func takeStacklessCoroChannelCacheLocked(*stacklessCoroScheduler) *stacklessCoroOperation { return nil }
 
 func cacheStacklessCoroChannelLocked(*stacklessCoroOperation) {}

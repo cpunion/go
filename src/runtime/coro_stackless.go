@@ -4980,18 +4980,26 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 		op.next = nil
 	}
 	task.state = stacklessCoroTaskWaiting
+	// A large set of live channel users can consume a bounded refill.
+	// Holding the scheduler lock also used for publishing cache returns
+	// prevents other executors from racing to refill the empty list.
+	refill := op == nil && !raceenabled && stacklessCoroChannelWaiterScanning &&
+		kind == stacklessCoroOperationChannel && s.liveSpawns >= stacklessCoroOperationCacheSize
+	if refill {
+		op = takeStacklessCoroSharedOperation(kind, s)
+	}
 	unlock(&s.lock)
+	if op == nil && !refill {
+		op = takeStacklessCoroSharedOperation(kind, nil)
+	}
 	if op == nil {
-		op = takeStacklessCoroSharedOperation(kind)
-		if op == nil {
-			switch kind {
-			case stacklessCoroOperationChannel:
-				op = newStacklessCoroChannelOperation()
-			case stacklessCoroOperationIO:
-				op = newStacklessCoroIOOperation()
-			default:
-				op = new(stacklessCoroOperation)
-			}
+		switch kind {
+		case stacklessCoroOperationChannel:
+			op = newStacklessCoroChannelOperation()
+		case stacklessCoroOperationIO:
+			op = newStacklessCoroIOOperation()
+		default:
+			op = new(stacklessCoroOperation)
 		}
 	}
 	if kind == stacklessCoroOperationIO {
@@ -5078,8 +5086,9 @@ func (s *stacklessCoroScheduler) cacheDrainedOperationsLocked() {
 }
 
 // takeStacklessCoroSharedOperation removes one operation from the overflow
-// shared by scheduler-local caches.
-func takeStacklessCoroSharedOperation(kind stacklessCoroOperationKind) *stacklessCoroOperation {
+// shared by scheduler-local caches. A non-nil refill scheduler has an
+// empty local cache and holds its lock.
+func takeStacklessCoroSharedOperation(kind stacklessCoroOperationKind, refill *stacklessCoroScheduler) *stacklessCoroOperation {
 	if raceenabled {
 		return nil
 	}
@@ -5095,7 +5104,7 @@ func takeStacklessCoroSharedOperation(kind stacklessCoroOperationKind) *stackles
 		stacklessCoroSharedOperations.count--
 		op.next = nil
 	} else if kind == stacklessCoroOperationChannel {
-		op = takeStacklessCoroChannelCacheLocked()
+		op = takeStacklessCoroChannelCacheLocked(refill)
 	}
 	unlock(&stacklessCoroSharedOperations.lock)
 	return op
