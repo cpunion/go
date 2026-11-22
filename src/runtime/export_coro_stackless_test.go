@@ -1625,7 +1625,7 @@ func PublicFileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byt
 }
 
 func FileWriteStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, status *uintptr) {
-	poll_runtime_coroFileWrite(ctx, fd, buffer, n, status)
+	*n, *status = poll_runtime_coroFileWrite(ctx, fd, buffer)
 }
 
 func SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,

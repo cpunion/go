@@ -28,13 +28,17 @@ func newStacklessCoroWriteOperation(ctx unsafe.Pointer, fd int, buffer []byte,
 	return op
 }
 
+// A file write returns in its calling activation. Syscall entry still
+// reserves replacement capacity when the write could block other tasks.
+//
 //go:linkname poll_runtime_coroFileWrite internal/poll.runtime_coroFileWrite
-func poll_runtime_coroFileWrite(ctx unsafe.Pointer, fd int, buffer []byte,
-	n *int, status *uintptr) {
-	op := newStacklessCoroWriteOperation(ctx, fd, buffer, n, status)
-	op.id = stacklessCoroDirectOperationID
+func poll_runtime_coroFileWrite(ctx unsafe.Pointer, fd int, buffer []byte) (int, uintptr) {
+	written := 0
 	for {
-		p := stacklessCoroWriteBuffer(op)
+		p := buffer[written:]
+		if len(p) > stacklessCoroMaxWrite {
+			p = p[:stacklessCoroMaxWrite]
+		}
 		coroEnterSyscall(ctx)
 		var count int32
 		for {
@@ -45,9 +49,18 @@ func poll_runtime_coroFileWrite(ctx unsafe.Pointer, fd int, buffer []byte,
 		}
 		coroExitSyscall()
 		KeepAlive(p)
-		if stacklessCoroWriteResult(op, count) {
-			completeStacklessCoroOperation(op)
-			return
+		if count < 0 {
+			return written, uintptr(-count)
+		}
+		if int(count) > len(p) {
+			throw("runtime: invalid stackless coroutine write count")
+		}
+		written += int(count)
+		if written == len(buffer) {
+			return written, 0
+		}
+		if count == 0 {
+			return written, stacklessCoroWriteNoProgressTag
 		}
 	}
 }
