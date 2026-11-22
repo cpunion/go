@@ -1,0 +1,30 @@
+name: Coroutine manager handoff
+
+on:
+  push:
+    branches:
+      - coro/measure-manager-handoff-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test the manager handoff and compare exact SDKs
+        run: bash .github/perf-coro-manager-handoff/measure.sh 0e7a225e9c309e9d5c3bc40c55378acd4ffaf79b ba4c4a20f0e17aa5ea7e943bc163b7b9a56ea4e9
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coro-manager-handoff
+          path: ${{ runner.temp }}/coro-manager-handoff/results
+          if-no-files-found: error
