@@ -208,13 +208,9 @@ func (operands invariantReturnOperands) depthTerm(n ir.Node) invariantDepth {
 	if !ok || operands.array == nil {
 		return invariantNoDepth
 	}
-	leaf := operands.array.uses[call]
-	if leaf == nil {
-		return invariantNoDepth
-	}
-	// The array proof already establishes purity, a constant index, and an
+	// A nonnil return expression proves purity, a constant index, and an
 	// in-bounds read from the private buffer with one byte initialized.
-	result := leaf.Body[0].(*ir.ReturnStmt).Results[0]
+	result := operands.array.uses[call]
 	if conv, ok := invariantIntegerCast(result); ok {
 		if index, ok := conv.X.(*ir.IndexExpr); ok && ir.Int64Val(index.Index) == operands.array.writeIndex {
 			return invariantByteDepth

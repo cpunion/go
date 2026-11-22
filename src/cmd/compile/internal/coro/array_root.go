@@ -21,7 +21,9 @@ type rootArrayPlan struct {
 	zeroIndex  int
 	write      *ir.AssignStmt
 	writeIndex int64
-	uses       map[*ir.CallExpr]*ir.Func
+	// Each entry describes a reader that cannot observe the array's
+	// address. A nil value keeps an effectful call in the lowered body.
+	uses map[*ir.CallExpr]ir.Node
 }
 
 // rootArrayLowering keeps a small traced frame for each invocation and one
@@ -285,7 +287,7 @@ func planFrameArray(function *Function, minSize int64, start int) *rootArrayPlan
 	index, ok := write.X.(*ir.IndexExpr)
 	if !ok || index.X != array || len(index.Init()) != 0 ||
 		!ir.IsConst(index.Index, constant.Int) || len(index.Index.Init()) != 0 ||
-		!rootArrayInput(write.Y) {
+		!rootArrayIntegerExpr(write.Y, ir.PPARAM) {
 		return nil
 	}
 	offset := ir.Int64Val(index.Index)
@@ -293,7 +295,7 @@ func planFrameArray(function *Function, minSize int64, start int) *rootArrayPlan
 		return nil
 	}
 	plan := &rootArrayPlan{array: array.Canonical(), zero: zero, zeroIndex: start, write: write,
-		writeIndex: offset, uses: make(map[*ir.CallExpr]*ir.Func)}
+		writeIndex: offset, uses: make(map[*ir.CallExpr]ir.Node)}
 	var inspect func(ir.Node) bool
 	inspect = func(node ir.Node) bool {
 		if node == zero || node == write {
@@ -310,11 +312,12 @@ func planFrameArray(function *Function, minSize int64, start int) *rootArrayPlan
 			address, ok := call.Args[0].(*ir.AddrExpr)
 			if ok && address.X == array && len(address.Init()) == 0 {
 				callee := edgeForCall(function, call).Callee
-				if !rootArrayLeaf(callee, array.Type()) || ir.StaticCalleeName(call.Fun) != callee.Nname ||
+				result, readOnly := rootArrayLeaf(callee, array.Type())
+				if !readOnly || ir.StaticCalleeName(call.Fun) != callee.Nname ||
 					ir.Any(call.Fun, func(n ir.Node) bool { return len(n.Init()) != 0 }) {
 					return false
 				}
-				plan.uses[call] = callee
+				plan.uses[call] = result
 				return true
 			}
 		}
@@ -331,7 +334,7 @@ func planFrameArray(function *Function, minSize int64, start int) *rootArrayPlan
 	return plan
 }
 
-func rootArrayInput(node ir.Node) bool {
+func rootArrayIntegerExpr(node ir.Node, source ir.Class) bool {
 	if node == nil || len(node.Init()) != 0 {
 		return false
 	}
@@ -340,12 +343,12 @@ func rootArrayInput(node ir.Node) bool {
 	}
 	switch node := node.(type) {
 	case *ir.Name:
-		return node.Class == ir.PPARAM && node.Type().IsInteger()
+		return node.Class == source && node.Type().IsInteger()
 	case *ir.ConvExpr:
 		return (node.Op() == ir.OCONV || node.Op() == ir.OCONVNOP) &&
-			node.Type().IsInteger() && rootArrayInput(node.X)
+			node.Type().IsInteger() && rootArrayIntegerExpr(node.X, source)
 	case *ir.BinaryExpr:
-		return rootArrayArithmetic(node.Op()) && rootArrayInput(node.X) && rootArrayInput(node.Y)
+		return rootArrayArithmetic(node.Op()) && rootArrayIntegerExpr(node.X, source) && rootArrayIntegerExpr(node.Y, source)
 	}
 	return false
 }
@@ -358,23 +361,27 @@ func rootArrayArithmetic(op ir.Op) bool {
 	return false
 }
 
-func rootArrayLeaf(fn *ir.Func, array *types.Type) bool {
-	if fn == nil || len(fn.Body) != 1 || fn.Type().NumRecvs() != 0 ||
+func rootArrayLeaf(fn *ir.Func, array *types.Type) (ir.Node, bool) {
+	if fn == nil || len(fn.Body) == 0 || fn.Type().NumRecvs() != 0 ||
 		fn.Type().NumParams() != 1 || fn.Type().NumResults() != 1 ||
 		!fn.Type().Result(0).Type.IsInteger() {
-		return false
+		return nil, false
 	}
 	input := fn.Type().Param(0)
 	if !input.Type.IsPtr() || !types.Identical(input.Type.Elem(), array) {
-		return false
+		return nil, false
 	}
 	parameter, ok := input.Nname.(*ir.Name)
 	if !ok {
-		return false
+		return nil, false
 	}
-	ret, ok := fn.Body[0].(*ir.ReturnStmt)
+	last := len(fn.Body) - 1
+	if !rootArrayReaderWrites(fn.Body[:last]) {
+		return nil, false
+	}
+	ret, ok := fn.Body[last].(*ir.ReturnStmt)
 	if !ok || len(ret.Init()) != 0 || len(ret.Results) != 1 {
-		return false
+		return nil, false
 	}
 	var value func(ir.Node) bool
 	value = func(node ir.Node) bool {
@@ -402,5 +409,41 @@ func rootArrayLeaf(fn *ir.Func, array *types.Type) bool {
 		}
 		return false
 	}
-	return value(ret.Results[0])
+	result := ret.Results[0]
+	if !value(result) {
+		return nil, false
+	}
+	if last != 0 {
+		return nil, true
+	}
+	return result, true
+}
+
+// rootArrayReaderWrites permits scalar global writes before a reader's
+// return. Neither the target nor the value of these writes can use the
+// array parameter.
+func rootArrayReaderWrites(body ir.Nodes) bool {
+	for _, node := range body {
+		if len(node.Init()) != 0 {
+			return false
+		}
+		var left, right ir.Node
+		switch statement := node.(type) {
+		case *ir.AssignStmt:
+			left, right = statement.X, statement.Y
+		case *ir.AssignOpStmt:
+			if !rootArrayArithmetic(statement.AsOp) {
+				return false
+			}
+			left, right = statement.X, statement.Y
+		default:
+			return false
+		}
+		target, ok := left.(*ir.Name)
+		if !ok || target.Class != ir.PEXTERN || len(target.Init()) != 0 || !target.Type().IsInteger() ||
+			!rootArrayIntegerExpr(right, ir.PEXTERN) {
+			return false
+		}
+	}
+	return true
 }

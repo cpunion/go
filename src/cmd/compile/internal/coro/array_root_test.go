@@ -31,6 +31,7 @@ func TestRootArrayReconstructionProof(t *testing.T) {
 		{"direct-read", 5120, false},
 		{"later-write", 5120, false},
 		{"helper-write", 5120, false},
+		{"helper-global-write", 5120, true},
 		{"helper-identity", 5120, false},
 		{"helper-division", 5120, false},
 		{"effectful-input", 5120, false},
@@ -109,6 +110,11 @@ func TestRootArrayReconstructionProof(t *testing.T) {
 				fn.Body = append(fn.Body[:2], assign(index(array, 1), typedInt(pos, octet, 2)), ret(call))
 			case "helper-write":
 				helper.Body = append(ir.Nodes{assign(index(parameter, 1), typedInt(pos, octet, 2))}, helper.Body...)
+			case "helper-global-write":
+				global := ir.NewNameAt(pos, pkg.Lookup("global"), integer)
+				global.Class = ir.PEXTERN
+				global.SetTypecheck(1)
+				helper.Body = append(ir.Nodes{assign(global, typedInt(pos, integer, 1))}, helper.Body...)
 			case "helper-identity":
 				pointer := ir.NewConvExpr(pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], parameter)
 				pointer.SetTypecheck(1)
@@ -163,8 +169,11 @@ func TestRootArrayReconstructionProof(t *testing.T) {
 			if write.X != lowered.snapshot || write.Y == nil || fn.Body[0] != write || value.Curfn != candidate.factory {
 				t.Fatal("lost the source conversion/evaluation point or result owner")
 			}
-			for call, original := range plan.uses {
-				if call.Fun != original.Nname || call.Args[0] != lowered.buffer || len(call.Init()) != 1 || call.Init()[0].Typecheck() == 0 {
+			for call, result := range plan.uses {
+				if (result == nil) != (tc.name == "helper-global-write") {
+					t.Fatal("array proof lost the reader's effect classification")
+				}
+				if call.Fun != helper.Nname || call.Args[0] != lowered.buffer || len(call.Init()) != 1 || call.Init()[0].Typecheck() == 0 {
 					t.Fatal("lost original readonly leaf or typed reconstruction")
 				}
 			}
