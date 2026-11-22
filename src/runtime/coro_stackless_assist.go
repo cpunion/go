@@ -9,6 +9,7 @@ package runtime
 import "internal/runtime/atomic"
 
 const stacklessCoroAssistWidth = 4
+const stacklessCoroShortExecutors = 3
 
 type stacklessCoroAssistLane struct {
 	lock       mutex
@@ -171,11 +172,11 @@ func (s *stacklessCoroScheduler) takeAssistBatch(lane *stacklessCoroAssistLane) 
 	if task != nil {
 		return task
 	}
-	if lane.wide && lane.retired != nil {
+	if lane.retired != nil {
 		stacklessCoroUnlinkRetired(lane.retired)
 	}
 	lock(&s.lock)
-	flushed := lane.wide && s.flushAssistCompletionsLocked(lane)
+	flushed := s.flushAssistCompletionsLocked(lane)
 	first := s.head
 	var anchor *stacklessCoroTask
 	if first == &s.root {
@@ -219,10 +220,10 @@ func (s *stacklessCoroScheduler) takeAssistBatch(lane *stacklessCoroAssistLane) 
 	return task
 }
 
-func (s *stacklessCoroScheduler) requeueAssist(lane *stacklessCoroAssistLane, task *stacklessCoroTask) bool {
+func (s *stacklessCoroScheduler) requeueAssist(lane *stacklessCoroAssistLane, task *stacklessCoroTask, rotate bool) (*stacklessCoroTask, bool) {
 	if task.parent() != nil || !s.canAssist() || getg().preempt ||
 		s.runnableState.Load()&stacklessCoroForeignReturnerBit != 0 {
-		return false
+		return nil, false
 	}
 	if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit || task.next != nil {
@@ -230,6 +231,17 @@ func (s *stacklessCoroScheduler) requeueAssist(lane *stacklessCoroAssistLane, ta
 	}
 	lock(&lane.lock)
 	task.state, task.resuming = stacklessCoroTaskRunnable, false
+	// With a ready successor, the swap preserves the runnable count.
+	if rotate && lane.head != nil {
+		next := lane.head
+		lane.tail.next = task
+		lane.tail = task
+		lane.head = next.next
+		next.next = nil
+		stacklessCoroStartReady(next)
+		unlock(&lane.lock)
+		return next, true
+	}
 	if lane.tail == nil {
 		lane.head = task
 	} else {
@@ -241,7 +253,7 @@ func (s *stacklessCoroScheduler) requeueAssist(lane *stacklessCoroAssistLane, ta
 	if runnable == 1 {
 		s.signal()
 	}
-	return true
+	return nil, true
 }
 
 // Merge ready work when the helper leaves or a foreign call may block.
@@ -274,9 +286,9 @@ func (s *stacklessCoroScheduler) retireAssistTask(lane *stacklessCoroAssistLane,
 	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
 		throw("runtime: invalid coroutine assist completion")
 	}
-	// Retire the source before running the next task. A widened driver
-	// also batches registry unlinking with the next scheduler refill.
-	if !lane.wide || !stacklessCoroMarkRetired(task) {
+	// Retire the source before running the next task. Unlink its
+	// record with the rest of the batch before recycling the frame.
+	if !stacklessCoroMarkRetired(task) {
 		stacklessCoroCompleteLogicalFrame(task)
 	}
 	task.next, lane.retired = lane.retired, task
@@ -290,9 +302,7 @@ func (s *stacklessCoroScheduler) retireAssistTask(lane *stacklessCoroAssistLane,
 
 func (s *stacklessCoroScheduler) flushAssistCompletions(lane *stacklessCoroAssistLane) {
 	if lane.retired != nil {
-		if lane.wide {
-			stacklessCoroUnlinkRetired(lane.retired)
-		}
+		stacklessCoroUnlinkRetired(lane.retired)
 		lock(&s.lock)
 		s.flushAssistCompletionsLocked(lane)
 		unlock(&s.lock)

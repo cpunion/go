@@ -335,6 +335,7 @@ type stacklessCoroReplacementState struct {
 	completed           atomic.Pointer[stacklessCoroTask]
 	dispatch            atomic.Pointer[stacklessCoroDispatchLanes]
 	yields, completions uint16 // protected by the scheduler lock
+	shortLimit          atomic.Uint8
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -1865,12 +1866,20 @@ resumeOwned:
 	case stacklessCoroActionYield, stacklessCoroActionHandoff:
 		idlePollSkip = nil
 		directInitialRoot = false
-		if fromAssist && action == stacklessCoroActionYield && s.requeueAssist(lane, task) {
-			hostYieldCheck++
-			if hostYieldCheck != 0 || !stacklessCoroHostRunnable() || !yieldStacklessCoroNative(s, nil) {
-				goto next
+		if fromAssist && action == stacklessCoroActionYield {
+			rotate := hostYieldCheck != ^uint8(0) && (!assist || lane.enabled.Load() && s.canParkAssistant())
+			next, queued := s.requeueAssist(lane, task, rotate)
+			if queued {
+				hostYieldCheck++
+				if next != nil {
+					task = next
+					goto resume
+				}
+				if hostYieldCheck != 0 || !stacklessCoroHostRunnable() || !yieldStacklessCoroNative(s, nil) {
+					goto next
+				}
+				return nil
 			}
-			return nil
 		}
 		fromAssist = false
 		// The ordinary host and public driver must get their scheduling
@@ -5306,7 +5315,14 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		next.state, next.resuming, next.next = stacklessCoroTaskRunning, true, nil
 		s.queueProgress += 2
 		if lifetime&stacklessCoroLifetimeDeferredExecutors != 0 && task != &s.root {
-			s.replacements.Load().yields++
+			replacements := s.replacements.Load()
+			replacements.yields++
+			if (replacements.yields == 24 || replacements.yields == 48) && gomaxprocs >= 3 {
+				select {
+				case replacements.wake <- struct{}{}:
+				default:
+				}
+			}
 		}
 		unlock(&s.lock)
 		return next, false, false
@@ -5751,6 +5767,11 @@ func (s *stacklessCoroScheduler) warmExecutorLimit() uint32 {
 	if raceenabled || stacklessCoroIsPullComparison(s) {
 		return stacklessCoroWarmExecutorCount
 	}
+	if replacements := s.replacements.Load(); replacements != nil {
+		if limit := replacements.shortLimit.Load(); limit != 0 && s.canAssist() {
+			return uint32(limit)
+		}
+	}
 	return uint32(max(stacklessCoroWarmExecutorCount, min(gomaxprocs, stacklessCoroMaxWarmExecutors)))
 }
 
@@ -5857,6 +5878,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 	var baselineRate int64
 	trialTicks, quietTicks := 0, 0
 	stable := false
+	var previousBacklog bool
 	started := nanotime()
 	headSince := started
 	// The initial replacement doorbell is idle until this manager widens
@@ -5878,7 +5900,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			// A delayed manager can receive several accumulated ticks.
 			// Require a fresh observation interval before sampling again.
 			if now-started < interval/2 {
-				// A completion can ring the doorbell before the first
+				// A yield or completion can ring the doorbell before the first
 				// timer tick. A failed probe leaves the regular window intact.
 				if lane == nil && gomaxprocs >= 3 && now-started >= interval/8 && s.canAssist() {
 					lock(&s.lock)
@@ -5887,7 +5909,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 					completed := replacements.completions - completionProgress
 					ready := s.head != nil
 					unlock(&s.lock)
-					if ready && completed >= 4 && yields >= 16 && yields*5 >= moved &&
+					if ready && (completed >= 4 || yields >= 24) && yields >= 16 && yields*5 >= moved &&
 						now-started >= int64(yields)*assistMaxYieldTime {
 						replacements.enableDispatchBatching()
 						return true
@@ -5897,6 +5919,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			}
 			lock(&s.lock)
 			next, nextHead := s.queueProgress, s.head
+			liveSpawns := s.liveSpawns
 			moved := int(next - progress)
 			yields := int(replacements.yields - yieldProgress)
 			yieldProgress = replacements.yields
@@ -5924,9 +5947,19 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if nextHead != head {
 				head, headSince = nextHead, now
 			}
-			admit := stable && canAssist
+			admit := canAssist && (stable || gomaxprocs >= 4 && moved >= 1024)
 			stable = canAssist
+			backlog := canAssist && liveSpawns >= 3*stacklessCoroShortExecutors*stacklessCoroAssistWidth
+			enoughWork := backlog || previousBacklog
+			previousBacklog = backlog
 			if lane == nil && admit && gomaxprocs > 1 && !stacklessCoroHostRunnable() {
+				if gomaxprocs > stacklessCoroShortExecutors && enoughWork {
+					// Enough live tasks to keep several batches on each
+					// driver, with spare capacity for ordinary Go work.
+					replacements.shortLimit.Store(stacklessCoroShortExecutors)
+					replacements.enableDispatchBatching()
+					return true
+				}
 				// The manager can give up its own P when it parks.
 				pilot := new(struct {
 					dispatch stacklessCoroDispatchLanes
@@ -5990,6 +6023,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 				yieldProgress = replacements.yields
 				completionProgress = replacements.completions
 				stable = false
+				previousBacklog = false
 				s.executorMonitorIdle = head == nil
 				unlock(&s.lock)
 				if head == nil {
