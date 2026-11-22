@@ -1,4 +1,4 @@
-name: Coroutine Linux scalar array frames
+name: Coroutine Linux folded depth returns
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare scalar array frames (Linux amd64)
+    name: Compare folded depth returns (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and validate scalar array frames
+      - name: Measure and validate folded depth returns
         shell: bash
         run: bash .github/coro-linux-perf/measure-driver.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-scalar-array-frames
+          name: coroutine-linux-folded-depth
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7

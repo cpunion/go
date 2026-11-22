@@ -3,8 +3,8 @@ set -euo pipefail
 
 fixture="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(git -C "$fixture" rev-parse --show-toplevel)"
-base=45b30d7bf5ededa6bf16b77278ed7c71451cc5f9
-candidate=e70fa1d4a714592186dda48ffccf2dc3b2bbdb90
+base=e70fa1d4a714592186dda48ffccf2dc3b2bbdb90
+candidate=86dfe67ed562b9307e91560c160c9b56e9e67b4b
 official="$(go env GOROOT)"
 samples="$RUNNER_TEMP/coro-frame-comparison"
 evidence="$RUNNER_TEMP/coro-linux-perf-evidence"
@@ -67,7 +67,7 @@ sdk="$samples/candidate"
 (
     cd "$sdk/src"
     GOEXPERIMENT=coro GO_TEST_TIMEOUT_SCALE=5 "$sdk/bin/go" test -count=1 cmd/compile/internal/coro \
-        -run '^Test(MutualRootArrayLineage|RootArrayCallerBoundary|FrameArrayReuseChunkPeers)$'
+        -run '^Test(InvariantReturn|MutualRootArrayLineage|RootArrayCallerBoundary|FrameArrayReuseChunkPeers)$'
 ) > "$evidence/candidate-compiler-lineage.txt" 2>&1
 
 # Run this separate diagnostic binary after the measured samples. Attribute
@@ -85,5 +85,5 @@ proc.write_text(body.replace(needle, "stk[n] = pc + sys.PCQuantum"))
 (out / "diagnostic.json").write_text(json.dumps({"Replace": {str(original): str(proc)}}))
 PY
 GOEXPERIMENT=coro "$sdk/bin/go" test -c -mod=mod -buildmode=pie -gcflags=-d=coro=4 -overlay "$samples/diagnostic.json" -o diagnostic.test . > "$evidence/diagnostic-build.log" 2>&1
-GOMAXPROCS=1 ./diagnostic.test -test.run='^$' -test.bench='^BenchmarkPackedBoundary440$' -test.benchtime=400000x -test.cpuprofile="$samples/machine.pprof" > "$evidence/diagnostic-profile-bench.txt"
+GOMAXPROCS=1 ./diagnostic.test -test.run='^$' -test.bench='^BenchmarkPackedBoundary440$' -test.benchtime=3s -test.cpuprofile="$samples/machine.pprof" > "$evidence/diagnostic-profile-bench.txt"
 "$sdk/bin/go" tool pprof -top -nodecount=40 diagnostic.test "$samples/machine.pprof" > "$evidence/diagnostic-profile-top.txt"
