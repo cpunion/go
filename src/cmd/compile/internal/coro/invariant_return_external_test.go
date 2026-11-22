@@ -103,6 +103,12 @@ func effectDepth(p *int, n int) int {
 	var buf [448]byte
 	buf[445] = byte(n)
 	if n == 0 { runtime.Gosched(); return readWithEffect(&buf) + *p }
+	return effectOtherDepth(p, n-1) + readWithEffect(&buf) + *p
+}
+func effectOtherDepth(p *int, n int) int {
+	var buf [448]byte
+	buf[445] = byte(n)
+	if n == 0 { runtime.Gosched(); return readWithEffect(&buf) + *p }
 	return effectDepth(p, n-1) + readWithEffect(&buf) + *p
 }
 
@@ -163,7 +169,7 @@ func main() {
 
 func TestInvariantReturn(t *testing.T) {
 	lowered := []string{"first", "second", "nativeCaller", "changed", "unequalA", "unequalB", "twice",
-		"leftDepth", "rightDepth", "projectedDepth", "offsetDepth", "effectDepth"}
+		"leftDepth", "rightDepth", "projectedDepth", "offsetDepth", "effectDepth", "effectOtherDepth"}
 	testSwitchReturnFilesNative(t, map[string]string{"main.go": invariantReturnSource}, "", nil, lowered, lowered)
 
 	source := filepath.Join(t.TempDir(), "main.go")
@@ -176,6 +182,14 @@ func TestInvariantReturn(t *testing.T) {
 	build.Env = append(build.Environ(), "GOEXPERIMENT=coro", "GOWORK=off")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
+	}
+	for _, name := range []string{"effectDepth", "effectOtherDepth"} {
+		out, err := testenv.Command(t, goTool, "tool", "objdump", "-s",
+			"^main[.]"+name+"[.]coro[.]array[.]func1$", program).CombinedOutput()
+		reader := regexp.MustCompile("CALL main[.]readWithEffect[(]SB[)]")
+		if err != nil || !reader.Match(out) {
+			t.Fatalf("%s lost the shared array buffer or effectful call: %v\n%s", name, err, out)
+		}
 	}
 	multiply := regexp.MustCompile(`\s(MADD|MUL|IMULQ)\s`)
 	for _, name := range []string{"first", "second", "changed", "unequalA", "unequalB", "twice",

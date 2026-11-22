@@ -72,8 +72,7 @@ func scalarArrayReturnReads(fn *ir.Func, plan *rootArrayPlan) []*ir.Node {
 // The reader is an integer expression over constant indices, so substitute
 // the saved byte and the zeros of the entry-initialized array at the call site.
 func scalarArrayRead(plan *rootArrayPlan, call *ir.CallExpr, snapshot *ir.Name) ir.Node {
-	leaf := plan.uses[call]
-	result := leaf.Body[0].(*ir.ReturnStmt).Results[0]
+	result := plan.uses[call]
 	var replace func(ir.Node) ir.Node
 	replace = func(node ir.Node) ir.Node {
 		if index, ok := node.(*ir.IndexExpr); ok {
