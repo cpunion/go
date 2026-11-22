@@ -1,4 +1,4 @@
-name: Coroutine Linux ordered unwind comparison
+name: Coroutine Linux direct file write comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare ordered coroutine unwinds (Linux amd64)
+    name: Compare direct coroutine file writes (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure ordered unwinds and run regressions
+      - name: Measure direct file writes and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-ordered.sh
+        run: bash .github/coro-linux-perf/measure-file.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-ordered-unwind
+          name: coroutine-linux-file-write
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
