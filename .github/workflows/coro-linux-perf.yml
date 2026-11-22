@@ -1,4 +1,4 @@
-name: Coroutine Linux channel exchange result comparison
+name: Coroutine Linux blocking public channel exchange comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare channel exchange results (Linux amd64)
+    name: Compare blocking public exchange (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure channel exchange results and run regressions
+      - name: Measure blocking public exchange and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-channel-projection.sh
+        run: bash .github/coro-linux-perf/measure-blocking-exchange.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-channel-projection
+          name: coroutine-linux-blocking-exchange
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
