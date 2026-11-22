@@ -2268,7 +2268,15 @@ func TestLowerStateMachines(t *testing.T) {
 	}
 	foundSleepGuard := false
 	ir.Visit(sleeperResume, func(node ir.Node) {
-		conditional, ok := node.(*ir.IfStmt)
+		guard, ok := node.(*ir.IfStmt)
+		if !ok || len(guard.Body) != 1 {
+			return
+		}
+		positive, ok := guard.Cond.(*ir.BinaryExpr)
+		if !ok || positive.Op() != ir.OGT || !ir.IsZero(positive.Y) {
+			return
+		}
+		conditional, ok := guard.Body[0].(*ir.IfStmt)
 		if !ok {
 			return
 		}
@@ -2282,6 +2290,9 @@ func TestLowerStateMachines(t *testing.T) {
 			return
 		}
 		foundSleepGuard = true
+		if len(call.Args) != 2 || !ir.SameSafeExpr(positive.X, call.Args[1]) {
+			t.Errorf("sleep guard does not test the same duration passed to coroSleep")
+		}
 		if len(conditional.Body) != 1 {
 			t.Errorf("sleep guard has %d statements, want 1",
 				len(conditional.Body))
@@ -2301,7 +2312,7 @@ func TestLowerStateMachines(t *testing.T) {
 		}
 	})
 	if !foundSleepGuard {
-		t.Error("sleeper resume has no coroSleep result guard")
+		t.Error("sleeper resume has no positive-duration guard before coroSleep")
 	}
 
 	var foreignResume *ir.Func

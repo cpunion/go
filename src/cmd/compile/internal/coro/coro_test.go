@@ -975,6 +975,7 @@ var (
 	progress        int32
 	timerPanic      any
 	timerPanicCalls int
+	sleepEvaluations int
 )
 
 //go:noinline
@@ -988,6 +989,17 @@ func sleepProgress() bool {
 	go markProgress()
 	time.Sleep(20 * time.Millisecond)
 	return atomic.LoadInt32(&progress) != 0
+}
+
+//go:noinline
+func sleepDuration(delay time.Duration) time.Duration {
+	sleepEvaluations++
+	return delay
+}
+
+//go:noinline
+func sleepOnce(delay time.Duration) {
+	time.Sleep(sleepDuration(delay))
 }
 
 //go:noinline
@@ -1088,8 +1100,11 @@ func main() {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
 
+	sleepOnce(-time.Millisecond)
+	sleepOnce(0)
+	sleepOnce(time.Microsecond)
 	invalidTicker()
-	if !sleepProgress() || !afterWait() || !afterFuncWait() ||
+	if sleepEvaluations != 3 || !sleepProgress() || !afterWait() || !afterFuncWait() ||
 		!resetWait() || !stoppedTimer() || tickerWait() != 3 ||
 		!tickWait() ||
 		timerPanic == nil ||
@@ -1122,7 +1137,7 @@ func main() {
 		t.Fatalf("output does not contain %q\n%s", want, out)
 	}
 	for _, name := range []string{
-		"markProgress", "sleepProgress", "afterWait", "afterFuncWait",
+		"markProgress", "sleepProgress", "sleepOnce", "afterWait", "afterFuncWait",
 		"resetWait", "stoppedTimer", "tickerWait", "tickWait",
 		"invalidTicker",
 	} {

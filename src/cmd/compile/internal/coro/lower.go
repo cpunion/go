@@ -5116,18 +5116,24 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				for _, init := range state.call.Init() {
 					body = append(body, edit(init))
 				}
-				duration := edit(state.call.Args[0])
-				duration = typecheck.Conv(duration, types.Types[types.TINT64])
-				wait := typecheck.Call(state.call.Pos(),
-					typecheck.LookupRuntime("coroSleep"),
+				pos := state.call.Pos()
+				int64Type := types.Types[types.TINT64]
+				duration := typecheck.TempAt(pos, resume, int64Type)
+				body = append(body,
+					ir.NewDecl(pos, ir.ODCL, duration),
+					ir.NewAssignStmt(pos, duration, typecheck.Conv(edit(state.call.Args[0]), int64Type)),
+				)
+				// A nonpositive sleep completes without registering a timer.
+				positive := ir.NewBinaryExpr(pos, ir.OGT, duration, typedInt(pos, int64Type, 0))
+				wait := typecheck.Call(pos, typecheck.LookupRuntime("coroSleep"),
 					ir.Nodes{ctx, duration}, false)
 				body = append(body,
-					ir.NewIfStmt(state.call.Pos(), wait, ir.Nodes{
-						ir.NewReturnStmt(state.call.Pos(), []ir.Node{
-							typedInt(state.call.Pos(),
-								types.Types[types.TUINT8],
-								int64(actionWait)),
-						}),
+					ir.NewIfStmt(pos, positive, ir.Nodes{
+						ir.NewIfStmt(pos, wait, ir.Nodes{
+							ir.NewReturnStmt(pos, []ir.Node{
+								typedInt(pos, types.Types[types.TUINT8], int64(actionWait)),
+							}),
+						}, nil),
 					}, nil),
 					gotoState(state.next),
 				)
