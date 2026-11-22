@@ -10,7 +10,7 @@ evidence="$RUNNER_TEMP/coro-linux-perf-evidence"
 mkdir -p "$samples"/{mixed,range,broad,cache,tmp} "$evidence"
 test "$RUNNER_ARCH" = X64
 test "$(uname -m)" = x86_64
-test "$(git -C "$repo" rev-parse HEAD^)" = "$ref"
+git -C "$repo" merge-base --is-ancestor "$ref" HEAD
 {
     printf 'implementation %s\n' "$ref"
     printf 'workflow revision %s\n' "$(git -C "$repo" rev-parse HEAD)"
@@ -34,7 +34,8 @@ unset GOROOT GOFLAGS GOEXPERIMENT GOOS GOARCH GOAMD64
     exit 1
 }
 "$sdk/bin/go" version | tee "$evidence/toolchain.txt"
-grep -q "d340d47ae1" "$evidence/toolchain.txt"
+built_ref="$(sed -nE 's/.*-devel_([0-9a-f]+) .*/\1/p' "$evidence/toolchain.txt")"
+[[ "$built_ref" =~ ^[0-9a-f]{7,40}$ && "$ref" == "$built_ref"* ]]
 cp "$fixture/bench.py" "$samples/"
 cp "$fixture"/mixed/*.go "$fixture/mixed/go.mod" "$samples/mixed/"
 cp "$fixture"/range/*.go "$fixture/range/go.mod" "$samples/range/"
