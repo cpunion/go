@@ -23,7 +23,8 @@ import (
 // retains one cleared waiter with the operation cache. The retained pointer
 // remains installed while the waiter is active so it is a stable GC root while
 // a native executor initializes and queues it. Extra select waiters are rooted
-// in slot before allocation can reach a GC safe point.
+// in slot before allocation can reach a GC safe point. A retained waiter
+// is cleared and checked on release before the operation can be cached.
 //
 //go:nosplit
 func newStacklessCoroSudog(op *stacklessCoroOperation, slot **channelWaiter) *channelWaiter {
@@ -33,9 +34,6 @@ func newStacklessCoroSudog(op *stacklessCoroOperation, slot **channelWaiter) *ch
 	if !op.waiterActive {
 		op.waiterActive = true
 		if sg := op.retainedWaiter(); sg != nil {
-			if !validReleasedStacklessCoroSudog(op, sg) {
-				throw("runtime: invalid cached stackless coroutine channel waiter")
-			}
 			if slot != nil {
 				*slot = sg
 			}
@@ -287,7 +285,7 @@ func chansendStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	sg := newStacklessCoroSudog(op, nil)
 	sg.coro.set(unsafe.Pointer(op))
 	sg.setNativeElem(element)
-	// Acquisition validates a cleared waiter; only select sets its select bit.
+	// Release checks that a retained waiter is clear before it can be reused.
 	sg.setNativeChannel(c)
 	c.sendq.enqueue(sg)
 	if raceenabled {

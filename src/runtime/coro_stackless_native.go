@@ -82,10 +82,10 @@ type stacklessCoroNativeContext struct {
 	public              bool
 	deferredYield       bool
 	poolNext            *stacklessCoroNativeContext
-	// deferredSleep is owned by the driver between adjacent fixed-stack
-	// episodes. A deadline without an operation belongs to the private root.
-	// Keeping this here avoids growing the shared logical scheduler.
-	deferredSleep     *stacklessCoroOperation
+	// A nonzero deadline describes a timer carried between native episodes.
+	// With no deadline the slot can hold a channel peer within an episode.
+	// A deadline without an operation belongs to the private root.
+	deferredOperation *stacklessCoroOperation
 	deferredSleepWhen int64
 }
 
@@ -217,7 +217,7 @@ again:
 	scheduler := ctx.scheduler
 	ctx.scheduler = nil
 	ctx.caller = nil
-	if ctx.deferredSleepWhen != 0 && ctx.deferredSleep == nil {
+	if ctx.deferredSleepWhen != 0 && ctx.deferredOperation == nil {
 		if !d.waitForWork(scheduler) {
 			throw("runtime: stopped private stackless coroutine sleep")
 		}
@@ -344,8 +344,8 @@ func (d *stacklessCoroNativeDriver) waitForOperation(s *stacklessCoroScheduler) 
 	if when == 0 {
 		return s.waitForWork()
 	}
-	op := ctx.deferredSleep
-	ctx.deferredSleep = nil
+	op := ctx.deferredOperation
+	ctx.deferredOperation = nil
 	ctx.deferredSleepWhen = 0
 
 	if op == nil {
@@ -489,7 +489,7 @@ func releaseStacklessCoroNativeContext(ctx *stacklessCoroNativeContext) {
 }
 
 func releaseStacklessCoroNativeContextAt(ctx *stacklessCoroNativeContext, idleCycle uint32) {
-	if ctx.deferredYield || ctx.deferredSleep != nil || ctx.deferredSleepWhen != 0 {
+	if ctx.deferredYield || ctx.deferredOperation != nil || ctx.deferredSleepWhen != 0 {
 		throw("runtime: releasing native context with deferred driver work")
 	}
 	// Replace an unused cache only after two consecutive roots requested the
@@ -1096,7 +1096,8 @@ func coroNativeFinish(executor *g) {
 		throw("runtime: invalid stackless coroutine native finish")
 	}
 	if ctx.gState.deferState != nil || ctx.gState.blockingScheduler != nil || ctx.gState.activeSource != nil ||
-		ctx.gState.sourceTransition || ctx.gState.channelPair || ctx.gState.channelWake || ctx.gState.channelRotate {
+		ctx.gState.sourceTransition || ctx.gState.channelPair || ctx.gState.channelWake || ctx.gState.channelRotate ||
+		ctx.deferredOperation != nil && ctx.deferredSleepWhen == 0 {
 		throw("runtime: active stackless coroutine state during native finish")
 	}
 	schedulerG := getg()
@@ -1183,6 +1184,33 @@ func stacklessCoroCanPairChannel(gp *g, s *stacklessCoroScheduler) bool {
 	return ctx != nil && !ctx.public && ctx.scheduler == s && !raceenabled
 }
 
+// A channel peer is deferred only within the compiler-proven path
+// between adjacent operations. It shares storage with a deferred timer,
+// which is identified by its nonzero deadline.
+func stacklessCoroDeferChannel(gp *g, s *stacklessCoroScheduler, op *stacklessCoroOperation) bool {
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.public || ctx.scheduler != s || ctx.deferredOperation != nil || ctx.deferredSleepWhen != 0 {
+		return false
+	}
+	ctx.deferredOperation = op
+	return true
+}
+
+func popStacklessCoroDeferredChannel(state *stacklessCoroGState) *stacklessCoroOperation {
+	if state.native != unsafe.Pointer(state) {
+		return nil
+	}
+	ctx := (*stacklessCoroNativeContext)(state.native)
+	if ctx.deferredSleepWhen != 0 {
+		return nil
+	}
+	op := ctx.deferredOperation
+	if op != nil {
+		ctx.deferredOperation = nil
+	}
+	return op
+}
+
 func stacklessCoroPublicCaller(gp *g) *g {
 	if ctx := stacklessCoroNativeContextFor(gp); ctx != nil && ctx.public {
 		return ctx.caller
@@ -1206,7 +1234,7 @@ func stacklessCoroDeferPrivateSleep(context *stacklessCoroContext, when int64) b
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
 	if ctx == nil || ctx.executor != gp || !ctx.public || ctx.caller.bubble != nil ||
-		context.scheduler != ctx.scheduler || ctx.deferredSleepWhen != 0 {
+		context.scheduler != ctx.scheduler || ctx.deferredOperation != nil || ctx.deferredSleepWhen != 0 {
 		return false
 	}
 	s := context.scheduler
@@ -1226,7 +1254,7 @@ func stacklessCoroDeferPrivateSleep(context *stacklessCoroContext, when int64) b
 func stacklessCoroPrivateSleep(s *stacklessCoroScheduler, task *stacklessCoroTask) (resume, suspend bool) {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
-	if ctx == nil || ctx.deferredSleepWhen == 0 || ctx.deferredSleep != nil {
+	if ctx == nil || ctx.deferredSleepWhen == 0 || ctx.deferredOperation != nil {
 		return false, false
 	}
 	if !s.privateRoot(task) || task.state != stacklessCoroTaskWaiting || !task.resuming {
@@ -1296,14 +1324,14 @@ func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
 	if ctx == nil || ctx.executor != gp || ctx.scheduler != s ||
-		ctx.deferredSleepWhen != 0 {
+		ctx.deferredOperation != nil || ctx.deferredSleepWhen != 0 {
 		return false
 	}
 	lock(&s.lock)
 	deferSleep := s.executorState.Load() == stacklessCoroExecutorStateOff &&
 		s.head == nil && s.tail == nil && s.runnableState.Load() == 0
 	if deferSleep {
-		ctx.deferredSleep = op
+		ctx.deferredOperation = op
 		ctx.deferredSleepWhen = when
 	}
 	unlock(&s.lock)
