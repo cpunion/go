@@ -1,0 +1,31 @@
+name: Coroutine executor admission
+
+on:
+  push:
+    branches:
+      - coro/measure-short-compute-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Compare coroutine executor admission on Linux amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and measure exact baseline and candidate SDKs
+        run: bash .github/perf-coro-compute/measure.sh d5f49720b9bb78c3311f15db2bb890f3f350013a 4ce8851bcf502bd2c78a58cab3f3fe02a4d700c0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coroutine-short-compute
+          path: ${{ runner.temp }}/coro-short-compute
+          if-no-files-found: error
