@@ -8,8 +8,6 @@ package runtime
 
 import "unsafe"
 
-const stacklessCoroScalarTaskCacheClass = 4
-
 // The208B scalar chunk occupies one exact allocator class on native targets.
 var (
 	_ [208 - unsafe.Sizeof(stacklessCoroScalarTaskChunk{})]byte

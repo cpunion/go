@@ -9,18 +9,16 @@ package runtime
 import "unsafe"
 
 const (
-	stacklessCoroTaskCacheGroups     = 2048
-	stacklessCoroTaskCacheGroupSize  = 64
-	stacklessCoroTaskCacheFrameBytes = 16
-	stacklessCoroTaskCacheCharge     = unsafe.Sizeof(stacklessCoroTask{}) + stacklessCoroTaskCacheFrameBytes
+	stacklessCoroTaskCacheGroups      = 2048
+	stacklessCoroTaskCacheGroupSize   = 64
+	stacklessCoroScalarTaskCacheClass = stacklessCoroTypedTaskCacheFirst - stacklessCoroTypedTaskCacheLast + 1
+	stacklessCoroTaskCacheClasses     = stacklessCoroScalarTaskCacheClass + 1
 )
 
-// Only independently allocated six-word tasks followed by a two-word frame
-// enter this pool. The four lists distinguish every possible frame pointer
-// bitmap. Compiler eligibility excludes addresses into these private frames.
-// Each reused allocation therefore retains its original precise GC layout.
-// These four classes keep active tasks independent. A fifth class retains only
-// fully completed, already existing four-member scalar chunks.
+// Each typed class pairs an allocation size with a complete pointer bitmap.
+// The compiler excludes addresses into these private frames, and the GC uses
+// the allocation's original layout across reuse. A separate class retains
+// fully completed four-member scalar chunks.
 type stacklessCoroTaskCacheGroup struct {
 	head  *stacklessCoroTask
 	next  uint16
@@ -29,7 +27,7 @@ type stacklessCoroTaskCacheGroup struct {
 
 type stacklessCoroTaskCacheGeneration struct {
 	groups [stacklessCoroTaskCacheGroups + 1]stacklessCoroTaskCacheGroup
-	tops   [5]uint16
+	tops   [stacklessCoroTaskCacheClasses]uint16
 	used   uint16
 	free   uint16
 	count  uint32
@@ -52,15 +50,24 @@ func stacklessCoroTaskCachePayloadBytes() uintptr {
 }
 
 func takeStacklessCoroCompletedTask(typ *_type, size uintptr) (*stacklessCoroTask, uint16) {
-	if raceenabled || size != stacklessCoroTaskCacheFrameBytes {
+	if raceenabled || size != 16 && size != 32 {
 		return nil, stacklessCoroUncachedFrameLineage
 	}
-	bitmap := uint8(*typ.GCData >> 6)
-	marker := stacklessCoroTypedTaskCacheFirst - uint16(bitmap)
+	class := uint16(*typ.GCData >> 6)
+	if size == 32 {
+		// The six-word task header leaves two frame bits in the first
+		// byte. A second byte exists only if the scan extends past it.
+		if typ.PtrBytes > 64 {
+			class |= uint16(*addb(typ.GCData, 1)&3) << 2
+		}
+		class += 1 << 2
+	}
+	marker := stacklessCoroTypedTaskCacheFirst - class
+	charge := uint32(unsafe.Sizeof(stacklessCoroTask{}) + size)
 	lock(&stacklessCoroSharedOperations.lock)
 	for age := uint8(0); age < 2; age++ {
 		g := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young^age]
-		index := g.tops[bitmap]
+		index := g.tops[class]
 		if index == 0 {
 			continue
 		}
@@ -70,16 +77,16 @@ func takeStacklessCoroCompletedTask(typ *_type, size uintptr) (*stacklessCoroTas
 		group := &g.groups[index]
 		task := group.head
 		if task == nil || group.count == 0 || group.count > stacklessCoroTaskCacheGroupSize ||
-			g.count == 0 || g.bytes < uint32(stacklessCoroTaskCacheCharge) || task.frameSize != marker {
+			g.count == 0 || g.bytes < charge || task.frameSize != marker {
 			throw("runtime: invalid stackless coroutine completed-task cache")
 		}
 		group.head = task.next
 		task.next = nil
 		group.count--
 		g.count--
-		g.bytes -= uint32(stacklessCoroTaskCacheCharge)
+		g.bytes -= charge
 		if group.count == 0 {
-			g.tops[bitmap] = group.next
+			g.tops[class] = group.next
 			group.next = g.free
 			g.free = index
 		}
@@ -96,16 +103,16 @@ func cacheStacklessCoroCompletedTask(task *stacklessCoroTask) {
 		task.context.frame != nil || task.context.scheduler != nil || task.next != nil {
 		throw("runtime: invalid stackless coroutine completed-task admission")
 	}
+	charge := uint32(unsafe.Sizeof(*task) + stacklessCoroCachedTaskFrameSize(task.frameSize))
 	lock(&stacklessCoroSharedOperations.lock)
-	if stacklessCoroSharedPayloadCacheBytes()+unsafe.Sizeof(stacklessCoroTask{})+
-		stacklessCoroTaskCacheFrameBytes > stacklessCoroChannelCacheBudget {
+	if stacklessCoroSharedPayloadCacheBytes()+uintptr(charge) > stacklessCoroChannelCacheBudget {
 		task.frameSize = 0
 		unlock(&stacklessCoroSharedOperations.lock)
 		return
 	}
 	g := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young]
-	bitmap := stacklessCoroTypedTaskCacheFirst - task.frameSize
-	index := g.tops[bitmap]
+	class := stacklessCoroTypedTaskCacheFirst - task.frameSize
+	index := g.tops[class]
 	if index == 0 || g.groups[index].count == stacklessCoroTaskCacheGroupSize {
 		if g.free != 0 {
 			index = g.free
@@ -118,8 +125,8 @@ func cacheStacklessCoroCompletedTask(task *stacklessCoroTask) {
 			unlock(&stacklessCoroSharedOperations.lock)
 			return
 		}
-		g.groups[index].next = g.tops[bitmap]
-		g.tops[bitmap] = index
+		g.groups[index].next = g.tops[class]
+		g.tops[class] = index
 	}
 	group := &g.groups[index]
 	task.state = stacklessCoroTaskNew
@@ -127,7 +134,7 @@ func cacheStacklessCoroCompletedTask(task *stacklessCoroTask) {
 	group.head = task
 	group.count++
 	g.count++
-	g.bytes += uint32(stacklessCoroTaskCacheCharge)
+	g.bytes += charge
 	unlock(&stacklessCoroSharedOperations.lock)
 }
 
@@ -143,7 +150,7 @@ func clearStacklessCoroCompletedTasksLocked() {
 		}
 		*group = stacklessCoroTaskCacheGroup{}
 	}
-	old.tops = [5]uint16{}
+	clear(old.tops[:])
 	old.count, old.used, old.free = 0, 0, 0
 	old.bytes = 0
 }

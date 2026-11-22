@@ -1441,7 +1441,7 @@ func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
 		} else if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parent() == nil &&
 			task.terminal == stacklessCoroTerminalNone && !task.goexit &&
 			task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
-			memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), 16)
+			memclrHasPointers(task.context.frame, stacklessCoroCachedTaskFrameSize(task.frameSize))
 		} else {
 			// Await results and unpublished reservations can still be read through
 			// a caller's frame pointer. Switched frames keep their prior lifetime.

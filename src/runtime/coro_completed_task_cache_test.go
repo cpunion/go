@@ -25,6 +25,9 @@ func TestStacklessCoroCompletedTaskCache(t *testing.T) {
 	runtime.GC()
 	old := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(old)
+	if !runtime.CheckStacklessCoroWideCompletedTaskCacheForTest() {
+		t.Fatal("wide layouts aliased, retained payload data, or charged incorrect bytes")
+	}
 	if !runtime.CheckStacklessCoroCompletedTaskCacheForTest() {
 		t.Fatal("bitmap isolation, group reuse, payload clearing, or await/reservation/Goexit exclusion failed")
 	}
@@ -58,8 +61,8 @@ func TestStacklessCoroCompletedTaskCacheGC(t *testing.T) {
 }
 
 //go:noinline
-func completedTaskCacheWeakPayload() weak.Pointer[byte] {
-	return weak.Make((*byte)(runtime.StacklessCoroCompletedTaskCachePayloadForTest()))
+func completedTaskCacheWeakPayload(wide bool) weak.Pointer[byte] {
+	return weak.Make((*byte)(runtime.StacklessCoroCompletedTaskCachePayloadForTest(wide)))
 }
 
 func TestStacklessCoroCompletedTaskCachePayload(t *testing.T) {
@@ -70,10 +73,12 @@ func TestStacklessCoroCompletedTaskCachePayload(t *testing.T) {
 	defer debug.SetGCPercent(old)
 	runtime.GC()
 	runtime.GC()
-	payload := completedTaskCacheWeakPayload()
-	runtime.GC()
-	if payload.Value() != nil {
-		t.Fatal("cached completed frame retained its payload")
+	for _, wide := range []bool{false, true} {
+		payload := completedTaskCacheWeakPayload(wide)
+		runtime.GC()
+		if payload.Value() != nil {
+			t.Fatalf("cached completed frame (wide=%t) retained its payload", wide)
+		}
 	}
 }
 

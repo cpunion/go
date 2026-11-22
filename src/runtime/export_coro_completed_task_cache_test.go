@@ -12,6 +12,16 @@ import (
 	"unsafe"
 )
 
+// Lock-ranking records the mutex address while the test publishes completed
+// tasks. Put the fixture on the heap so stack growth cannot move the lock.
+//
+//go:noinline
+func newCompletedTaskCacheTestScheduler() *stacklessCoroScheduler {
+	s := new(stacklessCoroScheduler)
+	lockInit(&s.lock, lockRankStacklessCoro)
+	return s
+}
+
 type completedTaskNoPointers struct {
 	task  stacklessCoroTask
 	frame [2]uintptr
@@ -35,18 +45,43 @@ type completedTaskBothPointers struct {
 	frame [2]unsafe.Pointer
 }
 
+type completedTaskWide[A, B, C, D any] struct {
+	task  stacklessCoroTask
+	frame struct {
+		a A
+		b B
+		c C
+		d D
+	}
+}
+
 func completedTaskCacheTypesForTest() [4]*_type {
 	return [4]*_type{abi.TypeFor[completedTaskNoPointers](), abi.TypeFor[completedTaskFirstPointer](),
 		abi.TypeFor[completedTaskLastPointer](), abi.TypeFor[completedTaskBothPointers]()}
 }
 
+func completedTaskWideCacheTypesForTest() [4]*_type {
+	type ptr = unsafe.Pointer
+	return [4]*_type{
+		abi.TypeFor[completedTaskWide[ptr, uintptr, uintptr, uintptr]](),
+		abi.TypeFor[completedTaskWide[uintptr, uintptr, ptr, uintptr]](),
+		abi.TypeFor[completedTaskWide[uintptr, uintptr, uintptr, ptr]](),
+		abi.TypeFor[completedTaskWide[ptr, ptr, ptr, ptr]](),
+	}
+}
+
 func completedTaskCacheNewForTest(typ *_type, bitmap int) *stacklessCoroTask {
 	task := (*stacklessCoroTask)(newobject(typ))
-	task.frameSize = stacklessCoroTypedTaskCacheFirst - uint16(bitmap)
+	size := typ.Size_ - unsafe.Sizeof(*task)
+	first := stacklessCoroTypedTaskCacheFirst
+	if size == 32 {
+		first = stacklessCoroWideTaskCacheFirst
+	}
+	task.frameSize = first - uint16(bitmap)
 	task.state = stacklessCoroTaskComplete
 	task.flags = stacklessCoroTaskTypedSpawn
 	task.context.frame = add(unsafe.Pointer(task), unsafe.Sizeof(*task))
-	for i := 0; i < 2; i++ {
+	for i := range int(size / unsafe.Sizeof(uintptr(0))) {
 		p := add(task.context.frame, uintptr(i)*unsafe.Sizeof(uintptr(0)))
 		if bitmap&(1<<i) != 0 {
 			*(*unsafe.Pointer)(p) = unsafe.Pointer(new(uint64))
@@ -61,8 +96,7 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 	if raceenabled {
 		return true
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newCompletedTaskCacheTestScheduler()
 	for bitmap, typ := range completedTaskCacheTypesForTest() {
 		if !validStacklessCoroTaskFrameType(typ, 16) || int(*typ.GCData>>6) != bitmap {
 			return false
@@ -120,6 +154,44 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 	return true
 }
 
+func CheckStacklessCoroWideCompletedTaskCacheForTest() bool {
+	// Keep all layouts live in the shared cache together. The first wide
+	// type has the same bitmap as a narrow type; the others cover both
+	// bits in the second GC byte.
+	types := completedTaskWideCacheTypesForTest()
+	bitmaps := [...]int{1, 4, 8, 15}
+	narrowType := abi.TypeFor[completedTaskFirstPointer]()
+	narrow := completedTaskCacheNewForTest(narrowType, 1)
+	clearStacklessCoroTaskFrame(narrow)
+	cacheStacklessCoroCompletedTask(narrow)
+	before := StacklessCoroSharedPayloadCacheBytesForTest()
+	var tasks [len(types)]*stacklessCoroTask
+	for i, typ := range types {
+		task := completedTaskCacheNewForTest(typ, bitmaps[i])
+		if !validStacklessCoroTaskFrameType(typ, 32) {
+			return false
+		}
+		frame := (*[4]uintptr)(task.context.frame)
+		clearStacklessCoroTaskFrame(task)
+		if *frame != [4]uintptr{} {
+			return false
+		}
+		cacheStacklessCoroCompletedTask(task)
+		tasks[i] = task
+	}
+	if StacklessCoroSharedPayloadCacheBytesForTest()-before != uintptr(len(tasks))*(unsafe.Sizeof(*narrow)+32) {
+		return false
+	}
+	for i, typ := range types {
+		task, marker := takeStacklessCoroCompletedTask(typ, 32)
+		if task != tasks[i] || marker != stacklessCoroWideTaskCacheFirst-uint16(bitmaps[i]) || task.next != nil {
+			return false
+		}
+	}
+	task, marker := takeStacklessCoroCompletedTask(narrowType, 16)
+	return task == narrow && marker == stacklessCoroTypedTaskCacheFirst-1
+}
+
 func StacklessCoroCompletedTaskCacheTokenForTest() unsafe.Pointer {
 	typ := abi.TypeFor[completedTaskLastPointer]()
 	task := completedTaskCacheNewForTest(typ, 2)
@@ -135,10 +207,14 @@ func StacklessCoroSharedPayloadCacheBytesForTest() uintptr {
 	return n
 }
 
-func StacklessCoroCompletedTaskCachePayloadForTest() unsafe.Pointer {
-	task := completedTaskCacheNewForTest(abi.TypeFor[completedTaskLastPointer](), 2)
+func StacklessCoroCompletedTaskCachePayloadForTest(wide bool) unsafe.Pointer {
+	typ, bitmap, offset := abi.TypeFor[completedTaskLastPointer](), 2, uintptr(8)
+	if wide {
+		typ, bitmap, offset = completedTaskWideCacheTypesForTest()[2], 8, 24
+	}
+	task := completedTaskCacheNewForTest(typ, bitmap)
 	payload := new([128]byte)
-	*(*unsafe.Pointer)(add(task.context.frame, 8)) = unsafe.Pointer(payload)
+	*(*unsafe.Pointer)(add(task.context.frame, offset)) = unsafe.Pointer(payload)
 	clearStacklessCoroTaskFrame(task)
 	cacheStacklessCoroCompletedTask(task)
 	return unsafe.Pointer(payload)
@@ -167,18 +243,22 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 	lockInit(&probe.ownership, lockRankStacklessCoro)
 	probe.active = make(map[*stacklessCoroTask]bool)
 	done := make(chan struct{}, 4)
-	types := completedTaskCacheTypesForTest()
+	narrow := completedTaskCacheTypesForTest()
+	wide := completedTaskWideCacheTypesForTest()
+	types := new([8]*_type)
+	copy(types[:4], narrow[:])
+	copy(types[4:], wide[:])
 	for worker := range 4 {
 		go func() {
-			s := new(stacklessCoroScheduler)
-			lockInit(&s.lock, lockRankStacklessCoro)
+			s := newCompletedTaskCacheTestScheduler()
 			for i := range 2000 {
-				bitmap := (i + worker) % 4
+				typ := types[(i+worker)%len(types)]
+				size := typ.Size_ - unsafe.Sizeof(stacklessCoroTask{})
 				lock(&s.lock)
-				task, marker := takeStacklessCoroCompletedTask(types[bitmap], 16)
+				task, marker := takeStacklessCoroCompletedTask(typ, size)
 				unlock(&s.lock)
 				if task == nil {
-					task = (*stacklessCoroTask)(newobject(types[bitmap]))
+					task = (*stacklessCoroTask)(newobject(typ))
 				}
 				lock(&probe.ownership)
 				if probe.active[task] {
@@ -187,8 +267,11 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 				probe.active[task] = true
 				unlock(&probe.ownership)
 				frame := add(unsafe.Pointer(task), unsafe.Sizeof(*task))
-				if *(*[2]uintptr)(frame) != [2]uintptr{} {
-					probe.failed.Add(1)
+				for _, word := range unsafe.Slice((*uintptr)(frame), int(size/unsafe.Sizeof(uintptr(0)))) {
+					if word != 0 {
+						probe.failed.Add(1)
+						break
+					}
 				}
 				Gosched()
 				task.context.frame = frame

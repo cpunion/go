@@ -11,17 +11,24 @@ import (
 	"unsafe"
 )
 
-// These four markers identify the complete GC bitmap of an individual
-// sixteen-byte frame. They remain uncached-lineage markers while active;
-// only a completed independent spawn may retain its cleared storage.
+// A typed marker identifies a frame size and its complete pointer bitmap.
+// Only completed independent spawns can retain their cleared allocations.
 const (
 	stacklessCoroTypedTaskCacheFirst  = stacklessCoroShortFrameChunkLast - 1
-	stacklessCoroTypedTaskCacheLast   = stacklessCoroTypedTaskCacheFirst - 3
+	stacklessCoroWideTaskCacheFirst   = stacklessCoroTypedTaskCacheFirst - (1 << 2)
+	stacklessCoroTypedTaskCacheLast   = stacklessCoroWideTaskCacheFirst - (1<<4 - 1)
 	stacklessCoroScalarTaskCacheFirst = stacklessCoroTypedTaskCacheLast - 1
 	stacklessCoroScalarTaskCacheLast  = stacklessCoroScalarTaskCacheFirst - (stacklessCoroTaskChunkSize - 1)
 )
 
-// Both completed-cache classes occupy one contiguous marker range.
+func stacklessCoroCachedTaskFrameSize(marker uint16) uintptr {
+	if marker > stacklessCoroWideTaskCacheFirst {
+		return 16
+	}
+	return 32
+}
+
+// The typed and scalar completed-task markers occupy one contiguous range.
 func isStacklessCoroCompletedTaskCacheMarker(marker uint16) bool {
 	return marker >= stacklessCoroScalarTaskCacheLast && marker <= stacklessCoroTypedTaskCacheFirst
 }
@@ -55,7 +62,7 @@ func validStacklessCoroTaskFrameType(typ *_type, size uintptr) bool {
 
 // coroTakeTypedTaskFrame preserves the normal frame reservation/cache prefix.
 // Only a cache-full reservation with no reusable task receives a combined
-// allocation. Only eligible two-word frames can reuse cleared allocations
+// allocation. Eligible two- and four-word frames can reuse cleared allocations
 // from completed independent spawns; structured results retain their lifetime.
 func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	size uintptr, allocationType *_type) unsafe.Pointer {

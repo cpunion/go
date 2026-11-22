@@ -217,7 +217,9 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 				task := (*stacklessCoroContext)(ctx).scheduler.reservedTasks
 				base, span, _ := findObject(uintptr(unsafe.Pointer(frame)), 0, 0)
 				if base == uintptr(unsafe.Pointer(task)) {
-					if span.elemsize != unsafe.Sizeof(stacklessCoroTask{})+frameSize || task.frameSize != stacklessCoroUncachedFrameLineage {
+					marker := task.frameSize
+					cached := isStacklessCoroTypedTaskCacheMarker(marker) && stacklessCoroCachedTaskFrameSize(marker) == frameSize
+					if span.elemsize != unsafe.Sizeof(stacklessCoroTask{})+frameSize || marker != stacklessCoroUncachedFrameLineage && !cached {
 						probe.failed.Add(1)
 					}
 					root.combined = append(root.combined, task)
@@ -294,7 +296,9 @@ func checkStacklessCoroTypedTaskFrames(count int, varyPrefix, cancelReservations
 	}
 	valid := caught == cancelReservations && probe.failed.Load() == 0 && probe.done.Load() == wantDone && probe.sum.Load() == wantSum
 	for _, task := range root.combined {
-		if task.resume != nil || task.parent() != nil || task.next != nil || task.context.frame != nil || task.context.scheduler != nil || task.flags != 0 || task.frameSize != 0 || task.state != stacklessCoroTaskComplete || task.terminal != stacklessCoroTerminalNone || task.goexit || task.resuming || task.readyPending {
+		cached := !cancelReservations && isStacklessCoroTypedTaskCacheMarker(task.frameSize) && task.state == stacklessCoroTaskNew
+		released := task.frameSize == 0 && task.state == stacklessCoroTaskComplete && task.next == nil
+		if (!cached && !released) || task.resume != nil || task.parent() != nil || task.context.frame != nil || task.context.scheduler != nil || task.flags != 0 || task.terminal != stacklessCoroTerminalNone || task.goexit || task.resuming || task.readyPending {
 			valid = false
 		}
 	}
