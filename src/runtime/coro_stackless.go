@@ -1790,17 +1790,23 @@ resumeActive:
 resumeOwned:
 	action := task.resume(unsafe.Pointer(&task.context))
 	state := getg().stacklessCoro
-	// Each chunk switch publishes the next frame and resume. Drive the
-	// lineage directly while the current executor owns its source and
-	// no deferred channel wake needs to be delivered.
-	if action == stacklessCoroActionChunkSwitch && native && !raceenabled {
+	// Each chunk switch publishes the next frame and resume. Check the
+	// ready queue here, where the scheduler is already available. Only
+	// reuse the current executor when it still owns the source and has
+	// no deferred channel wake to deliver.
+	if action == stacklessCoroActionChunkSwitch {
 		idlePollSkip = nil
-		for state != nil && !state.channelWake && s.retainLogicalOwner(state) {
-			action = task.resume(unsafe.Pointer(&task.context))
-			state = getg().stacklessCoro
-			if action != stacklessCoroActionChunkSwitch {
-				break
+		if native && !raceenabled {
+			for s.runnableState.Load() == 0 && state != nil && !state.channelWake && s.retainLogicalOwner(state) {
+				action = task.resume(unsafe.Pointer(&task.context))
+				state = getg().stacklessCoro
+				if action != stacklessCoroActionChunkSwitch {
+					break
+				}
 			}
+		}
+		if action == stacklessCoroActionChunkSwitch && s.runnableState.Load() != 0 {
+			action = stacklessCoroActionYield
 		}
 	}
 	if state != nil && state.channelWake {
@@ -3074,7 +3080,7 @@ func coroAdvanceFusedChunk(ctx, frame unsafe.Pointer, marker uint8, child stackl
 	header.resume = parentResume
 	context.frame = frame
 	task.resume = child
-	return switchStacklessCoroFusedChunk(context)
+	return stacklessCoroActionChunkSwitch
 }
 
 // coroPopFusedChunk returns an interior slot to its chunk. The parent is
@@ -3094,13 +3100,6 @@ func coroPopFusedChunk(ctx unsafe.Pointer) uint8 {
 	header.parent = nil
 	header.resume = nil
 	header.marker = 0
-	return switchStacklessCoroFusedChunk(context)
-}
-
-func switchStacklessCoroFusedChunk(context *stacklessCoroContext) uint8 {
-	if context.scheduler.runnableState.Load() != 0 {
-		return stacklessCoroActionYield
-	}
 	return stacklessCoroActionChunkSwitch
 }
 

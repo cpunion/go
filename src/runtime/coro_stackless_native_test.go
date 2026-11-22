@@ -389,6 +389,40 @@ func TestStacklessCoroFusedChunkInline(t *testing.T) {
 	}
 }
 
+func TestStacklessCoroChunkSwitchRunsReadyTask(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	for _, mode := range []struct {
+		name string
+		run  func(func(unsafe.Pointer) uint8)
+	}{
+		{"native", runtime.RunStacklessCoroForTest},
+		{"ordinary", runtime.RunStacklessCoroQueueInlineForTest},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			var workerRan atomic.Bool
+			var switching, sawReadyWorker bool
+			mode.run(func(ctx unsafe.Pointer) uint8 {
+				if switching {
+					sawReadyWorker = workerRan.Load()
+					return runtime.StacklessCoroActionComplete
+				}
+				runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+					workerRan.Store(true)
+					return runtime.StacklessCoroActionComplete
+				})
+				switching = true
+				// The initialized chunk requests another resume. The driver
+				// must run the queued sibling before reentering this task.
+				return runtime.StacklessCoroActionChunkSwitch
+			})
+			if !sawReadyWorker {
+				t.Fatal("resumed the chunk before dispatching its ready sibling")
+			}
+		})
+	}
+}
+
 func TestStacklessCoroNativeDropsOverflowTaskSlots(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(oldProcs)
