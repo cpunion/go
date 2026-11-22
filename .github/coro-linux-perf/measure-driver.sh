@@ -3,8 +3,8 @@ set -euo pipefail
 
 fixture="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(git -C "$fixture" rev-parse --show-toplevel)"
-base=50d84fed965444783396e70fc06ff70e741bd32d
-candidate=7c18dace74a2b86d6f4cbeca3550ddc2f6df1e80
+base=7c18dace74a2b86d6f4cbeca3550ddc2f6df1e80
+candidate=45b30d7bf5ededa6bf16b77278ed7c71451cc5f9
 official="$(go env GOROOT)"
 samples="$RUNNER_TEMP/coro-frame-comparison"
 evidence="$RUNNER_TEMP/coro-linux-perf-evidence"
@@ -63,3 +63,27 @@ sdk="$samples/candidate"
     GOEXPERIMENT=coro,staticlockranking GOGC=1 "$sdk/bin/go" test -count=5 -gcflags=-d=checkptr=2 runtime \
         -run 'TestStacklessCoro(NativeFusedChunk|Fused(ChunkInline|Resume)|LocalFused|UncachedFusedCompletion|FrameChunkInvariants|NativeProfileTransitions|NativePreemption|ChunkSwitchRunsReadyTask|QueuedYieldRunsOrdinaryGoroutine)'
 ) > "$evidence/candidate-runtime-checkptr.txt" 2>&1
+
+(
+    cd "$sdk/src"
+    GOEXPERIMENT=coro GO_TEST_TIMEOUT_SCALE=5 "$sdk/bin/go" test -count=1 cmd/compile/internal/coro \
+        -run '^Test(MutualRootArrayLineage|RootArrayCallerBoundary|FrameArrayReuseChunkPeers)$'
+) > "$evidence/candidate-compiler-lineage.txt" 2>&1
+
+# Run this separate diagnostic binary after the measured samples. Attribute
+# interrupted coroutine transitions to the signal's machine PC.
+python3 - "$sdk/src/runtime/proc.go" "$samples" <<'PY'
+import json
+from pathlib import Path
+import sys
+original, out = (Path(p) for p in sys.argv[1:])
+body = original.read_text()
+needle = "stk[n] = abi.FuncPCABIInternal(_LostCoroSourceTransition) + sys.PCQuantum"
+assert body.count(needle) == 1
+proc = out / "diagnostic-proc.go"
+proc.write_text(body.replace(needle, "stk[n] = pc + sys.PCQuantum"))
+(out / "diagnostic.json").write_text(json.dumps({"Replace": {str(original): str(proc)}}))
+PY
+GOEXPERIMENT=coro "$sdk/bin/go" test -c -mod=mod -buildmode=pie -gcflags=-d=coro=4 -overlay "$samples/diagnostic.json" -o diagnostic.test . > "$evidence/diagnostic-build.log" 2>&1
+GOMAXPROCS=1 ./diagnostic.test -test.run='^$' -test.bench='^BenchmarkPackedBoundary440$' -test.benchtime=400000x -test.cpuprofile="$samples/machine.pprof" > "$evidence/diagnostic-profile-bench.txt"
+"$sdk/bin/go" tool pprof -top -nodecount=40 diagnostic.test "$samples/machine.pprof" > "$evidence/diagnostic-profile-top.txt"
