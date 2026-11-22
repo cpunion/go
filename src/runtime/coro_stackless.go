@@ -333,9 +333,8 @@ type stacklessCoroReplacementState struct {
 	// Completed independent tasks remain charged to liveSpawns until the
 	// publisher of the first task recycles the batch under the scheduler lock.
 	completed           atomic.Pointer[stacklessCoroTask]
-	lane                atomic.Pointer[stacklessCoroAssistLane]
+	dispatch            atomic.Pointer[stacklessCoroDispatchLanes]
 	yields, completions uint16 // protected by the scheduler lock
-
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -1661,8 +1660,11 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot, fromAssist bool
 	var lane *stacklessCoroAssistLane
+	var useWide bool
 	if assist {
-		lane = s.replacements.Load().lane.Load()
+		lane = s.replacements.Load().assistant()
+	} else {
+		useWide = native && !public && !raceenabled && !stacklessCoroIsPullComparison(s)
 	}
 	// Check the host queues at most 256 logical yields apart. Public
 	// entries also check their first yield. Shared drivers already give
@@ -1676,7 +1678,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 		stacklessCoroAbortChannelPair(s)
 		if lane != nil {
 			s.flushAssistCompletions(lane)
-			s.returnAssistReady(lane)
+			s.releaseDispatchLane(lane)
 		}
 		if task == nil || task.context.scheduler != s || !task.resuming {
 			return
@@ -1716,16 +1718,22 @@ next:
 	}
 	task = nil
 	fromAssist = false
-	if lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
+	if assist && lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
 		return nil
 	}
-	if lane != nil && (!s.canAssist() || !s.canParkAssistant()) {
+	if lane != nil && (!s.canAssist() || assist && !s.canParkAssistant()) {
 		s.flushAssistCompletions(lane)
-		s.returnAssistReady(lane)
+		s.releaseDispatchLane(lane)
 		lane = nil
+	}
+	if lane == nil && useWide {
+		lane = s.acquireDispatchLane()
 	}
 	if lane != nil {
 		task = s.takeAssistBatch(lane)
+		if task == nil && useWide {
+			s.flushAssistCompletions(lane)
+		}
 		if task != nil {
 			fromAssist = true
 			goto resume
@@ -2040,7 +2048,16 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 		}
 		s.liveSpawns--
 		if s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
-			s.replacements.Load().completions++
+			replacements := s.replacements.Load()
+			replacements.completions++
+			// Once independent yields and completions are both visible,
+			// let the manager sample them before its first timer tick.
+			if replacements.completions == 4 && replacements.yields >= 24 && gomaxprocs >= 3 {
+				select {
+				case replacements.wake <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 	if s.rootComplete() && s.liveSpawns == 0 {
@@ -5861,6 +5878,21 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			// A delayed manager can receive several accumulated ticks.
 			// Require a fresh observation interval before sampling again.
 			if now-started < interval/2 {
+				// A completion can ring the doorbell before the first
+				// timer tick. A failed probe leaves the regular window intact.
+				if lane == nil && gomaxprocs >= 3 && now-started >= interval/8 && s.canAssist() {
+					lock(&s.lock)
+					moved := int(s.queueProgress - progress)
+					yields := int(replacements.yields - yieldProgress)
+					completed := replacements.completions - completionProgress
+					ready := s.head != nil
+					unlock(&s.lock)
+					if ready && completed >= 4 && yields >= 16 && yields*5 >= moved &&
+						now-started >= int64(yields)*assistMaxYieldTime {
+						replacements.enableDispatchBatching()
+						return true
+					}
+				}
 				continue
 			}
 			lock(&s.lock)
@@ -5896,12 +5928,17 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			stable = canAssist
 			if lane == nil && admit && gomaxprocs > 1 && !stacklessCoroHostRunnable() {
 				// The manager can give up its own P when it parks.
-				lane = new(stacklessCoroAssistLane)
+				pilot := new(struct {
+					dispatch stacklessCoroDispatchLanes
+					lane     stacklessCoroAssistLane
+				})
+				lane = &pilot.lane
 				lockInit(&lane.lock, lockRankStacklessCoroCache)
 				lane.wake = make(chan struct{}, 1)
 				lane.enabled.Store(true)
 				baselineRate = int64(completed) * interval / elapsed
-				replacements.lane.Store(lane)
+				pilot.dispatch.assistant = lane
+				replacements.dispatch.Store(&pilot.dispatch)
 				s.executorCount.Add(1)
 				go s.runReplacementExecutor(true, true)
 			} else if lane != nil && lane.enabled.Load() {
@@ -5925,9 +5962,17 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			if now-headSince >= headLimit {
 				return true
 			}
+			if gomaxprocs >= 3 && lane == nil && nextHead != nil && yields >= 16 && completed >= 4 && yields*5 >= moved &&
+				elapsed >= int64(yields)*assistMaxYieldTime && s.canAssist() {
+				replacements.enableDispatchBatching()
+				return true
+			}
 			if int64(moved)*serviceTarget < now-started {
 				slow++
 				if slow >= 2 {
+					if gomaxprocs >= 3 && yields >= 16 && completed >= 4 && yields*5 >= moved && s.canAssist() {
+						replacements.enableDispatchBatching()
+					}
 					return true
 				}
 			} else {
@@ -5969,7 +6014,7 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 		s.executorMonitorIdle = false
 		unlock(&s.lock)
 		s.lifetime.And(^stacklessCoroLifetimeDeferredExecutors)
-		if lane := s.replacements.Load().lane.Load(); lane != nil {
+		if lane := s.replacements.Load().assistant(); lane != nil {
 			lane.signal()
 		}
 		if !grow {
@@ -6014,7 +6059,7 @@ func (s *stacklessCoroScheduler) runReplacementExecutor(start, assist bool) {
 	}
 	var lane *stacklessCoroAssistLane
 	if assist {
-		lane = s.replacements.Load().lane.Load()
+		lane = s.replacements.Load().assistant()
 	}
 	for !s.drained() {
 		if lane != nil && !lane.enabled.Load() && s.canParkAssistant() {
@@ -6064,9 +6109,8 @@ func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
 	}
 	blocked := s.blockingExecutors.Add(1)
 	if replacements := s.replacements.Load(); replacements != nil {
-		if lane := replacements.lane.Load(); lane != nil {
-			s.returnAssistReady(lane)
-			lane.signal()
+		if dispatch := replacements.dispatch.Load(); dispatch != nil {
+			s.returnDispatchReady(dispatch)
 		}
 	}
 	shortage := blocked >= s.executorCount.Load()

@@ -32,6 +32,7 @@ type stacklessCoroGoroutine struct {
 	profileTrace     *stacklessCoroPanicTrace
 	profileBefore    bool
 	public           bool
+	retired          atomic.Bool
 }
 
 // Only public entries need caller PCs or a link in the public-G index.
@@ -541,6 +542,25 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
+// A completed native task has no signal-visible owner. Keep its typed
+// source in the bucket until the driver can unlink the whole batch.
+func stacklessCoroMarkRetired(task *stacklessCoroTask) bool {
+	record := task.source()
+	if record == nil || record.public || record.physicalG != nil || record.owner.Load() != nil {
+		return false
+	}
+	if record.retired.Load() {
+		throw("runtime: stackless coroutine already retired")
+	}
+	// A stopped-world snapshot sizes its result with the count and then
+	// iterates the table. Keep both updates in the same running interval.
+	mp := acquirem()
+	record.retired.Store(true)
+	stacklessCoroGoroutines.unhosted.Add(-1)
+	releasem(mp)
+	return true
+}
+
 func stacklessCoroCompleteLogicalFrameLocked(task *stacklessCoroTask) (removed, unhosted int64) {
 	root := stacklessCoroLogicalRoot(task)
 	p := stacklessCoroGoroutineBucket(root)
@@ -555,7 +575,7 @@ func stacklessCoroCompleteLogicalFrameLocked(task *stacklessCoroTask) (removed, 
 			*p = r.next
 			task.parentOrSource = nil
 			removed = 1
-			if r.physicalG == nil {
+			if r.physicalG == nil && !r.retired.Load() {
 				unhosted = 1
 			}
 			public := r.public
@@ -810,6 +830,9 @@ func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsaf
 	n := 0
 	for _, bucket := range stacklessCoroGoroutineBuckets() {
 		for r := bucket; r != nil; r = r.next {
+			if r.retired.Load() {
+				continue
+			}
 			gp := r.physicalG
 			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
 				continue
@@ -883,7 +906,7 @@ func stacklessCoroPrintGoroutines(skipID uint64) {
 	assertWorldStopped()
 	for _, bucket := range stacklessCoroGoroutineBuckets() {
 		for r := bucket; r != nil; r = r.next {
-			if r.goid == skipID {
+			if r.goid == skipID || r.retired.Load() {
 				continue
 			}
 			gp := r.physicalG

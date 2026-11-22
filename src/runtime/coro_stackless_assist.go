@@ -12,13 +12,89 @@ const stacklessCoroAssistWidth = 4
 
 type stacklessCoroAssistLane struct {
 	lock       mutex
-	enabled    atomic.Bool
 	wake       chan struct{}
 	head, tail *stacklessCoroTask
-	// The assisting driver owns the retired list. Its source records have
-	// already been removed. Other drivers may still take runnable tasks.
+	// The driver owns the retired list. These tasks are already absent
+	// from logical goroutine snapshots, though their records may still
+	// need to be unlinked. Other drivers can take runnable tasks.
 	retired      *stacklessCoroTask
+	leased       atomic.Uint32
+	enabled      atomic.Bool
+	wide         bool
 	retiredCount uint8
+}
+
+// The manager publishes this set before opening more executors. The
+// original assistant keeps its lane through the transition. Each widened
+// driver leases one lane per native episode; any driver can steal its work.
+type stacklessCoroDispatchLanes struct {
+	assistant *stacklessCoroAssistLane
+	lanes     []stacklessCoroAssistLane
+}
+
+func (r *stacklessCoroReplacementState) assistant() *stacklessCoroAssistLane {
+	if dispatch := r.dispatch.Load(); dispatch != nil {
+		return dispatch.assistant
+	}
+	return nil
+}
+
+func (r *stacklessCoroReplacementState) enableDispatchBatching() {
+	dispatch := &stacklessCoroDispatchLanes{
+		assistant: r.assistant(),
+		lanes:     make([]stacklessCoroAssistLane, min(gomaxprocs, stacklessCoroMaxWarmExecutors)),
+	}
+	for i := range dispatch.lanes {
+		lane := &dispatch.lanes[i]
+		lockInit(&lane.lock, lockRankStacklessCoroCache)
+		lane.wide = true
+	}
+	r.dispatch.Store(dispatch)
+}
+
+func (s *stacklessCoroScheduler) acquireDispatchLane() *stacklessCoroAssistLane {
+	replacements := s.replacements.Load()
+	if replacements == nil {
+		return nil
+	}
+	dispatch := replacements.dispatch.Load()
+	if dispatch == nil || len(dispatch.lanes) == 0 || !s.canAssist() {
+		return nil
+	}
+	for i := range dispatch.lanes {
+		lane := &dispatch.lanes[i]
+		if lane.leased.Load() == 0 && lane.leased.CompareAndSwap(0, 1) {
+			return lane
+		}
+	}
+	return nil
+}
+
+func (s *stacklessCoroScheduler) releaseDispatchLane(lane *stacklessCoroAssistLane) {
+	if !lane.wide {
+		s.returnAssistReady(lane)
+		return
+	}
+	// Nobody else adds tasks to this driver's lane. An empty lane stays
+	// empty until its next owner acquires the lease.
+	lock(&lane.lock)
+	remaining := lane.head != nil
+	unlock(&lane.lock)
+	if remaining {
+		s.returnAssistReady(lane)
+	}
+	lane.leased.Store(0)
+}
+
+//go:noinline
+func (s *stacklessCoroScheduler) returnDispatchReady(dispatch *stacklessCoroDispatchLanes) {
+	if lane := dispatch.assistant; lane != nil {
+		s.returnAssistReady(lane)
+		lane.signal()
+	}
+	for i := range dispatch.lanes {
+		s.returnAssistReady(&dispatch.lanes[i])
+	}
 }
 
 func (s *stacklessCoroScheduler) canParkAssistant() bool {
@@ -41,15 +117,32 @@ func (s *stacklessCoroScheduler) canAssist() bool {
 // An unstarted or yielded task is reachable from a scheduler queue until
 // a driver claims it. Drivers can drain this lane when the main FIFO empties.
 func (s *stacklessCoroScheduler) takeAssistReady() *stacklessCoroTask {
-	if replacements := s.replacements.Load(); replacements != nil {
-		if lane := replacements.lane.Load(); lane != nil {
-			lock(&lane.lock)
-			task := s.popAssistLocked(lane)
-			unlock(&lane.lock)
+	replacements := s.replacements.Load()
+	if replacements == nil {
+		return nil
+	}
+	dispatch := replacements.dispatch.Load()
+	if dispatch == nil {
+		return nil
+	}
+	if lane := dispatch.assistant; lane != nil {
+		if task := s.takeDispatchReady(lane); task != nil {
+			return task
+		}
+	}
+	for i := range dispatch.lanes {
+		if task := s.takeDispatchReady(&dispatch.lanes[i]); task != nil {
 			return task
 		}
 	}
 	return nil
+}
+
+func (s *stacklessCoroScheduler) takeDispatchReady(lane *stacklessCoroAssistLane) *stacklessCoroTask {
+	lock(&lane.lock)
+	task := s.popAssistLocked(lane)
+	unlock(&lane.lock)
+	return task
 }
 
 func (s *stacklessCoroScheduler) popAssistLocked(lane *stacklessCoroAssistLane) *stacklessCoroTask {
@@ -78,7 +171,11 @@ func (s *stacklessCoroScheduler) takeAssistBatch(lane *stacklessCoroAssistLane) 
 	if task != nil {
 		return task
 	}
+	if lane.wide && lane.retired != nil {
+		stacklessCoroUnlinkRetired(lane.retired)
+	}
 	lock(&s.lock)
+	flushed := lane.wide && s.flushAssistCompletionsLocked(lane)
 	first := s.head
 	var anchor *stacklessCoroTask
 	if first == &s.root {
@@ -86,6 +183,9 @@ func (s *stacklessCoroScheduler) takeAssistBatch(lane *stacklessCoroAssistLane) 
 	}
 	if first == nil || first.parent() != nil || !s.canAssist() {
 		unlock(&s.lock)
+		if flushed {
+			s.logicalTaskComplete(false)
+		}
 		return nil
 	}
 	last := first
@@ -113,6 +213,9 @@ func (s *stacklessCoroScheduler) takeAssistBatch(lane *stacklessCoroAssistLane) 
 	task = s.popAssistLocked(lane)
 	unlock(&lane.lock)
 	unlock(&s.lock)
+	if flushed {
+		s.logicalTaskComplete(false)
+	}
 	return task
 }
 
@@ -171,24 +274,38 @@ func (s *stacklessCoroScheduler) retireAssistTask(lane *stacklessCoroAssistLane,
 	if !task.canComplete() || task.next != nil || task.context.scheduler != nil {
 		throw("runtime: invalid coroutine assist completion")
 	}
-	// Retire the source before running the next task. The batch delays
-	// only scheduler-local accounting and frame reuse.
-	stacklessCoroCompleteLogicalFrame(task)
+	// Retire the source before running the next task. A widened driver
+	// also batches registry unlinking with the next scheduler refill.
+	if !lane.wide || !stacklessCoroMarkRetired(task) {
+		stacklessCoroCompleteLogicalFrame(task)
+	}
 	task.next, lane.retired = lane.retired, task
 	lane.retiredCount++
-	if lane.retiredCount == stacklessCoroAssistWidth {
+	if lane.retiredCount == 2*stacklessCoroAssistWidth ||
+		!lane.wide && lane.retiredCount == stacklessCoroAssistWidth {
 		s.flushAssistCompletions(lane)
 	}
 	return true
 }
 
 func (s *stacklessCoroScheduler) flushAssistCompletions(lane *stacklessCoroAssistLane) {
+	if lane.retired != nil {
+		if lane.wide {
+			stacklessCoroUnlinkRetired(lane.retired)
+		}
+		lock(&s.lock)
+		s.flushAssistCompletionsLocked(lane)
+		unlock(&s.lock)
+		s.logicalTaskComplete(false)
+	}
+}
+
+func (s *stacklessCoroScheduler) flushAssistCompletionsLocked(lane *stacklessCoroAssistLane) bool {
 	task := lane.retired
 	if task == nil {
-		return
+		return false
 	}
 	lane.retired, lane.retiredCount = nil, 0
-	lock(&s.lock)
 	for task != nil {
 		next := task.next
 		task.next = nil
@@ -197,6 +314,19 @@ func (s *stacklessCoroScheduler) flushAssistCompletions(lane *stacklessCoroAssis
 		s.recycleTaskLocked(task)
 		task = next
 	}
-	unlock(&s.lock)
-	s.logicalTaskComplete(false)
+	return true
+}
+
+func stacklessCoroUnlinkRetired(tasks *stacklessCoroTask) {
+	lock(&stacklessCoroGoroutines.lock)
+	var removed, unhosted int64
+	for task := tasks; task != nil; task = task.next {
+		if task.source() != nil {
+			r, u := stacklessCoroCompleteLogicalFrameLocked(task)
+			removed += r
+			unhosted += u
+		}
+	}
+	stacklessCoroFinishLogicalRetirementLocked(removed, unhosted)
+	unlock(&stacklessCoroGoroutines.lock)
 }
