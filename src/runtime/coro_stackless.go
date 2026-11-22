@@ -5089,11 +5089,14 @@ func (s *stacklessCoroScheduler) publishReadyLocked(task *stacklessCoroTask, que
 	if task != &s.root && s.initialRootPrivate {
 		s.initialRootPrivate = false
 	}
+	newTask := task.state == stacklessCoroTaskNew
 	task.state = stacklessCoroTaskRunnable
 	// A new independent task is registered with itself as the leaf, and
 	// completing a structured child restores its parent before readying it.
-	// Only a queued structured activation can change the visible leaf here.
-	if task.parent() != nil {
+	// A blocked structured activation can keep its existing leaf after its
+	// owner has released it. New structured children must publish theirs.
+	if task.parent() != nil && (raceenabled || newTask || s.terminalValues != nil ||
+		stacklessCoroPublishedLeaf(task) == nil) {
 		stacklessCoroSetLogicalLeaf(task, nil)
 	}
 	task.next = nil
@@ -5341,7 +5344,7 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 	}
 	if dispatch && s.head != nil && !getg().preempt &&
 		s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
-		next = s.takeLocked()
+		next = s.takeNativeLocked()
 	}
 	unlock(&s.lock)
 	if ready {

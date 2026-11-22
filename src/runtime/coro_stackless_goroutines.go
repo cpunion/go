@@ -272,12 +272,21 @@ func stacklessCoroGoroutineFor(root *stacklessCoroTask) *stacklessCoroGoroutine 
 	return nil
 }
 
-func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
-	size := len(stacklessCoroGoroutineBuckets())
-	if stacklessCoroGoroutines.records.Load() >= int64(size)*2 {
-		stacklessCoroResizeGoroutineBuckets(size * 2)
+// Reserve enough buckets to insert count new records under the registry lock.
+// Publish the count after the corresponding records have been linked.
+func stacklessCoroGoroutineBucketsForInsert(count int64) []*stacklessCoroGoroutine {
+	buckets := stacklessCoroGoroutineBuckets()
+	total := stacklessCoroGoroutines.records.Load() + count
+	for total > 2*int64(len(buckets)) {
+		stacklessCoroResizeGoroutineBuckets(2 * len(buckets))
+		buckets = stacklessCoroGoroutineBuckets()
 	}
-	p := stacklessCoroGoroutineBucket(r.root)
+	return buckets
+}
+
+func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
+	buckets := stacklessCoroGoroutineBucketsForInsert(1)
+	p := &buckets[stacklessCoroGoroutineIndex(r.root, len(buckets))]
 	r.next, *p = *p, r
 	stacklessCoroGoroutines.records.Add(1)
 }
@@ -295,7 +304,10 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 	caller := stacklessCoroPublicCaller(gp)
 	lock(&stacklessCoroGoroutines.lock)
 	root := stacklessCoroLogicalRoot(parent)
-	creator := stacklessCoroGoroutineFor(root)
+	creator := root.source()
+	if creator == nil {
+		creator = stacklessCoroGoroutineFor(root)
+	}
 	if creator == nil {
 		if root != &s.root {
 			throw("runtime: missing coroutine creator identity")
@@ -306,7 +318,12 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 	if h := currentStacklessCoroHost(); h != nil && h.root == root {
 		creator.labels = gp.labels
 	}
+	count := int64(len(tasks))
+	buckets := stacklessCoroGoroutineBucketsForInsert(count)
+	// Reserve consecutive IDs in spawn order with a single counter update.
+	goid := sched.goidgen.Add(count) - uint64(count)
 	for _, task := range tasks {
+		goid++
 		r := stacklessCoroGoroutines.taskFree
 		if r == nil {
 			r = takeStacklessCoroCachedRecordLocked()
@@ -318,7 +335,7 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 			stacklessCoroGoroutines.taskFreeCount--
 		}
 		*r = stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
-			goid: sched.goidgen.Add(1), parentGoid: creator.goid, gopc: callerpc,
+			goid: goid, parentGoid: creator.goid, gopc: callerpc,
 			labels: creator.labels}
 		if debug.tracebackancestors > 0 {
 			var previous []ancestorInfo
@@ -361,10 +378,12 @@ func (s *stacklessCoroScheduler) registerGoroutinesLocked(tasks []*stacklessCoro
 			*r.ancestors = ancestors
 		}
 		task.setSource(r)
-		stacklessCoroInsertGoroutine(r)
+		slot := &buckets[stacklessCoroGoroutineIndex(task, len(buckets))]
+		r.next, *slot = *slot, r
 	}
-	stacklessCoroGoroutines.unhosted.Add(int64(len(tasks)))
-	sched.goroutinesCreated.Add(int64(len(tasks)))
+	stacklessCoroGoroutines.records.Add(count)
+	stacklessCoroGoroutines.unhosted.Add(count)
+	sched.goroutinesCreated.Add(count)
 	unlock(&stacklessCoroGoroutines.lock)
 }
 
@@ -412,17 +431,19 @@ func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 	if !raceenabled && owner != nil && owner.stackIsFixed() {
 		s := task.context.scheduler
-		if record := task.source(); record != nil &&
-			(!record.public && !s.hasTerminalRecords() || record.public && s.privateRoot(task)) {
-			// Registration and structured completion already made this
-			// task the leaf. A private public root keeps that leaf until
-			// it publishes work or terminal metadata.
-			record.owner.Store(owner)
-			state := owner.stacklessCoro
-			state.activeSource = record
-			state.activeTerminalSource = false
-			state.sourceTransition = false
-			return
+		if !s.hasTerminalRecords() {
+			record := task.source()
+			if record == nil || record.public && !s.privateRoot(task) {
+				record = stacklessCoroPublishedLeaf(task)
+			}
+			if record != nil {
+				record.owner.Store(owner)
+				state := owner.stacklessCoro
+				state.activeSource = record
+				state.activeTerminalSource = false
+				state.sourceTransition = false
+				return
+			}
 		}
 	}
 	if stacklessCoroGoroutines.records.Load() == 0 {
@@ -467,6 +488,18 @@ func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
 		}
 	}
 	unlock(&stacklessCoroGoroutines.lock)
+}
+
+// The caller has claimed the resume or is publishing an existing task under
+// its scheduler lock. No other driver can enter this activation. A structured
+// parent may still be returning Wait, but can only clear its own owner after
+// the scheduler has published the child as the leaf.
+func stacklessCoroPublishedLeaf(task *stacklessCoroTask) *stacklessCoroGoroutine {
+	record := stacklessCoroLogicalRoot(task).source()
+	if record != nil && record.owner.Load() == nil && record.leaf == task && record.profileTrace == nil {
+		return record
+	}
+	return nil
 }
 
 func stacklessCoroClearLogicalOwner(task *stacklessCoroTask, native bool) {
