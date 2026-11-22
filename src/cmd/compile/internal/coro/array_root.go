@@ -236,7 +236,7 @@ func (candidate *lowerCandidate) planRootArray() *rootArrayPlan {
 
 func (candidate *lowerCandidate) planFrameArray(minSize int64) *rootArrayPlan {
 	start := 0
-	if candidate.invariantFast != nil {
+	if candidate.singleYieldFast != nil {
 		start = 1
 	}
 	return planFrameArray(candidate.function, minSize, start)

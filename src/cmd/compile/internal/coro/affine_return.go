@@ -11,12 +11,13 @@ import (
 	"go/constant"
 )
 
-// An affine return plan proves an exact scalar recurrence over machine int.
+// A plain affine return proves an exact scalar recurrence over machine int.
 // Every function in the closed call graph must return the same base and
 // add the same literal step after calling its target with n-1. The only
 // source effect is the base-case Gosched, which remains a single yield.
 // Helpers, pointers, closures, defers, spawns, floats and hidden Init effects
-// are excluded; the ordinary fallback keeps its original recursive body.
+// are excluded from the plain form. The invariant and ordered forms record
+// their own proofs. The ordinary fallback keeps its original recursive body.
 type affineReturnPlan struct {
 	input      *ir.Name
 	target     *ir.Func
@@ -25,6 +26,7 @@ type affineReturnPlan struct {
 	base, step int64
 	source     *Function
 	invariant  *invariantReturn
+	ordered    *orderedReturn
 }
 
 func affineLiteral(node ir.Node) (int64, bool) {
@@ -136,7 +138,7 @@ func affineReturnClosed(p *affineReturnPlan, plans map[*ir.Func]*affineReturnPla
 		seen[fn] = true
 		q := plans[fn]
 		if q == nil || candidates[fn] == nil || q.base != p.base || q.step != p.step ||
-			!sameInvariantReturn(p, q) {
+			!sameInvariantReturn(p, q) || !sameOrderedReturn(p.ordered, q.ordered) {
 			return false
 		}
 		fn = q.target
@@ -146,6 +148,9 @@ func affineReturnClosed(p *affineReturnPlan, plans map[*ir.Func]*affineReturnPla
 func applyAffineReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) *lowerCandidate {
 	if old.ordinary == nil {
 		return old
+	}
+	if p.ordered != nil {
+		return applyOrderedReturn(plan, old, p)
 	}
 	if p.invariant != nil {
 		return applyInvariantReturn(plan, old, p)

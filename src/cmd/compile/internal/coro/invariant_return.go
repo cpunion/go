@@ -156,12 +156,24 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		return true
 	}
 	if !operands.appendSum(&invariant.step, ret.Results[0], 0, takeResult) ||
-		!found || call.Op() != ir.OCALLFUNC || len(call.Args) != sig.NumParams() {
+		!found {
+		return nil
+	}
+	target := invariantReturnTarget(sig, invariant.depth, call)
+	if target == nil {
+		return nil
+	}
+	return &affineReturnPlan{input: depth, target: target, yield: yield, source: f, invariant: invariant}
+}
+
+// invariantReturnTarget checks that the edge changes only the depth.
+func invariantReturnTarget(sig *types.Type, depth int, call *ir.CallExpr) *ir.Func {
+	if call.Op() != ir.OCALLFUNC || len(call.Args) != sig.NumParams() {
 		return nil
 	}
 	for i, arg := range call.Args {
 		name := sig.Param(i).Nname.(*ir.Name)
-		if i+1 != invariant.depth {
+		if i+1 != depth {
 			if !affineInput(arg, name) {
 				return nil
 			}
@@ -180,10 +192,7 @@ func planInvariantReturn(f *Function) *affineReturnPlan {
 		return nil
 	}
 	target, _ := targetName.Defn.(*ir.Func)
-	if target == nil {
-		return nil
-	}
-	return &affineReturnPlan{input: depth, target: target, yield: yield, source: f, invariant: invariant}
+	return target
 }
 
 func invariantIntegerCast(n ir.Node) (*ir.ConvExpr, bool) {
@@ -360,6 +369,11 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 		ir.NewIfStmt(pos, ir.NewBinaryExpr(pos, ir.OGT, p.input, zero()), positive, nil),
 		ir.NewReturnStmt(pos, ir.Nodes{baseValue}),
 	}, nil)
+	return applySingleYieldFast(plan, old, p, original, declarations, yield, fast)
+}
+
+func applySingleYieldFast(plan *Plan, old *lowerCandidate, p *affineReturnPlan, original ir.Nodes, declarations []*ir.Name, yield *ir.CallExpr, fast *ir.IfStmt) *lowerCandidate {
+	fn := old.function.Func
 	ir.WithFunc(fn, func() { typecheck.Stmt(fast) })
 	fn.Body = append(ir.Nodes{fast}, original...)
 
@@ -383,7 +397,7 @@ func applyInvariantReturn(plan *Plan, old *lowerCandidate, p *affineReturnPlan) 
 	}
 	candidate.ordinary = old.ordinary
 	candidate.heapLocals = old.heapLocals
-	candidate.invariantFast = fast
+	candidate.singleYieldFast = fast
 	return candidate
 }
 
