@@ -1,4 +1,4 @@
-name: Coroutine Linux effectful array readers
+name: Coroutine Linux channel handoff profile
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare effectful array readers (Linux amd64)
+    name: Profile coroutine channel handoff (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and validate effectful array readers
+      - name: Measure and profile channel handoff
         shell: bash
-        run: bash .github/coro-linux-perf/measure-driver.sh
+        run: bash .github/coro-linux-perf/profile-channel.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-effectful-array-readers
+          name: coroutine-linux-channel-handoff
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
