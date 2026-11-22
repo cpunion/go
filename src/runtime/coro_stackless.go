@@ -336,6 +336,7 @@ type stacklessCoroReplacementState struct {
 	dispatch            atomic.Pointer[stacklessCoroDispatchLanes]
 	yields, completions uint16 // protected by the scheduler lock
 	shortLimit          atomic.Uint8
+	shortRate           uint16 // completions per millisecond before widening
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -5877,6 +5878,9 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 	var lane *stacklessCoroAssistLane
 	var baselineRate int64
 	trialTicks, quietTicks := 0, 0
+	// Require two useful samples with the assistant before widening.
+	thirdSamples := 0
+	var thirdBacklog bool
 	stable := false
 	var previousBacklog bool
 	started := nanotime()
@@ -5953,14 +5957,7 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			enoughWork := backlog || previousBacklog
 			previousBacklog = backlog
 			if lane == nil && admit && gomaxprocs > 1 && !stacklessCoroHostRunnable() {
-				if gomaxprocs > stacklessCoroShortExecutors && enoughWork {
-					// Enough live tasks to keep several batches on each
-					// driver, with spare capacity for ordinary Go work.
-					replacements.shortLimit.Store(stacklessCoroShortExecutors)
-					replacements.enableDispatchBatching()
-					return true
-				}
-				// The manager can give up its own P when it parks.
+				thirdBacklog = enoughWork
 				pilot := new(struct {
 					dispatch stacklessCoroDispatchLanes
 					lane     stacklessCoroAssistLane
@@ -5977,6 +5974,23 @@ func (s *stacklessCoroScheduler) awaitExecutorDemand() bool {
 			} else if lane != nil && lane.enabled.Load() {
 				rate := int64(completed) * interval / elapsed
 				trialTicks++
+				// Require enough live work for several batches per driver.
+				if liveSpawns >= 3*stacklessCoroShortExecutors*stacklessCoroAssistWidth {
+					thirdBacklog = true
+				}
+				if trialTicks > 1 && gomaxprocs > stacklessCoroShortExecutors && baselineRate != 0 &&
+					thirdBacklog && nextHead != nil && rate*100 >= baselineRate*108 &&
+					s.canAssist() && !stacklessCoroHostRunnable() {
+					thirdSamples++
+					if thirdSamples == 2 {
+						replacements.shortRate = uint16(min(int64(^uint16(0)), baselineRate))
+						replacements.shortLimit.Store(stacklessCoroShortExecutors)
+						replacements.enableDispatchBatching()
+						return true
+					}
+				} else {
+					thirdSamples = 0
+				}
 				// Give the helper one full interval to start before comparing
 				// progress. Two samples below the target stop early assistance.
 				if trialTicks > 1 && rate*100 < baselineRate*assistGainPercent {
@@ -6060,8 +6074,62 @@ func (s *stacklessCoroScheduler) manageReplacementExecutors() {
 		default:
 		}
 	}
+	const rateMillis = 1_000_000
+	const probeInterval = 2 * rateMillis
+	replacements := s.replacements.Load()
+	var probe <-chan struct{}
+	var timer *timeTimer
+	var lastProbe int64
+	var completions uint16
+	slow := 0
+	if replacements.shortLimit.Load() != 0 && replacements.shortRate != 0 {
+		wake := make(chan struct{}, 1)
+		probe = wake
+		lastProbe = nanotime()
+		lock(&s.lock)
+		completions = replacements.completions
+		unlock(&s.lock)
+		timer = newTimer(lastProbe+probeInterval, probeInterval, func(arg any, _ uintptr, _ int64) {
+			select {
+			case arg.(chan struct{}) <- struct{}{}:
+			default:
+			}
+		}, wake, nil)
+		defer stopTimer(timer)
+	}
 	for {
 		select {
+		case <-probe:
+			now := nanotime()
+			elapsed := now - lastProbe
+			if elapsed < probeInterval/2 {
+				continue
+			}
+			lastProbe = now
+			lock(&s.lock)
+			finished := replacements.completions - completions
+			completions = replacements.completions
+			pending := s.head != nil && s.liveSpawns >= 2*stacklessCoroShortExecutors*stacklessCoroAssistWidth
+			unlock(&s.lock)
+			// Sustained work at less than half the original short
+			// completion rate should use the normal capacity policy.
+			if pending && int64(finished)*2*rateMillis < int64(replacements.shortRate)*elapsed &&
+				!stacklessCoroHostRunnable() {
+				slow++
+			} else {
+				slow = 0
+			}
+			if slow >= 2 || !s.canAssist() {
+				// The short-wave limit no longer matches this scheduler's
+				// work. Resume the normal replacement policy.
+				replacements.shortLimit.Store(0)
+				stopTimer(timer)
+				probe = nil
+				select {
+				case s.executorGrow <- struct{}{}:
+				default:
+				}
+			}
 		case <-s.executorGrow:
 			for !s.drained() {
 				count := s.executorCount.Load()

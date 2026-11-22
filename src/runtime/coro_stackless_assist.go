@@ -315,6 +315,7 @@ func (s *stacklessCoroScheduler) flushAssistCompletionsLocked(lane *stacklessCor
 	if task == nil {
 		return false
 	}
+	count := lane.retiredCount
 	lane.retired, lane.retiredCount = nil, 0
 	for task != nil {
 		next := task.next
@@ -323,6 +324,12 @@ func (s *stacklessCoroScheduler) flushAssistCompletionsLocked(lane *stacklessCor
 		s.completeLogicalTaskLocked(task)
 		s.recycleTaskLocked(task)
 		task = next
+	}
+	if lane.wide && s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors == 0 {
+		replacements := s.replacements.Load()
+		if replacements.shortLimit.Load() != 0 {
+			replacements.completions += uint16(count)
+		}
 	}
 	return true
 }
