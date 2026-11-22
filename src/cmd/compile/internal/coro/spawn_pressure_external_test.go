@@ -242,7 +242,7 @@ func TestSpawnReadyPressure(t *testing.T) {
 			if native {
 				wantBatches = 2
 			}
-			if err != nil || strings.Count(string(batch), "runtime.coroSpawnFrameBatch(SB)") != wantBatches {
+			if err != nil || strings.Count(string(batch), "runtime.coroSpawnScalarBatch(SB)") != wantBatches {
 				t.Fatalf("batched producer native path = %t: %v\n%s", native, err, batch)
 			}
 			partitioned, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.partitionProduce\.coro\.func1$`, program).CombinedOutput()
@@ -254,7 +254,7 @@ func TestSpawnReadyPressure(t *testing.T) {
 				t.Fatalf("partitioned producer native path = %t: %v\n%s", native, err, partitioned)
 			}
 			ranged, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.rangeProduce\.coro\.func1$`, program).CombinedOutput()
-			if err != nil || strings.Contains(string(ranged), "runtime.coroSpawnFrameBatch(SB)") != native {
+			if err != nil || strings.Contains(string(ranged), "runtime.coroSpawnScalarBatch(SB)") != native {
 				t.Fatalf("integer range batch path = %t: %v\n%s", native, err, ranged)
 			}
 			procsList := []string{"1", "4"}

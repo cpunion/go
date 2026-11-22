@@ -212,15 +212,20 @@ func resolveSpawnBatchSites(candidates map[*ir.Func]*lowerCandidate) {
 					run := ir.NewBinaryExpr(pos, ir.OSUB, ir.DeepCopy(pos, period), modulo)
 					remaining = ir.NewCallExpr(pos, ir.OMIN, nil, ir.Nodes{remaining, run})
 				}
-				allocation := typecheck.NodNil()
-				if frame.allocation != nil {
-					allocation = reflectdata.TypePtrAt(pos, frame.allocation)
+				helper := "coroSpawnScalarBatch"
+				args := ir.Nodes{site.resume.Dcl[0], frame.resume.Nname, reflectdata.TypePtrAt(pos, frame.typ)}
+				if frame.typ.HasPointers() {
+					helper = "coroSpawnFrameBatch"
+					allocation := typecheck.NodNil()
+					if frame.allocation != nil {
+						allocation = reflectdata.TypePtrAt(pos, frame.allocation)
+					}
+					args = append(args, allocation)
 				}
-				spawn := typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnFrameBatch"), ir.Nodes{
-					site.resume.Dcl[0], frame.resume.Nname, reflectdata.TypePtrAt(pos, frame.typ), allocation,
+				args = append(args,
 					typedInt(pos, types.Types[types.TUINTPTR], frame.offset),
-					typedInt(pos, types.Types[types.TUINT32], frame.pc), remaining,
-				}, false)
+					typedInt(pos, types.Types[types.TUINT32], frame.pc), remaining)
+				spawn := typecheck.Call(pos, typecheck.LookupRuntime(helper), args, false)
 				block := ir.Nodes{
 					ir.NewDecl(pos, ir.ODCL, started),
 					ir.NewDecl(pos, ir.ODCL, yield),

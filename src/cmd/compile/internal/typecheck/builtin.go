@@ -338,12 +338,13 @@ var runtimeDecls = [...]struct {
 	{"coroTakeFusedChunkBoundary", funcTag, 222},
 	{"coroAdvanceFusedChunk", funcTag, 223},
 	{"coroPopFusedChunk", funcTag, 123},
-	{"coroSpawnFrameBatch", funcTag, 224},
-	{"coroTryChanExchange", funcTag, 225},
+	{"coroSpawnScalarBatch", funcTag, 224},
+	{"coroSpawnFrameBatch", funcTag, 225},
+	{"coroTryChanExchange", funcTag, 226},
 }
 
 func runtimeTypes() []*types.Type {
-	var typs [226]*types.Type
+	var typs [227]*types.Type
 	typs[0] = types.ByteType
 	typs[1] = types.NewPtr(typs[0])
 	typs[2] = types.Types[types.TANY]
@@ -568,8 +569,9 @@ func runtimeTypes() []*types.Type {
 	typs[221] = newSig(params(typs[7], typs[5], typs[1]), params(typs[7]))
 	typs[222] = newSig(params(typs[123], typs[5], typs[1]), params(typs[7]))
 	typs[223] = newSig(params(typs[7], typs[7], typs[71], typs[123]), params(typs[71]))
-	typs[224] = newSig(params(typs[7], typs[123], typs[1], typs[1], typs[5], typs[67], typs[13]), params(typs[13], typs[6]))
-	typs[225] = newSig(params(typs[7], typs[104], typs[3], typs[3], typs[141]), params(typs[6]))
+	typs[224] = newSig(params(typs[7], typs[123], typs[1], typs[5], typs[67], typs[13]), params(typs[13], typs[6]))
+	typs[225] = newSig(params(typs[7], typs[123], typs[1], typs[1], typs[5], typs[67], typs[13]), params(typs[13], typs[6]))
+	typs[226] = newSig(params(typs[7], typs[104], typs[3], typs[3], typs[141]), params(typs[6]))
 	return typs[:]
 }
 
