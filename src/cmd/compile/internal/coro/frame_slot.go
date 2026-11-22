@@ -40,7 +40,7 @@ func planSharedArrayAwaitInputs(candidates map[*ir.Func]*lowerCandidate) {
 // reusableAwaitInput finds a word-sized input whose final use is in the
 // outgoing call, so the scalar child result can occupy the same field.
 func reusableAwaitInput(candidate *lowerCandidate) *awaitInputReuse {
-	if candidate.sharedArrayPlan == nil || candidate.rootArray == nil ||
+	if candidate.sharedArrayPlan == nil ||
 		len(candidate.branches) != 0 || !keepsReturnInResume(candidate) {
 		return nil
 	}

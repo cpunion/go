@@ -58,8 +58,8 @@ func main(){
 
 func TestMutualRootArrayLineage(t *testing.T) {
 	testSwitchReturnProgram(t, mutualRootArraySource, nil,
-		[]string{"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB"},
-		"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB")
+		[]string{"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB", "mixedReadA", "mixedReadB"},
+		"even", "odd", "outside", "differentA", "differentB", "liveA", "liveB", "mixedReadA", "mixedReadB")
 }
 
 const mutualRootArraySource = `package main
@@ -167,6 +167,31 @@ func liveB(n int) int {
 	return child + readPair(&data)
 }
 
+// One peer reads into a local before suspending. Both peers must agree on
+// whether their private factories pass a reconstructed buffer.
+func mixedReadA(n int) int {
+	var data [440]byte
+	data[439] = byte(n)
+	before := readPair(&data)
+	if n == 0 {
+		runtime.Gosched()
+		return before
+	}
+	child := mixedReadB(n-1)
+	return child + before
+}
+
+func mixedReadB(n int) int {
+	var data [440]byte
+	data[439] = byte(n)
+	if n == 0 {
+		runtime.Gosched()
+		return readPair(&data)
+	}
+	child := mixedReadA(n-1)
+	return child + readPair(&data)
+}
+
 func collect() {
 	for range ready {
 		runtime.GC()
@@ -224,6 +249,9 @@ func main() {
 			if (n-i)%2 == 0 { wantA += i } else { wantB += i }
 		}
 		if liveA(n) != wantA || liveB(n) != wantB { panic("live input across await") }
+		var wantMixed int
+		for i := 0; i <= n; i++ { wantMixed += 2 * int(byte(i)) }
+		if mixedReadA(n) != wantMixed || mixedReadB(n) != wantMixed { panic("mixed reader lineage") }
 	}
 	println("switch-return-ok")
 }
