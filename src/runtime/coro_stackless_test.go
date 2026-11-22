@@ -4974,6 +4974,43 @@ func TestStacklessCoroSelectFastPath(t *testing.T) {
 		})
 	})
 
+	t.Run("BufferedAndClosed", func(t *testing.T) {
+		ready, closed := make(chan int, 1), make(chan int, 1)
+		close(closed)
+		wins := [2]int{}
+		for range 128 {
+			ready <- 57
+			chosen := -2
+			values := [2]int{-1, -1}
+			received := false
+			cases := runtime.NewStacklessCoroSelectCasesForTest(
+				[]any{ready, closed},
+				[]unsafe.Pointer{unsafe.Pointer(&values[0]), unsafe.Pointer(&values[1])}, 0)
+			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				if runtime.SelectStacklessCoroForTest(ctx, cases, true, &chosen, &received) {
+					t.Fatal("ready and closed buffered select waited")
+				}
+				return runtime.StacklessCoroActionComplete
+			})
+			switch chosen {
+			case 0:
+				if !received || values != [2]int{57, -1} || len(ready) != 0 {
+					t.Fatalf("buffered choice = (%t, %v), buffered %d", received, values, len(ready))
+				}
+			case 1:
+				if received || values != [2]int{-1, 0} || len(ready) != 1 || <-ready != 57 {
+					t.Fatalf("closed choice = (%t, %v), buffered %d", received, values, len(ready))
+				}
+			default:
+				t.Fatalf("ready and closed buffered select chose %d", chosen)
+			}
+			wins[chosen]++
+		}
+		if wins[0] == 0 || wins[1] == 0 {
+			t.Fatalf("both channels remained ready, selections = %v", wins)
+		}
+	})
+
 	t.Run("ReadyPeer", func(t *testing.T) {
 		channel := make(chan int, 1)
 		other := make(chan int, 1)

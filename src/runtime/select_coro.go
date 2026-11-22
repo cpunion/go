@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -162,17 +163,16 @@ func tryStacklessCoroSelect(ctx unsafe.Pointer, cases []scase, nsends int,
 		stacklessCoroIsPullComparison(context.scheduler) {
 		return false
 	}
-	if block && !stacklessCoroSelectMayBeReady(cases, nsends) {
-		return false
-	}
-
 	var casi int
 	var recvOK, handled bool
 	if !asanenabled && !msanenabled && len(cases) == 2 && nsends == 0 {
-		casi, handled = tryStacklessCoroBufferedRecvPair(cases)
+		casi, handled = tryStacklessCoroBufferedRecvPair(cases, block)
 		recvOK = casi >= 0
 	}
 	if !handled {
+		if block && !stacklessCoroSelectMayBeReady(cases, nsends) {
+			return false
+		}
 		var order [2 * stacklessCoroSelectCaseCacheSize]uint16
 		casi, recvOK = selectgo(&cases[0], &order[0], nil, nsends,
 			len(cases)-nsends, false)
@@ -186,14 +186,41 @@ func tryStacklessCoroSelect(ctx unsafe.Pointer, cases []scase, nsends int,
 	return true
 }
 
-// tryStacklessCoroBufferedRecvPair picks a ready buffered receive while both
-// channels are locked. Peer waiters and closed channels need the full select.
-func tryStacklessCoroBufferedRecvPair(cases []scase) (chosen int, handled bool) {
+// tryStacklessCoroBufferedRecvPair picks a buffered receive. A sole ready
+// channel can be selected under its own lock once the other is known to be
+// empty and open. Peer waiters and closed channels need the full select.
+func tryStacklessCoroBufferedRecvPair(cases []scase, block bool) (chosen int, handled bool) {
 	left, right := cases[0].c, cases[1].c
 	if left == nil || right == nil || left == right ||
 		left.dataqsiz == 0 || right.dataqsiz == 0 ||
 		left.timer != nil || right.timer != nil || left.bubble != nil || right.bubble != nil {
 		return -1, false
+	}
+
+	leftCount, rightCount := atomic.Loaduint(&left.qcount), atomic.Loaduint(&right.qcount)
+	if (leftCount == 0) != (rightCount == 0) {
+		index, other := 0, right
+		if leftCount == 0 {
+			index, other = 1, left
+		}
+		selected := cases[index]
+		c := selected.c
+		lock(&c.lock)
+		// At the empty observation, this channel stays ready under its
+		// lock. closed is monotonic, so a later open observation also
+		// proves the other channel was open at that point. A buffered
+		// empty channel cannot have a queued sender.
+		if c.qcount != 0 && c.closed == 0 && c.sendq.first == nil &&
+			atomic.Loaduint(&other.qcount) == 0 && atomic.Load(&other.closed) == 0 {
+			stacklessCoroSelectReceiveBuffered(c, selected.elem)
+			unlock(&c.lock)
+			return index, true
+		}
+		unlock(&c.lock)
+	} else if block && leftCount == 0 && atomic.Load(&left.closed) == 0 && atomic.Load(&right.closed) == 0 {
+		// The retained path checks readiness under both locks before
+		// queuing, so a concurrent send or close can still win.
+		return -1, true
 	}
 
 	first, second := left, right
@@ -211,22 +238,32 @@ func tryStacklessCoroBufferedRecvPair(cases []scase) (chosen int, handled bool) 
 				chosen = 1
 			}
 			selected := cases[chosen]
-			c := selected.c
-			qp := chanbuf(c, c.recvx)
-			if selected.elem != nil {
-				typedmemmove(c.elemtype, selected.elem, qp)
-			}
-			typedmemclr(c.elemtype, qp)
-			c.recvx++
-			if c.recvx == c.dataqsiz {
-				c.recvx = 0
-			}
-			c.qcount--
+			stacklessCoroSelectReceiveBuffered(selected.c, selected.elem)
 		}
 	}
 	unlock(&first.lock)
 	unlock(&second.lock)
 	return chosen, handled
+}
+
+// The caller holds c.lock and has ruled out a sender waiting to refill the
+// buffer. As in coroEntryChanRecv, the write barrier cannot change under
+// this lock.
+func stacklessCoroSelectReceiveBuffered(c *hchan, element unsafe.Pointer) {
+	if size := uintptr(c.elemsize); size != 0 {
+		slot := chanbuf(c, c.recvx)
+		if element != nil {
+			if writeBarrier.enabled || goexperiment.CgoCheck2 {
+				typedmemmove(c.elemtype, element, slot)
+			} else {
+				memmove(element, slot, size)
+			}
+		}
+		if c.elemtype.Pointers() {
+			typedmemclr(c.elemtype, slot)
+		}
+	}
+	advanceStacklessCoroRecv(c)
 }
 
 func startStacklessCoroSelect(ctx unsafe.Pointer, cases0 *scase,
