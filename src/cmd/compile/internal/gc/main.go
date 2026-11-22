@@ -270,6 +270,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	var preserveCall func(*ir.Func) bool
 	if buildcfg.Experiment.Coro {
 		base.Timer.Start("fe", "coro-provisional")
+		if base.Debug.Coro > 3 && !instrumented {
+			for _, fn := range typecheck.Target.Funcs {
+				coro.FoldPrivateChannelPairs(fn)
+			}
+		}
 		plan, err := coro.Analyze(typecheck.Target.Funcs,
 			cgoDirectives)
 		if err != nil {
@@ -323,9 +328,13 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 			}
 			if body != nil {
 				coro.RecordSourceCopy(body, fn)
+				coro.FoldPrivateChannelPairs(body)
 				transformed = append(transformed, loopvar.ForCapture(body)...)
 			}
 			for _, child := range typecheck.Target.Funcs[start:] {
+				if child != body {
+					coro.FoldPrivateChannelPairs(child)
+				}
 				transformed = append(transformed, loopvar.ForCapture(child)...)
 			}
 			return body
@@ -339,6 +348,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		var plan *coro.Plan
 		var err error
 		if base.Debug.Coro > 3 && !instrumented {
+			// Inline bodies are decoded from the original source and may have
+			// reintroduced pairs eliminated before the provisional analysis.
+			for _, fn := range typecheck.Target.Funcs {
+				coro.FoldPrivateChannelPairs(fn)
+			}
 			plan, err = coro.AnalyzeWithSpecializations(typecheck.Target.Funcs, cgoDirectives, bodies)
 		} else {
 			plan, err = coro.Analyze(typecheck.Target.Funcs, cgoDirectives)
