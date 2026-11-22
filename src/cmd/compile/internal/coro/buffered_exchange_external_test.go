@@ -185,3 +185,80 @@ func TestBufferedChannelExchange(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicBufferedChannelExchangeMiss(t *testing.T) {
+	testSwitchReturnFilesNative(t, map[string]string{
+		"go.mod": "module exchangecheck\n\ngo 1.27\n",
+		"pair/pair.go": `package pair
+
+func Exchange(ch chan *int, sent *int) (*int, bool) {
+	ch <- sent
+	value, ok := <-ch
+	return value, ok
+}
+`,
+		"main.go": `package main
+
+import (
+	"exchangecheck/pair"
+	"runtime"
+)
+
+func checkBlocking(capacity int) {
+	ch := make(chan *int, capacity)
+	sent, initial := 71, 83
+	if capacity != 0 {
+		ch <- &initial
+	}
+	done := make(chan struct{})
+	go func() {
+		value := <-ch
+		runtime.GC()
+		if capacity == 0 {
+			ch <- value
+		} else if value != &initial {
+			panic("buffer lost its oldest item")
+		}
+		close(done)
+	}()
+	value, ok := pair.Exchange(ch, &sent)
+	<-done
+	if !ok || value != &sent || *value != 71 {
+		panic("blocking exchange changed the value")
+	}
+}
+
+func checkClosedReceive() {
+	ch := make(chan *int)
+	sent := 79
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	go func() {
+		<-ch
+		runtime.GC()
+		close(ch)
+	}()
+	value, ok := pair.Exchange(ch, &sent)
+	if value != nil || ok {
+		panic("closed channel returned a value")
+	}
+	defer func() {
+		if recover() == nil {
+			panic("send on a closed channel returned")
+		}
+	}()
+	pair.Exchange(ch, &sent)
+}
+
+func main() {
+	for _, procs := range []int{1, 4} {
+		runtime.GOMAXPROCS(procs)
+		checkBlocking(0)
+		checkBlocking(1)
+		checkClosedReceive()
+	}
+	println("switch-return-ok")
+}
+`,
+	}, "exchangecheck/pair=", nil, nil, nil)
+}
