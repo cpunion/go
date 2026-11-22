@@ -3,8 +3,8 @@ set -euo pipefail
 
 fixture="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(git -C "$fixture" rev-parse --show-toplevel)"
-base=7c18dace74a2b86d6f4cbeca3550ddc2f6df1e80
-candidate=45b30d7bf5ededa6bf16b77278ed7c71451cc5f9
+base=45b30d7bf5ededa6bf16b77278ed7c71451cc5f9
+candidate=e70fa1d4a714592186dda48ffccf2dc3b2bbdb90
 official="$(go env GOROOT)"
 samples="$RUNNER_TEMP/coro-frame-comparison"
 evidence="$RUNNER_TEMP/coro-linux-perf-evidence"

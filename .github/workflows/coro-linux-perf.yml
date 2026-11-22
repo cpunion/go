@@ -1,4 +1,4 @@
-name: Coroutine Linux shared frame slots
+name: Coroutine Linux scalar array frames
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare shared frame slots (Linux amd64)
+    name: Compare scalar array frames (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and validate shared frame slots
+      - name: Measure and validate scalar array frames
         shell: bash
         run: bash .github/coro-linux-perf/measure-driver.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-shared-frame-slots
+          name: coroutine-linux-scalar-array-frames
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
