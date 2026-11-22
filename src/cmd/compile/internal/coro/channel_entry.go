@@ -10,6 +10,65 @@ import (
 	"cmd/compile/internal/types"
 )
 
+// installBufferedChannelExchangeEntry completes a function consisting of a
+// send immediately followed by a receive and return without creating a root.
+// Its operands are stable, so the existing entry can handle a miss.
+func installBufferedChannelExchangeEntry(candidate *lowerCandidate, anchors ...*ir.Name) bool {
+	fn, ordinary := candidate.function.Func, candidate.ordinary
+	if candidate.factoryABI != FactoryABI3 || len(ordinary.Body) != 3 || len(candidate.function.Sites) != 2 {
+		return false
+	}
+	send, ok := ordinary.Body[0].(*ir.SendStmt)
+	if !ok || len(send.Init()) != 0 ||
+		!stableChannelEntryOperand(send.Chan) || !stableChannelEntryOperand(send.Value) ||
+		send.Chan.Type().Elem().Size() > 16 {
+		return false
+	}
+	assign, ok := ordinary.Body[1].(*ir.AssignStmt)
+	if !ok || !assign.Def {
+		return false
+	}
+	received, ok := assign.X.(*ir.Name)
+	if !ok || received.Class != ir.PAUTO || received.Addrtaken() {
+		return false
+	}
+	for _, init := range assign.Init() {
+		decl, ok := init.(*ir.Decl)
+		if !ok || decl.X != received {
+			return false
+		}
+	}
+	receive, ok := assign.Y.(*ir.UnaryExpr)
+	if !ok || receive.Op() != ir.ORECV || receive.X != send.Chan || len(receive.Init()) != 0 {
+		return false
+	}
+	ret, ok := ordinary.Body[2].(*ir.ReturnStmt)
+	if !ok || len(ret.Init()) != 0 || len(ret.Results) != 1 || ret.Results[0] != received {
+		return false
+	}
+
+	addOrdinaryBody(fn, ordinary, anchors...)
+	ir.WithFunc(fn, func() {
+		pos := send.Pos()
+		elem := send.Chan.Type().Elem()
+		source := typecheck.TempAt(pos, fn, elem)
+		result := typecheck.TempAt(pos, fn, elem)
+		exchanged := typecheck.Call(pos, typecheck.LookupRuntime("coroTryChanExchange", elem, elem, elem),
+			ir.Nodes{typecheck.NodNil(), send.Chan, typecheck.NodAddr(source), typecheck.NodAddr(result), typecheck.NodNil()}, false)
+		prefix := ir.Nodes{
+			ir.NewDecl(pos, ir.ODCL, source),
+			ir.NewDecl(pos, ir.ODCL, result),
+			ir.NewAssignStmt(pos, source, send.Value),
+			ir.NewAssignStmt(pos, result, ir.NewZero(pos, elem)),
+			ir.NewIfStmt(pos, exchanged, ir.Nodes{ir.NewReturnStmt(ret.Pos(), ir.Nodes{result})}, nil),
+		}
+		typecheck.Stmts(prefix)
+		send.Value = source
+		fn.Body = append(prefix, fn.Body...)
+	})
+	return true
+}
+
 // channelEntry is the first channel operation of a public explicit-frame entry.
 // On a miss, a private resume state can take the already evaluated operands.
 // Factory callers continue to enter the original initial state.

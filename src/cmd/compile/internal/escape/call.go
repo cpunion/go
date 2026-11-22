@@ -413,14 +413,22 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 		return e.addr(param.Nname.(*ir.Name))
 	}
 
-	// These compiler-generated runtime calls invoke the cleanup closure
-	// synchronously. The runtime may retain the task or token while
-	// cleanup runs, but never retains the closure itself.
 	if sym := fn.Sym(); sym != nil && sym.Pkg == ir.Pkgs.Runtime {
 		switch sym.Name {
 		case "coroDeferInvokeTrace", "coroDeferCall":
+			// Cleanup runs synchronously. The runtime can retain the task
+			// or token, while the invocation only uses the closure.
 			if param == fn.Type().Param(1) {
 				return e.teeHole(e.mutatorHole(), e.calleeHole())
+			}
+		case "coroTryChanExchange":
+			// The channel can retain the sent value. The helper never
+			// retains the address of a source or result slot.
+			switch param {
+			case fn.Type().Param(2):
+				return e.heapHole().shift(1)
+			case fn.Type().Param(3), fn.Type().Param(4):
+				return e.mutatorHole()
 			}
 		}
 	}
