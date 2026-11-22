@@ -22,7 +22,7 @@ jobs:
           go-version: '1.27.3'
           cache: false
       - name: Test and measure exact baseline and candidate SDKs
-        run: bash .github/perf-coro-spawn/measure.sh 63746d7012c5283e48e8aea85e3339be6e0a333d 0f3d981395c1f24c6ea15f128a83a1bc62a2f9b2
+        run: bash .github/perf-coro-spawn/measure.sh 63746d7012c5283e48e8aea85e3339be6e0a333d d5f49720b9bb78c3311f15db2bb890f3f350013a
       - uses: actions/upload-artifact@v7
         if: always()
         with:
