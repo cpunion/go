@@ -1,4 +1,4 @@
-name: Coroutine Linux blocking read comparison
+name: Coroutine Linux socket write comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare blocking coroutine file reads (Linux amd64)
+    name: Compare coroutine socket writes (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure file reads and run regressions
+      - name: Measure socket writes and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-read.sh
+        run: bash .github/coro-linux-perf/measure-socket.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-blocking-read
+          name: coroutine-linux-socket-write
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
