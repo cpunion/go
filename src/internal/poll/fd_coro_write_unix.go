@@ -67,17 +67,20 @@ func (fd *FD) CoroWriteStart(ctx unsafe.Pointer, p []byte, n *int, status *uintp
 		fd.writeUnlock()
 		return CoroWriteFallback, nil
 	}
-	if err := fd.pd.prepareWrite(fd.isFile); err != nil {
-		fd.writeUnlock()
-		return CoroWriteDone, err
-	}
 	// Unlike Read, Write must issue a syscall even for an empty buffer.
+	var statusCode uintptr
 	if fd.pd.pollable() && atomic.LoadUint32(&fd.isBlocking) == 0 {
-		runtime_coroSocketWrite(ctx, fd.pd.runtimeCtx, fd.Sysfd, p, n, status)
-		return CoroWriteWait, nil
+		if runtime_coroSocketWrite(ctx, fd.pd.runtimeCtx, fd.Sysfd, p, n, status) {
+			return CoroWriteWait, nil
+		}
+		statusCode = *status
+	} else {
+		if err := fd.pd.prepareWrite(fd.isFile); err != nil {
+			fd.writeUnlock()
+			return CoroWriteDone, err
+		}
+		*n, statusCode = runtime_coroFileWrite(ctx, fd.Sysfd, p)
 	}
-	written, statusCode := runtime_coroFileWrite(ctx, fd.Sysfd, p)
-	*n = written
 	if statusCode == 0 {
 		fd.writeUnlock()
 		return CoroWriteDone, nil
@@ -113,4 +116,4 @@ func CoroCallWrite(ctx unsafe.Pointer, call func()) {
 
 func runtime_coroFileWrite(ctx unsafe.Pointer, fd int, p []byte) (int, uintptr)
 
-func runtime_coroSocketWrite(ctx unsafe.Pointer, pd uintptr, fd int, p []byte, n *int, status *uintptr)
+func runtime_coroSocketWrite(ctx unsafe.Pointer, pd uintptr, fd int, p []byte, n *int, status *uintptr) bool
