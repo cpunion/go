@@ -101,6 +101,8 @@ const (
 	StacklessCoroPollErrTimeout = pollErrTimeout
 )
 
+const StacklessCoroActionChunkSwitch = stacklessCoroActionChunkSwitch
+
 func RunStacklessCoroForTest(resume func(unsafe.Pointer) uint8) {
 	coroRun(resume)
 }
@@ -131,6 +133,15 @@ func RunStacklessCoroInlineForTest(resume func(unsafe.Pointer) uint8) {
 
 func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 	resume func(unsafe.Pointer) uint8) {
+	runStacklessCoroInlineForTest(frame, resume, true)
+}
+
+func RunStacklessCoroQueueInlineForTest(resume func(unsafe.Pointer) uint8) {
+	runStacklessCoroInlineForTest(nil, resume, false)
+}
+
+func runStacklessCoroInlineForTest(frame unsafe.Pointer,
+	resume func(unsafe.Pointer) uint8, public bool) {
 	s := newStacklessCoroTestScheduler()
 	*s = stacklessCoroScheduler{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
@@ -139,7 +150,7 @@ func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 	s.root.resume = resume
 	s.root.context.frame = frame
 	s.ready(&s.root, false)
-	s.run(false, true)
+	s.run(false, public)
 	s.finish()
 }
 
