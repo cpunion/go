@@ -7167,6 +7167,16 @@ func TestStacklessCoroCallRead(t *testing.T) {
 }
 
 func TestStacklessCoroBlockingProgress(t *testing.T) {
+	t.Run("P1", func(t *testing.T) {
+		testStacklessCoroBlockingProgress(t, 1)
+	})
+	t.Run("P2", func(t *testing.T) {
+		testStacklessCoroBlockingProgress(t, 2)
+	})
+}
+
+func testStacklessCoroBlockingProgress(t *testing.T, procs int) {
+	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -7174,7 +7184,7 @@ func TestStacklessCoroBlockingProgress(t *testing.T) {
 	defer syscall.Close(fds[0])
 	defer syscall.Close(fds[1])
 
-	oldProcs := runtime.GOMAXPROCS(1)
+	oldProcs := runtime.GOMAXPROCS(procs)
 	defer runtime.GOMAXPROCS(oldProcs)
 
 	const rounds = 2*runtime.StacklessCoroWarmExecutorCount + 1

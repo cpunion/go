@@ -342,6 +342,7 @@ type stacklessCoroReplacementState struct {
 	shortLimit          atomic.Uint8
 	shortRate           uint16 // completions per millisecond before widening
 	workProbe           atomic.Uint32
+	managerPending      atomic.Uint32
 }
 
 // stacklessCoroScheduler owns every continuation it runs. Producers enqueue
@@ -769,6 +770,9 @@ func runStacklessCoroRoot(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 // caller can return, panic, or Goexit as soon as rootDone closes; this owner
 // and the existing replacement executors remain until all spawned tasks end.
 func (s *stacklessCoroScheduler) runOwner() {
+	// Launch the manager after the public driver has handed off. This lets
+	// the owner become runnable without first waiting to wake the manager.
+	s.startPendingReplacementManager()
 	// A short detached episode can get its P from runnext and wake the
 	// same producer in runnext before an ordinary goroutine runs. Yield
 	// on the owner's ordinary stack when there is local competition.
@@ -6024,9 +6028,10 @@ func (s *stacklessCoroScheduler) executorWake() chan struct{} {
 }
 
 func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
-	s.replacements.Store(&stacklessCoroReplacementState{
+	replacements := &stacklessCoroReplacementState{
 		wake: make(chan struct{}, stacklessCoroWarmExecutorCount-1),
-	})
+	}
+	s.replacements.Store(replacements)
 	// The initial replacements and manager can all report completion without
 	// parking. Growth beyond the warm set retains the ordinary join fallback.
 	s.executorDone = make(chan bool, stacklessCoroWarmExecutorCount)
@@ -6043,8 +6048,23 @@ func (s *stacklessCoroScheduler) startReplacementExecutors(deferWorkers bool) {
 	for range count - 1 {
 		go s.replacementExecutor(false)
 	}
-	go s.manageReplacementExecutors()
+	gp := getg()
+	if deferWorkers && count == 1 && stacklessCoroPublicCaller(gp) != gp {
+		// The public driver stops at the first spawn. If its resume enters
+		// a blocking call first, enterBlockingExecutor starts the manager.
+		replacements.managerPending.Store(1)
+	} else {
+		go s.manageReplacementExecutors()
+	}
 	s.executorState.Store(stacklessCoroExecutorStateRunning)
+}
+
+//go:noinline
+func (s *stacklessCoroScheduler) startPendingReplacementManager() {
+	if r := s.replacements.Load(); r != nil &&
+		r.managerPending.Load() != 0 && r.managerPending.CompareAndSwap(1, 0) {
+		go s.manageReplacementExecutors()
+	}
 }
 
 // awaitExecutorDemand runs on the ordinary manager G. A stream of small
@@ -6414,6 +6434,9 @@ func (s *stacklessCoroScheduler) enterBlockingExecutor() (handoff bool) {
 	}
 	blocked := s.blockingExecutors.Add(1)
 	if replacements := s.replacements.Load(); replacements != nil {
+		if replacements.managerPending.Load() != 0 {
+			s.startPendingReplacementManager()
+		}
 		if dispatch := replacements.dispatch.Load(); dispatch != nil {
 			s.returnDispatchReady(dispatch)
 		}
@@ -6466,6 +6489,7 @@ func (s *stacklessCoroScheduler) stopReplacementExecutors() {
 		return
 	}
 	s.stopExecutorRuns()
+	s.startPendingReplacementManager()
 	// Replacements may finish before the manager stops growing the set. Count
 	// their notifications, but do not take the final count until the manager
 	// has published its last possible increment through the same channel.
