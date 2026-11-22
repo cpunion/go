@@ -83,6 +83,7 @@ func blocked(n int) {
 }
 var batchGate chan struct{}
 var batchReady, batchDone, batchSum uint64
+var batchValue *uint64
 func batchWorker() {
  atomic.AddUint64(&batchReady,1)
  <-batchGate
@@ -93,6 +94,44 @@ func typedBatchWorker() {
  <-batchGate
  atomic.AddUint64(&batchSum,seed)
  atomic.AddUint64(&batchDone,1)
+}
+func pointerBatchWorker() {
+ value:=batchValue
+ atomic.AddUint64(&batchReady,1)
+ <-batchGate
+ atomic.AddUint64(&batchSum,*value)
+ atomic.AddUint64(&batchDone,1)
+}
+func partitionProduce(n,offset int,moving bool) {
+ batchGate=make(chan struct{})
+ batchValue=new(uint64)
+ *batchValue=7
+ atomic.StoreUint64(&batchReady,0)
+ atomic.StoreUint64(&batchDone,0)
+ atomic.StoreUint64(&batchSum,0)
+ if moving {
+  for i:=0; i<n; i++ {
+   if (i+i)%4==0 {go batchWorker()} else {go pointerBatchWorker()}
+  }
+ } else {
+  for i:=0; i<n; i++ {
+   if (i+offset)%4==0 {go batchWorker()} else {go pointerBatchWorker()}
+  }
+ }
+ for atomic.LoadUint64(&batchReady)<uint64(n) { runtime.Gosched() }
+ batchValue=nil
+ runtime.GC()
+ close(batchGate)
+ for atomic.LoadUint64(&batchDone)<uint64(n) { runtime.Gosched() }
+ want:=uint64(0)
+ for i:=0; i<n; i++ {
+  bias:=offset
+  if moving {bias=i}
+  if (i+bias)%4!=0 {want+=7}
+ }
+ if atomic.LoadUint64(&batchSum)!=want || atomic.LoadUint64(&batchDone)!=uint64(n) {
+  panic("partitioned batch changed child count, target or live pointer")
+ }
 }
 func batchProduce(n int, typed bool) {
  batchGate=make(chan struct{})
@@ -130,6 +169,8 @@ func rangeProduce(n int) {
 func main() {
  for _,n:=range []int{-7,0,1,9,127,128,129,1031} {rangeProduce(n)}
  for _,n:=range []int{0,1,7,8,9,127,128,129,255,256,257,1031} {batchProduce(n,false);batchProduce(n,true)}
+ for _,offset:=range []int{-5,0,1,int(^uint(0)>>1)} {partitionProduce(259,offset,false)}
+ partitionProduce(259,0,true)
  if runtime.GOMAXPROCS(0)>=8 {batchProduce(100000,false)}
  for _,n:=range []int{0,1,127,128,129,255,256,1000,10000} {
   arguments=0;atomic.StoreUint64(&completed,0);atomic.StoreUint64(&sum,0)
@@ -201,11 +242,19 @@ func TestSpawnReadyPressure(t *testing.T) {
 			if native {
 				wantBatches = 2
 			}
-			if err != nil || strings.Count(string(batch), "runtime.coroSpawnScalarBatch(SB)") != wantBatches {
+			if err != nil || strings.Count(string(batch), "runtime.coroSpawnFrameBatch(SB)") != wantBatches {
 				t.Fatalf("batched producer native path = %t: %v\n%s", native, err, batch)
 			}
+			partitioned, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.partitionProduce\.coro\.func1$`, program).CombinedOutput()
+			wantPartitionBatches := 0
+			if native {
+				wantPartitionBatches = 1
+			}
+			if err != nil || strings.Count(string(partitioned), "runtime.coroSpawnFrameBatch(SB)") != wantPartitionBatches {
+				t.Fatalf("partitioned producer native path = %t: %v\n%s", native, err, partitioned)
+			}
 			ranged, err := testenv.Command(t, goTool, "tool", "objdump", "-s", `^main\.rangeProduce\.coro\.func1$`, program).CombinedOutput()
-			if err != nil || strings.Contains(string(ranged), "runtime.coroSpawnScalarBatch(SB)") != native {
+			if err != nil || strings.Contains(string(ranged), "runtime.coroSpawnFrameBatch(SB)") != native {
 				t.Fatalf("integer range batch path = %t: %v\n%s", native, err, ranged)
 			}
 			procsList := []string{"1", "4"}

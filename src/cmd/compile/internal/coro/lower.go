@@ -138,8 +138,8 @@ type lowerCandidate struct {
 	scalarArrayReads  []*ir.Node
 	reusedAwaitInput  *awaitInputReuse
 	reusedArray       *frameArrayReuse
-	scalarSpawn       *scalarSpawnFactory
-	scalarSpawnSites  []scalarSpawnSite
+	zeroSpawn         *zeroSpawnFactory
+	spawnBatchSites   []spawnBatchSite
 	affineRoot        *affineReturnPlan
 	singleYieldFast   *ir.IfStmt
 	channelEntry      *channelEntry
@@ -693,7 +693,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 	}
 	retainCapturedEntries(candidates)
 	resolveFusedFrameChunkProofs(candidates)
-	resolveScalarSpawnSites(candidates)
+	resolveSpawnBatchSites(candidates)
 	for _, function := range functions {
 		if ordinary := rejectedBodies[function.Func]; ordinary != nil {
 			remapOrdinaryBody(function.Func, ordinary)
@@ -3483,9 +3483,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	continueStates := make(map[ir.Node]int)
 	var lowerStatements func(ir.Nodes, int) int
 	var lowerStatement func(ir.Node, int) int
-	spawnLoops := make(map[*ir.GoDeferStmt]scalarSpawnLoop)
+	spawnLoops := make(map[*ir.GoDeferStmt]spawnBatchLoop)
 	lowerLoop := func(target ir.Node, loop *ir.ForStmt, next int) int {
-		if spawn, batch := planScalarSpawnLoop(target, loop); spawn != nil {
+		if spawn, batch := planSpawnBatchLoop(target, loop); spawn != nil {
 			spawnLoops[spawn] = batch
 		}
 		conditionState := addState(lowerState{
@@ -4727,12 +4727,17 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						}, nil)
 					}
 					edge := edgeForCall(function, call)
-					if loop, ok := spawnLoops[goStmt]; ok && child.frame != nil && child.spawnGuard == nil && len(edge.Targets) == 0 {
+					if loop, ok := spawnLoops[goStmt]; ok && name == "coroSpawnFrame" &&
+						child.spawnGuard == nil && len(edge.Targets) == 0 {
 						block := ir.NewBlockStmt(goStmt.Pos(), append(child.setup, spawn))
-						candidate.scalarSpawnSites = append(candidate.scalarSpawnSites, scalarSpawnSite{
+						site := spawnBatchSite{
 							block: block, spawn: spawn, resume: resume, callee: edge.Callee,
-							index: edit(loop.index), limit: edit(loop.limit),
-						})
+							index: edit(loop.index), limit: edit(loop.limit), period: loop.period,
+						}
+						if loop.offset != nil {
+							site.offset = edit(loop.offset)
+						}
+						candidate.spawnBatchSites = append(candidate.spawnBatchSites, site)
 						body = append(body, block)
 						continue
 					}
@@ -5708,8 +5713,8 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	for i, stmt := range resume.Body {
 		resume.Body[i] = rewrite(stmt)
 	}
-	for i := range candidate.scalarSpawnSites {
-		site := &candidate.scalarSpawnSites[i]
+	for i := range candidate.spawnBatchSites {
+		site := &candidate.spawnBatchSites[i]
 		site.index, site.limit = rewrite(site.index), rewrite(site.limit)
 	}
 	if array := candidate.reusedArray; array != nil && array.clear == nil {
@@ -5903,6 +5908,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	rootAssignment := ir.NewAssignStmt(pos, factoryFrame,
 		typecheck.ConvNop(takeRootFrame, framePointerType))
 	var takeChildFrame ir.Node
+	var taskAllocation *types.Type
 	// Await suspends the parent before starting its child. A recursive spawn
 	// can create concurrent siblings from the same parent, so those factories
 	// must not hand out the same adjacent array element.
@@ -5926,9 +5932,10 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	} else {
 		helper := "coroTakeFrame"
 		args := ir.Nodes{factoryCtx, factoryResume, frameSize()}
-		if allocation := explicitTaskFrameAllocationType(pos, frameType, closureVars); allocation != nil {
+		taskAllocation = explicitTaskFrameAllocationType(pos, frameType, closureVars)
+		if taskAllocation != nil {
 			helper = "coroTakeTypedTaskFrame"
-			args = append(args, reflectdata.TypePtrAt(pos, allocation))
+			args = append(args, reflectdata.TypePtrAt(pos, taskAllocation))
 		}
 		takeFrame := typecheck.Call(pos,
 			typecheck.LookupRuntime(helper), args, false)
@@ -6070,7 +6077,10 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 		recordChunkStore(fields[i], childResult)
 	}
 
-	candidate.scalarSpawn = newScalarSpawnFactory(candidate, resume, factoryFrame, replacements[candidate.resumePC], factoryPrologue, declarations[initializers:])
+	if !fusedFrame && candidate.rootArray == nil {
+		candidate.zeroSpawn = newZeroSpawnFactory(candidate, resume, factoryFrame,
+			replacements[candidate.resumePC], taskAllocation, factoryPrologue, declarations[initializers:])
+	}
 	oldCurFunc := ir.CurFunc
 	ir.CurFunc = factory
 	frameResult := typecheck.ConvNop(factoryFrame, unsafePointerType)

@@ -78,6 +78,16 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine frame reservation outside resume")
 	}
+	task := s.reserveTypedFrameTaskLocked(parent, child, size, allocationType)
+	task.next = s.reservedTasks
+	s.reservedTasks = task
+	frame := task.context.frame
+	unlock(&s.lock)
+	return frame
+}
+
+func (s *stacklessCoroScheduler) reserveTypedFrameTaskLocked(parent *stacklessCoroTask,
+	child stacklessCoroResume, size uintptr, allocationType *_type) *stacklessCoroTask {
 	task := s.takeCachedFrameTaskLocked(child, uint16(size))
 	if task == nil {
 		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
@@ -90,7 +100,6 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			// Pending scalar-only slots stay available for scalar reservations;
 			// typed frames still receive independent precisely typed storage.
 			if !validStacklessCoroTaskFrameType(allocationType, size) {
-				unlock(&s.lock)
 				throw("runtime: invalid stackless coroutine task-frame allocation type")
 			}
 			cached, marker := takeStacklessCoroCompletedTask(allocationType, size)
@@ -117,9 +126,5 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	} else {
 		task.setParent(parent)
 	}
-	task.next = s.reservedTasks
-	s.reservedTasks = task
-	frame := task.context.frame
-	unlock(&s.lock)
-	return frame
+	return task
 }
