@@ -1,4 +1,4 @@
-name: Coroutine Linux frame profiles
+name: Coroutine Linux frame optimization
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Same-source frame profiles (Linux amd64)
+    name: Compare frame initialization (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure and profile frame boundaries
+      - name: Measure the frame initialization change
         shell: bash
-        run: bash .github/coro-linux-perf/measure-frame.sh
+        run: bash .github/coro-linux-perf/measure-candidate.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-frames
+          name: coroutine-linux-frame-candidate
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
