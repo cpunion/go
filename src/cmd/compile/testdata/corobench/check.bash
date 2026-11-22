@@ -168,7 +168,6 @@ expected=(
 	parallelYieldWork
 	channelWorker
 	channelRoundTrips
-	readyChannelPairs
 	readySelects
 	sleepLoop
 	fileReads
@@ -218,6 +217,11 @@ for function in "${expected[@]}"; do
 		exit 1
 	fi
 done
+# The private buffered pair folds to arithmetic before effect analysis.
+if ! grep -Eq '^coro: func=.*\.readyChannelPairs effect=nosuspend .* seeds=- primary=plain( |$)' "$lowering_output"; then
+	echo "readyChannelPairs lost its non-suspending channel fold" >&2
+	exit 1
+fi
 if ! grep -Eq 'coro: phase=lower lowered=[1-9][0-9]*' "$lowering_output"; then
 	echo "coroutine lowering did not lower any probe functions" >&2
 	exit 1
@@ -229,6 +233,13 @@ if ! "$coro_goroot/bin/go" test -c -o "$test_binary" \
 	exit 1
 fi
 "$coro_goroot/bin/go" tool nm "$test_binary" >"$symbols_output"
+ready_pair="$output_dir/ready-channel-pair.objdump"
+"$coro_goroot/bin/go" tool objdump -s '\.readyChannelPairs$' "$test_binary" >"$ready_pair"
+if ! grep -Eq '^TEXT .*\.readyChannelPairs\(SB\)' "$ready_pair" ||
+	grep -Eq 'runtime\.(chansend|chanrecv|coro)' "$ready_pair"; then
+	echo "readyChannelPairs executes channel operations or constructs a coroutine frame" >&2
+	exit 1
+fi
 for function in "${expected[@]}"; do
 	case "$function" in
 		recursiveYield|mutualYieldA|mutualYieldB)

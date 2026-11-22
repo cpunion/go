@@ -12,10 +12,12 @@ import (
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -25,6 +27,24 @@ var (
 	uintSink  uint64
 	floatSink float64
 )
+
+func TestPublicReadFileError(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "write-only")
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var buffer [1]byte
+	for range 2 {
+		n, err := fileReads(file, buffer[:], 1)
+		var pathErr *os.PathError
+		if n != 0 || !errors.Is(err, syscall.EBADF) || !errors.As(err, &pathErr) ||
+			pathErr.Op != "read" || pathErr.Path != filename {
+			t.Fatalf("write-only file read = (%d, %v), want read PathError wrapping EBADF", n, err)
+		}
+	}
+}
 
 func TestProbes(t *testing.T) {
 	if got := yieldLoop(2); got != 2 {
