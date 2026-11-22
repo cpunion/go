@@ -1,0 +1,30 @@
+name: Coroutine first batch latency
+
+on:
+  push:
+    branches:
+      - coro/measure-cold-start-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Measure first batch phases and compare scheduling choices
+        run: bash .github/perf-coro-cold-start/measure.sh 0e7a225e9c309e9d5c3bc40c55378acd4ffaf79b
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coro-cold-start
+          path: ${{ runner.temp }}/coro-cold-start/validation
+          if-no-files-found: error
