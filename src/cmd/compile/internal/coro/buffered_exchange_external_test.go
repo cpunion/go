@@ -24,6 +24,18 @@ func exchange(ch chan int, value int) (int, bool) {
 	return result, ok
 }
 
+func exchangeAdjusted(ch chan int, value int) int64 {
+	ch <- value
+	received := int64(<-ch)
+	return received + 1
+}
+
+func exchangeOK(ch chan int, value int) bool {
+	ch <- value
+	_, ok := <-ch
+	return ok
+}
+
 func pointerExchange(ch chan *int, value *int) (any, verdict) {
 	var result any
 	var ok verdict
@@ -84,6 +96,8 @@ func checkReady() {
 		want[i%2] = 100+i
 	}
 	check(<-ch == want[0] && <-ch == want[1])
+	check(exchangeAdjusted(ch, 71) == 72 && len(ch) == 0)
+	check(exchangeOK(ch, 73) && len(ch) == 0)
 
 	left, right := new(int), new(int)
 	*left, *right = 57, 59
@@ -162,9 +176,12 @@ func TestBufferedChannelExchange(t *testing.T) {
 			t.Fatalf("%s calls buffered exchange=%t, want %t\n%s", name, got, want, out)
 		}
 	}
-	out, err := testenv.Command(t, goTool, "tool", "objdump", "-s", "^main[.]exchangeOnce$", program).CombinedOutput()
-	if err != nil || !strings.Contains(string(out), "runtime.coroTryChanExchange") ||
-		!strings.Contains(string(out), "runtime.coroRunFrame") {
-		t.Fatalf("public entry has no ready exchange or fallback: %v\n%s", err, out)
+	for _, name := range []string{"exchangeOnce", "exchange", "exchangeAdjusted", "exchangeOK", "pointerExchange"} {
+		symbol := "^main[.]" + name + "$"
+		out, err := testenv.Command(t, goTool, "tool", "objdump", "-s", symbol, program).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "runtime.coroTryChanExchange") ||
+			!strings.Contains(string(out), "runtime.coroRunFrame") {
+			t.Fatalf("%s has no ready exchange or fallback: %v\n%s", name, err, out)
+		}
 	}
 }
