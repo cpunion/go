@@ -1,0 +1,20 @@
+--- a/src/runtime/chan_coro.go
++++ b/src/runtime/chan_coro.go
+@@ -185,2 +185,2 @@
+-					if writeBarrier.enabled || goexperiment.CgoCheck2 {
+-						if element != nil {
++					if element != nil {
++						if writeBarrier.enabled || goexperiment.CgoCheck2 {
+@@ -188,4 +188 @@
+-						}
+-						typedmemclr(c.elemtype, slot)
+-					} else {
+-						if element != nil {
++						} else {
+@@ -194 +191,5 @@
+-						memclrNoHeapPointers(slot, uintptr(c.elemsize))
++					}
++					// The next sender overwrites this slot before it is readable.
++					// Only pointer-bearing elements need to release GC roots.
++					if c.elemtype.Pointers() || asanenabled || msanenabled {
++						typedmemclr(c.elemtype, slot)
