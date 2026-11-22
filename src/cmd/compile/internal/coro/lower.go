@@ -244,6 +244,7 @@ type lowerIO struct {
 	wait      *ir.Name
 	start     ir.Node
 	finish    ir.Node
+	completed *types.Sym
 }
 
 type lowerState struct {
@@ -4523,11 +4524,18 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	}
 	recordSourceResume(resume, fn, resumePC, positions)
 	labels := make([]*types.Sym, len(states))
-	for i := range states {
-		// Lower is also called directly by tests, where ir.CurFunc is unset, so
-		// allocate labels from resume instead of using typecheck.AutoLabel.
-		labels[i] = resume.Sym().Pkg.LookupNum(".coro", int(resume.Label))
+	// Lower is also called directly by tests, where ir.CurFunc is unset, so
+	// allocate labels from resume instead of using typecheck.AutoLabel.
+	newLabel := func() *types.Sym {
+		label := resume.Sym().Pkg.LookupNum(".coro", int(resume.Label))
 		resume.Label++
+		return label
+	}
+	for i, state := range states {
+		labels[i] = newLabel()
+		if state.io != nil && state.transition == SiteInvalid {
+			state.io.completed = newLabel()
+		}
 	}
 	// The factory, the frozen public channel entry, and the continuation
 	// stores can enter the dispatcher. Other states keep their direct edges
@@ -4898,6 +4906,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 					typecheck.NodAddr(edit(io.err)),
 					edit(io.direct), edit(io.status),
 				}, false))
+			body = append(body, ir.NewLabelStmt(io.call.Pos(), io.completed))
 			for _, name := range []*ir.Name{io.receiver, io.dummyErr} {
 				if name == nil {
 					continue
@@ -5194,7 +5203,9 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 									types.Types[types.TUINT8], int64(actionWait)),
 							}),
 						}, nil),
-						gotoState(state.next))
+						// The start function already produced both results.
+						// Only a resumed activation owns an I/O finish.
+						ir.NewBranchStmt(state.call.Pos(), ir.OGOTO, io.completed))
 					action = actionWait
 					break
 				}
