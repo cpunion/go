@@ -1,4 +1,4 @@
-name: Coroutine Linux socket write comparison
+name: Coroutine Linux channel pair comparison
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare coroutine socket writes (Linux amd64)
+    name: Compare coroutine channel pairs (Linux amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -20,13 +20,13 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: false
-      - name: Measure socket writes and run regressions
+      - name: Measure channel pairs and run regressions
         shell: bash
-        run: bash .github/coro-linux-perf/measure-socket.sh
+        run: bash .github/coro-linux-perf/measure-pairs.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coroutine-linux-socket-write
+          name: coroutine-linux-channel-pairs
           path: ${{ runner.temp }}/coro-linux-perf-evidence
           if-no-files-found: error
           retention-days: 7
