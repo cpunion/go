@@ -5,7 +5,7 @@ root="$(pwd -P)"
 export GOENV=off GOWORK=off GOTOOLCHAIN=local GOCACHE="$root/cache" GO111MODULE=off
 export GOEXPERIMENT=coro CGO_ENABLED=0
 cd progress
-modes=(base tail next global eager timerreuseempty handoff managerworker managerone)
+modes=(base tail next global eager timerreuseempty handoff managerworker managerone parked parkedfast parkedslow)
 for mode in "${modes[@]}"; do
     flags=()
     if [[ "$mode" != base ]]; then flags=(-overlay="$root/overlays/$mode.json"); fi
