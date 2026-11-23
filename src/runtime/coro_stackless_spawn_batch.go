@@ -228,3 +228,44 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 	}
 	return int32(len(tasks))
 }
+
+func coroUseOrdinarySpawnBatch(count int) bool {
+	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 4 && !raceenabled && count >= 8 && count <= 64 &&
+		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
+}
+
+// coroOrdinarySpawnBatch distributes a prefix to idle processors and then
+// publishes the remainder on this processor. The compiler supplies a static
+// zero-argument entry and a private loop bound.
+func coroOrdinarySpawnBatch(fn func(), count int) {
+	caller := getg()
+	pc := sys.GetCallerPC()
+	entry := *(**funcval)(unsafe.Pointer(&fn))
+	systemstack(func() {
+		pp := getg().m.p.ptr()
+		if mainStarted && gomaxprocs > 1 {
+			var prefix gQueue
+			n := min(count, 3)
+			for range n {
+				prefix.pushBack(newproc1(entry, caller, pc, false, waitReasonZero))
+			}
+			injectRunnableGQueue(&prefix)
+			count -= n
+		}
+		for range count {
+			runqput(pp, newproc1(entry, caller, pc, false, waitReasonZero), false)
+		}
+		if mainStarted {
+			wakep()
+		}
+	})
+}
+
+func coroOrdinaryBatchYield() {
+	checkTimeouts()
+	mcall(coroOrdinaryBatchYield_m)
+}
+
+func coroOrdinaryBatchYield_m(gp *g) {
+	goschedImpl(gp, false, !gp.preempt)
+}

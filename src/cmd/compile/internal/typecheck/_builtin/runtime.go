@@ -396,6 +396,9 @@ func coroSemrelease(unsafe.Pointer, *uint32, bool, int) bool
 
 // stackless coroutine entry selection
 func coroUseOrdinary() bool
+func coroUseOrdinarySpawnBatch(int) bool
+func coroOrdinarySpawnBatch(func(), int)
+func coroOrdinaryBatchYield()
 func coroEntryChanSend(chan<- any, *any) bool
 func coroEntryChanRecv(*any, <-chan any) (bool, bool)
 

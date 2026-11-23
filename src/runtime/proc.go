@@ -4095,7 +4095,10 @@ func injectglist(glist *gList) {
 	// Turn the gList into a gQueue.
 	q := gQueue{glist.head, tail.guintptr(), glist.size}
 	*glist = gList{}
+	injectRunnableGQueue(&q)
+}
 
+func injectRunnableGQueue(q *gQueue) {
 	startIdle := func(n int32) {
 		for ; n > 0; n-- {
 			mp := acquirem() // See comment in startm.
@@ -4118,7 +4121,7 @@ func injectglist(glist *gList) {
 	if pp == nil {
 		n := q.size
 		lock(&sched.lock)
-		globrunqputbatch(&q)
+		globrunqputbatch(q)
 		unlock(&sched.lock)
 		startIdle(n)
 		return
@@ -4138,9 +4141,9 @@ func injectglist(glist *gList) {
 		startIdle(n)
 	}
 
-	if runqputbatch(pp, &q); !q.empty() {
+	if runqputbatch(pp, q); !q.empty() {
 		lock(&sched.lock)
-		globrunqputbatch(&q)
+		globrunqputbatch(q)
 		unlock(&sched.lock)
 	}
 
@@ -4334,7 +4337,7 @@ func park_m(gp *g) {
 	schedule()
 }
 
-func goschedImpl(gp *g, preempted bool) {
+func goschedImpl(gp *g, preempted, local bool) {
 	pp := gp.m.p.ptr()
 	trace := traceAcquire()
 	status := readgstatus(gp)
@@ -4362,6 +4365,8 @@ func goschedImpl(gp *g, preempted bool) {
 		// If preempted for STW, keep the G on the local P in runnext
 		// so it can keep running immediately after the STW.
 		runqput(pp, gp, true)
+	} else if goexperiment.Coro && local {
+		runqput(pp, gp, false)
 	} else {
 		lock(&sched.lock)
 		globrunqput(gp)
@@ -4377,7 +4382,7 @@ func goschedImpl(gp *g, preempted bool) {
 
 // Gosched continuation on g0.
 func gosched_m(gp *g) {
-	goschedImpl(gp, false)
+	goschedImpl(gp, false, false)
 }
 
 // goschedguarded is a forbidden-states-avoided version of gosched_m.
@@ -4385,11 +4390,11 @@ func goschedguarded_m(gp *g) {
 	if !canPreemptM(gp.m) {
 		gogo(&gp.sched) // never return
 	}
-	goschedImpl(gp, false)
+	goschedImpl(gp, false, false)
 }
 
 func gopreempt_m(gp *g) {
-	goschedImpl(gp, true)
+	goschedImpl(gp, true, false)
 }
 
 // preemptPark parks gp and puts it in _Gpreempted.

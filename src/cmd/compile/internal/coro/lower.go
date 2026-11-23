@@ -647,6 +647,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		delete(rejectedBodies, fn)
 		delete(specializedBodies, fn)
 	}
+	batchWorkers := make(map[*ir.Func]*ir.Func)
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
 		depth := func(fn *ir.Func) int {
@@ -682,7 +683,8 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 				remapOrdinaryBody(fn, candidate.ordinary)
 				fn.Body = candidate.ordinary.Body
 				ir.WithFunc(fn, func() { typecheck.Stmts(fn.Body) })
-			} else if !installBufferedChannelExchangeEntry(candidate, rangeBodyEntryAnchors(candidate)...) {
+			} else if !installBufferedChannelExchangeEntry(candidate, rangeBodyEntryAnchors(candidate)...) &&
+				!installOrdinarySpawnBatchEntry(candidate, candidates, bodies, batchWorkers) {
 				addOrdinaryBody(function.Func, candidate.ordinary, rangeBodyEntryAnchors(candidate)...)
 			}
 		}
