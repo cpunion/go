@@ -2583,7 +2583,7 @@ func TestLowerStateMachines(t *testing.T) {
 		runSingle, runStructured, structured, deferred, dynamicDeferred,
 		repeatedDeferred, repeatedRead,
 	} {
-		wantStatements := 2
+		wantStatements := 2 + fn.Type().NumResults()
 		wantRuntime := "coroRun"
 		if explicitFrames[fn] {
 			wantStatements = 7 + fn.Type().NumResults()
@@ -2598,6 +2598,19 @@ func TestLowerStateMachines(t *testing.T) {
 			t.Errorf("%s body has %d statements, want %d", fn.Sym().Name,
 				len(fn.Body), wantStatements)
 			continue
+		}
+		if !explicitFrames[fn] {
+			ret := fn.Body[len(fn.Body)-1].(*ir.ReturnStmt)
+			if len(ret.Results) != fn.Type().NumResults() {
+				t.Fatalf("%s wrapper returned %d results, want %d", fn.Sym().Name,
+					len(ret.Results), fn.Type().NumResults())
+			}
+			for i, result := range ret.Results {
+				decl, ok := fn.Body[i].(*ir.Decl)
+				if !ok || decl.X != result {
+					t.Errorf("%s wrapper result %d is not its declared result cell", fn.Sym().Name, i)
+				}
+			}
 		}
 		var runtimeCalls int
 		ir.VisitList(fn.Body, func(node ir.Node) {

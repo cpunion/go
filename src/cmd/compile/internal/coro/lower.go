@@ -5473,15 +5473,20 @@ func finishLowering(candidate *lowerCandidate, resume *ir.Func,
 	for i, field := range inputs {
 		args[i], _ = field.Nname.(ir.Node)
 	}
+	// The factory can keep these addresses across suspensions. Allocate
+	// its result cells only in the native arm of the public entry.
+	var entry, results ir.Nodes
 	for _, field := range fn.Type().Results() {
-		result, _ := field.Nname.(ir.Node)
+		result := typecheck.TempAt(pos, fn, field.Type)
+		entry = append(entry, ir.NewDecl(pos, ir.ODCL, result))
 		args = append(args, typecheck.NodAddr(result))
+		results = append(results, result)
 	}
 	args = append(sourceCaptureArguments(fn), args...)
 	newResume := typecheck.Call(pos, factory.Nname, args, false)
 	run := typecheck.Call(pos, typecheck.LookupRuntime("coroRun"),
 		ir.Nodes{newResume}, false)
-	fn.Body = []ir.Node{run, ir.NewReturnStmt(pos, nil)}
+	fn.Body = append(entry, run, ir.NewReturnStmt(pos, results))
 	typecheck.Stmts(fn.Body)
 	ir.CurFunc = oldCurFunc
 
