@@ -2700,11 +2700,15 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 			roots = runtime.StacklessCoroWarmExecutorCount
 		}
 		frames := make([]unsafe.Pointer, roots+1)
+		var native bool
 		for i := range frames {
 			state, total := 0, 0
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 				switch state {
 				case 0:
+					if i == 0 {
+						native, _, _, _, _, _ = runtime.StacklessCoroNativeStackForTest()
+					}
 					state = 1
 					frame := newStacklessCoroFrameCacheTestFrame(ctx,
 						stacklessCoroFrameCacheResume, i+1, &total)
@@ -2724,8 +2728,6 @@ func TestStacklessCoroFrameCache(t *testing.T) {
 				t.Fatalf("native-context total = %d, want %d", total, i+1)
 			}
 		}
-		native := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
-			runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
 		if got, want := frames[0] == frames[len(frames)-1],
 			native && !race.Enabled; got != want {
 			t.Fatalf("native-context frame reused = %t, want %t", got, want)

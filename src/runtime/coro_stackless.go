@@ -341,6 +341,7 @@ type stacklessCoroReplacementState struct {
 	dispatch            atomic.Pointer[stacklessCoroDispatchLanes]
 	yields, completions uint16 // protected by the scheduler lock
 	shortLimit          atomic.Uint8
+	managedHeavy        atomic.Bool
 	shortRate           uint16 // completions per millisecond before widening
 	workProbe           atomic.Uint32
 	pendingManager      atomic.Pointer[stacklessCoroScheduler]
@@ -1699,6 +1700,10 @@ func (s *stacklessCoroScheduler) resumeWithWorkProbe(task *stacklessCoroTask, pr
 		probe.replacements = nil
 		return action
 	}
+	if GOOS == "linux" && GOARCH == "arm64" && elapsed >= 8*sustainedWork {
+		r.managedHeavy.Store(true)
+
+	}
 	probe.samples++
 	if probe.samples == 2 || elapsed >= sustainedWork {
 		probe.replacements = nil
@@ -1783,7 +1788,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	// transition below.
 	if initial {
 		task = s.takeInitialRoot()
-		directInitialRoot = (native || !stacklessCoroNativeStackAvailable) &&
+		directInitialRoot = (native || !stacklessCoroNativeStackAvailable || stacklessCoroLinuxARM64Managed) &&
 			!raceenabled && !stacklessCoroIsPullComparison(s)
 		goto resume
 	}
@@ -1793,7 +1798,7 @@ next:
 	// but after a spawn it must leave before selecting any queued task. The
 	// owner then selects detached children without tying their C activations
 	// to the ordinary public caller's stack.
-	if s.driverDone(public) {
+	if s.driverDone(public) || native && !public && s.prefersManagedCompute() {
 		return nil
 	}
 	task = nil
@@ -1975,9 +1980,9 @@ resumeOwned:
 		fromAssist = false
 		// The ordinary host and public driver must get their scheduling
 		// checks before reserving the next logical task.
-		dispatch := native && !public && action == stacklessCoroActionYield &&
+		dispatch := native && !public && !s.prefersManagedCompute() && action == stacklessCoroActionYield &&
 			!raceenabled && !stacklessCoroIsPullComparison(s) && hostYieldCheck != ^uint8(0)
-		next, resumeDirectly, foreignReturner := s.yield(task, native, dispatch)
+		next, resumeDirectly, foreignReturner := s.yield(task, native && !s.prefersManagedCompute(), dispatch)
 		if next != nil {
 			hostYieldCheck++
 			initial = false
@@ -2065,7 +2070,7 @@ resumeOwned:
 		if fromAssist && s.retireAssistTask(lane, task) {
 			goto next
 		}
-		dispatch := native && !public && !raceenabled && !stacklessCoroIsPullComparison(s)
+		dispatch := native && !public && !raceenabled && !stacklessCoroIsPullComparison(s) && !s.prefersManagedCompute()
 		task = s.complete(task, dispatch && lane == nil)
 		if task != nil {
 			initial, directInitialRoot = false, false
@@ -6593,4 +6598,13 @@ func stacklessCoroOperationBucket(id uint64) **stacklessCoroOperation {
 	registry := stacklessCoroOperations.registry
 	index := id % uint64(len(registry.buckets))
 	return &registry.buckets[index]
+}
+
+// A measured expensive independent continuation uses ordinary scheduling.
+func (s *stacklessCoroScheduler) prefersManagedCompute() bool {
+	if GOOS != "linux" || GOARCH != "arm64" {
+		return false
+	}
+	r := s.replacements.Load()
+	return r != nil && r.managedHeavy.Load()
 }

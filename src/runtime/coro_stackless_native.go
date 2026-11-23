@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.coro && ((darwin && arm64) || (linux && amd64))
+//go:build goexperiment.coro && ((darwin && arm64) || (linux && (amd64 || (arm64 && corolinuxarm64native))))
 
 package runtime
 
@@ -154,7 +154,8 @@ func init() {
 // the managed-stack driver for now.
 func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	initial, public bool) *stacklessCoroScheduler {
-	if raceenabled {
+	if raceenabled || GOOS == "linux" && GOARCH == "arm64" &&
+		gomaxprocs < 4 && d.context == nil || s.prefersManagedCompute() {
 		return nil
 	}
 	if d.context == nil {

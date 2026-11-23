@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.coro && !race && ((darwin && arm64) || (linux && amd64))
+//go:build goexperiment.coro && !race && ((darwin && arm64) || (linux && (amd64 || (arm64 && corolinuxarm64native))))
 
 package runtime_test
 
@@ -948,4 +948,22 @@ func growStacklessCoroNativeStack(depth int) {
 	keep[depth&(len(keep)-1)] = byte(depth)
 	growStacklessCoroNativeStack(depth + 1)
 	runtime.KeepAlive(&keep)
+}
+
+func TestStacklessCoroHybridDriverChoice(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "arm64" {
+		t.Skip("Linux arm64 driver selection")
+	}
+	p := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(p)
+	for _, count := range []int{2, 4, 2, 4} {
+		runtime.GOMAXPROCS(count)
+		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+			native, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest()
+			if native != (count >= 4) {
+				t.Errorf("GOMAXPROCS=%d: fixed stack = %v", count, native)
+			}
+			return runtime.StacklessCoroActionComplete
+		})
+	}
 }

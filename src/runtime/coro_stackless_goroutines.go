@@ -429,7 +429,29 @@ func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer
 	return callerPC
 }
 
+const stacklessCoroLinuxARM64Managed = GOOS == "linux" && GOARCH == "arm64"
+
+// The independent source is already its published leaf. The selected
+// resume owns this task until it is made runnable or completes again.
+func stacklessCoroManagedIndependentLeaf(task *stacklessCoroTask, record *stacklessCoroGoroutine) bool {
+	return record != nil && !record.public && record.root == task &&
+		record.leaf == task && record.physicalG == nil && record.profileTrace == nil
+}
+
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
+	if stacklessCoroLinuxARM64Managed && !raceenabled && owner != nil && !owner.stackIsFixed() &&
+		task != &task.context.scheduler.root {
+		record := task.source()
+		if stacklessCoroManagedIndependentLeaf(task, record) && record.owner.Load() == nil &&
+			owner.stacklessCoro != nil && !task.context.scheduler.hasTerminalRecords() {
+			record.owner.Store(owner)
+			state := owner.stacklessCoro
+			state.activeSource = record
+			state.activeTerminalSource = false
+			state.sourceTransition = false
+			return
+		}
+	}
 	if !raceenabled && owner != nil && owner.stackIsFixed() {
 		s := task.context.scheduler
 		if !s.hasTerminalRecords() {
@@ -511,7 +533,8 @@ func stacklessCoroClearLogicalOwner(task *stacklessCoroTask, native bool) {
 		state.activeSource = nil
 		state.activeTerminalSource = false
 		state.sourceTransition = false
-		if native && record != nil && !terminal {
+		if record != nil && !terminal && (native ||
+			stacklessCoroLinuxARM64Managed && !raceenabled && stacklessCoroManagedIndependentLeaf(task, record)) {
 			// A structured child may have taken ownership while the parent
 			// was returning Wait. Only clear our own publication; the
 			// parent's active resume keeps this record live until then.
