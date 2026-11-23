@@ -15,6 +15,8 @@ import (
 	"unsafe"
 )
 
+const stacklessCoroNativeStackAvailable = true
+
 const (
 	// Bound total fixed descriptor storage. Active and idle-stack holders
 	// consume slots from the same pool; overflow descriptors are heap allocated.

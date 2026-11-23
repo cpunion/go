@@ -8,6 +8,8 @@ package runtime
 
 import "unsafe"
 
+const stacklessCoroNativeStackAvailable = false
+
 func stacklessCoroPublicCaller(gp *g) *g { return gp }
 
 func stacklessCoroCanPairChannel(*g, *stacklessCoroScheduler) bool { return false }

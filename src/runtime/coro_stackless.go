@@ -1777,13 +1777,14 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 
 	// Select the private root before entering the ordinary queue loop. Keeping
 	// this branch out of that loop avoids adding work to every later yield.
-	// takeInitialRoot validates the root before its first resume. A native
-	// driver can retain that ownership while the root remains private; every
-	// non-yield action is validated by its handler below.
+	// takeInitialRoot validates the root before its first resume. Native
+	// drivers and the Go-stack driver on fallback platforms can retain
+	// ownership across private yields. Each other action validates its own
+	// transition below.
 	if initial {
 		task = s.takeInitialRoot()
-		directInitialRoot = native && !raceenabled &&
-			!stacklessCoroIsPullComparison(s)
+		directInitialRoot = (native || !stacklessCoroNativeStackAvailable) &&
+			!raceenabled && !stacklessCoroIsPullComparison(s)
 		goto resume
 	}
 
