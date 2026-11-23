@@ -1989,7 +1989,7 @@ resumeOwned:
 		// checks before reserving the next logical task.
 		dispatch := native && !public && !s.prefersManagedCompute() && action == stacklessCoroActionYield &&
 			!raceenabled && !stacklessCoroIsPullComparison(s) && hostYieldCheck != ^uint8(0)
-		if managedDispatch && action == stacklessCoroActionYield && gomaxprocs <= 4 &&
+		if managedDispatch && action == stacklessCoroActionYield && gomaxprocs <= 8 &&
 			hostYieldCheck < managedYieldInterval-1 && s.runnableState.Load() == 1 &&
 			s.canAssist() && !getg().preempt {
 			dispatch = true
@@ -5517,6 +5517,12 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		// again. Keep its running ownership on the current native executor.
 		unlock(&s.lock)
 		return nil, true, false
+	}
+	// On a wider managed scheduler, prefer the ordinary scheduler while
+	// several children are live. Check the count under the ready lock.
+	if stacklessCoroLinuxARM64Managed && !stacklessCoroNativeStackAvailable &&
+		dispatch && !native && gomaxprocs > 4 && s.liveSpawns != 1 {
+		dispatch = false
 	}
 	// FIFO rotation keeps the same ready count. Hosts and structured
 	// publications retain their routing and source metadata updates.

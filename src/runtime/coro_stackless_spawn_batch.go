@@ -230,7 +230,12 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 }
 
 func coroUseOrdinarySpawnBatch(count int) bool {
-	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 128 &&
+	limit := 128
+	if !stacklessCoroNativeStackAvailable {
+		// Wider eligible fan-outs avoid contention between managed drivers.
+		limit = 1024
+	}
+	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= limit &&
 		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
 }
 
