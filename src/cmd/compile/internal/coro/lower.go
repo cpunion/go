@@ -647,7 +647,7 @@ func Lower(plan *Plan, bodies *BodyReader) (LowerResult, error) {
 		delete(rejectedBodies, fn)
 		delete(specializedBodies, fn)
 	}
-	batchWorkers := make(map[*ir.Func]*ir.Func)
+	batchWorkers := make(map[*ir.Func]ordinarySpawnWorkers)
 	lowerOrder := slices.Clone(functions)
 	slices.SortStableFunc(lowerOrder, func(a, b *Function) int {
 		depth := func(fn *ir.Func) int {

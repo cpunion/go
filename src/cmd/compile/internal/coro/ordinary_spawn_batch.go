@@ -9,14 +9,20 @@ import (
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"internal/abi"
 	"internal/buildcfg"
 	"slices"
 )
 
-// The ordinary route uses the source entry for a small spawn and join loop.
+type ordinarySpawnWorkers struct {
+	batch *ir.Func
+	plain *ir.Func
+}
+
+// The ordinary route uses the source entry for a bounded spawn and join loop.
 // The same body handles the standard fallback, including all call operands.
 func installOrdinarySpawnBatchEntry(candidate *lowerCandidate, candidates map[*ir.Func]*lowerCandidate,
-	bodies *BodyReader, workers map[*ir.Func]*ir.Func) bool {
+	bodies *BodyReader, workers map[*ir.Func]ordinarySpawnWorkers) bool {
 	fn := candidate.function.Func
 	ordinary := candidate.ordinary
 	if buildcfg.GOOS != "linux" || buildcfg.GOARCH != "arm64" || base.Flag.Cfg.Instrumenting ||
@@ -75,29 +81,41 @@ func installOrdinarySpawnBatchEntry(candidate *lowerCandidate, candidates map[*i
 		child.function.Sites[0].Kind != SiteYield || target.Type().NumParams() != 0 || target.Type().NumResults() != 0 {
 		return false
 	}
-	worker := workers[target]
-	if worker == nil {
-		worker = bodies.Clone(target, types.LocalPkg.Lookup(target.Sym().Name+".coro.batch"))
-		if worker == nil || !ordinarySpawnWorker(worker) {
+	worker, ok := workers[target]
+	if !ok {
+		worker.batch = bodies.Clone(target, types.LocalPkg.Lookup(target.Sym().Name+".coro.batch"))
+		if worker.batch == nil || !ordinarySpawnWorker(worker.batch) {
 			return false
 		}
-		RecordSourceCopy(worker, target)
+		worker.plain = bodies.Clone(target, types.LocalPkg.Lookup(target.Sym().Name+".coro.batchplain"))
+		if worker.plain == nil {
+			return false
+		}
+		RecordSourceCopy(worker.batch, target)
+		RecordSourceCopy(worker.plain, target)
 		workers[target] = worker
-		typecheck.Target.Funcs = append(typecheck.Target.Funcs, worker)
+		typecheck.Target.Funcs = append(typecheck.Target.Funcs, worker.batch, worker.plain)
 	}
 
 	remapOrdinaryBody(fn, ordinary)
 	ir.WithFunc(fn, func() {
 		pos := fn.Pos()
+		ordinaryRoute := typecheck.TempAt(pos, fn, types.Types[types.TBOOL])
 		batch := typecheck.TempAt(pos, fn, types.Types[types.TBOOL])
 		choose := typecheck.Call(pos, typecheck.LookupRuntime("coroUseOrdinarySpawnBatch"), ir.Nodes{argument}, false)
-		assign := ir.NewAssignStmt(pos, batch, choose)
+		assignRoute := ir.NewAssignStmt(pos, ordinaryRoute, choose)
+		withinLimit := ir.NewBinaryExpr(pos, ir.OLE, argument, ir.NewInt(pos, abi.CoroOrdinarySpawnBatchLimit))
+		assignBatch := ir.NewAssignStmt(pos, batch, ir.NewLogicalExpr(pos, ir.OANDAND, ordinaryRoute, withinLimit))
 		var edit func(ir.Node) ir.Node
 		edit = func(node ir.Node) ir.Node {
 			switch node {
 			case launch:
-				call := typecheck.Call(launch.Body[0].Pos(), typecheck.LookupRuntime("coroOrdinarySpawnBatch"), ir.Nodes{worker.Nname, argument}, false)
-				return ir.NewIfStmt(node.Pos(), batch, ir.Nodes{call}, ir.Nodes{node})
+				entry := typecheck.LookupRuntime("coroOrdinarySpawnBatch")
+				spawnPos := launch.Body[0].Pos()
+				batchCall := typecheck.Call(spawnPos, entry, ir.Nodes{worker.batch.Nname, argument}, false)
+				plainCall := typecheck.Call(spawnPos, entry, ir.Nodes{worker.plain.Nname, argument}, false)
+				ordinaryLaunch := ir.NewIfStmt(node.Pos(), batch, ir.Nodes{batchCall}, ir.Nodes{plainCall})
+				return ir.NewIfStmt(node.Pos(), ordinaryRoute, ir.Nodes{ordinaryLaunch}, ir.Nodes{node})
 			case wait:
 				call := typecheck.Call(node.Pos(), typecheck.LookupRuntime("coroOrdinaryBatchYield"), nil, false)
 				return ir.NewIfStmt(node.Pos(), batch, ir.Nodes{call}, ir.Nodes{node})
@@ -108,8 +126,8 @@ func installOrdinarySpawnBatchEntry(candidate *lowerCandidate, candidates map[*i
 		for i, stmt := range ordinary.Body {
 			ordinary.Body[i] = edit(stmt)
 		}
-		condition := ir.NewLogicalExpr(pos, ir.OOROR, batch, ordinaryEntryCondition(fn, nil))
-		fn.Body = ir.Nodes{assign, ir.NewIfStmt(pos, condition, ordinary.Body, fn.Body)}
+		condition := ir.NewLogicalExpr(pos, ir.OOROR, ordinaryRoute, ordinaryEntryCondition(fn, nil))
+		fn.Body = ir.Nodes{assignRoute, assignBatch, ir.NewIfStmt(pos, condition, ordinary.Body, fn.Body)}
 		typecheck.Stmts(fn.Body)
 	})
 	return true

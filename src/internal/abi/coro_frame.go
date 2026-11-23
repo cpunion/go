@@ -17,6 +17,9 @@ const CoroFrameZeroMinBytes = 1024
 // CoroSpawnBatchFrameBytes bounds frame initialization under the ready lock.
 const CoroSpawnBatchFrameBytes = 256
 
+// CoroOrdinarySpawnBatchLimit bounds launches in one system-stack call.
+const CoroOrdinarySpawnBatchLimit = 64
+
 // CoroResumeTerminalOffset locates the aligned pair of terminal bytes just
 // before a resume context. A zero uint16 means normal execution on either
 // byte order. The runtime interprets nonzero terminal state.

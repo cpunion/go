@@ -227,7 +227,7 @@ func TestCBlockingGroupCapacity(t *testing.T) {
 
 func TestParallelYieldBatchBounds(t *testing.T) {
 	const rounds, work = 3, 32
-	for _, tasks := range []int{7, 8, 16, 64, 65} {
+	for _, tasks := range []int{7, 8, 16, 64, 65, 100, 128, 129} {
 		var want uint64
 		for seed := uint64(1); seed <= uint64(rounds*tasks); seed++ {
 			want += parallelWork(work, parallelWork(work, seed))

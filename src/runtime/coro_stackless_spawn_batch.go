@@ -230,7 +230,7 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 }
 
 func coroUseOrdinarySpawnBatch(count int) bool {
-	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 64 &&
+	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 128 &&
 		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
 }
 
@@ -241,6 +241,20 @@ func coroOrdinarySpawnBatch(fn func(), count int) {
 	caller := getg()
 	pc := sys.GetCallerPC()
 	entry := *(**funcval)(unsafe.Pointer(&fn))
+	if count > abi.CoroOrdinarySpawnBatchLimit {
+		// Use the regular runnext policy for repeated larger launches.
+		// Retain the compiler's source go statement as the creator.
+		for range count {
+			systemstack(func() {
+				pp := getg().m.p.ptr()
+				runqput(pp, newproc1(entry, caller, pc, false, waitReasonZero), true)
+				if mainStarted {
+					wakep()
+				}
+			})
+		}
+		return
+	}
 	systemstack(func() {
 		pp := getg().m.p.ptr()
 		if mainStarted && gomaxprocs > 1 {
