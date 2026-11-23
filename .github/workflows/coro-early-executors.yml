@@ -1,0 +1,30 @@
+name: Coroutine early executor admission
+
+on:
+  push:
+    branches:
+      - coro/measure-early-executors-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Compare executor startup and Go
+        run: bash .github/perf-coro-early-executors/measure.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-early-executors
+          path: ${{ runner.temp }}/coro-early-executors/results
+          if-no-files-found: error
