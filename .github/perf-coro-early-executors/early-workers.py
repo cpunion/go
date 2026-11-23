@@ -19,16 +19,16 @@ def replace(source, old, new, count=1):
 original = scheduler.read_text()
 spawn = batch.read_text()
 prepare = """
-// Start bounded helpers before taking the queue lock. They can wait on an
-// ordinary Go stack while the producer initializes the first ready prefix.
-func (s *stacklessCoroScheduler) startInitialSpawnWorkers(parent *stacklessCoroTask,
-	remaining, limit int) chan struct{} {
-	if !stacklessCoroNativeStackAvailable || raceenabled || gomaxprocs < 3 ||
-		parent != &s.root || remaining <= limit || remaining < 8 || remaining > 64 ||
-		s.spawned() || !s.canAssist() || stacklessCoroIsPullComparison(s) || !getg().stackIsFixed() ||
-		s.executorState.Load() != stacklessCoroExecutorStateOff {
-		return nil
-	}
+func (s *stacklessCoroScheduler) initialSpawnNeedsWorkers(parent *stacklessCoroTask, remaining, limit int) bool {
+	return stacklessCoroNativeStackAvailable && !raceenabled && gomaxprocs >= 3 &&
+		parent == &s.root && remaining > limit && remaining >= 8 && remaining <= 64 &&
+		!s.spawned() && s.canAssist() && !stacklessCoroIsPullComparison(s) && getg().stackIsFixed() &&
+		s.executorState.Load() == stacklessCoroExecutorStateOff
+}
+
+// Start bounded helpers on ordinary stacks. They can wait while the
+// producer initializes the first ready prefix.
+func (s *stacklessCoroScheduler) startInitialSpawnWorkers() chan struct{} {
 	s.prepareReplacementExecutors()
 	target := uint32(min(gomaxprocs, WORKERS))
 	if !s.executorCount.CompareAndSwap(1, target) {
@@ -79,10 +79,13 @@ def batch_schedule(code, after_publish):
 	s.prepareReplacementExecutors()""", """	unlock(&s.lock)
 	FINISH
 	s.prepareReplacementExecutors()""", 2)
-    start = "published := s.startInitialSpawnWorkers(parent, remaining, limit)"
+    reserve = "var published chan struct{}\n\tif wanted {\n\t\tpublished = s.startInitialSpawnWorkers()\n\t}"
+    start = "wanted := s.initialSpawnNeedsWorkers(parent, remaining, limit)"
     finish = "if published != nil {\n\t\tclose(published)\n\t}"
     if after_publish:
-        start, finish = "", start + "\n\t" + finish
+        finish = reserve + "\n\t" + finish
+    else:
+        start += "\n\t" + reserve
     return code.replace("START", start).replace("FINISH", finish)
 
 

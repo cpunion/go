@@ -6,6 +6,9 @@ scratch="$RUNNER_TEMP/coro-early-executors"
 out="$scratch/results"
 mkdir -p "$scratch"/{bench,cache,overlays,results}
 test "$(uname -s -m)" = 'Linux x86_64'
+if ! git cat-file -e "$revision^{commit}"; then
+    git fetch --depth=1 --no-tags origin "$revision"
+fi
 git worktree add --detach "$scratch/sdk" "$revision"
 test "$(git -C "$scratch/sdk" rev-parse HEAD)" = "$revision"
 
@@ -60,5 +63,9 @@ for mode in base early3 after3; do
     "$sdk" tool objdump -s '\.parallelYieldWork\.coro\.func1$' "$mode-trace.test" |
         awk '/CALL.*coroSpawnScalarBatch/ { print; found=1 } END { if (!found) exit 1 }' > "$out/$mode-route.asm"
     python3 -B "$recipe/measure-cold-dispatch.py" "$mode-trace.test" "$out/$mode" 36
+    if test "$mode" != base; then
+        python3 -B -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ParallelYieldWork16/P4"]["entry_to_early_worker"]["samples"] > 0' \
+            "$out/$mode/cold-dispatch-summary.json"
+    fi
     gzip "$out/$mode/cold-dispatch.jsonl"
 done
