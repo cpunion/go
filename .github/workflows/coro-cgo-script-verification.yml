@@ -1,0 +1,29 @@
+name: Direct C scripts on native Linux amd64
+
+on:
+  push:
+    branches:
+      - coro/verify-bounded-cgo-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: Build Go and run the two direct C scripts
+        shell: bash
+        run: |
+          test "$(uname -s -m)" = 'Linux x86_64'
+          export GOTOOLCHAIN=local GOENV=off GOWORK=off
+          export GOROOT_BOOTSTRAP="$(go env GOROOT)"
+          (cd src && ./make.bash)
+          bin/go version
+          bin/go test -p 4 -count=1 -timeout=8m -v cmd/go             -run '^TestScript/cgo_coro_(direct_metadata|pointer_results)$'
