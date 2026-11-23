@@ -38,6 +38,10 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_t
 	yield := false
 	size := typ.Size_
 	limit := min(remaining, len(tasks), abi.CoroSpawnBatchFrameBytes/int(size))
+	// Yield at the end of this prefix so the owner can consume it
+	// before the producer resumes the rest of this small counting loop.
+	handoff := gomaxprocs > 1 && !raceenabled && remaining > limit && remaining >= 8 && remaining <= 64 &&
+		parent == &s.root && !s.spawned() && !stacklessCoroIsPullComparison(s)
 	ready := s.runnableState.Load() &^ stacklessCoroForeignReturnerBit
 	reserve := !raceenabled && !isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	for count < limit {
@@ -95,7 +99,7 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_t
 		s.signal()
 	}
 	s.wakeReplacementExecutor(live, runnable)
-	return count, yield
+	return count, yield || handoff
 }
 
 // coroSpawnFrameBatch publishes consecutive spawns with the same pointer-
@@ -123,6 +127,10 @@ func coroSpawnFrameBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ, all
 	yield := false
 	size := typ.Size_
 	limit := min(remaining, len(tasks), abi.CoroSpawnBatchFrameBytes/int(size))
+	// Yield at the end of this prefix so the owner can consume it
+	// before the producer resumes the rest of this small counting loop.
+	handoff := gomaxprocs > 1 && !raceenabled && remaining > limit && remaining >= 8 && remaining <= 64 &&
+		parent == &s.root && !s.spawned() && !stacklessCoroIsPullComparison(s)
 	ready := s.runnableState.Load() &^ stacklessCoroForeignReturnerBit
 	reserve := !raceenabled && !isStacklessCoroUncachedFrameLineage(parent.frameSize)
 	for count < limit {
@@ -184,7 +192,7 @@ func coroSpawnFrameBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ, all
 		s.signal()
 	}
 	s.wakeReplacementExecutor(live, runnable)
-	return count, yield
+	return count, yield || handoff
 }
 
 // publishSpawnBatchLocked appends new independent tasks to the shared FIFO
