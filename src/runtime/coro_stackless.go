@@ -1738,6 +1738,13 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	var directInitialRoot, fromAssist bool
 	var lane *stacklessCoroAssistLane
 	var useWide bool
+	// A managed driver with one queued successor can rotate logical tasks
+	// without entering the Go scheduler on each yield. Keep public and hosted
+	// drivers on their existing paths.
+	managedDispatch := stacklessCoroLinuxARM64Managed && !stacklessCoroNativeStackAvailable &&
+		!public && !assist && !raceenabled && !stacklessCoroIsPullComparison(s) &&
+		currentStacklessCoroHost() == nil
+	const managedYieldInterval = 64
 	var probe stacklessCoroWorkProbe
 	if native && !public && !assist && gomaxprocs >= 2 &&
 		s.lifetime.Load()&stacklessCoroLifetimeDeferredExecutors != 0 {
@@ -1982,6 +1989,11 @@ resumeOwned:
 		// checks before reserving the next logical task.
 		dispatch := native && !public && !s.prefersManagedCompute() && action == stacklessCoroActionYield &&
 			!raceenabled && !stacklessCoroIsPullComparison(s) && hostYieldCheck != ^uint8(0)
+		if managedDispatch && action == stacklessCoroActionYield && gomaxprocs <= 4 &&
+			hostYieldCheck < managedYieldInterval-1 && s.runnableState.Load() == 1 &&
+			s.canAssist() && !getg().preempt {
+			dispatch = true
+		}
 		next, resumeDirectly, foreignReturner := s.yield(task, native && !s.prefersManagedCompute(), dispatch)
 		if next != nil {
 			hostYieldCheck++
@@ -2004,6 +2016,9 @@ resumeOwned:
 			goto resume
 		}
 		if !native {
+			if managedDispatch {
+				hostYieldCheck = 0
+			}
 			Gosched()
 			break
 		}
@@ -5486,7 +5501,7 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 	return task
 }
 
-// dispatch allows a native driver to reserve the FIFO successor while it
+// dispatch allows an eligible driver to reserve the FIFO successor while it
 // still holds the ready lock. Foreign returners must first get a chance at P.
 func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch bool) (next *stacklessCoroTask, resumeDirectly, foreignReturner bool) {
 	lock(&s.lock)
@@ -5503,7 +5518,7 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, native, dispatch
 		unlock(&s.lock)
 		return nil, true, false
 	}
-	// Native FIFO rotation keeps the same ready count. Hosts and structured
+	// FIFO rotation keeps the same ready count. Hosts and structured
 	// publications retain their routing and source metadata updates.
 	lifetime := s.lifetime.Load()
 	if dispatch && !getg().preempt && s.head != nil &&
