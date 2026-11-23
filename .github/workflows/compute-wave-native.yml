@@ -1,0 +1,30 @@
+name: Coroutine early spawn comparison
+
+on:
+  push:
+    branches:
+      - coro/measure-early-spawn-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Compare exact native toolchains
+        run: bash .github/perf-compute-wave/measure.sh 435e07371d700fc0d84a9090ee4ec5e73a360320 e16abc1c2b76514fe60b655135590f360bd683f8
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-compute-wave
+          path: ${{ runner.temp }}/coro-compute-wave/validation
+          if-no-files-found: error
