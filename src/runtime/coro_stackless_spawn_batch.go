@@ -236,7 +236,7 @@ func coroUseOrdinarySpawnBatch(count int) bool {
 	limit := abi.CoroOrdinarySpawnBatchLimit
 	if stacklessCoroLinuxARM64Managed {
 		limit = 128
-		if !stacklessCoroNativeStackAvailable {
+		if !stacklessCoroNativeStackAvailable || gomaxprocs == 2 {
 			// Wider eligible fan-outs avoid contention between managed drivers.
 			limit = 1024
 		}
@@ -253,6 +253,10 @@ func coroOrdinarySpawnBatch(fn func(), count int) {
 	pc := sys.GetCallerPC()
 	entry := *(**funcval)(unsafe.Pointer(&fn))
 	if count > abi.CoroOrdinarySpawnBatchLimit {
+		if stacklessCoroLinuxARM64Managed && gomaxprocs == 2 {
+			coroOrdinarySpawnChunks(entry, caller, pc, count)
+			return
+		}
 		// Use the regular runnext policy for repeated larger launches.
 		// Retain the compiler's source go statement as the creator.
 		for range count {
@@ -284,6 +288,26 @@ func coroOrdinarySpawnBatch(fn func(), count int) {
 			wakep()
 		}
 	})
+}
+
+// On two Ps, publish bounded groups to amortize scheduler entry and wake
+// the spare P once per group. Each worker retains the source creator PC and
+// the ordinary runnext policy.
+func coroOrdinarySpawnChunks(entry *funcval, caller *g, pc uintptr, count int) {
+	const width = 16
+	for count > 0 {
+		n := min(count, width)
+		systemstack(func() {
+			pp := getg().m.p.ptr()
+			for range n {
+				runqput(pp, newproc1(entry, caller, pc, false, waitReasonZero), true)
+			}
+			if mainStarted {
+				wakep()
+			}
+		})
+		count -= n
+	}
 }
 
 func coroOrdinaryBatchYield() {
