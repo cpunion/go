@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -835,7 +836,15 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 		throw("runtime: nil stackless coroutine resume function")
 	}
 	if s.wake == nil {
-		s.wake = acquireStacklessCoroWake()
+		if goexperiment.CgoCheck2 && getg().stackIsFixed() {
+			// The native executor's thread stack is outside Go's stack
+			// spans. Receive the cached Go channel on the executor's
+			// Go-allocated scheduler stack so cgocheck2 can classify
+			// the temporary destination.
+			systemstack(func() { s.wake = acquireStacklessCoroWake() })
+		} else {
+			s.wake = acquireStacklessCoroWake()
+		}
 	}
 	s.executorCount.Store(1)
 	lockInit(&s.lock, lockRankStacklessCoro)
