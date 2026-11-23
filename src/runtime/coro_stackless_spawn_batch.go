@@ -230,7 +230,7 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 }
 
 func coroUseOrdinarySpawnBatch(count int) bool {
-	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 4 && !raceenabled && count >= 8 && count <= 64 &&
+	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 64 &&
 		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
 }
 
@@ -245,7 +245,7 @@ func coroOrdinarySpawnBatch(fn func(), count int) {
 		pp := getg().m.p.ptr()
 		if mainStarted && gomaxprocs > 1 {
 			var prefix gQueue
-			n := min(count, 3)
+			n := min(count, 3, int(gomaxprocs)-1)
 			for range n {
 				prefix.pushBack(newproc1(entry, caller, pc, false, waitReasonZero))
 			}
