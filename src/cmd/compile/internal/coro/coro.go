@@ -705,7 +705,13 @@ func (p *Plan) calledExec(function *Function) ExecFlags {
 			continue
 		}
 		if summary, known := p.edgeSummary(edge); known {
-			flags |= summary.Exec
+			exec := summary.Exec
+			if edge.Kind == DirectCall && ordinaryThreadCall(edge.Node) {
+				// LockOSThread runs on the ordinary host. Its stack
+				// requirement does not apply to the calling resume.
+				exec &^= NeedsGoStack
+			}
+			flags |= exec
 		}
 	}
 	return flags
