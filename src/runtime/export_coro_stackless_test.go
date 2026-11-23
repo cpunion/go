@@ -9,10 +9,16 @@ package runtime
 import (
 	"internal/abi"
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
 var StacklessCoroUseOrdinaryForTest = coroUseOrdinary
+
+func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {
+	gp := getg()
+	return gp.stackIsFixed(), sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi
+}
 
 type stacklessCoroFrameChunkExportFrame struct {
 	depth   int

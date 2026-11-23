@@ -9,17 +9,11 @@ package runtime
 import (
 	"internal/abi"
 	"internal/runtime/gc"
-	"internal/runtime/sys"
 	"unsafe"
 )
 
 func StacklessCoroNativeYieldUnsupportedForTest() bool {
 	return yieldStacklessCoroNative(nil, nil)
-}
-
-func StacklessCoroNativeStackForTest() (native bool, sp, lo, hi, g0lo, g0hi uintptr) {
-	gp := getg()
-	return gp.stackIsFixed(), sys.GetCallerSP(), gp.stack.lo, gp.stack.hi, gp.m.g0.stack.lo, gp.m.g0.stack.hi
 }
 
 func StacklessCoroNativeSignalTargetForTest() *M {
