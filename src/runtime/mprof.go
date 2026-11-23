@@ -926,9 +926,10 @@ func (r *MemProfileRecord) Stack() []uintptr {
 // the testing package's -test.memprofile flag instead
 // of calling MemProfile directly.
 func MemProfile(p []MemProfileRecord, inuseZero bool) (n int, ok bool) {
+	i := 0
 	return memProfileInternal(len(p), inuseZero, func(r profilerecord.MemProfileRecord) {
-		copyMemProfileRecord(&p[0], r)
-		p = p[1:]
+		copyMemProfileRecord(&p[i], r)
+		i++
 	})
 }
 
