@@ -230,7 +230,7 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 }
 
 func coroUseOrdinarySpawnBatch(count int) bool {
-	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 64 &&
+	return GOOS == "linux" && (GOARCH == "arm64" || GOARCH == "amd64") && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= 64 &&
 		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
 }
 

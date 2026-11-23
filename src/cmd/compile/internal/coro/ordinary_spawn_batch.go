@@ -19,7 +19,7 @@ func installOrdinarySpawnBatchEntry(candidate *lowerCandidate, candidates map[*i
 	bodies *BodyReader, workers map[*ir.Func]*ir.Func) bool {
 	fn := candidate.function.Func
 	ordinary := candidate.ordinary
-	if buildcfg.GOOS != "linux" || buildcfg.GOARCH != "arm64" || base.Flag.Cfg.Instrumenting ||
+	if buildcfg.GOOS != "linux" || (buildcfg.GOARCH != "arm64" && buildcfg.GOARCH != "amd64") || base.Flag.Cfg.Instrumenting ||
 		bodies == nil || bodies.Clone == nil || fn.OClosure != nil || fn.Type().HasShape() ||
 		candidate.rangeOwner != nil || candidate.rangeBody != nil || candidate.function.Terminal != 0 ||
 		candidate.function.Exec != NeedsTaskContext || len(candidate.function.Sites) != 2 {
