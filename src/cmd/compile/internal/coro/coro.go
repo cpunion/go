@@ -452,6 +452,12 @@ func analyze(funcs []*ir.Func, cgoDirectives [][]string, specializedTargets map[
 }
 
 func (p *Plan) scan(function *Function, localTargets map[*ir.Name][]*ir.Func) {
+	// An ordinary cgo wrapper enters a syscall through runtime.cgocall.
+	// It cannot release a logical scheduler's executor or start a replacement.
+	// Admitted direct-call recipes provide their own foreign-call handoff.
+	if function.Func.Pragma&ir.CgoUnsafeArgs != 0 {
+		function.LocalExec |= NeedsGoStack
+	}
 	// An ABI adapter for a generated cgo wrapper calls the wrapper with the
 	// same symbol name. The direct-call metadata describes source calls to
 	// that wrapper, not this compiler-generated adapter.
