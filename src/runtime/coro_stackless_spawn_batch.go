@@ -94,7 +94,7 @@ func coroSpawnScalarBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ *_t
 		runnable = s.runnableState.Add(queued)
 	}
 	unlock(&s.lock)
-	s.prepareReplacementExecutors()
+	s.prepareReplacementExecutorsForInitialBatch(handoff && remaining <= stacklessCoroSpawnBatchSize)
 	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
 		s.signal()
 	}
@@ -187,7 +187,7 @@ func coroSpawnFrameBatch(ctx unsafe.Pointer, child stacklessCoroResume, typ, all
 		runnable = s.runnableState.Add(queued)
 	}
 	unlock(&s.lock)
-	s.prepareReplacementExecutors()
+	s.prepareReplacementExecutorsForInitialBatch(handoff && remaining <= stacklessCoroSpawnBatchSize)
 	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
 		s.signal()
 	}

@@ -6007,6 +6007,10 @@ func (s *stacklessCoroScheduler) needsWarmExecutor(count uint32) bool {
 }
 
 func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
+	s.prepareReplacementExecutorsForInitialBatch(false)
+}
+
+func (s *stacklessCoroScheduler) prepareReplacementExecutorsForInitialBatch(handoff bool) {
 	// Spawn calls this for every child, but preparation happens only once
 	// during a scheduler lifetime. Avoid an atomic read-modify-write after
 	// another caller has started preparing or running the executors.
@@ -6019,7 +6023,11 @@ func (s *stacklessCoroScheduler) prepareReplacementExecutors() {
 		s.executorState.Store(stacklessCoroExecutorStateSingleP)
 		return
 	}
-	s.startReplacementExecutors(getg().stackIsFixed())
+	// A small batch that is about to hand off can use an idle P while
+	// the public driver leaves its native episode. Larger batches retain
+	// demand-based admission to avoid competing with short callbacks.
+	early := handoff && stacklessCoroLinuxARM64Managed && gomaxprocs == 4
+	s.startReplacementExecutors(getg().stackIsFixed() && !early)
 }
 
 // Before promotion there is only the original driver. The active task keeps
