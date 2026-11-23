@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build goexperiment.coro && ((darwin && arm64) || (linux && amd64))
+//go:build goexperiment.coro && ((darwin && arm64) || (linux && (amd64 || arm64)))
 
 package runtime
 
@@ -10,7 +10,7 @@ import "unsafe"
 
 const stacklessCoroScalarTaskCacheClass = 4
 
-// The208B scalar chunk occupies one exact allocator class on native targets.
+// The 208-byte scalar chunk occupies one exact allocator class on supported targets.
 var (
 	_ [208 - unsafe.Sizeof(stacklessCoroScalarTaskChunk{})]byte
 	_ [unsafe.Sizeof(stacklessCoroScalarTaskChunk{}) - 208]byte
