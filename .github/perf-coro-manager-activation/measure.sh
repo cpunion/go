@@ -26,7 +26,7 @@ grep -Fq "${revision:0:8}" validation/sdk-version.txt
 cp -R sdk/src/cmd/compile/testdata/corobench/. bench/
 cp "$files/bench.py" "$files/compute_test.go" bench/
 cp "$files/progress/main.go" progress/
-cp "$files"/*.py "$files"/screen-*.sh .
+cp "$files"/*.py "$files"/*.sh .
 for phase in queue transfer timer-reuse channels handoff manager-worker parked progress; do
     printf 'Running %s\n' "$phase"
     bash "screen-$phase.sh"
