@@ -230,12 +230,18 @@ func (s *stacklessCoroScheduler) publishSpawnBatchLocked(tasks []*stacklessCoroT
 }
 
 func coroUseOrdinarySpawnBatch(count int) bool {
-	limit := 128
-	if !stacklessCoroNativeStackAvailable {
-		// Wider eligible fan-outs avoid contention between managed drivers.
-		limit = 1024
+	if GOOS != "linux" || (GOARCH != "arm64" && GOARCH != "amd64") {
+		return false
 	}
-	return stacklessCoroLinuxARM64Managed && gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= limit &&
+	limit := abi.CoroOrdinarySpawnBatchLimit
+	if stacklessCoroLinuxARM64Managed {
+		limit = 128
+		if !stacklessCoroNativeStackAvailable {
+			// Wider eligible fan-outs avoid contention between managed drivers.
+			limit = 1024
+		}
+	}
+	return gomaxprocs >= 2 && !raceenabled && count >= 8 && count <= limit &&
 		getg().stacklessCoro == nil && !getg().stackIsFixed() && !coroUseOrdinary()
 }
 
