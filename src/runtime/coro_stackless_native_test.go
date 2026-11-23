@@ -954,16 +954,31 @@ func TestStacklessCoroHybridDriverChoice(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "arm64" {
 		t.Skip("Linux arm64 driver selection")
 	}
-	p := runtime.GOMAXPROCS(2)
+	p := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(p)
-	for _, count := range []int{2, 4, 2, 4} {
+	for _, count := range []int{1, 2, 4, 2, 1} {
 		runtime.GOMAXPROCS(count)
-		runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
-			native, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest()
-			if native != (count >= 4) {
-				t.Errorf("GOMAXPROCS=%d: fixed stack = %v", count, native)
-			}
+		childNative := make(chan bool, 1)
+		var rootNative bool
+		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+			rootNative, _, _, _, _, _ = runtime.StacklessCoroNativeStackForTest()
+			runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+				native, _, _, _, _, _ := runtime.StacklessCoroNativeStackForTest()
+				childNative <- native
+				return runtime.StacklessCoroActionComplete
+			})
 			return runtime.StacklessCoroActionComplete
 		})
+		if rootNative != (count >= 4) {
+			t.Errorf("GOMAXPROCS=%d: fixed stack for public root = %v", count, rootNative)
+		}
+		select {
+		case native := <-childNative:
+			if native != (count >= 2) {
+				t.Errorf("GOMAXPROCS=%d: fixed stack for detached child = %v", count, native)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("GOMAXPROCS=%d: detached child did not run", count)
+		}
 	}
 }

@@ -154,8 +154,12 @@ func init() {
 // the managed-stack driver for now.
 func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	initial, public bool) *stacklessCoroScheduler {
-	if raceenabled || GOOS == "linux" && GOARCH == "arm64" &&
-		gomaxprocs < 4 && d.context == nil || s.prefersManagedCompute() {
+	// On Linux arm64 the public caller starts on its Go stack at low P
+	// counts, so the first spawn can wake a replacement without waiting for
+	// a native handoff. Detached executors can use the fixed stack with two
+	// Ps and dispatch short logical yields within the same episode.
+	if raceenabled || GOOS == "linux" && GOARCH == "arm64" && d.context == nil &&
+		(gomaxprocs < 2 || public && gomaxprocs < 4) || s.prefersManagedCompute() {
 		return nil
 	}
 	if d.context == nil {
