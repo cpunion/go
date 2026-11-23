@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 revision="$1"
+shift
 files="$(cd "$(dirname "$0")" && pwd -P)"
 root="$RUNNER_TEMP/coro-manager-activation"
 mkdir -p "$root/bench" "$root/cache" "$root/overlays" "$root/validation" "$root/progress"
@@ -27,7 +28,10 @@ cp -R sdk/src/cmd/compile/testdata/corobench/. bench/
 cp "$files/bench.py" "$files/compute_test.go" bench/
 cp "$files/progress/main.go" progress/
 cp "$files"/*.py "$files"/*.sh .
-for phase in queue transfer timer-reuse channels handoff manager-worker parked progress; do
+if (( $# == 0 )); then
+    set -- queue transfer timer-reuse channels handoff manager-worker parked progress
+fi
+for phase; do
     printf 'Running %s\n' "$phase"
     bash "screen-$phase.sh"
 done

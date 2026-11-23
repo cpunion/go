@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - coro/measure-manager-activation-20261123
+      - coro/measure-first-child-20261123
 
 permissions:
   contents: read
@@ -25,7 +26,13 @@ jobs:
           go-version: '1.27.3'
           cache: false
       - name: Compare the manager and native stack handoff
-        run: bash .github/perf-coro-manager-activation/measure.sh 435e07371d700fc0d84a9090ee4ec5e73a360320
+        run: |
+          if [[ "$GITHUB_REF_NAME" == coro/measure-first-child-20261123 ]]; then
+            set -- owner-startup measured-dispatch prepared-owner
+          else
+            set --
+          fi
+          bash .github/perf-coro-manager-activation/measure.sh 435e07371d700fc0d84a9090ee4ec5e73a360320 "$@"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
