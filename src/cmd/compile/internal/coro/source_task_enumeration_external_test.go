@@ -16,8 +16,9 @@ import (
 
 func TestSourceIndependentTaskEnumeration(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
-		t.Skip("native coroutine executor is not supported")
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")) {
+		t.Skip("coroutine source enumeration is not supported")
 	}
 	const program = `package main
 import("bytes";"context";"fmt";"os";"runtime";"runtime/metrics";"runtime/pprof";"strconv";"strings";"sync/atomic";"time")

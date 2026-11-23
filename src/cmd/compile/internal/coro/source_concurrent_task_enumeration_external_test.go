@@ -15,8 +15,9 @@ import (
 
 func TestSourceConcurrentTaskEnumeration(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
-		t.Skip("native coroutine executor is not supported")
+	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" ||
+		runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")) {
+		t.Skip("coroutine source enumeration is not supported")
 	}
 	// Keep enumerating during active native resumes, frame transitions, host
 	// promotion and completion. Parked-only tests cannot expose private resume
