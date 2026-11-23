@@ -1741,7 +1741,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public, assist 
 	// A managed driver with one queued successor can rotate logical tasks
 	// without entering the Go scheduler on each yield. Keep public and hosted
 	// drivers on their existing paths.
-	managedDispatch := stacklessCoroLinuxARM64Managed && !stacklessCoroNativeStackAvailable &&
+	managedDispatch := stacklessCoroLinuxARM64Managed && !native &&
 		!public && !assist && !raceenabled && !stacklessCoroIsPullComparison(s) &&
 		currentStacklessCoroHost() == nil
 	const managedYieldInterval = 64
@@ -1990,6 +1990,7 @@ resumeOwned:
 		dispatch := native && !public && !s.prefersManagedCompute() && action == stacklessCoroActionYield &&
 			!raceenabled && !stacklessCoroIsPullComparison(s) && hostYieldCheck != ^uint8(0)
 		if managedDispatch && action == stacklessCoroActionYield && gomaxprocs <= 8 &&
+			(!stacklessCoroNativeStackAvailable || gomaxprocs == 1) &&
 			hostYieldCheck < managedYieldInterval-1 && s.runnableState.Load() == 1 &&
 			s.canAssist() && !getg().preempt {
 			dispatch = true
