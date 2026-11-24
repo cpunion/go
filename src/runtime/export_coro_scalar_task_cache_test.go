@@ -45,8 +45,7 @@ func CheckStacklessCoroScalarTaskCacheForTest() bool {
 	if unsafe.Sizeof(stacklessCoroTask{}) != 48 || unsafe.Sizeof(stacklessCoroScalarTaskChunk{}) != 208 {
 		return false
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	var chunks [48]*stacklessCoroScalarTaskChunk
 	for i := range chunks {
 		chunk := scalarTaskCacheChunkForTest()
@@ -143,8 +142,7 @@ func CheckStacklessCoroScalarTaskCacheForTest() bool {
 }
 
 func StacklessCoroScalarTaskCachePopulationForTest(n int) ([]unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) {
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	tokens := make([]unsafe.Pointer, n*4)
 	for i := 0; i < n; i++ {
 		chunk := scalarTaskCacheChunkForTest()
@@ -163,8 +161,7 @@ func StacklessCoroScalarTaskCacheNextForTest(p unsafe.Pointer) unsafe.Pointer {
 	return unsafe.Pointer((*stacklessCoroTask)(p).next)
 }
 func StacklessCoroScalarTaskCacheFillForTest(n int) (uint32, uintptr) {
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	for range n {
 		scalarTaskCacheWholeForTest(s, scalarTaskCacheChunkForTest())
 	}
@@ -201,8 +198,7 @@ func CheckStacklessCoroScalarTaskCacheConcurrentForTest() bool {
 	done := make(chan struct{}, 4)
 	for range 4 {
 		go func() {
-			s := new(stacklessCoroScheduler)
-			lockInit(&s.lock, lockRankStacklessCoro)
+			s := newStacklessCoroTestScheduler()
 			for range 1000 {
 				chunk := takeStacklessCoroCompletedScalarTaskChunk()
 				if chunk == nil {
@@ -256,8 +252,7 @@ func StacklessCoroScalarTaskCacheFatalForTest(mode string) {
 		cacheStacklessCoroCompletedScalarTaskChunk(task)
 		return
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	scalarTaskCacheWholeForTest(s, scalarTaskCacheChunkForTest())
 	lock(&stacklessCoroSharedOperations.lock)
 	g := &stacklessCoroCompletedTasks.generations[stacklessCoroChannelCache.young]

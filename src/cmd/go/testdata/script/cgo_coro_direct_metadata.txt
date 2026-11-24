@@ -1,4 +1,7 @@
 [!cgo] skip
+[!GOOS:darwin] [!GOOS:linux] skip
+[GOOS:darwin] [!GOARCH:arm64] skip
+[GOOS:linux] [!GOARCH:amd64] skip
 
 env GOEXPERIMENT=coro
 mkdir direct
@@ -49,9 +52,9 @@ grep '[*]result = add_pair[(][*]p0, [*]p1[)]' direct/main.cgo2.c
 grep 'value = errno_pair[(][*]p0, p1[)]' direct/main.cgo2.c
 ! grep 'cgo_direct.*may_callback' direct/_cgo_gotypes.go
 go build -gcflags='-l -d=coro=4' -o program .
-stderr 'coro: func=main.main effect=nosuspend local=nosuspend .* primary=coro exec=block-thread,system-abi'
-stderr 'coro: site=[0-9]+ func=main.main kind=foreign foreign=direct-mayblock'
-stderr 'coro: phase=lower lowered=5 skipped=0'
+stderr 'coro: func=main\.runDirect effect=nosuspend local=nosuspend .* primary=coro exec=block-thread,system-abi'
+stderr 'coro: site=[0-9]+ func=main\.runDirect kind=foreign foreign=direct-mayblock'
+stderr 'coro: skip main\.C\.may_callback: ordinary helper requires growing Go stack'
 exec ./program
 stderr '^42$'
 
@@ -79,14 +82,14 @@ stdout '_Cdirect_add_u64'
 stdout 'add_u64'
 ! stdout 'runtime.cgocall'
 ! stdout 'runtime.asmcgocall'
-go tool objdump -s 'main\.main\.coro\.func1' program
+go tool objdump -s 'main\.runDirect\.coro\.func1' program
 stdout '_Cdirect_add_u64'
 stdout '_Cdirect_mix_fp'
 stdout '_Cdirect_call_sin'
 stdout '_Cdirect2_errno_value'
 stdout '_Cdirect2_errno_void'
 stdout '_Cdirect2_errno_pair'
-stdout '_Cfunc_may_callback'
+! stdout '_Cfunc_may_callback'
 ! stdout '_Cfunc_add_u64'
 ! stdout '_C2func_errno_value'
 ! stdout 'runtime.cgocall'
@@ -101,6 +104,8 @@ stdout '_Cdirect2_errno_value'
 go tool objdump -s 'main\.orderedArgument\.coro\.func1' program
 stdout 'runtime.coroPanic'
 ! stdout 'runtime.gopanic'
+go tool objdump -s '^main\.main$' program
+stdout '_Cfunc_may_callback'
 go tool objdump -s 'main\._Cfunc_may_callback' program
 stdout 'runtime.cgocall'
 
@@ -108,7 +113,7 @@ stdout 'runtime.cgocall'
 [race] ! stderr 'coro: phase=lower'
 [race] exec ./raceprogram
 [race] stderr '^42$'
-[race] go tool objdump -s 'main\.main$' raceprogram
+[race] go tool objdump -s 'main\.runDirect$' raceprogram
 [race] stdout '_Cfunc_add_u64'
 [race] ! stdout '_Cdirect_add_u64'
 [race] go tool objdump -s 'main\._Cfunc_add_u64' raceprogram
@@ -234,8 +239,15 @@ func pairCalls(iterations int) C.pair_t {
 }
 
 func main() {
+	if C.may_callback(9) != 9 {
+		panic("bad ordinary C ABI result")
+	}
+	runDirect()
+}
+
+//go:noinline
+func runDirect() {
 	value := C.add_u64(orderedArgument(19, 0), orderedArgument(23, 1))
-	callbackValue := C.may_callback(9)
 	mixed := C.mix_i(-5, 600, -70000, 80000)
 	var slot C.uint32_t
 	C.set_u32(&slot, 77)
@@ -251,7 +263,7 @@ func main() {
 	steadyErrnoValue, steadyErrnoErr := errnoCall(C.EBUSY)
 	pair := pairCalls(3)
 	errnoPair, pairErr := C.errno_pair(C.pair_t{x: 9, y: 1.5}, C.ERANGE)
-	if argumentOrder != 2 || callbackValue != 9 || mixed != 10595 ||
+	if argumentOrder != 2 || mixed != 10595 ||
 		slot != 77 || narrow != -120 || staticValue != 42 ||
 		mixedFloat != 3.75 || scaledFloat != 3 ||
 		sine != sine || sine < 0.479425 || sine > 0.479426 ||

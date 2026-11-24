@@ -156,16 +156,29 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 				if unsafe.Sizeof(uintptr(0)) == 8 && !raceenabled {
 					task := s.reservedTasks
 					base, span, _ := findObject(uintptr(unsafe.Pointer(task)), 0, 0)
-					if isStacklessCoroScalarTaskCacheMarker(task.frameSize) {
-						index := uintptr(stacklessCoroScalarTaskCacheFirst - task.frameSize)
-						chunk := (*stacklessCoroScalarTaskChunk)(unsafe.Add(unsafe.Pointer(task), -int(index*unsafe.Sizeof(*task))))
-						if s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount ||
-							base != uintptr(unsafe.Pointer(chunk)) || span.elemsize != unsafe.Sizeof(*chunk) ||
-							unsafe.Pointer(frame) != unsafe.Pointer(&chunk.frames[index]) {
+					if s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
+						if task.frameSize != stacklessCoroUncachedFrameLineage ||
+							base != uintptr(unsafe.Pointer(task)) ||
+							span.elemsize != unsafe.Sizeof(stacklessCoroTask{}) {
 							probe.failed.Add(1)
 						}
-					} else if base != uintptr(unsafe.Pointer(task)) || span.elemsize != unsafe.Sizeof(stacklessCoroTask{}) {
-						probe.failed.Add(1)
+					} else {
+						offset := uintptr(unsafe.Pointer(task)) - base
+						index := offset / unsafe.Sizeof(*task)
+						chunk := (*stacklessCoroScalarTaskChunk)(unsafe.Pointer(base))
+						if offset%unsafe.Sizeof(*task) != 0 || index >= stacklessCoroTaskChunkSize ||
+							span.elemsize != unsafe.Sizeof(*chunk) ||
+							unsafe.Pointer(frame) != unsafe.Pointer(&chunk.frames[index]) {
+							probe.failed.Add(1)
+						} else {
+							wantFrameSize := stacklessCoroScalarTaskFrameMarker(task, unsafe.Pointer(&chunk.frames[index]))
+							if wantFrameSize == 0 {
+								wantFrameSize = stacklessCoroUncachedFrameLineage
+							}
+							if task.frameSize != wantFrameSize {
+								probe.failed.Add(1)
+							}
+						}
 					}
 				}
 				payload := &stacklessCoroTaskFramePayload{value: uint64(i) + 17, probe: probe}

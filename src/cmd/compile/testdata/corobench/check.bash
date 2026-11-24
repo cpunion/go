@@ -45,6 +45,13 @@ cd "$script_dir"
 export GO111MODULE=off
 export GOEXPERIMENT=coro
 
+# Match internal/platform.CoroDirectSupported. TestProbes exercises the
+# ordinary C wrappers on targets that do not have a direct C ABI.
+direct_c=false
+case "$("$coro_goroot/bin/go" env GOOS)/$("$coro_goroot/bin/go" env GOARCH)" in
+	darwin/arm64 | linux/amd64) direct_c=true ;;
+esac
+
 if ! "$coro_goroot/bin/go" test -count=1 -covermode=set \
 	-coverprofile="$probe_coverage" -gcflags='-l -d=coro=4' \
 	>"$correctness_output" 2>&1; then
@@ -198,15 +205,12 @@ expected=(
 	blockingTCPRead
 	blockingTCPRelease
 	blockingTCPRoundTrips
-	cScalarCalls
-	cPairCalls
-	cErrnoCalls
-	cLibmCalls
 	handoffWorker
-	cBlockingHandoffs
-	cBlockingGroupWorker
-	cBlockingGroup
 )
+if "$direct_c"; then
+	expected+=(cScalarCalls cPairCalls cErrnoCalls cLibmCalls
+		cBlockingHandoffs cBlockingGroupWorker cBlockingGroup)
+fi
 for function in "${expected[@]}"; do
 	if ! grep -Eq "coro: func=.*\\.${function} .* primary=coro" \
 		"$lowering_output"; then
@@ -293,10 +297,18 @@ if ! awk '
 	echo "steady coroutine frame allocation is not zero" >&2
 	exit 1
 fi
+# Measure shallow recursive reuse beyond the fixed cost at benchmark startup.
 if ! "$test_binary" -test.run '^$' \
-	-test.bench '^(BenchmarkRecursiveYield64|BenchmarkRecursiveYield4096|BenchmarkMutualYield4096)$' \
-	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
+	-test.bench '^BenchmarkRecursiveYield64$' \
+	-test.benchmem -test.benchtime=10000x -test.count=3 -test.cpu=1 \
 	>"$recursive_allocation_output"; then
+	tail -n 100 "$recursive_allocation_output" >&2
+	exit 1
+fi
+if ! "$test_binary" -test.run '^$' \
+	-test.bench '^(BenchmarkRecursiveYield4096|BenchmarkMutualYield4096)$' \
+	-test.benchmem -test.benchtime=100x -test.count=3 -test.cpu=1 \
+	>>"$recursive_allocation_output"; then
 	tail -n 100 "$recursive_allocation_output" >&2
 	exit 1
 fi
@@ -489,13 +501,23 @@ for function in fileWrite fileWrites fileWriteDiscard blockingFileWrite tcpWrite
 		fi
 	done
 done
-for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block \
-	probe_block_group; do
-	if ! grep -Eq "_Cdirect2?_${symbol}" "$symbols_output"; then
-		echo "missing direct C symbol for $symbol" >&2
+if "$direct_c"; then
+	for symbol in probe_scalar probe_pair_add probe_errno probe_sin probe_block \
+		probe_block_group; do
+		if ! grep -Eq "_Cdirect2?_${symbol}" "$symbols_output"; then
+			echo "missing direct C symbol for $symbol" >&2
+			exit 1
+		fi
+	done
+else
+	handoff=$("$coro_goroot/bin/go" tool objdump -s '\.cBlockingHandoffs$' "$test_binary")
+	if ! grep -Eq '^TEXT .*\.cBlockingHandoffs\(SB\)' <<<"$handoff" ||
+		grep -Eq 'runtime\.coroRun' <<<"$handoff" ||
+		! grep -Eq 'CALL .*\._Cfunc_probe_block(\.abi0)?\(SB\)' <<<"$handoff"; then
+		echo "cBlockingHandoffs did not retain its ordinary C wrapper" >&2
 		exit 1
 	fi
-done
+fi
 
 # These single-iteration executions check task counts and lifecycle only.
 # CI timings are not a performance comparison, and partial/mixed batches need
