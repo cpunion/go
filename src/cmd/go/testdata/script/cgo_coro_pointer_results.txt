@@ -1,10 +1,14 @@
 [!cgo] skip
-[!GOARCH:arm64] [!GOARCH:amd64] skip
 [!GOOS:darwin] [!GOOS:linux] skip
+[GOOS:darwin] [!GOARCH:arm64] skip
+[GOOS:linux] [!GOARCH:amd64] skip
 
 env GOEXPERIMENT=coro
 go build -gcflags='-l -d=coro=4' -o program .
-stderr 'coro: phase=lower lowered=3 skipped=0'
+stderr 'coro: site=[0-9]+ func=main\.pointerCall kind=foreign foreign=direct-mayblock'
+stderr 'coro: site=[0-9]+ func=main\.pointerErrno kind=foreign foreign=direct-mayblock'
+stderr 'coro: skip main\.C\.pointer_value: no coroutine sites'
+stderr 'coro: skip main\.C\.pointer_errno: no coroutine sites'
 go build -o auditor ./audit
 exec ./auditor $GOROOT/bin/go program
 stdout '^pointer-window-ok$'
