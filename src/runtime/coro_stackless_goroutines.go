@@ -61,8 +61,10 @@ func stacklessCoroGoroutineBucket(root *stacklessCoroTask) **stacklessCoroGorout
 }
 
 func stacklessCoroGoroutineIndex(root *stacklessCoroTask, n int) uintptr {
-	addr := uintptr(unsafe.Pointer(root))
-	return memhash(unsafe.Pointer(&addr), 0, unsafe.Sizeof(addr)) & uintptr(n-1)
+	x := uint64(uintptr(unsafe.Pointer(root)))
+	x ^= x >> 16
+	x *= 0x9e3779b97f4a7c15
+	return uintptr(x^(x>>32)) & uintptr(n-1)
 }
 
 // Readers hold the registry lock or run with the world stopped.

@@ -12,19 +12,27 @@ import (
 )
 
 func TestStacklessCoroRegistryResize(t *testing.T) {
-	const n = 4096
-	grownBuckets, nonEmpty, maxChain, drainedBuckets, largeNil, remaining := runtime.CheckStacklessCoroRegistryResizeForTest(n)
-	if grownBuckets < 2048 {
-		t.Fatalf("grownBuckets = %d, want >= 2048 for %d live records", grownBuckets, n)
-	}
-	if nonEmpty < grownBuckets/2 {
-		t.Fatalf("nonEmpty = %d / %d, hash distribution unexpectedly skewed", nonEmpty, grownBuckets)
-	}
-	if maxChain > 16 {
-		t.Fatalf("maxChain = %d for %d records across %d buckets, want <= 16", maxChain, n, grownBuckets)
-	}
-	if drainedBuckets != 256 || !largeNil || remaining != 0 {
-		t.Fatalf("after drain: buckets=%d largeNil=%v remaining=%d, want 256, true, 0",
-			drainedBuckets, largeNil, remaining)
+	for _, tc := range []struct {
+		n          int
+		minBuckets int
+		maxChain   int
+	}{
+		{n: 4096, minBuckets: 2048, maxChain: 16},
+		{n: 30000, minBuckets: 16384, maxChain: 16},
+	} {
+		grownBuckets, nonEmpty, maxChain, drainedBuckets, largeNil, remaining := runtime.CheckStacklessCoroRegistryResizeForTest(tc.n)
+		if grownBuckets < tc.minBuckets {
+			t.Fatalf("n=%d: grownBuckets = %d, want >= %d", tc.n, grownBuckets, tc.minBuckets)
+		}
+		if nonEmpty < grownBuckets/2 {
+			t.Fatalf("n=%d: nonEmpty = %d / %d, hash distribution unexpectedly skewed", tc.n, nonEmpty, grownBuckets)
+		}
+		if maxChain > tc.maxChain {
+			t.Fatalf("n=%d: maxChain = %d across %d buckets, want <= %d", tc.n, maxChain, grownBuckets, tc.maxChain)
+		}
+		if drainedBuckets != 256 || !largeNil || remaining != 0 {
+			t.Fatalf("n=%d after drain: buckets=%d largeNil=%v remaining=%d, want 256, true, 0",
+				tc.n, drainedBuckets, largeNil, remaining)
+		}
 	}
 }
