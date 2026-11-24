@@ -74,21 +74,24 @@ func stacklessCoroSourcePC(source funcInfo, file string, line int32) uintptr {
 	files, lines := pctab[source.pcfile:], pctab[source.pcln:]
 	fileEnd, lineEnd := entry, entry
 	fileNo, lineNo := int32(-1), int32(-1)
+	fileStart, lineStart := true, true
 	for pc := entry; ; pc = min(fileEnd, lineEnd) {
 		var ok bool
 		for fileEnd <= pc {
-			files, ok = step(files, &fileEnd, &fileNo, fileEnd == entry)
+			files, ok = step(files, &fileEnd, &fileNo, fileStart)
+			fileStart = false
 			if !ok {
 				return entry
 			}
 		}
 		for lineEnd <= pc {
-			lines, ok = step(lines, &lineEnd, &lineNo, lineEnd == entry)
+			lines, ok = step(lines, &lineEnd, &lineNo, lineStart)
+			lineStart = false
 			if !ok {
 				return entry
 			}
 		}
-		if lineNo == line && fileNo >= 0 && int(fileNo) < len(source.datap.filetab) && funcfile(source, fileNo) == file {
+		if lineNo == line && fileNo >= 0 && uint64(source.cuOffset)+uint64(fileNo) < uint64(len(source.datap.cutab)) && funcfile(source, fileNo) == file {
 			// The PC tables can include bytes beyond the function. Use the
 			// same boundary check as a forward stack lookup.
 			if findfunc(pc) == source {
