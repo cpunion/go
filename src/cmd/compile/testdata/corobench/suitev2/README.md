@@ -1,50 +1,48 @@
 # Stage-2 Coroutine Performance & Attribution Suite (`suitev2`)
 
-`suitev2` measures stackless coroutine performance with mandatory execution-path auditing, tail latency, process OS RSS, GC reclamation, and phase cost attribution.
+`suitev2` measures clean-baseline coroutine performance and phase cost attribution across all three required comparison groups:
 
-## Three Required Comparison Groups
+1. **Same-commit `coro` vs `nocoro`** (`--coro` vs `--nocoro`)
+2. **Exact upstream merge-base** (`--coro` / `--nocoro` vs `--upstream`)
+3. **Clean parent vs single optimization candidate** (`--parent` vs `--candidate`)
 
-1. **Same-commit experiment switch cost** (`coro` vs `nocoro`):
-   - Measures the isolated impact of `GOEXPERIMENT=coro` + `-gcflags='-l -d=coro=4'` vs `GOEXPERIMENT=nocoro` at the exact same Git commit.
-2. **Exact upstream merge-base delta** (`coro`/`nocoro` vs `upstream`):
-   - Verifies `git merge-base` against unmodified upstream Go (e.g. `72aa6db794`) and tracks both total fork delta (`coro/upstream`) and experiment-off drift (`nocoro/upstream`).
-3. **Single-optimization patch attribution** (`candidate` vs `parent`):
-   - Compares a single candidate commit against its clean parent commit (`--parent` vs `--candidate`) using the same paired interleaved rounds and path audit.
+## Workloads
 
-## Execution Path Audit & Segregation
+- **Real I/O** (`io_real_test.go`): `RealIOPipeRoundTrip16`, `RealIOTCPEcho16`, `RealIOTCPFanout8`.
+- **Parameterized / Capturing / Open-Callable Fan-out/Fan-in** (`fanout_test.go`): `FanoutArgs{16,100,1000}`, `FanoutCapture{16,100,1000}`, `FanoutDynamicOpen64`.
+- **Massive Parking** (`massive_park_test.go`): `MassivePark{10k,30k,100k}` (`-benchtime=1x` fresh process reporting spawn-park, wake-drain, wake `p50`/`p95`/`p99`, parked heap / Go-stack / OS-RSS, unhosted ratio, and `GC1`/`GC2`/`GC4`/`FreeOSMemory` reclamation).
+- **Phase Attribution** (`phase_attrib_test.go`): `PhaseRootStart`, `PhaseSpawnComplete{100,1000}`, `PhaseSpawnYield{100,1000}`, `PhaseParkWake{100,1000}`, `PhaseChannelPingPong`.
+- **Ordinary Fallback Control** (`fanout_test.go`): `FallbackOrdinaryHost16` (deliberately uses ordinary cgo to prove automatic fallback segregation).
 
-Every benchmark is audited automatically from `-d=coro=4` compiler diagnostics, `go tool nm`, and `go tool objdump` (inspecting `.coro.func*` lowered state machines separately from public `coroUseOrdinary` entry wrappers):
+## Execution Path Verification & Invalidation
 
-- **`native-coro`** / **`managed-coro`**: All entry/worker functions lowered to `.coro`, all required coroutine operations present in disassembly, and no `runtime.newproc` fallback inside `.coro.func*`. Scored in the Core Dashboard.
-- **`ordinary-fallback`**: Skipped by lowering, missing `.coro` symbol, or calls `runtime.newproc` inside `.coro.func*`. Segregated into Section 7 (never mixed into stackless scores). `FallbackOrdinaryHost16` serves as a built-in control proving automatic fallback detection.
-- **`compiler-eliminated`**: Lowered to `.coro` without fallback, but a required target operation (e.g., `coroChanSend`/`coroChanRecv`/`coroReadStart`) disappeared from disassembly. Segregated into Section 8 as compiler-optimization-only data.
+Every coro-enabled SDK (`coro`, `parent`, `candidate`) is verified BOTH:
+- **Statically**: `-d=coro=4` diagnostics, `go tool nm` `.coro` symbols, and `.coro.func*` vs public entry `go tool objdump`.
+- **At runtime outside timing**: `TestSuiteV2RuntimePath` walks hardware frame pointers (`fpprobe/fpprobe_{arm64,amd64}.s`) at every tested `P` for every benchmark root and worker, observing actual runtime frames (`runtime.coroNativeMain` -> `native-coro`, `runtime.(*stacklessCoroScheduler).*` without native -> `managed-coro`, no coroutine frames -> `ordinary-fallback`).
+
+If any core benchmark unexpectedly falls back, loses a required target operation, mixes backends, or changes execution path between `parent` and `candidate`, `run_v2.py` marks the comparison **INVALID** and exits with code `2`.
+
+## Full SDK Identity Verification
+
+Every SDK must supply a verifiable full 40-character Git SHA from either a clean `.git` worktree or `<goroot>/CORO_BUILD_MANIFEST.json` (checked against live `sha256` of `bin/go` and `pkg/tool/*/compile`, plus `go version` short-SHA prefix). `run_v2.py` verifies same-commit `coro`/`nocoro`, exact `git merge-base` for `upstream`, and Mode-3 `parent -> candidate` commit ancestry.
 
 ## Usage
 
-Baseline (Modes 1 & 2):
-
 ```bash
+# Harness unit tests
+python3 test_run_v2.py
+
+# Baseline comparison (Modes 1 + 2)
 python3 run_v2.py \
-  --output /path/to/new-output-dir \
-  --upstream /path/to/upstream-goroot \
-  --nocoro /path/to/same-commit-nocoro-goroot \
-  --coro /path/to/same-commit-coro-goroot \
-  --upstream-ref master \
-  --samples 6 --warmups 2 --park-samples 4 --benchtime 150ms --cpus 1,2,4
-```
+  --upstream /path/to/upstream-72aa6db794 \
+  --nocoro   /path/to/e277e2c6e3-nocoro \
+  --coro     /path/to/e277e2c6e3-coro \
+  --git-repo /path/to/go-repo \
+  --output   /path/to/results/baseline
 
-Single-patch attribution (Mode 3):
-
-```bash
+# Single-patch attribution (Mode 3)
 python3 run_v2.py \
-  --output /path/to/patch-eval-dir \
-  --parent /path/to/clean-parent-coro-goroot \
-  --candidate /path/to/candidate-coro-goroot \
-  --samples 6 --warmups 2 --park-samples 4 --benchtime 150ms --cpus 1,2,4
-```
-
-Unit tests for parser and audit classifier:
-
-```bash
-python3 test_run_v2.py -v
+  --parent    /path/to/e277e2c6e3-coro \
+  --candidate /path/to/patch-coro \
+  --output    /path/to/results/patch
 ```

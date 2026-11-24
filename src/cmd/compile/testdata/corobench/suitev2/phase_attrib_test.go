@@ -21,6 +21,9 @@ import (
 //   5. Steady-state channel wake/handoff without root start/teardown (PhaseChannelPingPong)
 
 func phaseRootEntry(x uint64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	runtime.Gosched()
 	return x + 1
 }
@@ -28,6 +31,9 @@ func phaseRootEntry(x uint64) uint64 {
 var neverYield bool
 
 func phaseNoWorkWorker(done *atomic.Uint64) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	if neverYield {
 		runtime.Gosched()
 	}
@@ -35,6 +41,9 @@ func phaseNoWorkWorker(done *atomic.Uint64) {
 }
 
 func runPhaseSpawnComplete(rounds, tasks int, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	var total uint64
 	var done atomic.Uint64
 	for r := 0; r < rounds; r++ {
@@ -53,11 +62,17 @@ func runPhaseSpawnComplete(rounds, tasks int, latencies []int64) uint64 {
 }
 
 func phaseYieldWorker(done *atomic.Uint64) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	runtime.Gosched()
 	done.Add(1)
 }
 
 func runPhaseSpawnYield(rounds, tasks int, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	var total uint64
 	var done atomic.Uint64
 	for r := 0; r < rounds; r++ {
@@ -76,12 +91,18 @@ func runPhaseSpawnYield(rounds, tasks int, latencies []int64) uint64 {
 }
 
 func phaseParkWorker(gate chan struct{}, ready, done *atomic.Uint64) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	ready.Add(1)
 	<-gate
 	done.Add(1)
 }
 
 func runPhaseParkWake(rounds, tasks int, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	var total uint64
 	var ready, done atomic.Uint64
 	for r := 0; r < rounds; r++ {
@@ -106,6 +127,9 @@ func runPhaseParkWake(rounds, tasks int, latencies []int64) uint64 {
 }
 
 func phasePingPongWorker(ping, pong chan int, iterations int) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	for i := 0; i < iterations; i++ {
 		v := <-ping
 		pong <- v + 1
@@ -113,6 +137,9 @@ func phasePingPongWorker(ping, pong chan int, iterations int) {
 }
 
 func runPhaseChannelPingPong(iterations int) int {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	ping := make(chan int)
 	pong := make(chan int)
 	go phasePingPongWorker(ping, pong, iterations)

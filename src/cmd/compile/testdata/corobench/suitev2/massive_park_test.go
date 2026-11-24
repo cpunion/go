@@ -30,6 +30,9 @@ type massiveParkSession struct {
 }
 
 func massiveParkWorker(id int, payload *parkPayload, sess *massiveParkSession) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	sess.ready.Add(1)
 	<-sess.gate
 	elapsed := time.Now().UnixNano() - sess.releaseStart.Load()
@@ -41,6 +44,9 @@ func massiveParkWorker(id int, payload *parkPayload, sess *massiveParkSession) {
 }
 
 func runMassivePark(tasks int, sess *massiveParkSession) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	payloads := make([]parkPayload, tasks)
 	for i := 0; i < tasks; i++ {
 		payloads[i] = parkPayload{id: uint64(i), tag: uint64(i * 31)}
@@ -182,4 +188,5 @@ func benchmarkMassivePark(b *testing.B, tasks int) {
 }
 
 func BenchmarkMassivePark10k(b *testing.B)  { benchmarkMassivePark(b, 10000) }
+func BenchmarkMassivePark30k(b *testing.B)  { benchmarkMassivePark(b, 30000) }
 func BenchmarkMassivePark100k(b *testing.B) { benchmarkMassivePark(b, 100000) }

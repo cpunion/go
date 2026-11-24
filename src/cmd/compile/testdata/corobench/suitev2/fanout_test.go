@@ -33,6 +33,9 @@ func mixWork(seed uint64, rounds int, weights []uint64) uint64 {
 }
 
 func fanoutArgsWorker(id int, cfg *fanoutConfig, results chan fanoutResult) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	v := mixWork(cfg.salt^uint64(id+1), cfg.rounds, cfg.weights)
 	runtime.Gosched()
 	v = mixWork(v^uint64(id+17), cfg.rounds, cfg.weights)
@@ -40,6 +43,9 @@ func fanoutArgsWorker(id int, cfg *fanoutConfig, results chan fanoutResult) {
 }
 
 func runFanoutArgs(batches, workers int, cfg *fanoutConfig, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	results := make(chan fanoutResult, workers)
 	var total uint64
 	for b := 0; b < batches; b++ {
@@ -57,6 +63,9 @@ func runFanoutArgs(batches, workers int, cfg *fanoutConfig, latencies []int64) u
 }
 
 func runFanoutCapture(batches, workers int, cfg *fanoutConfig, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	results := make(chan fanoutResult, workers)
 	weights := cfg.weights
 	salt := cfg.salt
@@ -68,6 +77,9 @@ func runFanoutCapture(batches, workers int, cfg *fanoutConfig, latencies []int64
 			id := i
 			seed := salt ^ uint64(b+1) ^ uint64(id+1)
 			go func() {
+				if runtimePathProbeEnabled {
+					recordRuntimePathProbe(probeRoleWorker)
+				}
 				v := mixWork(seed, rounds, weights)
 				runtime.Gosched()
 				v = mixWork(v^uint64(id+31), rounds, weights)
@@ -92,6 +104,9 @@ type openAddWorker struct {
 }
 
 func (w *openAddWorker) Run(id int, out chan fanoutResult) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	v := mixWork(w.cfg.salt+uint64(id+1), w.cfg.rounds, w.cfg.weights)
 	runtime.Gosched()
 	out <- fanoutResult{id: id, checksum: v}
@@ -102,12 +117,18 @@ type openXorWorker struct {
 }
 
 func (w *openXorWorker) Run(id int, out chan fanoutResult) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	v := mixWork(w.cfg.salt^uint64(id+7), w.cfg.rounds, w.cfg.weights)
 	runtime.Gosched()
 	out <- fanoutResult{id: id, checksum: v ^ 0x9e3779b97f4a7c15}
 }
 
 func runFanoutDynamicOpen(batches int, runners []openWorker, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	workers := len(runners)
 	results := make(chan fanoutResult, workers)
 	var total uint64
@@ -130,6 +151,9 @@ func runFanoutDynamicOpen(batches int, runners []openWorker, latencies []int64) 
 // forcing ordinary Go-stack fallback. The harness segregates this benchmark
 // into the ordinary-fallback table to verify automatic path classification.
 func fallbackOrdinaryWorker(id int, cfg *fanoutConfig, results chan fanoutResult) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	v := ordinaryCgoFallbackOp(cfg.salt ^ uint64(id+1))
 	v = mixWork(v, cfg.rounds, cfg.weights)
 	runtime.Gosched()
@@ -137,6 +161,9 @@ func fallbackOrdinaryWorker(id int, cfg *fanoutConfig, results chan fanoutResult
 }
 
 func runFallbackOrdinaryFanout(batches, workers int, cfg *fanoutConfig, latencies []int64) uint64 {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	results := make(chan fanoutResult, workers)
 	var total uint64
 	for b := 0; b < batches; b++ {

@@ -110,6 +110,9 @@ func newPipePairs(tb testing.TB, count int) ([]pipePair, func()) {
 }
 
 func pipeEchoServer(reqR, respW *os.File, rounds int, done chan error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var buf [ioPayloadSize]byte
 	for i := 0; i < rounds; i++ {
 		if err := fileReadFull(reqR, buf[:]); err != nil {
@@ -126,6 +129,9 @@ func pipeEchoServer(reqR, respW *os.File, rounds int, done chan error) {
 }
 
 func pipeEchoClient(reqW, respR *os.File, id, rounds int, latencies []int64, done chan error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var sendBuf, recvBuf [ioPayloadSize]byte
 	sendBuf[0] = byte(id)
 	for i := 0; i < rounds; i++ {
@@ -149,6 +155,9 @@ func pipeEchoClient(reqW, respR *os.File, id, rounds int, latencies []int64, don
 }
 
 func runPipeRoundTrips(pairs []pipePair, roundsPerPair int, latencies [][]int64) error {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	n := len(pairs)
 	done := make(chan error, n*2)
 	for i := 0; i < n; i++ {
@@ -215,6 +224,9 @@ func newTCPPairs(tb testing.TB, count int) ([]tcpPair, func()) {
 }
 
 func tcpEchoServer(conn *net.TCPConn, rounds int, done chan error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var buf [ioPayloadSize]byte
 	for i := 0; i < rounds; i++ {
 		if err := tcpReadFull(conn, buf[:]); err != nil {
@@ -231,6 +243,9 @@ func tcpEchoServer(conn *net.TCPConn, rounds int, done chan error) {
 }
 
 func tcpEchoClient(conn *net.TCPConn, id, rounds int, latencies []int64, done chan error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var sendBuf, recvBuf [ioPayloadSize]byte
 	sendBuf[0] = byte(id)
 	for i := 0; i < rounds; i++ {
@@ -254,6 +269,9 @@ func tcpEchoClient(conn *net.TCPConn, id, rounds int, latencies []int64, done ch
 }
 
 func runTCPEchoRounds(pairs []tcpPair, roundsPerConn int, latencies [][]int64) error {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	n := len(pairs)
 	done := make(chan error, n*2)
 	for i := 0; i < n; i++ {
@@ -276,6 +294,9 @@ type tcpFanoutReply struct {
 }
 
 func tcpFanoutBackend(conn *net.TCPConn, totalRequests int, done chan error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var buf [ioPayloadSize]byte
 	for i := 0; i < totalRequests; i++ {
 		if err := tcpReadFull(conn, buf[:]); err != nil {
@@ -292,6 +313,9 @@ func tcpFanoutBackend(conn *net.TCPConn, totalRequests int, done chan error) {
 }
 
 func tcpFanoutLeaf(conn *net.TCPConn, reqID, leafID int, replies chan tcpFanoutReply) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleWorker)
+	}
 	var sendBuf, recvBuf [ioPayloadSize]byte
 	sendBuf[0] = byte(reqID + leafID)
 	sendBuf[1] = byte(leafID)
@@ -311,6 +335,9 @@ func tcpFanoutLeaf(conn *net.TCPConn, reqID, leafID int, replies chan tcpFanoutR
 }
 
 func runTCPFanoutBatches(pairs []tcpPair, batches int, batchLatencies []int64) (uint64, error) {
+	if runtimePathProbeEnabled {
+		recordRuntimePathProbe(probeRoleRoot)
+	}
 	fanout := len(pairs)
 	serverDone := make(chan error, fanout)
 	for i := 0; i < fanout; i++ {
