@@ -23,7 +23,7 @@ type stacklessCoroGoroutine struct {
 	publicNext       *stacklessCoroGoroutine
 	root, leaf       *stacklessCoroTask
 	scheduler        *stacklessCoroScheduler
-	owner            *g
+	owner            atomic.Pointer[g]
 	publicG          *g
 	hostG            *g
 	goid, parentGoid uint64
@@ -191,8 +191,8 @@ func (r *stacklessCoroGoroutine) setProfileCaller(pcs []uintptr) {
 }
 
 func stacklessCoroLogicalRoot(task *stacklessCoroTask) *stacklessCoroTask {
-	for task.parent != nil {
-		task = task.parent
+	for p := task.parent(); p != nil; p = task.parent() {
+		task = p
 	}
 	return task
 }
@@ -209,12 +209,16 @@ func stacklessCoroGoroutineFor(root *stacklessCoroTask) *stacklessCoroGoroutine 
 }
 
 func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
+	if r.root.parent() != nil {
+		throw("runtime: stackless coroutine record attached to non-root task")
+	}
 	size := len(stacklessCoroGoroutineBuckets())
 	if stacklessCoroGoroutines.records.Load() >= int64(size)*2 {
 		stacklessCoroResizeGoroutineBuckets(size * 2)
 	}
 	p := stacklessCoroGoroutineBucket(r.root)
 	r.next, *p = *p, r
+	r.root.setSource(r)
 	stacklessCoroGoroutines.records.Add(1)
 }
 
@@ -226,7 +230,7 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 	caller := stacklessCoroPublicCaller(gp)
 	lock(&stacklessCoroGoroutines.lock)
 	root := stacklessCoroLogicalRoot(parent)
-	creator := stacklessCoroGoroutineFor(root)
+	creator := root.source()
 	if creator == nil {
 		if root != &s.root {
 			throw("runtime: missing coroutine creator identity")
@@ -335,116 +339,118 @@ func stacklessCoroSpawnSourcePC(gp *g, callerPC uintptr, callerSP unsafe.Pointer
 }
 
 func stacklessCoroSetLogicalLeaf(task *stacklessCoroTask, owner *g) {
-	if stacklessCoroGoroutines.records.Load() == 0 {
+	r := stacklessCoroLogicalRoot(task).source()
+	if r == nil {
 		return
 	}
-	// Snapshot terminal metadata outside the signal handler. The scheduler
-	// lock protects its cold list; the retained trace is immutable. Queue
-	// publication already holds that lock and passes no owner.
+	// Snapshot terminal metadata outside the signal handler only when this
+	// scheduler actually holds cold terminal/defer/host entries.
 	var boundary *stacklessCoroTask
 	var trace *stacklessCoroPanicTrace
 	var before bool
 	if owner != nil {
-		s := task.context.scheduler
-		lock(&s.lock)
-		for at := task; at != nil; at = at.parent {
-			if trace = s.terminalSourceTrace(at); trace != nil {
-				boundary, before = at, true
-				break
+		if s := task.context.scheduler; s != nil && s.terminalValues.Load() != nil {
+			lock(&s.lock)
+			for at := task; at != nil; at = at.parent() {
+				if trace = s.terminalSourceTrace(at); trace != nil {
+					boundary, before = at, true
+					break
+				}
+				if trace = s.deferTrace(at); trace != nil {
+					boundary = at
+					break
+				}
 			}
-			if trace = s.deferTrace(at); trace != nil {
-				boundary = at
-				break
-			}
+			unlock(&s.lock)
 		}
-		unlock(&s.lock)
-	}
-	lock(&stacklessCoroGoroutines.lock)
-	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil {
-		r.leaf, r.owner = task, owner
-		r.profileBoundary, r.profileTrace, r.profileBefore = boundary, trace, before
-		// Runnable tasks have no owner. Only the executing G publishes a
-		// signal-visible source record; queue publication must not touch a G.
-		if owner != nil {
-			if state := owner.stacklessCoro; state != nil {
-				state.activeSource = r
-				state.sourceTransition = false
-			}
+		if state := owner.stacklessCoro; state != nil {
+			state.sourceTransition = true
 		}
 	}
-	unlock(&stacklessCoroGoroutines.lock)
+	r.leaf = task
+	r.profileBoundary, r.profileTrace, r.profileBefore = boundary, trace, before
+	r.owner.Store(owner)
+	// Runnable tasks have no owner. Only the executing G publishes a
+	// signal-visible source record; queue publication must not touch a G.
+	if owner != nil {
+		if state := owner.stacklessCoro; state != nil {
+			state.activeSource = r
+			state.sourceTransition = false
+		}
+	}
 }
 
 func stacklessCoroClearLogicalOwner(task *stacklessCoroTask) {
+	gp := getg()
 	// Clear the signal-visible owner before any frame or record can be recycled.
-	if state := getg().stacklessCoro; state != nil {
+	if state := gp.stacklessCoro; state != nil {
 		state.activeSource = nil
 		state.sourceTransition = false
 	}
-	if stacklessCoroGoroutines.records.Load() == 0 {
-		return
-	}
-	lock(&stacklessCoroGoroutines.lock)
-	if r := stacklessCoroGoroutineFor(stacklessCoroLogicalRoot(task)); r != nil && r.owner == getg() {
-		r.owner = nil
+	r := stacklessCoroLogicalRoot(task).source()
+	if r != nil && r.owner.Load() == gp {
+		r.owner.Store(nil)
 		r.profileBoundary, r.profileTrace, r.profileBefore = nil, nil, false
 	}
-	unlock(&stacklessCoroGoroutines.lock)
 }
 
 // Complete a structured activation before clearing its frame or parent link.
 // Its logical root remains visible at the caller until that root completes.
 func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
-	if stacklessCoroGoroutines.records.Load() == 0 {
+	if parent := task.parent(); parent != nil {
+		if r := stacklessCoroLogicalRoot(parent).source(); r != nil {
+			r.leaf = parent
+			r.owner.Store(nil)
+		}
+		return
+	}
+	r := task.source()
+	if r == nil {
 		return
 	}
 	lock(&stacklessCoroGoroutines.lock)
-	root := stacklessCoroLogicalRoot(task)
-	p := stacklessCoroGoroutineBucket(root)
-	for *p != nil && (*p).root != root {
+	p := stacklessCoroGoroutineBucket(task)
+	for *p != nil && *p != r {
 		p = &(*p).next
 	}
-	if r := *p; r != nil {
-		if task.parent != nil {
-			r.leaf, r.owner = task.parent, nil
-		} else {
-			*p = r.next
-			if !r.public && !r.hosted {
-				stacklessCoroGoroutines.unhosted.Add(-1)
-			}
-			count := stacklessCoroGoroutines.records.Add(-1)
-			public := r.public
-			reusable := !public && !r.hosted && r.owner == nil
-			if public {
-				p := stacklessCoroPublicGoroutineBucket(r.publicG)
-				for *p != r {
-					if *p == nil {
-						throw("runtime: missing public coroutine identity")
-					}
-					p = &(*p).publicNext
+	if *p == r {
+		*p = r.next
+		task.setSource(nil)
+		if !r.public && !r.hosted {
+			stacklessCoroGoroutines.unhosted.Add(-1)
+		}
+		count := stacklessCoroGoroutines.records.Add(-1)
+		public := r.public
+		reusable := !public && !r.hosted && r.owner.Load() == nil
+		if public {
+			p := stacklessCoroPublicGoroutineBucket(r.publicG)
+			for *p != r {
+				if *p == nil {
+					throw("runtime: missing public coroutine identity")
 				}
-				*p = r.publicNext
+				p = &(*p).publicNext
 			}
-			callerPCs := r.profileCaller
-			*r = stacklessCoroGoroutine{}
-			if public && stacklessCoroGoroutines.publicFreeCount < stacklessCoroWarmExecutorCount {
-				// Retain only reusable storage for code addresses. No
-				// stack pointer or caller object survives registration.
-				clear(callerPCs)
-				r.profileCaller = callerPCs[:0]
-				r.next = stacklessCoroGoroutines.publicFree
-				stacklessCoroGoroutines.publicFree = r
-				stacklessCoroGoroutines.publicFreeCount++
-			} else if reusable && stacklessCoroGoroutines.taskFreeCount < stacklessCoroTaskCacheSize {
-				// Completion has detached the root and cleared the signal-
-				// visible owner. Retain only the empty record for another go.
-				r.next = stacklessCoroGoroutines.taskFree
-				stacklessCoroGoroutines.taskFree = r
-				stacklessCoroGoroutines.taskFreeCount++
-			}
-			if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
-				stacklessCoroResizeGoroutineBuckets(size / 2)
-			}
+			*p = r.publicNext
+		}
+		callerPCs := r.profileCaller
+		*r = stacklessCoroGoroutine{}
+		if public && stacklessCoroGoroutines.publicFreeCount < stacklessCoroWarmExecutorCount {
+			// Retain only reusable storage for code addresses. No
+			// stack pointer or caller object survives registration.
+			clear(callerPCs)
+			r.profileCaller = callerPCs[:0]
+			r.next = stacklessCoroGoroutines.publicFree
+			stacklessCoroGoroutines.publicFree = r
+			stacklessCoroGoroutines.publicFreeCount++
+		} else if reusable && stacklessCoroGoroutines.taskFreeCount < stacklessCoroTaskCacheSize {
+			// Completion has detached the root and cleared the signal-
+			// visible owner. Retain only the empty record for another go.
+			r.next = stacklessCoroGoroutines.taskFree
+			stacklessCoroGoroutines.taskFree = r
+			stacklessCoroGoroutines.taskFreeCount++
+		}
+		if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
+			stacklessCoroResizeGoroutineBuckets(size / 2)
 		}
 	}
 	unlock(&stacklessCoroGoroutines.lock)
@@ -513,9 +519,9 @@ func stacklessCoroLogicalTrace(r *stacklessCoroGoroutine) *stacklessCoroPanicTra
 // window; collecting it does not allocate a complete return-PC payload.
 func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGoroutine) {
 	var leafEntry, leafPC uintptr
-	if r.owner != nil {
+	if owner := r.owner.Load(); owner != nil {
 		var u unwinder
-		for u.init(r.owner, unwindSilentErrors); u.valid(); u.next() {
+		for u.init(owner, unwindSilentErrors); u.valid(); u.next() {
 			f := u.frame.fn
 			if info := stacklessCoroSourceFrame(f); info != nil && info.flags&abi.CoroSourceResume != 0 {
 				source := stacklessCoroSourceFunc(f, info)
@@ -529,7 +535,7 @@ func (trace *stacklessCoroPanicTrace) appendLogicalGoroutine(r *stacklessCoroGor
 		}
 	}
 	first := true
-	for task := r.leaf; task != nil; task = task.parent {
+	for task := r.leaf; task != nil; task = task.parent() {
 		if previous := r.scheduler.terminalSourceTrace(task); previous != nil {
 			trace.appendTrace(previous)
 			break
@@ -734,7 +740,7 @@ func stacklessCoroPrintGoroutines(skipID uint64) {
 			status := "waiting"
 			if r.leaf.state == stacklessCoroTaskRunnable || r.leaf.state == stacklessCoroTaskNew {
 				status = "runnable"
-			} else if r.owner != nil {
+			} else if r.owner.Load() != nil {
 				status = "running"
 			}
 			print("\ngoroutine ", r.goid, " [", status)

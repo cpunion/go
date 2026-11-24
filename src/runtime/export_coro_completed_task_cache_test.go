@@ -100,7 +100,7 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 			embeddedBefore := *(*[2]uintptr)(embedded)
 			switch kind {
 			case 0:
-				task.parent = new(stacklessCoroTask)
+				task.setParent(new(stacklessCoroTask))
 			case 1:
 				task.flags = 0
 			case 2:

@@ -765,12 +765,12 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 	firstParent := new(stacklessCoroTask)
 	secondParent := new(stacklessCoroTask)
 	first := &stacklessCoroTask{
-		resume: resume, parent: firstParent,
+		resume: resume, parentOrSource: unsafe.Pointer(firstParent),
 		flags: stacklessCoroTaskCacheFrame, frameSize: 1,
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
 	second := &stacklessCoroTask{
-		resume: resume, parent: secondParent,
+		resume: resume, parentOrSource: unsafe.Pointer(secondParent),
 		flags: stacklessCoroTaskCacheFrame, frameSize: 1,
 		context: stacklessCoroContext{frame: unsafe.Pointer(new(byte))},
 	}
@@ -787,7 +787,7 @@ func StacklessCoroCancelReservedFramesForTest() bool {
 		recycled = s.freeTasks == nil && s.freePlainTaskCount == 0
 	}
 	valid := s.reservedTasks == second && second.next == nil &&
-		second.parent == secondParent &&
+		second.parent() == secondParent &&
 		second.hasFlag(stacklessCoroTaskCacheFrame) &&
 		s.cachedFrameTasks == 1 && s.cachedFrameBytes == 1 &&
 		recycled &&
@@ -1775,7 +1775,7 @@ func DrainedStacklessCoroSchedulerForTest(pointer unsafe.Pointer) bool {
 	s := (*stacklessCoroScheduler)(pointer)
 	lock(&s.lock)
 	drained := s.drained() && s.liveSpawns == 0 && s.head == nil &&
-		s.tail == nil && s.reservedTasks == nil && s.terminalValues == nil &&
+		s.tail == nil && s.reservedTasks == nil && s.terminalValues.Load() == nil &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit
 	unlock(&s.lock)
 	return drained && s.blockingExecutors.Load() == 0 &&
@@ -1874,9 +1874,9 @@ func CheckCompletionHandoffStacklessCoroForTest(parentResuming,
 	parent.state = stacklessCoroTaskWaiting
 	parent.resuming = parentResuming
 	child := &stacklessCoroTask{
-		parent:   parent,
-		state:    stacklessCoroTaskRunning,
-		resuming: true,
+		parentOrSource: unsafe.Pointer(parent),
+		state:          stacklessCoroTaskRunning,
+		resuming:       true,
 	}
 	var readyTask *stacklessCoroTask
 	if ready {

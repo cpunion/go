@@ -115,7 +115,7 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			}
 		}
 	} else {
-		task.parent = parent
+		task.setParent(parent)
 	}
 	task.next = s.reservedTasks
 	s.reservedTasks = task

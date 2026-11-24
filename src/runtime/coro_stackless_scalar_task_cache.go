@@ -41,7 +41,7 @@ func stacklessCoroScalarTaskChunkFor(task *stacklessCoroTask) (*stacklessCoroSca
 
 func clearStacklessCoroScalarTaskFrame(task *stacklessCoroTask) {
 	chunk, index := stacklessCoroScalarTaskChunkFor(task)
-	if task.flags == stacklessCoroTaskTypedSpawn && task.parent == nil &&
+	if task.flags == stacklessCoroTaskTypedSpawn && task.parentOrSource == nil &&
 		task.state == stacklessCoroTaskComplete && task.terminal == stacklessCoroTerminalNone &&
 		!task.goexit && task.context.frame == unsafe.Pointer(&chunk.frames[index]) {
 		chunk.frames[index] = 0
@@ -97,7 +97,7 @@ func takeStacklessCoroCompletedScalarTaskChunk() *stacklessCoroScalarTaskChunk {
 func cacheStacklessCoroCompletedScalarTaskChunk(task *stacklessCoroTask) {
 	if raceenabled || !isStacklessCoroScalarTaskCacheMarker(task.frameSize) ||
 		task.state != stacklessCoroTaskComplete || task.resume != nil || task.context.frame != nil ||
-		task.parent != nil || task.context.scheduler != nil || task.next != nil {
+		task.parentOrSource != nil || task.context.scheduler != nil || task.next != nil {
 		throw("runtime: invalid stackless coroutine scalar-task admission")
 	}
 	chunk, _ := stacklessCoroScalarTaskChunkFor(task)
@@ -113,7 +113,7 @@ func cacheStacklessCoroCompletedScalarTaskChunk(task *stacklessCoroTask) {
 	}
 	for i := range chunk.tasks {
 		member := &chunk.tasks[i]
-		if member.resume != nil || member.parent != nil ||
+		if member.resume != nil || member.parentOrSource != nil ||
 			member.next != nil || member.terminal != stacklessCoroTerminalNone || member.goexit ||
 			member.resuming || member.readyPending || member.flags != 0 ||
 			member.context.frame != nil || member.context.scheduler != nil {

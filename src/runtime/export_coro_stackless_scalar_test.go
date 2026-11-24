@@ -63,9 +63,9 @@ func CheckStacklessCoroScalarFramesForTest(size uintptr, count int) (paired int,
 		first := frames[stacklessCoroDirectBatchedTaskCount]
 		offset := stacklessCoroTaskChunkSize * unsafe.Sizeof(stacklessCoroTask{})
 		owner := (*stacklessCoroTask)(unsafe.Add(first, -int(offset)))
-		if owner.context.frame != first || owner.parent == nil ||
-			owner.parent.context.frame == nil ||
-			(*[2]uint64)(owner.parent.context.frame)[0] != 0x7363616c6172 {
+		if owner.context.frame != first || owner.parent() == nil ||
+			owner.parent().context.frame == nil ||
+			(*[2]uint64)(owner.parent().context.frame)[0] != 0x7363616c6172 {
 			return paired, false
 		}
 	}
