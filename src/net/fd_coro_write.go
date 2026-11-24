@@ -18,6 +18,9 @@ import (
 // write lock. Contended and non-stream writes use a blocking-I/O worker.
 func (c *conn) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
 	*n = 0
+	*err = nil
+	*direct = false
+	*status = 0
 	if !c.ok() {
 		*err = syscall.EINVAL
 		return false
@@ -25,7 +28,6 @@ func (c *conn) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, 
 
 	state, e := c.fd.pfd.CoroWriteStart(ctx, b, n, status)
 	if state == poll.CoroWriteFallback {
-		*direct = false
 		poll.CoroCallWrite(ctx, func() {
 			count, writeErr := c.fd.Write(b)
 			*n = count
@@ -38,11 +40,9 @@ func (c *conn) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, 
 		return true
 	}
 	runtime.KeepAlive(c.fd)
-	if e == nil {
-		*err = nil
-		return false
+	if e != nil {
+		*err = c.coroWriteError(wrapSyscallError(writeSyscallName, e))
 	}
-	*err = c.coroWriteError(wrapSyscallError(writeSyscallName, e))
 	return false
 }
 

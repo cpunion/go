@@ -12,6 +12,7 @@ import (
 	"io"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func newCoroTestFD(t *testing.T, network string) *FD {
@@ -55,6 +56,43 @@ func TestCoroReadStartWithoutOperation(t *testing.T) {
 		state, err := fd.CoroReadStart(nil, nil, new(int), new(uintptr))
 		if state != CoroReadDone || !errors.Is(err, ErrFileClosing) {
 			t.Fatalf("CoroReadStart = %v, %v, want done, ErrFileClosing", state, err)
+		}
+	})
+
+	t.Run("blocking deadline", func(t *testing.T) {
+		var pipe [2]int
+		if err := syscall.Pipe(pipe[:]); err != nil {
+			t.Fatal(err)
+		}
+		defer syscall.Close(pipe[1])
+		fd := &FD{Sysfd: pipe[0], IsStream: true}
+		if err := syscall.SetNonblock(fd.Sysfd, true); err != nil {
+			syscall.Close(fd.Sysfd)
+			t.Fatal(err)
+		}
+		if err := fd.Init("file", true); err != nil {
+			syscall.Close(fd.Sysfd)
+			t.Fatal(err)
+		}
+		defer fd.Close()
+		if err := fd.SetBlocking(); err != nil {
+			t.Fatal(err)
+		}
+		// Keep the pipe readable so a missing deadline check fails without blocking the test.
+		if _, err := syscall.Write(pipe[1], []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := fd.SetReadDeadline(time.Unix(1, 0)); err != nil {
+			t.Fatal(err)
+		}
+		var data [1]byte
+		for range 2 {
+			var n int
+			var status uintptr
+			state, err := fd.CoroReadStart(nil, data[:], &n, &status)
+			if state != CoroReadDone || n != 0 || !errors.Is(err, ErrDeadlineExceeded) {
+				t.Fatalf("CoroReadStart = %v, %d, %v, want done, 0, ErrDeadlineExceeded", state, n, err)
+			}
 		}
 	})
 }
