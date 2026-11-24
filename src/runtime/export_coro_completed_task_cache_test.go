@@ -61,8 +61,7 @@ func CheckStacklessCoroCompletedTaskCacheForTest() bool {
 	if raceenabled {
 		return true
 	}
-	s := new(stacklessCoroScheduler)
-	lockInit(&s.lock, lockRankStacklessCoro)
+	s := newStacklessCoroTestScheduler()
 	for bitmap, typ := range completedTaskCacheTypesForTest() {
 		if !validStacklessCoroTaskFrameType(typ, 16) || int(*typ.GCData>>6) != bitmap {
 			return false
@@ -170,8 +169,7 @@ func CheckStacklessCoroCompletedTaskCacheConcurrentForTest() bool {
 	types := completedTaskCacheTypesForTest()
 	for worker := range 4 {
 		go func() {
-			s := new(stacklessCoroScheduler)
-			lockInit(&s.lock, lockRankStacklessCoro)
+			s := newStacklessCoroTestScheduler()
 			for i := range 2000 {
 				bitmap := (i + worker) % 4
 				lock(&s.lock)

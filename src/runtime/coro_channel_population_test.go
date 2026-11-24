@@ -23,10 +23,12 @@ func channelPopulationRound(t *testing.T, tokens []unsafe.Pointer) {
 	t.Helper()
 	channel := make(chan int)
 	var started, completed atomic.Int32
+	var scheduler unsafe.Pointer
 	step := 0
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
 		switch step {
 		case 0:
+			scheduler = runtime.SchedulerStacklessCoroForTest(ctx)
 			step++
 			for range tokens {
 				childStep, value := 0, 0
@@ -64,6 +66,14 @@ func channelPopulationRound(t *testing.T, tokens []unsafe.Pointer) {
 	})
 	if int(started.Load()) != len(tokens) || int(completed.Load()) != len(tokens) {
 		t.Fatal("channel population did not complete")
+	}
+	// The public root can return after the last receiver increments completed,
+	// before the scheduler processes that receiver's completion. Drainage
+	// publishes the scheduler's idle operations to the shared cache.
+	if len(tokens) != 0 {
+		for !runtime.DrainedStacklessCoroSchedulerForTest(scheduler) {
+			runtime.Gosched()
+		}
 	}
 }
 
