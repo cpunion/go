@@ -291,14 +291,26 @@ func TestCgoDirectAggregateSafety(t *testing.T) {
 	}
 }
 
-func TestCgoDirectCall(t *testing.T) {
-	oldExperiment := buildcfg.Experiment
-	oldGccgo := *gccgo
+func useCgoDirectTarget(t *testing.T) {
+	t.Helper()
+	oldExperiment, oldGccgo := buildcfg.Experiment, *gccgo
+	oldGOOS, oldGOARCH := buildcfg.GOOS, buildcfg.GOARCH
+
 	buildcfg.Experiment.Coro = true
-	defer func() {
-		buildcfg.Experiment = oldExperiment
-		*gccgo = oldGccgo
-	}()
+	*gccgo = false
+	if !cgoDirectSupported() {
+		// These tests generate declarations without executing target code.
+		buildcfg.GOOS, buildcfg.GOARCH = "darwin", "arm64"
+	}
+
+	t.Cleanup(func() {
+		buildcfg.Experiment, *gccgo = oldExperiment, oldGccgo
+		buildcfg.GOOS, buildcfg.GOARCH = oldGOOS, oldGOARCH
+	})
+}
+
+func TestCgoDirectCall(t *testing.T) {
+	useCgoDirectTarget(t)
 
 	p := &Package{
 		noCallbacks: map[string]bool{"add_u64": true},
@@ -507,14 +519,7 @@ func TestCgoDirectTypedef(t *testing.T) {
 }
 
 func TestCgoDirectErrno(t *testing.T) {
-	oldExperiment := buildcfg.Experiment
-	oldGccgo := *gccgo
-	buildcfg.Experiment.Coro = true
-	*gccgo = false
-	defer func() {
-		buildcfg.Experiment = oldExperiment
-		*gccgo = oldGccgo
-	}()
+	useCgoDirectTarget(t)
 
 	n := &Name{
 		C:        "read",
@@ -1070,14 +1075,7 @@ func TestCgoDirectCBridge(t *testing.T) {
 }
 
 func TestCgoDirectGoDeclaration(t *testing.T) {
-	oldExperiment := buildcfg.Experiment
-	oldGccgo := *gccgo
-	buildcfg.Experiment.Coro = true
-	*gccgo = false
-	defer func() {
-		buildcfg.Experiment = oldExperiment
-		*gccgo = oldGccgo
-	}()
+	useCgoDirectTarget(t)
 
 	cType := func() *Type {
 		return &Type{Size: 8, Align: 8, Go: ast.NewIdent("uint64")}
