@@ -50,6 +50,8 @@ func (s *stacklessCoroSudog) clear() {
 	s.owner = nil
 }
 
+//go:nosplit
+//go:nowritebarrierrec
 func (gp *g) stackIsFixed() bool {
 	state := gp.stacklessCoro
 	return state != nil && state.native == unsafe.Pointer(state)

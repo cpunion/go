@@ -463,3 +463,32 @@ func (r *StacklessCoroNativeParkRoundTrip) Close() {
 func StacklessCoroAsyncPreemptOffForTest() bool {
 	return debug.asyncpreemptoff != 0
 }
+
+// CheckStacklessCoroFixedStackCgoPointerForTest verifies that a stack slot on
+// an active fixed coroutine stack is outside heap/Go-stack spans yet still
+// recognized by cgoIsGoPointer (and therefore cgocheck2 write/memmove barriers).
+//
+//go:noinline
+func CheckStacklessCoroFixedStackCgoPointerForTest(ch chan *int, value *int) bool {
+	var slot *int
+	addr := noescape(unsafe.Pointer(&slot))
+	if inHeapOrStack(uintptr(addr)) || !cgoIsGoPointer(addr) {
+		return false
+	}
+	onSystem := false
+	systemstack(func() {
+		onSystem = cgoIsGoPointer(addr)
+	})
+	if !onSystem {
+		return false
+	}
+	// Exercise an indirect pointer write and a channel receive targeting slot
+	// on the fixed OS thread stack under cgocheck2.
+	write := func(dst **int) { *dst = value }
+	write((**int)(addr))
+	if slot != value {
+		return false
+	}
+	slot = <-ch
+	return slot == value
+}

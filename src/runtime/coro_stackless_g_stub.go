@@ -41,6 +41,8 @@ func releaseStacklessCoroSudog(unsafe.Pointer, *sudog) {
 	throw("runtime: stackless coroutine channel waiter without experiment")
 }
 
+//go:nosplit
+//go:nowritebarrierrec
 func (*g) stackIsFixed() bool {
 	return false
 }

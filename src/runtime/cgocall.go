@@ -804,6 +804,18 @@ func cgoIsGoPointer(p unsafe.Pointer) bool {
 		return true
 	}
 
+	if goexperiment.Coro {
+		if gp := getg(); gp != nil {
+			if gp.stackIsFixed() && cgoInRange(p, gp.stack.lo, gp.stack.hi) {
+				return true
+			}
+			if mp := gp.m; mp != nil && mp.curg != nil && mp.curg != gp &&
+				mp.curg.stackIsFixed() && cgoInRange(p, mp.curg.stack.lo, mp.curg.stack.hi) {
+				return true
+			}
+		}
+	}
+
 	for _, datap := range activeModules() {
 		if cgoInRange(p, datap.data, datap.edata) || cgoInRange(p, datap.bss, datap.ebss) {
 			return true

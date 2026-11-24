@@ -904,3 +904,18 @@ func growStacklessCoroNativeStack(depth int) {
 	growStacklessCoroNativeStack(depth + 1)
 	runtime.KeepAlive(&keep)
 }
+
+func TestStacklessCoroNativeFixedStackCgoPointer(t *testing.T) {
+	ch := make(chan *int, 1)
+	value := new(int)
+	*value = 42
+	ch <- value
+	var ok bool
+	runtime.RunStacklessCoroForTest(func(unsafe.Pointer) uint8 {
+		ok = runtime.CheckStacklessCoroFixedStackCgoPointerForTest(ch, value)
+		return runtime.StacklessCoroActionComplete
+	})
+	if !ok {
+		t.Fatal("fixed coroutine stack slot was not recognized by cgoIsGoPointer")
+	}
+}
