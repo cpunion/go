@@ -883,8 +883,9 @@ func gopanic(e any) {
 	// and String methods to prepare the panic strings before startpanic.
 	preprintpanics(&p)
 
-	fatalpanic(&p)   // should not return
-	*(*int)(nil) = 0 // not reached
+	logicalStacks := stacklessCoroPrepareFatalTraceback()
+	fatalpanic(&p, logicalStacks) // should not return
+	*(*int)(nil) = 0              // not reached
 }
 
 // start initializes a panic to start unwinding the stack.
@@ -1465,7 +1466,7 @@ func fatalthrow(t throwType) {
 
 		startpanic_m()
 
-		if dopanic_m(gp, pc, sp, nil) {
+		if dopanic_m(gp, pc, sp, nil, false) {
 			// crash uses a decent amount of nosplit stack and we're already
 			// low on stack in throw, so crash on the system stack (unlike
 			// fatalpanic).
@@ -1483,7 +1484,7 @@ func fatalthrow(t throwType) {
 // runningPanicDefers once main is blocked from exiting.
 //
 //go:nosplit
-func fatalpanic(msgs *_panic) {
+func fatalpanic(msgs *_panic, logicalStacks bool) {
 	pc := sys.GetCallerPC()
 	sp := sys.GetCallerSP()
 	gp := getg()
@@ -1510,7 +1511,7 @@ func fatalpanic(msgs *_panic) {
 			bubble = de.bubble
 		}
 
-		docrash = dopanic_m(gp, pc, sp, bubble)
+		docrash = dopanic_m(gp, pc, sp, bubble, logicalStacks)
 	})
 
 	if docrash {
@@ -1593,7 +1594,7 @@ var deadlock mutex
 // gp is the crashing g running on this M, but may be a user G, while getg() is
 // always g0.
 // If bubble is non-nil, print the stacks for goroutines in this group as well.
-func dopanic_m(gp *g, pc, sp uintptr, bubble *synctestBubble) bool {
+func dopanic_m(gp *g, pc, sp uintptr, bubble *synctestBubble, logicalStacks bool) bool {
 	if gp.sig != 0 {
 		signame := signame(gp.sig)
 		if signame != "" {
@@ -1620,7 +1621,11 @@ func dopanic_m(gp *g, pc, sp uintptr, bubble *synctestBubble) bool {
 		if !didothers {
 			if all {
 				didothers = true
-				tracebackothers(gp)
+				if logicalStacks {
+					stacklessCoroFatalTracebackOthers(gp)
+				} else {
+					tracebackothers(gp)
+				}
 			} else if bubble != nil {
 				// This panic is caused by a synctest bubble deadlock.
 				// Print stacks for goroutines in the deadlocked bubble.

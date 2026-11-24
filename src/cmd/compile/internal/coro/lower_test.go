@@ -581,6 +581,7 @@ func TestLowerRecursiveFrameChunk(t *testing.T) {
 		"runtime.coroTakeSelfFrame",
 		"runtime.coroAwaitSelfFrame",
 		"runtime.coroCompleteSelfFrame",
+		"runtime.coroProfileResume",
 	} {
 		if runtimeCalls[name] != 1 {
 			t.Errorf("lowered recursive function has %d %s calls, want one",

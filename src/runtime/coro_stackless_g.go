@@ -12,10 +12,12 @@ type stacklessCoroGState struct {
 	native            unsafe.Pointer
 	deferState        *stacklessCoroDeferState
 	blockingScheduler *stacklessCoroScheduler
+	activeSource      *stacklessCoroGoroutine
+	sourceTransition  bool
 }
 
-// Cold state lives behind the existing defer word. The native context embeds
-// stacklessCoroGState and must keep its established allocation size.
+// Cold defer state lives behind a separate word from the active source record.
+// A signal handler reads the current owner directly, without a registry lock.
 type stacklessCoroDeferState struct {
 	task                            *stacklessCoroTask
 	trace                           *stacklessCoroPanicTrace

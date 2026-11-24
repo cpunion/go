@@ -19,8 +19,8 @@ import (
 )
 
 // The crashing goroutine must keep its source identity after terminal frames
-// are released. This checks that goroutine only; enumeration of other idle
-// native goroutines by the fatal all-goroutine printer is a separate contract.
+// are released. A fatal all-goroutine dump must also retain idle logical
+// goroutines exactly once, with the same labels, creators and ancestry.
 func TestTerminalLogicalPanicIdentity(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 	if !(runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" || runtime.GOOS == "linux" && runtime.GOARCH == "amd64") {
@@ -119,7 +119,7 @@ body:
  }
 }
 `
-	dir := t.TempDir()
+	dir := t.ArtifactDir()
 	file := filepath.Join(dir, "main.go")
 	if err := os.WriteFile(file, []byte(program), 0600); err != nil {
 		t.Fatal(err)
@@ -164,6 +164,10 @@ body:
 						run := terminalPanicCommand(t, exe, mode)
 						run.Env = append(run.Environ(), "GOMAXPROCS="+p, "GOGC=1", "GODEBUG=asyncpreemptoff=0,tracebacklabels=1,tracebackancestors=3", "GOTRACEBACK="+level)
 						data, err := run.CombinedOutput()
+						name := config.name + "-" + mode + "-p" + p + "-" + level + ".log"
+						if writeErr := os.WriteFile(filepath.Join(dir, name), data, 0600); writeErr != nil {
+							t.Fatal(writeErr)
+						}
 						text := string(data)
 						exit, ok := err.(*exec.ExitError)
 						panicText := "panic: identity-probe"
@@ -180,6 +184,25 @@ body:
 						before, after, ok := strings.Cut(rest, "END_BEFORE\n")
 						if !ok {
 							t.Fatalf("missing after snapshot: %s", text)
+						}
+						idleBefore := fatalIdentityStacks(before, "main.parked(")
+						idleAfter := fatalIdentityStacks(after, "main.parked(")
+						if len(idleBefore) != 1 {
+							t.Fatalf("missing idle baseline: %s", text)
+						}
+						if level == "all" {
+							if len(idleAfter) != 1 {
+								t.Fatalf("%s P%s: idle goroutine count %d, want 1\n%s", mode, p, len(idleAfter), text)
+							}
+							want, got := idleBefore[0], idleAfter[0]
+							if got.id != want.id || !strings.Contains(got.header, `"fatal-root": source`) || !strings.Contains(want.header, `"fatal-root": source`) || strings.Contains(got.header, "locked to thread") || strings.Contains(want.header, "locked to thread") || !reflect.DeepEqual(got.created, want.created) || got.ancestry != want.ancestry {
+								t.Fatalf("%s P%s: idle identity changed: before=%+v after=%+v\n%s", mode, p, want, got, text)
+							}
+							if strings.Contains(got.text, ".coro.") || strings.Contains(got.text, "stacklessCoro") {
+								t.Fatalf("idle stack exposes private frames: %s", text)
+							}
+						} else if len(idleAfter) != 0 {
+							t.Fatalf("single traceback unexpectedly includes idle goroutine: %s", text)
 						}
 						marker, recursiveFrames := "main.crasher(", 5
 						if mode == "ordinary-after-recovery" {

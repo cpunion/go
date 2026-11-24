@@ -12,6 +12,17 @@ import (
 	"unsafe"
 )
 
+// Save the terminal boundary PCs at runtime initialization. Both fatal
+// tracebacks and CPU sampling are reachable from the allocator. Referencing
+// gopanic or Goexit directly on those paths would introduce a dependency
+// cycle in the allocator's statically initialized dispatch tables.
+var stacklessCoroPanicPC, stacklessCoroGoexitPC uintptr
+
+func init() {
+	stacklessCoroPanicPC = abi.FuncPCABIInternal(gopanic)
+	stacklessCoroGoexitPC = abi.FuncPCABIInternal(Goexit)
+}
+
 // A terminal task releases its typed frames before its panic reaches an
 // ordinary stack. Keep source positions with the same inner/outer text bound,
 // and a complete return-PC payload for Callers. Neither payload retains user
@@ -74,9 +85,9 @@ func (trace *stacklessCoroPanicTrace) appendFrame(uf inlineFrame) {
 }
 
 func (trace *stacklessCoroPanicTrace) appendTrace(previous *stacklessCoroPanicTrace) {
-	boundary := abi.FuncPCABIInternal(gopanic)
+	boundary := stacklessCoroPanicPC
 	if previous.goexit {
-		boundary = abi.FuncPCABIInternal(Goexit)
+		boundary = stacklessCoroGoexitPC
 	}
 	if trace.pcCount != 0 {
 		trace.appendPC(boundary + 1)

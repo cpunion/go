@@ -182,7 +182,7 @@ func TestStacklessCoroNativeBurstParkedRoot(t *testing.T) {
 	if before <= 256<<10 || after > 256<<10 || reserved != 0 {
 		t.Fatalf("parked cache before=%d after=%d reservations=%d", before, after, reserved)
 	}
-	if got := runtime.StacklessCoroNativeContextAllocationSizeForTest(); got > 208 {
+	if got := runtime.StacklessCoroNativeContextAllocationSizeForTest(); got > 224 {
 		t.Fatalf("native context grew to %d allocator bytes", got)
 	}
 }

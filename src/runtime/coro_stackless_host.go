@@ -29,8 +29,8 @@ type stacklessCoroHost struct {
 	startNext    *stacklessCoroHost
 }
 
-// Only an ordinary host allocates this extension. The native executor keeps
-// the original three-pointer G state and its existing context size class.
+// Only an ordinary host allocates this extension. Both native executors and
+// ordinary hosts publish the signal-visible source owner in their common state.
 type stacklessCoroHostGState struct {
 	stacklessCoroGState
 	host          *stacklessCoroHost
@@ -349,7 +349,7 @@ func (h *stacklessCoroHost) run() {
 	state.host = h
 	gp.stacklessCoro = &state.stacklessCoroGState
 	defer func() {
-		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil || state.parkedTask != nil || state.parkedTrace != nil {
+		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil || state.activeSource != nil || state.sourceTransition || state.parkedTask != nil || state.parkedTrace != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
 		gp.stacklessCoro = previous

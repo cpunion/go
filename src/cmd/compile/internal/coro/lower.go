@@ -5404,6 +5404,13 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 			ir.NewLabelStmt(pos, reloadFrame))
 	}
 	prefix = append(prefix, ir.NewAssignStmt(pos, frame, loadFrame))
+	if selfOnly {
+		// The runtime has already published a complete new frame chain.
+		// End its CPU sampling transition only after the generated loop
+		// reloads the frame it is about to execute.
+		prefix = append(prefix, typecheck.Call(pos,
+			typecheck.LookupRuntime("coroProfileResume"), nil, false))
+	}
 	resume.Body = append(prefix, resume.Body...)
 
 	autoInitializers := make(map[*ir.Name]bool)
