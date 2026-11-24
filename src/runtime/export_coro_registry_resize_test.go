@@ -6,15 +6,19 @@
 
 package runtime
 
-func CheckStacklessCoroRegistryResizeForTest(n int) (grownBuckets, nonEmpty, maxChain, drainedBuckets int, largeNil bool, remaining int64) {
+func CheckStacklessCoroRegistryResizeForTest(n int) (grownBuckets, nonEmpty, maxChain, drainedBuckets int, largeNil bool, remaining, unhostedDelta int64) {
 	tasks := make([]stacklessCoroTask, n)
-	recs := make([]stacklessCoroGoroutine, n)
+	recs := make([]*stacklessCoroGoroutine, n)
+	for i := 0; i < n; i++ {
+		recs[i] = &stacklessCoroGoroutine{root: &tasks[i], leaf: &tasks[i]}
+	}
 
 	lock(&stacklessCoroGoroutines.lock)
 	baseRecords := stacklessCoroGoroutines.records.Load()
+	baseUnhosted := stacklessCoroGoroutines.unhosted.Load()
 	for i := 0; i < n; i++ {
-		recs[i] = stacklessCoroGoroutine{root: &tasks[i], leaf: &tasks[i]}
-		stacklessCoroInsertGoroutine(&recs[i])
+		stacklessCoroInsertGoroutine(recs[i])
+		stacklessCoroGoroutines.unhosted.Add(1)
 	}
 	buckets := stacklessCoroGoroutineBuckets()
 	grownBuckets = len(buckets)
@@ -32,9 +36,9 @@ func CheckStacklessCoroRegistryResizeForTest(n int) (grownBuckets, nonEmpty, max
 	}
 	// Verify every inserted task is findable after all rehashes.
 	for i := 0; i < n; i++ {
-		if stacklessCoroGoroutineFor(&tasks[i]) != &recs[i] {
+		if stacklessCoroGoroutineFor(&tasks[i]) != recs[i] {
 			unlock(&stacklessCoroGoroutines.lock)
-			return -1, 0, 0, 0, false, -1
+			return -1, 0, 0, 0, false, -1, -1
 		}
 	}
 	unlock(&stacklessCoroGoroutines.lock)
@@ -47,6 +51,7 @@ func CheckStacklessCoroRegistryResizeForTest(n int) (grownBuckets, nonEmpty, max
 	drainedBuckets = len(stacklessCoroGoroutineBuckets())
 	largeNil = stacklessCoroGoroutines.largeBuckets == nil
 	remaining = stacklessCoroGoroutines.records.Load() - baseRecords
+	unhostedDelta = stacklessCoroGoroutines.unhosted.Load() - baseUnhosted
 	unlock(&stacklessCoroGoroutines.lock)
 	return
 }

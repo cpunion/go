@@ -20,7 +20,7 @@ func TestStacklessCoroRegistryResize(t *testing.T) {
 		{n: 4096, minBuckets: 2048, maxChain: 16},
 		{n: 30000, minBuckets: 16384, maxChain: 16},
 	} {
-		grownBuckets, nonEmpty, maxChain, drainedBuckets, largeNil, remaining := runtime.CheckStacklessCoroRegistryResizeForTest(tc.n)
+		grownBuckets, nonEmpty, maxChain, drainedBuckets, largeNil, remaining, unhostedDelta := runtime.CheckStacklessCoroRegistryResizeForTest(tc.n)
 		if grownBuckets < tc.minBuckets {
 			t.Fatalf("n=%d: grownBuckets = %d, want >= %d", tc.n, grownBuckets, tc.minBuckets)
 		}
@@ -30,9 +30,9 @@ func TestStacklessCoroRegistryResize(t *testing.T) {
 		if maxChain > tc.maxChain {
 			t.Fatalf("n=%d: maxChain = %d across %d buckets, want <= %d", tc.n, maxChain, grownBuckets, tc.maxChain)
 		}
-		if drainedBuckets != 256 || !largeNil || remaining != 0 {
-			t.Fatalf("n=%d after drain: buckets=%d largeNil=%v remaining=%d, want 256, true, 0",
-				tc.n, drainedBuckets, largeNil, remaining)
+		if drainedBuckets != 256 || !largeNil || remaining != 0 || unhostedDelta != 0 {
+			t.Fatalf("n=%d after drain: buckets=%d largeNil=%v remaining=%d unhostedDelta=%d, want 256, true, 0, 0",
+				tc.n, drainedBuckets, largeNil, remaining, unhostedDelta)
 		}
 	}
 }
