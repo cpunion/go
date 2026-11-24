@@ -96,6 +96,7 @@ func CoroWaitGroupWaiters(wg *WaitGroup) uint32 {
 	const controller = `package sync_test
 
 import (
+ "runtime/metrics"
  "runtime"
  "sync"
  "testing"
@@ -185,10 +186,10 @@ func TestCoroWaitGroupSpawn(t *testing.T) {
   var wg sync.WaitGroup
   started, release := make(chan struct{}, count), make(chan struct{})
   wg.Add(count)
-  before := runtime.NumGoroutine()
+  before := ordinaryGoroutines()
   sync.CoroWaitGroupSpawn(&wg, started, release, count, mode)
   for i := 0; i < count; i++ { <-started }
-  parked := runtime.NumGoroutine()
+  parked := ordinaryGoroutines()
   runtime.GC()
   close(release)
   wg.Wait()
@@ -196,6 +197,16 @@ func TestCoroWaitGroupSpawn(t *testing.T) {
    t.Fatalf("mode %d created ordinary goroutines: before=%d parked=%d", mode, before, parked)
   }
  }
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	for _, config := range []struct {

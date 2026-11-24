@@ -26,6 +26,7 @@ func TestIntegerRangeFactory(t *testing.T) {
 	const source = `package main
 
 import (
+ "runtime/metrics"
  "runtime"
  "sync"
  "time"
@@ -160,17 +161,27 @@ func main() {
  if trace != 321 { panic("repeated defer order") }
  var wg sync.WaitGroup
  ready, done := make(chan int, 128), make(chan int)
- baseline := runtime.NumGoroutine()
+ baseline := ordinaryGoroutines()
  spawn(&wg, ready, done)
  var seen [128]bool
  for range 128 { value := <-ready; if seen[value] { panic("duplicate task") }; seen[value] = true }
- if NATIVE && runtime.NumGoroutine() > baseline+8 { panic("integer range spawned ordinary goroutines") }
+ if NATIVE && ordinaryGoroutines() > baseline+8 { panic("integer range spawned ordinary goroutines") }
  runtime.GC()
  close(done)
  wait(&wg)
  for i, f := range captured() { if f() != i { panic("capture fallback") } }
  if sliced([]int{2, 3}) != 5 || labeled() != 1 { panic("slice or labeled range") }
  println("integer-range-ok")
+}
+
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
 }
 `
 	const controller = `package main

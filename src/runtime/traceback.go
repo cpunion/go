@@ -1369,8 +1369,13 @@ func goroutineheader(gp *g) {
 		print(", synctest bubble ", bubble.id)
 	}
 	print("]")
-	if gp.labels != nil && debug.tracebacklabels.Load() == 1 {
-		labels := (*label.Set)(gp.labels).List
+	printGoroutineLabels(gp.labels)
+	print(":\n")
+}
+
+func printGoroutineLabels(labelMap unsafe.Pointer) {
+	if labelMap != nil && debug.tracebacklabels.Load() == 1 {
+		labels := (*label.Set)(labelMap).List
 		if len(labels) > 0 {
 			print(" {")
 			for i, kv := range labels {
@@ -1392,7 +1397,6 @@ func goroutineheader(gp *g) {
 			print("}")
 		}
 	}
-	print(":\n")
 }
 
 func tracebackStringNeedsQuoting(s string) bool {

@@ -23,6 +23,7 @@ func TestCapturedDeclarationStorage(t *testing.T) {
 	}
 	testenv.MustHaveGoBuild(t)
 	const source = `package main
+import "runtime/metrics"
 import "runtime"
 func integers() (fs []func(int)int, ps []*int) {
  for i:=range 4 {ps=append(ps,&i);fs=append(fs,func(d int)int{i+=d;runtime.Gosched();return i});runtime.Gosched();i+=10};return
@@ -93,12 +94,22 @@ func main(){
  anyReaders,anyPointers:=cases([]any{1,2,&object{n:3},&object{n:4},nil,"ab",true,5.0});runtime.GC()
  if anyPointers[0].(*int)==anyPointers[1].(*int)||anyPointers[2].(**object)==anyPointers[3].(**object)||anyPointers[4].(*any)==anyPointers[5].(*any)||anyPointers[6].(*any)==anyPointers[7].(*any) {panic("aliased case declarations")}
  for i,f:=range anyReaders {v:=f();switch i {case 0,1:if v.(int)!=11+i||*anyPointers[i].(*int)!=11+i {panic("int case capture")};case 2,3:if v.(*object).n!=11+i||(*anyPointers[i].(**object)).n!=11+i {panic("pointer case capture")};case 4,5:if v!="bound"||*anyPointers[i].(*any)!="bound" {panic("multi-type case capture")};default:if v!="default"||*anyPointers[i].(*any)!="default" {panic("default case capture")}}}
- done:=make(chan int);before:=runtime.NumGoroutine();values:=make([]int,64);for i:=range values {values[i]=i};spawn(values,ready,release,done)
- total:=0;for range 64 {total+=<-ready};if total!=2016 {panic("spawn input cells")};if NATIVE && runtime.NumGoroutine()>before+16 {panic("ordinary goroutine per range child")};runtime.GC()
+ done:=make(chan int);before:=ordinaryGoroutines();values:=make([]int,64);for i:=range values {values[i]=i};spawn(values,ready,release,done)
+ total:=0;for range 64 {total+=<-ready};if total!=2016 {panic("spawn input cells")};if NATIVE && ordinaryGoroutines()>before+16 {panic("ordinary goroutine per range child")};runtime.GC()
  for range 64 {release<-1};total=0;for range 64 {total+=<-done};if total!=2016 {panic("spawn output cells")}
  ps=cleanup([]int{1,2,3});if len(ps)!=2||ps[0]==ps[1]||*ps[0]!=101||*ps[1]!=102 {panic("panic cleanup cell lifetime")}
  println("captured-storage-ok")
-}`
+}
+// Count ordinary Go stacks separately from unhosted logical goroutines.
+// This remains a dispatch check after NumGoroutine includes native tasks.
+func ordinaryGoroutines() int {
+ samples := []metrics.Sample{{Name: "/sched/coro/goroutines/unhosted:goroutines"}}
+ metrics.Read(samples)
+ native := 0
+ if samples[0].Value.Kind() == metrics.KindUint64 { native = int(samples[0].Value.Uint64()) }
+ return runtime.NumGoroutine() - native
+}
+`
 	for _, config := range []struct{ name, experiment, flags string }{
 		{"native", "coro", "-l -d=coro=4"},
 		{"checkptr", "coro", "-l -d=coro=4 -d=checkptr=2"},

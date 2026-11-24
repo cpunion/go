@@ -8,6 +8,8 @@ package runtime
 
 import "unsafe"
 
+func stacklessCoroPublicCaller(gp *g) *g { return gp }
+
 func yieldStacklessCoroNativeRoot(*stacklessCoroScheduler, *stacklessCoroTask) bool {
 	Gosched()
 	return false

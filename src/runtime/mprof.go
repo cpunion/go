@@ -1391,9 +1391,18 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		labels[0] = ourg.labels
 	}
 	ourg.goroutineProfiled.Store(goroutineProfileSatisfied)
-	goroutineProfile.offset.Store(1)
+	logical := 0
+	systemstack(func() {
+		var logicalLabels []unsafe.Pointer
+		if labels != nil {
+			logicalLabels = labels[1:]
+		}
+		logical = stacklessCoroGoroutineProfile(p[1:], logicalLabels, true)
+	})
+	goroutineProfile.offset.Store(1 + int64(logical))
 
-	// Prepare for all other goroutines to enter the profile. Aside from ourg,
+	// Prepare for all other goroutines to enter the profile. Aside from ourg
+	// and coroutine hosts captured while the world was stopped,
 	// every goroutine struct in the allgs list has its goroutineProfiled field
 	// cleared. Any goroutine created from this point on (while
 	// goroutineProfile.active is set) will start with its goroutineProfiled
@@ -1583,7 +1592,7 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 	stw := stopTheWorld(stwGoroutineProfile)
 
 	// World is stopped, no locking required.
-	n = 1
+	n = 1 + int(stacklessCoroUnhostedGoroutines())
 	forEachGRace(func(gp1 *g) {
 		if isOK(gp1) {
 			n++
@@ -1607,10 +1616,16 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 			lbl[0] = gp.labels
 			lbl = lbl[1:]
 		}
+		logical := 0
+		systemstack(func() { logical = stacklessCoroGoroutineProfile(r, lbl, false) })
+		r = r[logical:]
+		if lbl != nil {
+			lbl = lbl[logical:]
+		}
 
 		// Save other goroutines.
 		forEachGRace(func(gp1 *g) {
-			if !isOK(gp1) {
+			if !isOK(gp1) || stacklessCoroSnapshotGoroutine(gp1) {
 				return
 			}
 
@@ -1710,7 +1725,10 @@ func Stack(buf []byte, all bool) int {
 			goroutineheader(gp)
 			traceback(pc, sp, 0, gp)
 			if all {
-				tracebackothers(gp)
+				tracebacksomeothers(gp, func(other *g) bool {
+					return !stacklessCoroSnapshotGoroutine(other)
+				})
+				stacklessCoroTracebackGoroutines()
 			}
 			g0.m.traceback = 0
 			n = len(g0.writebuf)

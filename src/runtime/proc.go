@@ -5435,6 +5435,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		newg.tracking = true
 	}
 	gcController.addScannableStack(pp, int64(newg.stack.hi-newg.stack.lo))
+	logicalID := stacklessCoroInitHostG(fn, callergp, newg)
 
 	// Get a goid and switch to runnable. This needs to happen under traceAcquire
 	// since it's a goroutine transition. See tracer invariants in trace.go.
@@ -5452,9 +5453,13 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 		pp.goidcache -= _GoidCacheBatch - 1
 		pp.goidcacheend = pp.goidcache + _GoidCacheBatch
 	}
-	newg.goid = pp.goidcache
+	if logicalID != 0 {
+		newg.goid = logicalID
+	} else {
+		newg.goid = pp.goidcache
+		pp.goidcache++
+	}
 	casgstatus(newg, _Gdead, status)
-	pp.goidcache++
 	newg.trace.reset()
 	if trace.ok() {
 		trace.GoCreate(newg, newg.startpc, parked)
@@ -5489,7 +5494,9 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 			racereleasemergeg(newg, unsafe.Pointer(&labelSync))
 		}
 	}
-	pp.goroutinesCreated++
+	if logicalID == 0 {
+		pp.goroutinesCreated++
+	}
 	releasem(mp)
 
 	return newg
@@ -5767,6 +5774,7 @@ func badunlockosthread() {
 
 func gcount(includeSys bool) int32 {
 	n := int32(atomic.Loaduintptr(&allglen)) - sched.gFree.stack.size - sched.gFree.noStack.size
+	n += int32(stacklessCoroUnhostedGoroutines())
 	if !includeSys {
 		n -= sched.ngsys.Load()
 	}
