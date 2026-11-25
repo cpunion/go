@@ -34,6 +34,7 @@ type stacklessCoroHost struct {
 type stacklessCoroHostGState struct {
 	stacklessCoroGState
 	host          *stacklessCoroHost
+	publicState   *stacklessCoroPublicGState
 	ordinaryDepth uint32
 	activeTask    *stacklessCoroTask
 	parkedTask    *stacklessCoroTask
@@ -347,12 +348,13 @@ func (h *stacklessCoroHost) run() {
 	previousDefer := state.deferState
 	state.native = unsafe.Pointer(&state.blockingScheduler)
 	state.host = h
-	gp.stacklessCoro = &state.stacklessCoroGState
+	state.publicState = stacklessCoroPublicStateFrom(previous)
+	atomicstorep(unsafe.Pointer(&gp.stacklessCoro), unsafe.Pointer(&state.stacklessCoroGState))
 	defer func() {
 		if state.blockingScheduler != nil || state.deferState != previousDefer || state.ordinaryDepth != 0 || state.activeTask != nil || state.activeSource != nil || state.sourceTransition || state.parkedTask != nil || state.parkedTrace != nil {
 			throw("runtime: active state during stackless coroutine host finish")
 		}
-		gp.stacklessCoro = previous
+		atomicstorep(unsafe.Pointer(&gp.stacklessCoro), unsafe.Pointer(previous))
 	}()
 	h.driveThroughGoexit()
 }
