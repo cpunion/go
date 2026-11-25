@@ -2899,9 +2899,14 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Dynamic callee snapshots belong to the source caller during validation;
 	// rechecking that relationship after reparenting would lose their arguments.
 	goCalls := make(map[*ir.CallExpr]*ir.CallExpr)
+	elidedGoWrappers := make(map[*ir.Func]bool)
 	for _, edge := range function.Edges {
 		if edge.Kind == GoCall {
-			goCalls[edge.Node] = unwrapGoCall(edge.Node)
+			unwrapped := unwrapGoCall(edge.Node)
+			goCalls[edge.Node] = unwrapped
+			if candidate.transitions[edge.Node] == SiteSpawn && unwrapped != edge.Node {
+				elidedGoWrappers[edge.Node.Fun.(*ir.ClosureExpr).Func] = true
+			}
 		}
 	}
 	// Keep NoSuspend adapters unchanged. Both explicit frames and closure
@@ -2979,8 +2984,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// A source declaration may execute repeatedly. Its cell is allocated at
 	// that declaration; each nested closure snapshots the cell pointer when
 	// created, rather than sharing the next iteration's pointer slot.
-	ir.Visit(fn, func(node ir.Node) {
+	// Frontend-generated go wrappers that SiteSpawn eliminates never exist at
+	// runtime; skip their synthetic captures so frozen go operands stay in the
+	// caller frame without per-argument heap cells.
+	var visitCaptureClosures func(ir.Node)
+	visitCaptureClosures = func(node ir.Node) {
 		if closure, ok := node.(*ir.ClosureExpr); ok {
+			if elidedGoWrappers[closure.Func] {
+				return
+			}
 			for _, variable := range closure.Func.ClosureVars {
 				source := variable.Canonical()
 				if source.Curfn == fn && source.Sym().Name != typecheck.LocalDictName {
@@ -2988,7 +3000,13 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 				}
 			}
 		}
-	})
+	}
+	ir.Visit(fn, visitCaptureClosures)
+	for call, unwrapped := range goCalls {
+		if candidate.transitions[call] == SiteSpawn && unwrapped != call {
+			ir.Visit(unwrapped, visitCaptureClosures)
+		}
+	}
 	for _, variable := range candidate.iterationVars {
 		addCaptureCell(variable)
 	}
@@ -3818,11 +3836,21 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	// Retain their literals so their captures still move into resume, including
 	// callee snapshots introduced by captured-parameter specialization.
 	var sourceLiterals ir.Nodes
-	ir.Visit(fn, func(node ir.Node) {
+	var visitSourceLiterals func(ir.Node)
+	visitSourceLiterals = func(node ir.Node) {
 		if closure, ok := node.(*ir.ClosureExpr); ok {
+			if elidedGoWrappers[closure.Func] {
+				return
+			}
 			sourceLiterals = append(sourceLiterals, closure)
 		}
-	})
+	}
+	ir.Visit(fn, visitSourceLiterals)
+	for call, unwrapped := range goCalls {
+		if candidate.transitions[call] == SiteSpawn && unwrapped != call {
+			ir.Visit(unwrapped, visitSourceLiterals)
+		}
+	}
 	entryState := lowerStatements(fn.Body, completeState)
 	candidate.entryZeroed = entryZeroedFrameLocals(states[entryState].body)
 	declarations = append(declarations, ir.NewAssignStmt(pos, pc,
@@ -4087,13 +4115,16 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 		return node
 	}
 
-	deferClosures := make(map[*ir.Func]bool, len(candidate.defers))
+	skipClosures := make(map[*ir.Func]bool, len(candidate.defers)+len(elidedGoWrappers))
 	for _, deferred := range candidate.defers {
 		if closure, ok := deferred.call.Fun.(*ir.ClosureExpr); ok {
-			deferClosures[closure.Func] = true
+			skipClosures[closure.Func] = true
 		}
 	}
-	if err := reparentClosureCaptures(fn, resume, deferClosures, edit, sourceLiterals...); err != nil {
+	for wrapper := range elidedGoWrappers {
+		skipClosures[wrapper] = true
+	}
+	if err := reparentClosureCaptures(fn, resume, skipClosures, edit, sourceLiterals...); err != nil {
 		return err
 	}
 
