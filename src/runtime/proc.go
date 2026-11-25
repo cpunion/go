@@ -4555,6 +4555,7 @@ func gdestroy(gp *g) {
 	gp.bubble = nil
 	gp.fipsOnlyBypass = false
 	gp.secret = 0
+	stacklessCoroClearGState(gp)
 
 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
 		// Flush assist credit to the global pool. This gives

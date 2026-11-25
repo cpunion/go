@@ -42,6 +42,9 @@ func releaseStacklessCoroSudog(unsafe.Pointer, *sudog) {
 }
 
 //go:nosplit
+func stacklessCoroClearGState(*g) {}
+
+//go:nosplit
 //go:nowritebarrierrec
 func (*g) stackIsFixed() bool {
 	return false

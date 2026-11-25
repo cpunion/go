@@ -51,6 +51,11 @@ func (s *stacklessCoroSudog) clear() {
 }
 
 //go:nosplit
+func stacklessCoroClearGState(gp *g) {
+	gp.stacklessCoro = nil
+}
+
+//go:nosplit
 //go:nowritebarrierrec
 func (gp *g) stackIsFixed() bool {
 	state := gp.stacklessCoro

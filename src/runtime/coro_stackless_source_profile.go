@@ -93,15 +93,38 @@ func stacklessCoroProfileCallerLink(gp *g, f funcInfo, pc uintptr, sp unsafe.Poi
 // by its P and contains only integers. The profiler reads the published
 // public record as before.
 type stacklessCoroCallerProfile struct {
-	rootPC, callerPC uintptr
-	returnPCs        [12]uintptr
-	pcs              [16]uintptr
-	offsets          [12]uint16
-	depth            uint16
-	nReturn, nPC     uint8
+	resumePC, rootPC, callerPC uintptr
+	returnPCs                  [12]uintptr
+	pcs                        [16]uintptr
+	offsets                    [12]uint16
+	depth                      uint16
+	nReturn, nPC               uint8
 }
 
-func stacklessCoroCachedProfileCaller(gp *g, rootPC, callerPC uintptr, sp unsafe.Pointer, pcs []uintptr) int {
+func stacklessCoroCachedPublicProfileCaller(gp *g, resumePC, callerPC uintptr, sp unsafe.Pointer, pcs []uintptr) (int, bool) {
+	if !framepointer_enabled || callerPC == 0 || resumePC == 0 ||
+		gp.stktopsp-uintptr(sp) > stacklessCoroProfileCacheDepth {
+		return 0, false
+	}
+	mp := acquirem()
+	if pp := mp.p.ptr(); pp != nil && mp.curg == gp && uintptr(sp) >= gp.stack.lo && gp.stktopsp < gp.stack.hi {
+		depth := gp.stktopsp - uintptr(sp)
+		for i := range pp.callerProfiles {
+			c := &pp.callerProfiles[i]
+			if c.resumePC == resumePC {
+				if n := c.load(c.rootPC, callerPC, depth, sp, pcs); n > 0 {
+					pp.profileMisses = 0
+					releasem(mp)
+					return n, true
+				}
+			}
+		}
+	}
+	releasem(mp)
+	return 0, false
+}
+
+func stacklessCoroCachedProfileCaller(gp *g, resumePC, rootPC, callerPC uintptr, sp unsafe.Pointer, pcs []uintptr) int {
 	if !framepointer_enabled || callerPC == 0 || gp.stktopsp-uintptr(sp) > stacklessCoroProfileCacheDepth {
 		return stacklessCoroCaptureProfileCaller(gp, rootPC, callerPC, sp, pcs, nil)
 	}
@@ -125,7 +148,7 @@ func stacklessCoroCachedProfileCaller(gp *g, rootPC, callerPC uintptr, sp unsafe
 		pp.profileMisses = 0
 	}
 	releasem(mp)
-	return stacklessCoroRememberProfileCaller(gp, rootPC, callerPC, sp, pcs)
+	return stacklessCoroRememberProfileCaller(gp, resumePC, rootPC, callerPC, sp, pcs)
 }
 
 //go:nosplit
@@ -142,8 +165,8 @@ func (c *stacklessCoroCallerProfile) load(rootPC, callerPC, depth uintptr, sp un
 }
 
 //go:noinline
-func stacklessCoroRememberProfileCaller(gp *g, rootPC, callerPC uintptr, sp unsafe.Pointer, pcs []uintptr) int {
-	c := stacklessCoroCallerProfile{rootPC: rootPC, callerPC: callerPC}
+func stacklessCoroRememberProfileCaller(gp *g, resumePC, rootPC, callerPC uintptr, sp unsafe.Pointer, pcs []uintptr) int {
+	c := stacklessCoroCallerProfile{resumePC: resumePC, rootPC: rootPC, callerPC: callerPC}
 	n := stacklessCoroCaptureProfileCaller(gp, rootPC, callerPC, sp, pcs, &c)
 	if c.depth != 0 && n != 0 && n <= len(c.pcs) {
 		c.nPC = uint8(copy(c.pcs[:], pcs[:n]))
