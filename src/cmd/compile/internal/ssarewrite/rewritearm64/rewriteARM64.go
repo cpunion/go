@@ -10156,6 +10156,27 @@ func rewriteValue_OpARM64MOVBUload(v *ssa.Value) bool {
 		v.AddArg2(ptr, mem)
 		return true
 	}
+	// match: (MOVBUload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVBUload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVBUload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
 	// match: (MOVBUload [off] {sym} (ADD ptr idx) mem)
 	// cond: off == 0 && sym == nil
 	// result: (MOVBUloadidx ptr idx mem)
@@ -10381,6 +10402,27 @@ func rewriteValue_OpARM64MOVBload(v *ssa.Value) bool {
 		}
 		v.Reset(ssaop.OpARM64MOVBload)
 		v.AuxInt = ssa.Int32ToAuxInt(off1 + int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
+	// match: (MOVBload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVBload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVBload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
 		v.Aux = ssa.SymToAux(sym)
 		v.AddArg2(ptr, mem)
 		return true
@@ -10909,6 +10951,27 @@ func rewriteValue_OpARM64MOVDload(v *ssa.Value) bool {
 		v.AddArg2(ptr, mem)
 		return true
 	}
+	// match: (MOVDload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVDload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVDload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
 	// match: (MOVDload [off] {sym} (ADD ptr idx) mem)
 	// cond: off == 0 && sym == nil
 	// result: (MOVDloadidx ptr idx mem)
@@ -11353,6 +11416,27 @@ func rewriteValue_OpARM64MOVHUload(v *ssa.Value) bool {
 		v.AddArg2(ptr, mem)
 		return true
 	}
+	// match: (MOVHUload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVHUload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVHUload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
 	// match: (MOVHUload [off] {sym} (ADD ptr idx) mem)
 	// cond: off == 0 && sym == nil
 	// result: (MOVHUloadidx ptr idx mem)
@@ -11666,6 +11750,27 @@ func rewriteValue_OpARM64MOVHload(v *ssa.Value) bool {
 		}
 		v.Reset(ssaop.OpARM64MOVHload)
 		v.AuxInt = ssa.Int32ToAuxInt(off1 + int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
+	// match: (MOVHload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVHload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVHload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
 		v.Aux = ssa.SymToAux(sym)
 		v.AddArg2(ptr, mem)
 		return true
@@ -12384,6 +12489,27 @@ func rewriteValue_OpARM64MOVWUload(v *ssa.Value) bool {
 		v.AddArg2(ptr, mem)
 		return true
 	}
+	// match: (MOVWUload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVWUload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVWUload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
 	// match: (MOVWUload [off] {sym} (ADD ptr idx) mem)
 	// cond: off == 0 && sym == nil
 	// result: (MOVWUloadidx ptr idx mem)
@@ -12678,6 +12804,27 @@ func rewriteValue_OpARM64MOVWload(v *ssa.Value) bool {
 		}
 		v.Reset(ssaop.OpARM64MOVWload)
 		v.AuxInt = ssa.Int32ToAuxInt(off1 + int32(off2))
+		v.Aux = ssa.SymToAux(sym)
+		v.AddArg2(ptr, mem)
+		return true
+	}
+	// match: (MOVWload [off1] {sym} (SUBconst [off2] ptr) mem)
+	// cond: ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)
+	// result: (MOVWload [off1-int32(off2)] {sym} ptr mem)
+	for {
+		off1 := ssa.AuxIntToInt32(v.AuxInt)
+		sym := ssa.AuxToSym(v.Aux)
+		if v_0.Op != ssaop.OpARM64SUBconst {
+			break
+		}
+		off2 := ssa.AuxIntToInt64(v_0.AuxInt)
+		ptr := v_0.Args[0]
+		mem := v_1
+		if !(ssa.Is32Bit(int64(off1)-off2) && (ptr.Op != ssaop.OpSB || !config.Ctxt.Flag_dynlink)) {
+			break
+		}
+		v.Reset(ssaop.OpARM64MOVWload)
+		v.AuxInt = ssa.Int32ToAuxInt(off1 - int32(off2))
 		v.Aux = ssa.SymToAux(sym)
 		v.AddArg2(ptr, mem)
 		return true
