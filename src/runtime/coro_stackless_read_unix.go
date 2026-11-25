@@ -26,16 +26,22 @@ func init() {
 }
 
 func coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	coroFileRead1(ctx, fd, buffer, n, errno, false)
-}
-
-func coroPublicFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	coroFileRead1(ctx, fd, buffer, n, errno, true)
+	op := stacklessCoroStartIOOperation(ctx, "read")
+	// This operation is completed directly below and is never registered.
+	op.id = stacklessCoroDirectOperationID
+	count, status := stacklessCoroFileRead(ctx, fd, buffer, false)
+	if n != nil {
+		*n = count
+	}
+	if errno != nil {
+		*errno = status
+	}
+	completeStacklessCoroOperation(op)
 }
 
 //go:linkname poll_runtime_coroFileRead internal/poll.runtime_coroFileRead
-func poll_runtime_coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	coroPublicFileRead(ctx, fd, buffer, n, errno)
+func poll_runtime_coroFileRead(ctx unsafe.Pointer, fd int, buffer []byte) (int, uintptr) {
+	return stacklessCoroFileRead(ctx, fd, buffer, true)
 }
 
 //go:linkname poll_runtime_coroCallRead internal/poll.runtime_coroCallRead
@@ -43,44 +49,38 @@ func poll_runtime_coroCallRead(ctx unsafe.Pointer, call func()) {
 	coroCallRead(ctx, call)
 }
 
-func coroFileRead1(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr, retryEINTR bool) {
-	op := stacklessCoroStartIOOperation(ctx, "read")
-	// This operation is completed directly below and is never registered.
-	// It still needs a nonzero identity for the common completion checks.
-	op.id = stacklessCoroDirectOperationID
-	op.resourceState().buffer = buffer
-	op.resourceState().n = n
-	op.resourceState().errno = errno
-
-	var count int32
-	var readErrno uintptr
-	if len(buffer) != 0 {
-		coroEnterSyscall(ctx)
-		for {
-			count = read(int32(fd), unsafe.Pointer(&buffer[0]),
-				stacklessCoroReadLength(len(buffer)))
-			if count != -_EINTR || !retryEINTR {
-				break
-			}
-		}
-		coroExitSyscall()
-		if count < 0 {
-			readErrno = uintptr(-count)
-		}
+// stacklessCoroFileRead may block in the syscall. The executor can hand off
+// its P and admit replacement capacity while the calling frame stays live.
+func stacklessCoroFileRead(ctx unsafe.Pointer, fd int, buffer []byte, retryEINTR bool) (int, uintptr) {
+	if len(buffer) == 0 {
+		return 0, 0
 	}
+	p := unsafe.Pointer(&buffer[0])
+	length := stacklessCoroReadLength(len(buffer))
+	coroEnterSyscall(ctx)
+	count := stacklessCoroRead(int32(fd), p, length, retryEINTR)
+	coroExitSyscall()
 	KeepAlive(buffer)
+	return stacklessCoroReadResult(count)
+}
 
-	if op.resourceState().n != nil {
-		if count < 0 {
-			*op.resourceState().n = -1
-		} else {
-			*op.resourceState().n = int(count)
+// The file path calls this while in syscall state.
+//
+//go:nosplit
+func stacklessCoroRead(fd int32, p unsafe.Pointer, length int32, retryEINTR bool) int32 {
+	for {
+		count := read(fd, p, length)
+		if count != -_EINTR || !retryEINTR {
+			return count
 		}
 	}
-	if op.resourceState().errno != nil {
-		*op.resourceState().errno = readErrno
+}
+
+func stacklessCoroReadResult(count int32) (int, uintptr) {
+	if count < 0 {
+		return -1, uintptr(-count)
 	}
-	completeStacklessCoroOperation(op)
+	return int(count), 0
 }
 
 func stacklessCoroReadLength(length int) int32 {

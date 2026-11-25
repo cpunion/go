@@ -100,8 +100,9 @@ func TestStacklessCoroSocketDuplex(t *testing.T) {
 	sibling := func(ctx unsafe.Pointer) uint8 {
 		if readState == 0 {
 			readState = 1
-			runtime.SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], readBuffer[:], &readN, &readStatus)
-			return runtime.StacklessCoroActionWait
+			if runtime.SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], readBuffer[:], &readN, &readStatus) {
+				return runtime.StacklessCoroActionWait
+			}
 		}
 		readDone = true
 		return runtime.StacklessCoroActionComplete
@@ -110,8 +111,9 @@ func TestStacklessCoroSocketDuplex(t *testing.T) {
 		if state == 0 {
 			state = 1
 			runtime.SpawnStacklessCoroForTest(ctx, sibling)
-			runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &writeN, &writeStatus)
-			return runtime.StacklessCoroActionWait
+			if runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &writeN, &writeStatus) {
+				return runtime.StacklessCoroActionWait
+			}
 		}
 		if !readDone {
 			return runtime.StacklessCoroActionYield
@@ -130,13 +132,8 @@ func TestStacklessCoroFileWriteError(t *testing.T) {
 	for _, buffer := range [][]byte{nil, []byte("x")} {
 		var n int
 		var status uintptr
-		started := false
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if !started {
-				started = true
-				runtime.FileWriteStacklessCoroForTest(ctx, -1, buffer, &n, &status)
-				return runtime.StacklessCoroActionWait
-			}
+			runtime.FileWriteStacklessCoroForTest(ctx, -1, buffer, &n, &status)
 			return runtime.StacklessCoroActionComplete
 		})
 		if n != 0 || status != uintptr(syscall.EBADF) {
@@ -164,13 +161,8 @@ func TestStacklessCoroFileWriteLarge(t *testing.T) {
 	defer syscall.Close(fd)
 	var n int
 	var status uintptr
-	started := false
 	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-		if !started {
-			started = true
-			runtime.FileWriteStacklessCoroForTest(ctx, fd, buffer, &n, &status)
-			return runtime.StacklessCoroActionWait
-		}
+		runtime.FileWriteStacklessCoroForTest(ctx, fd, buffer, &n, &status)
 		return runtime.StacklessCoroActionComplete
 	})
 	if n != len(buffer) || status != 0 {
@@ -249,11 +241,12 @@ func TestStacklessCoroWriteProgress(t *testing.T) {
 						return runtime.StacklessCoroActionComplete
 					})
 					if pollable {
-						runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &n, &status)
-					} else {
-						runtime.FileWriteStacklessCoroForTest(ctx, fds[0], payload, &n, &status)
+						if runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &n, &status) {
+							return runtime.StacklessCoroActionWait
+						}
+						return runtime.StacklessCoroActionComplete
 					}
-					return runtime.StacklessCoroActionWait
+					runtime.FileWriteStacklessCoroForTest(ctx, fds[0], payload, &n, &status)
 				}
 				return runtime.StacklessCoroActionComplete
 			})
@@ -265,6 +258,42 @@ func TestStacklessCoroWriteProgress(t *testing.T) {
 				t.Fatalf("registered operations = %d, want %d", after, before)
 			}
 		})
+	}
+}
+
+func TestStacklessCoroSocketWriteReady(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	for _, fd := range fds {
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	descriptor, errno := runtime.OpenStacklessCoroPollDescForTest(fds[0])
+	if errno != 0 {
+		t.Fatal(syscall.Errno(errno))
+	}
+	defer runtime.CloseStacklessCoroPollDescForTest(descriptor)
+	defer runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+	payload := []byte("ready socket")
+	var status uintptr
+	var n int
+	runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+		if runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &n, &status) {
+			t.Fatal("ready socket write suspended")
+		}
+		return runtime.StacklessCoroActionComplete
+	})
+	if n != len(payload) || status != 0 {
+		t.Fatalf("ready write = (%d, %d), want (%d, 0)", n, status, len(payload))
+	}
+	actual := make([]byte, len(payload))
+	if n, err := syscall.Read(fds[1], actual); err != nil || n != len(payload) || !bytes.Equal(actual, payload) {
+		t.Fatalf("peer read = (%d, %q, %v), want %q", n, actual, err, payload)
 	}
 }
 
@@ -288,17 +317,102 @@ func TestStacklessCoroSocketWriteDeadline(t *testing.T) {
 	for _, buffer := range [][]byte{nil, []byte("deadline")} {
 		var n int
 		var status uintptr
-		started := false
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if !started {
-				started = true
-				runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], buffer, &n, &status)
-				return runtime.StacklessCoroActionWait
+			if runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], buffer, &n, &status) {
+				t.Fatal("expired socket write suspended")
 			}
 			return runtime.StacklessCoroActionComplete
 		})
 		if n != 0 || status != runtime.StacklessCoroPollErrorStatusForTest(2) {
 			t.Fatalf("expired write = (%d, %d), want (0, deadline)", n, status)
 		}
+	}
+}
+
+func TestStacklessCoroSocketWritePartialError(t *testing.T) {
+	for _, expireDeadline := range []bool{false, true} {
+		name := "peer_close"
+		if expireDeadline {
+			name = "deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer syscall.Close(fds[0])
+			peerClosed := false
+			defer func() {
+				if !peerClosed {
+					syscall.Close(fds[1])
+				}
+			}()
+			if err := syscall.SetNonblock(fds[0], true); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.SetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096); err != nil {
+				t.Fatal(err)
+			}
+			descriptor, errno := runtime.OpenStacklessCoroPollDescForTest(fds[0])
+			if errno != 0 {
+				t.Fatal(syscall.Errno(errno))
+			}
+			defer runtime.CloseStacklessCoroPollDescForTest(descriptor)
+			defer runtime.UnblockStacklessCoroPollDescForTest(descriptor)
+
+			beforeOps := runtime.StacklessCoroOperationCountForTest()
+			beforePoll := runtime.StacklessCoroPollWaitCountForTest()
+			payload := bytes.Repeat([]byte("partial-err"), 1<<16)
+			var n int
+			var status uintptr
+			done := make(chan struct{})
+			go func() {
+				var state int
+				runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+					if state == 0 {
+						state = 1
+						if runtime.SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor, fds[0], payload, &n, &status) {
+							return runtime.StacklessCoroActionWait
+						}
+					}
+					return runtime.StacklessCoroActionComplete
+				})
+				close(done)
+			}()
+
+			deadline := time.Now().Add(5 * time.Second)
+			for runtime.StacklessCoroPollWaitCountForTest() < beforePoll+1 {
+				if time.Now().After(deadline) {
+					t.Fatal("partial write did not arm poll descriptor after EAGAIN")
+				}
+				runtime.Gosched()
+			}
+			if expireDeadline {
+				runtime.ExpireWriteStacklessCoroPollDescForTest(descriptor)
+			} else {
+				peerClosed = true
+				if err := syscall.Close(fds[1]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("partial socket write did not complete after error")
+			}
+			if n <= 0 || n >= len(payload) {
+				t.Fatalf("partial write n = %d, want 0 < n < %d", n, len(payload))
+			}
+			if expireDeadline {
+				if status != runtime.StacklessCoroPollErrorStatusForTest(2) {
+					t.Fatalf("partial deadline status = %d, want deadline", status)
+				}
+			} else if status != uintptr(syscall.EPIPE) && status != uintptr(syscall.ECONNRESET) {
+				t.Fatalf("partial close status = %d (%v), want EPIPE or ECONNRESET", status, syscall.Errno(status))
+			}
+			if afterOps := runtime.StacklessCoroOperationCountForTest(); afterOps != beforeOps {
+				t.Fatalf("registered operations = %d, want %d", afterOps, beforeOps)
+			}
+		})
 	}
 }

@@ -56,19 +56,28 @@ func (fd *FD) CoroReadStart(ctx unsafe.Pointer, p []byte, n *int, status *uintpt
 		fd.readUnlock()
 		return CoroReadDone, nil
 	}
-	if err := fd.pd.prepareRead(fd.isFile); err != nil {
-		fd.readUnlock()
-		return CoroReadDone, err
-	}
 	if fd.IsStream && len(p) > maxRW {
 		p = p[:maxRW]
 	}
-	if fd.pd.pollable() && atomic.LoadUint32(&fd.isBlocking) == 0 {
-		runtime_coroSocketRead(ctx, fd.pd.runtimeCtx, fd.Sysfd, p, n, status)
-	} else {
-		runtime_coroFileRead(ctx, fd.Sysfd, p, n, status)
+	if fd.pd.pollable() {
+		if atomic.LoadUint32(&fd.isBlocking) == 0 {
+			if runtime_coroSocketRead(ctx, fd.pd.runtimeCtx, fd.Sysfd, p, n, status) {
+				return CoroReadWait, nil
+			}
+			return CoroReadDone, fd.CoroReadFinish(n, *status)
+		}
+		if err := fd.pd.prepareRead(fd.isFile); err != nil {
+			fd.readUnlock()
+			return CoroReadDone, err
+		}
 	}
-	return CoroReadWait, nil
+	count, statusCode := runtime_coroFileRead(ctx, fd.Sysfd, p)
+	*n = count
+	if statusCode == 0 {
+		fd.readUnlock()
+		return CoroReadDone, fd.eofError(count, nil)
+	}
+	return CoroReadDone, fd.CoroReadFinish(n, statusCode)
 }
 
 // CoroReadFinish converts a runtime completion into the result of FD.Read and
@@ -92,8 +101,8 @@ func CoroCallRead(ctx unsafe.Pointer, call func()) {
 	runtime_coroCallRead(ctx, call)
 }
 
-func runtime_coroFileRead(ctx unsafe.Pointer, fd int, p []byte, n *int, status *uintptr)
+func runtime_coroFileRead(ctx unsafe.Pointer, fd int, p []byte) (int, uintptr)
 
-func runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr, fd int, p []byte, n *int, status *uintptr)
+func runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr, fd int, p []byte, n *int, status *uintptr) bool
 
 func runtime_coroCallRead(ctx unsafe.Pointer, call func())

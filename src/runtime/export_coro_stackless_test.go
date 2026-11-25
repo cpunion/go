@@ -1576,16 +1576,16 @@ func FileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *
 }
 
 func PublicFileReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
-	poll_runtime_coroFileRead(ctx, fd, buffer, n, errno)
+	*n, *errno = poll_runtime_coroFileRead(ctx, fd, buffer)
 }
 
 func FileWriteStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, status *uintptr) {
-	poll_runtime_coroFileWrite(ctx, fd, buffer, n, status)
+	*n, *status = poll_runtime_coroFileWrite(ctx, fd, buffer)
 }
 
 func SocketWriteWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
-	fd int, buffer []byte, n *int, status *uintptr) {
-	poll_runtime_coroSocketWrite(ctx, uintptr(descriptor), fd, buffer, n, status)
+	fd int, buffer []byte, n *int, status *uintptr) bool {
+	return poll_runtime_coroSocketWrite(ctx, uintptr(descriptor), fd, buffer, n, status)
 }
 
 func ExpireWriteStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
@@ -1593,17 +1593,7 @@ func ExpireWriteStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
 }
 
 func StacklessCoroWriteResultForTest(size, written int, count int32) (int, uintptr, bool) {
-	result := new(struct {
-		n      int
-		status uintptr
-	})
-	result.n = written
-	op := newStacklessCoroIOOperation()
-	op.resourceState().buffer = make([]byte, size)
-	op.resourceState().n = &result.n
-	op.resourceState().errno = &result.status
-	done := stacklessCoroWriteResult(op, count)
-	return result.n, result.status, done
+	return stacklessCoroWriteResult(size, written, count)
 }
 
 func SocketReadStacklessCoroForTest(ctx unsafe.Pointer, fd int, buffer []byte, n *int, errno *uintptr) {
@@ -1629,8 +1619,8 @@ func ExpireReadStacklessCoroPollDescForTest(descriptor unsafe.Pointer) {
 }
 
 func SocketReadWithPollDescStacklessCoroForTest(ctx, descriptor unsafe.Pointer,
-	fd int, buffer []byte, n *int, errno *uintptr) {
-	poll_runtime_coroSocketRead(ctx, uintptr(descriptor), fd, buffer, n, errno)
+	fd int, buffer []byte, n *int, errno *uintptr) bool {
+	return poll_runtime_coroSocketRead(ctx, uintptr(descriptor), fd, buffer, n, errno)
 }
 
 func StacklessCoroPollErrorStatusForTest(pollErr int) uintptr {

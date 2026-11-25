@@ -39,7 +39,10 @@ func (c *conn) coroWriteStart(ctx unsafe.Pointer, b []byte, n *int, err *error, 
 		*direct = true
 		return true
 	}
-	*err = c.coroWriteError(wrapSyscallError(writeSyscallName, e))
+	runtime.KeepAlive(c.fd)
+	if e != nil {
+		*err = c.coroWriteError(wrapSyscallError(writeSyscallName, e))
+	}
 	return false
 }
 

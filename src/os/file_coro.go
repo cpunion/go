@@ -13,8 +13,8 @@ import (
 )
 
 // coroReadStart is the compiler-private entry used for a Read suspension.
-// The common path retains the file's read lock until coroReadFinish. Lock
-// contention alone falls back to the bounded blocking-read worker pool.
+// A pending read retains the file's read lock until coroReadFinish. Lock
+// contention uses the bounded blocking-read worker pool.
 func (f *File) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
 	*n = 0
 	*err = nil
@@ -38,7 +38,10 @@ func (f *File) coroReadStart(ctx unsafe.Pointer, b []byte, n *int, err *error, d
 		*direct = true
 		return true
 	}
-	*err = f.wrapErr("read", e)
+	runtime.KeepAlive(f)
+	if e != nil {
+		*err = f.wrapErr("read", e)
+	}
 	return false
 }
 
