@@ -666,15 +666,16 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
 	s.registerPublicGoroutine(sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
 	s = runStacklessCoroRoot(s)
-	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
-		if !s.drained() {
+	life := s.lifetime.Load()
+	if life&stacklessCoroLifetimePublicHost != 0 {
+		if life&stacklessCoroLifetimeDrained == 0 {
 			go s.runOwner()
 		}
 		s.waitPublicRoot()
 		s.finish()
 		return false
 	}
-	if s.spawned() && !s.drained() {
+	if life&stacklessCoroLifetimeSpawned != 0 && life&stacklessCoroLifetimeDrained == 0 {
 		// The public driver's native activation has ended. Transfer its one
 		// executor slot to an independent owner before waiting for the root.
 		// Otherwise a spawned blocking C call could pin this ordinary caller
@@ -686,8 +687,13 @@ func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 		// retain the scheduler and root frame. Neither may enter a root pool.
 		return false
 	}
-	s.stopReplacementExecutors()
-	cacheStacklessCoroDrainedTasks(s)
+	if state := s.executorState.Load(); state != stacklessCoroExecutorStateOff &&
+		state != stacklessCoroExecutorStateSingleP {
+		s.stopReplacementExecutors()
+	}
+	if life&stacklessCoroLifetimeSpawned != 0 {
+		cacheStacklessCoroDrainedTasks(s)
+	}
 	return finishStacklessCoroRootScheduler(s)
 }
 
@@ -803,6 +809,11 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 
 func finishStacklessCoroRootScheduler(s *stacklessCoroScheduler) (
 	quiescent bool) {
+	if !raceenabled && !s.spawned() &&
+		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
+		s.terminalValues.Load() == nil {
+		return releaseStacklessCoroRootScheduler(s)
+	}
 	defer func() {
 		if !raceenabled {
 			quiescent = releaseStacklessCoroRootScheduler(s)
@@ -842,8 +853,21 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	}
 	wake := s.wake
 	drainStacklessCoroWake(wake)
-	*s = stacklessCoroScheduler{}
-	s.wake = wake
+	if state == stacklessCoroExecutorStateOff &&
+		s.freeTasks == nil && s.freeOperations == nil && s.rootDone == nil &&
+		s.liveSpawns == 0 && s.freePlainTaskCount == 0 &&
+		s.freeFrameBytes == 0 && s.cachedFrameTasks == 0 &&
+		s.cachedFrameBytes == 0 && s.freeOperationCount == 0 &&
+		s.overflowTaskCounts == 0 && s.batchedTaskCounts == 0 {
+		s.root = stacklessCoroTask{}
+		s.initialRootPrivate = false
+		s.lifetime.Store(0)
+		s.executorCount.Store(0)
+		s.drainCacheAge = stacklessCoroDrainCacheAge{}
+	} else {
+		*s = stacklessCoroScheduler{}
+		s.wake = wake
+	}
 	for i := range stacklessCoroRootSchedulerCache.slots {
 		if stacklessCoroRootSchedulerCache.slots[i].CompareAndSwap(nil, s) {
 			return true
@@ -1565,31 +1589,27 @@ func (s *stacklessCoroScheduler) runLoop(native, public bool) {
 }
 
 type stacklessCoroRunScope struct {
-	gp        *g
-	state     *stacklessCoroGState
-	temporary bool
+	gp         *g
+	state      *stacklessCoroGState
+	checkDefer bool
 }
 
 func enterStacklessCoroRunScope() stacklessCoroRunScope {
 	gp := getg()
 	state := gp.stacklessCoro
-	temporary := state == nil
-	if temporary {
+	if state == nil {
 		state = new(stacklessCoroGState)
 		gp.stacklessCoro = state
 	}
-	return stacklessCoroRunScope{gp: gp, state: state, temporary: temporary}
+	return stacklessCoroRunScope{gp: gp, state: state, checkDefer: state.deferState == nil}
 }
 
 func (scope *stacklessCoroRunScope) leave() {
 	if scope.state.blockingScheduler != nil {
 		throw("runtime: active stackless coroutine blocking call after run")
 	}
-	if scope.temporary {
-		if scope.gp.stacklessCoro != scope.state || scope.state.deferState != nil {
-			throw("runtime: invalid stackless coroutine run state")
-		}
-		scope.gp.stacklessCoro = nil
+	if scope.gp.stacklessCoro != scope.state || (scope.checkDefer && scope.state.deferState != nil) {
+		throw("runtime: invalid stackless coroutine run state")
 	}
 }
 
@@ -1646,8 +1666,7 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 	// non-yield action is validated by its handler below.
 	if initial {
 		task = s.takeInitialRoot()
-		directInitialRoot = native && !raceenabled &&
-			!stacklessCoroIsPullComparison(s)
+		directInitialRoot = !raceenabled && !stacklessCoroIsPullComparison(s)
 		goto resume
 	}
 

@@ -119,21 +119,30 @@ func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroGoroutine {
 // Hand-written runtime continuations without source metadata need no record
 // until they spawn a child. Reuse only completely cleared public records.
 func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, callerSP unsafe.Pointer) {
-	source := s.publicSourceFunc()
-	if !source.valid() {
-		return
-	}
 	gp := getg()
+	resumePC := stacklessCoroResumeIdentity(s.root.resume).fn
 	var pcs [maxCPUProfStack]uintptr
-	// The caller still owns its stack. Walk it before locking the registry.
-	// Most starts fit in two small Go frames. Skip the speculative walk
-	// when the current stack already extends beyond them.
-	if gp.stktopsp-uintptr(callerSP) <= stacklessCoroGoStartProfileDepth {
-		pcs[0] = stacklessCoroProfileGoStart(gp, source, callerPC, callerSP)
+	n := 0
+	if gp.stktopsp-uintptr(callerSP) > stacklessCoroGoStartProfileDepth {
+		if cached, ok := stacklessCoroCachedPublicProfileCaller(gp, resumePC, callerPC, callerSP, pcs[:]); ok {
+			n = cached
+		}
 	}
-	n := 1
-	if pcs[0] == 0 {
-		n = stacklessCoroCachedProfileCaller(gp, source.entry(), callerPC, callerSP, pcs[:])
+	if n == 0 {
+		source := s.publicSourceFunc()
+		if !source.valid() {
+			return
+		}
+		// The caller still owns its stack. Walk it before locking the registry.
+		// Most starts fit in two small Go frames. Skip the speculative walk
+		// when the current stack already extends beyond them.
+		if gp.stktopsp-uintptr(callerSP) <= stacklessCoroGoStartProfileDepth {
+			pcs[0] = stacklessCoroProfileGoStart(gp, source, callerPC, callerSP)
+		}
+		n = 1
+		if pcs[0] == 0 {
+			n = stacklessCoroCachedProfileCaller(gp, resumePC, source.entry(), callerPC, callerSP, pcs[:])
+		}
 	}
 	lock(&stacklessCoroGoroutines.lock)
 	s.registerPublicGoroutineLocked(gp, &s.root, pcs[:n])
