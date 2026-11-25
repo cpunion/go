@@ -15,6 +15,11 @@ func yieldStacklessCoroNativeRoot(*stacklessCoroScheduler, *stacklessCoroTask) b
 	return false
 }
 
+func yieldStacklessCoroNativeExecutor() bool {
+	Gosched()
+	return false
+}
+
 type stacklessCoroNativeDriver struct{}
 
 type stacklessCoroDrainCacheAge struct{}
@@ -23,6 +28,10 @@ func (*stacklessCoroDrainCacheAge) complete() {}
 
 func (*stacklessCoroNativeDriver) run(*stacklessCoroScheduler, bool, bool) *stacklessCoroScheduler {
 	return nil
+}
+
+func (*stacklessCoroNativeDriver) consumeDeferredYield() bool {
+	return false
 }
 
 func (*stacklessCoroNativeDriver) close(*stacklessCoroScheduler, bool) {}

@@ -9,7 +9,7 @@ package runtime
 import "unsafe"
 
 func StacklessCoroSinglePExecutorsForTest(ctx unsafe.Pointer) bool {
-	return (*stacklessCoroContext)(ctx).scheduler.executorState.Load() ==
+	return (*stacklessCoroContext)(ctx).scheduler.loadExecutorState() ==
 		stacklessCoroExecutorStateSingleP
 }
 
@@ -29,7 +29,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 	s.prepareReplacementExecutors()
 	done := s.rootDone
 	lazy := !raceenabled && !stacklessCoroIsPullComparison(s)
-	valid := done != nil && ((s.executorState.Load() ==
+	valid := done != nil && ((s.loadExecutorState() ==
 		stacklessCoroExecutorStateSingleP) == lazy)
 	if lazy {
 		valid = valid && s.executorCount.Load() == 1 &&
@@ -46,7 +46,7 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 		s.wakeReplacementExecutor()
 	}
 	if !lazy || mode != 0 {
-		valid = valid && s.executorState.Load() ==
+		valid = valid && s.loadExecutorState() ==
 			stacklessCoroExecutorStateRunning &&
 			s.executorCount.Load() == stacklessCoroWarmExecutorCount &&
 			s.executorWake != nil && s.executorDone != nil &&
@@ -60,6 +60,6 @@ func StacklessCoroSinglePPromotionForTest(mode int) bool {
 	default:
 		valid = false
 	}
-	return valid && s.drained() && s.executorState.Load() !=
+	return valid && s.drained() && s.loadExecutorState() !=
 		stacklessCoroExecutorStatePreparing
 }
