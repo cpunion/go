@@ -188,6 +188,9 @@ func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 //go:noinline
 func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 	exclude *stacklessCoroTask) *stacklessCoroTask {
+	if stacklessCoroOperations.ioCount.Load() == 0 {
+		return nil
+	}
 	var previous *stacklessCoroTask
 	for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
 		claimed := stacklessCoroPollIOAtIdle(s, exclude, previous)
