@@ -12,6 +12,8 @@ type stacklessCoroTracebackState struct{}
 
 type stacklessCoroPanicState struct{}
 
+type stacklessCoroP struct{}
+
 func initStacklessCoroPanicTrace(*_panic, uintptr) {}
 
 func stacklessCoroTracebackText(*unwinder, *stacklessCoroTracebackState, bool, bool, func() (bool, bool)) (bool, bool) {

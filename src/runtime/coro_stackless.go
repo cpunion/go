@@ -630,7 +630,7 @@ func coroRun(resume stacklessCoroResume) {
 func coroRunFrame(frame unsafe.Pointer, resume stacklessCoroResume,
 	frameSize uintptr) bool {
 	s := acquireStacklessCoroRootScheduler(frame, resume, frameSize)
-	s.registerPublicGoroutine()
+	s.registerPublicGoroutine(sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
 	s = runStacklessCoroRoot(s)
 	if s.lifetime.Load()&stacklessCoroLifetimePublicHost != 0 {
 		if !s.drained() {

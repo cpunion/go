@@ -35,6 +35,12 @@ type stacklessCoroSourcePosition struct {
 	file, fileSize, line uint32
 }
 
+type stacklessCoroP struct {
+	callerProfiles [4]stacklessCoroCallerProfile
+	nextProfile    uint8
+	profileMisses  uint8
+}
+
 func stacklessCoroSourceFrame(f funcInfo) *stacklessCoroSourceInfo {
 	if !f.valid() {
 		return nil
