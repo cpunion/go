@@ -250,7 +250,7 @@ func stacklessCoroActiveSource(gp *g) *stacklessCoroGoroutine {
 		return nil
 	}
 	r := gp.stacklessCoro.activeSource
-	if r == nil || r.owner != gp || gp.stacklessCoro.sourceTransition {
+	if r == nil || r.owner.Load() != gp || gp.stacklessCoro.sourceTransition {
 		return nil
 	}
 	return r
@@ -268,7 +268,7 @@ func stacklessCoroProfileTransition(gp *g, mp *m) bool {
 	}
 	state := gp.stacklessCoro
 	return state.activeSource != nil && (mp.locks != 0 ||
-		state.sourceTransition || state.activeSource.owner != gp)
+		state.sourceTransition || state.activeSource.owner.Load() != gp)
 }
 
 // A helper can finish publishing a different activation before returning to
@@ -371,7 +371,7 @@ func stacklessCoroActiveSourcePCs(u *unwinder, source funcInfo, skip *int, buf [
 // and immutable terminal PCs were published before this resume started; no
 // scheduler list lookup or lock is permitted here.
 func walkStacklessCoroProfileFrames(r *stacklessCoroGoroutine, visit func(funcInfo, uintptr) bool) {
-	for task := r.leaf; task != nil; task = task.parent {
+	for task := r.leaf; task != nil; task = task.parent() {
 		if task == r.profileBoundary && r.profileBefore {
 			return
 		}

@@ -197,7 +197,7 @@ func walkStacklessCoroSourceFrames(task *stacklessCoroTask, visit func(funcInfo,
 		if !complete {
 			return rootPC, false
 		}
-		task = task.parent
+		task = task.parent()
 	}
 	return rootPC, true
 }

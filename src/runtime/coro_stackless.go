@@ -193,17 +193,17 @@ const (
 )
 
 type stacklessCoroTask struct {
-	resume       stacklessCoroResume
-	parent       *stacklessCoroTask
-	next         *stacklessCoroTask
-	state        stacklessCoroTaskState
-	terminal     stacklessCoroTerminalKind
-	goexit       bool
-	resuming     bool
-	readyPending bool
-	flags        stacklessCoroTaskFlags
-	frameSize    uint16
-	context      stacklessCoroContext
+	resume         stacklessCoroResume
+	parentOrSource unsafe.Pointer
+	next           *stacklessCoroTask
+	state          stacklessCoroTaskState
+	terminal       stacklessCoroTerminalKind
+	goexit         bool
+	resuming       bool
+	readyPending   bool
+	flags          stacklessCoroTaskFlags
+	frameSize      uint16
+	context        stacklessCoroContext
 }
 
 // stacklessCoroScalarTaskChunk pairs task identities with pointer-free frames.
@@ -213,6 +213,40 @@ type stacklessCoroTask struct {
 type stacklessCoroScalarTaskChunk struct {
 	tasks  [stacklessCoroTaskChunkSize]stacklessCoroTask
 	frames [stacklessCoroTaskChunkSize]uint32
+}
+
+// A structured task retains its parent. A logical root task (which has no
+// parent) reuses the same GC-scanned pointer word to retain its source record
+// directly. The tag is an interior pointer one byte inside stacklessCoroGoroutine,
+// keeping the whole record live to GC and valid under checkptr.
+const stacklessCoroTaskSourceOffset = 1
+
+func (task *stacklessCoroTask) parent() *stacklessCoroTask {
+	link := task.parentOrSource
+	if uintptr(link)&stacklessCoroTaskSourceOffset != 0 {
+		return nil
+	}
+	return (*stacklessCoroTask)(link)
+}
+
+func (task *stacklessCoroTask) setParent(parent *stacklessCoroTask) {
+	task.parentOrSource = unsafe.Pointer(parent)
+}
+
+func (task *stacklessCoroTask) source() *stacklessCoroGoroutine {
+	link := task.parentOrSource
+	if uintptr(link)&stacklessCoroTaskSourceOffset == 0 {
+		return nil
+	}
+	return (*stacklessCoroGoroutine)(unsafe.Add(link, -stacklessCoroTaskSourceOffset))
+}
+
+func (task *stacklessCoroTask) setSource(record *stacklessCoroGoroutine) {
+	if record == nil {
+		task.parentOrSource = nil
+		return
+	}
+	task.parentOrSource = unsafe.Add(unsafe.Pointer(record), stacklessCoroTaskSourceOffset)
 }
 
 func (task *stacklessCoroTask) hasFlag(flag stacklessCoroTaskFlags) bool {
@@ -310,7 +344,7 @@ type stacklessCoroScheduler struct {
 	// their lifetime; Drained is published only when this count is zero.
 	liveSpawns     uint64
 	root           stacklessCoroTask
-	terminalValues *stacklessCoroTerminalValue
+	terminalValues atomic.Pointer[stacklessCoroTerminalValue]
 	wake           chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
@@ -793,7 +827,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 		s.root.state == stacklessCoroTaskComplete &&
 		!s.root.resuming && !s.root.readyPending &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit &&
-		s.terminalValues == nil && s.blockingExecutors.Load() == 0 &&
+		s.terminalValues.Load() == nil && s.blockingExecutors.Load() == 0 &&
 		s.foreignReturners.Load() == 0 &&
 		(state == stacklessCoroExecutorStateOff ||
 			state == stacklessCoroExecutorStateSingleP ||
@@ -1090,7 +1124,7 @@ func (s *stacklessCoroScheduler) onlyUnusedScalarFrameTasksLocked() bool {
 func initializeStacklessCoroTask(task *stacklessCoroTask, frame unsafe.Pointer,
 	resume stacklessCoroResume, parent *stacklessCoroTask) *stacklessCoroTask {
 	task.resume = resume
-	task.parent = parent
+	task.setParent(parent)
 	task.context.frame = frame
 	task.flags = 0
 	task.frameSize = 0
@@ -1352,7 +1386,7 @@ func clearStacklessCoroTaskFrame(task *stacklessCoroTask) {
 	if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) {
 		if task.frameSize <= stacklessCoroScalarTaskCacheFirst {
 			clearStacklessCoroScalarTaskFrame(task)
-		} else if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parent == nil &&
+		} else if task.hasFlag(stacklessCoroTaskTypedSpawn) && task.parentOrSource == nil &&
 			task.terminal == stacklessCoroTerminalNone && !task.goexit &&
 			task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
 			memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), 16)
@@ -1404,7 +1438,7 @@ func (s *stacklessCoroScheduler) recycleTaskLocked(task *stacklessCoroTask) {
 			s.cachedFrameTasks > 0 &&
 			s.cachedFrameBytes >= task.frameSize
 	}
-	if task == &s.root || !validFrame || task.parent != nil ||
+	if task == &s.root || !validFrame || task.parentOrSource != nil ||
 		task.next != nil || task.state != stacklessCoroTaskComplete ||
 		task.terminal != stacklessCoroTerminalNone || task.goexit ||
 		task.flags&stacklessCoroTaskCompletionMask != 0 ||
@@ -1946,7 +1980,7 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			task.frameSize = stacklessCoroUncachedFrameLineage
 		}
 	} else {
-		task.parent = parent
+		task.setParent(parent)
 	}
 	task.next = s.reservedTasks
 	s.reservedTasks = task
@@ -2016,7 +2050,7 @@ func coroTakeFrameChunk(ctx unsafe.Pointer, child stacklessCoroResume,
 			}
 		}
 	} else {
-		task.parent = parent
+		task.setParent(parent)
 	}
 	task.next = s.reservedTasks
 	s.reservedTasks = task
@@ -2234,7 +2268,7 @@ func coroTakeSelfFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		s.cachedFrameTasks++
 		s.cachedFrameBytes += uint16(size)
 	} else if task != nil {
-		task.parent = parent
+		task.setParent(parent)
 	}
 	parent.setFlag(stacklessCoroTaskFusedPending, true)
 	if task != nil {
@@ -2349,7 +2383,7 @@ func coroAwaitSelfFrame(ctx, frame unsafe.Pointer,
 	}
 	owner := s.takeReservedFrameTaskLocked(parent, frame, child)
 	if owner != nil {
-		owner.parent = nil
+		owner.setParent(nil)
 		childHeader.owner = owner
 		childHeader.marker = parentHeader.marker &
 			(stacklessCoroFusedFrameChunkValidated |
@@ -2615,7 +2649,7 @@ func coroTakeFusedFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		s.cachedFrameTasks++
 		s.cachedFrameBytes += uint16(size)
 	} else if task != nil {
-		task.parent = parent
+		task.setParent(parent)
 	}
 	if task != nil {
 		parent.flags |= stacklessCoroTaskFusedPending
@@ -2795,7 +2829,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 			stacklessCoroFusedFrameShortChunk)
 	}
 	if owner != nil {
-		owner.parent = nil
+		owner.setParent(nil)
 		childHeader.owner = owner
 	} else if chunkCompatible {
 		parentMarker := parentHeader.marker &
@@ -3124,7 +3158,7 @@ func (s *stacklessCoroScheduler) discardFreeCachedFrameTaskLocked() bool {
 			previous = task
 			continue
 		}
-		if task.state != stacklessCoroTaskNew || task.parent != nil ||
+		if task.state != stacklessCoroTaskNew || task.parentOrSource != nil ||
 			task.context.scheduler != nil || task.context.frame == nil ||
 			task.frameSize == 0 || s.freeFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine free cached frame")
@@ -3158,7 +3192,7 @@ func (s *stacklessCoroScheduler) discardIdleFrameTasks() {
 			link = &task.next
 			continue
 		}
-		if task.state != stacklessCoroTaskNew || task.parent != nil ||
+		if task.state != stacklessCoroTaskNew || task.parentOrSource != nil ||
 			task.context.scheduler != nil || task.context.frame == nil ||
 			task.frameSize == 0 || s.freeFrameBytes < task.frameSize {
 			throw("runtime: invalid stackless coroutine idle frame")
@@ -3179,7 +3213,7 @@ func (s *stacklessCoroScheduler) takeReservedFrameTaskLocked(
 	identity := stacklessCoroResumeIdentity(resume)
 	var previous *stacklessCoroTask
 	for task := s.reservedTasks; task != nil; task = task.next {
-		if task.parent != parent ||
+		if task.parent() != parent ||
 			stacklessCoroResumeIdentity(task.resume) != identity {
 			previous = task
 			continue
@@ -3215,13 +3249,13 @@ func (s *stacklessCoroScheduler) cancelReservedFrameTasksLocked(
 	for task := reserved; task != nil; {
 		next := task.next
 		task.next = nil
-		if task.parent != parent {
+		if task.parent() != parent {
 			task.next = s.reservedTasks
 			s.reservedTasks = task
 			task = next
 			continue
 		}
-		task.parent = nil
+		task.setParent(nil)
 		task.state = stacklessCoroTaskComplete
 		s.discardCachedFrameTaskLocked(task)
 		s.recycleTaskLocked(task)
@@ -3698,7 +3732,7 @@ func coroDeferRecoverAwait(ctx unsafe.Pointer) any {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine awaited recover outside resume")
 	}
-	owner := task.parent
+	owner := task.parent()
 	if owner == nil || !task.hasFlag(stacklessCoroTaskDeferChild) {
 		unlock(&s.lock)
 		return nil
@@ -3771,7 +3805,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	if task == nil {
 		task = s.newTaskLocked(frame, child, nil)
 	} else {
-		task.parent = nil
+		task.setParent(nil)
 	}
 	s.markUncachedFrameLineageLocked(task, parent, frame)
 	if s.liveSpawns == ^uint64(0) {
@@ -4650,7 +4684,7 @@ func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bo
 	if raceenabled || stacklessCoroIsPullComparison(s) || task != &s.root ||
 		s.lifetime.Load() != 0 ||
 		s.executorState.Load() != stacklessCoroExecutorStateOff ||
-		task.parent != nil || task.next != nil ||
+		task.parent() != nil || task.next != nil ||
 		task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
 		task.flags&stacklessCoroTaskCompletionMask != 0 ||
@@ -4679,7 +4713,7 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine completion")
 	}
-	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	deferred := task.parent() != nil && task.hasFlag(stacklessCoroTaskDeferChild)
 	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
@@ -4692,8 +4726,8 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
-	parent := task.parent
-	task.parent = nil
+	parent := task.parent()
+	task.setParent(nil)
 	if parent == nil {
 		root := task == &s.root
 		s.completeLogicalTaskLocked(task)
@@ -4741,7 +4775,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine termination")
 	}
-	if s.spawned() && task.parent == nil && task != &s.root && s.taskHostLocked(task) == nil {
+	if s.spawned() && task.parent() == nil && task != &s.root && s.taskHostLocked(task) == nil {
 		// Only registered go tasks have an independent logical lifetime.
 		// Hand-written continuation drivers retain caller panic propagation.
 		// An uncaught panic can invoke arbitrary Error/String methods before
@@ -4752,7 +4786,7 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 		stacklessCoroHostStart(h)
 		return
 	}
-	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	deferred := task.parent() != nil && task.hasFlag(stacklessCoroTaskDeferChild)
 	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
@@ -4766,8 +4800,8 @@ func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
-	parent := task.parent
-	task.parent = nil
+	parent := task.parent()
+	task.setParent(nil)
 	if parent == nil {
 		s.completeLogicalTaskLocked(task)
 		if task != &s.root {
@@ -4813,7 +4847,7 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 		unlock(&s.lock)
 		throw("runtime: invalid stackless coroutine Goexit termination")
 	}
-	deferred := task.parent != nil && task.hasFlag(stacklessCoroTaskDeferChild)
+	deferred := task.parent() != nil && task.hasFlag(stacklessCoroTaskDeferChild)
 	stacklessCoroCompleteLogicalFrame(task)
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
@@ -4827,8 +4861,8 @@ func (s *stacklessCoroScheduler) goexit(task *stacklessCoroTask) {
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
-	parent := task.parent
-	task.parent = nil
+	parent := task.parent()
+	task.setParent(nil)
 	if parent == nil {
 		s.completeLogicalTaskLocked(task)
 		if task == &s.root {

@@ -22,7 +22,7 @@ type stacklessCoroTerminalValue struct {
 }
 
 func (s *stacklessCoroScheduler) terminalTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	for entry := s.terminalValues.Load(); entry != nil; entry = entry.next {
 		if entry.task == task {
 			return entry.trace
 		}
@@ -32,7 +32,7 @@ func (s *stacklessCoroScheduler) terminalTrace(task *stacklessCoroTask) *stackle
 
 func (s *stacklessCoroScheduler) setTerminalPanic(task *stacklessCoroTask, value any, trace *stacklessCoroPanicTrace) {
 	s.setTerminalValue(task, value)
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	for entry := s.terminalValues.Load(); entry != nil; entry = entry.next {
 		if entry.task == task {
 			entry.trace = trace
 			return
@@ -43,7 +43,7 @@ func (s *stacklessCoroScheduler) setTerminalPanic(task *stacklessCoroTask, value
 // Callers hold s.lock, or exclusively own a private or completed scheduler.
 // The nil task key is reserved for the ordinary host list.
 func (s *stacklessCoroScheduler) terminalValue(task *stacklessCoroTask) (any, bool) {
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	for entry := s.terminalValues.Load(); entry != nil; entry = entry.next {
 		if entry.task == task {
 			return entry.value, entry.hasValue
 		}
@@ -52,22 +52,27 @@ func (s *stacklessCoroScheduler) terminalValue(task *stacklessCoroTask) (any, bo
 }
 
 func (s *stacklessCoroScheduler) setTerminalValue(task *stacklessCoroTask, value any) {
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	head := s.terminalValues.Load()
+	for entry := head; entry != nil; entry = entry.next {
 		if entry.task == task {
 			entry.value, entry.hasValue = value, true
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, value: value, hasValue: true, next: s.terminalValues}
+	s.terminalValues.Store(&stacklessCoroTerminalValue{task: task, value: value, hasValue: true, next: head})
 }
 
 func (s *stacklessCoroScheduler) clearTerminalValue(task *stacklessCoroTask) {
-	for link := &s.terminalValues; *link != nil; link = &(*link).next {
-		entry := *link
+	var prev *stacklessCoroTerminalValue
+	for entry := s.terminalValues.Load(); entry != nil; prev, entry = entry, entry.next {
 		if entry.task == task {
 			entry.value, entry.trace, entry.hasValue = nil, nil, false
 			if entry.deferTrace == nil && entry.exitTrace == nil {
-				*link = entry.next
+				if prev == nil {
+					s.terminalValues.Store(entry.next)
+				} else {
+					prev.next = entry.next
+				}
 				entry.task, entry.next = nil, nil
 			}
 			return
@@ -82,17 +87,18 @@ func (s *stacklessCoroScheduler) setDeferTrace(task *stacklessCoroTask, trace *s
 	if trace == nil {
 		return
 	}
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	head := s.terminalValues.Load()
+	for entry := head; entry != nil; entry = entry.next {
 		if entry.task == task {
 			entry.deferTrace = trace
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, deferTrace: trace, next: s.terminalValues}
+	s.terminalValues.Store(&stacklessCoroTerminalValue{task: task, deferTrace: trace, next: head})
 }
 
 func (s *stacklessCoroScheduler) deferTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	for entry := s.terminalValues.Load(); entry != nil; entry = entry.next {
 		if entry.task == task {
 			return entry.deferTrace
 		}
@@ -101,12 +107,16 @@ func (s *stacklessCoroScheduler) deferTrace(task *stacklessCoroTask) *stacklessC
 }
 
 func (s *stacklessCoroScheduler) clearDeferTrace(task *stacklessCoroTask) {
-	for link := &s.terminalValues; *link != nil; link = &(*link).next {
-		entry := *link
+	var prev *stacklessCoroTerminalValue
+	for entry := s.terminalValues.Load(); entry != nil; prev, entry = entry, entry.next {
 		if entry.task == task {
 			entry.deferTrace = nil
 			if !entry.hasValue && entry.exitTrace == nil {
-				*link = entry.next
+				if prev == nil {
+					s.terminalValues.Store(entry.next)
+				} else {
+					prev.next = entry.next
+				}
 				entry.task, entry.next = nil, nil
 			}
 			return
@@ -122,7 +132,7 @@ func (s *stacklessCoroScheduler) terminalSourceTrace(task *stacklessCoroTask) *s
 }
 
 func (s *stacklessCoroScheduler) terminalExitTrace(task *stacklessCoroTask) *stacklessCoroPanicTrace {
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	for entry := s.terminalValues.Load(); entry != nil; entry = entry.next {
 		if entry.task == task {
 			return entry.exitTrace
 		}
@@ -134,22 +144,27 @@ func (s *stacklessCoroScheduler) setExitTrace(task *stacklessCoroTask, trace *st
 	if trace == nil {
 		return
 	}
-	for entry := s.terminalValues; entry != nil; entry = entry.next {
+	head := s.terminalValues.Load()
+	for entry := head; entry != nil; entry = entry.next {
 		if entry.task == task {
 			entry.exitTrace = trace
 			return
 		}
 	}
-	s.terminalValues = &stacklessCoroTerminalValue{task: task, exitTrace: trace, next: s.terminalValues}
+	s.terminalValues.Store(&stacklessCoroTerminalValue{task: task, exitTrace: trace, next: head})
 }
 
 func (s *stacklessCoroScheduler) clearExitTrace(task *stacklessCoroTask) {
-	for link := &s.terminalValues; *link != nil; link = &(*link).next {
-		entry := *link
+	var prev *stacklessCoroTerminalValue
+	for entry := s.terminalValues.Load(); entry != nil; prev, entry = entry, entry.next {
 		if entry.task == task {
 			entry.exitTrace = nil
 			if !entry.hasValue && entry.deferTrace == nil {
-				*link = entry.next
+				if prev == nil {
+					s.terminalValues.Store(entry.next)
+				} else {
+					prev.next = entry.next
+				}
 				entry.task, entry.next = nil, nil
 			}
 			return

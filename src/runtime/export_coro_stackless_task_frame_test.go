@@ -307,7 +307,7 @@ func checkStacklessCoroTypedTaskFrames(count int, varyPrefix, cancelReservations
 	}
 	valid := caught == cancelReservations && probe.failed.Load() == 0 && probe.done.Load() == wantDone && probe.sum.Load() == wantSum
 	for _, task := range root.combined {
-		if task.resume != nil || task.parent != nil || task.next != nil || task.context.frame != nil || task.context.scheduler != nil || task.flags != 0 || task.frameSize != 0 || task.state != stacklessCoroTaskComplete || task.terminal != stacklessCoroTerminalNone || task.goexit || task.resuming || task.readyPending {
+		if task.resume != nil || task.parentOrSource != nil || task.next != nil || task.context.frame != nil || task.context.scheduler != nil || task.flags != 0 || task.frameSize != 0 || task.state != stacklessCoroTaskComplete || task.terminal != stacklessCoroTerminalNone || task.goexit || task.resuming || task.readyPending {
 			valid = false
 		}
 	}

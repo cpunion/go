@@ -142,7 +142,7 @@ func (trace *stacklessCoroPanicTrace) appendLineage(task *stacklessCoroTask, gp 
 				return
 			}
 		}
-		task = task.parent
+		task = task.parent()
 	}
 }
 
