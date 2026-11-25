@@ -98,9 +98,17 @@ func publishStacklessCoroClosedOperations(s *stacklessCoroScheduler,
 		unlock(&stacklessCoroSharedOperations.lock)
 	}
 	unlock(&s.lock)
-	// Keep one wake attempt per completed non-resuming task. A scheduler
-	// may have several admitted executors waiting for work on other Ps.
-	for range signals {
-		s.signal()
+	// Wake at most the currently parked executors (capped by signals).
+	if signals != 0 {
+		if waiting := int(s.waitingExecutors()); waiting != 0 {
+			if signals > waiting {
+				signals = waiting
+			}
+			for range signals {
+				s.signal()
+			}
+		} else if stacklessCoroIsPullComparison(s) {
+			s.signal()
+		}
 	}
 }

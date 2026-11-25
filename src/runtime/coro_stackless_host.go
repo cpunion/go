@@ -210,7 +210,7 @@ func prepareStacklessCoroHostCall(ctx unsafe.Pointer, call func(), deferred func
 	s.prepareReplacementExecutors()
 	// A different task may have won executor preparation. rootDone must have
 	// been published before a public host borrows it as its buffered doorbell.
-	for s.executorState.Load() == stacklessCoroExecutorStatePreparing {
+	for s.loadExecutorState() == stacklessCoroExecutorStatePreparing {
 		Gosched()
 	}
 	lock(&s.lock)

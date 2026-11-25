@@ -143,7 +143,7 @@ func (d *stacklessCoroNativeDriver) run(s *stacklessCoroScheduler,
 	if d.context == nil {
 		// A private public driver has one executor and no replacements.
 		// It may acquire another context after returning one before a wait.
-		d.root = s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		d.root = s.loadExecutorState() == stacklessCoroExecutorStateOff &&
 			s.executorCount.Load() == 1
 		d.context = acquireStacklessCoroNativeContext()
 		// Only a new scheduler can inherit the context's task cache. A
@@ -210,14 +210,18 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 	releaseStacklessCoroNativeSchedulerStack(ctx)
 	if ctx.deferredYield {
 		ctx.deferredYield = false
-		// The public lineage is already queued and signaled. Yield only after
-		// restoring the ordinary caller and releasing the native thread lock.
-		// A private root also returns its inactive context before yielding;
-		// otherwise concurrent runnable roots each retain an executor identity
-		// before any of them reaches its channel wait.
+		public := ctx.public
+		// The yielded work is already queued. Yield only after restoring the
+		// ordinary caller and releasing the native thread lock. A private root
+		// also returns its inactive context before yielding; otherwise
+		// concurrent runnable roots each retain an executor identity before
+		// any of them reaches its channel wait.
 		d.releasePrivateWaitContext(s)
 		Gosched()
-		return s.waitForWork()
+		if public {
+			return !s.publicDriverDone()
+		}
+		return !s.drained()
 	}
 	// No native episode is running on this context while its driver waits.
 	// Do not retain a completed burst for the lifetime of a parked root.
@@ -226,7 +230,7 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 		releaseStacklessCoroNativeBurst(ctx)
 	}
 	if ctx.selfFrames != nil || ctx.selfFrameChunks != nil ||
-		(d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0) {
+		(d.root && s.loadExecutorState() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0) {
 		return d.waitWithCachedFrames(s)
 	}
 	if d.releasePrivateWaitContext(s) {
@@ -235,13 +239,21 @@ func (d *stacklessCoroNativeDriver) waitForWork(s *stacklessCoroScheduler) bool 
 	return d.waitForOperation(s)
 }
 
+func (d *stacklessCoroNativeDriver) consumeDeferredYield() bool {
+	if d.context == nil || !d.context.deferredYield {
+		return false
+	}
+	d.context.deferredYield = false
+	return true
+}
+
 // releasePrivateWaitContext returns an inactive context whose public root can
 // wait without it. Deferred work and shared/foreign executors keep their
 // existing driver. No caller or defer may touch ctx after this succeeds.
 func (d *stacklessCoroNativeDriver) releasePrivateWaitContext(s *stacklessCoroScheduler) bool {
 	ctx := d.context
 	if !d.root || !ctx.public ||
-		s.executorState.Load() != stacklessCoroExecutorStateOff ||
+		s.loadExecutorState() != stacklessCoroExecutorStateOff ||
 		ctx.deferredYield || ctx.deferredSleep != nil {
 		return false
 	}
@@ -269,7 +281,7 @@ func registerStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) *at
 
 func (d *stacklessCoroNativeDriver) waitWithCachedFrames(s *stacklessCoroScheduler) bool {
 	ctx := d.context
-	leased := d.root && s.executorState.Load() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0
+	leased := d.root && s.loadExecutorState() == stacklessCoroExecutorStateOff && s.freeFrameBytes != 0
 	if leased {
 		// Reuse the inactive episode link as an exclusive parked-cache lease.
 		// No other driver can start an episode on this scheduler while we wait.
@@ -295,7 +307,7 @@ func (d *stacklessCoroNativeDriver) waitWithCachedFrames(s *stacklessCoroSchedul
 func clearStacklessCoroNativeParkedCache(ctx *stacklessCoroNativeContext) {
 	if s := ctx.scheduler; s != nil {
 		if ctx.schedulerG != nil || ctx.caller != nil ||
-			s.executorState.Load() != stacklessCoroExecutorStateOff {
+			s.loadExecutorState() != stacklessCoroExecutorStateOff {
 			throw("runtime: invalid parked stackless coroutine cache lease")
 		}
 		s.discardIdleFrameTasks()
@@ -343,7 +355,7 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 		return
 	}
 	if d.root && rootComplete &&
-		s.executorState.Load() == stacklessCoroExecutorStateOff &&
+		s.loadExecutorState() == stacklessCoroExecutorStateOff &&
 		s.reservedTasks == nil && s.freeFrameBytes == s.cachedFrameBytes &&
 		s.freeTasks != nil {
 		s.discardFreeOverflowTasks()
@@ -411,10 +423,14 @@ func cacheStacklessCoroDrainedTasks(s *stacklessCoroScheduler) {
 func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 	var native stacklessCoroNativeDriver
 	scheduler := native.run(s, false, false)
+	yielded := native.consumeDeferredYield()
 	if scheduler != nil {
 		native.close(scheduler, false)
 	} else {
 		native.close(s, false)
+	}
+	if yielded && !s.drained() {
+		Gosched()
 	}
 	return scheduler
 }
@@ -476,22 +492,35 @@ func releaseStacklessCoroNativeContextAt(ctx *stacklessCoroNativeContext, idleCy
 	unlock(&stacklessCoroNativePool.lock)
 }
 
-// yieldStacklessCoroNativeRoot ends a public episode before a host yield,
-// including structured children of its root. Yielding a thread-bound executor
-// could otherwise require a new M for every runnable public root. Keep spawned
-// roots on their existing handoff: their public driver closes without waiting
-// and cannot consume deferred work. The ordinary driver consumes the queued wake.
+// yieldStacklessCoroNativeRoot ends a native episode before a host yield,
+// re-queueing task first. Yielding a thread-bound executor directly would
+// trigger stoplockedm/startm OS-thread handoffs; deferring the Gosched until
+// after coroNativeFinish keeps the yield on the unlocked ordinary driver G.
 func yieldStacklessCoroNativeRoot(s *stacklessCoroScheduler, task *stacklessCoroTask) bool {
 	gp := getg()
 	ctx := stacklessCoroNativeContextFor(gp)
-	if ctx == nil || ctx.executor != gp || !ctx.public || s.publicDriverDone() {
+	if ctx == nil || ctx.executor != gp || (ctx.public && s.publicDriverDone()) {
 		Gosched()
 		return false
 	}
 	task.context.scheduler = nil
 	s.yield(task, false)
 	ctx.deferredYield = true
-	s.signal()
+	return true
+}
+
+// yieldStacklessCoroNativeExecutor ends the current native episode so the
+// unlocked ordinary driver calls Gosched after coroNativeFinish rather than
+// parking a thread-locked M via stoplockedm. The caller has already re-queued
+// its yielded task.
+func yieldStacklessCoroNativeExecutor() bool {
+	gp := getg()
+	ctx := stacklessCoroNativeContextFor(gp)
+	if ctx == nil || ctx.executor != gp {
+		Gosched()
+		return false
+	}
+	ctx.deferredYield = true
 	return true
 }
 
@@ -1127,7 +1156,7 @@ func stacklessCoroDeferSleep(s *stacklessCoroScheduler,
 		return false
 	}
 	lock(&s.lock)
-	deferSleep := s.executorState.Load() == stacklessCoroExecutorStateOff &&
+	deferSleep := s.loadExecutorState() == stacklessCoroExecutorStateOff &&
 		s.head == nil && s.tail == nil && s.runnableState.Load() == 0
 	if deferSleep {
 		ctx.deferredSleep = op
