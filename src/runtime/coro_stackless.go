@@ -591,6 +591,7 @@ var stacklessCoroOperations struct {
 	lock     mutex
 	next     uint64
 	registry *stacklessCoroOperationRegistry
+	ioCount  atomic.Int32
 }
 
 // stacklessCoroSharedOperations retains completed operations that exceeded a
@@ -1707,9 +1708,7 @@ next:
 	}
 	task = s.take()
 	if task == nil {
-		if native {
-			task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
-		}
+		task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
 		if task == nil {
 			if !park {
 				return idlePollSkip
@@ -5283,6 +5282,9 @@ func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
 	// may add its first waiter resources later, but cannot become IO while
 	// this source is live. Snapshot this before readers can observe the slot.
 	op.registeredIO = op.ioState() != nil
+	if op.registeredIO {
+		stacklessCoroOperations.ioCount.Add(1)
+	}
 	stacklessCoroOperations.next++
 	if stacklessCoroOperations.next == 0 {
 		stacklessCoroOperations.next++
@@ -5305,6 +5307,9 @@ func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 	if op != nil {
 		*link = op.next
 		op.next = nil
+		if op.registeredIO {
+			stacklessCoroOperations.ioCount.Add(-1)
+		}
 	}
 	unlock(&stacklessCoroOperations.lock)
 	return op
