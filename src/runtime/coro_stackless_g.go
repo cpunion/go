@@ -6,7 +6,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/atomic"
+	"unsafe"
+)
 
 type stacklessCoroGState struct {
 	native            unsafe.Pointer
@@ -14,6 +17,50 @@ type stacklessCoroGState struct {
 	blockingScheduler *stacklessCoroScheduler
 	activeSource      *stacklessCoroGoroutine
 	sourceTransition  bool
+}
+
+// Ordinary public callers retain their private active and reusable public root
+// record here without growing stacklessCoroGState or stacklessCoroNativeContext.
+// state.native points to &state.deferState, a real GC-visible interior pointer
+// distinct from native fixed executors (&state) and host extensions
+// (&state.blockingScheduler).
+type stacklessCoroPublicGState struct {
+	stacklessCoroGState
+	publicRecord atomic.Pointer[stacklessCoroGoroutine]
+	publicFree   *stacklessCoroGoroutine
+}
+
+func stacklessCoroPublicStateFrom(state *stacklessCoroGState) *stacklessCoroPublicGState {
+	if state == nil {
+		return nil
+	}
+	if state.native == unsafe.Pointer(&state.deferState) {
+		return (*stacklessCoroPublicGState)(unsafe.Pointer(state))
+	}
+	if state.native == unsafe.Pointer(&state.blockingScheduler) {
+		return (*stacklessCoroHostGState)(unsafe.Pointer(state)).publicState
+	}
+	return nil
+}
+
+func stacklessCoroPublicState(gp *g) *stacklessCoroPublicGState {
+	return stacklessCoroPublicStateFrom((*stacklessCoroGState)(atomic.Loadp(unsafe.Pointer(&gp.stacklessCoro))))
+}
+
+func acquireStacklessCoroPublicState(gp *g) *stacklessCoroPublicGState {
+	if pub := stacklessCoroPublicState(gp); pub != nil {
+		return pub
+	}
+	state := gp.stacklessCoro
+	if state != nil && (state.native != nil || state.deferState != nil ||
+		state.blockingScheduler != nil || state.activeSource != nil ||
+		state.sourceTransition) {
+		return nil
+	}
+	pub := new(stacklessCoroPublicGState)
+	pub.native = unsafe.Pointer(&pub.deferState)
+	atomicstorep(unsafe.Pointer(&gp.stacklessCoro), unsafe.Pointer(&pub.stacklessCoroGState))
+	return pub
 }
 
 // Cold defer state lives behind a separate word from the active source record.
@@ -52,7 +99,7 @@ func (s *stacklessCoroSudog) clear() {
 
 //go:nosplit
 func stacklessCoroClearGState(gp *g) {
-	gp.stacklessCoro = nil
+	atomicstorep(unsafe.Pointer(&gp.stacklessCoro), nil)
 }
 
 //go:nosplit

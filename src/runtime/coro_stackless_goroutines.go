@@ -25,6 +25,7 @@ type stacklessCoroGoroutine struct {
 	scheduler        *stacklessCoroScheduler
 	owner            atomic.Pointer[g]
 	publicG          *g
+	publicState      *stacklessCoroPublicGState
 	hostG            *g
 	goid, parentGoid uint64
 	gopc             uintptr
@@ -35,6 +36,7 @@ type stacklessCoroGoroutine struct {
 	profileTrace     *stacklessCoroPanicTrace
 	profileBefore    bool
 	public, hosted   bool
+	inRegistry       bool
 }
 
 const stacklessCoroInlineBuckets = 256
@@ -121,6 +123,56 @@ func stacklessCoroPublicGoroutineBucket(gp *g) **stacklessCoroGoroutine {
 func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, callerSP unsafe.Pointer) {
 	gp := getg()
 	resumePC := stacklessCoroResumeIdentity(s.root.resume).fn
+	// Fast path: keep an unnested public root private to its ordinary G so
+	// short-lived roots avoid global registry locking, hashing, and counters.
+	if pub := acquireStacklessCoroPublicState(gp); pub != nil && pub.publicRecord.Load() == nil {
+		r := pub.publicFree
+		if r != nil {
+			pub.publicFree = nil
+		} else {
+			r = &stacklessCoroGoroutine{profileCaller: make([]uintptr, 0, maxCPUProfStack)}
+		}
+		buf := r.profileCaller[:cap(r.profileCaller)]
+		n := 0
+		if gp.stktopsp-uintptr(callerSP) > stacklessCoroGoStartProfileDepth {
+			if cached, ok := stacklessCoroCachedPublicProfileCaller(gp, resumePC, callerPC, callerSP, buf); ok {
+				n = cached
+			}
+		}
+		if n == 0 {
+			source := s.publicSourceFunc()
+			if !source.valid() {
+				if pub.publicFree == nil {
+					pub.publicFree = r
+				}
+				return
+			}
+			if gp.stktopsp-uintptr(callerSP) <= stacklessCoroGoStartProfileDepth {
+				buf[0] = stacklessCoroProfileGoStart(gp, source, callerPC, callerSP)
+			} else {
+				buf[0] = 0
+			}
+			n = 1
+			if buf[0] == 0 {
+				n = stacklessCoroCachedProfileCaller(gp, resumePC, source.entry(), callerPC, callerSP, buf)
+			}
+		}
+		r.root = &s.root
+		r.leaf = &s.root
+		r.scheduler = s
+		r.publicG = gp
+		r.publicState = pub
+		r.goid = gp.goid
+		r.parentGoid = gp.parentGoid
+		r.gopc = gp.gopc
+		r.labels = gp.labels
+		r.ancestors = gp.ancestors
+		r.profileCaller = buf[:n]
+		r.public = true
+		s.root.setSource(r)
+		pub.publicRecord.Store(r)
+		return
+	}
 	var pcs [maxCPUProfStack]uintptr
 	n := 0
 	if gp.stktopsp-uintptr(callerSP) > stacklessCoroGoStartProfileDepth {
@@ -227,6 +279,7 @@ func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
 	}
 	p := stacklessCoroGoroutineBucket(r.root)
 	r.next, *p = *p, r
+	r.inRegistry = true
 	r.root.setSource(r)
 	stacklessCoroGoroutines.records.Add(1)
 }
@@ -415,6 +468,23 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 	}
 	r := task.source()
 	if r == nil {
+		return
+	}
+	if !r.inRegistry {
+		task.setSource(nil)
+		pub := r.publicState
+		if !r.public || pub == nil || pub.publicRecord.Load() != r {
+			throw("runtime: missing private public coroutine identity")
+		}
+		gp := r.publicG
+		pub.publicRecord.Store(nil)
+		callerPCs := r.profileCaller
+		*r = stacklessCoroGoroutine{}
+		clear(callerPCs)
+		r.profileCaller = callerPCs[:0]
+		if (gp == getg() || gp == stacklessCoroPublicCaller(getg())) && pub.publicFree == nil {
+			pub.publicFree = r
+		}
 		return
 	}
 	lock(&stacklessCoroGoroutines.lock)
@@ -645,11 +715,55 @@ func stacklessCoroSnapshotRecord(gp *g) *stacklessCoroGoroutine {
 		}
 		return nil
 	}
+	if pub := stacklessCoroPublicState(gp); pub != nil {
+		if r := pub.publicRecord.Load(); r != nil && r.publicG == gp {
+			f := findfunc(stacklessCoroResumeIdentity(r.root.resume).fn)
+			info := stacklessCoroSourceFrame(f)
+			if info != nil && info.flags&abi.CoroSourceResume != 0 && stacklessCoroSourceFunc(f, info).valid() {
+				return r
+			}
+			return nil
+		}
+	}
 	return nil
 }
 
 func stacklessCoroSnapshotGoroutine(gp *g) bool {
 	return stacklessCoroSnapshotRecord(gp) != nil
+}
+
+// Requires STW. Visit both globally registered logical goroutines and private
+// unnested public roots owned directly by ordinary Gs.
+func visitStacklessCoroGoroutines(visit func(*stacklessCoroGoroutine)) {
+	assertWorldStopped()
+	for _, bucket := range stacklessCoroGoroutineBuckets() {
+		for r := bucket; r != nil; r = r.next {
+			visit(r)
+		}
+	}
+	forEachGRace(func(gp *g) {
+		if pub := stacklessCoroPublicState(gp); pub != nil {
+			if r := pub.publicRecord.Load(); r != nil {
+				visit(r)
+			}
+		}
+	})
+}
+
+func stacklessCoroHasActiveGoroutines() bool {
+	if stacklessCoroGoroutines.records.Load() != 0 {
+		return true
+	}
+	found := false
+	forEachGRace(func(gp *g) {
+		if found {
+			return
+		}
+		if pub := stacklessCoroPublicState(gp); pub != nil && pub.publicRecord.Load() != nil {
+			found = true
+		}
+	})
+	return found
 }
 
 // Requires STW. A host created after this snapshot is already satisfied by
@@ -658,33 +772,31 @@ func stacklessCoroSnapshotGoroutine(gp *g) bool {
 func stacklessCoroGoroutineProfile(p []profilerecord.StackRecord, labels []unsafe.Pointer, concurrent bool) int {
 	assertWorldStopped()
 	n := 0
-	for _, bucket := range stacklessCoroGoroutineBuckets() {
-		for r := bucket; r != nil; r = r.next {
-			gp := r.hostG
-			if r.public {
-				gp = r.publicG
-			}
-			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
-				continue
-			}
-			trace := stacklessCoroLogicalTrace(r)
-			depth := len(trace.pcs)
-			if depth > int(debug.profstackdepth) {
-				depth = int(debug.profstackdepth)
-			}
-			p[n].Stack = trace.pcs[:depth]
-			if labels != nil {
-				labels[n] = r.labels
-				if gp != nil {
-					labels[n] = gp.labels
-				}
-			}
-			if gp != nil && concurrent {
-				gp.goroutineProfiled.Store(goroutineProfileSatisfied)
-			}
-			n++
+	visitStacklessCoroGoroutines(func(r *stacklessCoroGoroutine) {
+		gp := r.hostG
+		if r.public {
+			gp = r.publicG
 		}
-	}
+		if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
+			return
+		}
+		trace := stacklessCoroLogicalTrace(r)
+		depth := len(trace.pcs)
+		if depth > int(debug.profstackdepth) {
+			depth = int(debug.profstackdepth)
+		}
+		p[n].Stack = trace.pcs[:depth]
+		if labels != nil {
+			labels[n] = r.labels
+			if gp != nil {
+				labels[n] = gp.labels
+			}
+		}
+		if gp != nil && concurrent {
+			gp.goroutineProfiled.Store(goroutineProfileSatisfied)
+		}
+		n++
+	})
 	return n
 }
 
@@ -699,7 +811,7 @@ func stacklessCoroTracebackGoroutines() {
 func stacklessCoroPrepareFatalTraceback() bool {
 	level, all, crash := gotraceback()
 	if level != 1 || !all || crash || debug.dontfreezetheworld != 0 ||
-		panicking.Load() != 0 || stacklessCoroGoroutines.records.Load() == 0 {
+		panicking.Load() != 0 || !stacklessCoroHasActiveGoroutines() {
 		return false
 	}
 	// Fatal printing must still work when another P cannot be preempted.
@@ -734,66 +846,64 @@ func stacklessCoroFatalTracebackOthers(me *g) {
 // fatalpanic. No mutable registry link is read without a completed real STW.
 func stacklessCoroPrintGoroutines(skipID uint64) {
 	assertWorldStopped()
-	for _, bucket := range stacklessCoroGoroutineBuckets() {
-		for r := bucket; r != nil; r = r.next {
-			if r.goid == skipID {
+	visitStacklessCoroGoroutines(func(r *stacklessCoroGoroutine) {
+		if r.goid == skipID {
+			return
+		}
+		gp := r.hostG
+		if r.public {
+			gp = r.publicG
+		}
+		if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
+			return
+		}
+		status := "waiting"
+		if r.leaf.state == stacklessCoroTaskRunnable || r.leaf.state == stacklessCoroTaskNew {
+			status = "runnable"
+		} else if r.owner.Load() != nil {
+			status = "running"
+		}
+		print("\ngoroutine ", r.goid, " [", status)
+		if gp != nil && gp.lockedm != 0 {
+			print(", locked to thread")
+		}
+		print("]")
+		labels := r.labels
+		if gp != nil {
+			labels = gp.labels
+		}
+		printGoroutineLabels(labels)
+		print(":\n")
+		var trace stacklessCoroPanicTrace
+		trace.appendLogicalGoroutine(r)
+		for i := 0; i < trace.count; i++ {
+			uf, ok := trace.at(i)
+			if !ok {
+				if i == tracebackInnerFrames {
+					print("...", trace.count-tracebackInnerFrames-tracebackOuterFrames, " frames elided...\n")
+				}
 				continue
 			}
-			gp := r.hostG
-			if r.public {
-				gp = r.publicG
-			}
-			if gp != nil && stacklessCoroSnapshotRecord(gp) != r {
-				continue
-			}
-			status := "waiting"
-			if r.leaf.state == stacklessCoroTaskRunnable || r.leaf.state == stacklessCoroTaskNew {
-				status = "runnable"
-			} else if r.owner.Load() != nil {
-				status = "running"
-			}
-			print("\ngoroutine ", r.goid, " [", status)
-			if gp != nil && gp.lockedm != 0 {
-				print(", locked to thread")
-			}
-			print("]")
-			labels := r.labels
-			if gp != nil {
-				labels = gp.labels
-			}
-			printGoroutineLabels(labels)
-			print(":\n")
-			var trace stacklessCoroPanicTrace
-			trace.appendLogicalGoroutine(r)
-			for i := 0; i < trace.count; i++ {
-				uf, ok := trace.at(i)
-				if !ok {
-					if i == tracebackInnerFrames {
-						print("...", trace.count-tracebackInnerFrames-tracebackOuterFrames, " frames elided...\n")
-					}
-					continue
+			f := findfunc(uf.pc)
+			iu, _ := newInlineUnwinder(f, uf.pc)
+			sf := iu.srcFunc(uf)
+			file, line := iu.fileLine(uf)
+			name := sf.name()
+			if !iu.isInlined(uf) {
+				if source := stacklessCoroSourceName(f); source != "" {
+					name = source
 				}
-				f := findfunc(uf.pc)
-				iu, _ := newInlineUnwinder(f, uf.pc)
-				sf := iu.srcFunc(uf)
-				file, line := iu.fileLine(uf)
-				name := sf.name()
-				if !iu.isInlined(uf) {
-					if source := stacklessCoroSourceName(f); source != "" {
-						name = source
-					}
-				}
-				printFuncName(name)
-				print("(...)\n\t", file, ":", line, "\n")
 			}
-			if f := findfunc(r.gopc); f.valid() && r.goid != 1 {
-				printcreatedby1(f, r.gopc, r.parentGoid)
-			}
-			if r.ancestors != nil {
-				for _, ancestor := range *r.ancestors {
-					printAncestorTraceback(ancestor)
-				}
+			printFuncName(name)
+			print("(...)\n\t", file, ":", line, "\n")
+		}
+		if f := findfunc(r.gopc); f.valid() && r.goid != 1 {
+			printcreatedby1(f, r.gopc, r.parentGoid)
+		}
+		if r.ancestors != nil {
+			for _, ancestor := range *r.ancestors {
+				printAncestorTraceback(ancestor)
 			}
 		}
-	}
+	})
 }
