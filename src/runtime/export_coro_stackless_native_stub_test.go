@@ -8,7 +8,10 @@ package runtime
 
 import "unsafe"
 
-func StacklessCoroClearNativeTaskCachesForTest() int { return 0 }
+func StacklessCoroClearNativeTaskCachesForTest() int {
+	resetStacklessCoroBurstCachesForTest()
+	return 0
+}
 
 func StacklessCoroClearCurrentRootCacheForTest(unsafe.Pointer) {}
 

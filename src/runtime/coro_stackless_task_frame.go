@@ -94,6 +94,9 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 				throw("runtime: invalid stackless coroutine task-frame allocation type")
 			}
 			cached, marker := takeStacklessCoroCompletedTask(allocationType, size)
+			if cached == nil && marker == stacklessCoroUncachedFrameLineage {
+				cached = takeStacklessCoroTypedBurst(child, allocationType, size)
+			}
 			storage := unsafe.Pointer(cached)
 			if storage == nil {
 				storage = newobject(allocationType)

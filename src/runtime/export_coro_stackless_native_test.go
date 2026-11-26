@@ -206,6 +206,7 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 			break
 		}
 	}
+	resetStacklessCoroBurstCachesForTest()
 	return count
 }
 

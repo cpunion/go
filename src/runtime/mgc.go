@@ -2193,6 +2193,7 @@ func boring_registerCache(p unsafe.Pointer) {
 
 func clearpools(coalesceCoroCache bool) {
 	clearStacklessCoroNativeCaches(coalesceCoroCache)
+	clearStacklessCoroBurstCaches(coalesceCoroCache)
 
 	// clear sync.Pools
 	if poolcleanup != nil {

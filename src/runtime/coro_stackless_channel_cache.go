@@ -161,3 +161,7 @@ func clearStacklessCoroChannelCache() {
 	stacklessCoroChannelCache.young ^= 1
 	unlock(&stacklessCoroSharedOperations.lock)
 }
+
+func clearStacklessCoroManagedChannelCache() {}
+
+func resetStacklessCoroManagedChannelCacheForTest() {}
