@@ -5170,8 +5170,7 @@ func (s *stacklessCoroScheduler) replacementExecutor(start bool) {
 	for !s.drained() {
 		if !stacklessCoroIsPullComparison(s) &&
 			s.runnableState.Load()&^stacklessCoroForeignReturnerBit == 0 {
-			if stacklessCoroPollIOAtIdle(s, nil, nil) == nil ||
-				s.runnableState.Load()&^stacklessCoroForeignReturnerBit == 0 {
+			if !stacklessCoroPollIOForReplacement(s) {
 				if !s.waitForWork() {
 					break
 				}
