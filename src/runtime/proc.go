@@ -6060,6 +6060,7 @@ func (pp *p) destroy() {
 		globrunqputhead(pp.runnext.ptr())
 		pp.runnext = 0
 	}
+	drainStacklessCoroPState(pp)
 
 	// Move all timers to the local P.
 	getg().m.p.ptr().timers.take(&pp.timers)

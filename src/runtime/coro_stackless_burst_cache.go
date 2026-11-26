@@ -191,6 +191,7 @@ func clearStacklessCoroTypedBurstCache() {
 }
 
 func clearStacklessCoroBurstCaches(coalesce bool) {
+	clearStacklessCoroPStates()
 	if coalesce {
 		return
 	}
