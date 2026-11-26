@@ -1708,16 +1708,19 @@ next:
 	}
 	task = s.take()
 	if task == nil {
-		task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
-		if task == nil {
-			if !park {
-				return idlePollSkip
-			}
-			if !s.waitForWork() {
-				return nil
-			}
-			goto next
+		goto idlePoll
+	}
+	goto resume
+idlePoll:
+	task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
+	if task == nil {
+		if !park {
+			return idlePollSkip
 		}
+		if !s.waitForWork() {
+			return nil
+		}
+		goto next
 	}
 resume:
 	task.context.scheduler = s
@@ -1773,6 +1776,34 @@ resumeActive:
 	case stacklessCoroActionYield, stacklessCoroActionHandoff:
 		idlePollSkip = nil
 		directInitialRoot = false
+		if action == stacklessCoroActionYield && !raceenabled && !stacklessCoroIsPullComparison(s) {
+			nextYieldCheck := hostYieldCheck + 1
+			if nextYieldCheck != 0 && !getg().preempt && gcBlackenEnabled == 0 {
+				next, resumeDirectly, foreignReturner := s.yieldAndTake(task, true, public)
+				if resumeDirectly {
+					hostYieldCheck = nextYieldCheck
+					goto resume
+				}
+				if !foreignReturner {
+					hostYieldCheck = nextYieldCheck
+					initial = false
+					if next != nil {
+						task = next
+						goto resume
+					}
+					if s.driverDone(public) {
+						return nil
+					}
+					goto idlePoll
+				}
+				if !native {
+					Gosched()
+				} else if yieldStacklessCoroNativeExecutor() {
+					return nil
+				}
+				break
+			}
+		}
 		resumeDirectly, foreignReturner := s.yield(task, true)
 		if resumeDirectly {
 			// The logical queue is empty, but an ordinary goroutine may be
@@ -1827,22 +1858,40 @@ resumeActive:
 		}
 		idlePollSkip = nil
 	case stacklessCoroActionWait:
-		if s.waiting(task, native) {
+		next, resumeDirectly := s.waitingAndTake(task, native, public)
+		if resumeDirectly {
 			idlePollSkip = nil
 			initial = false
 			directInitialRoot = false
 			goto resume
 		}
+		initial = false
+		directInitialRoot = false
+		if next != nil {
+			idlePollSkip = nil
+			task = next
+			goto resume
+		}
+		if s.driverDone(public) {
+			return nil
+		}
 		idlePollSkip = task
+		goto idlePoll
 	case stacklessCoroActionComplete:
 		idlePollSkip = nil
 		if initial && s.completeInitialRoot(task) {
 			return nil
 		}
-		task = s.complete(task)
+		task = s.completeAndTake(task, public)
+		initial = false
+		directInitialRoot = false
 		if task != nil {
 			goto resume
 		}
+		if s.driverDone(public) {
+			return nil
+		}
+		goto idlePoll
 	case stacklessCoroActionPanic:
 		idlePollSkip = nil
 		s.terminate(task)
@@ -4615,11 +4664,24 @@ func (s *stacklessCoroScheduler) readyLocked(task *stacklessCoroTask) uint32 {
 }
 
 func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
-	lock(&s.lock)
 	current := currentStacklessCoroHost()
 	if current != nil && current.scheduler != s {
 		current = nil
 	}
+	if current == nil && !stacklessCoroIsPullComparison(s) &&
+		s.runnableState.Load()&^stacklessCoroForeignReturnerBit == 0 {
+		return nil
+	}
+	lock(&s.lock)
+	task := s.takeLocked(current)
+	unlock(&s.lock)
+	if task != nil && raceenabled {
+		raceacquire(unsafe.Pointer(task))
+	}
+	return task
+}
+
+func (s *stacklessCoroScheduler) takeLocked(current *stacklessCoroHost) *stacklessCoroTask {
 	var task *stacklessCoroTask
 	for {
 		if current != nil {
@@ -4628,7 +4690,6 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 			pull := stacklessCoroIsPullComparison(s)
 			task = s.head
 			if task == nil || pull && task.state != stacklessCoroTaskRunnable {
-				unlock(&s.lock)
 				return nil
 			}
 			if !pull {
@@ -4648,7 +4709,6 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 			}
 		}
 		if task == nil {
-			unlock(&s.lock)
 			return nil
 		}
 		break
@@ -4658,10 +4718,6 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 		throw("runtime: dequeued non-runnable stackless coroutine")
 	}
 	task.state, task.resuming = stacklessCoroTaskRunning, true
-	unlock(&s.lock)
-	if raceenabled {
-		raceacquire(unsafe.Pointer(task))
-	}
 	return task
 }
 
@@ -4691,6 +4747,22 @@ func (s *stacklessCoroScheduler) takeInitialRoot() *stacklessCoroTask {
 }
 
 func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, allowDirect bool) (resumeDirectly, foreignReturner bool) {
+	_, resumeDirectly, foreignReturner = s.yieldTask(task, allowDirect, false, false)
+	return
+}
+
+func (s *stacklessCoroScheduler) yieldAndTake(task *stacklessCoroTask, allowDirect, public bool) (next *stacklessCoroTask, resumeDirectly, foreignReturner bool) {
+	return s.yieldTask(task, allowDirect, true, public)
+}
+
+func (s *stacklessCoroScheduler) yieldTask(task *stacklessCoroTask, allowDirect, takeNext, public bool) (next *stacklessCoroTask, resumeDirectly, foreignReturner bool) {
+	var current *stacklessCoroHost
+	if takeNext {
+		current = currentStacklessCoroHost()
+		if current != nil && current.scheduler != s {
+			current = nil
+		}
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -4704,16 +4776,41 @@ func (s *stacklessCoroScheduler) yield(task *stacklessCoroTask, allowDirect bool
 		// With no competing work, a queue round trip would select this task
 		// again. Keep its running ownership on the current executor.
 		unlock(&s.lock)
-		return true, false
+		return nil, true, false
 	}
 	task.resuming = false
 	runnable := s.readyLocked(task)
+	foreignReturner = runnable&stacklessCoroForeignReturnerBit != 0
+	if takeNext && !foreignReturner && !s.driverDone(public) {
+		next = s.takeLocked(current)
+	}
 	unlock(&s.lock)
-	return false, runnable&stacklessCoroForeignReturnerBit != 0
+	if next != nil && raceenabled {
+		raceacquire(unsafe.Pointer(next))
+	}
+	return next, false, foreignReturner
 }
 
 func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 	native bool) (resumeDirectly bool) {
+	_, resumeDirectly = s.waitingTask(task, native, false, false)
+	return
+}
+
+func (s *stacklessCoroScheduler) waitingAndTake(task *stacklessCoroTask,
+	native, public bool) (next *stacklessCoroTask, resumeDirectly bool) {
+	return s.waitingTask(task, native, true, public)
+}
+
+func (s *stacklessCoroScheduler) waitingTask(task *stacklessCoroTask,
+	native, takeNext, public bool) (next *stacklessCoroTask, resumeDirectly bool) {
+	var current *stacklessCoroHost
+	if takeNext {
+		current = currentStacklessCoroHost()
+		if current != nil && current.scheduler != s {
+			current = nil
+		}
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskWaiting || !task.resuming {
 		unlock(&s.lock)
@@ -4730,7 +4827,7 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 		// Race and pull-comparison builds retain their separate handoff.
 		task.state = stacklessCoroTaskRunning
 		unlock(&s.lock)
-		return true
+		return nil, true
 	}
 	task.resuming = false
 	if raceenabled {
@@ -4739,11 +4836,18 @@ func (s *stacklessCoroScheduler) waiting(task *stacklessCoroTask,
 	if ready {
 		s.readyLocked(task)
 	}
+	if takeNext && !s.driverDone(public) {
+		next = s.takeLocked(current)
+	}
+	needSignal := ready && (!takeNext || next == nil || s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0)
 	unlock(&s.lock)
-	if ready {
+	if needSignal {
 		s.signalIfWaiting()
 	}
-	return false
+	if next != nil && raceenabled {
+		raceacquire(unsafe.Pointer(next))
+	}
+	return next, false
 }
 
 func (s *stacklessCoroScheduler) readyAfterPanic(task *stacklessCoroTask) {
@@ -4794,6 +4898,21 @@ func (s *stacklessCoroScheduler) completeInitialRoot(task *stacklessCoroTask) bo
 }
 
 func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCoroTask {
+	return s.completeTask(task, false, false)
+}
+
+func (s *stacklessCoroScheduler) completeAndTake(task *stacklessCoroTask, public bool) *stacklessCoroTask {
+	return s.completeTask(task, true, public)
+}
+
+func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext, public bool) *stacklessCoroTask {
+	var current *stacklessCoroHost
+	if takeNext {
+		current = currentStacklessCoroHost()
+		if current != nil && current.scheduler != s {
+			current = nil
+		}
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -4832,12 +4951,19 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 		if !root {
 			s.recycleTaskLocked(task)
 		}
+		var next *stacklessCoroTask
+		if takeNext && !s.driverDone(public) {
+			next = s.takeLocked(current)
+		}
 		unlock(&s.lock)
 		if !root && burstResume != nil {
 			cacheStacklessCoroTypedBurst(burstResume, task)
 		}
 		s.logicalTaskComplete(root)
-		return nil
+		if next != nil && raceenabled {
+			raceacquire(unsafe.Pointer(next))
+		}
+		return next
 	}
 	if parent.state != stacklessCoroTaskWaiting ||
 		(!deferred && (parent.terminal != stacklessCoroTerminalNone || parent.goexit)) {
@@ -4861,8 +4987,15 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	}
 	s.readyLocked(parent)
 	s.recycleTaskLocked(task)
+	var next *stacklessCoroTask
+	if takeNext && !s.driverDone(public) {
+		next = s.takeLocked(current)
+	}
 	unlock(&s.lock)
-	return nil
+	if next != nil && raceenabled {
+		raceacquire(unsafe.Pointer(next))
+	}
+	return next
 }
 
 func (s *stacklessCoroScheduler) terminate(task *stacklessCoroTask) {

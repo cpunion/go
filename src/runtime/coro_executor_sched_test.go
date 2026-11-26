@@ -62,10 +62,12 @@ func TestStacklessCoroExecutorDeferredYieldFairness(t *testing.T) {
 			defer runtime.GOMAXPROCS(prev)
 
 			var peerTicks atomic.Int32
+			peerStarted := make(chan struct{})
 			stopPeer := make(chan struct{})
 			peerDone := make(chan struct{})
 			go func() {
 				defer close(peerDone)
+				close(peerStarted)
 				for {
 					select {
 					case <-stopPeer:
@@ -76,15 +78,18 @@ func TestStacklessCoroExecutorDeferredYieldFairness(t *testing.T) {
 					}
 				}
 			}()
+			<-peerStarted
 
 			const workers = 8
-			const yields = 300
+			const maxYields = 200000
 			var completed atomic.Int32
+			var ticksBefore int32
 			runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
+				ticksBefore = peerTicks.Load()
 				for range workers {
 					count := 0
 					runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
-						if count < yields {
+						if peerTicks.Load() == ticksBefore && count < maxYields {
 							count++
 							return runtime.StacklessCoroActionYield
 						}
@@ -103,8 +108,8 @@ func TestStacklessCoroExecutorDeferredYieldFairness(t *testing.T) {
 			if completed.Load() != workers {
 				t.Fatalf("completed = %d, want %d", completed.Load(), workers)
 			}
-			if peerTicks.Load() == 0 {
-				t.Fatal("ordinary peer goroutine made zero progress")
+			if peerTicks.Load() == ticksBefore {
+				t.Fatal("ordinary peer goroutine made zero progress during coroutine yields")
 			}
 		})
 	}
