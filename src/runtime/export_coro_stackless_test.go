@@ -1296,24 +1296,26 @@ func StacklessCoroChannelWaitersForTest(channel any) (send, recv, logical int) {
 }
 
 func StacklessCoroOperationCountForTest() int {
-	lock(&stacklessCoroOperations.lock)
 	count := 0
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
-		for op := registry.buckets[index]; op != nil; op = op.next {
+		slot := &registry.buckets[index]
+		lock(&slot.lock)
+		for op := slot.head; op != nil; op = op.next {
 			count++
 		}
+		unlock(&slot.lock)
 	}
-	unlock(&stacklessCoroOperations.lock)
 	return count
 }
 
 func StacklessCoroPollWaitCountForTest() int {
-	lock(&stacklessCoroOperations.lock)
 	count := 0
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
-		for op := registry.buckets[index]; op != nil; op = op.next {
+		slot := &registry.buckets[index]
+		lock(&slot.lock)
+		for op := slot.head; op != nil; op = op.next {
 			if op.ioState() == nil || op.resourceState().async || op.resourceState().packet[stacklessCoroPollDescWord] == 0 {
 				continue
 			}
@@ -1327,8 +1329,8 @@ func StacklessCoroPollWaitCountForTest() int {
 				count++
 			}
 		}
+		unlock(&slot.lock)
 	}
-	unlock(&stacklessCoroOperations.lock)
 	return count
 }
 
@@ -1472,21 +1474,22 @@ func StacklessCoroOperationTokenForTest(ctx unsafe.Pointer) unsafe.Pointer {
 	if context == nil || context.scheduler == nil || context.task() == nil {
 		throw("runtime: invalid stackless coroutine operation token query")
 	}
-	lock(&stacklessCoroOperations.lock)
 	var found *stacklessCoroOperation
 	registry := stacklessCoroOperations.registry
 	for index := range registry.buckets {
-		for op := registry.buckets[index]; op != nil; op = op.next {
+		slot := &registry.buckets[index]
+		lock(&slot.lock)
+		for op := slot.head; op != nil; op = op.next {
 			if op.scheduler() == context.scheduler && op.task == context.task() {
 				if found != nil {
-					unlock(&stacklessCoroOperations.lock)
+					unlock(&slot.lock)
 					throw("runtime: multiple stackless coroutine operations for one task")
 				}
 				found = op
 			}
 		}
+		unlock(&slot.lock)
 	}
-	unlock(&stacklessCoroOperations.lock)
 	return unsafe.Pointer(found)
 }
 
@@ -1897,14 +1900,9 @@ func CheckStacklessCoroOperationRegistryForTest() bool {
 	firstID := registerStacklessCoroOperation(first)
 	// Leave exactly one bucket rotation between consecutive registrations so
 	// the test covers a real collision.
-	lock(&stacklessCoroOperations.lock)
 	for range stacklessCoroOperationRegistryBucketCount - 1 {
-		stacklessCoroOperations.next++
-		if stacklessCoroOperations.next == 0 {
-			stacklessCoroOperations.next++
-		}
+		nextStacklessCoroOperationID()
 	}
-	unlock(&stacklessCoroOperations.lock)
 	secondID := registerStacklessCoroOperation(second)
 	valid := firstID != 0 && secondID != 0 && firstID != secondID &&
 		firstID%stacklessCoroOperationRegistryBucketCount ==
@@ -1927,14 +1925,9 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 	ids := make([]uint64, len(operations))
 	for i := range operations {
 		if i != 0 {
-			lock(&stacklessCoroOperations.lock)
 			for range stacklessCoroOperationRegistryBucketCount - 1 {
-				stacklessCoroOperations.next++
-				if stacklessCoroOperations.next == 0 {
-					stacklessCoroOperations.next++
-				}
+				nextStacklessCoroOperationID()
 			}
-			unlock(&stacklessCoroOperations.lock)
 		}
 		op := new(stacklessCoroOperation)
 		if i&1 != 0 {
@@ -1947,17 +1940,13 @@ func CheckStacklessCoroOperationRegistryScanForTest() bool {
 		ids[i] = registerStacklessCoroOperation(op)
 	}
 	bucket := int(ids[0] % stacklessCoroOperationRegistryBucketCount)
-	lock(&stacklessCoroOperations.lock)
 	registry := stacklessCoroOperations.registry
-	oldScan := registry.scan
-	registry.scan = uint16(bucket)
-	unlock(&stacklessCoroOperations.lock)
+	oldScan := registry.scan.Load()
+	registry.scan.Store(uint32(bucket))
 	valid := stacklessCoroPollIOAtIdle(s, nil, nil) == nil
-	lock(&stacklessCoroOperations.lock)
-	valid = valid && int(registry.scan) ==
+	valid = valid && int(registry.scan.Load()) ==
 		(bucket+1)%stacklessCoroOperationRegistryBucketCount
-	registry.scan = oldScan
-	unlock(&stacklessCoroOperations.lock)
+	registry.scan.Store(oldScan)
 	for i := range operations {
 		if takeStacklessCoroOperation(ids[i]) != operations[i] {
 			valid = false

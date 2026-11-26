@@ -22,7 +22,7 @@ func StacklessCoroWriteBarrierLockForTest(kind int, spans bool) {
 		initializeStacklessCoroScheduler(s, nil, stacklessCoroLockRankProbeResume, 0)
 		m = &s.lock
 	case 1:
-		m = &stacklessCoroOperations.lock
+		m = &stacklessCoroOperations.registry.buckets[0].lock
 	case 2:
 		m = &stacklessCoroSharedOperations.lock
 	case 3:

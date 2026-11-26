@@ -56,3 +56,92 @@ func CheckStacklessCoroNetpollPopOneForTest() string {
 	KeepAlive(ops)
 	return ""
 }
+
+func CheckStacklessCoroNetpollFanoutWakeForTest() string {
+	if stacklessCoroNetpoll.started.Load() != 0 ||
+		stacklessCoroNetpoll.head.Load() != 0 ||
+		stacklessCoroNetpoll.drained.Load() != 0 {
+		return "netpoll fanout probe is not isolated"
+	}
+	if gomaxprocs < 2 {
+		return "netpoll fanout probe requires GOMAXPROCS >= 2"
+	}
+	s := newStacklessCoroTestScheduler()
+	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
+	s.executorState.Store(stacklessCoroExecutorStateRunning | uint32(2<<stacklessCoroExecutorWaitingShift))
+	const n = 4
+	ops := make([]*stacklessCoroOperation, n)
+	for i := range ops {
+		op := newStacklessCoroIOOperation()
+		op.id = uint64(i + 1)
+		task := new(stacklessCoroTask)
+		task.context.scheduler = s
+		op.task = task
+		ops[i] = op
+		stacklessCoroNetpollReady(op)
+	}
+	// First pop sees 3 extra queued ops and 2 waiting executors -> should send
+	// min(extra, waiting, gomaxprocs-1) signals to s.wake.
+	first := stacklessCoroNetpollPopOne(true)
+	if first == nil {
+		return "first netpoll pop returned nil"
+	}
+	wantSignals := min(min(n-1, int(gomaxprocs)-1), 2)
+	if got := len(s.wake); got != wantSignals {
+		return "unexpected netpoll fanout signal count"
+	}
+	// Drain remaining ops with waiting=0 -> must not add extra signals.
+	s.executorState.Store(stacklessCoroExecutorStateRunning)
+	for range n - 1 {
+		if stacklessCoroNetpollPopOne(true) == nil {
+			return "remaining netpoll pop returned nil"
+		}
+	}
+	if got := len(s.wake); got != wantSignals {
+		return "netpoll fanout signaled with zero waiting executors"
+	}
+	stacklessCoroNetpoll.wake.Store(pdNil)
+	KeepAlive(ops)
+	return ""
+}
+
+func CheckStacklessCoroOperationRegistryShardsForTest(workers, perWorker int) string {
+	done := make(chan string, workers)
+	for range workers {
+		go func() {
+			ids := make([]uint64, perWorker)
+			ops := make([]*stacklessCoroOperation, perWorker)
+			for i := range perWorker {
+				op := new(stacklessCoroOperation)
+				ops[i] = op
+				id := registerStacklessCoroOperation(op)
+				if id == 0 {
+					done <- "registered zero operation id"
+					return
+				}
+				ids[i] = id
+			}
+			for i := range perWorker {
+				if findStacklessCoroOperation(ids[i]) != ops[i] {
+					done <- "missing registered operation"
+					return
+				}
+				if takeStacklessCoroOperation(ids[i]) != ops[i] {
+					done <- "mismatched taken operation"
+					return
+				}
+				if takeStacklessCoroOperation(ids[i]) != nil {
+					done <- "duplicate operation removal succeeded"
+					return
+				}
+			}
+			done <- ""
+		}()
+	}
+	for range workers {
+		if msg := <-done; msg != "" {
+			return msg
+		}
+	}
+	return ""
+}

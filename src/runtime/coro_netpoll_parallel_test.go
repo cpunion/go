@@ -31,3 +31,30 @@ func TestStacklessCoroNetpollParallelDrain(t *testing.T) {
 		t.Fatal(msg)
 	}
 }
+
+func TestStacklessCoroNetpollFanoutWake(t *testing.T) {
+	const child = "GO_TEST_CORO_NETPOLL_FANOUT"
+	if os.Getenv(child) != "1" {
+		cmd := testenv.CleanCmdEnv(testenv.Command(t, testenv.Executable(t),
+			"-test.run=^TestStacklessCoroNetpollFanoutWake$"))
+		cmd.Env = append(cmd.Env, child+"=1", "GOMAXPROCS=4")
+		if debug := os.Getenv("GODEBUG"); debug != "" {
+			cmd.Env = append(cmd.Env, "GODEBUG="+debug)
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("netpoll fanout subprocess: %v\n%s", err, out)
+		}
+		return
+	}
+	if msg := runtime.CheckStacklessCoroNetpollFanoutWakeForTest(); msg != "" {
+		t.Fatal(msg)
+	}
+}
+
+func TestStacklessCoroOperationRegistryShards(t *testing.T) {
+	prev := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(prev)
+	if msg := runtime.CheckStacklessCoroOperationRegistryShardsForTest(8, 256); msg != "" {
+		t.Fatal(msg)
+	}
+}
