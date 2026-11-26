@@ -39,7 +39,10 @@ type stacklessCoroGoroutine struct {
 	inRegistry       bool
 }
 
-const stacklessCoroInlineBuckets = 256
+const (
+	stacklessCoroInlineBuckets          = 256
+	stacklessCoroGoroutineBurstCacheCap = 1024
+)
 
 type stacklessCoroSpawnSite struct {
 	returnPC, sourcePC uintptr
@@ -54,6 +57,9 @@ var stacklessCoroGoroutines struct {
 	publicFreeCount int
 	taskFree        *stacklessCoroGoroutine
 	taskFreeCount   int
+	taskBurst       [2]*stacklessCoroGoroutine
+	taskBurstCount  [2]int
+	taskBurstYoung  uint8
 	pending         *stacklessCoroHost
 	spawnSites      [128]stacklessCoroSpawnSite
 	unhosted        atomic.Int64
@@ -304,11 +310,11 @@ func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stackless
 		creator.labels = gp.labels
 	}
 	r := stacklessCoroGoroutines.taskFree
-	if r == nil {
-		r = new(stacklessCoroGoroutine)
-	} else {
+	if r != nil {
 		stacklessCoroGoroutines.taskFree = r.next
 		stacklessCoroGoroutines.taskFreeCount--
+	} else if r = takeStacklessCoroGoroutineBurstLocked(); r == nil {
+		r = new(stacklessCoroGoroutine)
 	}
 	*r = stacklessCoroGoroutine{root: task, leaf: task, scheduler: s,
 		goid: sched.goidgen.Add(1), parentGoid: creator.goid, gopc: callerpc,
@@ -527,6 +533,12 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 			r.next = stacklessCoroGoroutines.taskFree
 			stacklessCoroGoroutines.taskFree = r
 			stacklessCoroGoroutines.taskFreeCount++
+		} else if reusable &&
+			stacklessCoroGoroutines.taskBurstCount[0]+stacklessCoroGoroutines.taskBurstCount[1] < stacklessCoroGoroutineBurstCacheCap {
+			young := stacklessCoroGoroutines.taskBurstYoung
+			r.next = stacklessCoroGoroutines.taskBurst[young]
+			stacklessCoroGoroutines.taskBurst[young] = r
+			stacklessCoroGoroutines.taskBurstCount[young]++
 		}
 		if size := len(stacklessCoroGoroutines.largeBuckets); size != 0 && count <= int64(size/4) {
 			stacklessCoroResizeGoroutineBuckets(size / 2)
@@ -537,6 +549,35 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 
 func stacklessCoroUnhostedGoroutines() int64 {
 	return stacklessCoroGoroutines.unhosted.Load()
+}
+
+func takeStacklessCoroGoroutineBurstLocked() *stacklessCoroGoroutine {
+	for age := uint8(0); age < 2; age++ {
+		gen := stacklessCoroGoroutines.taskBurstYoung ^ age
+		if r := stacklessCoroGoroutines.taskBurst[gen]; r != nil {
+			stacklessCoroGoroutines.taskBurst[gen] = r.next
+			stacklessCoroGoroutines.taskBurstCount[gen]--
+			return r
+		}
+	}
+	return nil
+}
+
+func clearStacklessCoroGoroutineBurstCache() {
+	lock(&stacklessCoroGoroutines.lock)
+	old := stacklessCoroGoroutines.taskBurstYoung ^ 1
+	stacklessCoroGoroutines.taskBurst[old] = nil
+	stacklessCoroGoroutines.taskBurstCount[old] = 0
+	stacklessCoroGoroutines.taskBurstYoung = old
+	unlock(&stacklessCoroGoroutines.lock)
+}
+
+func resetStacklessCoroGoroutineBurstCacheForTest() {
+	lock(&stacklessCoroGoroutines.lock)
+	stacklessCoroGoroutines.taskBurst = [2]*stacklessCoroGoroutine{}
+	stacklessCoroGoroutines.taskBurstCount = [2]int{}
+	stacklessCoroGoroutines.taskBurstYoung = 0
+	unlock(&stacklessCoroGoroutines.lock)
 }
 
 func stacklessCoroRegisterHostStart(h *stacklessCoroHost) {

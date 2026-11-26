@@ -3892,7 +3892,9 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	if s.liveSpawns == ^uint64(0) {
 		throw("runtime: stackless coroutine spawn count overflow")
 	}
-	if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) {
+	if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) ||
+		(task.frameSize == stacklessCoroUncachedFrameLineage &&
+			frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task))) {
 		task.setFlag(stacklessCoroTaskTypedSpawn, true)
 	}
 	s.liveSpawns++
@@ -4805,6 +4807,15 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
+	var burstResume stacklessCoroResume
+	if !raceenabled && unsafe.Sizeof(uintptr(0)) == 8 &&
+		!task.hasFlag(stacklessCoroTaskCacheFrame) &&
+		task.frameSize == stacklessCoroUncachedFrameLineage &&
+		task.hasFlag(stacklessCoroTaskTypedSpawn) &&
+		task.parentOrSource == nil &&
+		task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
+		burstResume = task.resume
+	}
 	task.resuming = false
 	task.state = stacklessCoroTaskComplete
 	if !task.hasFlag(stacklessCoroTaskCacheFrame) {
@@ -4822,6 +4833,9 @@ func (s *stacklessCoroScheduler) complete(task *stacklessCoroTask) *stacklessCor
 			s.recycleTaskLocked(task)
 		}
 		unlock(&s.lock)
+		if !root && burstResume != nil {
+			cacheStacklessCoroTypedBurst(burstResume, task)
+		}
 		s.logicalTaskComplete(root)
 		return nil
 	}
