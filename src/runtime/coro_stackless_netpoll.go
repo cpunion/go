@@ -12,9 +12,16 @@ import (
 )
 
 var stacklessCoroNetpoll struct {
-	started atomic.Uint32
-	head    atomic.Uintptr
-	wake    atomic.Uintptr
+	started   atomic.Uint32
+	head      atomic.Uintptr
+	wake      atomic.Uintptr
+	loopG     atomic.Pointer[g]
+	drainLock mutex
+	drained   atomic.Uintptr
+}
+
+func init() {
+	lockInit(&stacklessCoroNetpoll.drainLock, lockRankStacklessCoro)
 }
 
 const (
@@ -191,6 +198,20 @@ func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 	if stacklessCoroOperations.ioCount.Load() == 0 {
 		return nil
 	}
+	if task := stacklessCoroDrainReadyIO(s); task != nil {
+		return task
+	}
+	if gomaxprocs > 1 {
+		wokeLoop := stacklessCoroNetpollPollNonblocking()
+		task := stacklessCoroDrainReadyIO(s)
+		if wokeLoop {
+			stacklessCoroNetpollReleaseLoop()
+		}
+		if task != nil {
+			return task
+		}
+		return s.take()
+	}
 	var previous *stacklessCoroTask
 	for attempt := 0; attempt < stacklessCoroIdlePollAttempts; attempt++ {
 		claimed := stacklessCoroPollIOAtIdle(s, exclude, previous)
@@ -215,6 +236,147 @@ func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 		}
 	}
 	return nil
+}
+
+// stacklessCoroPollIOForReplacement checks for ready I/O before an idle
+// replacement executor parks without entering a native stack episode.
+func stacklessCoroPollIOForReplacement(s *stacklessCoroScheduler) bool {
+	if stacklessCoroOperations.ioCount.Load() == 0 {
+		return false
+	}
+	if stacklessCoroDrainReadyIOForReplacement(s) {
+		return true
+	}
+	if gomaxprocs == 1 {
+		return stacklessCoroPollIOAtIdle(s, nil, nil) != nil &&
+			s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0
+	}
+	wokeLoop := stacklessCoroNetpollPollNonblocking()
+	ready := stacklessCoroDrainReadyIOForReplacement(s)
+	if wokeLoop {
+		stacklessCoroNetpollReleaseLoop()
+	}
+	return ready
+}
+
+// stacklessCoroNetpollPollNonblocking performs a single-flight nonblocking
+// netpoll(0) on the system stack, sharing sched.pollingNet with findRunnable.
+// Ready coroutine operations are published to stacklessCoroNetpoll.head by
+// netpollCoroDispatch; any ready ordinary goroutines are injected into the
+// Go scheduler. If netpoll(0) returned the parked coroutine completion G, it
+// withholds readying that G and returns true so the caller can drain the
+// newly arrived completions inline and re-arm the parked G without an extra
+// wakeup when nothing remains.
+func stacklessCoroNetpollPollNonblocking() bool {
+	if !netpollinited() || !netpollAnyWaiters() || sched.lastpoll.Load() == 0 {
+		return false
+	}
+	if sched.pollingNet.Swap(1) != 0 {
+		return false
+	}
+	loopG := stacklessCoroNetpoll.loopG.Load()
+	wokeLoop := false
+	systemstack(func() {
+		list, delta := netpoll(0)
+		sched.pollingNet.Store(0)
+		if !list.empty() {
+			var other gList
+			for !list.empty() {
+				gp := list.pop()
+				if loopG != nil && gp == loopG {
+					wokeLoop = true
+					continue
+				}
+				other.push(gp)
+			}
+			if !other.empty() {
+				injectglist(&other)
+			}
+			if delta != 0 {
+				netpollAdjustWaiters(delta)
+			}
+		}
+	})
+	return wokeLoop
+}
+
+// stacklessCoroNetpollReleaseLoop either returns the withheld parked
+// completion G to stacklessCoroNetpoll.wake when all completions have already
+// been drained, or readies it if more completions remain or raced in.
+func stacklessCoroNetpollReleaseLoop() {
+	loopG := stacklessCoroNetpoll.loopG.Load()
+	lock(&stacklessCoroNetpoll.drainLock)
+	if !stacklessCoroNetpoll.wake.CompareAndSwap(pdReady, uintptr(unsafe.Pointer(loopG))) {
+		unlock(&stacklessCoroNetpoll.drainLock)
+		throw("runtime: unexpected stackless coroutine netpoll wake state")
+	}
+	needWake := false
+	if stacklessCoroNetpoll.drained.Load() != 0 || stacklessCoroNetpoll.head.Load() != 0 {
+		needWake = stacklessCoroNetpoll.wake.CompareAndSwap(uintptr(unsafe.Pointer(loopG)), pdReady)
+	}
+	unlock(&stacklessCoroNetpoll.drainLock)
+	if needWake {
+		systemstack(func() {
+			var list gList
+			list.push(loopG)
+			injectglist(&list)
+		})
+	}
+}
+
+// stacklessCoroDrainReadyIO processes already-dispatched netpoll completions
+// until s has a runnable task or the ready queue is empty.
+func stacklessCoroDrainReadyIO(s *stacklessCoroScheduler) *stacklessCoroTask {
+	for {
+		op := stacklessCoroNetpollPopOne(true)
+		if op == nil {
+			return nil
+		}
+		stacklessCoroSocketAttempt(op)
+		if task := s.take(); task != nil {
+			return task
+		}
+	}
+}
+
+func stacklessCoroDrainReadyIOForReplacement(s *stacklessCoroScheduler) bool {
+	for {
+		if s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0 {
+			return true
+		}
+		op := stacklessCoroNetpollPopOne(true)
+		if op == nil {
+			return s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0
+		}
+		stacklessCoroSocketAttempt(op)
+	}
+}
+
+// stacklessCoroNetpollPopOne claims one ready I/O operation from the netpoll
+// completion list so multiple idle executors and the netpoll completion
+// goroutine can execute nonblocking I/O retries in parallel.
+func stacklessCoroNetpollPopOne(checkFast bool) *stacklessCoroOperation {
+	if checkFast && stacklessCoroNetpoll.drained.Load() == 0 && stacklessCoroNetpoll.head.Load() == 0 {
+		return nil
+	}
+	lock(&stacklessCoroNetpoll.drainLock)
+	head := stacklessCoroNetpoll.drained.Load()
+	if head == 0 {
+		head = stacklessCoroNetpoll.head.Swap(0)
+	}
+	if head == 0 {
+		unlock(&stacklessCoroNetpoll.drainLock)
+		return nil
+	}
+	op := (*stacklessCoroOperation)(unsafe.Pointer(head))
+	next := uintptr(op.resourceState().packet[stacklessCoroPollNextWord])
+	op.resourceState().packet[stacklessCoroPollNextWord] = 0
+	stacklessCoroNetpoll.drained.Store(next)
+	unlock(&stacklessCoroNetpoll.drainLock)
+	if op.id == 0 {
+		throw("runtime: invalid stackless coroutine poll completion")
+	}
+	return op
 }
 
 func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
@@ -299,22 +461,32 @@ func stacklessCoroNetpollReady(op *stacklessCoroOperation) *g {
 }
 
 func stacklessCoroNetpollLoop() {
+	stacklessCoroNetpoll.loopG.Store(getg())
 	for {
-		head := stacklessCoroNetpoll.head.Swap(0)
-		for head != 0 {
-			op := (*stacklessCoroOperation)(unsafe.Pointer(head))
-			head = uintptr(op.resourceState().packet[stacklessCoroPollNextWord])
-			op.resourceState().packet[stacklessCoroPollNextWord] = 0
-			if getg().stacklessCoro != nil || op.id == 0 ||
-				findStacklessCoroOperation(op.id) != op {
+		for {
+			op := stacklessCoroNetpollPopOne(true)
+			if op == nil {
+				break
+			}
+			if getg().stacklessCoro != nil {
 				throw("runtime: invalid stackless coroutine poll completion")
 			}
 			stacklessCoroSocketAttempt(op)
 		}
 
-		if !stacklessCoroNetpoll.wake.CompareAndSwap(pdReady, pdNil) &&
-			stacklessCoroNetpoll.head.Load() == 0 &&
-			stacklessCoroNetpoll.wake.CompareAndSwap(pdNil, pdWait) {
+		if stacklessCoroNetpoll.wake.CompareAndSwap(pdReady, pdNil) {
+			continue
+		}
+		// Serialize with concurrent drainLock holders before parking so an
+		// operation moving from head to drained cannot be missed.
+		if op := stacklessCoroNetpollPopOne(false); op != nil {
+			if getg().stacklessCoro != nil {
+				throw("runtime: invalid stackless coroutine poll completion")
+			}
+			stacklessCoroSocketAttempt(op)
+			continue
+		}
+		if stacklessCoroNetpoll.wake.CompareAndSwap(pdNil, pdWait) {
 			gopark(stacklessCoroNetpollPark,
 				unsafe.Pointer(&stacklessCoroNetpoll.wake),
 				waitReasonIOWait, traceBlockNet, 1)

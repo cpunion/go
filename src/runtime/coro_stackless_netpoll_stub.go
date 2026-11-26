@@ -15,3 +15,7 @@ func stacklessCoroPollIOBeforePark(*stacklessCoroScheduler,
 	*stacklessCoroTask) *stacklessCoroTask {
 	return nil
 }
+
+func stacklessCoroPollIOForReplacement(*stacklessCoroScheduler) bool {
+	return false
+}
