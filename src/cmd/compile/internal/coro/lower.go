@@ -123,6 +123,7 @@ type lowerCandidate struct {
 	frameType         *types.Type
 	resumePC          *ir.Name
 	frameChunkLength  int64
+	runtimeBorrowed   map[*ir.Name]bool
 	entryZeroed       map[*ir.Name]bool
 	selfAwait         bool
 	selfSpawn         bool
@@ -4388,6 +4389,20 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 	gotoState := func(state int) ir.Node {
 		return ir.NewBranchStmt(pos, ir.OGOTO, labels[state])
 	}
+	runtimeBorrowed := make(map[*ir.Name]bool)
+	candidate.runtimeBorrowed = runtimeBorrowed
+	borrowRuntimeAddr := func(node ir.Node) ir.Node {
+		if name, ok := node.(*ir.Name); ok {
+			outer := name.Canonical()
+			if name.IsClosureVar() && name.Outer != nil {
+				outer = name.Outer.Canonical()
+			}
+			if !outer.Addrtaken() {
+				runtimeBorrowed[outer] = true
+			}
+		}
+		return typecheck.NodAddr(node)
+	}
 	var stateBodies ir.Nodes
 	for i, state := range states {
 		body := make([]ir.Node, 0, len(state.body)+4)
@@ -4688,7 +4703,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			if notifyOperation(operation.call) != "" {
 				args[1] = typecheck.ConvNop(args[1], types.Types[types.TUNSAFEPTR])
 			}
-			args = append(args, typecheck.NodAddr(edit(operation.state)))
+			args = append(args, borrowRuntimeAddr(edit(operation.state)))
 			wait := typecheck.Call(operation.call.Pos(),
 				typecheck.LookupRuntime(waitOperation(operation.call)), args, false)
 			body = append(body,
@@ -4711,8 +4726,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 			body = append(body, typecheck.Call(io.call.Pos(), io.finish,
 				ir.Nodes{
 					edit(io.receiver),
-					typecheck.NodAddr(edit(io.n)),
-					typecheck.NodAddr(edit(io.err)),
+					borrowRuntimeAddr(edit(io.n)),
+					borrowRuntimeAddr(edit(io.err)),
 					edit(io.direct), edit(io.status),
 				}, false))
 			for _, name := range []*ir.Name{io.receiver, io.dummyErr} {
@@ -4823,6 +4838,15 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						state.statement.Pos(), casePointerType)
 					if selection.descriptors != nil {
 						descriptors := edit(selection.descriptors)
+						if name, ok := descriptors.(*ir.Name); ok {
+							outer := name.Canonical()
+							if name.IsClosureVar() && name.Outer != nil {
+								outer = name.Outer.Canonical()
+							}
+							if !outer.Addrtaken() {
+								runtimeBorrowed[outer] = true
+							}
+						}
 						first := ir.NewIndexExpr(state.statement.Pos(),
 							descriptors, ir.NewInt(state.statement.Pos(), 0))
 						casesPointer = typecheck.ConvNop(
@@ -4849,8 +4873,8 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 								types.Types[types.TBOOL],
 								constant.MakeBool(
 									selection.defaultCase == nil)),
-							typecheck.NodAddr(edit(selection.chosen)),
-							typecheck.NodAddr(edit(selection.received)),
+							borrowRuntimeAddr(edit(selection.chosen)),
+							borrowRuntimeAddr(edit(selection.received)),
 						}, false)
 					body = append(body,
 						ir.NewIfStmt(state.statement.Pos(), wait, ir.Nodes{
@@ -4892,12 +4916,12 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						typecheck.LookupRuntime("coroChanSend",
 							elementType, elementType),
 						ir.Nodes{ctx, channelValue,
-							typecheck.NodAddr(value)}, false)
+							borrowRuntimeAddr(value)}, false)
 				} else {
 					resultPointer := ir.Node(typecheck.NodNil())
 					if channel.recvValue != nil &&
 						!ir.IsBlank(channel.recvValue) {
-						resultPointer = typecheck.NodAddr(
+						resultPointer = borrowRuntimeAddr(
 							edit(channel.recvValue))
 					}
 					okPointer := ir.Node(typecheck.NodNil())
@@ -4906,7 +4930,7 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 						if channel.recvOKTemp != nil {
 							target = channel.recvOKTemp
 						}
-						okPointer = typecheck.NodAddr(edit(target))
+						okPointer = borrowRuntimeAddr(edit(target))
 					}
 					wait = typecheck.Call(channel.node.Pos(),
 						typecheck.LookupRuntime("coroChanRecv",
@@ -4965,10 +4989,10 @@ func lowerFunction(candidate *lowerCandidate, factories map[*ir.Func]*ir.Func) e
 							edit(state.call.Args[1])))
 					wait := typecheck.Call(state.call.Pos(), io.start, ir.Nodes{
 						edit(io.receiver), ctx, edit(io.buffer),
-						typecheck.NodAddr(edit(io.n)),
-						typecheck.NodAddr(edit(io.err)),
-						typecheck.NodAddr(edit(io.direct)),
-						typecheck.NodAddr(edit(io.status)),
+						borrowRuntimeAddr(edit(io.n)),
+						borrowRuntimeAddr(edit(io.err)),
+						borrowRuntimeAddr(edit(io.direct)),
+						borrowRuntimeAddr(edit(io.status)),
 					}, false)
 					body = append(body,
 						ir.NewAssignStmt(state.call.Pos(), edit(io.wait), wait),
@@ -5526,7 +5550,7 @@ func finishExplicitFrameLowering(candidate *lowerCandidate, resume *ir.Func,
 	} else {
 		helper := "coroTakeFrame"
 		args := ir.Nodes{factoryCtx, factoryResume, frameSize()}
-		if allocation := explicitTaskFrameAllocationType(pos, frameType, closureVars); allocation != nil {
+		if allocation := explicitTaskFrameAllocationType(pos, frameType, closureVars, candidate.runtimeBorrowed); allocation != nil {
 			helper = "coroTakeTypedTaskFrame"
 			args = append(args, reflectdata.TypePtrAt(pos, allocation))
 		}

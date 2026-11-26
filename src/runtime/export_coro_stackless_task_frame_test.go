@@ -86,6 +86,20 @@ func CheckStacklessCoroTypedTaskFrameTypesForTest() bool {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		return !validStacklessCoroTaskFrameType(valid, unsafe.Sizeof(stacklessCoroTaskFrameTestFrame{}))
 	}
+	valid56 := abi.TypeFor[struct {
+		task  stacklessCoroTask
+		frame struct {
+			p1, p2 *stacklessCoroTaskFramePayload
+			words  [5]uint64
+		}
+	}]()
+	bad24 := abi.TypeFor[struct {
+		task  stacklessCoroTask
+		frame struct {
+			p1    *stacklessCoroTaskFramePayload
+			words [2]uint64
+		}
+	}]()
 	badPointers := abi.TypeFor[struct {
 		header [6]unsafe.Pointer
 		frame  stacklessCoroTaskFrameTestFrame
@@ -95,6 +109,8 @@ func CheckStacklessCoroTypedTaskFrameTypesForTest() bool {
 		frame  stacklessCoroTaskFrameTestFrame
 	}]()
 	return validStacklessCoroTaskFrameType(valid, 32) &&
+		validStacklessCoroTaskFrameType(valid56, 56) &&
+		!validStacklessCoroTaskFrameType(bad24, 24) &&
 		!validStacklessCoroTaskFrameType(badPointers, 32) &&
 		!validStacklessCoroTaskFrameType(badScalars, 32) &&
 		!validStacklessCoroTaskFrameType(valid, 24) &&
