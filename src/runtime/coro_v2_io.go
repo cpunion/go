@@ -157,7 +157,7 @@ func coroTryPollParkedIO(exclude1, exclude2 *coroTask) *coroTask {
 				return nil
 			}
 			scanned++
-			if task == exclude1 || task == exclude2 || io.pd == nil || task.state.Load() != coroStateParked {
+			if task == exclude1 || task == exclude2 || io.pd == nil || io.mode == 'a' || task.state.Load() != coroStateParked {
 				task = next
 				continue
 			}
@@ -388,7 +388,11 @@ func coroArmNetpoll(task *coroTask, io *coroIOState) (bool, int) {
 			throw("runtime: double wait on pollDesc")
 		}
 	}
-	if errCode := netpollcheckerr(pd, mode); errCode != pollNoError {
+	checkMode := mode
+	if checkMode == 'a' {
+		checkMode = 'r'
+	}
+	if errCode := netpollcheckerr(pd, checkMode); errCode != pollNoError {
 		if gpp.CompareAndSwap(tag, pdNil) {
 			netpollAdjustWaiters(-1)
 			coroIOUnanchor(task, io)
@@ -407,6 +411,13 @@ func coroCompleteIO(task *coroTask) bool {
 	io := task.ioState
 	pd := io.pd
 	mode := io.mode
+	if mode == 'a' {
+		// Wait-only readiness (used by CoroAcceptStep): consume pdReady and unanchor.
+		pd.rg.CompareAndSwap(pdReady, pdNil)
+		coroIOUnanchor(task, io)
+		task.flags &^= coroFlagIOPending
+		return false
+	}
 	for {
 		if errCode := netpollcheckerr(pd, mode); errCode != pollNoError {
 			if mode == 'w' {
@@ -490,6 +501,22 @@ func coroCompleteIO(task *coroTask) bool {
 			}
 		}
 	}
+}
+
+//go:linkname poll_runtime_coroWaitRead internal/poll.runtime_coroWaitRead
+func poll_runtime_coroWaitRead(ctx unsafe.Pointer, pdPtr uintptr) (bool, int) {
+	task := (*coroTask)(ctx)
+	pd := (*pollDesc)(unsafe.Pointer(pdPtr))
+	if errCode := netpollcheckerr(pd, 'r'); errCode != pollNoError {
+		return false, errCode
+	}
+	io := task.ensureIOState()
+	io.pd = pd
+	io.mode = 'a'
+	io.buf = nil
+	io.nOut = nil
+	io.statusOut = nil
+	return coroArmNetpoll(task, io)
 }
 
 //go:linkname poll_runtime_coroSocketRead internal/poll.runtime_coroSocketRead

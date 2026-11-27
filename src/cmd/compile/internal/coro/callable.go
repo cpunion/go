@@ -14,17 +14,49 @@ import (
 	"fmt"
 )
 
-// emitCallableAdapter emits a tiny typed factory adapter for a lowered method
-// or top-level function so dynamic interface/function `go` calls can dispatch
-// directly into F.coro with zero argument boxing and zero allocation.
+// emitCallableAdapter emits a tiny typed factory adapter (and optional result
+// copier) for a lowered method or top-level function so dynamic/cross-package
+// `go` and synchronous calls can dispatch directly into F.coro with zero
+// argument boxing and zero allocation.
 func (p *Plan) emitCallableAdapter(info *FuncInfo) {
 	fn := info.Orig
-	if fn.OClosure != nil {
-		return // anonymous closures are dispatched directly at their literal site
+	if fn.OClosure != nil || fn.Type().HasShape() || fn.Dupok() || fn.Type().IsVariadic() {
+		return // anonymous closures and generic shapes are dispatched directly at their call site
 	}
 	pos := fn.Pos()
 	sig := fn.Type()
 	resumeFuncType := info.FactoryFn.Type().Results()[1].Type
+
+	// Emit result copier + frame release for cross-package / dynamic await.
+	if len(info.ResFields) > 0 {
+		resTypes := make([]*types.Type, len(info.ResFields))
+		for i, rf := range info.ResFields {
+			resTypes[i] = rf.Type
+		}
+		rcSig := buildResCopierType(pos, resTypes)
+		rcSym := types.LocalPkg.Lookup(fn.Sym().Name + ".coro.res")
+		rc := ir.NewFunc(pos, pos, rcSym, rcSig)
+		typecheck.DeclFunc(rc)
+		ir.WithFunc(rc, func() {
+			rcParams := rc.Type().Params()
+			frameParam := rcParams[0].Nname.(*ir.Name)
+			fptrType := types.NewPtr(info.FrameType)
+			fVar := newLocal(rc, pos, ".f", fptrType)
+			rc.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, fVar)))
+			rc.Body.Append(assignNode(pos, fVar, typecheck.ConvNop(frameParam, fptrType)))
+			for i, rf := range info.ResFields {
+				outPtr := rcParams[i+1].Nname.(*ir.Name)
+				cond := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, outPtr, ir.NewNilExpr(pos, outPtr.Type())))
+				writeStmt := assignNode(pos, typecheck.Expr(ir.NewStarExpr(pos, outPtr)), fieldSel(pos, fVar, rf))
+				rc.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, cond, []ir.Node{writeStmt}, nil)))
+			}
+			relCall := typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{frameParam}, false)
+			rc.Body.Append(typecheck.Stmt(relCall))
+			typecheck.FinishFuncBody()
+			typecheck.Stmts(rc.Body)
+		})
+		info.ResCopyFn = rc
+	}
 
 	// Adapter signature:
 	//   func(recvOrClo unsafe.Pointer, args...) (unsafe.Pointer, func(unsafe.Pointer) uint8)
@@ -84,7 +116,7 @@ func (p *Plan) emitCallableAdapter(info *FuncInfo) {
 }
 
 // emitCallableInit creates a synthetic package init function calling
-// runtime.coroRegisterCallable for every lowered method/function in this package.
+// runtime.coroRegisterCallableAwait for every lowered method/function in this package.
 func (p *Plan) emitCallableInit(lowered []*FuncInfo) {
 	var regs []*FuncInfo
 	for _, info := range lowered {
@@ -101,28 +133,37 @@ func (p *Plan) emitCallableInit(lowered []*FuncInfo) {
 	fnInit := ir.NewFunc(pos, pos, sym, types.NewSignature(nil, nil, nil))
 	typecheck.DeclFunc(fnInit)
 	ir.WithFunc(fnInit, func() {
-		regFn := typecheck.LookupRuntime("coroRegisterCallable")
+		regFn := typecheck.LookupRuntime("coroRegisterCallableAwait")
 		for _, info := range regs {
 			fn := info.Orig
+			var resAny ir.Node = ir.NewNilExpr(pos, types.Types[types.TINTER])
+			if info.ResCopyFn != nil {
+				resAny = typecheck.AssignConv(info.ResCopyFn.Nname, types.Types[types.TINTER], "coroRegisterCallableAwait")
+			}
 			if info.IfaceAdpFn != nil {
-				// Method expression (*T).M (or T.M) gives a direct funcval whose .fn matches itab.Fun[idx].
 				recv := fn.Type().Recv()
 				mname := methodBaseName(fn)
 				if mname == "" {
 					continue
 				}
 				msym := fn.Sym().Pkg.Lookup(mname)
-				mexpr := typecheck.NewMethodExpr(pos, recv.Type, msym)
-				if mexpr == nil {
-					continue
+				facAny := typecheck.AssignConv(info.IfaceAdpFn.Nname, types.Types[types.TINTER], "coroRegisterCallableAwait")
+				if mexpr := typecheck.NewMethodExpr(pos, recv.Type, msym); mexpr != nil {
+					fnAny := typecheck.AssignConv(mexpr, types.Types[types.TINTER], "coroRegisterCallableAwait")
+					fnInit.Body.Append(typecheck.Stmt(typecheck.Call(pos, regFn, []ir.Node{fnAny, facAny, resAny, ir.NewBool(pos, true)}, false)))
 				}
-				fnAny := typecheck.AssignConv(mexpr, types.Types[types.TINTER], "coroRegisterCallable")
-				facAny := typecheck.AssignConv(info.IfaceAdpFn.Nname, types.Types[types.TINTER], "coroRegisterCallable")
-				fnInit.Body.Append(typecheck.Stmt(typecheck.Call(pos, regFn, []ir.Node{fnAny, facAny}, false)))
+				// For value receivers T.M, interfaces holding T dispatch via the (*T).M
+				// wrapper in itab.Fun[idx], so register (*T).M as well.
+				if !recv.Type.IsPtr() {
+					if pmexpr := typecheck.NewMethodExpr(pos, types.NewPtr(recv.Type), msym); pmexpr != nil {
+						pfnAny := typecheck.AssignConv(pmexpr, types.Types[types.TINTER], "coroRegisterCallableAwait")
+						fnInit.Body.Append(typecheck.Stmt(typecheck.Call(pos, regFn, []ir.Node{pfnAny, facAny, resAny, ir.NewBool(pos, true)}, false)))
+					}
+				}
 			} else if info.FuncAdpFn != nil {
-				fnAny := typecheck.AssignConv(fn.Nname, types.Types[types.TINTER], "coroRegisterCallable")
-				facAny := typecheck.AssignConv(info.FuncAdpFn.Nname, types.Types[types.TINTER], "coroRegisterCallable")
-				fnInit.Body.Append(typecheck.Stmt(typecheck.Call(pos, regFn, []ir.Node{fnAny, facAny}, false)))
+				fnAny := typecheck.AssignConv(fn.Nname, types.Types[types.TINTER], "coroRegisterCallableAwait")
+				facAny := typecheck.AssignConv(info.FuncAdpFn.Nname, types.Types[types.TINTER], "coroRegisterCallableAwait")
+				fnInit.Body.Append(typecheck.Stmt(typecheck.Call(pos, regFn, []ir.Node{fnAny, facAny, resAny, ir.NewBool(pos, false)}, false)))
 			}
 		}
 		typecheck.FinishFuncBody()
@@ -288,6 +329,97 @@ func (rw *bodyRewriter) emitDynamicFuncGo(pos src.XPos, call *ir.CallExpr) {
 	rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, cond, thenBody, elseBody)))
 }
 
+// emitCrossPkgMethodGo lowers `go x.Method(args...)` targeting an external
+// package using runtime.coroLookupAwaitFunction(T.Method, true) -> coroSpawnFrame,
+// falling back to an ordinary `go` thunk if not lowered.
+func (rw *bodyRewriter) emitCrossPkgMethodGo(pos src.XPos, call *ir.CallExpr) {
+	sel := call.Fun.(*ir.SelectorExpr)
+	recvExpr := rw.rewriteNode(sel.X)
+	wantT := recvExpr.Type()
+	if sel.Selection != nil && sel.Selection.Type != nil && sel.Selection.Type.Recv() != nil {
+		wantT = sel.Selection.Type.Recv().Type
+		if wantT.IsPtr() && !recvExpr.Type().IsPtr() {
+			recvExpr = typecheck.NodAddrAt(pos, recvExpr)
+		} else if !wantT.IsPtr() && recvExpr.Type().IsPtr() {
+			recvExpr = typecheck.Expr(ir.NewStarExpr(pos, recvExpr))
+		}
+	}
+	seq := rw.tmpSeq
+	rw.tmpSeq++
+
+	recvVar := newLocal(rw.rf, pos, fmt.Sprintf(".cmr%d", seq), wantT)
+	rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, recvVar)))
+	rw.rf.Body.Append(assignNode(pos, recvVar, recvExpr))
+
+	argVars := make([]*ir.Name, len(call.Args))
+	for i, a := range call.Args {
+		ra := rw.rewriteNode(a)
+		av := newLocal(rw.rf, pos, fmt.Sprintf(".cma%d_%d", seq, i), ra.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, av)))
+		rw.rf.Body.Append(assignNode(pos, av, ra))
+		argVars[i] = av
+	}
+
+	mexpr := typecheck.NewMethodExpr(pos, wantT, sel.Sel)
+	fnAny := typecheck.AssignConv(mexpr, types.Types[types.TINTER], "coroLookupAwaitFunction")
+	facPtr := newLocal(rw.rf, pos, fmt.Sprintf(".cmf%d", seq), types.Types[types.TUNSAFEPTR])
+	cloPtr := newLocal(rw.rf, pos, fmt.Sprintf(".cmc%d", seq), types.Types[types.TUNSAFEPTR])
+	resPtr := newLocal(rw.rf, pos, fmt.Sprintf(".cmrc%d", seq), types.Types[types.TUNSAFEPTR])
+	lkCall := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitFunction"), []ir.Node{fnAny, ir.NewBool(pos, true)}, false)
+	rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, cloPtr, resPtr}, []ir.Node{lkCall})))
+
+	adpType := buildDynamicAdapterType(pos, call.Fun.Type())
+	var thenBody ir.Nodes
+	facFnVar := rw.emitCastFuncPtr(pos, &thenBody, adpType, facPtr)
+	var rawRecv ir.Node
+	if wantT.IsPtr() {
+		rawRecv = typecheck.ConvNop(recvVar, types.Types[types.TUNSAFEPTR])
+	} else {
+		rawRecv = typecheck.ConvNop(typecheck.NodAddrAt(pos, recvVar), types.Types[types.TUNSAFEPTR])
+	}
+	callArgs := make([]ir.Node, 0, 1+len(argVars))
+	callArgs = append(callArgs, rawRecv)
+	for _, av := range argVars {
+		callArgs = append(callArgs, av)
+	}
+	frameVar := newLocal(rw.rf, pos, fmt.Sprintf(".cmsf%d", seq), types.Types[types.TUNSAFEPTR])
+	resVar := newLocal(rw.rf, pos, fmt.Sprintf(".cmsr%d", seq), adpType.Results()[1].Type)
+	adpCall := typecheck.Call(pos, facFnVar, callArgs, false)
+	thenBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{frameVar, resVar}, []ir.Node{adpCall})))
+	thenBody.Append(typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnFrame"), []ir.Node{rw.ctxVar, frameVar, resVar}, false)))
+
+	thunk := rw.makeZeroArgThunk(pos, func(clo *ir.Func) {
+		cr := ir.NewClosureVar(pos, clo, recvVar)
+		csel := ir.NewSelectorExpr(pos, ir.ODOTMETH, cr, sel.Sel)
+		csel.Selection = sel.Selection
+		csel.SetType(sel.Type())
+		csel.SetTypecheck(1)
+		cArgs := make([]ir.Node, len(argVars))
+		for i, av := range argVars {
+			cArgs[i] = ir.NewClosureVar(pos, clo, av)
+		}
+		ce := typecheck.Call(pos, csel, cArgs, false)
+		clo.Body.Append(typecheck.Stmt(ce))
+	})
+	elseBody := []ir.Node{
+		typecheck.Stmt(ir.NewGoDeferStmt(pos, ir.OGO, typecheck.Call(pos, thunk, nil, false))),
+	}
+
+	cond := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+	rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, cond, thenBody, elseBody)))
+}
+
+func (rw *bodyRewriter) emitCastFuncPtr(pos src.XPos, dst *ir.Nodes, fnType *types.Type, rawPtr ir.Node) *ir.Name {
+	seq := rw.tmpSeq
+	rw.tmpSeq++
+	fnVar := newLocal(rw.rf, pos, fmt.Sprintf(".cfn%d", seq), fnType)
+	dst.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, fnVar)))
+	dst.Append(assignNode(pos, fnVar, ir.NewNilExpr(pos, fnType)))
+	ptr := typecheck.ConvNop(typecheck.NodAddrAt(pos, fnVar), types.NewPtr(types.Types[types.TUNSAFEPTR]))
+	dst.Append(assignNode(pos, typecheck.Expr(ir.NewStarExpr(pos, ptr)), rawPtr))
+	return fnVar
+}
+
 func buildDynamicAdapterType(pos src.XPos, callSig *types.Type) *types.Type {
 	params := []*types.Field{types.NewField(pos, nil, types.Types[types.TUNSAFEPTR])}
 	for _, p := range callSig.Params() {
@@ -301,5 +433,52 @@ func buildDynamicAdapterType(pos src.XPos, callSig *types.Type) *types.Type {
 		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
 		types.NewField(pos, nil, resumeSig),
 	}
+	return types.NewSignature(nil, params, results)
+}
+
+func buildResCopierType(pos src.XPos, resTypes []*types.Type) *types.Type {
+	params := make([]*types.Field, 0, 1+len(resTypes))
+	params = append(params, types.NewField(pos, types.LocalPkg.Lookup("frame"), types.Types[types.TUNSAFEPTR]))
+	for i, rt := range resTypes {
+		params = append(params, types.NewField(pos, types.LocalPkg.Lookup(fmt.Sprintf("r%d", i)), types.NewPtr(rt)))
+	}
+	return types.NewSignature(nil, params, nil)
+}
+
+func buildIfaceIOStartType(pos src.XPos) *types.Type {
+	byteSlice := types.NewSlice(types.Types[types.TUINT8])
+	params := []*types.Field{
+		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, nil, byteSlice),
+		types.NewField(pos, nil, types.NewPtr(types.Types[types.TINT])),
+		types.NewField(pos, nil, types.NewPtr(types.ErrorType)),
+		types.NewField(pos, nil, types.NewPtr(types.Types[types.TBOOL])),
+		types.NewField(pos, nil, types.NewPtr(types.Types[types.TUINTPTR])),
+	}
+	results := []*types.Field{types.NewField(pos, nil, types.Types[types.TBOOL])}
+	return types.NewSignature(nil, params, results)
+}
+
+func buildIfaceIOFinishType(pos src.XPos) *types.Type {
+	params := []*types.Field{
+		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, nil, types.NewPtr(types.Types[types.TINT])),
+		types.NewField(pos, nil, types.NewPtr(types.ErrorType)),
+		types.NewField(pos, nil, types.Types[types.TBOOL]),
+		types.NewField(pos, nil, types.Types[types.TUINTPTR]),
+	}
+	return types.NewSignature(nil, params, nil)
+}
+
+func buildIfaceAcceptStepType(pos src.XPos, connType *types.Type) *types.Type {
+	params := []*types.Field{
+		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, nil, types.Types[types.TUNSAFEPTR]),
+		types.NewField(pos, nil, types.NewPtr(connType)),
+		types.NewField(pos, nil, types.NewPtr(types.ErrorType)),
+		types.NewField(pos, nil, types.NewPtr(types.Types[types.TBOOL])),
+	}
+	results := []*types.Field{types.NewField(pos, nil, types.Types[types.TBOOL])}
 	return types.NewSignature(nil, params, results)
 }

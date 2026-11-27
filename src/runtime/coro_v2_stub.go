@@ -12,11 +12,13 @@ type coroSudog struct{}
 
 func (s *coroSudog) coroTask() *coroTask { return nil }
 
-func coroClearPools()                  {}
-func coroDrainP(pp *p)                 {}
-func coroUnhostedCount() uint64        { return 0 }
-func coroChanWake(sg *sudog, ok bool)  {}
-func coroChanCloseWake(head *sudog)    {}
+func coroClearPools()                   {}
+func coroDrainP(pp *p)                  {}
+func coroUnhostedCount() uint64         { return 0 }
+func coroChanWake(sg *sudog, ok bool)   {}
+func coroChanCloseWake(head *sudog)     {}
+func coroSemaWake(s *sudog)             {}
+func coroNotifyWake(s *sudog)           {}
 func coroTryWinSelect(t *coroTask) bool { return false }
 
 //go:nowritebarrier

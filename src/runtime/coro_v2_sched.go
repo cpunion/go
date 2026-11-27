@@ -74,7 +74,7 @@ type coroTask struct {
 	rootSlot   atomic.Uint32
 	result     uint32
 	flags      uint32
-	_          uint32
+	semaTicket atomic.Uint32
 }
 
 type coroDeferNode struct {
@@ -124,9 +124,10 @@ type coroPState struct {
 	runqT   uint32
 	runq    [coroPRunqSize]*coroTask
 
-	cache       [coroPCacheSlots]coroTypeCacheSlot
-	cacheCredit uintptr // pre-reserved budget bytes owned by this P (zero global atomics on hot path)
-	cacheNext   uint8
+	cache         [coroPCacheSlots]coroTypeCacheSlot
+	cacheCredit   uintptr // pre-reserved budget bytes owned by this P (zero global atomics on hot path)
+	cacheNext     uint8
+	runnextStreak uint8
 }
 
 var coroUnhostedShardsArr [coroUnhostedShards]struct {
@@ -560,6 +561,7 @@ func coroRecycle(task *coroTask) {
 	task.rootSlot.Store(0)
 	task.result = 0
 	task.flags = 0
+	task.semaTicket.Store(0)
 
 	task.next = slot.young
 	slot.young = task
@@ -874,8 +876,13 @@ func coroDequeue() *coroTask {
 	myp := mp.p.ptr()
 	if myp != nil {
 		if ps := myp.coro.Load(); ps != nil {
+			skipRunnext := false
 			if t := ps.runnext.Load(); t != nil {
-				if ps.runnext.CompareAndSwap(t, nil) {
+				ps.runnextStreak++
+				if ps.runnextStreak&31 == 0 && atomic.LoadAcq(&ps.runqH) != atomic.Load(&ps.runqT) {
+					skipRunnext = true
+				}
+				if !skipRunnext && ps.runnext.CompareAndSwap(t, nil) {
 					if atomic.LoadAcq(&ps.runqH) == atomic.Load(&ps.runqT) {
 						coroTryMarkPEmpty(ps)
 					}
@@ -890,11 +897,14 @@ func coroDequeue() *coroTask {
 			for {
 				h := atomic.LoadAcq(&ps.runqH)
 				if h == t {
-					coroTryMarkPEmpty(ps)
+					if !skipRunnext {
+						coroTryMarkPEmpty(ps)
+					}
 					break
 				}
 				task := ps.runq[h&(coroPRunqSize-1)]
 				if atomic.CasRel(&ps.runqH, h, h+1) {
+					ps.runnextStreak = 0
 					if h+1 == t && ps.runnext.Load() == nil {
 						coroTryMarkPEmpty(ps)
 					}
@@ -903,6 +913,18 @@ func coroDequeue() *coroTask {
 						raceacquire(unsafe.Pointer(task))
 					}
 					return task
+				}
+			}
+			if skipRunnext {
+				if rn := ps.runnext.Load(); rn != nil && ps.runnext.CompareAndSwap(rn, nil) {
+					if atomic.LoadAcq(&ps.runqH) == atomic.Load(&ps.runqT) {
+						coroTryMarkPEmpty(ps)
+					}
+					releasem(mp)
+					if raceenabled {
+						raceacquire(unsafe.Pointer(rn))
+					}
+					return rn
 				}
 			}
 		}
@@ -1498,6 +1520,7 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 	}()
 
 	yieldBudget := uint8(0)
+	stepBudget := uint8(0)
 	var action uint8
 	var lastParkedIO *coroTask
 	var lastProbedIO *coroTask
@@ -1584,6 +1607,20 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 			// Direct I/O completed! Reset probe misses so we can chain to the peer.
 			ioProbeMisses = 0
 			lastProbedIO = nil
+		}
+
+		// Periodically honor Go scheduler preemption across all coroutine actions
+		// (channel ping-pong, sync.Mutex loops, deep awaits, I/O), not only Gosched.
+		stepBudget++
+		if stepBudget&63 == 0 && getg().preempt {
+			if root == nil || task != root || coroHasWork() {
+				task.state.Store(coroStateRunnable)
+				coroEnqueue(task, false)
+				task = nil
+				Gosched()
+				continue
+			}
+			Gosched()
 		}
 
 		didWork = true

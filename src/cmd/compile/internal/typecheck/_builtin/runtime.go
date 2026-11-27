@@ -210,8 +210,13 @@ func coroSelect(ctx unsafe.Pointer, cas0 *byte, nsends int, nrecvs int, block bo
 func coroSleep(ctx unsafe.Pointer, ns int64) bool
 func coroGC(ctx unsafe.Pointer)
 func coroRegisterCallable(fn interface{}, factory interface{})
+func coroRegisterCallableAwait(fn interface{}, factory interface{}, resCopier interface{}, isMethod bool)
 func coroLookupFunction(fn interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroLookupAwaitFunction(fn interface{}, wantMethod bool) (unsafe.Pointer, unsafe.Pointer, unsafe.Pointer)
 func coroLookupInterface(itab unsafe.Pointer, data unsafe.Pointer, methodIdx uintptr) (unsafe.Pointer, unsafe.Pointer)
+func coroLookupAwaitInterface(itab unsafe.Pointer, data unsafe.Pointer, methodIdx uintptr) (unsafe.Pointer, unsafe.Pointer, unsafe.Pointer)
+func coroLookupIO(itab unsafe.Pointer, data unsafe.Pointer, methodIdx uintptr) (unsafe.Pointer, unsafe.Pointer, unsafe.Pointer)
+func coroLookupAccept(itab unsafe.Pointer, data unsafe.Pointer, methodIdx uintptr) (unsafe.Pointer, unsafe.Pointer)
 
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer
 func makeslice64(typ *byte, len int64, cap int64) unsafe.Pointer

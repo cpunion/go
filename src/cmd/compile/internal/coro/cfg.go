@@ -28,7 +28,11 @@ const (
 	termChanRecv
 	termSelect
 	termIO
+	termIfaceIO
+	termSync
+	termAccept
 	termAwait
+	termDynAwait
 	termPanic
 	termGoexit
 )
@@ -64,17 +68,39 @@ type blockTerm struct {
 	hasDefault bool
 	defaultBB  *basicBlock
 
-	// termIO
+	// termIO / termIfaceIO
 	ioKind   ioKind
 	ioRecv   ir.Node
 	ioBuf    ir.Node
 	ioNDst   ir.Node
 	ioErrDst ir.Node
+	ioSel    *ir.SelectorExpr
+
+	// termSync
+	syncKind syncKind
+	syncRecv ir.Node
+
+	// termAccept
+	acceptKind   acceptKind
+	acceptRecv   ir.Node
+	acceptOutTmp *ir.Name
+	acceptErrTmp *ir.Name
+	acceptOutDst ir.Node
+	acceptErrDst ir.Node
+	acceptSel    *ir.SelectorExpr
 
 	// termAwait
 	awaitCallee *ir.Func
 	awaitArgs   []ir.Node // captures (if closure) + receiver (if method) + regular args
 	awaitDsts   []ir.Node
+
+	// termDynAwait
+	dynCall    *ir.CallExpr
+	dynRecv    ir.Node
+	dynFun     ir.Node
+	dynArgs    []ir.Node
+	dynResTmps []*ir.Name
+	dynDsts    []ir.Node
 }
 
 type basicBlock struct {
@@ -105,16 +131,27 @@ type funcCFG struct {
 
 	// Frame scratch requirements (filled during CFG construction, bound in frame.go).
 	needAwaitChild bool
+	needDynAwait   bool
 	needIO         bool
+	needIfaceIO    bool
+	needSync       bool
+	needAccept     bool
 	needChanOK     bool
 	maxSelectCases int
 	hasEscapingClo bool
 
 	awaitChildField *types.Field
+	resCopyField    *types.Field
 	ioNField        *types.Field
 	ioErrField      *types.Field
 	ioDirectField   *types.Field
 	ioStatusField   *types.Field
+	ioFinField      *types.Field
+	ioRawField      *types.Field
+	syncStField     *types.Field
+	acceptHeldField *types.Field
+	acceptStepField *types.Field
+	acceptRawField  *types.Field
 	chanOKField     *types.Field
 	selCasesField   *types.Field
 	selChosenField  *types.Field
@@ -133,13 +170,30 @@ func buildCFG(plan *Plan, info *FuncInfo) *funcCFG {
 	}
 
 	// Pin any local captured by a nested closure (plain defer or escaping closure),
-	// excluding synthetic .gowrap/.deferwrap wrappers which we unwrap directly.
+	// excluding synthetic .gowrap/.deferwrap wrappers and directly-invoked lowered
+	// closures (which pass captures straight to F.coro without forming an OCLOSURE).
+	directLoweredClo := make(map[*ir.Func]bool)
+	ir.VisitList(info.Orig.Body, func(n ir.Node) {
+		switch x := n.(type) {
+		case *ir.GoDeferStmt:
+			if call, ok := x.Call.(*ir.CallExpr); ok {
+				call = unwrapGoDeferCall(call)
+				if clo, ok := call.Fun.(*ir.ClosureExpr); ok && clo.Func != nil && plan.Lowered[clo.Func] != nil {
+					directLoweredClo[clo.Func] = true
+				}
+			}
+		case *ir.CallExpr:
+			if clo, ok := x.Fun.(*ir.ClosureExpr); ok && clo.Func != nil && plan.Lowered[clo.Func] != nil {
+				directLoweredClo[clo.Func] = true
+			}
+		}
+	})
 	ir.VisitList(info.Orig.Body, func(n ir.Node) {
 		clo, ok := n.(*ir.ClosureExpr)
-		if !ok || clo.Func == nil || isGoDeferWrapper(clo.Func) {
+		if !ok || clo.Func == nil || isUnwrappableGoDeferWrapper(clo.Func) {
 			return
 		}
-		if plan.Lowered[clo.Func] == nil {
+		if plan.Lowered[clo.Func] == nil || !directLoweredClo[clo.Func] {
 			for _, cv := range clo.Func.ClosureVars {
 				if cv.Outer != nil && cv.Outer.Curfn == info.Orig {
 					g.pinnedLocals[cv.Outer.Canonical()] = true
@@ -180,7 +234,8 @@ func buildCFG(plan *Plan, info *FuncInfo) *funcCFG {
 
 func termSuccs(t *blockTerm) []*basicBlock {
 	switch t.kind {
-	case termGoto, termYield, termGC, termSleep, termChanSend, termChanRecv, termSelect, termIO, termAwait:
+	case termGoto, termYield, termGC, termSleep, termChanSend, termChanRecv, termSelect,
+		termIO, termIfaceIO, termSync, termAccept, termAwait, termDynAwait:
 		if t.target != nil {
 			return []*basicBlock{t.target}
 		}
@@ -277,13 +332,9 @@ func (g *funcCFG) nodeHasSuspend(n ir.Node) bool {
 			if rn.X != nil && rn.X.Type() != nil && rn.X.Type().IsChan() {
 				found = true
 			}
-		case ir.OCALLFUNC, ir.OCALLMETH:
+		case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER:
 			call := x.(*ir.CallExpr)
-			if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone || isRuntimeGoexitCall(call) {
-				found = true
-				return
-			}
-			if callee := staticLocalCallee(call, g.loweredSet()); callee != nil {
+			if g.isSuspendingCall(call) {
 				found = true
 			}
 		}
@@ -303,18 +354,48 @@ func (g *funcCFG) exprHasSuspend(n ir.Node) bool {
 		switch x.Op() {
 		case ir.ORECV:
 			found = true
-		case ir.OCALLFUNC, ir.OCALLMETH:
+		case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER:
 			call := x.(*ir.CallExpr)
-			if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone || isRuntimeGoexitCall(call) {
-				found = true
-				return
-			}
-			if callee := staticLocalCallee(call, g.loweredSet()); callee != nil {
+			if g.isSuspendingCall(call) {
 				found = true
 			}
 		}
 	})
 	return found
+}
+
+func (g *funcCFG) isDynAwaitCandidate(call *ir.CallExpr) bool {
+	if call == nil || call.GoDefer {
+		return false
+	}
+	if isSuspendingBuiltinCall(call) || isRuntimeGoexitCall(call) ||
+		matchStdlibIO(call) != ioNone || matchIfaceIO(call) != ioNone ||
+		matchStdlibSync(call) != syncNone || matchStdlibAccept(call) != acceptNone ||
+		g.isLoweredCallee(call) != nil {
+		return false
+	}
+	return isEligibleDynAwaitCall(call)
+}
+
+func (g *funcCFG) isMultiLowerCall(call *ir.CallExpr) bool {
+	if call == nil || call.GoDefer {
+		return false
+	}
+	return matchStdlibIO(call) != ioNone ||
+		matchIfaceIO(call) != ioNone ||
+		matchStdlibAccept(call) != acceptNone ||
+		g.isLoweredCallee(call) != nil ||
+		g.isDynAwaitCandidate(call)
+}
+
+func (g *funcCFG) isSuspendingCall(call *ir.CallExpr) bool {
+	if call == nil || call.GoDefer {
+		return false
+	}
+	return isSuspendingBuiltinCall(call) ||
+		isRuntimeGoexitCall(call) ||
+		matchStdlibSync(call) != syncNone ||
+		g.isMultiLowerCall(call)
 }
 
 func (g *funcCFG) loweredSet() map[*ir.Func]bool {
@@ -443,7 +524,7 @@ func (g *funcCFG) lowerStmt(n ir.Node, label *types.Sym) {
 			if len(ret.Results) == 1 && len(results) > 1 {
 				// Multi-value return: `return f()`
 				call, ok := ret.Results[0].(*ir.CallExpr)
-				if ok && (matchStdlibIO(call) != ioNone || g.isLoweredCallee(call) != nil) {
+				if ok && g.isMultiLowerCall(call) {
 					dsts := make([]ir.Node, len(results))
 					for i, r := range results {
 						dsts[i] = g.resultName(ret.Pos(), i, r)
@@ -559,9 +640,9 @@ func (g *funcCFG) lowerStmt(n ir.Node, label *types.Sym) {
 			g.emitChanRecv(as.Pos(), ch, dst, nil)
 			return
 		}
-		if as.Y != nil && (as.Y.Op() == ir.OCALLFUNC || as.Y.Op() == ir.OCALLMETH) {
+		if as.Y != nil && (as.Y.Op() == ir.OCALLFUNC || as.Y.Op() == ir.OCALLMETH || as.Y.Op() == ir.OCALLINTER) {
 			call := as.Y.(*ir.CallExpr)
-			if matchStdlibIO(call) != ioNone || g.isLoweredCallee(call) != nil {
+			if g.isMultiLowerCall(call) {
 				var dst ir.Node
 				if !ir.IsBlank(as.X) {
 					dst = g.flattenLValue(as.X)
@@ -610,7 +691,7 @@ func (g *funcCFG) lowerStmt(n ir.Node, label *types.Sym) {
 	case ir.OAS2FUNC:
 		al := n.(*ir.AssignListStmt)
 		call, ok := al.Rhs[0].(*ir.CallExpr)
-		if ok && (matchStdlibIO(call) != ioNone || g.isLoweredCallee(call) != nil) {
+		if ok && g.isMultiLowerCall(call) {
 			dsts := make([]ir.Node, len(al.Lhs))
 			for i, l := range al.Lhs {
 				if !ir.IsBlank(l) {
@@ -668,7 +749,7 @@ func (g *funcCFG) lowerStmt(n ir.Node, label *types.Sym) {
 		g.emitChanRecv(n.Pos(), ch, nil, nil)
 		return
 
-	case ir.OCALLFUNC, ir.OCALLMETH:
+	case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER:
 		call := n.(*ir.CallExpr)
 		if g.lowerStandaloneCall(call) {
 			return
@@ -787,7 +868,35 @@ func (g *funcCFG) lowerStandaloneCall(call *ir.CallExpr) bool {
 		g.cur = nextBB
 		return true
 	}
-	if matchStdlibIO(call) != ioNone || g.isLoweredCallee(call) != nil {
+	if sk := matchStdlibSync(call); sk != syncNone {
+		sel := call.Fun.(*ir.SelectorExpr)
+		var recv ir.Node
+		if sel.Op() == ir.OMETHEXPR {
+			recv = g.flattenExpr(call.Args[0])
+		} else {
+			recv = g.flattenExpr(sel.X)
+		}
+		if !recv.Type().IsPtr() {
+			if nm, ok := recv.(*ir.Name); ok && nm.Canonical().Class == ir.PAUTO && nm.Canonical().Curfn == g.fn {
+				g.pinnedLocals[nm.Canonical()] = true
+			}
+			recv = typecheck.NodAddrAt(pos, recv)
+		}
+		recvTmp := g.newTemp(pos, recv.Type(), false)
+		g.emitAssign(pos, recvTmp, recv)
+		g.needSync = true
+		loopBB := g.newResumeBlock()
+		g.terminate(blockTerm{
+			kind:     termSync,
+			pos:      pos,
+			target:   loopBB,
+			syncKind: sk,
+			syncRecv: recvTmp,
+		})
+		g.cur = loopBB
+		return true
+	}
+	if g.isMultiLowerCall(call) {
 		g.lowerMultiCall(pos, call, nil)
 		return true
 	}
@@ -828,22 +937,152 @@ func (g *funcCFG) lowerMultiCall(pos src.XPos, call *ir.CallExpr, dsts []ir.Node
 		return
 	}
 
-	callee := g.isLoweredCallee(call)
-	if callee == nil {
-		base.FatalfAt(pos, "coro: lowerMultiCall on non-lowered callee")
+	if kind := matchIfaceIO(call); kind != ioNone {
+		sel := call.Fun.(*ir.SelectorExpr)
+		recv := g.flattenExpr(sel.X)
+		buf := g.flattenExpr(call.Args[0])
+		g.needIO = true
+		g.needIfaceIO = true
+		g.needAwaitChild = true
+		g.needDynAwait = true
+		var nDst, errDst ir.Node
+		if len(dsts) > 0 {
+			nDst = dsts[0]
+		}
+		if len(dsts) > 1 {
+			errDst = dsts[1]
+		}
+		nextBB := g.newResumeBlock()
+		g.terminate(blockTerm{
+			kind:     termIfaceIO,
+			pos:      pos,
+			target:   nextBB,
+			ioKind:   kind,
+			ioRecv:   recv,
+			ioBuf:    buf,
+			ioNDst:   nDst,
+			ioErrDst: errDst,
+			ioSel:    sel,
+		})
+		g.cur = nextBB
+		return
 	}
-	g.needAwaitChild = true
-	args := g.collectCalleeArgs(call, callee)
-	nextBB := g.newResumeBlock()
-	g.terminate(blockTerm{
-		kind:        termAwait,
-		pos:         pos,
-		target:      nextBB,
-		awaitCallee: callee,
-		awaitArgs:   args,
-		awaitDsts:   dsts,
-	})
-	g.cur = nextBB
+
+	if ak := matchStdlibAccept(call); ak != acceptNone {
+		sel := call.Fun.(*ir.SelectorExpr)
+		var recv ir.Node
+		if sel.Op() == ir.OMETHEXPR {
+			recv = g.flattenExpr(call.Args[0])
+		} else {
+			recv = g.flattenExpr(sel.X)
+		}
+		recvTmp := g.newTemp(pos, recv.Type(), false)
+		g.emitAssign(pos, recvTmp, recv)
+		g.needAccept = true
+		if ak == acceptIface {
+			g.needAwaitChild = true
+			g.needDynAwait = true
+		}
+		sig := call.Fun.Type()
+		outTmp := g.newTemp(pos, sig.Results()[0].Type, true)
+		errTmp := g.newTemp(pos, sig.Results()[1].Type, true)
+		var outDst, errDst ir.Node
+		if len(dsts) > 0 {
+			outDst = dsts[0]
+		}
+		if len(dsts) > 1 {
+			errDst = dsts[1]
+		}
+		loopBB := g.newResumeBlock()
+		g.terminate(blockTerm{
+			kind:         termAccept,
+			pos:          pos,
+			target:       loopBB,
+			acceptKind:   ak,
+			acceptRecv:   recvTmp,
+			acceptOutTmp: outTmp,
+			acceptErrTmp: errTmp,
+			acceptOutDst: outDst,
+			acceptErrDst: errDst,
+			acceptSel:    sel,
+		})
+		g.cur = loopBB
+		return
+	}
+
+	if callee := g.isLoweredCallee(call); callee != nil {
+		g.needAwaitChild = true
+		args := g.collectCalleeArgs(call, callee)
+		nextBB := g.newResumeBlock()
+		g.terminate(blockTerm{
+			kind:        termAwait,
+			pos:         pos,
+			target:      nextBB,
+			awaitCallee: callee,
+			awaitArgs:   args,
+			awaitDsts:   dsts,
+		})
+		g.cur = nextBB
+		return
+	}
+
+	if g.isDynAwaitCandidate(call) {
+		g.needAwaitChild = true
+		g.needDynAwait = true
+		var dynRecv, dynFun ir.Node
+		switch call.Op() {
+		case ir.OCALLINTER:
+			sel := call.Fun.(*ir.SelectorExpr)
+			dynRecv = g.flattenExpr(sel.X)
+		case ir.OCALLMETH:
+			sel := call.Fun.(*ir.SelectorExpr)
+			recv := g.flattenExpr(sel.X)
+			if sel.Selection != nil && sel.Selection.Type != nil && sel.Selection.Type.Recv() != nil {
+				wantT := sel.Selection.Type.Recv().Type
+				if wantT.IsPtr() && !recv.Type().IsPtr() {
+					if nm, ok := recv.(*ir.Name); ok && nm.Canonical().Class == ir.PAUTO && nm.Canonical().Curfn == g.fn {
+						g.pinnedLocals[nm.Canonical()] = true
+					}
+					recv = typecheck.NodAddrAt(pos, recv)
+				} else if !wantT.IsPtr() && recv.Type().IsPtr() {
+					recv = typecheck.Expr(ir.NewStarExpr(pos, recv))
+				}
+			}
+			dynRecv = recv
+		case ir.OCALLFUNC:
+			if _, isStatic := call.Fun.(*ir.Name); !isStatic {
+				dynFun = g.flattenExpr(call.Fun)
+			}
+		}
+		dynArgs := make([]ir.Node, len(call.Args))
+		for i, a := range call.Args {
+			dynArgs[i] = g.flattenExpr(a)
+		}
+		sig := call.Fun.Type()
+		resFields := sig.Results()
+		resTmps := make([]*ir.Name, len(resFields))
+		for i, rf := range resFields {
+			if i < len(dsts) && dsts[i] != nil && !ir.IsBlank(dsts[i]) {
+				resTmps[i] = g.newTemp(pos, rf.Type, true)
+			}
+		}
+		nextBB := g.newResumeBlock()
+		g.terminate(blockTerm{
+			kind:       termDynAwait,
+			pos:        pos,
+			target:     nextBB,
+			dynCall:    call,
+			dynRecv:    dynRecv,
+			dynFun:     dynFun,
+			dynArgs:    dynArgs,
+			dynResTmps: resTmps,
+			dynDsts:    dsts,
+		})
+		g.cur = nextBB
+		return
+	}
+
+	base.FatalfAt(pos, "coro: lowerMultiCall on unsupported call %v", call)
 }
 
 func (g *funcCFG) collectCalleeArgs(call *ir.CallExpr, callee *ir.Func) []ir.Node {
@@ -1496,7 +1735,7 @@ func (g *funcCFG) flattenExpr(n ir.Node) ir.Node {
 		return x
 
 	case *ir.CallExpr:
-		if matchStdlibIO(x) != ioNone || g.isLoweredCallee(x) != nil {
+		if g.isMultiLowerCall(x) {
 			resTmp := g.newTemp(pos, x.Type(), false)
 			g.lowerMultiCall(pos, x, []ir.Node{resTmp})
 			return resTmp

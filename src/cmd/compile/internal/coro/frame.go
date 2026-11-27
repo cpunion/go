@@ -14,8 +14,10 @@ import (
 )
 
 // coroHeaderFields returns the leading header fields matching runtime.coroTask:
-//   _ [7]unsafe.Pointer
-//   _ [6]uint32
+//
+//	_ [7]unsafe.Pointer
+//	_ [6]uint32
+//
 // Exact size: 80 B on 64-bit, 52 B on 32-bit, zero trailing padding, 0x7f GC bitmap.
 func coroHeaderFields(pos src.XPos) []*types.Field {
 	ptrArr := types.NewArray(types.Types[types.TUNSAFEPTR], 7)
@@ -69,11 +71,19 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 	def := make([][]uint64, nBlocks)
 	liveIn := make([][]uint64, nBlocks)
 	liveOut := make([][]uint64, nBlocks)
+	addrTouch := make([][]uint64, nBlocks)
+	addrDecl := make([][]uint64, nBlocks)
+	addrLiveIn := make([][]uint64, nBlocks)
+	addrLiveOut := make([][]uint64, nBlocks)
 	for i := range nBlocks {
 		use[i] = make([]uint64, words)
 		def[i] = make([]uint64, words)
 		liveIn[i] = make([]uint64, words)
 		liveOut[i] = make([]uint64, words)
+		addrTouch[i] = make([]uint64, words)
+		addrDecl[i] = make([]uint64, words)
+		addrLiveIn[i] = make([]uint64, words)
+		addrLiveOut[i] = make([]uint64, words)
 	}
 	setBit := func(bs []uint64, idx int) { bs[idx/64] |= 1 << (uint(idx) % 64) }
 	hasBit := func(bs []uint64, idx int) bool { return bs[idx/64]&(1<<(uint(idx)%64)) != 0 }
@@ -85,6 +95,9 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 		ir.Visit(n, func(x ir.Node) {
 			if nm, ok := x.(*ir.Name); ok {
 				if idx := addLocal(nm); idx >= 0 && idx < nVars {
+					if !hasBit(addrDecl[bi], idx) {
+						setBit(addrTouch[bi], idx)
+					}
 					if !hasBit(def[bi], idx) {
 						setBit(use[bi], idx)
 					}
@@ -93,6 +106,9 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 				for _, cv := range clo.Func.ClosureVars {
 					if cv.Outer != nil {
 						if idx := addLocal(cv.Outer); idx >= 0 && idx < nVars {
+							if !hasBit(addrDecl[bi], idx) {
+								setBit(addrTouch[bi], idx)
+							}
 							if !hasBit(def[bi], idx) {
 								setBit(use[bi], idx)
 							}
@@ -108,12 +124,23 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 		}
 		if nm, ok := n.(*ir.Name); ok {
 			if idx := addLocal(nm); idx >= 0 && idx < nVars {
+				if !hasBit(addrDecl[bi], idx) {
+					setBit(addrTouch[bi], idx)
+				}
 				setBit(def[bi], idx)
 			}
 			return
 		}
 		// Assigning through pointer/index/field reads the base expression.
 		markRead(bi, n)
+	}
+	markDecl := func(bi int, n ir.Node) {
+		if nm, ok := n.(*ir.Name); ok {
+			if idx := addLocal(nm); idx >= 0 && idx < nVars {
+				setBit(addrDecl[bi], idx)
+				setBit(def[bi], idx)
+			}
+		}
 	}
 
 	// Record unconditional resume-epilogue writes at the start of their target
@@ -139,8 +166,40 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 			if t.ioErrDst != nil {
 				markWrite(ti, t.ioErrDst)
 			}
+		case termIfaceIO:
+			if t.ioNDst != nil {
+				markWrite(ti, t.ioNDst)
+			}
+			if t.ioErrDst != nil {
+				markWrite(ti, t.ioErrDst)
+			}
+		case termSync:
+			markRead(ti, t.syncRecv)
+		case termAccept:
+			if t.acceptKind != acceptIface {
+				markRead(ti, t.acceptRecv)
+			}
+			markRead(ti, t.acceptOutTmp)
+			markRead(ti, t.acceptErrTmp)
+			if t.acceptOutDst != nil {
+				markWrite(ti, t.acceptOutDst)
+			}
+			if t.acceptErrDst != nil {
+				markWrite(ti, t.acceptErrDst)
+			}
 		case termAwait:
 			for _, d := range t.awaitDsts {
+				if d != nil {
+					markWrite(ti, d)
+				}
+			}
+		case termDynAwait:
+			for _, tmp := range t.dynResTmps {
+				if tmp != nil {
+					markRead(ti, tmp)
+				}
+			}
+			for _, d := range t.dynDsts {
 				if d != nil {
 					markWrite(ti, d)
 				}
@@ -150,14 +209,18 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 
 	for bi, bb := range g.blocks {
 		for _, stmt := range bb.stmts {
-			recordStmtUseDef(bi, stmt, markRead, markWrite)
+			recordStmtUseDef(bi, stmt, markRead, markWrite, markDecl)
 		}
 		recordTermUseDef(bi, &bb.term, markRead, markWrite)
 	}
 
 	// Standard backward dataflow fixed-point:
-	//   liveOut[b] = union_{s in succs(b)} liveIn[s]
-	//   liveIn[b]  = use[b] U (liveOut[b] \ def[b])
+	//   liveOut[b]     = union_{s in succs(b)} liveIn[s]
+	//   liveIn[b]      = use[b] U (liveOut[b] \ def[b])
+	// And for address-taken locals (whose heap cell allocation happens at ODCL),
+	// track any read OR write reachable across a suspension without an intervening ODCL:
+	//   addrLiveOut[b] = union_{s in succs(b)} addrLiveIn[s]
+	//   addrLiveIn[b]  = addrTouch[b] U (addrLiveOut[b] \ addrDecl[b])
 	for changed := true; changed; {
 		changed = false
 		for bi := nBlocks - 1; bi >= 0; bi-- {
@@ -171,6 +234,12 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 						liveOut[bi][w] = nv
 						changed = true
 					}
+					aold := addrLiveOut[bi][w]
+					anv := aold | addrLiveIn[si][w]
+					if anv != aold {
+						addrLiveOut[bi][w] = anv
+						changed = true
+					}
 				}
 			}
 			for w := range words {
@@ -180,19 +249,25 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 					liveIn[bi][w] = nv
 					changed = true
 				}
+				aold := addrLiveIn[bi][w]
+				anv := addrTouch[bi][w] | (addrLiveOut[bi][w] &^ addrDecl[bi][w])
+				if anv != aold {
+					addrLiveIn[bi][w] = anv
+					changed = true
+				}
 			}
 		}
 	}
 
 	// A local must be stored in the heap frame if:
 	//   - it is live at entry of any resume target block (crosses a suspension), OR
-	//   - it is address-taken (may be referenced across suspension via pointer/slice/defer), OR
+	//   - it is address-taken and read/written after a suspension without a fresh ODCL, OR
 	//   - it is a CFG terminator output/scratch slot (written on resume or passed by address to runtime).
 	needFrame := make([]bool, nVars)
 	for _, bb := range g.blocks {
 		if bb.resumeState > 0 {
 			for i := range nVars {
-				if hasBit(liveIn[bb.id], i) {
+				if hasBit(liveIn[bb.id], i) || (locals[i].Addrtaken() && hasBit(addrLiveIn[bb.id], i)) {
 					needFrame[i] = true
 				}
 			}
@@ -287,15 +362,30 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 		info.VarFields[nm] = f
 	}
 
-	// Scratch fields required by terminators (awaitChild, io, select, chan ok).
+	// Scratch fields required by terminators (awaitChild, dynAwait, io, sync, accept, select, chan ok).
 	if g.needAwaitChild {
 		g.awaitChildField = addField("child", types.Types[types.TUNSAFEPTR])
+	}
+	if g.needDynAwait {
+		g.resCopyField = addField("resCp", types.Types[types.TUNSAFEPTR])
 	}
 	if g.needIO {
 		g.ioNField = addField("ioN", types.Types[types.TINT])
 		g.ioErrField = addField("ioErr", types.ErrorType)
 		g.ioDirectField = addField("ioDir", types.Types[types.TBOOL])
 		g.ioStatusField = addField("ioSt", types.Types[types.TUINTPTR])
+	}
+	if g.needIfaceIO {
+		g.ioFinField = addField("ioFin", types.Types[types.TUNSAFEPTR])
+		g.ioRawField = addField("ioRaw", types.Types[types.TUNSAFEPTR])
+	}
+	if g.needSync {
+		g.syncStField = addField("syncSt", types.NewArray(types.Types[types.TUINT64], 2))
+	}
+	if g.needAccept {
+		g.acceptHeldField = addField("accH", types.Types[types.TBOOL])
+		g.acceptStepField = addField("accS", types.Types[types.TUNSAFEPTR])
+		g.acceptRawField = addField("accR", types.Types[types.TUNSAFEPTR])
 	}
 	if g.needChanOK {
 		g.chanOKField = addField("chOK", types.Types[types.TBOOL])
@@ -317,17 +407,17 @@ func buildFrame(info *FuncInfo, g *funcCFG) {
 	info.FrameType = frameType
 }
 
-func recordStmtUseDef(bi int, n ir.Node, markRead, markWrite func(int, ir.Node)) {
+func recordStmtUseDef(bi int, n ir.Node, markRead, markWrite, markDecl func(int, ir.Node)) {
 	if n == nil {
 		return
 	}
 	// Visit any Init statements attached to n first.
 	for _, init := range n.Init() {
-		recordStmtUseDef(bi, init, markRead, markWrite)
+		recordStmtUseDef(bi, init, markRead, markWrite, markDecl)
 	}
 	switch n.Op() {
 	case ir.ODCL:
-		markWrite(bi, n.(*ir.Decl).X)
+		markDecl(bi, n.(*ir.Decl).X)
 	case ir.OAS:
 		as := n.(*ir.AssignStmt)
 		markRead(bi, as.Y)
@@ -347,7 +437,7 @@ func recordStmtUseDef(bi int, n ir.Node, markRead, markWrite func(int, ir.Node))
 		}
 	case ir.OBLOCK:
 		for _, s := range n.(*ir.BlockStmt).List {
-			recordStmtUseDef(bi, s, markRead, markWrite)
+			recordStmtUseDef(bi, s, markRead, markWrite, markDecl)
 		}
 	default:
 		markRead(bi, n)
@@ -370,11 +460,21 @@ func recordTermUseDef(bi int, t *blockTerm, markRead, markWrite func(int, ir.Nod
 			markRead(bi, c.ch)
 			markRead(bi, c.val)
 		}
-	case termIO:
+	case termIO, termIfaceIO:
 		markRead(bi, t.ioRecv)
 		markRead(bi, t.ioBuf)
+	case termSync:
+		markRead(bi, t.syncRecv)
+	case termAccept:
+		markRead(bi, t.acceptRecv)
 	case termAwait:
 		for _, a := range t.awaitArgs {
+			markRead(bi, a)
+		}
+	case termDynAwait:
+		markRead(bi, t.dynRecv)
+		markRead(bi, t.dynFun)
+		for _, a := range t.dynArgs {
 			markRead(bi, a)
 		}
 	case termPanic:

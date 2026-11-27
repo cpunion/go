@@ -101,8 +101,62 @@ func CoroCallRead(ctx unsafe.Pointer, call func()) {
 	runtime_coroCallRead(ctx, call)
 }
 
+// CoroAcceptStep performs one non-blocking accept step for a stackless
+// coroutine. held tracks whether the caller currently holds fd's read lock
+// across a netpoll suspension. Returns parked=true if the coroutine armed
+// netpoll and must return coroActionWait; returns parked=false with final
+// accept results (and read lock released) when done.
+func (fd *FD) CoroAcceptStep(ctx unsafe.Pointer, held *bool) (int, syscall.Sockaddr, string, error, bool) {
+	if !*held {
+		locked, err := fd.tryReadLock()
+		if err != nil {
+			return -1, nil, "", err, false
+		}
+		if !locked {
+			// Contended listener accept lock: fall back to blocking Accept.
+			s, rsa, errcall, err := fd.Accept()
+			return s, rsa, errcall, err, false
+		}
+		if err := fd.pd.prepareRead(fd.isFile); err != nil {
+			fd.readUnlock()
+			return -1, nil, "", err, false
+		}
+		*held = true
+	}
+	for {
+		s, rsa, errcall, err := accept(fd.Sysfd)
+		if err == nil {
+			*held = false
+			fd.readUnlock()
+			return s, rsa, "", nil, false
+		}
+		switch err {
+		case syscall.EINTR, syscall.ECONNABORTED:
+			continue
+		case syscall.EAGAIN:
+			if fd.pd.pollable() {
+				parked, errCode := runtime_coroWaitRead(ctx, fd.pd.runtimeCtx)
+				if errCode != 0 {
+					*held = false
+					fd.readUnlock()
+					return -1, nil, "", convertErr(errCode, fd.isFile), false
+				}
+				if parked {
+					return -1, nil, "", nil, true
+				}
+				continue
+			}
+		}
+		*held = false
+		fd.readUnlock()
+		return -1, nil, errcall, err, false
+	}
+}
+
 func runtime_coroFileRead(ctx unsafe.Pointer, fd int, p []byte) (int, uintptr)
 
 func runtime_coroSocketRead(ctx unsafe.Pointer, pd uintptr, fd int, p []byte, n *int, status *uintptr) bool
+
+func runtime_coroWaitRead(ctx unsafe.Pointer, pd uintptr) (bool, int)
 
 func runtime_coroCallRead(ctx unsafe.Pointer, call func())
