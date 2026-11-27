@@ -38,7 +38,8 @@ func validStacklessCoroTaskFrameType(typ *_type, size uintptr) bool {
 	headerSize := unsafe.Sizeof(stacklessCoroTask{})
 	if unsafe.Sizeof(uintptr(0)) != 8 ||
 		headerSize != abi.CoroTaskFrameHeaderWords*8 ||
-		size == 0 || size%16 != 0 || size > abi.CoroTaskFrameMaxBytes ||
+		size < 16 || size > abi.CoroTaskFrameMaxBytes ||
+		(size%16 != 0 && (size <= 32 || size%8 != 0)) ||
 		typ == nil || typ.Kind() != abi.Struct ||
 		typ.Size_ != headerSize+size || typ.Align_ != 8 ||
 		typ.PtrBytes < headerSize || typ.GCData == nil ||

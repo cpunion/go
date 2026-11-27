@@ -34,8 +34,45 @@ type stacklessCoroBurstTestAlloc48 struct {
 	frame stacklessCoroBurstTestFrame48
 }
 
-func stacklessCoroBurstTestResumeA(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
-func stacklessCoroBurstTestResumeB(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+type stacklessCoroBurstTestFrame56 struct {
+	state uint64
+	p1    *uint64
+	pad   [5]uint64
+}
+
+type stacklessCoroBurstTestAlloc56 struct {
+	task  stacklessCoroTask
+	frame stacklessCoroBurstTestFrame56
+}
+
+type stacklessCoroBurstTestFrame200 struct {
+	state uint64
+	p1    *uint64
+	pad   [23]uint64
+}
+
+type stacklessCoroBurstTestAlloc200 struct {
+	task  stacklessCoroTask
+	frame stacklessCoroBurstTestFrame200
+}
+
+type stacklessCoroBurstTestFrame248 struct {
+	state uint64
+	p1    *uint64
+	pad   [29]uint64
+}
+
+type stacklessCoroBurstTestAlloc248 struct {
+	task  stacklessCoroTask
+	frame stacklessCoroBurstTestFrame248
+}
+
+func stacklessCoroBurstTestResumeA(unsafe.Pointer) uint8  { return stacklessCoroActionComplete }
+func stacklessCoroBurstTestResumeB(unsafe.Pointer) uint8  { return stacklessCoroActionComplete }
+func stacklessCoroBurstTestResumeC1(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+func stacklessCoroBurstTestResumeC2(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+func stacklessCoroBurstTestResumeC3(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+func stacklessCoroBurstTestResumeC4(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
 
 func CheckStacklessCoroGoroutineBurstCacheForTest() string {
 	resetStacklessCoroBurstCachesForTest()
@@ -101,7 +138,7 @@ func CheckStacklessCoroTypedBurstCacheForTest() string {
 	if alloc.frame.p1 != nil || alloc.frame.p2 != nil {
 		return "cached typed burst task did not clear frame pointers"
 	}
-	if stacklessCoroTypedBurst.totalBytes.Load() != unsafe.Sizeof(stacklessCoroTask{})+size32 {
+	if stacklessCoroTypedBurst.totalBytes.Load() != stacklessCoroTypedBurstCharge(size32) {
 		return "typed burst totalBytes mismatch after cache admission"
 	}
 
@@ -141,6 +178,109 @@ func CheckStacklessCoroTypedBurstCacheForTest() string {
 	cacheStacklessCoroTypedBurst(stacklessCoroBurstTestResumeB, &allocB2.task)
 	if stacklessCoroTypedBurst.totalBytes.Load() != 0 {
 		return "ambiguous resume still admitted new cache entries"
+	}
+
+	// Verify 8B-aligned 56B frame + 48B task (104B raw -> 112B size class) is
+	// charged by its actual allocator size class, and multi-slot admissions
+	// never exceed stacklessCoroTypedBurstBudget in either accounted or actual
+	// span element bytes.
+	resetStacklessCoroBurstCachesForTest()
+	typ56 := abi.TypeFor[stacklessCoroBurstTestAlloc56]()
+	size56 := unsafe.Sizeof(stacklessCoroBurstTestFrame56{})
+	typ200 := abi.TypeFor[stacklessCoroBurstTestAlloc200]()
+	size200 := unsafe.Sizeof(stacklessCoroBurstTestFrame200{})
+	typ248 := abi.TypeFor[stacklessCoroBurstTestAlloc248]()
+	size248 := unsafe.Sizeof(stacklessCoroBurstTestFrame248{})
+
+	if takeStacklessCoroTypedBurst(stacklessCoroBurstTestResumeC1, typ56, size56) != nil {
+		return "cold 56B typed burst slot returned non-nil"
+	}
+	alloc56 := (*stacklessCoroBurstTestAlloc56)(newobject(typ56))
+	elem56 := spanOf(uintptr(unsafe.Pointer(alloc56))).elemsize
+	if elem56 != 112 || stacklessCoroTypedBurstCharge(size56) != elem56 {
+		return "56B task+frame typed burst charge does not match 112B size class"
+	}
+	alloc56.task.state = stacklessCoroTaskComplete
+	cacheStacklessCoroTypedBurst(stacklessCoroBurstTestResumeC1, &alloc56.task)
+	if stacklessCoroTypedBurst.totalBytes.Load() != elem56 {
+		return "56B task+frame totalBytes did not charge actual size class"
+	}
+
+	// Register the remaining 3 slots with larger size classes so 4 slots can
+	// push aggregate retained bytes right up to the 512 KiB budget ceiling.
+	_ = takeStacklessCoroTypedBurst(stacklessCoroBurstTestResumeC2, typ200, size200)
+	_ = takeStacklessCoroTypedBurst(stacklessCoroBurstTestResumeC3, typ248, size248)
+	_ = takeStacklessCoroTypedBurst(stacklessCoroBurstTestResumeC4, typ248, size248)
+
+	type budgetSpec struct {
+		resume stacklessCoroResume
+		typ    *_type
+		size   uintptr
+	}
+	specs := []budgetSpec{
+		{stacklessCoroBurstTestResumeC1, typ56, size56},
+		{stacklessCoroBurstTestResumeC2, typ200, size200},
+		{stacklessCoroBurstTestResumeC3, typ248, size248},
+		{stacklessCoroBurstTestResumeC4, typ248, size248},
+	}
+	maxCharge := stacklessCoroTypedBurstCharge(size248)
+	// Pre-allocate combined task+frame objects before filling the cache so a
+	// background GC (e.g. GOGC=1) cannot age out entries mid-fill.
+	const rounds = 600
+	prealloc := make([][4]*stacklessCoroTask, rounds)
+	for round := range rounds {
+		for si, spec := range specs {
+			task := (*stacklessCoroTask)(newobject(spec.typ))
+			task.state = stacklessCoroTaskComplete
+			prealloc[round][si] = task
+		}
+	}
+	rejected := false
+	for round := range rounds {
+		for si, spec := range specs {
+			before := stacklessCoroTypedBurst.totalBytes.Load()
+			cacheStacklessCoroTypedBurst(spec.resume, prealloc[round][si])
+			after := stacklessCoroTypedBurst.totalBytes.Load()
+			if after > stacklessCoroTypedBurstBudget {
+				return "typed burst totalBytes exceeded budget"
+			}
+			if after == before {
+				rejected = true
+			}
+		}
+		if rejected && stacklessCoroTypedBurstBudget-stacklessCoroTypedBurst.totalBytes.Load() < maxCharge {
+			break
+		}
+	}
+	if !rejected {
+		return "multi-slot typed burst admissions never hit budget cap"
+	}
+	if stacklessCoroTypedBurstBudget-stacklessCoroTypedBurst.totalBytes.Load() >= maxCharge {
+		return "multi-slot typed burst cache stopped well below budget ceiling"
+	}
+	lock(&stacklessCoroSharedOperations.lock)
+	var actualSpanBytes uintptr
+	var activeSlots int
+	for i := uint8(0); i < stacklessCoroTypedBurst.used; i++ {
+		slot := &stacklessCoroTypedBurst.slots[i]
+		if slot.count > 0 {
+			activeSlots++
+		}
+		for j := uint16(0); j < slot.count; j++ {
+			sp := spanOf(uintptr(unsafe.Pointer(slot.entries[j])))
+			if sp == nil || sp.elemsize != slot.allocSize {
+				unlock(&stacklessCoroSharedOperations.lock)
+				return "cached typed burst entry span elemsize mismatch"
+			}
+			actualSpanBytes += sp.elemsize
+		}
+	}
+	unlock(&stacklessCoroSharedOperations.lock)
+	if activeSlots != stacklessCoroTypedBurstSlots {
+		return "multi-slot budget test did not populate all typed burst slots"
+	}
+	if actualSpanBytes != stacklessCoroTypedBurst.totalBytes.Load() || actualSpanBytes > stacklessCoroTypedBurstBudget {
+		return "actual retained span bytes mismatch or exceed typed burst budget"
 	}
 	return ""
 }

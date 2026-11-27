@@ -17,11 +17,11 @@ func TestTypedTaskFrameAllocationType(t *testing.T) {
 	if types.PtrSize != 8 {
 		t.Skip("combined task frames are restricted to 64-bit targets")
 	}
-	for _, size := range []int64{8, 16, 24, 32, 48, 64, 208, 224, 256} {
+	for _, size := range []int64{8, 16, 24, 32, 40, 48, 56, 64, 72, 200, 208, 216, 224, 256} {
 		frame := types.NewArray(types.Types[types.TUNSAFEPTR], size/8)
 		types.CalcSize(frame)
-		allocation := explicitTaskFrameAllocationType(src.NoXPos, frame, nil)
-		want := size%16 == 0 && size <= 208
+		allocation := explicitTaskFrameAllocationType(src.NoXPos, frame, nil, nil)
+		want := size >= 16 && size <= 208 && (size%16 == 0 || (size > 32 && size%8 == 0))
 		if (allocation != nil) != want {
 			t.Fatalf("size %d: eligible=%t, want %t", size, allocation != nil, want)
 		}
@@ -38,7 +38,7 @@ func TestTypedTaskFrameAllocationType(t *testing.T) {
 	}
 	frame := types.NewArray(types.Types[types.TUINT64], 4)
 	types.CalcSize(frame)
-	if explicitTaskFrameAllocationType(src.NoXPos, frame, nil) != nil {
+	if explicitTaskFrameAllocationType(src.NoXPos, frame, nil, nil) != nil {
 		t.Fatal("pointer-free frame selected instead of existing scalar/frame paths")
 	}
 	frame = types.NewArray(types.Types[types.TUNSAFEPTR], 4)
@@ -49,7 +49,10 @@ func TestTypedTaskFrameAllocationType(t *testing.T) {
 	outer.SetAddrtaken(true)
 	captured := ir.NewNameAt(src.NoXPos, typecheck.Lookup("capturedTaskFrame"), outer.Type())
 	captured.Outer = outer
-	if explicitTaskFrameAllocationType(src.NoXPos, frame, []*ir.Name{captured}) != nil {
+	if explicitTaskFrameAllocationType(src.NoXPos, frame, []*ir.Name{captured}, nil) != nil {
 		t.Fatal("address-taken frame variable selected for combined storage")
+	}
+	if explicitTaskFrameAllocationType(src.NoXPos, frame, []*ir.Name{captured}, map[*ir.Name]bool{outer: true}) == nil {
+		t.Fatal("runtime-borrowed channel/wait temporary wrongly rejected from combined storage")
 	}
 }

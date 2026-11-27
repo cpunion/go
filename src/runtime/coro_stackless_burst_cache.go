@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
@@ -70,6 +71,15 @@ func takeStacklessCoroTypedBurst(child stacklessCoroResume, typ *_type, frameSiz
 	return task
 }
 
+func stacklessCoroTypedBurstCharge(frameSize uintptr) uintptr {
+	size := unsafe.Sizeof(stacklessCoroTask{}) + frameSize
+	charge := roundupsize(size, false)
+	if size > gc.MinSizeForMallocHeader && size <= maxSmallSize-gc.MallocHeaderSize {
+		charge += gc.MallocHeaderSize
+	}
+	return charge
+}
+
 func findOrInitStacklessCoroTypedBurstSlotLocked(fn *funcval, typ *_type, frameSize uintptr) *stacklessCoroTypedBurstSlot {
 	for i := uint8(0); i < stacklessCoroTypedBurst.used; i++ {
 		slot := &stacklessCoroTypedBurst.slots[i]
@@ -90,7 +100,7 @@ func findOrInitStacklessCoroTypedBurstSlotLocked(fn *funcval, typ *_type, frameS
 		slot.resume = fn
 		slot.typ = typ
 		slot.frameSize = frameSize
-		slot.allocSize = unsafe.Sizeof(stacklessCoroTask{}) + frameSize
+		slot.allocSize = stacklessCoroTypedBurstCharge(frameSize)
 		return slot
 	}
 	// Replace an empty non-ambiguous slot so long-lived processes adapt to new
@@ -101,7 +111,7 @@ func findOrInitStacklessCoroTypedBurstSlotLocked(fn *funcval, typ *_type, frameS
 			slot.resume = fn
 			slot.typ = typ
 			slot.frameSize = frameSize
-			slot.allocSize = unsafe.Sizeof(stacklessCoroTask{}) + frameSize
+			slot.allocSize = stacklessCoroTypedBurstCharge(frameSize)
 			slot.oldEnd = 0
 			return slot
 		}
