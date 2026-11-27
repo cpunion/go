@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/cpu"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -580,17 +581,23 @@ type stacklessCoroTimerToken struct {
 	sequence uintptr
 }
 
+type stacklessCoroOperationBucketSlot struct {
+	lock mutex
+	head *stacklessCoroOperation
+	_    cpu.CacheLinePad
+}
+
 // The pointerful buckets live in one runtime-init allocation, leaving a single
-// pointer in the static runtime root set.
+// pointer in the static runtime root set. Per-bucket locks avoid cross-core
+// contention when multi-P schedulers register and complete socket I/O in parallel.
 type stacklessCoroOperationRegistry struct {
-	scan    uint16
-	buckets [stacklessCoroOperationRegistryBucketCount]*stacklessCoroOperation
+	scan    atomic.Uint32
+	buckets [stacklessCoroOperationRegistryBucketCount]stacklessCoroOperationBucketSlot
 }
 
 var stacklessCoroOperations struct {
-	lock     mutex
-	next     uint64
 	registry *stacklessCoroOperationRegistry
+	next     atomic.Uint64
 	ioCount  atomic.Int32
 }
 
@@ -648,8 +655,10 @@ var stacklessCoroRootFrameCache struct {
 
 func init() {
 	initStacklessCoroPayloadCache()
-	lockInit(&stacklessCoroOperations.lock, lockRankStacklessCoro)
 	stacklessCoroOperations.registry = new(stacklessCoroOperationRegistry)
+	for i := range stacklessCoroOperations.registry.buckets {
+		lockInit(&stacklessCoroOperations.registry.buckets[i].lock, lockRankStacklessCoro)
+	}
 	lockInit(&stacklessCoroSharedOperations.lock, lockRankStacklessCoroCache)
 	stacklessCoroWakePool.available = make(chan chan struct{}, stacklessCoroWarmExecutorCount)
 }
@@ -5421,8 +5430,16 @@ func (s *stacklessCoroScheduler) stopReplacementExecutors() {
 	}
 }
 
+func nextStacklessCoroOperationID() uint64 {
+	for {
+		id := stacklessCoroOperations.next.Add(1)
+		if id != 0 {
+			return id
+		}
+	}
+}
+
 func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
-	lock(&stacklessCoroOperations.lock)
 	// The source has not yet been published. IO storage already exists for
 	// every IO source and remains stable until registry removal. A channel
 	// may add its first waiter resources later, but cannot become IO while
@@ -5431,21 +5448,20 @@ func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
 	if op.registeredIO {
 		stacklessCoroOperations.ioCount.Add(1)
 	}
-	stacklessCoroOperations.next++
-	if stacklessCoroOperations.next == 0 {
-		stacklessCoroOperations.next++
-	}
-	op.id = stacklessCoroOperations.next
-	link := stacklessCoroOperationBucket(op.id)
-	op.next = *link
-	*link = op
-	unlock(&stacklessCoroOperations.lock)
-	return op.id
+	id := nextStacklessCoroOperationID()
+	op.id = id
+	slot := stacklessCoroOperationBucketSlotFor(id)
+	lock(&slot.lock)
+	op.next = slot.head
+	slot.head = op
+	unlock(&slot.lock)
+	return id
 }
 
 func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
-	lock(&stacklessCoroOperations.lock)
-	link := stacklessCoroOperationBucket(id)
+	slot := stacklessCoroOperationBucketSlotFor(id)
+	lock(&slot.lock)
+	link := &slot.head
 	for *link != nil && (*link).id != id {
 		link = &(*link).next
 	}
@@ -5457,7 +5473,7 @@ func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 			stacklessCoroOperations.ioCount.Add(-1)
 		}
 	}
-	unlock(&stacklessCoroOperations.lock)
+	unlock(&slot.lock)
 	return op
 }
 
@@ -5474,20 +5490,20 @@ func stacklessCoroTimerReady(arg any, sequence uintptr, _ int64) {
 }
 
 func findStacklessCoroOperation(id uint64) *stacklessCoroOperation {
-	lock(&stacklessCoroOperations.lock)
-	for op := *stacklessCoroOperationBucket(id); op != nil; op = op.next {
+	slot := stacklessCoroOperationBucketSlotFor(id)
+	lock(&slot.lock)
+	for op := slot.head; op != nil; op = op.next {
 		if op.id == id {
-			unlock(&stacklessCoroOperations.lock)
+			unlock(&slot.lock)
 			return op
 		}
 	}
-	unlock(&stacklessCoroOperations.lock)
+	unlock(&slot.lock)
 	return nil
 }
 
-// stacklessCoroOperationBucket returns the registry chain for id. Callers
-// access the returned link only while holding stacklessCoroOperations.lock.
-func stacklessCoroOperationBucket(id uint64) **stacklessCoroOperation {
+// stacklessCoroOperationBucketSlotFor returns the registry bucket for id.
+func stacklessCoroOperationBucketSlotFor(id uint64) *stacklessCoroOperationBucketSlot {
 	registry := stacklessCoroOperations.registry
 	index := id % uint64(len(registry.buckets))
 	return &registry.buckets[index]
