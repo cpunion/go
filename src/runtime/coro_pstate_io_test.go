@@ -29,7 +29,7 @@ func TestStacklessCoroMultiPInterleavedIOGCShrink(t *testing.T) {
 
 	const (
 		numPipes      = 16
-		roundsPerPipe = 40
+		roundsPerPipe = 120
 	)
 	type pipePair struct {
 		rfd int
@@ -67,17 +67,25 @@ func TestStacklessCoroMultiPInterleavedIOGCShrink(t *testing.T) {
 		errMsg.CompareAndSwap(nil, &m)
 	}
 
-	// Start concurrent chaos loop interleaving GC and GOMAXPROCS 4->1->4->2->1->4.
+	// Start concurrent chaos loop interleaving GC and GOMAXPROCS 1->4->2->1->4.
+	// Signal chaosStart as soon as the first pipe round completes so shrinks and
+	// GC cycles are guaranteed to overlap active multi-P netpoll I/O.
 	var stopChaos atomic.Bool
 	var gcCycles atomic.Int32
 	var shrinkCycles atomic.Int32
+	chaosStart := make(chan struct{})
+	var startOnce sync.Once
 	var chaosWG sync.WaitGroup
 	chaosWG.Add(1)
 	go func() {
 		defer chaosWG.Done()
-		seq := []int{4, 1, 4, 2, 1, 4}
+		select {
+		case <-chaosStart:
+		case <-time.After(2 * time.Second):
+		}
+		seq := []int{1, 4, 2, 1, 4}
 		step := 0
-		for !stopChaos.Load() {
+		for !stopChaos.Load() || shrinkCycles.Load() == 0 {
 			nextP := seq[step%len(seq)]
 			prevP := runtime.GOMAXPROCS(nextP)
 			if nextP < prevP {
@@ -86,7 +94,10 @@ func TestStacklessCoroMultiPInterleavedIOGCShrink(t *testing.T) {
 			runtime.GC()
 			gcCycles.Add(1)
 			step++
-			time.Sleep(500 * time.Microsecond)
+			if stopChaos.Load() {
+				break
+			}
+			time.Sleep(100 * time.Microsecond)
 		}
 	}()
 
@@ -167,6 +178,7 @@ func TestStacklessCoroMultiPInterleavedIOGCShrink(t *testing.T) {
 								if c := execCount[idx][round].Add(1); c != 1 {
 									recordErr(fmt.Sprintf("pipe %d round %d executed %d times", idx, round, c))
 								}
+								startOnce.Do(func() { close(chaosStart) })
 								sendRound = round
 								phase = 2
 								if runtime.SendIntStacklessCoroForTest(wctx, ack, &sendRound) {
