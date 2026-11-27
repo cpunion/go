@@ -50,6 +50,12 @@ const (
 	coroFlagChanOK                           // channel receive / select ok flag
 )
 
+type coroSudog struct {
+	coro *coroTask // stackless coroutine waiter (nil for ordinary G)
+}
+
+func (s *coroSudog) coroTask() *coroTask { return s.coro }
+
 // coroTask is embedded at offset 0 of every compiler-generated coroutine frame
 // struct: type F_frame struct { _ [7]unsafe.Pointer; _ [6]uint32; ... }.
 // Keeping all 7 pointer fields first gives a uniform 0x7f leading GC bitmap on

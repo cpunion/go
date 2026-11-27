@@ -407,6 +407,7 @@ type sudog struct {
 	// this for sudogs involved in channel ops.
 
 	g *g
+	coroSudog
 
 	next *sudog
 	prev *sudog
@@ -443,7 +444,6 @@ type sudog struct {
 	waitlink *sudog             // g.waiting list or semaRoot
 	waittail *sudog             // semaRoot
 	c        maybeTraceableChan // channel
-	coro     *coroTask          // stackless coroutine waiter (nil for ordinary G)
 }
 
 type libcall struct {

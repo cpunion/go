@@ -338,13 +338,13 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 		}
 	}
-	if goexperiment.Coro && sg.coro != nil {
+	if goexperiment.Coro && sg.coroTask() != nil {
 		if sg.elem.get() != nil {
 			typedmemmove(c.elemtype, sg.elem.get(), ep)
 			sg.elem.set(nil)
 		}
 		if raceenabled {
-			racereleasemerge(unsafe.Pointer(sg.coro))
+			racereleasemerge(unsafe.Pointer(sg.coroTask()))
 		}
 		unlockf()
 		coroChanWake(sg, true)
@@ -460,10 +460,10 @@ func closechan(c *hchan) {
 			typedmemclr(c.elemtype, sg.elem.get())
 			sg.elem.set(nil)
 		}
-		if goexperiment.Coro && sg.coro != nil {
+		if goexperiment.Coro && sg.coroTask() != nil {
 			sg.success = false
 			if raceenabled {
-				racereleasemerge(unsafe.Pointer(sg.coro))
+				racereleasemerge(unsafe.Pointer(sg.coroTask()))
 			}
 			sg.next = nil
 			if coroTail == nil {
@@ -493,10 +493,10 @@ func closechan(c *hchan) {
 			break
 		}
 		sg.elem.set(nil)
-		if goexperiment.Coro && sg.coro != nil {
+		if goexperiment.Coro && sg.coroTask() != nil {
 			sg.success = false
 			if raceenabled {
-				racereleasemerge(unsafe.Pointer(sg.coro))
+				racereleasemerge(unsafe.Pointer(sg.coroTask()))
 			}
 			sg.next = nil
 			if coroTail == nil {
@@ -782,9 +782,9 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 	}
 	sg.elem.set(nil)
-	if goexperiment.Coro && sg.coro != nil {
+	if goexperiment.Coro && sg.coroTask() != nil {
 		if raceenabled {
-			racereleasemerge(unsafe.Pointer(sg.coro))
+			racereleasemerge(unsafe.Pointer(sg.coroTask()))
 		}
 		unlockf()
 		coroChanWake(sg, true)
@@ -949,8 +949,8 @@ func (q *waitq) dequeue() *sudog {
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
 		if sgp.isSelect {
-			if goexperiment.Coro && sgp.coro != nil {
-				if !coroTryWinSelect(sgp.coro) {
+			if goexperiment.Coro && sgp.coroTask() != nil {
+				if !coroTryWinSelect(sgp.coroTask()) {
 					continue
 				}
 			} else if !sgp.g.selectDone.CompareAndSwap(0, 1) {
@@ -973,8 +973,8 @@ func (c *hchan) raceaddr() unsafe.Pointer {
 }
 
 func racesync(c *hchan, sg *sudog) {
-	if goexperiment.Coro && sg.coro != nil {
-		raceacquire(unsafe.Pointer(sg.coro))
+	if goexperiment.Coro && sg.coroTask() != nil {
+		raceacquire(unsafe.Pointer(sg.coroTask()))
 		racerelease(chanbuf(c, 0))
 		raceacquire(chanbuf(c, 0))
 		return
@@ -997,8 +997,8 @@ func racenotify(c *hchan, idx uint, sg *sudog) {
 	// of elemsize==0, yet the race detector can be made to handle multiple
 	// sync objects underneath the hood (one sync object per idx)
 	qp := chanbuf(c, idx)
-	if goexperiment.Coro && sg != nil && sg.coro != nil {
-		raceacquire(unsafe.Pointer(sg.coro))
+	if goexperiment.Coro && sg != nil && sg.coroTask() != nil {
+		raceacquire(unsafe.Pointer(sg.coroTask()))
 		if c.elemsize == 0 {
 			raceacquire(qp)
 			racerelease(qp)

@@ -8,6 +8,9 @@ package runtime
 
 type coroTask struct{}
 type coroPState struct{}
+type coroSudog struct{}
+
+func (s *coroSudog) coroTask() *coroTask { return nil }
 
 func coroClearPools()                  {}
 func coroDrainP(pp *p)                 {}

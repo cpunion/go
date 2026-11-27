@@ -578,6 +578,8 @@ type G = g
 
 type Sudog = sudog
 
+const CoroSudogSize = unsafe.Sizeof(coroSudog{})
+
 type XRegPerG = xRegPerG
 
 func Getg() *G {
