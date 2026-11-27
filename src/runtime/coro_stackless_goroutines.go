@@ -430,7 +430,7 @@ func stacklessCoroInsertGoroutine(r *stacklessCoroGoroutine) {
 // already remember their public caller; hand-written roots do so lazily here.
 // The caller can leave before independent children create further goroutines.
 func (s *stacklessCoroScheduler) registerGoroutineLocked(task, parent *stacklessCoroTask, callerpc uintptr, callersp unsafe.Pointer) {
-	if s.multiPFastPath() && debug.tracebackancestors == 0 {
+	if s.multiPSpawnFastPath() && debug.tracebackancestors == 0 {
 		if s.registerGoroutineMultiP(task, parent, callerpc, callersp) {
 			return
 		}

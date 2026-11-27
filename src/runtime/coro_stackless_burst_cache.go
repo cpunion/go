@@ -86,30 +86,54 @@ func takeStacklessCoroTypedBurst(child stacklessCoroResume, typ *_type, frameSiz
 	if fn == nil {
 		return nil
 	}
-	gen := stacklessCoroTypedBurst.gen.Load()
 	if gomaxprocs > 1 {
-		mp := acquirem()
-		if pp := mp.p.ptr(); pp != nil {
-			if ps := pp.coroP.Load(); ps != nil {
-				if ps.typedBurstCount > 0 && ps.typedBurstGen != gen {
-					dropCoroPTypedBurst(ps)
-				}
-				if ps.typedBurstCount > 0 && ps.typedBurstGen == gen &&
-					ps.typedBurstResume == fn && ps.typedBurstTyp == typ &&
-					ps.typedBurstFrameSize == frameSize {
-					ps.typedBurstCount--
-					task := ps.typedBurst[ps.typedBurstCount]
-					ps.typedBurst[ps.typedBurstCount] = nil
-					allocSize := ps.typedBurstAllocSize
-					releasem(mp)
-					stacklessCoroTypedBurst.totalBytes.Add(-allocSize)
-					task.state = stacklessCoroTaskNew
-					return task
-				}
+		return takeStacklessCoroTypedBurstMultiP(fn, typ, frameSize)
+	}
+	lock(&stacklessCoroTypedBurst.lock)
+	slot := findOrInitStacklessCoroTypedBurstSlotLocked(fn, typ, frameSize)
+	if slot == nil || slot.ambiguous || slot.count == 0 {
+		if slot != nil && slot.ambiguous {
+			stacklessCoroTypedBurst.gen.Add(1)
+		}
+		unlock(&stacklessCoroTypedBurst.lock)
+		return nil
+	}
+	slot.count--
+	task := slot.entries[slot.count]
+	slot.entries[slot.count] = nil
+	if slot.count < slot.oldEnd {
+		slot.oldEnd = slot.count
+	}
+	stacklessCoroTypedBurst.totalBytes.Add(-slot.allocSize)
+	unlock(&stacklessCoroTypedBurst.lock)
+	task.state = stacklessCoroTaskNew
+	return task
+}
+
+//go:noinline
+func takeStacklessCoroTypedBurstMultiP(fn *funcval, typ *_type, frameSize uintptr) *stacklessCoroTask {
+	gen := stacklessCoroTypedBurst.gen.Load()
+	mp := acquirem()
+	if pp := mp.p.ptr(); pp != nil {
+		if ps := pp.coroP.Load(); ps != nil {
+			if ps.typedBurstCount > 0 && ps.typedBurstGen != gen {
+				dropCoroPTypedBurst(ps)
+			}
+			if ps.typedBurstCount > 0 && ps.typedBurstGen == gen &&
+				ps.typedBurstResume == fn && ps.typedBurstTyp == typ &&
+				ps.typedBurstFrameSize == frameSize {
+				ps.typedBurstCount--
+				task := ps.typedBurst[ps.typedBurstCount]
+				ps.typedBurst[ps.typedBurstCount] = nil
+				allocSize := ps.typedBurstAllocSize
+				releasem(mp)
+				stacklessCoroTypedBurst.totalBytes.Add(-allocSize)
+				task.state = stacklessCoroTaskNew
+				return task
 			}
 		}
-		releasem(mp)
 	}
+	releasem(mp)
 	lock(&stacklessCoroTypedBurst.lock)
 	slot := findOrInitStacklessCoroTypedBurstSlotLocked(fn, typ, frameSize)
 	if slot == nil || slot.ambiguous || slot.count == 0 {
@@ -118,7 +142,7 @@ func takeStacklessCoroTypedBurst(child stacklessCoroResume, typ *_type, frameSiz
 			stacklessCoroTypedBurst.gen.Add(1)
 		}
 		unlock(&stacklessCoroTypedBurst.lock)
-		if ambiguous && gomaxprocs > 1 {
+		if ambiguous {
 			drainStacklessCoroPTypedBurst()
 		}
 		return nil
@@ -133,7 +157,7 @@ func takeStacklessCoroTypedBurst(child stacklessCoroResume, typ *_type, frameSiz
 	stacklessCoroTypedBurst.totalBytes.Add(-allocSize)
 	var batch [128]*stacklessCoroTask
 	batchN := 0
-	if gomaxprocs > 1 && slot.count > 0 {
+	if slot.count > 0 {
 		want := int(slot.count)
 		if want > len(batch) {
 			want = len(batch)
@@ -274,49 +298,71 @@ func cacheStacklessCoroTypedBurst(child stacklessCoroResume, task *stacklessCoro
 		task.resuming || task.readyPending {
 		throw("runtime: invalid stackless coroutine typed burst admission")
 	}
-	gen := stacklessCoroTypedBurst.gen.Load()
 	if gomaxprocs > 1 {
-		mp := acquirem()
-		if pp := mp.p.ptr(); pp != nil {
-			if ps := pp.coroP.Load(); ps != nil && ps.typedBurstGen == gen &&
-				ps.typedBurstResume == fn && ps.typedBurstFrameSize != 0 &&
-				ps.typedBurstCount < stacklessCoroPTypedBurstCap {
-				frameSize := ps.typedBurstFrameSize
-				allocSize := ps.typedBurstAllocSize
-				if tryReserveStacklessCoroTypedBurstBytes(allocSize) {
-					memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), frameSize)
-					ps.typedBurst[ps.typedBurstCount] = task
-					ps.typedBurstCount++
-					releasem(mp)
-					return
-				}
+		cacheStacklessCoroTypedBurstMultiP(fn, task)
+		return
+	}
+	lock(&stacklessCoroTypedBurst.lock)
+	var slot *stacklessCoroTypedBurstSlot
+	for i := uint8(0); i < stacklessCoroTypedBurst.used; i++ {
+		if stacklessCoroTypedBurst.slots[i].resume == fn {
+			slot = &stacklessCoroTypedBurst.slots[i]
+			break
+		}
+	}
+	if slot == nil || slot.ambiguous {
+		unlock(&stacklessCoroTypedBurst.lock)
+		return
+	}
+	if slot.count < stacklessCoroTypedBurstCap && tryReserveStacklessCoroTypedBurstBytes(slot.allocSize) {
+		memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), slot.frameSize)
+		slot.entries[slot.count] = task
+		slot.count++
+	}
+	unlock(&stacklessCoroTypedBurst.lock)
+}
+
+//go:noinline
+func cacheStacklessCoroTypedBurstMultiP(fn *funcval, task *stacklessCoroTask) {
+	gen := stacklessCoroTypedBurst.gen.Load()
+	mp := acquirem()
+	if pp := mp.p.ptr(); pp != nil {
+		if ps := pp.coroP.Load(); ps != nil && ps.typedBurstGen == gen &&
+			ps.typedBurstResume == fn && ps.typedBurstFrameSize != 0 &&
+			ps.typedBurstCount < stacklessCoroPTypedBurstCap {
+			frameSize := ps.typedBurstFrameSize
+			allocSize := ps.typedBurstAllocSize
+			if tryReserveStacklessCoroTypedBurstBytes(allocSize) {
+				memclrHasPointers(add(unsafe.Pointer(task), unsafe.Sizeof(stacklessCoroTask{})), frameSize)
+				ps.typedBurst[ps.typedBurstCount] = task
+				ps.typedBurstCount++
 				releasem(mp)
 				return
 			}
+			releasem(mp)
+			return
 		}
-		releasem(mp)
 	}
+	releasem(mp)
 	// If this P already has a full per-P buffer for fn, flush half to the global
 	// slot in one lock acquisition alongside task.
 	var flush [stacklessCoroPTypedBurstCap / 2]*stacklessCoroTask
 	flushN := 0
 	var flushAllocSize uintptr
-	if gomaxprocs > 1 {
-		mp := acquirem()
-		if pp := mp.p.ptr(); pp != nil {
-			if ps := pp.coroP.Load(); ps != nil && ps.typedBurstGen == gen &&
-				ps.typedBurstResume == fn && ps.typedBurstCount >= stacklessCoroPTypedBurstCap {
-				flushAllocSize = ps.typedBurstAllocSize
-				for flushN < len(flush) && ps.typedBurstCount > 0 {
-					ps.typedBurstCount--
-					flush[flushN] = ps.typedBurst[ps.typedBurstCount]
-					ps.typedBurst[ps.typedBurstCount] = nil
-					flushN++
-				}
+	mp = acquirem()
+	if pp := mp.p.ptr(); pp != nil {
+		if ps := pp.coroP.Load(); ps != nil && ps.typedBurstGen == gen &&
+			ps.typedBurstResume == fn && ps.typedBurstCount >= stacklessCoroPTypedBurstCap {
+			flushAllocSize = ps.typedBurstAllocSize
+			for flushN < len(flush) && ps.typedBurstCount > 0 {
+				ps.typedBurstCount--
+				flush[flushN] = ps.typedBurst[ps.typedBurstCount]
+				ps.typedBurst[ps.typedBurstCount] = nil
+				flushN++
 			}
 		}
-		releasem(mp)
 	}
+	releasem(mp)
 	lock(&stacklessCoroTypedBurst.lock)
 	var slot *stacklessCoroTypedBurstSlot
 	for i := uint8(0); i < stacklessCoroTypedBurst.used; i++ {
@@ -356,7 +402,7 @@ func cacheStacklessCoroTypedBurst(child stacklessCoroResume, task *stacklessCoro
 	// Always seed this P's typedBurst metadata for valid slots so subsequent
 	// completions on this P hit the lock-free per-P path even if the global slot
 	// was temporarily full.
-	if gomaxprocs > 1 && frameSize != 0 {
+	if frameSize != 0 {
 		mp := acquirem()
 		var ps *stacklessCoroPState
 		mp, ps = ensureCoroPState(mp)

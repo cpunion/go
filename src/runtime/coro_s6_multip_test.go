@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -91,27 +92,43 @@ func TestStacklessCoroPooledGoroutineGCAgingAndShrink(t *testing.T) {
 
 	const children = 256
 	for iter := range 4 {
-		var done atomic.Int32
-		spawned := false
+		gate := make(chan int)
+		var started, done atomic.Int32
+		rootState := 0
 		runtime.RunStacklessCoroForTest(func(ctx unsafe.Pointer) uint8 {
-			if !spawned {
-				spawned = true
+			switch rootState {
+			case 0:
+				rootState = 1
 				for range children {
 					step := 0
-					runtime.SpawnStacklessCoroForTest(ctx, func(unsafe.Pointer) uint8 {
+					var val int
+					var ok bool
+					runtime.SpawnStacklessCoroForTest(ctx, func(wctx unsafe.Pointer) uint8 {
 						if step == 0 {
 							step = 1
-							return runtime.StacklessCoroActionYield
+							started.Add(1)
+							if runtime.RecvIntStacklessCoroForTest(wctx, gate, &val, &ok) {
+								return runtime.StacklessCoroActionWait
+							}
 						}
 						done.Add(1)
 						return runtime.StacklessCoroActionComplete
 					})
 				}
-			}
-			if done.Load() < children {
 				return runtime.StacklessCoroActionYield
+			case 1:
+				if started.Load() < children {
+					return runtime.StacklessCoroActionYield
+				}
+				rootState = 2
+				close(gate)
+				return runtime.StacklessCoroActionYield
+			default:
+				if done.Load() < children {
+					return runtime.StacklessCoroActionYield
+				}
+				return runtime.StacklessCoroActionComplete
 			}
-			return runtime.StacklessCoroActionComplete
 		})
 		if got := done.Load(); got != children {
 			t.Fatalf("iter %d: completed %d/%d children", iter, got, children)
@@ -123,6 +140,12 @@ func TestStacklessCoroPooledGoroutineGCAgingAndShrink(t *testing.T) {
 	}
 
 	debug.SetGCPercent(oldGC)
+	// A replacement executor may still be finishing completeTask for the last
+	// child after done.Add(1) lets the root return; wait briefly for drainage.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.StacklessCoroUnhostedCountForTest() != 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
 	if got := runtime.StacklessCoroUnhostedCountForTest(); got != 0 {
 		t.Fatalf("unhosted stackless goroutines after drain = %d, want 0", got)
 	}

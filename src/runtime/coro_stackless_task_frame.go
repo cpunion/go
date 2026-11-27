@@ -100,7 +100,7 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		unlock(&s.lock)
 		return frame
 	}
-	if s.multiPFastPath() && (stacklessCoroNativeSupported || s.pRunqUsed()) {
+	if s.multiPFastPath() && s.pRunqUsed() {
 		if cached := coroPCacheTaskGet(s, child, uint16(size)); cached != nil {
 			if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 				parent.readyPending || parent.terminal != stacklessCoroTerminalNone || parent.goexit {
@@ -179,35 +179,13 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 		}
 	} else {
 		task.setParent(parent)
-		if s.multiPFastPath() && (stacklessCoroNativeSupported || s.pRunqUsed()) && s.freeTasks != nil {
-			// Batch-refill up to 32 matching CacheFrame tasks into this P's local ring.
-			var batch [32]*stacklessCoroTask
-			batchN := 0
-			for batchN < len(batch) {
-				extra := s.takeCachedFrameTaskLocked(child, uint16(size))
-				if extra == nil {
-					break
-				}
-				batch[batchN] = extra
-				batchN++
-			}
-			if batchN > 0 {
-				if coroPTryPutPendingTypedTask(task) {
-					frame := task.context.frame
-					unlock(&s.lock)
-					coroPCacheTaskPutBatch(s, child, uint16(size), batch[:batchN])
-					return frame
-				}
-				task.next = s.reservedTasks
-				s.reservedTasks = task
-				frame := task.context.frame
-				unlock(&s.lock)
-				coroPCacheTaskPutBatch(s, child, uint16(size), batch[:batchN])
+		if s.multiPFastPath() && s.pRunqUsed() && s.freeTasks != nil {
+			if frame, done := s.refillPCacheTasksLocked(task, child, uint16(size)); done {
 				return frame
 			}
 		}
 	}
-	if task.context.frame != nil && s.multiPFastPath() && (stacklessCoroNativeSupported || s.pRunqUsed()) && coroPTryPutPendingTypedTask(task) {
+	if task.context.frame != nil && s.multiPFastPath() && s.pRunqUsed() && coroPTryPutPendingTypedTask(task) {
 		frame := task.context.frame
 		unlock(&s.lock)
 		return frame
@@ -217,4 +195,34 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	frame := task.context.frame
 	unlock(&s.lock)
 	return frame
+}
+
+//go:noinline
+func (s *stacklessCoroScheduler) refillPCacheTasksLocked(task *stacklessCoroTask,
+	child stacklessCoroResume, size uint16) (unsafe.Pointer, bool) {
+	var batch [32]*stacklessCoroTask
+	batchN := 0
+	for batchN < len(batch) {
+		extra := s.takeCachedFrameTaskLocked(child, size)
+		if extra == nil {
+			break
+		}
+		batch[batchN] = extra
+		batchN++
+	}
+	if batchN == 0 {
+		return nil, false
+	}
+	if coroPTryPutPendingTypedTask(task) {
+		frame := task.context.frame
+		unlock(&s.lock)
+		coroPCacheTaskPutBatch(s, child, size, batch[:batchN])
+		return frame, true
+	}
+	task.next = s.reservedTasks
+	s.reservedTasks = task
+	frame := task.context.frame
+	unlock(&s.lock)
+	coroPCacheTaskPutBatch(s, child, size, batch[:batchN])
+	return frame, true
 }

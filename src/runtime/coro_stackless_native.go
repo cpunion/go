@@ -16,8 +16,6 @@ import (
 )
 
 const (
-	stacklessCoroNativeSupported = true
-
 	// Bound total fixed descriptor storage. Active and idle-stack holders
 	// consume slots from the same pool; overflow descriptors are heap allocated.
 	stacklessCoroSchedulerDescriptorCacheSize = 64
