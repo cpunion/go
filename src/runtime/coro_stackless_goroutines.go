@@ -171,8 +171,12 @@ func (s *stacklessCoroScheduler) registerPublicGoroutine(callerPC uintptr, calle
 		r.goid = gp.goid
 		r.parentGoid = gp.parentGoid
 		r.gopc = gp.gopc
-		r.labels = gp.labels
-		r.ancestors = gp.ancestors
+		if gp.labels != nil {
+			r.labels = gp.labels
+		}
+		if gp.ancestors != nil {
+			r.ancestors = gp.ancestors
+		}
 		r.profileCaller = buf[:n]
 		r.public = true
 		s.root.setSource(r)
@@ -484,12 +488,36 @@ func stacklessCoroCompleteLogicalFrame(task *stacklessCoroTask) {
 		}
 		gp := r.publicG
 		pub.publicRecord.Store(nil)
-		callerPCs := r.profileCaller
-		*r = stacklessCoroGoroutine{}
-		clear(callerPCs)
-		r.profileCaller = callerPCs[:0]
 		if (gp == getg() || gp == stacklessCoroPublicCaller(getg())) && pub.publicFree == nil {
+			r.root = nil
+			r.leaf = nil
+			r.scheduler = nil
+			r.publicG = nil
+			r.publicState = nil
+			if r.labels != nil {
+				r.labels = nil
+			}
+			if r.ancestors != nil {
+				r.ancestors = nil
+			}
+			if r.profileBoundary != nil {
+				r.profileBoundary = nil
+			}
+			if r.profileTrace != nil {
+				r.profileTrace = nil
+			}
+			r.profileBefore = false
+			r.public = false
+			r.profileCaller = r.profileCaller[:0]
+			if r.owner.Load() != nil {
+				r.owner.Store(nil)
+			}
 			pub.publicFree = r
+		} else {
+			callerPCs := r.profileCaller
+			*r = stacklessCoroGoroutine{}
+			clear(callerPCs)
+			r.profileCaller = callerPCs[:0]
 		}
 		return
 	}

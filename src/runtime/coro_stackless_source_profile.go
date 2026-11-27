@@ -108,15 +108,30 @@ func stacklessCoroCachedPublicProfileCaller(gp *g, resumePC, callerPC uintptr, s
 	}
 	mp := acquirem()
 	if pp := mp.p.ptr(); pp != nil && mp.curg == gp && uintptr(sp) >= gp.stack.lo && gp.stktopsp < gp.stack.hi {
-		depth := gp.stktopsp - uintptr(sp)
+		depth := uint16(gp.stktopsp - uintptr(sp))
 		for i := range pp.callerProfiles {
 			c := &pp.callerProfiles[i]
-			if c.resumePC == resumePC {
-				if n := c.load(c.rootPC, callerPC, depth, sp, pcs); n > 0 {
-					pp.profileMisses = 0
-					releasem(mp)
-					return n, true
+			if c.resumePC != resumePC || c.callerPC != callerPC || c.depth != depth {
+				continue
+			}
+			matched := true
+			for j := uint8(0); j < c.nReturn; j++ {
+				if *(*uintptr)(unsafe.Add(sp, uintptr(c.offsets[j]))) != c.returnPCs[j] {
+					matched = false
+					break
 				}
+			}
+			if matched {
+				n := int(c.nPC)
+				if n > len(pcs) {
+					n = len(pcs)
+				}
+				for j := 0; j < n; j++ {
+					pcs[j] = c.pcs[j]
+				}
+				pp.profileMisses = 0
+				releasem(mp)
+				return n, true
 			}
 		}
 	}
@@ -156,12 +171,19 @@ func (c *stacklessCoroCallerProfile) load(rootPC, callerPC, depth uintptr, sp un
 	if c.callerPC != callerPC || c.rootPC != rootPC || uintptr(c.depth) != depth {
 		return 0
 	}
-	for i, offset := range c.offsets[:c.nReturn] {
-		if *(*uintptr)(unsafe.Add(sp, uintptr(offset))) != c.returnPCs[i] {
+	for i := uint8(0); i < c.nReturn; i++ {
+		if *(*uintptr)(unsafe.Add(sp, uintptr(c.offsets[i]))) != c.returnPCs[i] {
 			return 0
 		}
 	}
-	return copy(pcs, c.pcs[:c.nPC])
+	n := int(c.nPC)
+	if n > len(pcs) {
+		n = len(pcs)
+	}
+	for i := 0; i < n; i++ {
+		pcs[i] = c.pcs[i]
+	}
+	return n
 }
 
 //go:noinline

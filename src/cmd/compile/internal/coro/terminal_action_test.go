@@ -18,6 +18,22 @@ func TestStableTerminalAction(t *testing.T) {
 		{"no-factory", func(c *lowerCandidate) { c.factoryABI = NoFactory }, false},
 		{"closure-factory", func(c *lowerCandidate) { c.factoryABI = FactoryABI1 }, false},
 		{"explicit-factory", func(c *lowerCandidate) { c.factoryABI = FactoryABI2 }, false},
+		{"non-fused-root", func(c *lowerCandidate) { c.fusedResume = false; c.fusedSelf = false }, true},
+		{"non-fused-root-yield", func(c *lowerCandidate) {
+			c.fusedResume = false
+			c.fusedSelf = false
+			c.function.Sites = []Site{{Kind: SiteYield}}
+		}, true},
+		{"non-fused-root-panic", func(c *lowerCandidate) {
+			c.fusedResume = false
+			c.fusedSelf = false
+			c.function.Terminal = MayPanic
+		}, false},
+		{"non-fused-root-defer", func(c *lowerCandidate) {
+			c.fusedResume = false
+			c.fusedSelf = false
+			c.defers = []*lowerDefer{{}}
+		}, false},
 		{"self-only", func(c *lowerCandidate) { c.fusedResume = false; c.fusedSelf = true }, false},
 		{"defer", func(c *lowerCandidate) { c.defers = []*lowerDefer{{}} }, false},
 		{"empty", func(c *lowerCandidate) { c.function.Sites = nil }, false},
