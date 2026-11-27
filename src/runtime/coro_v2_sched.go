@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/cpu"
 	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"unsafe"
@@ -84,17 +85,20 @@ type coroPanicState struct {
 }
 
 const (
-	coroPRunqSize      = 512
-	coroPStealBatch    = 128
-	coroPCacheSlots    = 4
-	coroPCacheSlotCap  = 1024
-	coroPCacheSpillAt  = 64
-	coroPCacheSpillCnt = 32
-	coroGCacheSlots    = 4
-	coroCacheBudget    = 512 << 10
-	coroMaxWorkers     = 128
-	coroMaxRootSlots   = 128
-	coroTotalDrivers   = coroMaxWorkers + coroMaxRootSlots
+	coroPRunqSize        = 512
+	coroPStealBatch      = 128
+	coroPCacheSlots      = 4
+	coroPCacheSlotCap    = 1024
+	coroPCacheSpillAt    = 64
+	coroPCacheSpillCnt   = 32
+	coroGCacheSlots      = 4
+	coroCacheBudget      = 512 << 10
+	coroCacheCreditChunk = 32 << 10
+	coroCacheCreditHigh  = 64 << 10
+	coroUnhostedShards   = 64
+	coroMaxWorkers       = 128
+	coroMaxRootSlots     = 128
+	coroTotalDrivers     = coroMaxWorkers + coroMaxRootSlots
 )
 
 type coroTypeCacheSlot struct {
@@ -113,9 +117,14 @@ type coroPState struct {
 	runqT   uint32
 	runq    [coroPRunqSize]*coroTask
 
-	cache      [coroPCacheSlots]coroTypeCacheSlot
-	cacheNext  uint8
-	unhosted   int64 // buffered delta folded to coroSched.unhosted on threshold/GC
+	cache       [coroPCacheSlots]coroTypeCacheSlot
+	cacheCredit uintptr // pre-reserved budget bytes owned by this P (zero global atomics on hot path)
+	cacheNext   uint8
+}
+
+var coroUnhostedShardsArr [coroUnhostedShards]struct {
+	v atomic.Int64
+	_ cpu.CacheLinePad
 }
 
 var coroSched struct {
@@ -125,12 +134,15 @@ var coroSched struct {
 	runqLen          int32
 	globalCache      [coroGCacheSlots]coroTypeCacheSlot
 	globalCacheCount atomic.Int32
+	_                cpu.CacheLinePad
 	runnable         atomic.Int32
-	unhosted         atomic.Int64
+	_                cpu.CacheLinePad
 	cacheBytes       atomic.Uintptr
+	_                cpu.CacheLinePad
 	activeDriver     atomic.Int32
 	workerCount      atomic.Int32
 	idleCount        atomic.Int32
+	_                cpu.CacheLinePad
 	idleDrivers      [coroTotalDrivers]atomic.Uintptr // guintptr of parked driver Gs
 	rootSlotUsed     [coroMaxRootSlots]atomic.Uint32  // 0=free, 1=claimed by parked root caller
 }
@@ -148,12 +160,25 @@ func init() {
 	}
 }
 
+func coroAddUnhosted(delta int64) {
+	mp := acquirem()
+	idx := 0
+	if pp := mp.p.ptr(); pp != nil {
+		idx = int(pp.id) & (coroUnhostedShards - 1)
+	}
+	coroUnhostedShardsArr[idx].v.Add(delta)
+	releasem(mp)
+}
+
 func coroUnhostedCount() uint64 {
-	n := coroSched.unhosted.Load()
-	if n < 0 {
+	var total int64
+	for i := range coroUnhostedShardsArr {
+		total += coroUnhostedShardsArr[i].v.Load()
+	}
+	if total < 0 {
 		return 0
 	}
-	return uint64(n)
+	return uint64(total)
 }
 
 func coroTryWinSelect(t *coroTask) bool {
@@ -346,8 +371,16 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 						if task.ioState != nil {
 							refund += coroIOAllocSize()
 						}
+						ps.cacheCredit += refund
+						var returnGlobal uintptr
+						if ps.cacheCredit > coroCacheCreditHigh {
+							returnGlobal = ps.cacheCredit - coroCacheCreditChunk
+							ps.cacheCredit = coroCacheCreditChunk
+						}
 						releasem(mp)
-						coroSched.cacheBytes.Add(-refund)
+						if returnGlobal > 0 {
+							coroSched.cacheBytes.Add(-returnGlobal)
+						}
 						task.next = nil
 						task.typ = typ
 						task.flags = coroFlagPooled
@@ -430,19 +463,73 @@ func coroRecycle(task *coroTask) {
 	}
 	typ := task.typ
 	allocSize := coroTypeAllocSize(typ)
-	if !coroTryReserveBudget(allocSize) {
+	ioSize := uintptr(0)
+	if task.ioState != nil {
+		ioSize = coroIOAllocSize()
+	}
+
+	mp := acquirem()
+	var ps *coroPState
+	mp, ps = coroEnsurePState(mp)
+	if ps == nil {
+		releasem(mp)
 		task.ioState = nil
 		return
 	}
-	ioCharged := uintptr(0)
-	if task.ioState != nil {
-		ioSize := coroIOAllocSize()
-		if coroTryReserveBudget(ioSize) {
-			ioCharged = ioSize
-		} else {
-			task.ioState = nil
+	idx := -1
+	for i := range ps.cache {
+		if ps.cache[i].typ == typ {
+			idx = i
+			break
 		}
 	}
+	if idx < 0 {
+		for i := range ps.cache {
+			if ps.cache[i].young == nil && ps.cache[i].old == nil {
+				idx = i
+				ps.cache[i].typ = typ
+				ps.cache[i].allocSize = allocSize
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		releasem(mp)
+		task.ioState = nil
+		return
+	}
+	slot := &ps.cache[idx]
+	if int(slot.youngCount)+int(slot.oldCount) >= coroPCacheSlotCap {
+		releasem(mp)
+		task.ioState = nil
+		return
+	}
+
+	// Charge per-P budget credit first (zero global atomics on hot path!).
+	need := allocSize + ioSize
+	if ps.cacheCredit < need {
+		chunk := uintptr(coroCacheCreditChunk)
+		if chunk < need {
+			chunk = need
+		}
+		if coroTryReserveBudget(chunk) {
+			ps.cacheCredit += chunk
+		} else if coroTryReserveBudget(need) {
+			ps.cacheCredit += need
+		} else if ioSize > 0 && (ps.cacheCredit >= allocSize || coroTryReserveBudget(allocSize)) {
+			if ps.cacheCredit < allocSize {
+				ps.cacheCredit += allocSize
+			}
+			task.ioState = nil
+			need = allocSize
+		} else {
+			releasem(mp)
+			task.ioState = nil
+			return
+		}
+	}
+	ps.cacheCredit -= need
+
 	// Clear frame payload while keeping exact GC type safety.
 	hdrSize := unsafe.Sizeof(coroTask{})
 	if typ.Size_ > hdrSize {
@@ -467,45 +554,6 @@ func coroRecycle(task *coroTask) {
 	task.result = 0
 	task.flags = 0
 
-	mp := acquirem()
-	var ps *coroPState
-	mp, ps = coroEnsurePState(mp)
-	if ps == nil {
-		releasem(mp)
-		task.ioState = nil
-		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
-		return
-	}
-	idx := -1
-	for i := range ps.cache {
-		if ps.cache[i].typ == typ {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		for i := range ps.cache {
-			if ps.cache[i].young == nil && ps.cache[i].old == nil {
-				idx = i
-				ps.cache[i].typ = typ
-				ps.cache[i].allocSize = allocSize
-				break
-			}
-		}
-	}
-	if idx < 0 {
-		releasem(mp)
-		task.ioState = nil
-		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
-		return
-	}
-	slot := &ps.cache[idx]
-	if int(slot.youngCount)+int(slot.oldCount) >= coroPCacheSlotCap {
-		releasem(mp)
-		task.ioState = nil
-		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
-		return
-	}
 	task.next = slot.young
 	slot.young = task
 	slot.youngCount++
@@ -562,9 +610,9 @@ func coroClearPools() {
 		if ps == nil {
 			continue
 		}
-		if ps.unhosted != 0 {
-			coroSched.unhosted.Add(ps.unhosted)
-			ps.unhosted = 0
+		if ps.cacheCredit > 0 {
+			coroSched.cacheBytes.Add(-ps.cacheCredit)
+			ps.cacheCredit = 0
 		}
 		hasCached := false
 		for i := range ps.cache {
@@ -598,9 +646,9 @@ func coroDrainP(pp *p) {
 	if ps == nil {
 		return
 	}
-	if ps.unhosted != 0 {
-		coroSched.unhosted.Add(ps.unhosted)
-		ps.unhosted = 0
+	if ps.cacheCredit > 0 {
+		coroSched.cacheBytes.Add(-ps.cacheCredit)
+		ps.cacheCredit = 0
 	}
 	// Drop per-P freelist caches cleanly.
 	for i := range ps.cache {
@@ -745,10 +793,10 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 		coroSched.runnable.Add(rem)
 		unlock(&coroSched.lock)
 	}
-	// Wake up to gomaxprocs-1 drivers for batch fan-out (e.g. close(ch)).
+	// Wake up to gomaxprocs - activeDriver drivers for batch fan-out (e.g. close(ch), netpoll).
 	want := count
-	if want > gomaxprocs {
-		want = gomaxprocs
+	if avail := gomaxprocs - coroSched.activeDriver.Load(); want > avail {
+		want = avail
 	}
 	for i := int32(0); i < want; i++ {
 		if !coroMaybeWakeDriver() {
@@ -1185,7 +1233,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, resume func(unsafe.Pointer) uint8
 	task.parent = nil
 	task.flags |= coroFlagUnhosted
 	task.state.Store(coroStateRunnable)
-	coroSched.unhosted.Add(1)
+	coroAddUnhosted(1)
 	coroEnqueue(task, false)
 	return coroSched.runnable.Load() >= 128
 }
@@ -1336,6 +1384,10 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 
 	yieldBudget := uint8(0)
 	var action uint8
+	var lastParkedIO *coroTask
+	var lastProbedIO *coroTask
+	ioProbeMisses := 0
+	didWork := false
 
 	for {
 		if startTerminal && task != nil {
@@ -1349,13 +1401,33 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 			// Drain ready direct-netpoll completions before dequeuing runq.
 			if readyTask := coroDrainNetpollOne(); readyTask != nil {
 				task = readyTask
+				ioProbeMisses = 0
+				lastProbedIO = nil
 			} else {
 				task = coroDequeue()
+				if task != nil {
+					ioProbeMisses = 0
+					lastProbedIO = nil
+				}
 			}
 			if task == nil {
 				if root != nil && root.state.Load() == coroStateDone {
 					return true, nil, false
 				}
+				// Before parking, try directly polling a peer parked I/O task when
+				// this driver recently performed work (avoids kevent/epoll + futex trip).
+				if didWork && ioProbeMisses < 4 {
+					if claimed := coroTryPollParkedIO(lastParkedIO, lastProbedIO); claimed != nil {
+						lastProbedIO = claimed
+						ioProbeMisses++
+						task = claimed
+						goto resume
+					}
+				}
+				didWork = false
+				ioProbeMisses = 0
+				lastParkedIO = nil
+				lastProbedIO = nil
 				var slot int32
 				if workerID >= 0 {
 					slot = workerID
@@ -1394,8 +1466,12 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 			if coroCompleteIO(task) {
 				goto handleWait
 			}
+			// Direct I/O completed! Reset probe misses so we can chain to the peer.
+			ioProbeMisses = 0
+			lastProbedIO = nil
 		}
 
+		didWork = true
 		active = task
 		action = task.resume(unsafe.Pointer(task))
 		active = nil
@@ -1468,6 +1544,9 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 		if raceenabled {
 			racereleasemerge(unsafe.Pointer(task))
 		}
+		if task.flags&coroFlagIOPending != 0 {
+			lastParkedIO = task
+		}
 		if task.state.CompareAndSwap(coroStateWaiting, coroStateParked) {
 			task = nil
 			continue
@@ -1530,7 +1609,7 @@ func coroFinishTask(task, driverRoot *coroTask) *coroTask {
 		return parent
 	}
 	if task.flags&coroFlagUnhosted != 0 {
-		coroSched.unhosted.Add(-1)
+		coroAddUnhosted(-1)
 	}
 	if task.flags&coroFlagRoot != 0 {
 		if raceenabled {
@@ -1579,7 +1658,7 @@ func coroFinishTerminal(task, driverRoot *coroTask) *coroTask {
 		return coroFinishTerminal(parent, driverRoot)
 	}
 	if task.flags&coroFlagUnhosted != 0 {
-		coroSched.unhosted.Add(-1)
+		coroAddUnhosted(-1)
 	}
 	if task.flags&coroFlagRoot != 0 {
 		if raceenabled {

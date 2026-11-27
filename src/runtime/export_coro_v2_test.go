@@ -69,7 +69,7 @@ func CoroV2SelectForTest(ctx unsafe.Pointer, cases []CoroV2SelectCaseForTest, ns
 }
 
 func CoroV2CacheBytesForTest() uintptr   { return coroSched.cacheBytes.Load() }
-func CoroV2UnhostedForTest() int64       { return coroSched.unhosted.Load() }
+func CoroV2UnhostedForTest() int64       { return int64(coroUnhostedCount()) }
 func CoroV2RunnableForTest() int32       { return coroSched.runnable.Load() }
 func CoroV2TypeOfForTest(v any) *_type   { return efaceOf(&v)._type }
 func CoroV2ActionCompleteForTest() uint8 { return coroActionComplete }
@@ -136,7 +136,7 @@ func CoroV2SeedMultiPRingsForTest(n int) (queued int, nonZeroP int) {
 		t.resume = coroV2ShrinkWorker
 		t.flags |= coroFlagUnhosted
 		t.state.Store(coroStateRunnable)
-		coroSched.unhosted.Add(1)
+		coroAddUnhosted(1)
 		mp = acquirem()
 		// Re-check target P ring directly (test runs with no active drivers yet).
 		h := atomic.LoadAcq(&ps.runqH)

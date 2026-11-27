@@ -64,12 +64,16 @@ func (task *coroTask) ensureIOState() *coroIOState {
 }
 
 // Sharded GC anchor table so tasks parked in non-GC pollDesc.{rg,wg} remain
-// reachable to the GC without any global contention.
+// reachable to the GC and can be directly polled before parking without
+// round-tripping through kevent/epoll_wait.
 var coroIOAnchors [coroIOAnchorShards]struct {
 	lock mutex
 	head *coroTask
+	tail *coroTask
 	_    [64]byte
 }
+
+var coroIOAnchorScan atomic.Uint32
 
 // Lock-free uintptr Treiber stack of tasks woken directly by native netpollunblock.
 var coroNetpollReady atomic.Uintptr
@@ -89,12 +93,16 @@ func coroIOAnchor(task *coroTask, io *coroIOState) {
 	io.anchorShard = shard
 	sh := &coroIOAnchors[shard]
 	lock(&sh.lock)
-	io.anchorPrev = nil
-	io.anchorNext = sh.head
-	if sh.head != nil && sh.head.ioState != nil {
-		sh.head.ioState.anchorPrev = task
+	// Append to tail (FIFO) so oldest waiters (most likely to have peer data ready)
+	// sit at sh.head for immediate first-probe hit in coroTryPollParkedIO.
+	io.anchorPrev = sh.tail
+	io.anchorNext = nil
+	if sh.tail != nil && sh.tail.ioState != nil {
+		sh.tail.ioState.anchorNext = task
+	} else {
+		sh.head = task
 	}
-	sh.head = task
+	sh.tail = task
 	io.anchored = true
 	unlock(&sh.lock)
 }
@@ -113,12 +121,86 @@ func coroIOUnanchor(task *coroTask, io *coroIOState) {
 		}
 		if io.anchorNext != nil && io.anchorNext.ioState != nil {
 			io.anchorNext.ioState.anchorPrev = io.anchorPrev
+		} else {
+			sh.tail = io.anchorPrev
 		}
 		io.anchorPrev = nil
 		io.anchorNext = nil
 		io.anchored = false
 	}
 	unlock(&sh.lock)
+}
+
+// coroTryPollParkedIO claims one parked I/O task (other than exclude1/exclude2)
+// directly from the sharded anchor table before a driver enters gopark. This
+// lets peer pipe/TCP readiness produced on the same or sibling P complete
+// immediately without a kevent/epoll_wait + gopark/futex round trip.
+func coroTryPollParkedIO(exclude1, exclude2 *coroTask) *coroTask {
+	if !netpollAnyWaiters() {
+		return nil
+	}
+	start := int(coroIOAnchorScan.Load()) & (coroIOAnchorShards - 1)
+	scanned := 0
+	for off := 0; off < coroIOAnchorShards; off++ {
+		idx := (start + off) & (coroIOAnchorShards - 1)
+		sh := &coroIOAnchors[idx]
+		if atomic.Loadp(unsafe.Pointer(&sh.head)) == nil {
+			continue
+		}
+		lock(&sh.lock)
+		for task := sh.head; task != nil; {
+			io := task.ioState
+			next := io.anchorNext
+			if scanned >= 16 {
+				coroIOAnchorScan.Store(uint32((idx + 1) & (coroIOAnchorShards - 1)))
+				unlock(&sh.lock)
+				return nil
+			}
+			scanned++
+			if task == exclude1 || task == exclude2 || io.pd == nil || task.state.Load() != coroStateParked {
+				task = next
+				continue
+			}
+			gpp := &io.pd.rg
+			if io.mode == 'w' {
+				gpp = &io.pd.wg
+			}
+			tag := uintptr(unsafe.Pointer(task)) | 1
+			if !gpp.CompareAndSwap(tag, pdNil) {
+				task = next
+				continue
+			}
+			netpollAdjustWaiters(-1)
+			if !task.state.CompareAndSwap(coroStateParked, coroStateRunning) {
+				throw("runtime: coroTryPollParkedIO invalid task state")
+			}
+			if raceenabled {
+				raceacquire(unsafe.Pointer(task))
+			}
+			// Move claimed task to shard tail so if it hits EAGAIN, the next
+			// probe tries a different oldest waiter first.
+			if io.anchorNext != nil {
+				if io.anchorPrev != nil {
+					io.anchorPrev.ioState.anchorNext = io.anchorNext
+				} else {
+					sh.head = io.anchorNext
+				}
+				io.anchorNext.ioState.anchorPrev = io.anchorPrev
+				io.anchorPrev = sh.tail
+				io.anchorNext = nil
+				if sh.tail != nil {
+					sh.tail.ioState.anchorNext = task
+				}
+				sh.tail = task
+			}
+			coroIOAnchorScan.Store(uint32((idx + 1) & (coroIOAnchorShards - 1)))
+			unlock(&sh.lock)
+			return task
+		}
+		unlock(&sh.lock)
+	}
+	coroIOAnchorScan.Store(uint32((start + 1) & (coroIOAnchorShards - 1)))
+	return nil
 }
 
 func coroNetpollHasReady() bool {
@@ -141,36 +223,54 @@ func coroNetpollWake(taskPtr uintptr) *g {
 			break
 		}
 	}
+	if coroSched.activeDriver.Load() >= gomaxprocs {
+		return nil
+	}
 	return coroPopIdleDriver()
 }
 
-// coroDrainNetpollOne pops one task woken by native netpoll and claims it
-// directly into Running on this driver (zero runq hop when already Parked!).
+// coroDrainNetpollOne atomically detaches all pending netpoll completions via
+// ABA-free Swap(0), claims the first Parked task directly into Running for this
+// driver, and fans out any remaining ready tasks via coroEnqueueBatch.
 func coroDrainNetpollOne() *coroTask {
-	for {
-		head := coroNetpollReady.Load()
-		if head == 0 {
-			return nil
-		}
-		task := (*coroTask)(unsafe.Pointer(head))
+	head := coroNetpollReady.Swap(0)
+	if head == 0 {
+		return nil
+	}
+	var first *coroTask
+	var batchHead, batchTail *coroTask
+	var batchN int32
+	for cur := head; cur != 0; {
+		task := (*coroTask)(unsafe.Pointer(cur))
 		next := task.ioState.readyNext
-		if !coroNetpollReady.CompareAndSwap(head, next) {
-			continue
-		}
 		task.ioState.readyNext = 0
-		// Claim directly if already Parked; otherwise set ReadyPending for active driver.
+		cur = next
 		for {
 			s := task.state.Load()
 			if s == coroStateParked {
-				if task.state.CompareAndSwap(coroStateParked, coroStateRunning) {
+				if first == nil {
+					if task.state.CompareAndSwap(coroStateParked, coroStateRunning) {
+						if raceenabled {
+							raceacquire(unsafe.Pointer(task))
+						}
+						first = task
+						break
+					}
+					continue
+				}
+				if task.state.CompareAndSwap(coroStateParked, coroStateRunnable) {
 					if raceenabled {
 						raceacquire(unsafe.Pointer(task))
 					}
-					// If more netpoll completions remain, nudge a peer driver.
-					if next != 0 {
-						coroMaybeWakeDriver()
+					task.next = nil
+					if batchTail == nil {
+						batchHead = task
+					} else {
+						batchTail.next = task
 					}
-					return task
+					batchTail = task
+					batchN++
+					break
 				}
 				continue
 			}
@@ -183,6 +283,10 @@ func coroDrainNetpollOne() *coroTask {
 			throw("runtime: invalid coroDrainNetpoll state")
 		}
 	}
+	if batchHead != nil {
+		coroEnqueueBatch(batchHead, batchTail, batchN)
+	}
+	return first
 }
 
 func coroRawRead(fd int32, buf []byte) int32 {
@@ -221,12 +325,23 @@ func coroRawWrite(fd int32, buf []byte) int32 {
 }
 
 func coroPrepareRecycleIO(task *coroTask) {
-	if io := task.ioState; io != nil {
-		if io.anchored {
-			coroIOUnanchor(task, io)
-		}
-		*io = coroIOState{}
+	io := task.ioState
+	if io == nil {
+		return
 	}
+	if io.anchored {
+		coroIOUnanchor(task, io)
+	}
+	if io.selectCases == nil && io.chanOK == nil && io.sleepTimer == nil {
+		io.pd = nil
+		io.buf = nil
+		io.nOut = nil
+		io.statusOut = nil
+		io.readyNext = 0
+		io.written = 0
+		return
+	}
+	*io = coroIOState{}
 }
 
 // coroArmNetpoll installs task|1 into pd.rg or pd.wg. Returns (parked, pollErr).
