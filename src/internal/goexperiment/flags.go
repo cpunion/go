@@ -130,4 +130,7 @@ type Flags struct {
 
 	// GoListExportNewFormat enables the new format for go list -export.
 	GoListExportNewFormat bool
+
+	// Coro enables experimental stackless coroutine lowering and runtime scheduling.
+	Coro bool
 }

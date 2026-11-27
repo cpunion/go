@@ -443,6 +443,7 @@ type sudog struct {
 	waitlink *sudog             // g.waiting list or semaRoot
 	waittail *sudog             // semaRoot
 	c        maybeTraceableChan // channel
+	coro     *coroTask          // stackless coroutine waiter (nil for ordinary G)
 }
 
 type libcall struct {
@@ -839,6 +840,9 @@ type p struct {
 	// Cache of a single pinner object to reduce allocations from repeated
 	// pinner creation.
 	pinnerCache *pinner
+
+	// Lazy per-P stackless coroutine runq and typed-frame freelist.
+	coro atomic.Pointer[coroPState]
 
 	trace pTraceState
 

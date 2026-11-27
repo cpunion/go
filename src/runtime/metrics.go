@@ -469,7 +469,13 @@ func initMetrics() {
 			deps: makeStatDepSet(schedStatsDep),
 			compute: func(in *statAggregate, out *metricValue) {
 				out.kind = metricKindUint64
-				out.scalar = in.schedStats.gTotal
+				out.scalar = in.schedStats.gTotal + coroUnhostedCount()
+			},
+		},
+		"/sched/coro/goroutines/unhosted:goroutines": {
+			compute: func(_ *statAggregate, out *metricValue) {
+				out.kind = metricKindUint64
+				out.scalar = coroUnhostedCount()
 			},
 		},
 		"/sched/goroutines/not-in-go:goroutines": {

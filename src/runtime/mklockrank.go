@@ -82,13 +82,14 @@ assistQueue,
 # Above SCHED are things that can call into the scheduler.
 < SCHED
 # Below SCHED is the scheduler implementation.
-< allocmR,
-  execR;
-allocmR, execR, hchan < sched;
+< allocmR;
+allocmR, hchan < sched;
 sched < allg, allp;
+allp < execR;
 
 # Channels
 NONE < notifyList;
+NONE < coroSched;
 hchan, notifyList < sudog;
 
 hchan, pollDesc, wakeableSleep < timers;
@@ -137,6 +138,7 @@ allg,
   allp, # procresize
   execR, # May grow stack
   execW, # May allocate after BeforeFork
+  coroSched,
   hchan,
   notifyList,
   reflectOffs,
@@ -186,7 +188,8 @@ gscan < stackLarge;
 gscan < hchanLeaf;
 
 # Write barrier
-defer,
+coroSched,
+  defer,
   gscan,
   mspanSpecial,
   pollCache,

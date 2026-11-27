@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -612,6 +613,15 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool, delta *int32) *g {
 			if old == pdWait {
 				old = pdNil
 			} else if old != pdNil {
+				if goexperiment.Coro && old&1 != 0 {
+					gp := coroNetpollWake(old &^ 1)
+					if gp != nil {
+						*delta -= 1
+						return gp
+					}
+					netpollAdjustWaiters(-1)
+					return nil
+				}
 				*delta -= 1
 			}
 			return (*g)(unsafe.Pointer(old))

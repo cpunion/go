@@ -25,6 +25,7 @@ type DebugFlags struct {
 	Closure               int    `help:"print information about closure compilation"`
 	CompressInstructions  int    `help:"use compressed instructions when possible (if supported by architecture)" concurrent:"ok"`
 	Converthash           string `help:"hash value for use in debugging changes to platform-dependent float-to-[u]int conversion" concurrent:"ok"`
+	Coro                  int    `help:"enable and debug stackless coroutine lowering (1-3: plan/dump, >=4: lower)" concurrent:"ok"`
 	Defer                 int    `help:"print information about defer compilation"`
 	DisableNil            int    `help:"disable nil checks" concurrent:"ok"`
 	DumpInlFuncProps      string `help:"dump function properties from inl heuristics to specified file"`

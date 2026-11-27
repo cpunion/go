@@ -19,6 +19,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/math"
 	"internal/runtime/sys"
@@ -96,14 +97,23 @@ func makechan(t *chantype, size int) *hchan {
 	switch {
 	case mem == 0:
 		// Queue or element size is zero.
-		c = (*hchan)(mallocgc(hchanSize, nil, true))
+		if goexperiment.Coro {
+			c = new(hchan)
+		} else {
+			c = (*hchan)(mallocgc(hchanSize, nil, true))
+		}
 		// Race detector uses this location for synchronization.
 		c.buf = c.raceaddr()
 	case !elem.Pointers():
 		// Elements do not contain pointers.
-		// Allocate hchan and buf in one call.
-		c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
-		c.buf = add(unsafe.Pointer(c), hchanSize)
+		// Allocate hchan and buf in one call (unless coro waiters need hchan scanned).
+		if goexperiment.Coro {
+			c = new(hchan)
+			c.buf = mallocgc(mem, nil, true)
+		} else {
+			c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
+			c.buf = add(unsafe.Pointer(c), hchanSize)
+		}
 	default:
 		// Elements contain pointers.
 		c = new(hchan)
@@ -328,6 +338,18 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 		}
 	}
+	if goexperiment.Coro && sg.coro != nil {
+		if sg.elem.get() != nil {
+			typedmemmove(c.elemtype, sg.elem.get(), ep)
+			sg.elem.set(nil)
+		}
+		if raceenabled {
+			racerelease(unsafe.Pointer(sg.coro))
+		}
+		unlockf()
+		coroChanWake(sg, true)
+		return
+	}
 	if sg.elem.get() != nil {
 		sendDirect(c.elemtype, sg, ep)
 		sg.elem.set(nil)
@@ -426,6 +448,7 @@ func closechan(c *hchan) {
 	c.closed = 1
 
 	var glist gList
+	var coroHead, coroTail *sudog
 
 	// release all readers
 	for {
@@ -436,6 +459,20 @@ func closechan(c *hchan) {
 		if sg.elem.get() != nil {
 			typedmemclr(c.elemtype, sg.elem.get())
 			sg.elem.set(nil)
+		}
+		if goexperiment.Coro && sg.coro != nil {
+			sg.success = false
+			if raceenabled {
+				racerelease(unsafe.Pointer(sg.coro))
+			}
+			sg.next = nil
+			if coroTail == nil {
+				coroHead = sg
+			} else {
+				coroTail.next = sg
+			}
+			coroTail = sg
+			continue
 		}
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
@@ -456,6 +493,20 @@ func closechan(c *hchan) {
 			break
 		}
 		sg.elem.set(nil)
+		if goexperiment.Coro && sg.coro != nil {
+			sg.success = false
+			if raceenabled {
+				racerelease(unsafe.Pointer(sg.coro))
+			}
+			sg.next = nil
+			if coroTail == nil {
+				coroHead = sg
+			} else {
+				coroTail.next = sg
+			}
+			coroTail = sg
+			continue
+		}
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
@@ -468,6 +519,10 @@ func closechan(c *hchan) {
 		glist.push(gp)
 	}
 	unlock(&c.lock)
+
+	if goexperiment.Coro && coroHead != nil {
+		coroChanCloseWake(coroHead)
+	}
 
 	// Ready all Gs now that we've dropped the channel lock.
 	for !glist.empty() {
@@ -727,6 +782,14 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 	}
 	sg.elem.set(nil)
+	if goexperiment.Coro && sg.coro != nil {
+		if raceenabled {
+			racerelease(unsafe.Pointer(sg.coro))
+		}
+		unlockf()
+		coroChanWake(sg, true)
+		return
+	}
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
@@ -886,7 +949,11 @@ func (q *waitq) dequeue() *sudog {
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
 		if sgp.isSelect {
-			if !sgp.g.selectDone.CompareAndSwap(0, 1) {
+			if goexperiment.Coro && sgp.coro != nil {
+				if !coroTryWinSelect(sgp.coro) {
+					continue
+				}
+			} else if !sgp.g.selectDone.CompareAndSwap(0, 1) {
 				// We lost the race to wake this goroutine.
 				continue
 			}
@@ -906,6 +973,12 @@ func (c *hchan) raceaddr() unsafe.Pointer {
 }
 
 func racesync(c *hchan, sg *sudog) {
+	if goexperiment.Coro && sg.coro != nil {
+		raceacquire(unsafe.Pointer(sg.coro))
+		racerelease(chanbuf(c, 0))
+		raceacquire(chanbuf(c, 0))
+		return
+	}
 	racerelease(chanbuf(c, 0))
 	raceacquireg(sg.g, chanbuf(c, 0))
 	racereleaseg(sg.g, chanbuf(c, 0))
@@ -924,6 +997,16 @@ func racenotify(c *hchan, idx uint, sg *sudog) {
 	// of elemsize==0, yet the race detector can be made to handle multiple
 	// sync objects underneath the hood (one sync object per idx)
 	qp := chanbuf(c, idx)
+	if goexperiment.Coro && sg != nil && sg.coro != nil {
+		raceacquire(unsafe.Pointer(sg.coro))
+		if c.elemsize == 0 {
+			raceacquire(qp)
+			racerelease(qp)
+		} else {
+			racereleaseacquire(qp)
+		}
+		return
+	}
 	// When elemsize==0, we don't allocate a full buffer for the channel.
 	// Instead of individual buffer entries, the race detector uses the
 	// c.buf as the only buffer entry.  This simplification prevents us from
