@@ -12,12 +12,14 @@ import (
 )
 
 var stacklessCoroNetpoll struct {
-	started   atomic.Uint32
-	head      atomic.Uintptr
-	wake      atomic.Uintptr
-	loopG     atomic.Pointer[g]
-	drainLock mutex
-	drained   atomic.Uintptr
+	started    atomic.Uint32
+	head       atomic.Uintptr
+	wake       atomic.Uintptr
+	loopG      atomic.Pointer[g]
+	drainLock  mutex
+	drained    atomic.Uintptr
+	lastSched  atomic.Uintptr
+	multiSched atomic.Uint32
 }
 
 func init() {
@@ -375,19 +377,20 @@ func stacklessCoroNetpollFanoutWake(s *stacklessCoroScheduler, extra int) {
 
 // stacklessCoroNetpollPopOne claims one ready I/O operation from the netpoll
 // completion list so multiple idle executors and the netpoll completion
-// goroutine can execute nonblocking I/O retries in parallel. On multi-P runs,
-// when additional ready operations remain queued, it fans out wakeups across
-// the schedulers owning those queued operations (falling back to op's scheduler
-// when a queued operation's scheduler has no waiting executors) so parked
-// executors wake before op's socket syscall begins.
+// goroutine can execute nonblocking I/O retries in parallel. On single-scheduler
+// workloads the fast path does no extra work under drainLock; when multiple
+// coroutine schedulers share the global ready queue, refilling a batch fans
+// out wakeups to waiting executors of other schedulers present in that batch.
 func stacklessCoroNetpollPopOne(checkFast bool) *stacklessCoroOperation {
 	if checkFast && stacklessCoroNetpoll.drained.Load() == 0 && stacklessCoroNetpoll.head.Load() == 0 {
 		return nil
 	}
 	lock(&stacklessCoroNetpoll.drainLock)
 	head := stacklessCoroNetpoll.drained.Load()
+	refilled := false
 	if head == 0 {
 		head = stacklessCoroNetpoll.head.Swap(0)
+		refilled = head != 0
 	}
 	if head == 0 {
 		unlock(&stacklessCoroNetpoll.drainLock)
@@ -397,81 +400,95 @@ func stacklessCoroNetpollPopOne(checkFast bool) *stacklessCoroOperation {
 	next := uintptr(op.resourceState().packet[stacklessCoroPollNextWord])
 	op.resourceState().packet[stacklessCoroPollNextWord] = 0
 	stacklessCoroNetpoll.drained.Store(next)
+	if refilled && next != 0 && gomaxprocs > 1 && stacklessCoroNetpoll.multiSched.Load() != 0 {
+		return stacklessCoroNetpollPopOneMultiSched(op, next)
+	}
+	unlock(&stacklessCoroNetpoll.drainLock)
+	if op.id == 0 {
+		throw("runtime: invalid stackless coroutine poll completion")
+	}
+	return op
+}
+
+// stacklessCoroNetpollPopOneMultiSched finishes popping op (called with
+// stacklessCoroNetpoll.drainLock held) when multiple schedulers have recently
+// published ready I/O. It scans a bounded prefix of the newly refilled batch
+// to wake waiting executors belonging to other schedulers (falling back to op's
+// scheduler if another scheduler has queued ops but zero waiting executors).
+// If the batch belongs solely to op's scheduler, it clears the multiSched hint
+// so subsequent single-scheduler refills stay on the zero-overhead fast path.
+//
+//go:noinline
+func stacklessCoroNetpollPopOneMultiSched(op *stacklessCoroOperation, next uintptr) *stacklessCoroOperation {
 	var targets [stacklessCoroWarmExecutorCount]*stacklessCoroScheduler
 	var counts [stacklessCoroWarmExecutorCount]int
 	nTargets := 0
-	if next != 0 && gomaxprocs > 1 {
-		limit := int(gomaxprocs) - 1
-		if limit > stacklessCoroWarmExecutorCount-1 {
-			limit = stacklessCoroWarmExecutorCount - 1
+	limit := int(gomaxprocs) - 1
+	if limit > stacklessCoroWarmExecutorCount-1 {
+		limit = stacklessCoroWarmExecutorCount - 1
+	}
+	var opSched *stacklessCoroScheduler
+	if op.task != nil {
+		opSched = op.scheduler()
+	}
+	assigned := 0
+	unassigned := 0
+	sawOtherSched := false
+	const scanLimit = stacklessCoroWarmExecutorCount * 4
+	for cur, scanned := next, 0; cur != 0 && assigned < limit && scanned < scanLimit; scanned++ {
+		curOp := (*stacklessCoroOperation)(unsafe.Pointer(cur))
+		cur = uintptr(curOp.resourceState().packet[stacklessCoroPollNextWord])
+		if curOp.task == nil {
+			continue
 		}
-		assigned := 0
-		unassigned := 0
-		const scanLimit = stacklessCoroWarmExecutorCount * 4
-		for cur, scanned := next, 0; cur != 0 && assigned < limit && scanned < scanLimit; scanned++ {
-			curOp := (*stacklessCoroOperation)(unsafe.Pointer(cur))
-			cur = uintptr(curOp.resourceState().packet[stacklessCoroPollNextWord])
-			if curOp.task == nil {
+		s := curOp.scheduler()
+		if s == nil || s == opSched {
+			continue
+		}
+		sawOtherSched = true
+		waiting := int(s.waitingExecutors())
+		if waiting <= 0 {
+			unassigned++
+			continue
+		}
+		idx := -1
+		for i := 0; i < nTargets; i++ {
+			if targets[i] == s {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			if nTargets == len(targets) {
 				continue
 			}
-			s := curOp.scheduler()
-			if s == nil {
-				continue
+			idx = nTargets
+			targets[idx] = s
+			nTargets++
+		}
+		if counts[idx] < waiting {
+			counts[idx]++
+			assigned++
+		}
+	}
+	if !sawOtherSched {
+		if opSched != nil {
+			stacklessCoroNetpoll.lastSched.Store(uintptr(unsafe.Pointer(opSched)))
+		}
+		stacklessCoroNetpoll.multiSched.Store(0)
+	} else if assigned < limit && unassigned > 0 && opSched != nil {
+		if waiting := int(opSched.waitingExecutors()); waiting > 0 {
+			rem := limit - assigned
+			if rem > unassigned {
+				rem = unassigned
 			}
-			waiting := int(s.waitingExecutors())
-			if waiting <= 0 {
-				unassigned++
-				continue
+			if rem > waiting {
+				rem = waiting
 			}
-			idx := -1
-			for i := 0; i < nTargets; i++ {
-				if targets[i] == s {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
-				if nTargets == len(targets) {
-					continue
-				}
-				idx = nTargets
-				targets[idx] = s
+			if rem > 0 && nTargets < len(targets) {
+				targets[nTargets] = opSched
+				counts[nTargets] = rem
 				nTargets++
-			}
-			if counts[idx] < waiting {
-				counts[idx]++
-				assigned++
-			}
-		}
-		if assigned < limit && unassigned > 0 && op.task != nil {
-			if s := op.scheduler(); s != nil {
-				if waiting := int(s.waitingExecutors()); waiting > 0 {
-					rem := limit - assigned
-					if rem > unassigned {
-						rem = unassigned
-					}
-					idx := -1
-					for i := 0; i < nTargets; i++ {
-						if targets[i] == s {
-							idx = i
-							break
-						}
-					}
-					if idx < 0 && nTargets < len(targets) {
-						idx = nTargets
-						targets[idx] = s
-						nTargets++
-					}
-					if idx >= 0 {
-						avail := waiting - counts[idx]
-						if rem > avail {
-							rem = avail
-						}
-						if rem > 0 {
-							counts[idx] += rem
-						}
-					}
-				}
 			}
 		}
 	}
@@ -543,6 +560,17 @@ func stacklessCoroNetpollInit() {
 //
 //go:nowritebarrier
 func stacklessCoroNetpollReady(op *stacklessCoroOperation) *g {
+	if op.task != nil {
+		if s := uintptr(unsafe.Pointer(op.scheduler())); s != 0 {
+			prev := stacklessCoroNetpoll.lastSched.Load()
+			if prev != s {
+				stacklessCoroNetpoll.lastSched.Store(s)
+				if prev != 0 {
+					stacklessCoroNetpoll.multiSched.Store(1)
+				}
+			}
+		}
+	}
 	for {
 		head := stacklessCoroNetpoll.head.Load()
 		op.resourceState().packet[stacklessCoroPollNextWord] = uint64(head)

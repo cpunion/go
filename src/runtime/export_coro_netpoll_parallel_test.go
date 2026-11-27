@@ -80,27 +80,31 @@ func CheckStacklessCoroNetpollFanoutWakeForTest() string {
 		ops[i] = op
 		stacklessCoroNetpollReady(op)
 	}
-	// First pop sees 3 extra queued ops and 2 waiting executors -> should send
-	// min(extra, waiting, gomaxprocs-1) signals to s.wake.
+	// Single-scheduler batch must stay on the zero-overhead fast path (no
+	// same-scheduler wake storm) and clear any stale multiSched hint.
+	stacklessCoroNetpoll.multiSched.Store(1)
 	first := stacklessCoroNetpollPopOne(true)
 	if first == nil {
 		return "first netpoll pop returned nil"
 	}
-	wantSignals := min(min(n-1, int(gomaxprocs)-1), 2)
-	if got := len(s.wake); got != wantSignals {
-		return "unexpected netpoll fanout signal count"
+	if got := len(s.wake); got != 0 {
+		return "single-scheduler netpoll pop unexpectedly fanned out wakes"
 	}
-	// Drain remaining ops with waiting=0 -> must not add extra signals.
-	s.executorState.Store(stacklessCoroExecutorStateRunning)
+	if stacklessCoroNetpoll.multiSched.Load() != 0 {
+		return "single-scheduler refill did not reset multiSched hint"
+	}
+	// Drain remaining ops.
 	for range n - 1 {
 		if stacklessCoroNetpollPopOne(true) == nil {
 			return "remaining netpoll pop returned nil"
 		}
 	}
-	if got := len(s.wake); got != wantSignals {
-		return "netpoll fanout signaled with zero waiting executors"
+	if got := len(s.wake); got != 0 {
+		return "single-scheduler drain sent unexpected wakes"
 	}
 	stacklessCoroNetpoll.wake.Store(pdNil)
+	stacklessCoroNetpoll.lastSched.Store(0)
+	stacklessCoroNetpoll.multiSched.Store(0)
 	KeepAlive(ops)
 	return ""
 }
@@ -190,6 +194,8 @@ func CheckStacklessCoroNetpollDualSchedulerFanoutForTest() string {
 		}
 	}
 	stacklessCoroNetpoll.wake.Store(pdNil)
+	stacklessCoroNetpoll.lastSched.Store(0)
+	stacklessCoroNetpoll.multiSched.Store(0)
 	KeepAlive(ops1)
 	KeepAlive(ops2)
 	return ""
