@@ -48,6 +48,8 @@ const (
 	coroFlagIOPending                        // waking from direct netpoll I/O; needs syscall completion
 	coroFlagChanSend                         // parked in channel send (for closed-chan panic)
 	coroFlagChanOK                           // channel receive / select ok flag
+	coroFlagUnhostedChild                    // structured await child of an unhosted coroutine
+	coroFlagTracked                          // currently registered in coroParkedShards
 )
 
 type coroSudog struct {
@@ -72,7 +74,7 @@ type coroTask struct {
 	selectDone atomic.Uint32
 	state      atomic.Uint32
 	rootSlot   atomic.Uint32
-	result     uint32
+	result     atomic.Uint32
 	flags      uint32
 	semaTicket atomic.Uint32
 }
@@ -85,9 +87,10 @@ type coroDeferNode struct {
 }
 
 type coroPanicState struct {
-	val    any
-	active bool
-	goexit bool
+	val      any
+	tracePCs []uintptr
+	active   bool
+	goexit   bool
 }
 
 const (
@@ -385,14 +388,14 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 							returnGlobal = ps.cacheCredit - coroCacheCreditChunk
 							ps.cacheCredit = coroCacheCreditChunk
 						}
+						task.next = nil
+						task.typ = typ
+						task.flags = (task.flags & coroFlagTracked) | coroFlagPooled
+						task.state.Store(coroStateNew)
 						releasem(mp)
 						if returnGlobal > 0 {
 							coroSched.cacheBytes.Add(-returnGlobal)
 						}
-						task.next = nil
-						task.typ = typ
-						task.flags = coroFlagPooled
-						task.state.Store(coroStateNew)
 						return unsafe.Pointer(task)
 					}
 				}
@@ -442,10 +445,12 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 					coroSpillGlobalCache(typ, allocSize, restHead, restTail, restCount)
 				}
 			}
+			mp = acquirem()
 			first.next = nil
 			first.typ = typ
-			first.flags = coroFlagPooled
+			first.flags = (first.flags & coroFlagTracked) | coroFlagPooled
 			first.state.Store(coroStateNew)
+			releasem(mp)
 			return unsafe.Pointer(first)
 		}
 	}
@@ -467,6 +472,9 @@ func coroRecycle(task *coroTask) {
 	coroPrepareRecycleIO(task)
 	if raceenabled || task.typ == nil || task.flags&coroFlagPooled == 0 {
 		task.ioState = nil
+		if task.flags&coroFlagTracked != 0 {
+			coroUntrackParked(task)
+		}
 		return
 	}
 	typ := task.typ
@@ -482,6 +490,9 @@ func coroRecycle(task *coroTask) {
 	if ps == nil {
 		releasem(mp)
 		task.ioState = nil
+		if task.flags&coroFlagTracked != 0 {
+			coroUntrackParked(task)
+		}
 		return
 	}
 	idx := -1
@@ -504,12 +515,18 @@ func coroRecycle(task *coroTask) {
 	if idx < 0 {
 		releasem(mp)
 		task.ioState = nil
+		if task.flags&coroFlagTracked != 0 {
+			coroUntrackParked(task)
+		}
 		return
 	}
 	slot := &ps.cache[idx]
 	if int(slot.youngCount)+int(slot.oldCount) >= coroPCacheSlotCap {
 		releasem(mp)
 		task.ioState = nil
+		if task.flags&coroFlagTracked != 0 {
+			coroUntrackParked(task)
+		}
 		return
 	}
 
@@ -533,6 +550,9 @@ func coroRecycle(task *coroTask) {
 		} else {
 			releasem(mp)
 			task.ioState = nil
+			if task.flags&coroFlagTracked != 0 {
+				coroUntrackParked(task)
+			}
 			return
 		}
 	}
@@ -549,7 +569,9 @@ func coroRecycle(task *coroTask) {
 			memclrNoHeapPointers(framePtr, frameLen)
 		}
 	}
-	// Clear task header fields (keeping zeroed ioState if reserved above).
+	// Clear task header fields (keeping zeroed ioState if reserved above and
+	// preserving coroFlagTracked/result across pool reuse for zero hot-path overhead).
+	tracked := task.flags & coroFlagTracked
 	task.resume = nil
 	task.next = nil
 	task.parent = nil
@@ -559,8 +581,10 @@ func coroRecycle(task *coroTask) {
 	task.selectDone.Store(0)
 	task.state.Store(coroStateNew)
 	task.rootSlot.Store(0)
-	task.result = 0
-	task.flags = 0
+	if tracked == 0 {
+		task.result.Store(0)
+	}
+	task.flags = tracked
 	task.semaTicket.Store(0)
 
 	task.next = slot.young
@@ -678,6 +702,7 @@ func coroClearPools() {
 			pp.coro.Store(nil)
 		}
 	}
+	coroClearParkedEmpty()
 }
 
 // coroDrainP runs under STW when pp is destroyed by procresize.
@@ -1329,6 +1354,7 @@ func coroReady(task *coroTask) {
 // lowered Go function called synchronously from an ordinary Go goroutine.
 // frame points to a combined struct{ coroTask; frame } allocated via coroAlloc.
 func coroRunFrame(frame unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
+	coroClearPanicTrace(getg().goid)
 	task := (*coroTask)(frame)
 	task.resume = resume
 	task.flags |= coroFlagRoot
@@ -1345,6 +1371,7 @@ func coroRunFrame(frame unsafe.Pointer, resume func(unsafe.Pointer) uint8) {
 		}
 		if pb.active {
 			val := pb.val
+			coroPublishPanicTrace(getg().goid, pb.tracePCs)
 			coroRecycle(task)
 			panic(val)
 		}
@@ -1382,6 +1409,9 @@ func coroAwaitFrame(ctx, childFrame unsafe.Pointer, resume func(unsafe.Pointer) 
 	child := (*coroTask)(childFrame)
 	child.resume = resume
 	child.parent = cur
+	if cur.flags&(coroFlagUnhosted|coroFlagUnhostedChild) != 0 {
+		child.flags |= coroFlagUnhostedChild
+	}
 	child.state.Store(coroStateRunning)
 	// Stash child in cur.next for immediate coroActionSwitch pickup in coroDriverLoop.
 	cur.next = child
@@ -1408,6 +1438,7 @@ func coroPanic(ctx unsafe.Pointer, val any) {
 	}
 	task.panicBox.val = val
 	task.panicBox.active = true
+	coroRecordPanicChain(task, task.panicBox)
 }
 
 // coroGoexit marks the active task as terminating via runtime.Goexit().
@@ -1458,6 +1489,9 @@ func coroRunDefers(task *coroTask) *coroTask {
 			child.resume = d.resume
 			child.parent = task
 			child.flags |= coroFlagDeferChild
+			if task.flags&(coroFlagUnhosted|coroFlagUnhostedChild) != 0 {
+				child.flags |= coroFlagUnhostedChild
+			}
 			child.state.Store(coroStateRunning)
 			return child
 		}
@@ -1693,6 +1727,9 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 		}
 
 	handleWait:
+		if task.flags&(coroFlagUnhosted|coroFlagUnhostedChild) != 0 && task.flags&coroFlagTracked == 0 {
+			coroTrackParked(task)
+		}
 		if raceenabled {
 			racereleasemerge(unsafe.Pointer(task))
 		}
@@ -1757,6 +1794,7 @@ func coroFinishTask(task, driverRoot *coroTask) *coroTask {
 		}
 		// Normal structured await child completed: parent reads return values from
 		// child's frame and then calls coroReleaseFrame(child).
+		task.state.Store(coroStateDone)
 		parent.state.Store(coroStateRunning)
 		return parent
 	}
@@ -1793,6 +1831,7 @@ func coroFinishTerminal(task, driverRoot *coroTask) *coroTask {
 				parent.panicBox.val = nil
 			} else if pb.active {
 				parent.panicBox.val = pb.val
+				parent.panicBox.tracePCs = pb.tracePCs
 				parent.panicBox.active = true
 			}
 			task.panicBox = nil
@@ -1824,6 +1863,7 @@ func coroFinishTerminal(task, driverRoot *coroTask) *coroTask {
 	task.state.Store(coroStateDone)
 	if pb != nil && pb.active && !pb.goexit {
 		val := pb.val
+		coroPublishPanicTrace(getg().goid, pb.tracePCs)
 		coroRecycle(task)
 		// Unhandled panic in independent goroutine crashes the process, matching Go spec.
 		panic(val)

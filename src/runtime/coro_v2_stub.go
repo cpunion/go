@@ -6,6 +6,11 @@
 
 package runtime
 
+import (
+	"internal/profilerecord"
+	"unsafe"
+)
+
 type coroTask struct{}
 type coroPState struct{}
 type coroSudog struct{}
@@ -20,6 +25,12 @@ func coroChanCloseWake(head *sudog)     {}
 func coroSemaWake(s *sudog)             {}
 func coroNotifyWake(s *sudog)           {}
 func coroTryWinSelect(t *coroTask) bool { return false }
+func coroPrintPanicTrace(gp *g)         {}
+func coroCountProfileTasksSTW() int     { return 0 }
+func coroRecordProfileSTW(dst []profilerecord.StackRecord, labels []unsafe.Pointer, pcBuf []uintptr) int {
+	return 0
+}
+func coroTracebackAll() {}
 
 //go:nowritebarrier
 func coroNetpollWake(taskPtr uintptr) *g { return nil }

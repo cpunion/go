@@ -1485,6 +1485,7 @@ func fatalpanic(msgs *_panic) {
 			runningPanicDefers.Add(-1)
 
 			printpanics(msgs)
+			coroPrintPanicTrace(gp)
 		}
 
 		// If this panic is the result of a synctest bubble deadlock,
