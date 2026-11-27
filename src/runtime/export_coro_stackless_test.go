@@ -146,9 +146,9 @@ func RunStacklessCoroFrameInlineForTest(frame unsafe.Pointer,
 func RunDetachedStacklessCoroForTest(root, detached func(unsafe.Pointer) uint8) {
 	s := newStacklessCoroTestScheduler()
 	*s = stacklessCoroScheduler{
-		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
-		liveSpawns: 1,
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
+	s.liveSpawns.Store(1)
 	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.resume = root
 	s.ready(&s.root, false)
@@ -721,7 +721,7 @@ func StacklessCoroLiveSpawnCountForTest(ctx unsafe.Pointer) uint64 {
 	context := (*stacklessCoroContext)(ctx)
 	s := context.scheduler
 	lock(&s.lock)
-	count := s.liveSpawns
+	count := s.liveSpawns.Load()
 	unlock(&s.lock)
 	return count
 }
@@ -1767,7 +1767,7 @@ func SchedulerStacklessCoroForTest(ctx unsafe.Pointer) unsafe.Pointer {
 func DrainedStacklessCoroSchedulerForTest(pointer unsafe.Pointer) bool {
 	s := (*stacklessCoroScheduler)(pointer)
 	lock(&s.lock)
-	drained := s.drained() && s.liveSpawns == 0 && s.head == nil &&
+	drained := s.drained() && s.liveSpawns.Load() == 0 && s.head == nil &&
 		s.tail == nil && s.reservedTasks == nil && s.terminalValues.Load() == nil &&
 		s.root.terminal == stacklessCoroTerminalNone && !s.root.goexit
 	unlock(&s.lock)

@@ -7,7 +7,9 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -104,14 +106,18 @@ func registerStacklessCoroSocketRead(op *stacklessCoroOperation, pd *pollDesc, o
 }
 
 func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
+	stacklessCoroSocketReadAttemptDirect(op, nil)
+}
+
+func stacklessCoroSocketReadAttemptDirect(op *stacklessCoroOperation,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	pd := (*pollDesc)(unsafe.Pointer(uintptr(op.resourceState().packet[stacklessCoroPollDescWord])))
 	if pd == nil || len(op.resourceState().buffer) == 0 {
 		throw("runtime: invalid stackless coroutine socket read")
 	}
 	for {
 		if resetErr := poll_runtime_pollReset(pd, 'r'); resetErr != pollNoError {
-			stacklessCoroSocketReadPollFinish(op, resetErr)
-			return
+			return stacklessCoroSocketReadPollFinishDirect(op, resetErr, wantSched)
 		}
 		count := read(op.resourceState().fd, unsafe.Pointer(&op.resourceState().buffer[0]),
 			stacklessCoroReadLength(len(op.resourceState().buffer)))
@@ -124,11 +130,10 @@ func stacklessCoroSocketReadAttempt(op *stacklessCoroOperation) {
 			if count < 0 {
 				readErrno = uintptr(-count)
 			}
-			stacklessCoroSocketReadFinish(op, count, readErrno)
-			return
+			return stacklessCoroSocketFinishDirect(op, int(count), readErrno, wantSched)
 		}
 		if stacklessCoroSocketReadArm(op, pd) {
-			return
+			return nil
 		}
 	}
 }
@@ -198,7 +203,7 @@ func stacklessCoroPollIOAtIdle(s *stacklessCoroScheduler,
 //go:noinline
 func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 	exclude *stacklessCoroTask) *stacklessCoroTask {
-	if stacklessCoroOperations.ioCount.Load() == 0 {
+	if !stacklessCoroHasRegisteredIO() {
 		return nil
 	}
 	if task := stacklessCoroDrainReadyIO(s); task != nil {
@@ -244,7 +249,7 @@ func stacklessCoroPollIOBeforePark(s *stacklessCoroScheduler,
 // stacklessCoroPollIOForReplacement checks for ready I/O before an idle
 // replacement executor parks without entering a native stack episode.
 func stacklessCoroPollIOForReplacement(s *stacklessCoroScheduler) bool {
-	if stacklessCoroOperations.ioCount.Load() == 0 {
+	if !stacklessCoroHasRegisteredIO() {
 		return false
 	}
 	if stacklessCoroDrainReadyIOForReplacement(s) {
@@ -307,17 +312,47 @@ func stacklessCoroNetpollPollNonblocking() bool {
 // completion G to stacklessCoroNetpoll.wake when all completions have already
 // been drained, or readies it if more completions remain or raced in.
 func stacklessCoroNetpollReleaseLoop() {
+	stacklessCoroNetpollReleaseLoopFor(nil, false)
+}
+
+func stacklessCoroNetpollReleaseLoopFor(s *stacklessCoroScheduler, callerActive bool) {
 	loopG := stacklessCoroNetpoll.loopG.Load()
 	lock(&stacklessCoroNetpoll.drainLock)
 	if !stacklessCoroNetpoll.wake.CompareAndSwap(pdReady, uintptr(unsafe.Pointer(loopG))) {
 		unlock(&stacklessCoroNetpoll.drainLock)
 		throw("runtime: unexpected stackless coroutine netpoll wake state")
 	}
+	drained := stacklessCoroNetpoll.drained.Load()
+	head := stacklessCoroNetpoll.head.Load()
 	needWake := false
-	if stacklessCoroNetpoll.drained.Load() != 0 || stacklessCoroNetpoll.head.Load() != 0 {
+	fanoutExtra := 0
+	if head != 0 {
 		needWake = stacklessCoroNetpoll.wake.CompareAndSwap(uintptr(unsafe.Pointer(loopG)), pdReady)
+	} else if drained != 0 {
+		if callerActive && s != nil && s.multiPFastPath() &&
+			stacklessCoroNetpoll.multiSched.Load() == 0 &&
+			stacklessCoroNetpoll.lastSched.Load() == uintptr(unsafe.Pointer(s)) {
+			// Single-scheduler batch: avoid waking loopG as an extra (P+1)th
+			// goroutine; instead wake idle peer executors of s directly up to
+			// min(remaining ops, waiting executors, GOMAXPROCS-1).
+			if waiting := int(s.waitingExecutors()); waiting > 0 {
+				limit := int(gomaxprocs) - 1
+				if limit > waiting {
+					limit = waiting
+				}
+				for cur := drained; cur != 0 && fanoutExtra < limit; fanoutExtra++ {
+					curOp := (*stacklessCoroOperation)(unsafe.Pointer(cur))
+					cur = uintptr(curOp.resourceState().packet[stacklessCoroPollNextWord])
+				}
+			}
+		} else {
+			needWake = stacklessCoroNetpoll.wake.CompareAndSwap(uintptr(unsafe.Pointer(loopG)), pdReady)
+		}
 	}
 	unlock(&stacklessCoroNetpoll.drainLock)
+	if fanoutExtra > 0 {
+		stacklessCoroNetpollFanoutWake(s, fanoutExtra)
+	}
 	if needWake {
 		systemstack(func() {
 			var list gList
@@ -335,7 +370,9 @@ func stacklessCoroDrainReadyIO(s *stacklessCoroScheduler) *stacklessCoroTask {
 		if op == nil {
 			return nil
 		}
-		stacklessCoroSocketAttempt(op)
+		if task := stacklessCoroSocketAttemptDirect(op, s); task != nil {
+			return task
+		}
 		if task := s.take(); task != nil {
 			return task
 		}
@@ -359,6 +396,83 @@ func stacklessCoroDrainReadyIOForReplacement(s *stacklessCoroScheduler) bool {
 // executors before executing a socket syscall when multiple ready I/O
 // completions are queued, so multi-P schedulers issue nonblocking socket
 // read/write syscalls in parallel instead of serializing behind one caller.
+// stacklessCoroNetpollSendWakeParallel performs a non-blocking send on an
+// internal coroutine executor wake channel, readying a parked executor with
+// next=false on multi-P so idle Ps steal it immediately instead of stalling on
+// the caller's runnext slot.
+func stacklessCoroNetpollSendWakeParallel(wake chan struct{}) {
+	c := *(**hchan)(unsafe.Pointer(&wake))
+	if c == nil {
+		return
+	}
+	if raceenabled {
+		racereadpc(c.raceaddr(), sys.GetCallerPC(), abi.FuncPCABIInternal(stacklessCoroNetpollSendWakeParallel))
+	}
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("send on synctest channel from outside bubble")
+	}
+	if c.closed == 0 && full(c) {
+		return
+	}
+	lock(&c.lock)
+	if c.closed != 0 {
+		unlock(&c.lock)
+		panic(plainError("send on closed channel"))
+	}
+	if sg := c.recvq.dequeue(); sg != nil {
+		if sg.coro.get() != nil {
+			send(c, sg, unsafe.Pointer(&zerobase), func() { unlock(&c.lock) }, 3)
+			return
+		}
+		if c.bubble != nil && getg().bubble != c.bubble {
+			unlock(&c.lock)
+			fatal("send on synctest channel from outside bubble")
+		}
+		if raceenabled {
+			if c.dataqsiz == 0 {
+				racesync(c, sg)
+			} else {
+				racenotify(c, c.recvx, nil)
+				racenotify(c, c.recvx, sg)
+				c.recvx++
+				if c.recvx == c.dataqsiz {
+					c.recvx = 0
+				}
+				c.sendx = c.recvx
+			}
+		}
+		full := sg.fullSudog()
+		if full.getFullElem() != nil {
+			full.setFullElem(nil)
+		}
+		gp := full.g
+		unlock(&c.lock)
+		gp.param = unsafe.Pointer(sg)
+		full.success = true
+		if full.releasetime != 0 {
+			full.releasetime = cputicks()
+		}
+		next := gomaxprocs <= 1
+		systemstack(func() {
+			ready(gp, 3, next)
+		})
+		return
+	}
+	if c.qcount < c.dataqsiz {
+		if raceenabled {
+			racenotify(c, c.sendx, nil)
+		}
+		c.sendx++
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount++
+		unlock(&c.lock)
+		return
+	}
+	unlock(&c.lock)
+}
+
 func stacklessCoroNetpollFanoutWake(s *stacklessCoroScheduler, extra int) {
 	if s == nil || extra <= 0 || gomaxprocs <= 1 {
 		return
@@ -371,7 +485,7 @@ func stacklessCoroNetpollFanoutWake(s *stacklessCoroScheduler, extra int) {
 		extra = waiting
 	}
 	for range extra {
-		s.signal()
+		stacklessCoroNetpollSendWakeParallel(s.wake)
 	}
 }
 
@@ -400,10 +514,37 @@ func stacklessCoroNetpollPopOne(checkFast bool) *stacklessCoroOperation {
 	next := uintptr(op.resourceState().packet[stacklessCoroPollNextWord])
 	op.resourceState().packet[stacklessCoroPollNextWord] = 0
 	stacklessCoroNetpoll.drained.Store(next)
-	if refilled && next != 0 && gomaxprocs > 1 && stacklessCoroNetpoll.multiSched.Load() != 0 {
-		return stacklessCoroNetpollPopOneMultiSched(op, next)
+	fanoutExtra := 0
+	var fanoutSched *stacklessCoroScheduler
+	if refilled && next != 0 && gomaxprocs > 1 {
+		if stacklessCoroNetpoll.multiSched.Load() != 0 {
+			return stacklessCoroNetpollPopOneMultiSched(op, next)
+		}
+		if op.task != nil {
+			if opSched := op.scheduler(); opSched != nil && opSched.multiPFastPath() {
+				if waiting := int(opSched.waitingExecutors()); waiting > 0 {
+					limit := int(gomaxprocs) - 1
+					if limit > waiting {
+						limit = waiting
+					}
+					maxCount := limit * 4
+					rem := 0
+					for cur := next; cur != 0 && rem < maxCount; rem++ {
+						curOp := (*stacklessCoroOperation)(unsafe.Pointer(cur))
+						cur = uintptr(curOp.resourceState().packet[stacklessCoroPollNextWord])
+					}
+					if extra := rem / 4; extra > 0 {
+						fanoutSched = opSched
+						fanoutExtra = extra
+					}
+				}
+			}
+		}
 	}
 	unlock(&stacklessCoroNetpoll.drainLock)
+	if fanoutExtra > 0 {
+		stacklessCoroNetpollFanoutWake(fanoutSched, fanoutExtra)
+	}
 	if op.id == 0 {
 		throw("runtime: invalid stackless coroutine poll completion")
 	}
@@ -503,11 +644,16 @@ func stacklessCoroNetpollPopOneMultiSched(op *stacklessCoroOperation, next uintp
 }
 
 func stacklessCoroSocketReadPollFinish(op *stacklessCoroOperation, pollErr int) {
+	stacklessCoroSocketReadPollFinishDirect(op, pollErr, nil)
+}
+
+func stacklessCoroSocketReadPollFinishDirect(op *stacklessCoroOperation, pollErr int,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	status := uintptr(pollErr)
 	if !op.resourceState().ownsPollDesc {
 		status |= stacklessCoroPollErrorTag
 	}
-	stacklessCoroSocketReadFinish(op, -1, status)
+	return stacklessCoroSocketFinishDirect(op, -1, status, wantSched)
 }
 
 func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, readErrno uintptr) {
@@ -515,6 +661,11 @@ func stacklessCoroSocketReadFinish(op *stacklessCoroOperation, count int32, read
 }
 
 func stacklessCoroSocketFinish(op *stacklessCoroOperation, count int, errno uintptr) {
+	stacklessCoroSocketFinishDirect(op, count, errno, nil)
+}
+
+func stacklessCoroSocketFinishDirect(op *stacklessCoroOperation, count int, errno uintptr,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	if op.resourceState().packet[stacklessCoroPollNextWord] != 0 {
 		throw("runtime: queued stackless coroutine socket completion")
 	}
@@ -538,18 +689,25 @@ func stacklessCoroSocketFinish(op *stacklessCoroOperation, count int, errno uint
 	if op.resourceState().errno != nil {
 		*op.resourceState().errno = errno
 	}
-	completeStacklessCoroOperation(op)
+	return completeStacklessCoroOperationDirect(op, wantSched)
 }
 
 func stacklessCoroSocketAttempt(op *stacklessCoroOperation) {
+	stacklessCoroSocketAttemptDirect(op, nil)
+}
+
+func stacklessCoroSocketAttemptDirect(op *stacklessCoroOperation,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	if op.resourceState().pollWrite {
-		stacklessCoroSocketWriteAttempt(op)
-	} else {
-		stacklessCoroSocketReadAttempt(op)
+		return stacklessCoroSocketWriteAttemptDirect(op, wantSched)
 	}
+	return stacklessCoroSocketReadAttemptDirect(op, wantSched)
 }
 
 func stacklessCoroNetpollInit() {
+	if stacklessCoroNetpoll.started.Load() != 0 {
+		return
+	}
 	if stacklessCoroNetpoll.started.CompareAndSwap(0, 1) {
 		go stacklessCoroNetpollLoop()
 	}

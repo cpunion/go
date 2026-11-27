@@ -20,14 +20,14 @@ func CheckStacklessCoroMixedScalarSlotsForTest() bool {
 	s.batchedTaskCounts = stacklessCoroTypedTaskFrameAllocationMode
 	lock(&s.lock)
 	for _, live := range [2]uint64{0, stacklessCoroTaskCacheSize + stacklessCoroDirectBatchedTaskCount} {
-		s.liveSpawns = live
+		s.liveSpawns.Store(live)
 		task := s.newScalarFrameTaskLocked(stacklessCoroScalarTaskFrameTestResume, nil)
 		if task.context.frame != nil || task.frameSize != 0 || s.freeTasks != nil {
 			unlock(&s.lock)
 			return false
 		}
 	}
-	s.liveSpawns++
+	s.liveSpawns.Add(1)
 	s.cachedFrameTasks = stacklessCoroTaskCacheSize
 	first := s.newScalarFrameTaskLocked(stacklessCoroScalarTaskFrameTestResume, nil)
 	if !isStacklessCoroScalarTaskCacheMarker(first.frameSize) || !s.onlyUnusedScalarFrameTasksLocked() {
