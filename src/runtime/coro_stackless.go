@@ -849,9 +849,9 @@ func initializeStacklessCoroScheduler(s *stacklessCoroScheduler,
 	}
 	if s.wake == nil {
 		s.wake = acquireStacklessCoroWake()
-		lockInit(&s.lock, lockRankStacklessCoro)
 	}
 	s.executorCount.Store(1)
+	lockInit(&s.lock, lockRankStacklessCoro)
 	root := &s.root
 	root.resume = resume
 	root.context.frame = frame
