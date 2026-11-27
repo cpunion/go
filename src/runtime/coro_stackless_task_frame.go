@@ -73,6 +73,51 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
 		return nil
 	}
+	if s.multiPFastPath() && s.lifetime.Load()&stacklessCoroLifetimeTypedBurstFast != 0 &&
+		validStacklessCoroTaskFrameType(allocationType, size) {
+		if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending || parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+			throw("runtime: stackless coroutine frame reservation outside resume")
+		}
+		cached, marker := takeStacklessCoroCompletedTask(allocationType, size)
+		if cached == nil && marker == stacklessCoroUncachedFrameLineage {
+			cached = takeStacklessCoroTypedBurst(child, allocationType, size)
+		}
+		storage := unsafe.Pointer(cached)
+		if storage == nil {
+			storage = newobject(allocationType)
+		}
+		task := initializeStacklessCoroTask((*stacklessCoroTask)(storage),
+			add(storage, unsafe.Sizeof(stacklessCoroTask{})), child, parent)
+		task.frameSize = marker
+		if coroPTryPutPendingTypedTask(task) {
+			return task.context.frame
+		}
+		lock(&s.lock)
+		task.next = s.reservedTasks
+		s.reservedTasks = task
+		frame := task.context.frame
+		unlock(&s.lock)
+		return frame
+	}
+	if s.multiPFastPath() && s.pRunqUsed() {
+		if cached := coroPCacheTaskGet(s, child, uint16(size)); cached != nil {
+			if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+				parent.readyPending || parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+				throw("runtime: stackless coroutine frame reservation outside resume")
+			}
+			cached.setParent(parent)
+			if coroPTryPutPendingTypedTask(cached) {
+				return cached.context.frame
+			}
+			lock(&s.lock)
+			cached.next = s.reservedTasks
+			s.reservedTasks = cached
+			frame := cached.context.frame
+			unlock(&s.lock)
+			return frame
+		}
+	}
 	lock(&s.lock)
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending || parent.terminal != stacklessCoroTerminalNone || parent.goexit {
@@ -83,7 +128,8 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	if task == nil {
 		if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
 			s.freeFrameBytes == 0 &&
-			(s.freeTasks == nil || s.onlyUnusedScalarFrameTasksLocked()) {
+			(s.freeTasks == nil || s.onlyUnusedScalarFrameTasksLocked()) &&
+			(!s.multiPFastPath() || !coroPHasCacheTasks(s)) {
 			// The full task cache need not contain one uniform frame size.
 			// Each eligible combined allocation has the same byte charge as
 			// its task share and separate frame. Record the allocation mode
@@ -94,6 +140,14 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 				unlock(&s.lock)
 				throw("runtime: invalid stackless coroutine task-frame allocation type")
 			}
+			s.batchedTaskCounts = s.batchedTaskCounts&^stacklessCoroDirectBatchedTaskCountMask | stacklessCoroTypedTaskFrameAllocationMode
+			useFast := s.multiPFastPath()
+			if useFast {
+				s.lifetime.Or(stacklessCoroLifetimeTypedBurstFast)
+			}
+			// Perform shared typed-burst lookup and heap allocation outside s.lock
+			// so stacklessCoroSharedOperations.lock never nests inside s.lock.
+			unlock(&s.lock)
 			cached, marker := takeStacklessCoroCompletedTask(allocationType, size)
 			if cached == nil && marker == stacklessCoroUncachedFrameLineage {
 				cached = takeStacklessCoroTypedBurst(child, allocationType, size)
@@ -102,10 +156,13 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 			if storage == nil {
 				storage = newobject(allocationType)
 			}
-			s.batchedTaskCounts = s.batchedTaskCounts&^stacklessCoroDirectBatchedTaskCountMask | stacklessCoroTypedTaskFrameAllocationMode
 			task = initializeStacklessCoroTask((*stacklessCoroTask)(storage),
 				add(storage, unsafe.Sizeof(stacklessCoroTask{})), child, parent)
 			task.frameSize = marker
+			if useFast && coroPTryPutPendingTypedTask(task) {
+				return task.context.frame
+			}
+			lock(&s.lock)
 		} else {
 			task = s.newFrameReservationTaskLocked(child, parent, size)
 			if s.cachedFrameTasks < stacklessCoroTaskCacheSize &&
@@ -114,16 +171,58 @@ func coroTakeTypedTaskFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 				task.frameSize = uint16(size)
 				s.cachedFrameTasks++
 				s.cachedFrameBytes += uint16(size)
-			} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize && s.freeFrameBytes == 0 {
+			} else if s.cachedFrameTasks == stacklessCoroTaskCacheSize &&
+				s.freeFrameBytes == 0 &&
+				(!s.multiPFastPath() || !coroPHasCacheTasks(s)) {
 				task.frameSize = stacklessCoroUncachedFrameLineage
 			}
 		}
 	} else {
 		task.setParent(parent)
+		if s.multiPFastPath() && s.pRunqUsed() && s.freeTasks != nil {
+			if frame, done := s.refillPCacheTasksLocked(task, child, uint16(size)); done {
+				return frame
+			}
+		}
+	}
+	if task.context.frame != nil && s.multiPFastPath() && s.pRunqUsed() && coroPTryPutPendingTypedTask(task) {
+		frame := task.context.frame
+		unlock(&s.lock)
+		return frame
 	}
 	task.next = s.reservedTasks
 	s.reservedTasks = task
 	frame := task.context.frame
 	unlock(&s.lock)
 	return frame
+}
+
+//go:noinline
+func (s *stacklessCoroScheduler) refillPCacheTasksLocked(task *stacklessCoroTask,
+	child stacklessCoroResume, size uint16) (unsafe.Pointer, bool) {
+	var batch [32]*stacklessCoroTask
+	batchN := 0
+	for batchN < len(batch) {
+		extra := s.takeCachedFrameTaskLocked(child, size)
+		if extra == nil {
+			break
+		}
+		batch[batchN] = extra
+		batchN++
+	}
+	if batchN == 0 {
+		return nil, false
+	}
+	if coroPTryPutPendingTypedTask(task) {
+		frame := task.context.frame
+		unlock(&s.lock)
+		coroPCacheTaskPutBatch(s, child, size, batch[:batchN])
+		return frame, true
+	}
+	task.next = s.reservedTasks
+	s.reservedTasks = task
+	frame := task.context.frame
+	unlock(&s.lock)
+	coroPCacheTaskPutBatch(s, child, size, batch[:batchN])
+	return frame, true
 }

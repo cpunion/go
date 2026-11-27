@@ -172,7 +172,7 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 				if unsafe.Sizeof(uintptr(0)) == 8 && !raceenabled {
 					task := s.reservedTasks
 					base, span, _ := findObject(uintptr(unsafe.Pointer(task)), 0, 0)
-					if s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
+					if s.liveSpawns.Load() <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
 						if task.frameSize != stacklessCoroUncachedFrameLineage ||
 							base != uintptr(unsafe.Pointer(task)) ||
 							span.elemsize != unsafe.Sizeof(stacklessCoroTask{}) {
@@ -243,9 +243,12 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 					frame = new(stacklessCoroTaskFrameTestFrame)
 				}
 			} else {
-				task := (*stacklessCoroContext)(ctx).scheduler.reservedTasks
+				task := coroPPeekPendingTypedTask()
+				if task == nil || task.context.frame != unsafe.Pointer(frame) {
+					task = (*stacklessCoroContext)(ctx).scheduler.reservedTasks
+				}
 				base, span, _ := findObject(uintptr(unsafe.Pointer(frame)), 0, 0)
-				if base == uintptr(unsafe.Pointer(task)) {
+				if task != nil && base == uintptr(unsafe.Pointer(task)) {
 					if span.elemsize != unsafe.Sizeof(stacklessCoroTask{})+frameSize || task.frameSize != stacklessCoroUncachedFrameLineage {
 						probe.failed.Add(1)
 					}
@@ -281,7 +284,7 @@ func stacklessCoroTaskFrameTestRootResume(ctx unsafe.Pointer) uint8 {
 	// root completion alone does not join still-retiring spawned tasks.
 	s := (*stacklessCoroContext)(ctx).scheduler
 	lock(&s.lock)
-	live := s.liveSpawns
+	live := s.liveSpawns.Load()
 	unlock(&s.lock)
 	if live != 0 {
 		return stacklessCoroActionYield

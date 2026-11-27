@@ -8,13 +8,20 @@ package runtime
 
 import (
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
 const (
-	stacklessCoroPRunqSize       = 256
-	stacklessCoroPOpCacheSize    = 16
-	stacklessCoroPFusedCacheSize = 32
+	stacklessCoroPRunqSize           = 512
+	stacklessCoroPRunqStealBatch     = 128
+	stacklessCoroPOpCacheSize        = 128
+	stacklessCoroPFusedCacheSize     = 32
+	stacklessCoroPGoroutineCacheSize = 128
+	stacklessCoroPTypedBurstCap      = 256
+	stacklessCoroPCacheTaskCap       = 256
+	stacklessCoroPCacheStealBatch    = 64
+	stacklessCoroPSpawnSiteCount     = 16
 	// Limit per-P fused frame caching to small objects without a malloc header
 	// so span.elemsize equals roundupsize(size, false) exactly.
 	stacklessCoroPFusedMaxSize = 512
@@ -31,17 +38,35 @@ type stacklessCoroPFusedFrame struct {
 // runtime.p avoids enlarging runtime.p or perturbing single-P cache layout.
 // All idle storage is dropped under STW during GC mark termination.
 type stacklessCoroPState struct {
-	opCacheCount   uint8
-	ioOpCacheCount uint8
-	fusedCount     uint8
-	fusedNextEvict uint8
-	opCache        *stacklessCoroOperation
-	ioOpCache      *stacklessCoroOperation
-	fused          [stacklessCoroPFusedCacheSize]stacklessCoroPFusedFrame
-	runqHead       uint32
-	runqTail       uint32
-	runqSched      atomic.Pointer[stacklessCoroScheduler]
-	runq           [stacklessCoroPRunqSize]*stacklessCoroTask
+	opCacheCount        uint8
+	ioOpCacheCount      uint8
+	fusedCount          uint8
+	fusedNextEvict      uint8
+	typedBurstCount     uint16
+	goroutineFreeCount  uint16
+	typedBurstGen       uint32
+	opCache             *stacklessCoroOperation
+	ioOpCache           *stacklessCoroOperation
+	goroutineFree       *stacklessCoroGoroutine
+	gUnhosted           atomic.Int64
+	pendingTypedTask    atomic.Pointer[stacklessCoroTask]
+	cacheTaskHead       uint32
+	cacheTaskTail       uint32
+	cacheTaskFrameSize  atomic.Uint32
+	cacheTaskSched      atomic.Pointer[stacklessCoroScheduler]
+	cacheTaskResume     atomic.Pointer[funcval]
+	cacheTask           [stacklessCoroPCacheTaskCap]*stacklessCoroTask
+	typedBurstResume    *funcval
+	typedBurstTyp       *_type
+	typedBurstFrameSize uintptr
+	typedBurstAllocSize uintptr
+	typedBurst          [stacklessCoroPTypedBurstCap]*stacklessCoroTask
+	spawnSites          [stacklessCoroPSpawnSiteCount]stacklessCoroSpawnSite
+	fused               [stacklessCoroPFusedCacheSize]stacklessCoroPFusedFrame
+	runqHead            uint32
+	runqTail            uint32
+	runqSched           atomic.Pointer[stacklessCoroScheduler]
+	runq                [stacklessCoroPRunqSize]*stacklessCoroTask
 }
 
 type stacklessCoroTaskLifecycleBytes struct {
@@ -242,6 +267,40 @@ func coroRunqPut(s *stacklessCoroScheduler, task *stacklessCoroTask) (uint32, bo
 	return runnable, true
 }
 
+// coroRunqPutBatchNoCount moves already-counted Runnable tasks (e.g. transferred
+// from s.head without decrementing runnableState) into the current P's runq.
+// Returns the number of tasks placed in ps.runq.
+func coroRunqPutBatchNoCount(s *stacklessCoroScheduler, tasks []*stacklessCoroTask) int {
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	if ps == nil {
+		releasem(mp)
+		return 0
+	}
+	h := atomic.LoadAcq(&ps.runqHead)
+	t := ps.runqTail
+	if t == h {
+		ps.runqSched.Store(s)
+	} else if ps.runqSched.Load() != s {
+		releasem(mp)
+		return 0
+	}
+	avail := stacklessCoroPRunqSize - (t - h)
+	n := len(tasks)
+	if uint32(n) > avail {
+		n = int(avail)
+	}
+	for i := 0; i < n; i++ {
+		ps.runq[(t+uint32(i))&(stacklessCoroPRunqSize-1)] = tasks[i]
+	}
+	if n > 0 {
+		atomic.StoreRel(&ps.runqTail, t+uint32(n))
+	}
+	releasem(mp)
+	return n
+}
+
 func coroRunqActivate(task *stacklessCoroTask) *stacklessCoroTask {
 	b := unpackTaskLifecycle(task.loadLifecycle())
 	if b.state != stacklessCoroTaskRunnable || b.resuming || b.readyPending {
@@ -284,7 +343,7 @@ func coroRunqGet(s *stacklessCoroScheduler) *stacklessCoroTask {
 // runqSched is only modified by its owning P while h == t; verifying it after
 // loading a non-empty [h, t) range guarantees that if CasRel(h, h+take) succeeds,
 // every slot in [h, h+take) belonged to s throughout the read.
-func coroRunqGrab(ps *stacklessCoroPState, s *stacklessCoroScheduler, batch *[stacklessCoroPRunqSize / 2]*stacklessCoroTask, limit uint32) uint32 {
+func coroRunqGrab(ps *stacklessCoroPState, s *stacklessCoroScheduler, batch *[stacklessCoroPRunqStealBatch]*stacklessCoroTask, limit uint32) uint32 {
 	for {
 		h := atomic.LoadAcq(&ps.runqHead)
 		t := atomic.LoadAcq(&ps.runqTail)
@@ -319,7 +378,7 @@ func coroRunqSteal(s *stacklessCoroScheduler) *stacklessCoroTask {
 		return nil
 	}
 	myps := myp.coroP.Load()
-	var batch [stacklessCoroPRunqSize / 2]*stacklessCoroTask
+	var batch [stacklessCoroPRunqStealBatch]*stacklessCoroTask
 	start := (int(myp.id) + 1) % nprocs
 	for offset := 0; offset < nprocs-1; offset++ {
 		pp := allp[(start+offset)%nprocs]
@@ -516,6 +575,54 @@ func drainStacklessCoroPState(pp *p) {
 	if ps == nil {
 		return
 	}
+	dropCoroPTypedBurst(ps)
+	if delta := ps.gUnhosted.Swap(0); delta != 0 {
+		stacklessCoroGoroutines.unhosted.Add(delta)
+	}
+	if ps.goroutineFree != nil {
+		// Return any pooled records to lock-free freeChunks so they stay reusable.
+		pushCoroPooledGChunk(ps.goroutineFree)
+		ps.goroutineFree = nil
+		ps.goroutineFreeCount = 0
+	}
+	if cs := ps.cacheTaskSched.Load(); cs != nil {
+		h := ps.cacheTaskHead
+		t := ps.cacheTaskTail
+		if h != t {
+			var bytes uint16
+			for i := h; i != t; i++ {
+				if task := ps.cacheTask[i&(stacklessCoroPCacheTaskCap-1)]; task != nil {
+					bytes += task.frameSize
+				}
+			}
+			keep := !cs.drained() && cs.cachedFrameBytes >= cs.freeFrameBytes+bytes
+			for i := h; i != t; i++ {
+				idx := i & (stacklessCoroPCacheTaskCap - 1)
+				task := ps.cacheTask[idx]
+				ps.cacheTask[idx] = nil
+				if keep && task != nil {
+					task.next = cs.freeTasks
+					cs.freeTasks = task
+				}
+			}
+			if keep {
+				cs.freeFrameBytes += bytes
+			}
+		}
+		ps.cacheTaskHead = 0
+		ps.cacheTaskTail = 0
+		ps.cacheTaskSched.Store(nil)
+		ps.cacheTaskResume.Store(nil)
+		ps.cacheTaskFrameSize.Store(0)
+	}
+	if pt := ps.pendingTypedTask.Load(); pt != nil {
+		ps.pendingTypedTask.Store(nil)
+		if parent := pt.parent(); parent != nil && parent.context.scheduler != nil {
+			s := parent.context.scheduler
+			pt.next = s.reservedTasks
+			s.reservedTasks = pt
+		}
+	}
 	if s := ps.runqSched.Load(); s != nil {
 		for ps.runqHead != ps.runqTail {
 			idx := ps.runqHead & (stacklessCoroPRunqSize - 1)
@@ -555,6 +662,52 @@ func clearStacklessCoroPStates() {
 		ps.opCacheCount = 0
 		ps.ioOpCache = nil
 		ps.ioOpCacheCount = 0
+		ps.goroutineFree = nil
+		ps.goroutineFreeCount = 0
+		if delta := ps.gUnhosted.Swap(0); delta != 0 {
+			stacklessCoroGoroutines.unhosted.Add(delta)
+		}
+		if cs := ps.cacheTaskSched.Load(); cs != nil {
+			h := ps.cacheTaskHead
+			t := ps.cacheTaskTail
+			if h != t {
+				var bytes uint16
+				for i := h; i != t; i++ {
+					if task := ps.cacheTask[i&(stacklessCoroPCacheTaskCap-1)]; task != nil {
+						bytes += task.frameSize
+					}
+				}
+				keep := !cs.drained() && cs.cachedFrameBytes >= cs.freeFrameBytes+bytes
+				for i := h; i != t; i++ {
+					idx := i & (stacklessCoroPCacheTaskCap - 1)
+					task := ps.cacheTask[idx]
+					if keep && task != nil {
+						task.next = cs.freeTasks
+						cs.freeTasks = task
+					}
+				}
+				if keep {
+					cs.freeFrameBytes += bytes
+				}
+			}
+			for i := range ps.cacheTask {
+				ps.cacheTask[i] = nil
+			}
+			ps.cacheTaskHead = 0
+			ps.cacheTaskTail = 0
+			ps.cacheTaskSched.Store(nil)
+			ps.cacheTaskResume.Store(nil)
+			ps.cacheTaskFrameSize.Store(0)
+		}
+		if pt := ps.pendingTypedTask.Load(); pt != nil {
+			ps.pendingTypedTask.Store(nil)
+			if parent := pt.parent(); parent != nil && parent.context.scheduler != nil {
+				s := parent.context.scheduler
+				pt.next = s.reservedTasks
+				s.reservedTasks = pt
+			}
+		}
+		dropCoroPTypedBurst(ps)
 		if ps.fusedCount != 0 {
 			for i := range ps.fusedCount {
 				ps.fused[i] = stacklessCoroPFusedFrame{}
@@ -744,4 +897,528 @@ func (s *stacklessCoroScheduler) waitingTaskMultiP(task *stacklessCoroTask,
 		return nil, true, true
 	}
 	return nil, false, false
+}
+
+func coroPPutPendingTypedTask(task *stacklessCoroTask) {
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	if ps != nil {
+		ps.pendingTypedTask.Store(task)
+	}
+	releasem(mp)
+}
+
+func coroPTryPutPendingTypedTask(task *stacklessCoroTask) bool {
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	ok := ps != nil && ps.pendingTypedTask.CompareAndSwap(nil, task)
+	releasem(mp)
+	return ok
+}
+
+func coroPPeekPendingTypedTask() *stacklessCoroTask {
+	mp := acquirem()
+	var task *stacklessCoroTask
+	if pp := mp.p.ptr(); pp != nil {
+		if ps := pp.coroP.Load(); ps != nil {
+			task = ps.pendingTypedTask.Load()
+		}
+	}
+	releasem(mp)
+	return task
+}
+
+func coroPTakePendingTypedTask(parent *stacklessCoroTask, frame unsafe.Pointer,
+	child stacklessCoroResume) *stacklessCoroTask {
+	mp := acquirem()
+	pp := mp.p.ptr()
+	if pp == nil {
+		releasem(mp)
+		return nil
+	}
+	ps := pp.coroP.Load()
+	if ps == nil {
+		releasem(mp)
+		return nil
+	}
+	task := ps.pendingTypedTask.Load()
+	if task == nil || task.context.frame != frame || task.parent() != parent ||
+		stacklessCoroResumeIdentity(task.resume) != stacklessCoroResumeIdentity(child) {
+		releasem(mp)
+		return nil
+	}
+	if !ps.pendingTypedTask.CompareAndSwap(task, nil) {
+		releasem(mp)
+		return nil
+	}
+	releasem(mp)
+	return task
+}
+
+// coroPTakePendingTypedTaskAnyP is the cold fallback when a goroutine migrated
+// Ps between coroTakeTypedTaskFrame and coroSpawnFrame/coroAwaitFrame.
+func coroPTakePendingTypedTaskAnyP(parent *stacklessCoroTask, frame unsafe.Pointer,
+	child stacklessCoroResume) *stacklessCoroTask {
+	if frame == nil || gomaxprocs <= 1 {
+		return nil
+	}
+	wantResume := stacklessCoroResumeIdentity(child)
+	mp := acquirem()
+	for _, pp := range allp {
+		if pp == nil {
+			continue
+		}
+		ps := pp.coroP.Load()
+		if ps == nil {
+			continue
+		}
+		task := ps.pendingTypedTask.Load()
+		if task != nil && task.context.frame == frame && task.parent() == parent &&
+			stacklessCoroResumeIdentity(task.resume) == wantResume &&
+			ps.pendingTypedTask.CompareAndSwap(task, nil) {
+			releasem(mp)
+			return task
+		}
+	}
+	releasem(mp)
+	return nil
+}
+
+// coroPCancelPendingTypedTask removes any unconsumed pending reservation owned
+// by parent across all Ps during panic/Goexit unwinding.
+func coroPCancelPendingTypedTask(parent *stacklessCoroTask) *stacklessCoroTask {
+	mp := acquirem()
+	for _, pp := range allp {
+		if pp == nil {
+			continue
+		}
+		ps := pp.coroP.Load()
+		if ps == nil {
+			continue
+		}
+		task := ps.pendingTypedTask.Load()
+		if task != nil && task.parent() == parent &&
+			ps.pendingTypedTask.CompareAndSwap(task, nil) {
+			releasem(mp)
+			return task
+		}
+	}
+	releasem(mp)
+	return nil
+}
+
+func coroPGoroutineGet() *stacklessCoroGoroutine {
+	mp := acquirem()
+	pp := mp.p.ptr()
+	if pp == nil {
+		releasem(mp)
+		return nil
+	}
+	ps := pp.coroP.Load()
+	if ps == nil || ps.goroutineFree == nil {
+		releasem(mp)
+		return nil
+	}
+	r := ps.goroutineFree
+	ps.goroutineFree = r.next
+	ps.goroutineFreeCount--
+	r.next = nil
+	r.shard = stacklessCoroPooledGTransit
+	releasem(mp)
+	return r
+}
+
+func coroPGoroutinePutBatch(head *stacklessCoroGoroutine) {
+	if head == nil {
+		return
+	}
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	if ps != nil {
+		for head != nil && ps.goroutineFreeCount < stacklessCoroPGoroutineCacheSize {
+			next := head.next
+			head.shard = stacklessCoroPooledGShard
+			head.next = ps.goroutineFree
+			ps.goroutineFree = head
+			ps.goroutineFreeCount++
+			head = next
+		}
+	}
+	if head != nil {
+		for cur := head; cur != nil; cur = cur.next {
+			cur.shard = stacklessCoroPooledGShard
+		}
+		pushCoroPooledGChunk(head)
+	}
+	releasem(mp)
+}
+
+func coroPSpawnSiteLookup(callerPC uintptr) uintptr {
+	mp := acquirem()
+	pp := mp.p.ptr()
+	if pp == nil {
+		releasem(mp)
+		return 0
+	}
+	ps := pp.coroP.Load()
+	if ps == nil {
+		releasem(mp)
+		return 0
+	}
+	site := &ps.spawnSites[(callerPC/sys.PCQuantum)%uintptr(len(ps.spawnSites))]
+	var sourcePC uintptr
+	if site.returnPC == callerPC {
+		sourcePC = site.sourcePC
+	}
+	releasem(mp)
+	return sourcePC
+}
+
+func coroPSpawnSiteStore(callerPC, sourcePC uintptr) {
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	if ps != nil {
+		site := &ps.spawnSites[(callerPC/sys.PCQuantum)%uintptr(len(ps.spawnSites))]
+		*site = stacklessCoroSpawnSite{returnPC: callerPC, sourcePC: sourcePC}
+	}
+	releasem(mp)
+}
+
+func dropCoroPTypedBurst(ps *stacklessCoroPState) {
+	if ps.typedBurstCount == 0 {
+		ps.typedBurstResume = nil
+		ps.typedBurstTyp = nil
+		return
+	}
+	dropped := uintptr(ps.typedBurstCount) * ps.typedBurstAllocSize
+	for i := uint16(0); i < ps.typedBurstCount; i++ {
+		ps.typedBurst[i] = nil
+	}
+	ps.typedBurstCount = 0
+	ps.typedBurstResume = nil
+	ps.typedBurstTyp = nil
+	ps.typedBurstFrameSize = 0
+	ps.typedBurstAllocSize = 0
+	stacklessCoroTypedBurst.totalBytes.Add(-dropped)
+}
+
+func coroPCacheTaskGrab(ps *stacklessCoroPState, s *stacklessCoroScheduler, fn *funcval, size uint32,
+	batch *[stacklessCoroPCacheStealBatch]*stacklessCoroTask, limit uint32) uint32 {
+	for {
+		h := atomic.LoadAcq(&ps.cacheTaskHead)
+		t := atomic.LoadAcq(&ps.cacheTaskTail)
+		n := t - h
+		if n == 0 || n > stacklessCoroPCacheTaskCap {
+			return 0
+		}
+		if ps.cacheTaskSched.Load() != s || ps.cacheTaskResume.Load() != fn || ps.cacheTaskFrameSize.Load() != size {
+			return 0
+		}
+		take := (n + 1) / 2
+		if take > limit {
+			take = limit
+		}
+		for i := uint32(0); i < take; i++ {
+			batch[i] = ps.cacheTask[(h+i)&(stacklessCoroPCacheTaskCap-1)]
+		}
+		if atomic.CasRel(&ps.cacheTaskHead, h, h+take) {
+			return take
+		}
+	}
+}
+
+func coroPHasCacheTasks(s *stacklessCoroScheduler) bool {
+	mp := acquirem()
+	for _, pp := range allp {
+		if pp == nil {
+			continue
+		}
+		ps := pp.coroP.Load()
+		if ps == nil || ps.cacheTaskSched.Load() != s {
+			continue
+		}
+		if atomic.LoadAcq(&ps.cacheTaskHead) != atomic.LoadAcq(&ps.cacheTaskTail) {
+			releasem(mp)
+			return true
+		}
+	}
+	releasem(mp)
+	return false
+}
+
+func coroPCacheTaskGet(s *stacklessCoroScheduler, resume stacklessCoroResume, size uint16) *stacklessCoroTask {
+	fn := stacklessCoroResumeIdentity(resume)
+	wantSize := uint32(size)
+	mp := acquirem()
+	myp := mp.p.ptr()
+	if myp == nil {
+		releasem(mp)
+		return nil
+	}
+	myps := myp.coroP.Load()
+	if myps != nil && myps.cacheTaskSched.Load() == s &&
+		myps.cacheTaskResume.Load() == fn && myps.cacheTaskFrameSize.Load() == wantSize {
+		t := myps.cacheTaskTail
+		for {
+			h := atomic.LoadAcq(&myps.cacheTaskHead)
+			if t == h {
+				break
+			}
+			task := myps.cacheTask[h&(stacklessCoroPCacheTaskCap-1)]
+			if atomic.CasRel(&myps.cacheTaskHead, h, h+1) {
+				releasem(mp)
+				return task
+			}
+		}
+	}
+	nprocs := len(allp)
+	if nprocs <= 1 {
+		releasem(mp)
+		return nil
+	}
+	var batch [stacklessCoroPCacheStealBatch]*stacklessCoroTask
+	start := (int(myp.id) + 1) % nprocs
+	for offset := 0; offset < nprocs-1; offset++ {
+		pp := allp[(start+offset)%nprocs]
+		if pp == nil || pp == myp {
+			continue
+		}
+		vps := pp.coroP.Load()
+		if vps == nil || vps.cacheTaskSched.Load() != s {
+			continue
+		}
+		limit := uint32(1)
+		if myps != nil {
+			mh := atomic.LoadAcq(&myps.cacheTaskHead)
+			mt := myps.cacheTaskTail
+			if mh == mt || (myps.cacheTaskSched.Load() == s && myps.cacheTaskResume.Load() == fn && myps.cacheTaskFrameSize.Load() == wantSize) {
+				avail := stacklessCoroPCacheTaskCap - (mt - mh)
+				if avail > 0 {
+					limit = avail + 1
+					if limit > uint32(len(batch)) {
+						limit = uint32(len(batch))
+					}
+				}
+			}
+		}
+		stolen := coroPCacheTaskGrab(vps, s, fn, wantSize, &batch, limit)
+		if stolen == 0 {
+			continue
+		}
+		if stolen > 1 && myps != nil {
+			mt := myps.cacheTaskTail
+			if atomic.LoadAcq(&myps.cacheTaskHead) == mt {
+				myps.cacheTaskSched.Store(s)
+				myps.cacheTaskResume.Store(fn)
+				myps.cacheTaskFrameSize.Store(wantSize)
+			}
+			for i := uint32(1); i < stolen; i++ {
+				myps.cacheTask[(mt+i-1)&(stacklessCoroPCacheTaskCap-1)] = batch[i]
+			}
+			atomic.StoreRel(&myps.cacheTaskTail, mt+stolen-1)
+		}
+		task := batch[0]
+		releasem(mp)
+		return task
+	}
+	releasem(mp)
+	return nil
+}
+
+func coroPCacheTaskPutBatch(s *stacklessCoroScheduler, resume stacklessCoroResume, size uint16, tasks []*stacklessCoroTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	fn := stacklessCoroResumeIdentity(resume)
+	wantSize := uint32(size)
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	stored := 0
+	if ps != nil {
+		h := atomic.LoadAcq(&ps.cacheTaskHead)
+		t := ps.cacheTaskTail
+		if h == t {
+			ps.cacheTaskSched.Store(s)
+			ps.cacheTaskResume.Store(fn)
+			ps.cacheTaskFrameSize.Store(wantSize)
+		}
+		if ps.cacheTaskSched.Load() == s && ps.cacheTaskResume.Load() == fn && ps.cacheTaskFrameSize.Load() == wantSize {
+			avail := int(stacklessCoroPCacheTaskCap - (t - h))
+			n := len(tasks)
+			if n > avail {
+				n = avail
+			}
+			for i := 0; i < n; i++ {
+				ps.cacheTask[(t+uint32(i))&(stacklessCoroPCacheTaskCap-1)] = tasks[i]
+			}
+			if n > 0 {
+				atomic.StoreRel(&ps.cacheTaskTail, t+uint32(n))
+				stored = n
+			}
+		}
+	}
+	releasem(mp)
+	if stored < len(tasks) {
+		var bytes uint16
+		for i := stored; i < len(tasks); i++ {
+			bytes += tasks[i].frameSize
+		}
+		lock(&s.lock)
+		if !s.drained() && s.cachedFrameBytes >= s.freeFrameBytes+bytes {
+			for i := stored; i < len(tasks); i++ {
+				t := tasks[i]
+				t.next = s.freeTasks
+				s.freeTasks = t
+			}
+			s.freeFrameBytes += bytes
+		}
+		unlock(&s.lock)
+	}
+}
+
+func coroPCacheTaskPut(s *stacklessCoroScheduler, task *stacklessCoroTask) {
+	fn := stacklessCoroResumeIdentity(task.resume)
+	wantSize := uint32(task.frameSize)
+	mp := acquirem()
+	var ps *stacklessCoroPState
+	mp, ps = ensureCoroPState(mp)
+	if ps == nil {
+		releasem(mp)
+		lock(&s.lock)
+		if !s.drained() && s.cachedFrameBytes >= s.freeFrameBytes+task.frameSize {
+			task.next = s.freeTasks
+			s.freeTasks = task
+			s.freeFrameBytes += task.frameSize
+		}
+		unlock(&s.lock)
+		return
+	}
+	h := atomic.LoadAcq(&ps.cacheTaskHead)
+	t := ps.cacheTaskTail
+	if h == t {
+		ps.cacheTaskSched.Store(s)
+		ps.cacheTaskResume.Store(fn)
+		ps.cacheTaskFrameSize.Store(wantSize)
+		ps.cacheTask[t&(stacklessCoroPCacheTaskCap-1)] = task
+		atomic.StoreRel(&ps.cacheTaskTail, t+1)
+		releasem(mp)
+		return
+	}
+	if ps.cacheTaskSched.Load() == s && ps.cacheTaskResume.Load() == fn &&
+		ps.cacheTaskFrameSize.Load() == wantSize && t-h < stacklessCoroPCacheTaskCap {
+		ps.cacheTask[t&(stacklessCoroPCacheTaskCap-1)] = task
+		atomic.StoreRel(&ps.cacheTaskTail, t+1)
+		releasem(mp)
+		return
+	}
+	// If the local ring belongs to a different scheduler, drain it first so this
+	// P switches cleanly to s.
+	var oldSched *stacklessCoroScheduler
+	var oldHead *stacklessCoroTask
+	var oldBytes uint16
+	if curSched := ps.cacheTaskSched.Load(); curSched != nil && curSched != s {
+		for {
+			ch := atomic.LoadAcq(&ps.cacheTaskHead)
+			if ch == t {
+				break
+			}
+			item := ps.cacheTask[ch&(stacklessCoroPCacheTaskCap-1)]
+			if atomic.CasRel(&ps.cacheTaskHead, ch, ch+1) {
+				if item != nil {
+					item.next = oldHead
+					oldHead = item
+					oldBytes += item.frameSize
+				}
+			}
+		}
+		oldSched = curSched
+		ps.cacheTaskSched.Store(s)
+		ps.cacheTaskResume.Store(fn)
+		ps.cacheTaskFrameSize.Store(wantSize)
+		ps.cacheTask[t&(stacklessCoroPCacheTaskCap-1)] = task
+		atomic.StoreRel(&ps.cacheTaskTail, t+1)
+		releasem(mp)
+		if oldHead != nil && !oldSched.drained() {
+			lock(&oldSched.lock)
+			if !oldSched.drained() && oldSched.cachedFrameBytes >= oldSched.freeFrameBytes+oldBytes {
+				for oldHead != nil {
+					next := oldHead.next
+					oldHead.next = oldSched.freeTasks
+					oldSched.freeTasks = oldHead
+					oldHead = next
+				}
+				oldSched.freeFrameBytes += oldBytes
+			}
+			unlock(&oldSched.lock)
+		}
+		return
+	}
+	releasem(mp)
+	lock(&s.lock)
+	if !s.drained() && s.cachedFrameBytes >= s.freeFrameBytes+task.frameSize {
+		task.next = s.freeTasks
+		s.freeTasks = task
+		s.freeFrameBytes += task.frameSize
+	}
+	unlock(&s.lock)
+}
+
+func coroPFlushCacheTasks(s *stacklessCoroScheduler) {
+	mp := acquirem()
+	pp := mp.p.ptr()
+	if pp == nil {
+		releasem(mp)
+		return
+	}
+	ps := pp.coroP.Load()
+	if ps == nil {
+		releasem(mp)
+		return
+	}
+	flushSched := ps.cacheTaskSched.Load()
+	if flushSched == nil || (s != nil && flushSched != s) {
+		releasem(mp)
+		return
+	}
+	t := ps.cacheTaskTail
+	if atomic.LoadAcq(&ps.cacheTaskHead) == t {
+		releasem(mp)
+		return
+	}
+	var flushHead *stacklessCoroTask
+	var flushBytes uint16
+	keep := !flushSched.drained()
+	for {
+		h := atomic.LoadAcq(&ps.cacheTaskHead)
+		if h == t {
+			break
+		}
+		item := ps.cacheTask[h&(stacklessCoroPCacheTaskCap-1)]
+		if atomic.CasRel(&ps.cacheTaskHead, h, h+1) {
+			if keep && item != nil {
+				item.next = flushHead
+				flushHead = item
+				flushBytes += item.frameSize
+			}
+		}
+	}
+	releasem(mp)
+	if flushHead != nil && !flushSched.drained() {
+		lock(&flushSched.lock)
+		if !flushSched.drained() && flushSched.cachedFrameBytes >= flushSched.freeFrameBytes+flushBytes {
+			for flushHead != nil {
+				next := flushHead.next
+				flushHead.next = flushSched.freeTasks
+				flushSched.freeTasks = flushHead
+				flushHead = next
+			}
+			flushSched.freeFrameBytes += flushBytes
+		}
+		unlock(&flushSched.lock)
+	}
 }

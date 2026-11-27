@@ -69,7 +69,7 @@ func StacklessCoroClosePublicationForTest(count, schedulers int,
 			s.freeOperations = newStacklessCoroIOOperation()
 			s.freeOperationCount = 1
 		}
-		s.liveSpawns++
+		s.liveSpawns.Add(1)
 		startStacklessCoroChannel(unsafe.Pointer(&task.context), channel,
 			element, &frame.received, false)
 		task.resuming = false
@@ -153,7 +153,7 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	s.wake = make(chan struct{})
 	s.rootDone = make(chan struct{})
 	s.lifetime.Store(stacklessCoroLifetimeSpawned)
-	s.liveSpawns = 2
+	s.liveSpawns.Store(2)
 	s.root.state = stacklessCoroTaskRunning
 	s.root.resuming = true
 	if executors {
@@ -164,7 +164,7 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	first.state, last.state = stacklessCoroTaskRunning, stacklessCoroTaskRunning
 	first.resuming, last.resuming = true, true
 	s.complete(first)
-	if s.liveSpawns != 1 || s.rootComplete() || s.drained() {
+	if s.liveSpawns.Load() != 1 || s.rootComplete() || s.drained() {
 		return false
 	}
 	events := make(chan uint8, 1)
@@ -207,5 +207,5 @@ func StacklessCoroCompletionWakeForTest(executors bool) bool {
 	state := <-events
 	valid = valid && state&3 == 3 && (executors || state&4 != 0)
 	<-done
-	return valid && s.drained() && s.liveSpawns == 0
+	return valid && s.drained() && s.liveSpawns.Load() == 0
 }

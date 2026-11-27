@@ -171,6 +171,7 @@ const (
 	stacklessCoroLifetimeHostStarted
 	stacklessCoroLifetimePublicHost
 	stacklessCoroLifetimePRunqUsed
+	stacklessCoroLifetimeTypedBurstFast
 )
 
 type stacklessCoroTaskState uint8
@@ -352,14 +353,16 @@ type stacklessCoroScheduler struct {
 	initialRootPrivate bool
 	// lifetime publishes monotonic facts for one initialized scheduler
 	// lifetime. Root completion is published only after its outcome is ready.
-	lifetime atomic.Uint8
-	// liveSpawns counts independent logical goroutines, not structured
-	// await frames. It is protected by lock. Root completion does not end
-	// their lifetime; Drained is published only when this count is zero.
-	liveSpawns     uint64
+	lifetime       atomic.Uint8
+	hasIO          atomic.Bool
 	root           stacklessCoroTask
 	terminalValues atomic.Pointer[stacklessCoroTerminalValue]
-	wake           chan struct{}
+	executorState  atomic.Uint32
+	// executorCount includes the original driver. Placed with read-mostly
+	// fields in the first 128 bytes so multi-P atomic updates to liveSpawns
+	// and runnableState do not false-share with lifetime/executorState/root.
+	executorCount atomic.Uint32
+	wake          chan struct{}
 	// rootDone belongs to the public caller, independently of the work wake
 	// channel. It is allocated only when a root first spawns another task.
 	rootDone chan struct{}
@@ -371,20 +374,19 @@ type stacklessCoroScheduler struct {
 	executorWake chan struct{}
 	// executorDone reports false for a replacement and true for the manager.
 	// Receiving the manager's marker freezes executorCount for the final join.
-	executorDone  chan bool
-	executorGrow  chan struct{}
-	executorStop  chan struct{}
-	executorState atomic.Uint32
-	// executorCount includes the original driver. blockingExecutors counts
-	// drivers that entered a blocking native operation but have not yet
-	// returned with a P.
-	executorCount     atomic.Uint32
-	blockingExecutors atomic.Uint32
+	executorDone chan bool
+	executorGrow chan struct{}
+	executorStop chan struct{}
+	// liveSpawns counts independent logical goroutines, not structured
+	// await frames. Updated atomically so multi-P uncached completions avoid
+	// s.lock until the final 1->0 drain transition.
+	liveSpawns atomic.Uint64
 	// runnableState stores the runnable count in its low 31 bits. The high
 	// bit asks a native executor to yield its P to a returning foreign call.
-	runnableState    atomic.Uint32
-	drainCacheAge    stacklessCoroDrainCacheAge
-	foreignReturners atomic.Uint32
+	runnableState     atomic.Uint32
+	blockingExecutors atomic.Uint32
+	drainCacheAge     stacklessCoroDrainCacheAge
+	foreignReturners  atomic.Uint32
 }
 
 // stacklessCoroOperationResources retains reusable resources after clearing the state
@@ -854,7 +856,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// removing its operation from the global registry. It may still read wake
 	// to signal an already completed task, so retain the immutable channel and
 	// leave both allocations to GC rather than inspecting or reusing them.
-	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted) != 0 {
+	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted|stacklessCoroLifetimePRunqUsed) != 0 {
 		return false
 	}
 	state := s.loadExecutorState()
@@ -879,9 +881,10 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	}
 	wake := s.wake
 	drainStacklessCoroWake(wake)
+	s.hasIO.Store(false)
 	if state == stacklessCoroExecutorStateOff &&
 		s.freeTasks == nil && s.freeOperations == nil && s.rootDone == nil &&
-		s.liveSpawns == 0 && s.freePlainTaskCount == 0 &&
+		s.liveSpawns.Load() == 0 && s.freePlainTaskCount == 0 &&
 		s.freeFrameBytes == 0 && s.cachedFrameTasks == 0 &&
 		s.cachedFrameBytes == 0 && s.freeOperationCount == 0 &&
 		s.overflowTaskCounts == 0 && s.batchedTaskCounts == 0 {
@@ -1120,7 +1123,7 @@ func (s *stacklessCoroScheduler) newScalarFrameTaskLocked(
 //go:noinline
 func (s *stacklessCoroScheduler) allocateScalarFrameTasksLocked() *stacklessCoroTask {
 	if s.batchedTaskCounts&stacklessCoroDirectBatchedTaskCountMask == stacklessCoroTypedTaskFrameAllocationMode &&
-		s.liveSpawns <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
+		s.liveSpawns.Load() <= stacklessCoroTaskCacheSize+stacklessCoroDirectBatchedTaskCount {
 		// Short mixed populations keep their exact individual task/tiny-frame
 		// charge. Beyond the local cache and direct prefix, the existing scalar
 		// block can serve a sustained population without growing either header.
@@ -1697,6 +1700,9 @@ func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *s
 		recordStacklessCoroPanic(s, task, value, true, p)
 		task.context.scheduler = nil
 		s.readyAfterPanic(task)
+		if s.multiPFastPath() {
+			coroPFlushCacheTasks(s)
+		}
 	}()
 
 	// Select the private root before entering the ordinary queue loop. Keeping
@@ -1716,6 +1722,9 @@ next:
 	// owner then selects detached children without tying their C activations
 	// to the ordinary public caller's stack.
 	if s.driverDone(public) {
+		if s.multiPFastPath() {
+			coroPFlushCacheTasks(s)
+		}
 		return nil
 	}
 	task = s.take()
@@ -1726,6 +1735,28 @@ next:
 idlePoll:
 	task = stacklessCoroPollIOBeforePark(s, idlePollSkip)
 	if task == nil {
+		if native && !raceenabled && !stacklessCoroIsPullComparison(s) && !public &&
+			s.multiPFastPath() && !s.drained() && !s.hasIO.Load() &&
+			s.pRunqUsed() &&
+			s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 &&
+			s.liveSpawns.Load() >= 2 {
+			for outer := 0; outer < 16; outer++ {
+				if s.drained() || getg().preempt || gcBlackenEnabled != 0 || stacklessCoroHostRunnable() {
+					break
+				}
+				for inner := 0; inner < 32; inner++ {
+					if s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0 {
+						if task = s.take(); task != nil {
+							goto resume
+						}
+					}
+					procyield(30)
+				}
+			}
+		}
+		if s.multiPFastPath() {
+			coroPFlushCacheTasks(s)
+		}
 		if !park {
 			return idlePollSkip
 		}
@@ -1983,12 +2014,11 @@ func (s *stacklessCoroScheduler) completeLogicalTaskLocked(task *stacklessCoroTa
 	if task == &s.root {
 		s.lifetime.Or(stacklessCoroLifetimeRootComplete)
 	} else {
-		if s.liveSpawns == 0 {
+		if s.liveSpawns.Add(-1) == ^uint64(0) {
 			throw("runtime: stackless coroutine spawn count underflow")
 		}
-		s.liveSpawns--
 	}
-	if s.rootComplete() && s.liveSpawns == 0 {
+	if s.rootComplete() && s.liveSpawns.Load() == 0 {
 		s.drainCacheAge.complete()
 		if !raceenabled && s.spawned() {
 			s.cacheDrainedOperationsLocked()
@@ -2100,6 +2130,24 @@ func coroTakeFrame(ctx unsafe.Pointer, child stacklessCoroResume,
 	s := context.scheduler
 	if isStacklessCoroUncachedFrameLineage(parent.frameSize) {
 		return nil
+	}
+	if s.multiPFastPath() && s.pRunqUsed() {
+		if cached := coroPCacheTaskGet(s, child, uint16(size)); cached != nil {
+			if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+				parent.readyPending || parent.terminal != stacklessCoroTerminalNone || parent.goexit {
+				throw("runtime: stackless coroutine frame reservation outside resume")
+			}
+			cached.setParent(parent)
+			if coroPTryPutPendingTypedTask(cached) {
+				return cached.context.frame
+			}
+			lock(&s.lock)
+			cached.next = s.reservedTasks
+			s.reservedTasks = cached
+			frame := cached.context.frame
+			unlock(&s.lock)
+			return frame
+		}
 	}
 	lock(&s.lock)
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
@@ -3298,6 +3346,9 @@ func (s *stacklessCoroScheduler) markUncachedFrameLineageLocked(task,
 func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 	resume stacklessCoroResume, size uint16) *stacklessCoroTask {
 	if s.freeTasks == nil {
+		if s.multiPFastPath() {
+			return coroPCacheTaskGet(s, resume, size)
+		}
 		return nil
 	}
 	identity := stacklessCoroResumeIdentity(resume)
@@ -3322,6 +3373,11 @@ func (s *stacklessCoroScheduler) takeCachedFrameTaskLocked(
 		s.freeFrameBytes -= task.frameSize
 		task.next = nil
 		return task
+	}
+	if s.multiPFastPath() {
+		if task := coroPCacheTaskGet(s, resume, size); task != nil {
+			return task
+		}
 	}
 	// A different warm family may fill the byte budget with smaller frames.
 	// Retiring just the holder used by the next reservation need not make room
@@ -3435,6 +3491,12 @@ func stacklessCoroResumeIdentity(resume stacklessCoroResume) *funcval {
 
 func (s *stacklessCoroScheduler) cancelReservedFrameTasksLocked(
 	parent *stacklessCoroTask) {
+	if pending := coroPCancelPendingTypedTask(parent); pending != nil {
+		pending.setParent(nil)
+		pending.state = stacklessCoroTaskComplete
+		s.discardCachedFrameTaskLocked(pending)
+		s.recycleTaskLocked(pending)
+	}
 	reserved := s.reservedTasks
 	s.reservedTasks = nil
 	for task := reserved; task != nil; {
@@ -3469,6 +3531,13 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 		throw("runtime: invalid stackless coroutine await")
 	}
 	s := context.scheduler
+	var pendingTask *stacklessCoroTask
+	if s.multiPSpawnFastPath() {
+		pendingTask = coroPTakePendingTypedTask(parent, frame, child)
+		if pendingTask == nil && frame != nil {
+			pendingTask = coroPTakePendingTypedTaskAnyP(parent, frame, child)
+		}
+	}
 	lock(&s.lock)
 	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
 		parent.readyPending ||
@@ -3476,7 +3545,10 @@ func coroAwaitFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) {
 		unlock(&s.lock)
 		throw("runtime: stackless coroutine await outside resume")
 	}
-	task := s.takeReservedFrameTaskLocked(parent, frame, child)
+	task := pendingTask
+	if task == nil {
+		task = s.takeReservedFrameTaskLocked(parent, frame, child)
+	}
 	if task == nil {
 		task = s.newTaskLocked(frame, child, parent)
 	}
@@ -3977,7 +4049,14 @@ func coroSpawn(ctx unsafe.Pointer, child stacklessCoroResume) bool {
 	return coroSpawnFrame(ctx, nil, child)
 }
 
+func (s *stacklessCoroScheduler) multiPSpawnFastPath() bool {
+	return s.multiPFastPath() &&
+		(s.pRunqUsed() || s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeTypedBurstFast) != 0)
+}
+
 func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
+	callerPC := sys.GetCallerPC()
+	callerSP := unsafe.Pointer(sys.GetCallerSP())
 	context := (*stacklessCoroContext)(ctx)
 	parent := context.task()
 	if context == nil || context.scheduler == nil || parent == nil ||
@@ -3985,32 +4064,118 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 		throw("runtime: invalid stackless coroutine spawn")
 	}
 	s := context.scheduler
-	lock(&s.lock)
-	if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
-		parent.readyPending || parent.terminal != stacklessCoroTerminalNone ||
-		parent.goexit {
+	if !s.multiPSpawnFastPath() {
+		lock(&s.lock)
+		if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending || parent.terminal != stacklessCoroTerminalNone ||
+			parent.goexit {
+			unlock(&s.lock)
+			throw("runtime: stackless coroutine spawn outside resume")
+		}
+		task := s.takeReservedFrameTaskLocked(parent, frame, child)
+		if task == nil {
+			task = s.newTaskLocked(frame, child, nil)
+		} else {
+			task.setParent(nil)
+		}
+		s.markUncachedFrameLineageLocked(task, parent, frame)
+		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) ||
+			(task.frameSize == stacklessCoroUncachedFrameLineage &&
+				frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task))) {
+			task.setFlag(stacklessCoroTaskTypedSpawn, true)
+		}
+		live := s.liveSpawns.Add(1)
+		if live == 0 {
+			unlock(&s.lock)
+			throw("runtime: stackless coroutine spawn count overflow")
+		}
+		s.registerGoroutineLocked(task, parent, callerPC, callerSP)
+		if s.lifetime.Load()&stacklessCoroLifetimeSpawned == 0 {
+			s.lifetime.Or(stacklessCoroLifetimeSpawned)
+		}
+		runnable := s.readyLocked(task)
+		yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
+			live <= stacklessCoroTaskCacheSize
 		unlock(&s.lock)
-		throw("runtime: stackless coroutine spawn outside resume")
+		s.prepareReplacementExecutors()
+		if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
+			s.signal()
+		}
+		s.wakeReplacementExecutor()
+		return yield
 	}
-	task := s.takeReservedFrameTaskLocked(parent, frame, child)
-	if task == nil {
-		task = s.newTaskLocked(frame, child, nil)
-	} else {
+	var task *stacklessCoroTask
+	var live uint64
+	pending := coroPTakePendingTypedTask(parent, frame, child)
+	if pending == nil && frame != nil {
+		pending = coroPTakePendingTypedTaskAnyP(parent, frame, child)
+	}
+	if pending != nil {
+		if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending || parent.terminal != stacklessCoroTerminalNone ||
+			parent.goexit {
+			throw("runtime: stackless coroutine spawn outside resume")
+		}
+		task = pending
 		task.setParent(nil)
+		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) ||
+			(task.frameSize == stacklessCoroUncachedFrameLineage &&
+				frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task))) {
+			task.setFlag(stacklessCoroTaskTypedSpawn, true)
+		}
+		live = s.liveSpawns.Add(1)
+		if live == 0 {
+			throw("runtime: stackless coroutine spawn count overflow")
+		}
+	} else {
+		lock(&s.lock)
+		if parent.state != stacklessCoroTaskRunning || !parent.resuming ||
+			parent.readyPending || parent.terminal != stacklessCoroTerminalNone ||
+			parent.goexit {
+			unlock(&s.lock)
+			throw("runtime: stackless coroutine spawn outside resume")
+		}
+		task = s.takeReservedFrameTaskLocked(parent, frame, child)
+		if task == nil {
+			task = s.newTaskLocked(frame, child, nil)
+		} else {
+			task.setParent(nil)
+		}
+		s.markUncachedFrameLineageLocked(task, parent, frame)
+		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) ||
+			(task.frameSize == stacklessCoroUncachedFrameLineage &&
+				frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task))) {
+			task.setFlag(stacklessCoroTaskTypedSpawn, true)
+		}
+		live = s.liveSpawns.Add(1)
+		if live == 0 {
+			unlock(&s.lock)
+			throw("runtime: stackless coroutine spawn count overflow")
+		}
+		unlock(&s.lock)
 	}
-	s.markUncachedFrameLineageLocked(task, parent, frame)
-	if s.liveSpawns == ^uint64(0) {
-		throw("runtime: stackless coroutine spawn count overflow")
+	// Register the logical goroutine identity outside s.lock so global
+	// goroutine registry locking never nests inside the scheduler lock.
+	s.registerGoroutineLocked(task, parent, callerPC, callerSP)
+	if s.lifetime.Load()&stacklessCoroLifetimeSpawned == 0 {
+		s.lifetime.Or(stacklessCoroLifetimeSpawned)
 	}
-	if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) ||
-		(task.frameSize == stacklessCoroUncachedFrameLineage &&
-			frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task))) {
-		task.setFlag(stacklessCoroTaskTypedSpawn, true)
+	var runnable uint32
+	if coroRunqEligible(s, task) {
+		task.setLifecycle(taskWordRunnable)
+		task.next = nil
+		var queued bool
+		runnable, queued = coroRunqPut(s, task)
+		if !queued {
+			lock(&s.lock)
+			runnable = s.enqueueRunnableLocked(task)
+			unlock(&s.lock)
+		}
+	} else {
+		lock(&s.lock)
+		runnable = s.readyLocked(task)
+		unlock(&s.lock)
 	}
-	s.liveSpawns++
-	s.registerGoroutineLocked(task, parent, sys.GetCallerPC(), unsafe.Pointer(sys.GetCallerSP()))
-	s.lifetime.Or(stacklessCoroLifetimeSpawned)
-	runnable := s.readyLocked(task)
 	// Give ready children an execution opportunity before a producer grows
 	// an unbounded queue. Parked children leave this queue, so this hint
 	// never caps the live set or waits for child completion. Once more than
@@ -4018,8 +4183,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, child stacklessCoroResume) bool {
 	// unlikely to replenish that cache; let the producer reach its next
 	// source suspension instead. Completing ready children keep this count low.
 	yield := runnable&^stacklessCoroForeignReturnerBit >= stacklessCoroTaskCacheSize/2 &&
-		s.liveSpawns <= stacklessCoroTaskCacheSize
-	unlock(&s.lock)
+		live <= stacklessCoroTaskCacheSize
 	s.prepareReplacementExecutors()
 	if host := currentStacklessCoroHost(); host != nil && host.scheduler == s {
 		// A host does not consume the scheduler's ordinary task queue. Its
@@ -4438,6 +4602,9 @@ func stacklessCoroStartOperationOfKind(ctx unsafe.Pointer, name string,
 		throw("runtime: invalid stackless coroutine " + name)
 	}
 	s := context.scheduler
+	if kind == stacklessCoroOperationIO && !s.hasIO.Load() {
+		s.hasIO.Store(true)
+	}
 	if (kind == stacklessCoroOperationChannel || kind == stacklessCoroOperationIO) &&
 		s.multiPFastPath() &&
 		s.lifetime.Load()&stacklessCoroLifetimeOperationStarted != 0 {
@@ -4766,9 +4933,14 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 			}
 		}
 	}
-	lock(&s.lock)
-	task := s.takeLocked(current)
-	unlock(&s.lock)
+	var task *stacklessCoroTask
+	if current == nil && s.multiPFastPath() && s.pRunqUsed() {
+		task = s.takeGlobalBatchMultiP()
+	} else {
+		lock(&s.lock)
+		task = s.takeLocked(current)
+		unlock(&s.lock)
+	}
 	if task == nil && current == nil && s.pRunqUsed() &&
 		s.runnableState.Load()&^stacklessCoroForeignReturnerBit != 0 {
 		if task = coroRunqGet(s); task == nil {
@@ -4777,6 +4949,48 @@ func (s *stacklessCoroScheduler) take() *stacklessCoroTask {
 	}
 	if task != nil && raceenabled {
 		raceacquire(unsafe.Pointer(task))
+	}
+	return task
+}
+
+//go:noinline
+func (s *stacklessCoroScheduler) takeGlobalBatchMultiP() *stacklessCoroTask {
+	var batch [32]*stacklessCoroTask
+	batchN := 0
+	lock(&s.lock)
+	task := s.takeLocked(nil)
+	if task != nil && s.head != nil {
+		for batchN < len(batch) && s.head != nil {
+			cand := s.head
+			if !coroRunqEligible(s, cand) || cand.state != stacklessCoroTaskRunnable || cand.resuming || cand.readyPending {
+				break
+			}
+			s.head = cand.next
+			if s.head == nil {
+				s.tail = nil
+			}
+			cand.next = nil
+			batch[batchN] = cand
+			batchN++
+		}
+	}
+	unlock(&s.lock)
+	if batchN > 0 {
+		pushed := coroRunqPutBatchNoCount(s, batch[:batchN])
+		if pushed < batchN {
+			lock(&s.lock)
+			for i := pushed; i < batchN; i++ {
+				t := batch[i]
+				t.next = nil
+				if s.tail == nil {
+					s.head = t
+				} else {
+					s.tail.next = t
+				}
+				s.tail = t
+			}
+			unlock(&s.lock)
+		}
 	}
 	return task
 }
@@ -5058,6 +5272,113 @@ func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext,
 			current = nil
 		}
 	}
+	// Multi-P lock-free fast path for completed independent CacheFrame tasks.
+	// Batches recycled CacheFrame tasks per P once the scheduler uses multi-P
+	// per-P queues.
+	if current == nil && s.multiPFastPath() && s.pRunqUsed() && task != &s.root &&
+		task.parent() == nil && task.hasFlag(stacklessCoroTaskCacheFrame) &&
+		task.flags&stacklessCoroTaskCompletionMask == 0 &&
+		task.terminal == stacklessCoroTerminalNone && !task.goexit &&
+		s.terminalValues.Load() == nil && coroRunqEligible(s, task) {
+		if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {
+			throw("runtime: invalid stackless coroutine completion")
+		}
+		stacklessCoroCompleteLogicalFrame(task)
+		task.setLifecycle(packTaskLifecycle(stacklessCoroTaskNew, false, false, stacklessCoroTerminalNone))
+		task.next = nil
+		// Decrement liveSpawns lock-free whenever cur > 1, OR when cur == 1
+		// and root is still running (!s.rootComplete()). Re-check rootComplete()
+		// after the 1->0 atomic transition so a concurrent root completion is
+		// guaranteed to publish Drained via the two-RMW fence.
+		remaining := s.liveSpawns.Add(-1)
+		if remaining == ^uint64(0) {
+			throw("runtime: stackless coroutine spawn count underflow")
+		}
+		if remaining == 0 && s.rootComplete() {
+			task.setLifecycle(taskWordComplete)
+			lock(&s.lock)
+			if s.rootComplete() && s.liveSpawns.Load() == 0 && !s.drained() {
+				s.drainCacheAge.complete()
+				if !raceenabled && s.spawned() {
+					s.cacheDrainedOperationsLocked()
+				}
+				s.lifetime.Or(stacklessCoroLifetimeDrained)
+			}
+			s.recycleTaskLocked(task)
+			unlock(&s.lock)
+			s.logicalTaskComplete(false)
+		} else {
+			coroPCacheTaskPut(s, task)
+		}
+		if takeNext && !s.driverDone(public) {
+			return s.take()
+		}
+		return nil
+	}
+	// Multi-P lock-free fast path for completed independent uncached/typed-burst
+	// tasks. Avoids s.lock entirely unless liveSpawns drops from 1 to 0.
+	// Four-member scalar task chunks stay on the locked path so s.lock continues
+	// to serialize sibling completion checks before whole-chunk cache publication.
+	if current == nil && s.multiPFastPath() && task != &s.root &&
+		task.parent() == nil && !task.hasFlag(stacklessCoroTaskCacheFrame) &&
+		isStacklessCoroUncachedFrameLineage(task.frameSize) &&
+		!isStacklessCoroScalarTaskCacheMarker(task.frameSize) &&
+		task.flags&stacklessCoroTaskCompletionMask == 0 &&
+		task.terminal == stacklessCoroTerminalNone && !task.goexit &&
+		s.terminalValues.Load() == nil && coroRunqEligible(s, task) {
+		if task.state != stacklessCoroTaskRunning || !task.resuming || task.readyPending {
+			throw("runtime: invalid stackless coroutine completion")
+		}
+		stacklessCoroCompleteLogicalFrame(task)
+		var burstResume stacklessCoroResume
+		if unsafe.Sizeof(uintptr(0)) == 8 &&
+			task.frameSize == stacklessCoroUncachedFrameLineage &&
+			task.hasFlag(stacklessCoroTaskTypedSpawn) &&
+			task.parentOrSource == nil &&
+			task.context.frame == add(unsafe.Pointer(task), unsafe.Sizeof(*task)) {
+			burstResume = task.resume
+		}
+		task.setLifecycle(taskWordComplete)
+		clearStacklessCoroTaskFrame(task)
+		if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+			cacheStacklessCoroCompletedTask(task)
+		} else {
+			task.frameSize = 0
+			if burstResume != nil {
+				cacheStacklessCoroTypedBurst(burstResume, task)
+			}
+		}
+		remaining := s.liveSpawns.Add(-1)
+		if remaining == ^uint64(0) {
+			throw("runtime: stackless coroutine spawn count underflow")
+		}
+		if remaining == 0 && s.rootComplete() {
+			lock(&s.lock)
+			if s.rootComplete() && s.liveSpawns.Load() == 0 && !s.drained() {
+				s.drainCacheAge.complete()
+				if !raceenabled && s.spawned() {
+					s.cacheDrainedOperationsLocked()
+				}
+				s.lifetime.Or(stacklessCoroLifetimeDrained)
+			}
+			unlock(&s.lock)
+			s.logicalTaskComplete(false)
+		}
+		if takeNext && !s.driverDone(public) {
+			return s.take()
+		}
+		return nil
+	}
+	// Detach independent goroutine metadata outside s.lock only when the
+	// multi-P lock-free goroutine path is active, avoiding a second contention
+	// point on stacklessCoroGoroutines.lock for single-queue pure-CPU bursts.
+	logicalCompleted := false
+	if s.multiPSpawnFastPath() && task.parent() == nil && task.state == stacklessCoroTaskRunning && task.resuming &&
+		!task.readyPending && task.flags&stacklessCoroTaskCompletionMask == 0 &&
+		task.terminal == stacklessCoroTerminalNone && !task.goexit {
+		stacklessCoroCompleteLogicalFrame(task)
+		logicalCompleted = true
+	}
 	lock(&s.lock)
 	if task.state != stacklessCoroTaskRunning || !task.resuming ||
 		task.readyPending ||
@@ -5067,7 +5388,9 @@ func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext,
 		throw("runtime: invalid stackless coroutine completion")
 	}
 	deferred := task.parent() != nil && task.hasFlag(stacklessCoroTaskDeferChild)
-	stacklessCoroCompleteLogicalFrame(task)
+	if !logicalCompleted {
+		stacklessCoroCompleteLogicalFrame(task)
+	}
 	if deferred {
 		task.setFlag(stacklessCoroTaskDeferChild, false)
 	}
@@ -5348,6 +5671,14 @@ func (s *stacklessCoroScheduler) signal() {
 	}
 }
 
+func (s *stacklessCoroScheduler) signalParallelCap(maxBuffered uint) {
+	stacklessCoroSendWakeCap(s.wake, maxBuffered, true)
+}
+
+func (s *stacklessCoroScheduler) signalCap(maxBuffered uint, parallel bool) {
+	stacklessCoroSendWakeCap(s.wake, maxBuffered, parallel)
+}
+
 func (s *stacklessCoroScheduler) signalIfWaiting() {
 	v := s.executorState.Load()
 	if raceenabled || v&stacklessCoroExecutorStateMask == stacklessCoroExecutorStateOff ||
@@ -5390,7 +5721,13 @@ func (s *stacklessCoroScheduler) wakeMultiprocessorReplacementExecutor() {
 		}
 		v = s.executorState.Load()
 	}
-	if v&stacklessCoroExecutorWaitingMask != 0 || stacklessCoroIsPullComparison(s) {
+	if waiting := (v & stacklessCoroExecutorWaitingMask) >> stacklessCoroExecutorWaitingShift; waiting != 0 {
+		if s.multiPSpawnFastPath() {
+			s.signalCap(1, false)
+		} else {
+			s.signal()
+		}
+	} else if stacklessCoroIsPullComparison(s) {
 		s.signal()
 	}
 	// Admit at most min(gomaxprocs, stacklessCoroWarmExecutorCount)-1 warm
