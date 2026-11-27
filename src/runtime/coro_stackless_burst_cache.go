@@ -60,9 +60,9 @@ func drainCoroPTypedBurstOnP(pp *p) {
 }
 
 func drainStacklessCoroPTypedBurst() {
-	systemstack(func() {
-		forEachP(waitReasonFlushProcCaches, drainCoroPTypedBurstOnP)
-	})
+	semacquire(&worldsema)
+	forEachP(waitReasonFlushProcCaches, drainCoroPTypedBurstOnP)
+	semrelease(&worldsema)
 }
 
 func tryReserveStacklessCoroTypedBurstBytes(allocSize uintptr) bool {
