@@ -216,7 +216,7 @@ func StacklessCoroClearNativeTaskCachesForTest() int {
 func StacklessCoroClearCurrentRootCacheForTest(ctx unsafe.Pointer) {
 	context := (*stacklessCoroContext)(ctx)
 	s := context.scheduler
-	if context.task() != &s.root || s.liveSpawns != 0 || s.reservedTasks != nil ||
+	if context.task() != &s.root || s.liveSpawns.Load() != 0 || s.reservedTasks != nil ||
 		s.freeFrameBytes != s.cachedFrameBytes {
 		throw("runtime: cold test root already owns active child frames")
 	}
@@ -245,9 +245,9 @@ func stacklessCoroNativeReplacementDrainResume(unsafe.Pointer) uint8 {
 func StacklessCoroNativeReplacementDrainForTest() (runs int, native bool) {
 	s := newStacklessCoroTestScheduler()
 	*s = stacklessCoroScheduler{
-		wake:       make(chan struct{}, stacklessCoroWarmExecutorCount),
-		liveSpawns: 2,
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
 	}
+	s.liveSpawns.Store(2)
 	lockInit(&s.lock, lockRankStacklessCoro)
 	s.root.state = stacklessCoroTaskWaiting
 	s.executorCount.Store(2)

@@ -70,7 +70,7 @@ func CheckStacklessCoroDrainedOperationsForTest() bool {
 	s := newStacklessCoroTestScheduler()
 	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
 	s.lifetime.Store(stacklessCoroLifetimeSpawned | stacklessCoroLifetimeOperationStarted)
-	s.liveSpawns = 1
+	s.liveSpawns.Store(1)
 	for range stacklessCoroOperationCacheSize {
 		op := newStacklessCoroChannelOperation()
 		op.next = s.freeOperations
@@ -84,7 +84,7 @@ func CheckStacklessCoroDrainedOperationsForTest() bool {
 		return false
 	}
 	s.completeLogicalTaskLocked(new(stacklessCoroTask))
-	valid := s.drained() && s.freeOperations == nil && s.freeOperationCount == 0 && s.liveSpawns == 0
+	valid := s.drained() && s.freeOperations == nil && s.freeOperationCount == 0 && s.liveSpawns.Load() == 0
 	unlock(&s.lock)
 	// No delayed native cache return may reinsert operations after an idle GC.
 	GC()

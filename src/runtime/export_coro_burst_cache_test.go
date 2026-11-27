@@ -258,9 +258,10 @@ func CheckStacklessCoroTypedBurstCacheForTest() string {
 	if stacklessCoroTypedBurstBudget-stacklessCoroTypedBurst.totalBytes.Load() >= maxCharge {
 		return "multi-slot typed burst cache stopped well below budget ceiling"
 	}
-	lock(&stacklessCoroSharedOperations.lock)
+	world := stopTheWorld(stwForTestResetDebugLog)
 	var actualSpanBytes uintptr
 	var activeSlots int
+	var mismatch string
 	for i := uint8(0); i < stacklessCoroTypedBurst.used; i++ {
 		slot := &stacklessCoroTypedBurst.slots[i]
 		if slot.count > 0 {
@@ -269,17 +270,46 @@ func CheckStacklessCoroTypedBurstCacheForTest() string {
 		for j := uint16(0); j < slot.count; j++ {
 			sp := spanOf(uintptr(unsafe.Pointer(slot.entries[j])))
 			if sp == nil || sp.elemsize != slot.allocSize {
-				unlock(&stacklessCoroSharedOperations.lock)
-				return "cached typed burst entry span elemsize mismatch"
+				mismatch = "cached typed burst entry span elemsize mismatch"
+				break
 			}
 			actualSpanBytes += sp.elemsize
 		}
+		if mismatch != "" {
+			break
+		}
 	}
-	unlock(&stacklessCoroSharedOperations.lock)
+	if mismatch == "" {
+		for _, pp := range allp {
+			if pp == nil {
+				continue
+			}
+			ps := pp.coroP.Load()
+			if ps == nil || ps.typedBurstCount == 0 {
+				continue
+			}
+			for j := uint16(0); j < ps.typedBurstCount; j++ {
+				sp := spanOf(uintptr(unsafe.Pointer(ps.typedBurst[j])))
+				if sp == nil || sp.elemsize != ps.typedBurstAllocSize {
+					mismatch = "per-P cached typed burst entry span elemsize mismatch"
+					break
+				}
+				actualSpanBytes += sp.elemsize
+			}
+			if mismatch != "" {
+				break
+			}
+		}
+	}
+	totalAccounted := stacklessCoroTypedBurst.totalBytes.Load()
+	startTheWorld(world)
+	if mismatch != "" {
+		return mismatch
+	}
 	if activeSlots != stacklessCoroTypedBurstSlots {
 		return "multi-slot budget test did not populate all typed burst slots"
 	}
-	if actualSpanBytes != stacklessCoroTypedBurst.totalBytes.Load() || actualSpanBytes > stacklessCoroTypedBurstBudget {
+	if actualSpanBytes != totalAccounted || actualSpanBytes > stacklessCoroTypedBurstBudget {
 		return "actual retained span bytes mismatch or exceed typed burst budget"
 	}
 	return ""

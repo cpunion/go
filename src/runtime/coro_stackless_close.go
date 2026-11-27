@@ -8,7 +8,7 @@ package runtime
 
 import "unsafe"
 
-const stacklessCoroCloseBatchSize = 32
+const stacklessCoroCloseBatchSize = 64
 
 type stacklessCoroClosedOperation struct {
 	operation *stacklessCoroOperation
@@ -21,6 +21,7 @@ type stacklessCoroClosedOperation struct {
 // Other sources keep their individual cleanup and completion ordering.
 func finishStacklessCoroClose(head *channelWaiter) {
 	var completed [stacklessCoroCloseBatchSize]stacklessCoroClosedOperation
+	var lastWoken *stacklessCoroScheduler
 	for head != nil {
 		op := (*stacklessCoroOperation)(head.coro.get())
 		if raceenabled || !stacklessCoroCloseBatchable(op) {
@@ -52,7 +53,14 @@ func finishStacklessCoroClose(head *channelWaiter) {
 			completed[count] = stacklessCoroClosedOperation{op, task}
 			count++
 		}
-		publishStacklessCoroClosedOperations(s, completed[:count])
+		isFirst := lastWoken != s
+		isLast := head == nil
+		if !isLast {
+			nextOp := (*stacklessCoroOperation)(head.coro.get())
+			isLast = !stacklessCoroCloseBatchable(nextOp) || nextOp.scheduler() != s
+		}
+		publishStacklessCoroClosedOperations(s, completed[:count], isFirst || isLast)
+		lastWoken = s
 	}
 }
 
@@ -64,7 +72,11 @@ func stacklessCoroCloseBatchable(op *stacklessCoroOperation) bool {
 }
 
 func publishStacklessCoroClosedOperations(s *stacklessCoroScheduler,
-	completed []stacklessCoroClosedOperation) {
+	completed []stacklessCoroClosedOperation, wake bool) {
+	if s.multiPFastPath() {
+		publishStacklessCoroClosedOperationsMultiP(s, completed, wake)
+		return
+	}
 	var overflow, tail *stacklessCoroOperation
 	signals := 0
 	lock(&s.lock)
@@ -105,10 +117,100 @@ func publishStacklessCoroClosedOperations(s *stacklessCoroScheduler,
 				signals = waiting
 			}
 			for range signals {
-				s.signal()
+				s.signalParallelCap(0)
 			}
 		} else if stacklessCoroIsPullComparison(s) {
 			s.signal()
+		}
+	}
+}
+
+func publishStacklessCoroClosedOperationsMultiP(s *stacklessCoroScheduler,
+	completed []stacklessCoroClosedOperation, wake bool) {
+	var opOverflow, opTail *stacklessCoroOperation
+	var spillHead, spillTail *stacklessCoroTask
+	var spillCount uint32
+	var slowHead, slowTail *stacklessCoroTask
+	signals := 0
+	for i := range completed {
+		entry := completed[i]
+		completed[i] = stacklessCoroClosedOperation{}
+		early := entry.task.completeWaitAtomic(0)
+		if !coroPOpCachePut(entry.operation) {
+			if opTail == nil {
+				opOverflow = entry.operation
+			} else {
+				opTail.next = entry.operation
+			}
+			opTail = entry.operation
+		}
+		if early {
+			continue
+		}
+		signals++
+		entry.task.next = nil
+		stacklessCoroSetLogicalLeaf(entry.task, nil)
+		if coroRunqEligible(s, entry.task) {
+			if _, ok := coroRunqPut(s, entry.task); ok {
+				continue
+			}
+			if spillTail == nil {
+				spillHead = entry.task
+			} else {
+				spillTail.next = entry.task
+			}
+			spillTail = entry.task
+			spillCount++
+		} else {
+			if slowTail == nil {
+				slowHead = entry.task
+			} else {
+				slowTail.next = entry.task
+			}
+			slowTail = entry.task
+		}
+	}
+	if opOverflow != nil {
+		lock(&stacklessCoroSharedOperations.lock)
+		for opOverflow != nil {
+			op := opOverflow
+			opOverflow = op.next
+			op.next = nil
+			cacheStacklessCoroSharedOperationLocked(op)
+		}
+		unlock(&stacklessCoroSharedOperations.lock)
+	}
+	if spillHead != nil || slowHead != nil {
+		lock(&s.lock)
+		if spillHead != nil {
+			if s.tail == nil {
+				s.head = spillHead
+			} else {
+				s.tail.next = spillHead
+			}
+			s.tail = spillTail
+			s.runnableState.Add(int32(spillCount))
+		}
+		for slowHead != nil {
+			task := slowHead
+			slowHead = task.next
+			task.next = nil
+			s.enqueueRunnableLocked(task)
+		}
+		unlock(&s.lock)
+	}
+	if wake && signals != 0 {
+		if waiting := int(s.waitingExecutors()); waiting != 0 {
+			if signals > waiting {
+				signals = waiting
+			}
+			limit := int(gomaxprocs) - 1
+			if limit > 0 && signals > limit {
+				signals = limit
+			}
+			for range signals {
+				s.signalParallelCap(uint(signals))
+			}
 		}
 	}
 }

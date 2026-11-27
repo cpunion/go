@@ -245,3 +245,94 @@ func chanrecvStackless(op *stacklessCoroOperation, c *hchan, element unsafe.Poin
 	}
 	unlock(&c.lock)
 }
+
+// stacklessCoroSendWake performs a non-blocking send on an internal coroutine
+// executor wake channel. When GOMAXPROCS > 1 and a parked executor is waiting
+// in recvq, it readies the executor with next=false so idle Ps steal it on the
+// first work-stealing round instead of stalling in runqgrab's usleep(3) waiting
+// to steal from the caller's runnext slot while the caller keeps running.
+func stacklessCoroSendWake(wake chan struct{}) {
+	stacklessCoroSendWakeCap(wake, 0, true)
+}
+
+func stacklessCoroSendWakeCap(wake chan struct{}, maxBuffered uint, parallel bool) {
+	c := *(**hchan)(unsafe.Pointer(&wake))
+	if c == nil {
+		return
+	}
+	if raceenabled {
+		racereadpc(c.raceaddr(), sys.GetCallerPC(), abi.FuncPCABIInternal(stacklessCoroSendWakeCap))
+	}
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("send on synctest channel from outside bubble")
+	}
+	if c.closed == 0 {
+		if !raceenabled && maxBuffered != 0 && c.qcount >= maxBuffered {
+			return
+		}
+		if full(c) {
+			return
+		}
+	}
+	lock(&c.lock)
+	if c.closed != 0 {
+		unlock(&c.lock)
+		panic(plainError("send on closed channel"))
+	}
+	if sg := c.recvq.dequeue(); sg != nil {
+		if sg.coro.get() != nil {
+			send(c, sg, unsafe.Pointer(&zerobase), func() { unlock(&c.lock) }, 3)
+			return
+		}
+		if c.bubble != nil && getg().bubble != c.bubble {
+			unlock(&c.lock)
+			fatal("send on synctest channel from outside bubble")
+		}
+		if raceenabled {
+			if c.dataqsiz == 0 {
+				racesync(c, sg)
+			} else {
+				racenotify(c, c.recvx, nil)
+				racenotify(c, c.recvx, sg)
+				c.recvx++
+				if c.recvx == c.dataqsiz {
+					c.recvx = 0
+				}
+				c.sendx = c.recvx
+			}
+		}
+		full := sg.fullSudog()
+		if full.getFullElem() != nil {
+			full.setFullElem(nil)
+		}
+		gp := full.g
+		unlock(&c.lock)
+		gp.param = unsafe.Pointer(sg)
+		full.success = true
+		if full.releasetime != 0 {
+			full.releasetime = cputicks()
+		}
+		next := !parallel || gomaxprocs <= 1
+		systemstack(func() {
+			ready(gp, 3, next)
+		})
+		return
+	}
+	limit := c.dataqsiz
+	if !raceenabled && maxBuffered != 0 && maxBuffered < limit {
+		limit = maxBuffered
+	}
+	if c.qcount < limit {
+		if raceenabled {
+			racenotify(c, c.sendx, nil)
+		}
+		c.sendx++
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount++
+		unlock(&c.lock)
+		return
+	}
+	unlock(&c.lock)
+}

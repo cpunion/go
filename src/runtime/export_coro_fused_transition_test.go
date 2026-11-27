@@ -60,10 +60,10 @@ func CheckStacklessCoroFusedSchedulerTransitionsForTest() string {
 	}
 
 	// 5. completeAndTake pops next independent task under the same lock.
-	s.liveSpawns = 2
+	s.liveSpawns.Store(2)
 	doneTask := &stacklessCoroTask{
-		resume: func(unsafe.Pointer) uint8 { return stacklessCoroActionComplete },
-		state:  stacklessCoroTaskRunning,
+		resume:   func(unsafe.Pointer) uint8 { return stacklessCoroActionComplete },
+		state:    stacklessCoroTaskRunning,
 		resuming: true,
 	}
 	nextTask := &stacklessCoroTask{state: stacklessCoroTaskNew}
@@ -77,7 +77,7 @@ func CheckStacklessCoroFusedSchedulerTransitionsForTest() string {
 	if !raceenabled && s.freeTasks != doneTask {
 		return "completeAndTake did not recycle completed task"
 	}
-	if s.liveSpawns != 1 {
+	if s.liveSpawns.Load() != 1 {
 		return "completeAndTake did not decrement liveSpawns"
 	}
 	return ""
