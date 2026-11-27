@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -39,6 +40,7 @@ type stacklessCoroP struct {
 	callerProfiles [4]stacklessCoroCallerProfile
 	nextProfile    uint8
 	profileMisses  uint8
+	coroP          atomic.Pointer[stacklessCoroPState]
 }
 
 func stacklessCoroSourceFrame(f funcInfo) *stacklessCoroSourceInfo {
