@@ -192,6 +192,27 @@ func selectsetpc(pc *uintptr)
 func selectgo(cas0 *byte, order0 *byte, pc0 *uintptr, nsends int, nrecvs int, block bool) (int, bool)
 func block()
 
+// stackless coroutine runtime
+func coroAlloc(typ *byte) unsafe.Pointer
+func coroRunFrame(frame unsafe.Pointer, resume func(unsafe.Pointer) uint8)
+func coroReleaseFrame(frame unsafe.Pointer)
+func coroSpawnFrame(ctx unsafe.Pointer, frame unsafe.Pointer, resume func(unsafe.Pointer) uint8) bool
+func coroSpawnOpaque(ctx unsafe.Pointer, fn func()) bool
+func coroAwaitFrame(ctx unsafe.Pointer, frame unsafe.Pointer, resume func(unsafe.Pointer) uint8) uint8
+func coroDefer(ctx unsafe.Pointer, fn func())
+func coroDeferCoro(ctx unsafe.Pointer, frame unsafe.Pointer, resume func(unsafe.Pointer) uint8)
+func coroPanic(ctx unsafe.Pointer, val interface{})
+func coroGoexit(ctx unsafe.Pointer)
+func coroRecover(ctx unsafe.Pointer) interface{}
+func coroChanSend(ctx unsafe.Pointer, c chan<- any, elem *any) bool
+func coroChanRecv(ctx unsafe.Pointer, c <-chan any, elem *any, ok *bool) bool
+func coroSelect(ctx unsafe.Pointer, cas0 *byte, nsends int, nrecvs int, block bool, chosen *int, ok *bool) bool
+func coroSleep(ctx unsafe.Pointer, ns int64) bool
+func coroGC(ctx unsafe.Pointer)
+func coroRegisterCallable(fn interface{}, factory interface{})
+func coroLookupFunction(fn interface{}) (unsafe.Pointer, unsafe.Pointer)
+func coroLookupInterface(itab unsafe.Pointer, data unsafe.Pointer, methodIdx uintptr) (unsafe.Pointer, unsafe.Pointer)
+
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer
 func makeslice64(typ *byte, len int64, cap int64) unsafe.Pointer
 func makeslicecopy(typ *byte, tolen int, fromlen int, from unsafe.Pointer) unsafe.Pointer

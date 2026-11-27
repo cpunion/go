@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/bloop"
+	"cmd/compile/internal/coro"
 	"cmd/compile/internal/coverage"
 	"cmd/compile/internal/deadlocals"
 	"cmd/compile/internal/dwarfgen"
@@ -85,6 +86,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	base.DebugSSA = ssacompile.PhaseOption
 	base.ParseFlags()
+	if base.Debug.Coro != 0 && !buildcfg.Experiment.Coro {
+		base.Fatalf("-d=coro requires GOEXPERIMENT=coro")
+	}
 
 	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
 		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap
@@ -255,6 +259,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Apply bloop markings.
 	bloop.Walk(typecheck.Target)
 
+	if buildcfg.Experiment.Coro && base.Debug.Coro >= 4 {
+		base.Timer.Start("fe", "coro-provisional")
+		interleaved.PreserveCall = coro.AnalyzePreserve(typecheck.Target)
+	}
+
 	// Interleaved devirtualization and inlining.
 	base.Timer.Start("fe", "devirtualize-and-inline")
 	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
@@ -266,6 +275,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	}
 
 	noder.MakeWrappers(typecheck.Target) // must happen after inlining
+	interleaved.PreserveCall = nil
 
 	// Get variable capture right in for loops.
 	var transformed []loopvar.VarAndLoop
@@ -273,6 +283,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		transformed = append(transformed, loopvar.ForCapture(fn)...)
 	}
 	ir.CurFunc = nil
+
+	if buildcfg.Experiment.Coro && base.Debug.Coro != 0 {
+		base.Timer.Start("fe", "coro")
+		coro.Compile(typecheck.Target)
+	}
 
 	// Build init task, if needed.
 	pkginit.MakeTask()

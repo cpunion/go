@@ -438,7 +438,7 @@ func (v varsAndDecls) Swap(i, j int) {
 func preInliningDcls(fnsym *obj.LSym) []*ir.Name {
 	fn := base.Ctxt.DwFixups.GetPrecursorFunc(fnsym).(*ir.Func)
 	var rdcl []*ir.Name
-	for _, n := range fn.Inl.Dcl {
+	for _, n := range fn.PreInliningDcl() {
 		if n.Sym().Name[0] == '.' || !shouldEmitDwarfVarSafe(n) {
 			continue
 		}

@@ -220,6 +220,15 @@ func coroRawWrite(fd int32, buf []byte) int32 {
 	}
 }
 
+func coroPrepareRecycleIO(task *coroTask) {
+	if io := task.ioState; io != nil {
+		if io.anchored {
+			coroIOUnanchor(task, io)
+		}
+		*io = coroIOState{}
+	}
+}
+
 // coroArmNetpoll installs task|1 into pd.rg or pd.wg. Returns (parked, pollErr).
 func coroArmNetpoll(task *coroTask, io *coroIOState) (bool, int) {
 	pd := io.pd
@@ -227,6 +236,9 @@ func coroArmNetpoll(task *coroTask, io *coroIOState) (bool, int) {
 	gpp := &pd.rg
 	if mode == 'w' {
 		gpp = &pd.wg
+	}
+	if gpp.CompareAndSwap(pdReady, pdNil) {
+		return false, pollNoError
 	}
 	coroIOAnchor(task, io)
 	task.flags |= coroFlagIOPending
@@ -237,7 +249,8 @@ func coroArmNetpoll(task *coroTask, io *coroIOState) (bool, int) {
 	tag := uintptr(unsafe.Pointer(task)) | 1
 	for {
 		if gpp.CompareAndSwap(pdReady, pdNil) {
-			// Edge arrived concurrently; caller will retry syscall immediately.
+			// Edge arrived concurrently; unanchor and retry syscall immediately.
+			coroIOUnanchor(task, io)
 			task.flags &^= coroFlagIOPending
 			task.state.Store(coroStateRunning)
 			return false, pollNoError
@@ -590,9 +603,6 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 
 func coroTimerWake(arg any, seq uintptr, delay int64) {
 	task := arg.(*coroTask)
-	if raceenabled {
-		racerelease(unsafe.Pointer(task))
-	}
 	coroReady(task)
 }
 

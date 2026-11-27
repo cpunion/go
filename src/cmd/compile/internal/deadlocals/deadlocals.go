@@ -123,9 +123,11 @@ func (v *visitor) node(n ir.Node) {
 
 	case ir.OAS:
 		n := n.(*ir.AssignStmt)
+		v.nodes(n.Init())
 		v.assign(n.Pos(), &n.X, &n.Y, false)
 	case ir.OAS2:
 		n := n.(*ir.AssignListStmt)
+		v.nodes(n.Init())
 
 		// If all LHS vars are blank, treat them as intentional
 		// uses of corresponding RHS vars.  If any are non-blank

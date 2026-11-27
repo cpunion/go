@@ -84,14 +84,17 @@ type coroPanicState struct {
 }
 
 const (
-	coroPRunqSize     = 512
-	coroPStealBatch   = 128
-	coroPCacheSlots   = 2
-	coroPCacheSlotCap = 1024
-	coroCacheBudget   = 512 << 10
-	coroMaxWorkers    = 128
-	coroMaxRootSlots  = 128
-	coroTotalDrivers  = coroMaxWorkers + coroMaxRootSlots
+	coroPRunqSize      = 512
+	coroPStealBatch    = 128
+	coroPCacheSlots    = 4
+	coroPCacheSlotCap  = 1024
+	coroPCacheSpillAt  = 64
+	coroPCacheSpillCnt = 32
+	coroGCacheSlots    = 4
+	coroCacheBudget    = 512 << 10
+	coroMaxWorkers     = 128
+	coroMaxRootSlots   = 128
+	coroTotalDrivers   = coroMaxWorkers + coroMaxRootSlots
 )
 
 type coroTypeCacheSlot struct {
@@ -116,18 +119,20 @@ type coroPState struct {
 }
 
 var coroSched struct {
-	lock         mutex
-	runqHead     *coroTask
-	runqTail     *coroTask
-	runqLen      int32
-	runnable     atomic.Int32
-	unhosted     atomic.Int64
-	cacheBytes   atomic.Uintptr
-	activeDriver atomic.Int32
-	workerCount  atomic.Int32
-	idleCount    atomic.Int32
-	idleDrivers  [coroTotalDrivers]atomic.Uintptr // guintptr of parked driver Gs
-	rootSlotUsed [coroMaxRootSlots]atomic.Uint32  // 0=free, 1=claimed by parked root caller
+	lock             mutex
+	runqHead         *coroTask
+	runqTail         *coroTask
+	runqLen          int32
+	globalCache      [coroGCacheSlots]coroTypeCacheSlot
+	globalCacheCount atomic.Int32
+	runnable         atomic.Int32
+	unhosted         atomic.Int64
+	cacheBytes       atomic.Uintptr
+	activeDriver     atomic.Int32
+	workerCount      atomic.Int32
+	idleCount        atomic.Int32
+	idleDrivers      [coroTotalDrivers]atomic.Uintptr // guintptr of parked driver Gs
+	rootSlotUsed     [coroMaxRootSlots]atomic.Uint32  // 0=free, 1=claimed by parked root caller
 }
 
 func init() {
@@ -185,9 +190,137 @@ func coroTypeAllocSize(typ *_type) uintptr {
 	return charge
 }
 
-// coroAlloc allocates (or pops from the current P's 2-way *_type freelist) a
-// combined struct{ coroTask; frame } object and returns its pointer (which is
-// both *coroTask and *F_frame).
+func coroIOAllocSize() uintptr {
+	return coroTypeAllocSize(abi.TypeFor[coroIOState]())
+}
+
+func coroTryReserveBudget(bytes uintptr) bool {
+	for {
+		cur := coroSched.cacheBytes.Load()
+		if cur+bytes > coroCacheBudget {
+			return false
+		}
+		if coroSched.cacheBytes.CompareAndSwap(cur, cur+bytes) {
+			return true
+		}
+	}
+}
+
+func coroEvictChain(head *coroTask, count uint16, allocSize uintptr) {
+	if count == 0 && head == nil {
+		return
+	}
+	ioSize := coroIOAllocSize()
+	var refund uintptr
+	for cur := head; cur != nil; {
+		nxt := cur.next
+		cur.next = nil
+		refund += allocSize
+		if cur.ioState != nil {
+			refund += ioSize
+			cur.ioState = nil
+		}
+		cur = nxt
+	}
+	if refund > 0 {
+		coroSched.cacheBytes.Add(-refund)
+	}
+}
+
+func coroSpillGlobalCache(typ *_type, allocSize uintptr, head, tail *coroTask, count uint16) {
+	if head == nil || count == 0 {
+		return
+	}
+	lock(&coroSched.lock)
+	idx := -1
+	for i := range coroSched.globalCache {
+		if coroSched.globalCache[i].typ == typ {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		for i := range coroSched.globalCache {
+			if coroSched.globalCache[i].young == nil && coroSched.globalCache[i].old == nil {
+				idx = i
+				coroSched.globalCache[i].typ = typ
+				coroSched.globalCache[i].allocSize = allocSize
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		unlock(&coroSched.lock)
+		coroEvictChain(head, count, allocSize)
+		return
+	}
+	gs := &coroSched.globalCache[idx]
+	tail.next = gs.young
+	gs.young = head
+	gs.youngCount += count
+	coroSched.globalCacheCount.Add(int32(count))
+	unlock(&coroSched.lock)
+}
+
+func coroRefillFromGlobalCache(typ *_type) (*coroTask, *coroTask, *coroTask, uint16, uintptr) {
+	if coroSched.globalCacheCount.Load() <= 0 {
+		return nil, nil, nil, 0, 0
+	}
+	lock(&coroSched.lock)
+	var first, restHead, restTail *coroTask
+	var restCount uint16
+	var allocSize uintptr
+	for i := range coroSched.globalCache {
+		gs := &coroSched.globalCache[i]
+		if gs.typ != typ || (gs.young == nil && gs.old == nil) {
+			continue
+		}
+		allocSize = gs.allocSize
+		var taken uint16
+		const maxTake = coroPCacheSpillAt
+		for taken < maxTake {
+			var t *coroTask
+			if gs.young != nil {
+				t = gs.young
+				gs.young = t.next
+				gs.youngCount--
+			} else if gs.old != nil {
+				t = gs.old
+				gs.old = t.next
+				gs.oldCount--
+			} else {
+				break
+			}
+			t.next = nil
+			if first == nil {
+				first = t
+			} else {
+				if restTail == nil {
+					restHead = t
+				} else {
+					restTail.next = t
+				}
+				restTail = t
+				restCount++
+			}
+			taken++
+		}
+		if taken > 0 {
+			coroSched.globalCacheCount.Add(-int32(taken))
+		}
+		if gs.youngCount == 0 && gs.oldCount == 0 {
+			gs.typ = nil
+			gs.allocSize = 0
+		}
+		break
+	}
+	unlock(&coroSched.lock)
+	return first, restHead, restTail, restCount, allocSize
+}
+
+// coroAlloc allocates (or pops from the current P's 2-way *_type freelist,
+// refilling in batches from the global spill cache on multi-P misses) a
+// combined struct{ coroTask; frame } object and returns its pointer.
 func coroAlloc(typ *_type) unsafe.Pointer {
 	if !raceenabled && typ != nil && typ.Size_ >= unsafe.Sizeof(coroTask{}) {
 		mp := acquirem()
@@ -209,9 +342,12 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 						slot.oldCount--
 					}
 					if task != nil {
-						allocSize := slot.allocSize
+						refund := slot.allocSize
+						if task.ioState != nil {
+							refund += coroIOAllocSize()
+						}
 						releasem(mp)
-						coroSched.cacheBytes.Add(-allocSize)
+						coroSched.cacheBytes.Add(-refund)
 						task.next = nil
 						task.typ = typ
 						task.flags = coroFlagPooled
@@ -222,6 +358,55 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 			}
 		}
 		releasem(mp)
+
+		if first, restHead, restTail, restCount, allocSize := coroRefillFromGlobalCache(typ); first != nil {
+			refund := allocSize
+			if first.ioState != nil {
+				refund += coroIOAllocSize()
+			}
+			coroSched.cacheBytes.Add(-refund)
+			if restHead != nil {
+				mp = acquirem()
+				var ps *coroPState
+				mp, ps = coroEnsurePState(mp)
+				stashed := false
+				if ps != nil {
+					idx := -1
+					for i := range ps.cache {
+						if ps.cache[i].typ == typ {
+							idx = i
+							break
+						}
+					}
+					if idx < 0 {
+						for i := range ps.cache {
+							if ps.cache[i].young == nil && ps.cache[i].old == nil {
+								idx = i
+								ps.cache[i].typ = typ
+								ps.cache[i].allocSize = allocSize
+								break
+							}
+						}
+					}
+					if idx >= 0 {
+						slot := &ps.cache[idx]
+						restTail.next = slot.young
+						slot.young = restHead
+						slot.youngCount += restCount
+						stashed = true
+					}
+				}
+				releasem(mp)
+				if !stashed {
+					coroSpillGlobalCache(typ, allocSize, restHead, restTail, restCount)
+				}
+			}
+			first.next = nil
+			first.typ = typ
+			first.flags = coroFlagPooled
+			first.state.Store(coroStateNew)
+			return unsafe.Pointer(first)
+		}
 	}
 	p := newobject(typ)
 	task := (*coroTask)(p)
@@ -235,19 +420,27 @@ func coroAlloc(typ *_type) unsafe.Pointer {
 // coroRecycle clears a completed combined task+frame and returns it to the
 // current P's 2-way *_type freelist if within the global 512 KiB budget.
 func coroRecycle(task *coroTask) {
-	if raceenabled || task == nil || task.typ == nil || task.flags&coroFlagPooled == 0 {
+	if task == nil {
+		return
+	}
+	coroPrepareRecycleIO(task)
+	if raceenabled || task.typ == nil || task.flags&coroFlagPooled == 0 {
+		task.ioState = nil
 		return
 	}
 	typ := task.typ
 	allocSize := coroTypeAllocSize(typ)
-	// Fast atomic budget reservation.
-	for {
-		cur := coroSched.cacheBytes.Load()
-		if cur+allocSize > coroCacheBudget {
-			return
-		}
-		if coroSched.cacheBytes.CompareAndSwap(cur, cur+allocSize) {
-			break
+	if !coroTryReserveBudget(allocSize) {
+		task.ioState = nil
+		return
+	}
+	ioCharged := uintptr(0)
+	if task.ioState != nil {
+		ioSize := coroIOAllocSize()
+		if coroTryReserveBudget(ioSize) {
+			ioCharged = ioSize
+		} else {
+			task.ioState = nil
 		}
 	}
 	// Clear frame payload while keeping exact GC type safety.
@@ -261,14 +454,13 @@ func coroRecycle(task *coroTask) {
 			memclrNoHeapPointers(framePtr, frameLen)
 		}
 	}
-	// Clear task header fields (retain clean ioState? Drop it to keep zero retention).
+	// Clear task header fields (keeping zeroed ioState if reserved above).
 	task.resume = nil
 	task.next = nil
 	task.parent = nil
 	task.typ = nil
 	task.defers = nil
 	task.panicBox = nil
-	task.ioState = nil
 	task.selectDone.Store(0)
 	task.state.Store(coroStateNew)
 	task.rootSlot.Store(0)
@@ -280,10 +472,10 @@ func coroRecycle(task *coroTask) {
 	mp, ps = coroEnsurePState(mp)
 	if ps == nil {
 		releasem(mp)
-		coroSched.cacheBytes.Add(-allocSize)
+		task.ioState = nil
+		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
 		return
 	}
-	// Find matching slot, empty slot, or evict oldest slot.
 	idx := -1
 	for i := range ps.cache {
 		if ps.cache[i].typ == typ {
@@ -303,25 +495,65 @@ func coroRecycle(task *coroTask) {
 	}
 	if idx < 0 {
 		releasem(mp)
-		coroSched.cacheBytes.Add(-allocSize)
+		task.ioState = nil
+		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
 		return
 	}
 	slot := &ps.cache[idx]
 	if int(slot.youngCount)+int(slot.oldCount) >= coroPCacheSlotCap {
 		releasem(mp)
-		coroSched.cacheBytes.Add(-allocSize)
+		task.ioState = nil
+		coroSched.cacheBytes.Add(-(allocSize + ioCharged))
 		return
 	}
 	task.next = slot.young
 	slot.young = task
 	slot.youngCount++
+
+	// On multi-P, spill half a batch to globalCache when local young exceeds threshold
+	// so producer Ps (spawning many workers) can reuse frames recycled on worker Ps.
+	var spillHead, spillTail *coroTask
+	var spillCount uint16
+	if gomaxprocs > 1 && slot.youngCount >= coroPCacheSpillAt {
+		spillHead = slot.young
+		cur := spillHead
+		for i := uint16(1); i < coroPCacheSpillCnt && cur.next != nil; i++ {
+			cur = cur.next
+			spillCount++
+		}
+		spillCount++ // include spillHead
+		spillTail = cur
+		slot.young = cur.next
+		spillTail.next = nil
+		slot.youngCount -= spillCount
+	}
 	releasem(mp)
+	if spillHead != nil {
+		coroSpillGlobalCache(typ, allocSize, spillHead, spillTail, spillCount)
+	}
 }
 
-// coroClearPools runs under STW in clearpools(). Ages per-P 2-way caches once
-// per GC so two idle collections reclaim 100% of cached frames (0 B retained).
+// coroClearPools runs under STW in clearpools(). Ages per-P and global 2-way
+// caches once per GC so two idle collections reclaim 100% of cached frames (0 B retained).
 func coroClearPools() {
 	assertWorldStopped()
+	for i := range coroSched.globalCache {
+		gs := &coroSched.globalCache[i]
+		if gs.oldCount > 0 {
+			coroSched.globalCacheCount.Add(-int32(gs.oldCount))
+			coroEvictChain(gs.old, gs.oldCount, gs.allocSize)
+			gs.old = nil
+			gs.oldCount = 0
+		}
+		gs.old = gs.young
+		gs.oldCount = gs.youngCount
+		gs.young = nil
+		gs.youngCount = 0
+		if gs.oldCount == 0 {
+			gs.typ = nil
+			gs.allocSize = 0
+		}
+	}
 	for _, pp := range allp {
 		if pp == nil {
 			continue
@@ -338,13 +570,7 @@ func coroClearPools() {
 		for i := range ps.cache {
 			slot := &ps.cache[i]
 			if slot.oldCount > 0 {
-				coroSched.cacheBytes.Add(-uintptr(slot.oldCount) * slot.allocSize)
-				// Break chain links so no stray pointer pins the list.
-				for cur := slot.old; cur != nil; {
-					nxt := cur.next
-					cur.next = nil
-					cur = nxt
-				}
+				coroEvictChain(slot.old, slot.oldCount, slot.allocSize)
 				slot.old = nil
 				slot.oldCount = 0
 			}
@@ -379,15 +605,18 @@ func coroDrainP(pp *p) {
 	// Drop per-P freelist caches cleanly.
 	for i := range ps.cache {
 		slot := &ps.cache[i]
-		dropped := uintptr(slot.youngCount+slot.oldCount) * slot.allocSize
-		if dropped > 0 {
-			coroSched.cacheBytes.Add(-dropped)
+		if slot.young != nil {
+			coroEvictChain(slot.young, slot.youngCount, slot.allocSize)
+			slot.young = nil
+			slot.youngCount = 0
 		}
-		slot.young = nil
-		slot.old = nil
-		slot.youngCount = 0
-		slot.oldCount = 0
+		if slot.old != nil {
+			coroEvictChain(slot.old, slot.oldCount, slot.allocSize)
+			slot.old = nil
+			slot.oldCount = 0
+		}
 		slot.typ = nil
+		slot.allocSize = 0
 	}
 	// Move runnable tasks to global queue (world stopped, no lock needed).
 	pushGlobal := func(t *coroTask) {
@@ -421,14 +650,14 @@ func coroDrainP(pp *p) {
 // queue on overflow) and wakes an idle driver if multi-P parallelism is available.
 func coroEnqueue(task *coroTask, next bool) {
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	mp := acquirem()
 	var ps *coroPState
 	mp, ps = coroEnsurePState(mp)
 	pushed := false
 	if ps != nil {
-		if next {
+		if next && gomaxprocs == 1 {
 			old := ps.runnext
 			ps.runnext = task
 			if old == nil {
@@ -473,7 +702,7 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 	}
 	if raceenabled {
 		for cur := head; cur != nil; cur = cur.next {
-			racerelease(unsafe.Pointer(cur))
+			racereleasemerge(unsafe.Pointer(cur))
 		}
 	}
 	// Put up to half a P-ring locally on current P, rest on global queue for instant stealing.
@@ -784,6 +1013,9 @@ func coroPopIdleDriver() *g {
 // coroMaybeWakeDriver ensures a driver is active when work exists and CPU
 // parallelism is available. Returns true if a driver was woken or spawned.
 func coroMaybeWakeDriver() bool {
+	if coroSched.activeDriver.Load() >= gomaxprocs {
+		return false
+	}
 	if coroSched.idleCount.Load() > 0 {
 		if gp := coroPopIdleDriver(); gp != nil {
 			goready(gp, 0)
@@ -799,7 +1031,7 @@ func coroMaybeWakeDriver() bool {
 	if maxW > coroMaxWorkers {
 		maxW = coroMaxWorkers
 	}
-	if maxW <= 0 || coroSched.activeDriver.Load() >= gomaxprocs {
+	if maxW <= 0 {
 		return false
 	}
 	for {
@@ -1234,7 +1466,7 @@ func coroDriverStepLoop(root *coroTask, workerID int32, task *coroTask, startTer
 
 	handleWait:
 		if raceenabled {
-			racerelease(unsafe.Pointer(task))
+			racereleasemerge(unsafe.Pointer(task))
 		}
 		if task.state.CompareAndSwap(coroStateWaiting, coroStateParked) {
 			task = nil
@@ -1278,10 +1510,10 @@ func coroFinishTask(task, driverRoot *coroTask) *coroTask {
 	task.parent = nil
 	if parent != nil {
 		isDefer := task.flags&coroFlagDeferChild != 0
-		if task.flags&coroFlagRoot == 0 {
-			coroRecycle(task)
-		}
 		if isDefer {
+			if task.flags&coroFlagRoot == 0 {
+				coroRecycle(task)
+			}
 			// Deferred coroutine finished; continue draining parent's remaining defers
 			// or finish parent.
 			if child := coroRunDefers(parent); child != nil {
@@ -1292,7 +1524,8 @@ func coroFinishTask(task, driverRoot *coroTask) *coroTask {
 			}
 			return coroFinishTask(parent, driverRoot)
 		}
-		// Normal structured await child completed: resume parent directly!
+		// Normal structured await child completed: parent reads return values from
+		// child's frame and then calls coroReleaseFrame(child).
 		parent.state.Store(coroStateRunning)
 		return parent
 	}

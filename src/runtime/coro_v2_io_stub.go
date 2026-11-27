@@ -60,11 +60,14 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 	return true
 }
 
+func coroPrepareRecycleIO(task *coroTask) {
+	if io := task.ioState; io != nil {
+		*io = coroIOState{}
+	}
+}
+
 func coroTimerWake(arg any, seq uintptr, delay int64) {
 	task := arg.(*coroTask)
-	if raceenabled {
-		racerelease(unsafe.Pointer(task))
-	}
 	coroReady(task)
 }
 

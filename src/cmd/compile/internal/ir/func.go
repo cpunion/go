@@ -228,6 +228,29 @@ type Inline struct {
 	CanDelayResults bool
 }
 
+var savedInlineDcl = make(map[*Func][]*Name)
+
+// DiscardInlineBody clears f.Inl after a body rewrite while preserving the
+// pre-inlining declarations needed by abstract DWARF entries.
+func (f *Func) DiscardInlineBody() {
+	if f.Inl != nil {
+		savedInlineDcl[f] = f.Inl.Dcl
+	}
+	f.Inl = nil
+}
+
+// PreInliningDcl returns the declaration snapshot used by abstract DWARF.
+func (f *Func) PreInliningDcl() []*Name {
+	if f.Inl != nil {
+		return f.Inl.Dcl
+	}
+	if dcl, ok := savedInlineDcl[f]; ok {
+		return dcl
+	}
+	base.FatalfAt(f.Pos(), "missing pre-inlining declarations for %v", f)
+	return nil
+}
+
 // A Mark represents a scope boundary.
 type Mark struct {
 	// Pos is the position of the token that marks the scope

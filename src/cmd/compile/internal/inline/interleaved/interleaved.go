@@ -17,6 +17,10 @@ import (
 	"fmt"
 )
 
+// PreserveCall, if non-nil, identifies callees whose call boundaries must
+// survive inlining for a later compiler pass.
+var PreserveCall func(*ir.Func) bool
+
 // DevirtualizeAndInlinePackage interleaves devirtualization and inlining on
 // all functions within pkg.
 func DevirtualizeAndInlinePackage(pkg *ir.Package, profile *pgoir.Profile) {
@@ -234,6 +238,9 @@ func (s *inlClosureState) edit(state *devirtualize.State, i int) (*ir.CallExpr, 
 	// must be re-checked.
 	callee, count := s.resolve(state, i)
 	if count <= 0 {
+		return nil, nil
+	}
+	if PreserveCall != nil && PreserveCall(callee) {
 		return nil, nil
 	}
 	if inlCall := inline.TryInlineCall(s.fn, call, s.bigCaller, s.profile, count == 1 && callee.ClosureParent != nil); inlCall != nil {

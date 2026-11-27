@@ -159,6 +159,9 @@ func coroChanWake(sg *sudog, ok bool) {
 	if task == nil {
 		return
 	}
+	if raceenabled {
+		raceacquire(unsafe.Pointer(task))
+	}
 	c := sg.c.get()
 	if c != nil && c.timer != nil && !sg.isSelect {
 		unblockTimerChan(c)
@@ -207,6 +210,9 @@ func coroChanCloseWake(head *sudog) {
 		if task == nil {
 			sg = next
 			continue
+		}
+		if raceenabled {
+			raceacquire(unsafe.Pointer(task))
 		}
 		if sg.isSelect {
 			io := task.ioState
@@ -294,18 +300,19 @@ func coroSelect(ctx unsafe.Pointer, cas0 *scase, nsends, nrecvs int, block bool,
 		pollorder[j] = uint16(i)
 		norder++
 	}
-	// Build lockorder heap sorted by channel address (reusing select.go logic).
-	for i := range scases {
+	// Build lockorder heap over non-nil channels only (matching select.go).
+	lockorder = lockorder[:norder]
+	for i := range lockorder {
 		j := i
-		c := scases[j].c
+		c := scases[pollorder[i]].c
 		for j > 0 && scases[lockorder[(j-1)/2]].c.sortkey() < c.sortkey() {
 			k := (j - 1) / 2
 			lockorder[j] = lockorder[k]
 			j = k
 		}
-		lockorder[j] = uint16(i)
+		lockorder[j] = pollorder[i]
 	}
-	for i := len(scases) - 1; i >= 0; i-- {
+	for i := len(lockorder) - 1; i >= 0; i-- {
 		o := lockorder[i]
 		c := scases[o].c
 		lockorder[i] = lockorder[0]
