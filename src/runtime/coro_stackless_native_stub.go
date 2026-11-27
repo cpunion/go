@@ -69,3 +69,7 @@ func stacklessCoroDeferSleep(*stacklessCoroScheduler,
 	*stacklessCoroOperation, int64) bool {
 	return false
 }
+
+func stacklessCoroNativeRootEnabled() bool {
+	return false
+}

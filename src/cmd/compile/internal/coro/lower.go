@@ -1991,13 +1991,13 @@ func (candidate *lowerCandidate) localSelfFrameLoop() bool {
 		!candidate.fusedResume && len(candidate.defers) == 0
 }
 
-// stableTerminalAction reports whether a fused resume can reuse its entry
-// query during completion. Await and yield return to the scheduler before a
-// child can publish a terminal outcome. An ordinary Go panic also unwinds the
+// stableTerminalAction reports whether a resume can reuse its entry query
+// during completion. Await and yield return to the scheduler before a child
+// can publish a terminal outcome. An ordinary Go panic also unwinds the
 // resume; its next invocation makes a fresh query. Other operation sites and
 // deferred calls can update the outcome within this invocation.
 func (candidate *lowerCandidate) stableTerminalAction() bool {
-	if candidate.factoryABI != FactoryABI3 || !candidate.fusedResume ||
+	if candidate.factoryABI != FactoryABI3 || candidate.localSelfFrameLoop() ||
 		len(candidate.defers) != 0 || candidate.function.Terminal != 0 ||
 		len(candidate.function.Sites) == 0 {
 		return false

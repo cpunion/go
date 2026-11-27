@@ -354,10 +354,9 @@ func (d *stacklessCoroNativeDriver) close(s *stacklessCoroScheduler, rootComplet
 	if ctx == nil {
 		return
 	}
-	if d.root && rootComplete &&
+	if s.freeTasks != nil && d.root && rootComplete &&
 		s.loadExecutorState() == stacklessCoroExecutorStateOff &&
-		s.reservedTasks == nil && s.freeFrameBytes == s.cachedFrameBytes &&
-		s.freeTasks != nil {
+		s.reservedTasks == nil && s.freeFrameBytes == s.cachedFrameBytes {
 		s.discardFreeOverflowTasks()
 		s.discardFreeBatchedTasks()
 		ctx.freeTasks = s.freeTasks
@@ -436,8 +435,9 @@ func coroRunOnNativeStack(s *stacklessCoroScheduler) *stacklessCoroScheduler {
 }
 
 func acquireStacklessCoroNativeContext() *stacklessCoroNativeContext {
+	start := stacklessCoroWarmSlotStart()
 	for i := range stacklessCoroNativePool.slots {
-		slot := &stacklessCoroNativePool.slots[i]
+		slot := &stacklessCoroNativePool.slots[(start+i)&(stacklessCoroWarmExecutorCount-1)]
 		ctx := slot.Load()
 		if ctx != nil && slot.CompareAndSwap(ctx, nil) {
 			ctx.selfFrameMissedRoot = false
@@ -477,8 +477,9 @@ func releaseStacklessCoroNativeContextAt(ctx *stacklessCoroNativeContext, idleCy
 		ctx.selfFrameMissRoots = 0
 	}
 	ctx.cacheIdleCycle = idleCycle
+	start := stacklessCoroWarmSlotStart()
 	for i := range stacklessCoroNativePool.slots {
-		if stacklessCoroNativePool.slots[i].CompareAndSwap(nil, ctx) {
+		if stacklessCoroNativePool.slots[(start+i)&(stacklessCoroWarmExecutorCount-1)].CompareAndSwap(nil, ctx) {
 			return
 		}
 	}
@@ -965,7 +966,7 @@ func coroNativeStart(caller *g) {
 	if GOARCH == "arm64" {
 		*(*uintptr)(unsafe.Pointer(sp - goarch.PtrSize)) = 0
 	}
-	memclrNoHeapPointers(unsafe.Pointer(&executor.sched), unsafe.Sizeof(executor.sched))
+	// executor.sched is already zeroed by coroNativeFinish and fresh creation.
 	executor.sched.sp = sp
 	executor.stktopsp = sp
 	executor.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum
@@ -973,19 +974,19 @@ func coroNativeStart(caller *g) {
 	gostartcall(&executor.sched, unsafe.Pointer(abi.FuncPCABIInternal(coroNativeMain)), nil)
 
 	schedulerG.m = mp
-	memclrNoHeapPointers(unsafe.Pointer(&schedulerG.sched), unsafe.Sizeof(schedulerG.sched))
 	schedulerG.sched.sp = schedulerG.stack.hi - 4*goarch.PtrSize
 	schedulerG.sched.g = guintptr(unsafe.Pointer(schedulerG))
 
-	executor.trace.reset()
 	trace := traceAcquire()
 	tracing := trace.ok()
+	if tracing || executor.trace.seq[0] != 0 || executor.trace.seq[1] != 0 {
+		executor.trace.reset()
+	}
 	canCASCaller := !tracing && caller.bubble == nil && !goroutineProfile.active
 	canCASExecutor := !tracing && executor.bubble == nil &&
 		!goroutineProfile.active && !casgstatusAlwaysTrack && !executor.tracking
 	gcController.addScannableStack(mp.p.ptr(), int64(executor.stack.hi-executor.stack.lo))
-	if !canCASExecutor ||
-		!executor.atomicstatus.CompareAndSwap(_Gdead, _Grunnable) {
+	if !canCASExecutor {
 		// Preserve scheduler latency tracking and wait for a concurrent stack
 		// scan when the executor is observable through the ordinary G path.
 		casgstatus(executor, _Gdead, _Grunnable)
@@ -1017,8 +1018,12 @@ func coroNativeStart(caller *g) {
 	if goroutineProfile.active {
 		tryRecordGoroutineProfile(executor, nil, osyield)
 	}
-	if !canCASExecutor ||
-		!executor.atomicstatus.CompareAndSwap(_Grunnable, _Grunning) {
+	if canCASExecutor {
+		if !executor.atomicstatus.CompareAndSwap(_Gdead, _Grunning) {
+			casgstatus(executor, _Gdead, _Grunnable)
+			casgstatus(executor, _Grunnable, _Grunning)
+		}
+	} else {
 		casgstatus(executor, _Grunnable, _Grunning)
 	}
 	if tracing {
@@ -1086,7 +1091,7 @@ func coroNativeFinish(executor *g) {
 	executor.stackguard0 = 0
 	executor.stackguard1 = 0
 	executor.stktopsp = 0
-	memclrNoHeapPointers(unsafe.Pointer(&executor.sched), unsafe.Sizeof(executor.sched))
+	executor.sched = gobuf{}
 
 	mp.curg = caller
 	mp.lockedg = ctx.lockedG
@@ -1180,4 +1185,8 @@ func resetStacklessCoroExecutor(executor *g) {
 	executor.throwsplit = false
 	executor.waitreason = waitReasonZero
 	executor.waitsince = 0
+}
+
+func stacklessCoroNativeRootEnabled() bool {
+	return true
 }
