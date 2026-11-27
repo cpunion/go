@@ -596,8 +596,10 @@ type stacklessCoroOperationRegistry struct {
 }
 
 var stacklessCoroOperations struct {
-	next     atomic.Uint64
 	registry *stacklessCoroOperationRegistry
+	_        cpu.CacheLinePad
+	next     atomic.Uint64
+	_        cpu.CacheLinePad
 	ioCount  atomic.Int32
 }
 
