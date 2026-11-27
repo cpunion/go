@@ -856,7 +856,7 @@ func releaseStacklessCoroRootScheduler(s *stacklessCoroScheduler) bool {
 	// removing its operation from the global registry. It may still read wake
 	// to signal an already completed task, so retain the immutable channel and
 	// leave both allocations to GC rather than inspecting or reusing them.
-	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted) != 0 {
+	if s.lifetime.Load()&(stacklessCoroLifetimeOperationStarted|stacklessCoroLifetimeHostStarted|stacklessCoroLifetimePRunqUsed) != 0 {
 		return false
 	}
 	state := s.loadExecutorState()
@@ -5317,9 +5317,12 @@ func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext,
 	}
 	// Multi-P lock-free fast path for completed independent uncached/typed-burst
 	// tasks. Avoids s.lock entirely unless liveSpawns drops from 1 to 0.
+	// Four-member scalar task chunks stay on the locked path so s.lock continues
+	// to serialize sibling completion checks before whole-chunk cache publication.
 	if current == nil && s.multiPFastPath() && task != &s.root &&
 		task.parent() == nil && !task.hasFlag(stacklessCoroTaskCacheFrame) &&
 		isStacklessCoroUncachedFrameLineage(task.frameSize) &&
+		!isStacklessCoroScalarTaskCacheMarker(task.frameSize) &&
 		task.flags&stacklessCoroTaskCompletionMask == 0 &&
 		task.terminal == stacklessCoroTerminalNone && !task.goexit &&
 		s.terminalValues.Load() == nil && coroRunqEligible(s, task) {
@@ -5337,6 +5340,14 @@ func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext,
 		}
 		task.setLifecycle(taskWordComplete)
 		clearStacklessCoroTaskFrame(task)
+		if isStacklessCoroTypedTaskCacheMarker(task.frameSize) {
+			cacheStacklessCoroCompletedTask(task)
+		} else {
+			task.frameSize = 0
+			if burstResume != nil {
+				cacheStacklessCoroTypedBurst(burstResume, task)
+			}
+		}
 		remaining := s.liveSpawns.Add(-1)
 		if remaining == ^uint64(0) {
 			throw("runtime: stackless coroutine spawn count underflow")
@@ -5352,18 +5363,6 @@ func (s *stacklessCoroScheduler) completeTask(task *stacklessCoroTask, takeNext,
 			}
 			unlock(&s.lock)
 			s.logicalTaskComplete(false)
-		}
-		if isStacklessCoroCompletedTaskCacheMarker(task.frameSize) {
-			if task.frameSize <= stacklessCoroScalarTaskCacheFirst {
-				cacheStacklessCoroCompletedScalarTaskChunk(task)
-			} else {
-				cacheStacklessCoroCompletedTask(task)
-			}
-		} else {
-			task.frameSize = 0
-			if burstResume != nil {
-				cacheStacklessCoroTypedBurst(burstResume, task)
-			}
 		}
 		if takeNext && !s.driverDone(public) {
 			return s.take()
