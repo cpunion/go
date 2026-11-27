@@ -1348,7 +1348,7 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		// allocation estimate without bothering to STW. As long as
 		// this is close, then we'll only need to STW once (on the next
 		// call).
-		return int(gcount(false)), false
+		return int(gcount(false)) + int(coroUnhostedCount()), false
 	}
 
 	semacquire(&goroutineProfile.sema)
@@ -1356,6 +1356,11 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 	ourg := getg()
 
 	pcbuf := makeProfStack() // see saveg() for explanation
+	var coroPCBuf []uintptr
+	if estCoro := int(coroUnhostedCount()); estCoro > 0 {
+		// Pre-allocate outside STW so coroRecordProfileSTW does zero allocations under STW.
+		coroPCBuf = make([]uintptr, (estCoro+64)*8)
+	}
 	stw := stopTheWorld(stwGoroutineProfile)
 	// Using gcount while the world is stopped should give us a consistent view
 	// of the number of live goroutines, minus the number of goroutines that are
@@ -1369,8 +1374,10 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		n++
 	}
 	n += int(gcCleanups.running.Load())
+	coroN := coroCountProfileTasksSTW()
+	n += coroN
 
-	if n > len(p) {
+	if n > len(p) || (coroN > 0 && len(coroPCBuf) < coroN*2) {
 		// There's not enough space in p to store the whole profile, so (per the
 		// contract of runtime.GoroutineProfile) we're not allowed to write to p
 		// at all and must return n, false.
@@ -1389,7 +1396,15 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		labels[0] = ourg.labels
 	}
 	ourg.goroutineProfiled.Store(goroutineProfileSatisfied)
-	goroutineProfile.offset.Store(1)
+	coroWritten := 0
+	if coroN > 0 {
+		var coroLabels []unsafe.Pointer
+		if labels != nil {
+			coroLabels = labels[1:]
+		}
+		coroWritten = coroRecordProfileSTW(p[1:], coroLabels, coroPCBuf)
+	}
+	goroutineProfile.offset.Store(int64(1 + coroWritten))
 
 	// Prepare for all other goroutines to enter the profile. Aside from ourg,
 	// every goroutine struct in the allgs list has its goroutineProfiled field

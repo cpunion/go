@@ -953,7 +953,7 @@ func (rw *bodyRewriter) emitTerm(t *blockTerm, bbLabels []*types.Sym) {
 		rw.setState(pos, t.target.resumeState)
 		gcCall := typecheck.Call(pos, typecheck.LookupRuntime("coroGC"), []ir.Node{rw.ctxVar}, false)
 		rw.rf.Body.Append(typecheck.Stmt(gcCall))
-		rw.rf.Body.Append(rw.returnAction(pos, coroActWait))
+		rw.rf.Body.Append(rw.returnAction(pos, coroActYield))
 
 	case termSleep:
 		rw.setState(pos, t.target.resumeState)

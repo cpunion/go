@@ -1445,6 +1445,7 @@ func tracebacksomeothers(me *g, showf func(*g) bool) {
 			traceback(^uintptr(0), ^uintptr(0), 0, gp)
 		}
 	})
+	coroTracebackAll()
 }
 
 // tracebackHexdump hexdumps part of stk around frame.sp and frame.fp
