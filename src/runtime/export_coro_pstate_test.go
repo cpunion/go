@@ -6,7 +6,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/atomic"
+	"unsafe"
+)
 
 type stacklessCoroPStateTestFrameA struct {
 	header stacklessCoroFusedResumeFrameHeader
@@ -20,6 +23,11 @@ type stacklessCoroPStateTestFrameB struct {
 
 func stacklessCoroPStateTestResumeA(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
 func stacklessCoroPStateTestResumeB(unsafe.Pointer) uint8 { return stacklessCoroActionComplete }
+func stacklessCoroPStateShrinkResume(ctx unsafe.Pointer) uint8 {
+	context := (*stacklessCoroContext)(ctx)
+	(*atomic.Int32)(context.frame).Add(1)
+	return stacklessCoroActionComplete
+}
 
 func CheckStacklessCoroTaskLifecycleAtomicsForTest() string {
 	// 1. Normal park before completion: parkWaitAtomic succeeds, then completeWaitAtomic returns early=false.
@@ -123,20 +131,28 @@ func CheckStacklessCoroPRunqShrinkDrainForTest() string {
 	if raceenabled {
 		return ""
 	}
-	// Run with 4 Ps, enqueue eligible runnable tasks on Ps, then shrink GOMAXPROCS(1)
-	// and verify drainStacklessCoroPState moves every queued task onto s.head so none are lost.
+	// Run with 4 Ps, deterministically enqueue executable runnable tasks into
+	// the local coroP.runq of Ps that will be destroyed (id >= 1), assert they
+	// are present in those destroyed-P rings BEFORE shrinking GOMAXPROCS(4->1),
+	// then verify drainStacklessCoroPState transfers them onto s.head and every
+	// task executes exactly once.
 	prev := GOMAXPROCS(4)
 	defer GOMAXPROCS(prev)
 
-	s := newStacklessCoroTestScheduler()
-	s.wake = make(chan struct{}, stacklessCoroWarmExecutorCount)
+	s := &stacklessCoroScheduler{
+		wake: make(chan struct{}, stacklessCoroWarmExecutorCount),
+	}
 	s.executorState.Store(stacklessCoroExecutorStateRunning)
 
 	const total = 32
+	const wantDestroyed = 16
 	tasks := make([]*stacklessCoroTask, total)
-	seen := make([]bool, total)
+	executed := make([]atomic.Int32, total)
 	for i := range total {
 		task := new(stacklessCoroTask)
+		task.resume = stacklessCoroPStateShrinkResume
+		task.context.frame = unsafe.Pointer(&executed[i])
+		task.context.scheduler = s
 		rec := &stacklessCoroGoroutine{
 			scheduler:  s,
 			inRegistry: true,
@@ -145,26 +161,106 @@ func CheckStacklessCoroPRunqShrinkDrainForTest() string {
 		task.setLifecycle(taskWordRunnable)
 		tasks[i] = task
 	}
-	// Push tasks across multiple goroutines so they spread across Ps.
-	done := make(chan struct{}, total)
-	for i := range total {
-		task := tasks[i]
+
+	// Keep 4 concurrent workers active so multiple Ps (including id >= 1)
+	// execute simultaneously. The first wantDestroyed tasks must land on a P
+	// with id >= 1 that GOMAXPROCS(1) will destroy.
+	nextDestroyed := new(atomic.Int32)
+	activeWorkers := new(atomic.Int32)
+	const workers = 4
+	ready := make(chan struct{}, workers)
+	goDone := make(chan struct{}, workers)
+	for range workers {
 		go func() {
-			if _, ok := coroRunqPut(s, task); !ok {
-				lock(&s.lock)
-				s.enqueueRunnableLocked(task)
-				unlock(&s.lock)
+			defer func() { goDone <- struct{}{} }()
+			activeWorkers.Add(1)
+			ready <- struct{}{}
+			for activeWorkers.Load() < workers {
+				Gosched()
 			}
-			done <- struct{}{}
+			for {
+				idx := int(nextDestroyed.Load())
+				if idx >= wantDestroyed {
+					return
+				}
+				mp := acquirem()
+				pp := mp.p.ptr()
+				onDestroyed := pp != nil && pp.id >= 1
+				releasem(mp)
+				if !onDestroyed {
+					// Keep P0 briefly occupied while P1..P3 run their workers.
+					procyield(30)
+					Gosched()
+					continue
+				}
+				claimed := int(nextDestroyed.Add(1)) - 1
+				if claimed >= wantDestroyed {
+					return
+				}
+				// Re-check P ownership right as we push; if preempted back to P0,
+				// push anyway and the explicit allp[1:] assertion below still
+				// verifies real residency on Ps to be destroyed.
+				if _, ok := coroRunqPut(s, tasks[claimed]); !ok {
+					lock(&s.lock)
+					s.enqueueRunnableLocked(tasks[claimed])
+					unlock(&s.lock)
+				}
+			}
 		}()
 	}
-	for range total {
-		<-done
+	for range workers {
+		<-ready
+	}
+	for range workers {
+		<-goDone
 	}
 
-	// Shrink GOMAXPROCS to 1, invoking p.destroy() -> drainStacklessCoroPState.
+	// Place remaining tasks across Ps (including P0).
+	for i := wantDestroyed; i < total; i++ {
+		if _, ok := coroRunqPut(s, tasks[i]); !ok {
+			lock(&s.lock)
+			s.enqueueRunnableLocked(tasks[i])
+			unlock(&s.lock)
+		}
+	}
+
+	// Explicitly assert that tasks are actually queued in the local coroP.runq
+	// of Ps with id >= 1 BEFORE calling GOMAXPROCS(1).
+	destroyedBefore := 0
+	mp := acquirem()
+	for idx := 1; idx < len(allp); idx++ {
+		pp := allp[idx]
+		if pp == nil {
+			continue
+		}
+		if ps := pp.coroP.Load(); ps != nil && ps.runqSched.Load() == s {
+			h := atomic.LoadAcq(&ps.runqHead)
+			t := atomic.LoadAcq(&ps.runqTail)
+			if t > h {
+				destroyedBefore += int(t - h)
+			}
+		}
+	}
+	releasem(mp)
+	if destroyedBefore == 0 {
+		return "no tasks were queued in coroP.runq of destroyed Ps (id >= 1) before GOMAXPROCS shrink"
+	}
+
+	// Shrink GOMAXPROCS 4 -> 1, invoking p.destroy() -> drainStacklessCoroPState.
 	GOMAXPROCS(1)
 
+	// Verify the drained tasks landed on s.head before we start taking.
+	lock(&s.lock)
+	headCount := 0
+	for cur := s.head; cur != nil; cur = cur.next {
+		headCount++
+	}
+	unlock(&s.lock)
+	if headCount < destroyedBefore {
+		return "drainStacklessCoroPState did not move destroyed-P ring tasks onto scheduler queue"
+	}
+
+	seen := make([]bool, total)
 	got := 0
 	for {
 		task := s.take()
@@ -182,10 +278,18 @@ func CheckStacklessCoroPRunqShrinkDrainForTest() string {
 			return "unexpected or duplicate task drained after GOMAXPROCS shrink"
 		}
 		seen[found] = true
+		if action := task.resume(unsafe.Pointer(&task.context)); action != stacklessCoroActionComplete {
+			return "drained task resume returned unexpected action"
+		}
 		got++
 	}
 	if got != total {
 		return "lost runnable task from per-P coroRunq across GOMAXPROCS shrink"
+	}
+	for i := range total {
+		if executed[i].Load() != 1 {
+			return "drained task did not execute exactly once"
+		}
 	}
 	if s.runnableState.Load() != 0 {
 		return "non-zero runnableState after draining all tasks"
