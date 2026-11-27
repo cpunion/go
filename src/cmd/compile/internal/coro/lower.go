@@ -59,23 +59,35 @@ func (p *Plan) lowerAll() (int, int, []string) {
 
 	// Stage 4b: emit F.coro.func1, F.coro, public wrapper F, and dynamic dispatch adapters.
 	deadClo := make(map[*ir.Func]bool)
+	escapedLoweredClo := make(map[*ir.Func]*bodyRewriter)
 	for _, info := range lowered {
 		g := cfgs[info]
-		p.emitResumeBody(info, g, deadClo)
+		p.emitResumeBody(info, g, deadClo, escapedLoweredClo)
 		p.emitFactoryBody(info)
 		p.rewritePublicWrapper(info)
 		p.emitCallableAdapter(info)
+	}
+	// Rebind any lowered closure that escaped as a value inside a lowered parent
+	// now that its public wrapper body has been emitted.
+	for clo, parentRW := range escapedLoweredClo {
+		parentRW.rebindNestedClosure(clo)
 	}
 
 	// Stage 4c: emit synthetic package init registering dynamic callables.
 	p.emitCallableInit(lowered)
 
-	// Prune dead .gowrap/.deferwrap wrappers and cloned plain defer closures whose
-	// parent function was lowered, so escape analysis never walks stale closure vars.
+	// Prune dead .gowrap/.deferwrap wrappers, cloned plain defer closures, and
+	// non-escaping lowered closures whose parent function was lowered, so escape
+	// analysis never walks stale ClosureVars pointing at moved parent locals.
 	kept := p.Pkg.Funcs[:0]
 	for _, fn := range p.Pkg.Funcs {
-		if fn != nil && (deadClo[fn] || (isGoDeferWrapper(fn) && p.Lowered[fn.ClosureParent] != nil)) {
-			continue
+		if fn != nil {
+			if deadClo[fn] || (isGoDeferWrapper(fn) && p.Lowered[fn.ClosureParent] != nil) {
+				continue
+			}
+			if fn.OClosure != nil && p.Lowered[fn] != nil && p.Lowered[fn.ClosureParent] != nil && escapedLoweredClo[fn] == nil {
+				continue
+			}
 		}
 		kept = append(kept, fn)
 	}
@@ -95,6 +107,9 @@ func (p *Plan) createFuncShells(info *FuncInfo) {
 	retField := types.NewField(pos, nil, types.Types[types.TUINT8])
 	resumeSig := types.NewSignature(nil, []*types.Field{ctxField}, []*types.Field{retField})
 	resumeFn := ir.NewFunc(pos, pos, resumeSym, resumeSig)
+	if fn.Dupok() {
+		resumeFn.SetDupok(true)
+	}
 	typecheck.DeclFunc(resumeFn)
 	typecheck.FinishFuncBody()
 	info.ResumeFn = resumeFn
@@ -118,6 +133,9 @@ func (p *Plan) createFuncShells(info *FuncInfo) {
 	}
 	facSig := types.NewSignature(nil, facParams, facResults)
 	facFn := ir.NewFunc(pos, pos, facSym, facSig)
+	if fn.Dupok() {
+		facFn.SetDupok(true)
+	}
 	typecheck.DeclFunc(facFn)
 	typecheck.FinishFuncBody()
 	info.FactoryFn = facFn
@@ -238,7 +256,7 @@ func (p *Plan) rewritePublicWrapper(info *FuncInfo) {
 	})
 }
 
-func (p *Plan) emitResumeBody(info *FuncInfo, g *funcCFG, deadClo map[*ir.Func]bool) {
+func (p *Plan) emitResumeBody(info *FuncInfo, g *funcCFG, deadClo map[*ir.Func]bool, escapedLoweredClo map[*ir.Func]*bodyRewriter) {
 	rf := info.ResumeFn
 	pos := info.Orig.Pos()
 	ir.WithFunc(rf, func() {
@@ -249,15 +267,16 @@ func (p *Plan) emitResumeBody(info *FuncInfo, g *funcCFG, deadClo map[*ir.Func]b
 		rf.Body.Append(assignNode(pos, fVar, typecheck.ConvNop(ctxVar, fptrType)))
 
 		rw := &bodyRewriter{
-			plan:      p,
-			info:      info,
-			g:         g,
-			rf:        rf,
-			ctxVar:    ctxVar,
-			fVar:      fVar,
-			stackLocs: make(map[*ir.Name]*ir.Name),
-			byRefCaps: make(map[*ir.Name]*types.Field),
-			deadClo:   deadClo,
+			plan:              p,
+			info:              info,
+			g:                 g,
+			rf:                rf,
+			ctxVar:            ctxVar,
+			fVar:              fVar,
+			stackLocs:         make(map[*ir.Name]*ir.Name),
+			byRefCaps:         make(map[*ir.Name]*types.Field),
+			deadClo:           deadClo,
+			escapedLoweredClo: escapedLoweredClo,
 		}
 		for i, cv := range info.Orig.ClosureVars {
 			if i < len(info.CapByRef) && info.CapByRef[i] {
@@ -313,16 +332,17 @@ func (p *Plan) emitResumeBody(info *FuncInfo, g *funcCFG, deadClo map[*ir.Func]b
 }
 
 type bodyRewriter struct {
-	plan      *Plan
-	info      *FuncInfo
-	g         *funcCFG
-	rf        *ir.Func
-	ctxVar    *ir.Name
-	fVar      *ir.Name
-	stackLocs map[*ir.Name]*ir.Name
-	byRefCaps map[*ir.Name]*types.Field
-	deadClo   map[*ir.Func]bool
-	tmpSeq    int
+	plan              *Plan
+	info              *FuncInfo
+	g                 *funcCFG
+	rf                *ir.Func
+	ctxVar            *ir.Name
+	fVar              *ir.Name
+	stackLocs         map[*ir.Name]*ir.Name
+	byRefCaps         map[*ir.Name]*types.Field
+	deadClo           map[*ir.Func]bool
+	escapedLoweredClo map[*ir.Func]*bodyRewriter
+	tmpSeq            int
 }
 
 func (rw *bodyRewriter) emitResumeEpilogue(bb *basicBlock, g *funcCFG, bbLabels []*types.Sym) {
@@ -361,6 +381,98 @@ func (rw *bodyRewriter) emitResumeEpilogue(bb *basicBlock, g *funcCFG, bbLabels 
 			if t.ioErrDst != nil {
 				rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(t.ioErrDst), fieldSel(pos, rw.fVar, g.ioErrField)))
 			}
+		case termIfaceIO:
+			// Complete direct netpoll finish OR awaited user io.Reader/Writer child.
+			var finBody ir.Nodes
+			finFnVar := rw.emitCastFuncPtr(pos, &finBody, buildIfaceIOFinishType(pos), fieldSel(pos, rw.fVar, g.ioFinField))
+			finCall := typecheck.Call(pos, finFnVar, []ir.Node{
+				fieldSel(pos, rw.fVar, g.ioRawField),
+				typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.ioNField)),
+				typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.ioErrField)),
+				fieldSel(pos, rw.fVar, g.ioDirectField),
+				fieldSel(pos, rw.fVar, g.ioStatusField),
+			}, false)
+			finBody.Append(typecheck.Stmt(finCall))
+			finBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.ioFinField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			finBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.ioRawField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+
+			var childBody ir.Nodes
+			resTypes := []*types.Type{types.Types[types.TINT], types.ErrorType}
+			var copyBody ir.Nodes
+			rcVar := rw.emitCastFuncPtr(pos, &copyBody, buildResCopierType(pos, resTypes), fieldSel(pos, rw.fVar, g.resCopyField))
+			copyBody.Append(typecheck.Stmt(typecheck.Call(pos, rcVar, []ir.Node{
+				fieldSel(pos, rw.fVar, g.awaitChildField),
+				typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.ioNField)),
+				typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.ioErrField)),
+			}, false)))
+			relOnly := []ir.Node{typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{fieldSel(pos, rw.fVar, g.awaitChildField)}, false))}
+			hasRC := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			childBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasRC, copyBody, relOnly)))
+			childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+
+			hasChild := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			elseIf := []ir.Node{typecheck.Stmt(ir.NewIfStmt(pos, hasChild, childBody, nil))}
+			hasFin := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.ioFinField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasFin, finBody, elseIf)))
+
+			if t.ioNDst != nil {
+				rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(t.ioNDst), fieldSel(pos, rw.fVar, g.ioNField)))
+			}
+			if t.ioErrDst != nil {
+				rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(t.ioErrDst), fieldSel(pos, rw.fVar, g.ioErrField)))
+			}
+		case termSync:
+			recv := rw.rewriteNode(t.syncRecv)
+			syncCall := callStdlibSyncMethod(pos, recv, t.syncKind, []ir.Node{
+				rw.ctxVar,
+				typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.syncStField)),
+			})
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, syncCall, []ir.Node{rw.returnAction(pos, coroActWait)}, nil)))
+		case termAccept:
+			outAddr := typecheck.NodAddrAt(pos, rw.rewriteNode(t.acceptOutTmp))
+			errAddr := typecheck.NodAddrAt(pos, rw.rewriteNode(t.acceptErrTmp))
+			heldAddr := typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, g.acceptHeldField))
+			if t.acceptKind != acceptIface {
+				recv := rw.rewriteNode(t.acceptRecv)
+				accCall := callStdlibAcceptMethod(pos, recv, t.acceptKind, []ir.Node{
+					rw.ctxVar, outAddr, errAddr, heldAddr,
+				})
+				rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, accCall, []ir.Node{rw.returnAction(pos, coroActWait)}, nil)))
+			} else {
+				var stepBody ir.Nodes
+				stepFnVar := rw.emitCastFuncPtr(pos, &stepBody, buildIfaceAcceptStepType(pos, t.acceptOutTmp.Type()), fieldSel(pos, rw.fVar, g.acceptStepField))
+				stepCall := typecheck.Call(pos, stepFnVar, []ir.Node{
+					fieldSel(pos, rw.fVar, g.acceptRawField), rw.ctxVar, outAddr, errAddr, heldAddr,
+				}, false)
+				stepBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, stepCall, []ir.Node{rw.returnAction(pos, coroActWait)}, nil)))
+				stepBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.acceptStepField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				stepBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.acceptRawField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+
+				var childBody ir.Nodes
+				resTypes := []*types.Type{t.acceptOutTmp.Type(), t.acceptErrTmp.Type()}
+				var copyBody ir.Nodes
+				rcVar := rw.emitCastFuncPtr(pos, &copyBody, buildResCopierType(pos, resTypes), fieldSel(pos, rw.fVar, g.resCopyField))
+				copyBody.Append(typecheck.Stmt(typecheck.Call(pos, rcVar, []ir.Node{
+					fieldSel(pos, rw.fVar, g.awaitChildField), outAddr, errAddr,
+				}, false)))
+				relOnly := []ir.Node{typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{fieldSel(pos, rw.fVar, g.awaitChildField)}, false))}
+				hasRC := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				childBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasRC, copyBody, relOnly)))
+				childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+
+				hasChild := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				elseIf := []ir.Node{typecheck.Stmt(ir.NewIfStmt(pos, hasChild, childBody, nil))}
+				hasStep := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.acceptStepField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasStep, stepBody, elseIf)))
+			}
+			if t.acceptOutDst != nil {
+				rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(t.acceptOutDst), rw.rewriteNode(t.acceptOutTmp)))
+			}
+			if t.acceptErrDst != nil {
+				rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(t.acceptErrDst), rw.rewriteNode(t.acceptErrTmp)))
+			}
 		case termAwait:
 			// Copy callee return values from childFrame, then release childFrame.
 			calleeInfo := rw.plan.Lowered[t.awaitCallee]
@@ -379,6 +491,43 @@ func (rw *bodyRewriter) emitResumeEpilogue(bb *basicBlock, g *funcCFG, bbLabels 
 			relCall := typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{childPtr}, false)
 			rw.rf.Body.Append(typecheck.Stmt(relCall))
 			rw.rf.Body.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		case termDynAwait:
+			sig := t.dynCall.Fun.Type()
+			resFields := sig.Results()
+			var childBody ir.Nodes
+			if len(resFields) > 0 {
+				resTypes := make([]*types.Type, len(resFields))
+				for i, rf := range resFields {
+					resTypes[i] = rf.Type
+				}
+				var copyBody ir.Nodes
+				rcVar := rw.emitCastFuncPtr(pos, &copyBody, buildResCopierType(pos, resTypes), fieldSel(pos, rw.fVar, g.resCopyField))
+				rcArgs := make([]ir.Node, 0, 1+len(resFields))
+				rcArgs = append(rcArgs, fieldSel(pos, rw.fVar, g.awaitChildField))
+				for i, rt := range resTypes {
+					if i < len(t.dynResTmps) && t.dynResTmps[i] != nil {
+						rcArgs = append(rcArgs, typecheck.NodAddrAt(pos, rw.rewriteNode(t.dynResTmps[i])))
+					} else {
+						rcArgs = append(rcArgs, ir.NewNilExpr(pos, types.NewPtr(rt)))
+					}
+				}
+				copyBody.Append(typecheck.Stmt(typecheck.Call(pos, rcVar, rcArgs, false)))
+				relOnly := []ir.Node{typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{fieldSel(pos, rw.fVar, g.awaitChildField)}, false))}
+				hasRC := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+				childBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasRC, copyBody, relOnly)))
+			} else {
+				childBody.Append(typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroReleaseFrame"), []ir.Node{fieldSel(pos, rw.fVar, g.awaitChildField)}, false)))
+			}
+			childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			childBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+
+			hasChild := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, fieldSel(pos, rw.fVar, g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasChild, childBody, nil)))
+			for i, dst := range t.dynDsts {
+				if dst != nil && !ir.IsBlank(dst) && i < len(t.dynResTmps) && t.dynResTmps[i] != nil {
+					rw.rf.Body.Append(assignNode(pos, rw.rewriteNode(dst), rw.rewriteNode(t.dynResTmps[i])))
+				}
+			}
 		case termSelect:
 			// Switch on f._selI to copy recv/ok and jump to chosen case body.
 			var cases []*ir.CaseClause
@@ -442,6 +591,14 @@ func isGoDeferWrapper(fn *ir.Func) bool {
 	return strings.Contains(name, ".gowrap") || strings.Contains(name, ".deferwrap")
 }
 
+func isUnwrappableGoDeferWrapper(fn *ir.Func) bool {
+	if !isGoDeferWrapper(fn) || len(fn.Body) != 1 {
+		return false
+	}
+	_, ok := fn.Body[0].(*ir.CallExpr)
+	return ok
+}
+
 // unwrapGoDeferCall peels off the synthetic zero-arg .gowrap/.deferwrap closure
 // produced by typecheck.tcGoDefer, restoring the original call with outer vars
 // already evaluated in the statement's Init list.
@@ -480,10 +637,10 @@ func unwrapGoDeferCall(call *ir.CallExpr) *ir.CallExpr {
 			return nm
 		}
 		cp := ir.Copy(n)
-		ir.EditChildren(cp, subst)
+		ir.EditChildrenWithHidden(cp, subst)
 		return cp
 	}
-	ir.EditChildren(clone, subst)
+	ir.EditChildrenWithHidden(clone, subst)
 	return clone
 }
 
@@ -513,22 +670,45 @@ func (rw *bodyRewriter) emitGoStmt(goSt *ir.GoDeferStmt) {
 	}
 
 	// 2. Dynamic interface method call: `go iface.M(args...)`.
-	if call.Op() == ir.OCALLINTER {
+	if call.Op() == ir.OCALLINTER && !call.IsDDD && !call.Fun.Type().IsVariadic() {
 		rw.emitDynamicInterfaceGo(pos, call)
 		return
 	}
 
-	// 3. Dynamic function value call: `go fnVar(args...)`.
-	if call.Op() == ir.OCALLFUNC {
-		if _, isStaticName := call.Fun.(*ir.Name); !isStaticName {
-			if _, isCloLit := call.Fun.(*ir.ClosureExpr); !isCloLit {
+	// 3. Dynamic function value or cross-package static function call: `go fn(args...)`.
+	if call.Op() == ir.OCALLFUNC && !call.IsDDD && !call.Fun.Type().IsVariadic() && !call.Fun.Type().HasShape() {
+		switch fn := call.Fun.(type) {
+		case *ir.Name:
+			if fn.Sym() != nil && fn.Sym().Pkg != nil && fn.Sym().Pkg != types.LocalPkg && isEligibleExternalPkg(fn.Sym().Pkg.Path) {
+				rw.emitDynamicFuncGo(pos, call)
+				return
+			}
+		case *ir.ClosureExpr:
+			// local non-lowered closure -> fall through to ordinary go
+		default:
+			if sel, ok := call.Fun.(*ir.SelectorExpr); !ok || sel.Op() != ir.OMETHEXPR {
 				rw.emitDynamicFuncGo(pos, call)
 				return
 			}
 		}
 	}
 
-	// 4. Unlowered static callee (e.g. skipped cgo worker or plain helper): spawn via coroSpawnOpaque.
+	// 4. Cross-package method call: `go x.Method(args...)`.
+	if call.Op() == ir.OCALLMETH && !call.IsDDD && !call.Fun.Type().IsVariadic() && !call.Fun.Type().HasShape() {
+		if sel, ok := call.Fun.(*ir.SelectorExpr); ok && sel.Op() == ir.ODOTMETH && sel.X != nil && sel.X.Type() != nil {
+			baseT := sel.X.Type()
+			if baseT.IsPtr() {
+				baseT = baseT.Elem()
+			}
+			if baseT != nil && baseT.Sym() != nil && baseT.Sym().Pkg != nil && baseT.Sym().Pkg != types.LocalPkg &&
+				!baseT.HasShape() && isEligibleExternalPkg(baseT.Sym().Pkg.Path) {
+				rw.emitCrossPkgMethodGo(pos, call)
+				return
+			}
+		}
+	}
+
+	// 5. Unlowered static callee (e.g. skipped cgo worker or plain helper): spawn via ordinary go.
 	rw.emitOpaqueGo(pos, call)
 }
 
@@ -889,6 +1069,188 @@ func (rw *bodyRewriter) emitTerm(t *blockTerm, bbLabels []*types.Sym) {
 		)
 		rw.rf.Body.Append(typecheck.Stmt(ifn))
 
+	case termIfaceIO:
+		seq := rw.tmpSeq
+		rw.tmpSeq++
+		ifaceExpr := rw.rewriteNode(t.ioRecv)
+		ifaceVar := newLocal(rw.rf, pos, fmt.Sprintf(".iio%d", seq), ifaceExpr.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, ifaceVar)))
+		rw.rf.Body.Append(assignNode(pos, ifaceVar, ifaceExpr))
+		bufExpr := rw.rewriteNode(t.ioBuf)
+		bufVar := newLocal(rw.rf, pos, fmt.Sprintf(".iob%d", seq), bufExpr.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, bufVar)))
+		rw.rf.Body.Append(assignNode(pos, bufVar, bufExpr))
+
+		itabRaw := ir.NewUnaryExpr(pos, ir.OITAB, ifaceVar)
+		itabRaw.SetType(types.Types[types.TUINTPTR])
+		itabRaw.SetTypecheck(1)
+		itabNode := typecheck.ConvNop(itabRaw, types.Types[types.TUNSAFEPTR])
+		idataNode := ir.NewUnaryExpr(pos, ir.OIDATA, ifaceVar)
+		idataNode.SetType(types.Types[types.TUNSAFEPTR])
+		idataNode.SetTypecheck(1)
+		methodIdx := t.ioSel.Offset() / int64(types.PtrSize)
+		idxNode := typecheck.Conv(ir.NewInt(pos, methodIdx), types.Types[types.TUINTPTR])
+
+		startPtr := newLocal(rw.rf, pos, fmt.Sprintf(".ios%d", seq), types.Types[types.TUNSAFEPTR])
+		finPtr := newLocal(rw.rf, pos, fmt.Sprintf(".iof%d", seq), types.Types[types.TUNSAFEPTR])
+		rawPtr := newLocal(rw.rf, pos, fmt.Sprintf(".ior%d", seq), types.Types[types.TUNSAFEPTR])
+		lkIO := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupIO"), []ir.Node{itabNode, idataNode, idxNode}, false)
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{startPtr, finPtr, rawPtr}, []ir.Node{lkIO})))
+
+		// Fast path 1: direct netpoll adapter (*os.File, *net.TCPConn, etc.).
+		var netpollBody ir.Nodes
+		netpollBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		netpollBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		startFnVar := rw.emitCastFuncPtr(pos, &netpollBody, buildIfaceIOStartType(pos), startPtr)
+		sCall := typecheck.Call(pos, startFnVar, []ir.Node{
+			rawPtr, rw.ctxVar, bufVar,
+			typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, rw.g.ioNField)),
+			typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, rw.g.ioErrField)),
+			typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, rw.g.ioDirectField)),
+			typecheck.NodAddrAt(pos, fieldSel(pos, rw.fVar, rw.g.ioStatusField)),
+		}, false)
+		parkedBody := []ir.Node{
+			assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioFinField), finPtr),
+			assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioRawField), rawPtr),
+			assignNode(pos, fieldSel(pos, rw.fVar, rw.info.StateField), typecheck.Conv(ir.NewInt(pos, int64(t.target.resumeState)), types.Types[types.TUINT32])),
+			rw.returnAction(pos, coroActWait),
+		}
+		doneBody := []ir.Node{
+			assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioFinField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])),
+			assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioRawField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])),
+			ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id]),
+		}
+		netpollBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, sCall, parkedBody, doneBody)))
+
+		// Path 2: lowered user io.Reader/Writer coroutine via coroLookupAwaitInterface, else inline.
+		var fallbackBody ir.Nodes
+		fallbackBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioFinField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		fallbackBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.ioRawField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		facPtr := newLocal(rw.rf, pos, fmt.Sprintf(".iaf%d", seq), types.Types[types.TUNSAFEPTR])
+		recvPtr := newLocal(rw.rf, pos, fmt.Sprintf(".iar%d", seq), types.Types[types.TUNSAFEPTR])
+		resPtr := newLocal(rw.rf, pos, fmt.Sprintf(".iac%d", seq), types.Types[types.TUNSAFEPTR])
+		lkAwait := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitInterface"), []ir.Node{itabNode, idataNode, idxNode}, false)
+		fallbackBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, recvPtr, resPtr}, []ir.Node{lkAwait})))
+
+		adpType := buildDynamicAdapterType(pos, t.ioSel.Type())
+		var awaitBody ir.Nodes
+		facFnVar := rw.emitCastFuncPtr(pos, &awaitBody, adpType, facPtr)
+		frameVar := newLocal(rw.rf, pos, fmt.Sprintf(".icf%d", seq), types.Types[types.TUNSAFEPTR])
+		resVar := newLocal(rw.rf, pos, fmt.Sprintf(".icr%d", seq), adpType.Results()[1].Type)
+		adpCall := typecheck.Call(pos, facFnVar, []ir.Node{recvPtr, bufVar}, false)
+		awaitBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{frameVar, resVar}, []ir.Node{adpCall})))
+		awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), frameVar))
+		awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), resPtr))
+		awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.info.StateField), typecheck.Conv(ir.NewInt(pos, int64(t.target.resumeState)), types.Types[types.TUINT32])))
+		awaitBody.Append(typecheck.Stmt(ir.NewReturnStmt(pos, []ir.Node{typecheck.Call(pos, typecheck.LookupRuntime("coroAwaitFrame"), []ir.Node{rw.ctxVar, frameVar, resVar}, false)})))
+
+		var inlineBody ir.Nodes
+		inlineBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		inlineBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		isel := ir.NewSelectorExpr(pos, ir.ODOTINTER, ifaceVar, t.ioSel.Sel)
+		isel.Selection = t.ioSel.Selection
+		isel.SetType(t.ioSel.Type())
+		isel.SetTypecheck(1)
+		icall := typecheck.Call(pos, isel, []ir.Node{bufVar}, false)
+		inlineBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{
+			fieldSel(pos, rw.fVar, rw.g.ioNField),
+			fieldSel(pos, rw.fVar, rw.g.ioErrField),
+		}, []ir.Node{icall})))
+		inlineBody.Append(ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id]))
+
+		hasFac := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		fallbackBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasFac, awaitBody, inlineBody)))
+
+		hasStart := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, startPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasStart, netpollBody, fallbackBody)))
+
+	case termSync:
+		arr := fieldSel(pos, rw.fVar, rw.g.syncStField)
+		rw.rf.Body.Append(assignNode(pos, typecheck.Expr(ir.NewIndexExpr(pos, arr, ir.NewInt(pos, 0))), typecheck.Conv(ir.NewInt(pos, 0), types.Types[types.TUINT64])))
+		rw.rf.Body.Append(assignNode(pos, typecheck.Expr(ir.NewIndexExpr(pos, arr, ir.NewInt(pos, 1))), typecheck.Conv(ir.NewInt(pos, 0), types.Types[types.TUINT64])))
+		rw.setState(pos, t.target.resumeState)
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id])))
+
+	case termAccept:
+		if t.acceptKind != acceptIface {
+			rw.rf.Body.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptHeldField), ir.NewBool(pos, false)))
+			rw.setState(pos, t.target.resumeState)
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id])))
+		} else {
+			seq := rw.tmpSeq
+			rw.tmpSeq++
+			lnExpr := rw.rewriteNode(t.acceptRecv)
+			lnVar := newLocal(rw.rf, pos, fmt.Sprintf(".aln%d", seq), lnExpr.Type())
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, lnVar)))
+			rw.rf.Body.Append(assignNode(pos, lnVar, lnExpr))
+
+			itabRaw := ir.NewUnaryExpr(pos, ir.OITAB, lnVar)
+			itabRaw.SetType(types.Types[types.TUINTPTR])
+			itabRaw.SetTypecheck(1)
+			itabNode := typecheck.ConvNop(itabRaw, types.Types[types.TUNSAFEPTR])
+			idataNode := ir.NewUnaryExpr(pos, ir.OIDATA, lnVar)
+			idataNode.SetType(types.Types[types.TUNSAFEPTR])
+			idataNode.SetTypecheck(1)
+			methodIdx := t.acceptSel.Offset() / int64(types.PtrSize)
+			idxNode := typecheck.Conv(ir.NewInt(pos, methodIdx), types.Types[types.TUINTPTR])
+
+			stepPtr := newLocal(rw.rf, pos, fmt.Sprintf(".asp%d", seq), types.Types[types.TUNSAFEPTR])
+			rawPtr := newLocal(rw.rf, pos, fmt.Sprintf(".arp%d", seq), types.Types[types.TUNSAFEPTR])
+			lkAcc := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAccept"), []ir.Node{itabNode, idataNode, idxNode}, false)
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{stepPtr, rawPtr}, []ir.Node{lkAcc})))
+
+			directBody := []ir.Node{
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptStepField), stepPtr),
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptRawField), rawPtr),
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptHeldField), ir.NewBool(pos, false)),
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])),
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])),
+				assignNode(pos, fieldSel(pos, rw.fVar, rw.info.StateField), typecheck.Conv(ir.NewInt(pos, int64(t.target.resumeState)), types.Types[types.TUINT32])),
+				ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id]),
+			}
+
+			var fbBody ir.Nodes
+			fbBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptStepField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			fbBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.acceptRawField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			facPtr := newLocal(rw.rf, pos, fmt.Sprintf(".aaf%d", seq), types.Types[types.TUNSAFEPTR])
+			recvPtr := newLocal(rw.rf, pos, fmt.Sprintf(".aar%d", seq), types.Types[types.TUNSAFEPTR])
+			resPtr := newLocal(rw.rf, pos, fmt.Sprintf(".aac%d", seq), types.Types[types.TUNSAFEPTR])
+			lkAwait := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitInterface"), []ir.Node{itabNode, idataNode, idxNode}, false)
+			fbBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, recvPtr, resPtr}, []ir.Node{lkAwait})))
+
+			adpType := buildDynamicAdapterType(pos, t.acceptSel.Type())
+			var awaitBody ir.Nodes
+			facFnVar := rw.emitCastFuncPtr(pos, &awaitBody, adpType, facPtr)
+			frameVar := newLocal(rw.rf, pos, fmt.Sprintf(".acf%d", seq), types.Types[types.TUNSAFEPTR])
+			resVar := newLocal(rw.rf, pos, fmt.Sprintf(".acr%d", seq), adpType.Results()[1].Type)
+			adpCall := typecheck.Call(pos, facFnVar, []ir.Node{recvPtr}, false)
+			awaitBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{frameVar, resVar}, []ir.Node{adpCall})))
+			awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), frameVar))
+			awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), resPtr))
+			awaitBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.info.StateField), typecheck.Conv(ir.NewInt(pos, int64(t.target.resumeState)), types.Types[types.TUINT32])))
+			awaitBody.Append(typecheck.Stmt(ir.NewReturnStmt(pos, []ir.Node{typecheck.Call(pos, typecheck.LookupRuntime("coroAwaitFrame"), []ir.Node{rw.ctxVar, frameVar, resVar}, false)})))
+
+			var inlineBody ir.Nodes
+			inlineBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			inlineBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			asel := ir.NewSelectorExpr(pos, ir.ODOTINTER, lnVar, t.acceptSel.Sel)
+			asel.Selection = t.acceptSel.Selection
+			asel.SetType(t.acceptSel.Type())
+			asel.SetTypecheck(1)
+			acall := typecheck.Call(pos, asel, nil, false)
+			inlineBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{
+				rw.rewriteNode(t.acceptOutTmp),
+				rw.rewriteNode(t.acceptErrTmp),
+			}, []ir.Node{acall})))
+			inlineBody.Append(ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id]))
+
+			hasFac := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			fbBody.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasFac, awaitBody, inlineBody)))
+
+			hasStep := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, stepPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasStep, directBody, fbBody)))
+		}
+
 	case termAwait:
 		rw.setState(pos, t.target.resumeState)
 		calleeInfo := rw.plan.Lowered[t.awaitCallee]
@@ -905,6 +1267,9 @@ func (rw *bodyRewriter) emitTerm(t *blockTerm, bbLabels []*types.Sym) {
 		rw.rf.Body.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), frameVar))
 		awaitCall := typecheck.Call(pos, typecheck.LookupRuntime("coroAwaitFrame"), []ir.Node{rw.ctxVar, frameVar, resVar}, false)
 		rw.rf.Body.Append(typecheck.Stmt(ir.NewReturnStmt(pos, []ir.Node{awaitCall})))
+
+	case termDynAwait:
+		rw.emitDynAwaitTerm(t, bbLabels)
 
 	case termPanic:
 		val := rw.rewriteNode(t.arg)
@@ -972,25 +1337,29 @@ func (rw *bodyRewriter) rewriteNode(n ir.Node) ir.Node {
 			if v.Op() == ir.ORECOVER {
 				return typecheck.Call(v.Pos(), typecheck.LookupRuntime("coroRecover"), []ir.Node{rw.ctxVar}, false)
 			}
-			ir.EditChildren(v, edit)
+			ir.EditChildrenWithHidden(v, edit)
 			return v
 
 		case *ir.ClosureExpr:
 			// Nested closure literal appearing as a value (not directly invoked in go/defer):
 			// rebind any captures of Orig's locals to capture fVar instead!
-			if v.Func != nil && rw.plan.Lowered[v.Func] == nil {
-				rw.rebindNestedClosure(v.Func)
+			if v.Func != nil {
+				if rw.plan.Lowered[v.Func] == nil {
+					rw.rebindNestedClosure(v.Func)
+				} else if v.Func.ClosureParent == rw.info.Orig {
+					rw.escapedLoweredClo[v.Func] = rw
+				}
 			}
 			return v
 
 		case *ir.AssignStmt:
 			v.Def = false
-			ir.EditChildren(v, edit)
+			ir.EditChildrenWithHidden(v, edit)
 			return v
 
 		case *ir.AssignListStmt:
 			v.Def = false
-			ir.EditChildren(v, edit)
+			ir.EditChildrenWithHidden(v, edit)
 			return v
 
 		case *ir.Decl:
@@ -1003,7 +1372,7 @@ func (rw *bodyRewriter) rewriteNode(n ir.Node) ir.Node {
 			return v
 
 		default:
-			ir.EditChildren(x, edit)
+			ir.EditChildrenWithHidden(x, edit)
 			return x
 		}
 	}
@@ -1055,7 +1424,7 @@ func (rw *bodyRewriter) rebindNestedClosure(clo *ir.Func) {
 					return fieldSel(nm.Pos(), fCap, fld)
 				}
 			}
-			ir.EditChildren(n, edit)
+			ir.EditChildrenWithHidden(n, edit)
 			return n
 		}
 		for i, s := range clo.Body {
@@ -1080,17 +1449,11 @@ func (cr *nestedClosureRewriter) rewrite(n ir.Node) ir.Node {
 		if x == nil {
 			return nil
 		}
-		if inits := x.Init(); len(inits) > 0 {
-			var kept ir.Nodes
-			for _, st := range inits {
-				kept.Append(edit(st))
-			}
-			if in, ok := x.(ir.InitNode); ok {
-				*in.PtrInit() = kept
-			}
-		}
 		switch v := x.(type) {
 		case *ir.Name:
+			if v.Curfn == cr.clo {
+				return v
+			}
 			c := v.Canonical()
 			if repl, ok := cr.paramMap[c]; ok {
 				return repl
@@ -1118,17 +1481,28 @@ func (cr *nestedClosureRewriter) rewrite(n ir.Node) ir.Node {
 				return nm
 			}
 			return v
+		case *ir.Decl:
+			c := v.X.Canonical()
+			if c.Class == ir.PAUTO && c.Curfn != cr.clo {
+				mapped, ok := cr.localMap[c]
+				if !ok {
+					mapped = newLocal(cr.clo, v.Pos(), v.X.Sym().Name, v.X.Type())
+					cr.localMap[c] = mapped
+				}
+				v.X = mapped
+			}
+			return v
 		case *ir.CallExpr:
 			if cr.rewriteRecv && v.Op() == ir.ORECOVER {
 				return typecheck.Call(v.Pos(), typecheck.LookupRuntime("coroRecover"), []ir.Node{cr.ctxCap}, false)
 			}
-			ir.EditChildren(v, edit)
+			ir.EditChildrenWithHidden(v, edit)
 			return v
 		case *ir.ClosureExpr:
 			// Do NOT rewrite recover() inside deeper nested closures (per Go spec).
 			return v
 		default:
-			ir.EditChildren(x, edit)
+			ir.EditChildrenWithHidden(x, edit)
 			return x
 		}
 	}
@@ -1149,6 +1523,184 @@ func callStdlibIOMethod(pos src.XPos, recv ir.Node, kind ioKind, methodName stri
 	fullArgs = append(fullArgs, recv)
 	fullArgs = append(fullArgs, args...)
 	return typecheck.Call(pos, mexpr, fullArgs, false)
+}
+
+func callStdlibSyncMethod(pos src.XPos, recv ir.Node, kind syncKind, args []ir.Node) ir.Node {
+	methodName := "coroLock"
+	switch kind {
+	case syncMutexLock, syncRWMutexLock:
+		methodName = "coroLock"
+	case syncRWMutexRLock:
+		methodName = "coroRLock"
+	case syncWaitGroupWait, syncCondWait:
+		methodName = "coroWait"
+	}
+	pkg := recv.Type().Elem().Sym().Pkg
+	sym := pkg.Lookup(methodName)
+	mexpr := typecheck.NewMethodExpr(pos, recv.Type(), sym)
+	fullArgs := make([]ir.Node, 0, 1+len(args))
+	fullArgs = append(fullArgs, recv)
+	fullArgs = append(fullArgs, args...)
+	return typecheck.Call(pos, mexpr, fullArgs, false)
+}
+
+func callStdlibAcceptMethod(pos src.XPos, recv ir.Node, kind acceptKind, args []ir.Node) ir.Node {
+	methodName := "coroAcceptStep"
+	switch kind {
+	case acceptTCP:
+		methodName = "coroAcceptTCPStep"
+	case acceptTCPConn, acceptUnixConn:
+		methodName = "coroAcceptStep"
+	case acceptUnix:
+		methodName = "coroAcceptUnixStep"
+	}
+	pkg := recv.Type().Elem().Sym().Pkg
+	sym := pkg.Lookup(methodName)
+	mexpr := typecheck.NewMethodExpr(pos, recv.Type(), sym)
+	fullArgs := make([]ir.Node, 0, 1+len(args))
+	fullArgs = append(fullArgs, recv)
+	fullArgs = append(fullArgs, args...)
+	return typecheck.Call(pos, mexpr, fullArgs, false)
+}
+
+func (rw *bodyRewriter) emitDynAwaitTerm(t *blockTerm, bbLabels []*types.Sym) {
+	pos := t.pos
+	call := t.dynCall
+	seq := rw.tmpSeq
+	rw.tmpSeq++
+
+	argVars := make([]*ir.Name, len(t.dynArgs))
+	for i, a := range t.dynArgs {
+		ra := rw.rewriteNode(a)
+		av := newLocal(rw.rf, pos, fmt.Sprintf(".dwa%d_%d", seq, i), ra.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, av)))
+		rw.rf.Body.Append(assignNode(pos, av, ra))
+		argVars[i] = av
+	}
+
+	facPtr := newLocal(rw.rf, pos, fmt.Sprintf(".dwf%d", seq), types.Types[types.TUNSAFEPTR])
+	rawPtr := newLocal(rw.rf, pos, fmt.Sprintf(".dwr%d", seq), types.Types[types.TUNSAFEPTR])
+	resPtr := newLocal(rw.rf, pos, fmt.Sprintf(".dwc%d", seq), types.Types[types.TUNSAFEPTR])
+
+	var inlineFun ir.Node
+	var rawArg ir.Node
+	switch call.Op() {
+	case ir.OCALLINTER:
+		sel := call.Fun.(*ir.SelectorExpr)
+		ifaceExpr := rw.rewriteNode(t.dynRecv)
+		ifaceVar := newLocal(rw.rf, pos, fmt.Sprintf(".dwi%d", seq), ifaceExpr.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, ifaceVar)))
+		rw.rf.Body.Append(assignNode(pos, ifaceVar, ifaceExpr))
+		itabRaw := ir.NewUnaryExpr(pos, ir.OITAB, ifaceVar)
+		itabRaw.SetType(types.Types[types.TUINTPTR])
+		itabRaw.SetTypecheck(1)
+		itabNode := typecheck.ConvNop(itabRaw, types.Types[types.TUNSAFEPTR])
+		idataNode := ir.NewUnaryExpr(pos, ir.OIDATA, ifaceVar)
+		idataNode.SetType(types.Types[types.TUNSAFEPTR])
+		idataNode.SetTypecheck(1)
+		methodIdx := sel.Offset() / int64(types.PtrSize)
+		idxNode := typecheck.Conv(ir.NewInt(pos, methodIdx), types.Types[types.TUINTPTR])
+		lk := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitInterface"), []ir.Node{itabNode, idataNode, idxNode}, false)
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, rawPtr, resPtr}, []ir.Node{lk})))
+		rawArg = rawPtr
+
+		isel := ir.NewSelectorExpr(pos, ir.ODOTINTER, ifaceVar, sel.Sel)
+		isel.Selection = sel.Selection
+		isel.SetType(sel.Type())
+		isel.SetTypecheck(1)
+		inlineFun = isel
+
+	case ir.OCALLMETH:
+		sel := call.Fun.(*ir.SelectorExpr)
+		recvExpr := rw.rewriteNode(t.dynRecv)
+		recvVar := newLocal(rw.rf, pos, fmt.Sprintf(".dwm%d", seq), recvExpr.Type())
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, recvVar)))
+		rw.rf.Body.Append(assignNode(pos, recvVar, recvExpr))
+		mexpr := typecheck.NewMethodExpr(pos, recvVar.Type(), sel.Sel)
+		fnAny := typecheck.AssignConv(mexpr, types.Types[types.TINTER], "coroLookupAwaitFunction")
+		lk := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitFunction"), []ir.Node{fnAny, ir.NewBool(pos, true)}, false)
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, rawPtr, resPtr}, []ir.Node{lk})))
+		if recvVar.Type().IsPtr() {
+			rawArg = typecheck.ConvNop(recvVar, types.Types[types.TUNSAFEPTR])
+		} else {
+			rawArg = typecheck.ConvNop(typecheck.NodAddrAt(pos, recvVar), types.Types[types.TUNSAFEPTR])
+		}
+
+		msel := ir.NewSelectorExpr(pos, ir.ODOTMETH, recvVar, sel.Sel)
+		msel.Selection = sel.Selection
+		msel.SetType(sel.Type())
+		msel.SetTypecheck(1)
+		inlineFun = msel
+
+	case ir.OCALLFUNC:
+		var fnNode ir.Node
+		if t.dynFun != nil {
+			fnExpr := rw.rewriteNode(t.dynFun)
+			fnVar := newLocal(rw.rf, pos, fmt.Sprintf(".dwv%d", seq), fnExpr.Type())
+			rw.rf.Body.Append(typecheck.Stmt(ir.NewDecl(pos, ir.ODCL, fnVar)))
+			rw.rf.Body.Append(assignNode(pos, fnVar, fnExpr))
+			fnNode = fnVar
+		} else {
+			fnNode = call.Fun
+		}
+		fnAny := typecheck.AssignConv(fnNode, types.Types[types.TINTER], "coroLookupAwaitFunction")
+		lk := typecheck.Call(pos, typecheck.LookupRuntime("coroLookupAwaitFunction"), []ir.Node{fnAny, ir.NewBool(pos, false)}, false)
+		rw.rf.Body.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{facPtr, rawPtr, resPtr}, []ir.Node{lk})))
+		rawArg = rawPtr
+		inlineFun = fnNode
+	}
+
+	adpType := buildDynamicAdapterType(pos, call.Fun.Type())
+	var thenBody ir.Nodes
+	facFnVar := rw.emitCastFuncPtr(pos, &thenBody, adpType, facPtr)
+	adpArgs := make([]ir.Node, 0, 1+len(argVars))
+	adpArgs = append(adpArgs, rawArg)
+	for _, av := range argVars {
+		adpArgs = append(adpArgs, av)
+	}
+	frameVar := newLocal(rw.rf, pos, fmt.Sprintf(".dwaf%d", seq), types.Types[types.TUNSAFEPTR])
+	resVar := newLocal(rw.rf, pos, fmt.Sprintf(".dwar%d", seq), adpType.Results()[1].Type)
+	adpCall := typecheck.Call(pos, facFnVar, adpArgs, false)
+	thenBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, []ir.Node{frameVar, resVar}, []ir.Node{adpCall})))
+	thenBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), frameVar))
+	thenBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), resPtr))
+	thenBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.info.StateField), typecheck.Conv(ir.NewInt(pos, int64(t.target.resumeState)), types.Types[types.TUINT32])))
+	thenBody.Append(typecheck.Stmt(ir.NewReturnStmt(pos, []ir.Node{typecheck.Call(pos, typecheck.LookupRuntime("coroAwaitFrame"), []ir.Node{rw.ctxVar, frameVar, resVar}, false)})))
+
+	var elseBody ir.Nodes
+	elseBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.awaitChildField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+	elseBody.Append(assignNode(pos, fieldSel(pos, rw.fVar, rw.g.resCopyField), ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+	inlineArgs := make([]ir.Node, len(argVars))
+	for i, av := range argVars {
+		inlineArgs[i] = av
+	}
+	icall := typecheck.Call(pos, inlineFun, inlineArgs, false)
+	hasAnyRes := false
+	for _, rt := range t.dynResTmps {
+		if rt != nil {
+			hasAnyRes = true
+			break
+		}
+	}
+	if !hasAnyRes {
+		elseBody.Append(typecheck.Stmt(icall))
+	} else if len(t.dynResTmps) == 1 {
+		elseBody.Append(assignNode(pos, rw.rewriteNode(t.dynResTmps[0]), icall))
+	} else {
+		lhs := make([]ir.Node, len(t.dynResTmps))
+		for i, rt := range t.dynResTmps {
+			if rt != nil {
+				lhs[i] = rw.rewriteNode(rt)
+			} else {
+				lhs[i] = ir.BlankNode
+			}
+		}
+		elseBody.Append(typecheck.Stmt(ir.NewAssignListStmt(pos, ir.OAS2, lhs, []ir.Node{icall})))
+	}
+	elseBody.Append(ir.NewBranchStmt(pos, ir.OGOTO, bbLabels[t.target.id]))
+
+	hasFac := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
+	rw.rf.Body.Append(typecheck.Stmt(ir.NewIfStmt(pos, hasFac, thenBody, elseBody)))
 }
 
 func newLocal(fn *ir.Func, pos src.XPos, name string, t *types.Type) *ir.Name {

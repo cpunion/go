@@ -21,6 +21,7 @@ package runtime
 
 import (
 	"internal/cpu"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"unsafe"
 )
@@ -229,6 +230,16 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	}
 	unlock(&root.lock)
 	if s != nil { // May be slow or even yield, so unlock first
+		if goexperiment.Coro && s.coroTask() != nil {
+			if s.ticket != 0 {
+				throw("corrupted semaphore ticket")
+			}
+			if handoff && cansemacquire(addr) {
+				s.ticket = 1
+			}
+			coroSemaWake(s)
+			return
+		}
 		acquiretime := s.acquiretime
 		if acquiretime != 0 {
 			// Charge contention that this (delayed) unlock caused.
@@ -302,11 +313,16 @@ func cansemacquire(addr *uint32) bool {
 
 // queue adds s to the blocked goroutines in semaRoot.
 func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
-	s.g = getg()
-	s.elem.set(unsafe.Pointer(addr))
-	// Storing this pointer so that we can trace the semaphore address
-	// from the blocked goroutine when checking for goroutine leaks.
-	s.g.waiting = s
+	if goexperiment.Coro && s.coroTask() != nil {
+		s.g = nil
+		s.elem.set(unsafe.Pointer(addr))
+	} else {
+		s.g = getg()
+		s.elem.set(unsafe.Pointer(addr))
+		// Storing this pointer so that we can trace the semaphore address
+		// from the blocked goroutine when checking for goroutine leaks.
+		s.g.waiting = s
+	}
 	s.next = nil
 	s.prev = nil
 	s.waiters = 0
@@ -476,7 +492,9 @@ Found:
 		tailtime = s.acquiretime
 	}
 	// Goroutine is no longer blocked. Clear the waiting pointer.
-	s.g.waiting = nil
+	if s.g != nil {
+		s.g.waiting = nil
+	}
 	s.parent = nil
 	s.elem.set(nil)
 	s.next = nil
@@ -653,6 +671,11 @@ func notifyListNotifyAll(l *notifyList) {
 	for s != nil {
 		next := s.next
 		s.next = nil
+		if goexperiment.Coro && s.coroTask() != nil {
+			coroNotifyWake(s)
+			s = next
+			continue
+		}
 		if s.g.bubble != nil && getg().bubble != s.g.bubble {
 			println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
 			fatal("semaphore wake of synctest goroutine from outside bubble")
@@ -710,6 +733,10 @@ func notifyListNotifyOne(l *notifyList) {
 			}
 			unlock(&l.lock)
 			s.next = nil
+			if goexperiment.Coro && s.coroTask() != nil {
+				coroNotifyWake(s)
+				return
+			}
 			if s.g.bubble != nil && getg().bubble != s.g.bubble {
 				println("semaphore wake of synctest goroutine", s.g.goid, "from outside bubble")
 				fatal("semaphore wake of synctest goroutine from outside bubble")

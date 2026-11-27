@@ -55,3 +55,26 @@ func (f *File) coroReadFinish(n *int, err *error, direct bool, status uintptr) {
 	runtime.KeepAlive(f)
 	*err = f.wrapErr("read", e)
 }
+
+func runtime_coroRegisterIO(methodFn, startFn, finishFn any)
+
+func coroFileReadStartAdapter(raw, ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
+	return (*File)(raw).coroReadStart(ctx, b, n, err, direct, status)
+}
+
+func coroFileReadFinishAdapter(raw unsafe.Pointer, n *int, err *error, direct bool, status uintptr) {
+	(*File)(raw).coroReadFinish(n, err, direct, status)
+}
+
+func coroFileWriteStartAdapter(raw, ctx unsafe.Pointer, b []byte, n *int, err *error, direct *bool, status *uintptr) bool {
+	return (*File)(raw).coroWriteStart(ctx, b, n, err, direct, status)
+}
+
+func coroFileWriteFinishAdapter(raw unsafe.Pointer, n *int, err *error, direct bool, status uintptr) {
+	(*File)(raw).coroWriteFinish(n, err, direct, status)
+}
+
+func init() {
+	runtime_coroRegisterIO((*File).Read, coroFileReadStartAdapter, coroFileReadFinishAdapter)
+	runtime_coroRegisterIO((*File).Write, coroFileWriteStartAdapter, coroFileWriteFinishAdapter)
+}

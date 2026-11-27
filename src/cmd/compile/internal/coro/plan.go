@@ -26,7 +26,7 @@ import (
 	"strings"
 )
 
-// ioKind identifies a compiler-lowered direct stdlib I/O operation.
+// ioKind identifies a compiler-lowered direct stdlib or interface I/O operation.
 type ioKind uint8
 
 const (
@@ -35,6 +35,32 @@ const (
 	ioFileWrite
 	ioConnRead
 	ioConnWrite
+	ioIfaceRead
+	ioIfaceWrite
+)
+
+// syncKind identifies a compiler-lowered coroutine-aware sync primitive call.
+type syncKind uint8
+
+const (
+	syncNone syncKind = iota
+	syncMutexLock
+	syncRWMutexLock
+	syncRWMutexRLock
+	syncWaitGroupWait
+	syncCondWait
+)
+
+// acceptKind identifies a compiler-lowered direct netpoll listener Accept call.
+type acceptKind uint8
+
+const (
+	acceptNone     acceptKind = iota
+	acceptTCP                 // (*net.TCPListener).AcceptTCP() (*net.TCPConn, error)
+	acceptTCPConn             // (*net.TCPListener).Accept() (net.Conn, error)
+	acceptUnix                // (*net.UnixListener).AcceptUnix() (*net.UnixConn, error)
+	acceptUnixConn            // (*net.UnixListener).Accept() (net.Conn, error)
+	acceptIface               // net.Listener.Accept() (net.Conn, error)
 )
 
 // Plan summarizes coroutine analysis results for a package.
@@ -52,8 +78,9 @@ type FuncInfo struct {
 	FrameType  *types.Type
 	FactoryFn  *ir.Func // F.coro
 	ResumeFn   *ir.Func // F.coro.func1
-	IfaceAdpFn *ir.Func // method adapter for coroLookupInterface
-	FuncAdpFn  *ir.Func // func adapter for coroLookupFunction
+	IfaceAdpFn *ir.Func // method adapter for coroLookupInterface / coroLookupAwaitInterface
+	FuncAdpFn  *ir.Func // func adapter for coroLookupFunction / coroLookupAwaitFunction
+	ResCopyFn  *ir.Func // result copier + frame release for cross-pkg/dynamic await
 
 	// Capture metadata for closures (indexed matching Orig.ClosureVars).
 	CapByRef []bool
@@ -119,10 +146,16 @@ func isSuspendingStdlibFunc(fn *ir.Func) bool {
 		return name == "Gosched" || name == "GC" || name == "Goexit"
 	case "time":
 		return name == "Sleep"
+	case "sync":
+		return name == "(*Mutex).Lock" || name == "(*RWMutex).Lock" ||
+			name == "(*RWMutex).RLock" || name == "(*WaitGroup).Wait" ||
+			name == "(*Cond).Wait"
 	case "os":
 		return name == "(*File).Read" || name == "(*File).Write"
 	case "net":
-		return strings.HasSuffix(name, ").Read") || strings.HasSuffix(name, ").Write")
+		return strings.HasSuffix(name, ").Read") || strings.HasSuffix(name, ").Write") ||
+			strings.HasSuffix(name, ").Accept") || strings.HasSuffix(name, ").AcceptTCP") ||
+			strings.HasSuffix(name, ").AcceptUnix")
 	}
 	return false
 }
@@ -191,7 +224,8 @@ func analyze(pkg *ir.Package) *Plan {
 				if call.GoDefer {
 					return
 				}
-				if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone {
+				if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone ||
+					matchStdlibSync(call) != syncNone || matchStdlibAccept(call) != acceptNone {
 					p.HasSuspend[fn] = true
 					return
 				}
@@ -204,8 +238,15 @@ func analyze(pkg *ir.Package) *Plan {
 				}
 			case ir.OCALLINTER:
 				call := n.(*ir.CallExpr)
+				if call.GoDefer {
+					return
+				}
 				if reason := disqualifyingInterfaceCall(call); reason != "" {
 					p.SkipReason[fn] = reason
+					return
+				}
+				if matchIfaceIO(call) != ioNone || matchStdlibAccept(call) != acceptNone {
+					p.HasSuspend[fn] = true
 				}
 			}
 		})
@@ -297,14 +338,29 @@ func basicIneligibleReason(fn *ir.Func) string {
 		}
 	}
 	if fn.Type() != nil && fn.Type().HasShape() {
-		return "generic shape"
+		// Generic shape functions lower cleanly with DUPOK frame/factory/resume
+		// symbols, except for range-over-shape-map which requires a dictionary
+		// runtime map type instead of reflectdata.TypePtrAt.
+		hasShapeMapRange := false
+		ir.VisitList(fn.Body, func(n ir.Node) {
+			if hasShapeMapRange {
+				return
+			}
+			if rn, ok := n.(*ir.RangeStmt); ok && rn.X != nil && rn.X.Type() != nil &&
+				rn.X.Type().IsMap() && rn.X.Type().HasShape() {
+				hasShapeMapRange = true
+			}
+		})
+		if hasShapeMapRange {
+			return "generic shape map range"
+		}
 	}
 	return ""
 }
 
 func isPropagatingDisqualifier(reason string) bool {
 	switch reason {
-	case "", "empty body", "wrapper", "package init", "generic shape", "cgo/init helper",
+	case "", "empty body", "wrapper", "package init", "generic shape", "generic shape map range", "cgo/init helper",
 		"spawns only disqualified ordinary goroutines":
 		return false
 	}
@@ -313,8 +369,9 @@ func isPropagatingDisqualifier(reason string) bool {
 
 // pureOrdinaryHostReason reports whether fn only spawns statically disqualified
 // ordinary goroutines (e.g. cgo workers) and has no lowered/dynamic spawns,
-// lowered awaits, or direct coroutine I/O/sleep. Skipping such pure ordinary-host
-// coordinators avoids coroutine frame/driver overhead when zero workers can lower.
+// lowered awaits, or direct coroutine I/O/sleep/sync/accept. Skipping such pure
+// ordinary-host coordinators avoids coroutine frame/driver overhead when zero
+// workers can lower.
 func pureOrdinaryHostReason(fn *ir.Func, p *Plan, inPkg map[*ir.Func]bool) string {
 	hasDisqualifiedGo := false
 	hasEligibleCoroOp := false
@@ -341,11 +398,17 @@ func pureOrdinaryHostReason(fn *ir.Func, p *Plan, inPkg map[*ir.Func]bool) strin
 			if call.GoDefer {
 				return
 			}
-			if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone {
+			if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone ||
+				matchStdlibSync(call) != syncNone || matchStdlibAccept(call) != acceptNone {
 				hasEligibleCoroOp = true
 				return
 			}
 			if callee := staticLocalCallee(call, inPkg); callee != nil && p.SkipReason[callee] == "" && p.HasSuspend[callee] {
+				hasEligibleCoroOp = true
+			}
+		case ir.OCALLINTER:
+			call := n.(*ir.CallExpr)
+			if !call.GoDefer && (matchIfaceIO(call) != ioNone || matchStdlibAccept(call) != acceptNone) {
 				hasEligibleCoroOp = true
 			}
 		}
@@ -408,6 +471,244 @@ func matchStdlibIO(call *ir.CallExpr) ioKind {
 		return ioConnWrite
 	}
 	return ioNone
+}
+
+func matchStdlibSync(call *ir.CallExpr) syncKind {
+	if call == nil || call.IsDDD || (call.Op() != ir.OCALLMETH && call.Op() != ir.OCALLFUNC) {
+		return syncNone
+	}
+	sel, ok := call.Fun.(*ir.SelectorExpr)
+	if !ok || sel.Sel == nil {
+		return syncNone
+	}
+	mname := sel.Sel.Name
+	if mname != "Lock" && mname != "RLock" && mname != "Wait" {
+		return syncNone
+	}
+	var recvTyp *types.Type
+	if sel.Op() == ir.OMETHEXPR {
+		if len(call.Args) != 1 || call.Args[0].Type() == nil {
+			return syncNone
+		}
+		recvTyp = call.Args[0].Type()
+	} else {
+		if len(call.Args) != 0 || sel.X == nil || sel.X.Type() == nil {
+			return syncNone
+		}
+		recvTyp = sel.X.Type()
+	}
+	baseT := recvTyp
+	if baseT.IsPtr() {
+		baseT = baseT.Elem()
+	}
+	if baseT == nil || baseT.Sym() == nil || baseT.Sym().Pkg == nil || baseT.Sym().Pkg.Path != "sync" {
+		return syncNone
+	}
+	switch baseT.Sym().Name {
+	case "Mutex":
+		if mname == "Lock" {
+			return syncMutexLock
+		}
+	case "RWMutex":
+		if mname == "Lock" {
+			return syncRWMutexLock
+		}
+		if mname == "RLock" {
+			return syncRWMutexRLock
+		}
+	case "WaitGroup":
+		if mname == "Wait" {
+			return syncWaitGroupWait
+		}
+	case "Cond":
+		if mname == "Wait" {
+			return syncCondWait
+		}
+	}
+	return syncNone
+}
+
+func matchIfaceIO(call *ir.CallExpr) ioKind {
+	if buildcfg.GOOS != "darwin" && buildcfg.GOOS != "linux" {
+		return ioNone
+	}
+	if call == nil || call.Op() != ir.OCALLINTER || call.IsDDD || len(call.Args) != 1 {
+		return ioNone
+	}
+	sel, ok := call.Fun.(*ir.SelectorExpr)
+	if !ok || sel.Sel == nil {
+		return ioNone
+	}
+	mname := sel.Sel.Name
+	if mname != "Read" && mname != "Write" {
+		return ioNone
+	}
+	sig := call.Fun.Type()
+	if sig == nil || len(sig.Params()) != 1 || len(sig.Results()) != 2 {
+		return ioNone
+	}
+	p0 := sig.Params()[0].Type
+	if !p0.IsSlice() || p0.Elem().Kind() != types.TUINT8 {
+		return ioNone
+	}
+	if sig.Results()[0].Type.Kind() != types.TINT || !types.Identical(sig.Results()[1].Type, types.ErrorType) {
+		return ioNone
+	}
+	if mname == "Read" {
+		return ioIfaceRead
+	}
+	return ioIfaceWrite
+}
+
+func matchStdlibAccept(call *ir.CallExpr) acceptKind {
+	if buildcfg.GOOS != "darwin" && buildcfg.GOOS != "linux" {
+		return acceptNone
+	}
+	if call == nil || call.IsDDD {
+		return acceptNone
+	}
+	sel, ok := call.Fun.(*ir.SelectorExpr)
+	if !ok || sel.Sel == nil {
+		return acceptNone
+	}
+	mname := sel.Sel.Name
+	if call.Op() == ir.OCALLINTER {
+		if mname != "Accept" || len(call.Args) != 0 {
+			return acceptNone
+		}
+		sig := call.Fun.Type()
+		if sig == nil || len(sig.Params()) != 0 || len(sig.Results()) != 2 {
+			return acceptNone
+		}
+		r0 := sig.Results()[0].Type
+		if r0 == nil || r0.Sym() == nil || r0.Sym().Pkg == nil ||
+			r0.Sym().Pkg.Path != "net" || r0.Sym().Name != "Conn" {
+			return acceptNone
+		}
+		if !types.Identical(sig.Results()[1].Type, types.ErrorType) {
+			return acceptNone
+		}
+		return acceptIface
+	}
+	if call.Op() != ir.OCALLMETH && call.Op() != ir.OCALLFUNC {
+		return acceptNone
+	}
+	var recvTyp *types.Type
+	if sel.Op() == ir.OMETHEXPR {
+		if len(call.Args) != 1 || call.Args[0].Type() == nil {
+			return acceptNone
+		}
+		recvTyp = call.Args[0].Type()
+	} else {
+		if len(call.Args) != 0 || sel.X == nil || sel.X.Type() == nil {
+			return acceptNone
+		}
+		recvTyp = sel.X.Type()
+	}
+	if !recvTyp.IsPtr() {
+		return acceptNone
+	}
+	elem := recvTyp.Elem()
+	if elem == nil || elem.Sym() == nil || elem.Sym().Pkg == nil || elem.Sym().Pkg.Path != "net" {
+		return acceptNone
+	}
+	switch elem.Sym().Name {
+	case "TCPListener":
+		if mname == "AcceptTCP" {
+			return acceptTCP
+		}
+		if mname == "Accept" {
+			return acceptTCPConn
+		}
+	case "UnixListener":
+		if mname == "AcceptUnix" {
+			return acceptUnix
+		}
+		if mname == "Accept" {
+			return acceptUnixConn
+		}
+	}
+	return acceptNone
+}
+
+// isEligibleExternalPkg reports whether a package outside LocalPkg may contain
+// lowered coroutine functions registered in runtime.coroCallables.
+func isEligibleExternalPkg(pkgPath string) bool {
+	switch pkgPath {
+	case "", "runtime", "syscall", "sync", "sync/atomic", "reflect",
+		"os", "net", "time", "testing", "unsafe",
+		"errors", "fmt", "math", "sort", "slices", "maps",
+		"strconv", "strings", "bytes", "unicode", "cmp",
+		"path", "path/filepath", "encoding/binary", "log":
+		return false
+	}
+	for _, pref := range []string{"runtime/", "internal/", "math/", "unicode/", "hash", "crypto/"} {
+		if strings.HasPrefix(pkgPath, pref) {
+			return false
+		}
+	}
+	return true
+}
+
+// isEligibleDynAwaitCall reports whether a synchronous call inside a lowered
+// function may dynamically resolve to a lowered coroutine in runtime.coroCallables.
+func isEligibleDynAwaitCall(call *ir.CallExpr) bool {
+	if call == nil || call.GoDefer || call.IsDDD || call.Fun == nil {
+		return false
+	}
+	sig := call.Fun.Type()
+	if sig == nil || sig.Kind() != types.TFUNC || sig.IsVariadic() || sig.HasShape() {
+		return false
+	}
+	switch call.Op() {
+	case ir.OCALLINTER:
+		if len(call.Args) != len(sig.Params()) {
+			return false
+		}
+		if disqualifyingInterfaceCall(call) != "" {
+			return false
+		}
+		return true
+	case ir.OCALLFUNC:
+		if len(call.Args) != len(sig.Params()) {
+			return false
+		}
+		switch fn := call.Fun.(type) {
+		case *ir.Name:
+			if fn.Sym() == nil || fn.Sym().Pkg == nil || fn.Sym().Pkg == types.LocalPkg {
+				return false
+			}
+			return isEligibleExternalPkg(fn.Sym().Pkg.Path)
+		case *ir.ClosureExpr:
+			return false
+		default:
+			if sel, ok := call.Fun.(*ir.SelectorExpr); ok && sel.Op() == ir.OMETHEXPR {
+				return false
+			}
+			// Dynamic function variable/expression.
+			return true
+		}
+	case ir.OCALLMETH:
+		sel, ok := call.Fun.(*ir.SelectorExpr)
+		if !ok || sel.Op() != ir.ODOTMETH || sel.Sel == nil || sel.X == nil || sel.X.Type() == nil {
+			return false
+		}
+		if len(call.Args) != len(sig.Params()) {
+			return false
+		}
+		baseT := sel.X.Type()
+		if baseT.IsPtr() {
+			baseT = baseT.Elem()
+		}
+		if baseT == nil || baseT.Sym() == nil || baseT.Sym().Pkg == nil || baseT.Sym().Pkg == types.LocalPkg {
+			return false
+		}
+		if baseT.HasShape() {
+			return false
+		}
+		return isEligibleExternalPkg(baseT.Sym().Pkg.Path)
+	}
+	return false
 }
 
 func disqualifyingCallReason(call *ir.CallExpr) string {
