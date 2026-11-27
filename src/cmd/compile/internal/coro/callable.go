@@ -219,7 +219,7 @@ func (rw *bodyRewriter) emitDynamicInterfaceGo(pos src.XPos, call *ir.CallExpr) 
 		clo.Body.Append(typecheck.Stmt(ce))
 	})
 	elseBody := []ir.Node{
-		typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnOpaque"), []ir.Node{rw.ctxVar, thunk}, false)),
+		typecheck.Stmt(ir.NewGoDeferStmt(pos, ir.OGO, typecheck.Call(pos, thunk, nil, false))),
 	}
 
 	cond := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))
@@ -281,7 +281,7 @@ func (rw *bodyRewriter) emitDynamicFuncGo(pos src.XPos, call *ir.CallExpr) {
 		clo.Body.Append(typecheck.Stmt(ce))
 	})
 	elseBody := []ir.Node{
-		typecheck.Stmt(typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnOpaque"), []ir.Node{rw.ctxVar, thunk}, false)),
+		typecheck.Stmt(ir.NewGoDeferStmt(pos, ir.OGO, typecheck.Call(pos, thunk, nil, false))),
 	}
 
 	cond := typecheck.Expr(ir.NewBinaryExpr(pos, ir.ONE, facPtr, ir.NewNilExpr(pos, types.Types[types.TUNSAFEPTR])))

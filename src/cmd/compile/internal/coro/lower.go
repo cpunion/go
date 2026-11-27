@@ -581,8 +581,8 @@ func (rw *bodyRewriter) emitOpaqueGo(pos src.XPos, call *ir.CallExpr) {
 		callExpr = typecheck.Call(pos, cFun, cArgs, rwCall.IsDDD).(*ir.CallExpr)
 		clo.Body.Append(typecheck.Stmt(callExpr))
 	})
-	spawnCall := typecheck.Call(pos, typecheck.LookupRuntime("coroSpawnOpaque"), []ir.Node{rw.ctxVar, thunk}, false)
-	rw.rf.Body.Append(typecheck.Stmt(spawnCall))
+	thunkCall := typecheck.Call(pos, thunk, nil, false)
+	rw.rf.Body.Append(typecheck.Stmt(ir.NewGoDeferStmt(pos, ir.OGO, thunkCall)))
 }
 
 func (rw *bodyRewriter) emitDeferStmt(defSt *ir.GoDeferStmt) {

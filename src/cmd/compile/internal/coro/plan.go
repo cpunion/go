@@ -250,10 +250,19 @@ func analyze(pkg *ir.Package) *Plan {
 	}
 
 	// Select eligible suspending functions for lowering.
+	// Also detect functions whose only `go` spawns target statically disqualified
+	// ordinary goroutines (e.g. cgo workers) and have no lowered await/I/O/sleep:
+	// lowering such pure ordinary-host coordinators would only add frame/driver
+	// overhead without converting any worker to a stackless coroutine.
 	for _, fn := range p.Funcs {
-		if p.SkipReason[fn] == "" && p.HasSuspend[fn] {
-			p.Lowered[fn] = &FuncInfo{Orig: fn}
+		if p.SkipReason[fn] != "" || !p.HasSuspend[fn] {
+			continue
 		}
+		if reason := pureOrdinaryHostReason(fn, p, inPkg); reason != "" {
+			p.SkipReason[fn] = reason
+			continue
+		}
+		p.Lowered[fn] = &FuncInfo{Orig: fn}
 	}
 
 	// Determine by-ref vs by-val capture mode for lowered closures.
@@ -295,10 +304,56 @@ func basicIneligibleReason(fn *ir.Func) string {
 
 func isPropagatingDisqualifier(reason string) bool {
 	switch reason {
-	case "", "empty body", "wrapper", "package init", "generic shape", "cgo/init helper":
+	case "", "empty body", "wrapper", "package init", "generic shape", "cgo/init helper",
+		"spawns only disqualified ordinary goroutines":
 		return false
 	}
 	return true
+}
+
+// pureOrdinaryHostReason reports whether fn only spawns statically disqualified
+// ordinary goroutines (e.g. cgo workers) and has no lowered/dynamic spawns,
+// lowered awaits, or direct coroutine I/O/sleep. Skipping such pure ordinary-host
+// coordinators avoids coroutine frame/driver overhead when zero workers can lower.
+func pureOrdinaryHostReason(fn *ir.Func, p *Plan, inPkg map[*ir.Func]bool) string {
+	hasDisqualifiedGo := false
+	hasEligibleCoroOp := false
+	ir.VisitList(fn.Body, func(n ir.Node) {
+		if hasEligibleCoroOp {
+			return
+		}
+		switch n.Op() {
+		case ir.OGO:
+			gs := n.(*ir.GoDeferStmt)
+			call, ok := gs.Call.(*ir.CallExpr)
+			if !ok {
+				hasEligibleCoroOp = true
+				return
+			}
+			call = unwrapGoDeferCall(call)
+			if callee := staticLocalCallee(call, inPkg); callee != nil && isPropagatingDisqualifier(p.SkipReason[callee]) {
+				hasDisqualifiedGo = true
+				return
+			}
+			hasEligibleCoroOp = true
+		case ir.OCALLFUNC, ir.OCALLMETH:
+			call := n.(*ir.CallExpr)
+			if call.GoDefer {
+				return
+			}
+			if isSuspendingBuiltinCall(call) || matchStdlibIO(call) != ioNone {
+				hasEligibleCoroOp = true
+				return
+			}
+			if callee := staticLocalCallee(call, inPkg); callee != nil && p.SkipReason[callee] == "" && p.HasSuspend[callee] {
+				hasEligibleCoroOp = true
+			}
+		}
+	})
+	if hasDisqualifiedGo && !hasEligibleCoroOp {
+		return "spawns only disqualified ordinary goroutines"
+	}
+	return ""
 }
 
 func isSuspendingBuiltinCall(call *ir.CallExpr) bool {

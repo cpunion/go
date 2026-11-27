@@ -118,7 +118,8 @@ type coroTypeCacheSlot struct {
 
 // coroPState is lazily allocated on p.coro on first coroutine use on that P.
 type coroPState struct {
-	runnext *coroTask
+	runnext atomic.Pointer[coroTask]
+	hasWork atomic.Uint32
 	runqH   uint32
 	runqT   uint32
 	runq    [coroPRunqSize]*coroTask
@@ -137,11 +138,11 @@ var coroSched struct {
 	lock             mutex
 	runqHead         *coroTask
 	runqTail         *coroTask
-	runqLen          int32
+	runqLen          atomic.Int32
 	globalCache      [coroGCacheSlots]coroTypeCacheSlot
 	globalCacheCount atomic.Int32
 	_                cpu.CacheLinePad
-	runnable         atomic.Int32
+	nonEmptyP        atomic.Int32
 	_                cpu.CacheLinePad
 	cacheBytes       atomic.Uintptr
 	_                cpu.CacheLinePad
@@ -587,10 +588,34 @@ func coroRecycle(task *coroTask) {
 	}
 }
 
+// coroTrimChain keeps at most keep tasks at the head of chain and evicts the
+// remainder back to GC + budget accounting.
+func coroTrimChain(head *coroTask, count uint16, keep uint16, allocSize uintptr) (*coroTask, uint16) {
+	if count <= keep || head == nil {
+		return head, count
+	}
+	if keep == 0 {
+		coroEvictChain(head, count, allocSize)
+		return nil, 0
+	}
+	cur := head
+	for i := uint16(1); i < keep && cur.next != nil; i++ {
+		cur = cur.next
+	}
+	evict := cur.next
+	cur.next = nil
+	if evict != nil {
+		coroEvictChain(evict, count-keep, allocSize)
+	}
+	return head, keep
+}
+
 // coroClearPools runs under STW in clearpools(). Ages per-P and global 2-way
-// caches once per GC so two idle collections reclaim 100% of cached frames (0 B retained).
+// caches once per GC and caps single-GC carry-over so bursty workloads shed
+// excess cached frames on GC1 and reclaim 100% on GC2 (0 B retained).
 func coroClearPools() {
 	assertWorldStopped()
+	const gcCarryMax = 64 // max frames per slot carried across one GC boundary
 	for i := range coroSched.globalCache {
 		gs := &coroSched.globalCache[i]
 		if gs.oldCount > 0 {
@@ -598,6 +623,11 @@ func coroClearPools() {
 			coroEvictChain(gs.old, gs.oldCount, gs.allocSize)
 			gs.old = nil
 			gs.oldCount = 0
+		}
+		if gs.youngCount > gcCarryMax {
+			dropped := gs.youngCount - gcCarryMax
+			gs.young, gs.youngCount = coroTrimChain(gs.young, gs.youngCount, gcCarryMax, gs.allocSize)
+			coroSched.globalCacheCount.Add(-int32(dropped))
 		}
 		gs.old = gs.young
 		gs.oldCount = gs.youngCount
@@ -628,6 +658,9 @@ func coroClearPools() {
 				slot.old = nil
 				slot.oldCount = 0
 			}
+			if slot.youngCount > gcCarryMax {
+				slot.young, slot.youngCount = coroTrimChain(slot.young, slot.youngCount, gcCarryMax, slot.allocSize)
+			}
 			slot.old = slot.young
 			slot.oldCount = slot.youngCount
 			slot.young = nil
@@ -639,7 +672,7 @@ func coroClearPools() {
 				hasCached = true
 			}
 		}
-		if !hasCached && ps.runnext == nil && ps.runqH == ps.runqT {
+		if !hasCached && ps.runnext.Load() == nil && ps.runqH == ps.runqT && ps.hasWork.Load() == 0 {
 			pp.coro.Store(nil)
 		}
 	}
@@ -684,11 +717,11 @@ func coroDrainP(pp *p) {
 			coroSched.runqTail.next = t
 		}
 		coroSched.runqTail = t
-		coroSched.runqLen++
+		coroSched.runqLen.Add(1)
 	}
-	if ps.runnext != nil {
-		pushGlobal(ps.runnext)
-		ps.runnext = nil
+	if rn := ps.runnext.Load(); rn != nil {
+		ps.runnext.Store(nil)
+		pushGlobal(rn)
 	}
 	for ps.runqH != ps.runqT {
 		idx := ps.runqH & (coroPRunqSize - 1)
@@ -697,12 +730,35 @@ func coroDrainP(pp *p) {
 		ps.runqH++
 		pushGlobal(t)
 	}
+	if ps.hasWork.Load() != 0 {
+		ps.hasWork.Store(0)
+		coroSched.nonEmptyP.Add(-1)
+	}
 	pp.coro.Store(nil)
 }
 
+func coroMarkPNonEmpty(ps *coroPState) {
+	if ps.hasWork.Load() == 0 && ps.hasWork.CompareAndSwap(0, 1) {
+		coroSched.nonEmptyP.Add(1)
+	}
+}
+
+func coroTryMarkPEmpty(ps *coroPState) {
+	if ps.hasWork.Load() != 0 && ps.hasWork.CompareAndSwap(1, 0) {
+		coroSched.nonEmptyP.Add(-1)
+		if ps.runnext.Load() != nil || atomic.LoadAcq(&ps.runqT) != atomic.LoadAcq(&ps.runqH) {
+			if ps.hasWork.CompareAndSwap(0, 1) {
+				coroSched.nonEmptyP.Add(1)
+			}
+		}
+	}
+}
+
 // coroEnqueue puts a runnable task onto the current P's runnext/runq (or global
-// queue on overflow) and wakes an idle driver if multi-P parallelism is available.
+// queue on overflow) with zero global atomic contention on busy Ps, and wakes
+// the root owner directly (if applicable) or an idle helper driver.
 func coroEnqueue(task *coroTask, next bool) {
+	isRoot := task.flags&coroFlagRoot != 0
 	if raceenabled {
 		racereleasemerge(unsafe.Pointer(task))
 	}
@@ -712,22 +768,22 @@ func coroEnqueue(task *coroTask, next bool) {
 	pushed := false
 	if ps != nil {
 		if next && gomaxprocs == 1 {
-			old := ps.runnext
-			ps.runnext = task
+			old := ps.runnext.Load()
+			ps.runnext.Store(task)
 			if old == nil {
-				coroSched.runnable.Add(1)
+				coroMarkPNonEmpty(ps)
 				pushed = true
 			} else {
-				task = old // demote displaced runnext into ring
+				task = old // demote displaced runnext into stealable ring
 			}
 		}
 		if !pushed {
 			h := atomic.LoadAcq(&ps.runqH)
-			t := ps.runqT
+			t := atomic.Load(&ps.runqT)
 			if t-h < coroPRunqSize {
 				ps.runq[t&(coroPRunqSize-1)] = task
-				coroSched.runnable.Add(1)
-				atomic.StoreRel(&ps.runqT, t+1)
+				atomic.Xadd(&ps.runqT, 1)
+				coroMarkPNonEmpty(ps)
 				pushed = true
 			}
 		}
@@ -742,9 +798,11 @@ func coroEnqueue(task *coroTask, next bool) {
 			coroSched.runqTail.next = task
 		}
 		coroSched.runqTail = task
-		coroSched.runqLen++
-		coroSched.runnable.Add(1)
+		coroSched.runqLen.Add(1)
 		unlock(&coroSched.lock)
+	}
+	if isRoot && coroWakeRootOwner(task) {
+		return
 	}
 	coroMaybeWakeDriver()
 }
@@ -766,7 +824,7 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 	var localN int32
 	if ps != nil {
 		h := atomic.LoadAcq(&ps.runqH)
-		t := ps.runqT
+		t := atomic.Load(&ps.runqT)
 		avail := int32(coroPRunqSize - (t - h))
 		limit := avail
 		if gomaxprocs > 1 && limit > coroPStealBatch {
@@ -780,8 +838,8 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 			localN++
 		}
 		if localN > 0 {
-			coroSched.runnable.Add(localN)
-			atomic.StoreRel(&ps.runqT, t+uint32(localN))
+			atomic.Xadd(&ps.runqT, localN)
+			coroMarkPNonEmpty(ps)
 		}
 	}
 	releasem(mp)
@@ -795,8 +853,7 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 			coroSched.runqTail.next = head
 		}
 		coroSched.runqTail = tail
-		coroSched.runqLen += rem
-		coroSched.runnable.Add(rem)
+		coroSched.runqLen.Add(rem)
 		unlock(&coroSched.lock)
 	}
 	// Wake up to gomaxprocs - activeDriver drivers for batch fan-out (e.g. close(ch), netpoll).
@@ -812,29 +869,35 @@ func coroEnqueueBatch(head, tail *coroTask, count int32) {
 }
 
 func coroDequeue() *coroTask {
-	// 1. Check local P runnext & ring (lock-free).
+	// 1. Check local P runnext & ring (lock-free, zero global atomics while busy).
 	mp := acquirem()
 	myp := mp.p.ptr()
 	if myp != nil {
 		if ps := myp.coro.Load(); ps != nil {
-			if t := ps.runnext; t != nil {
-				ps.runnext = nil
-				coroSched.runnable.Add(-1)
-				releasem(mp)
-				if raceenabled {
-					raceacquire(unsafe.Pointer(t))
+			if t := ps.runnext.Load(); t != nil {
+				if ps.runnext.CompareAndSwap(t, nil) {
+					if atomic.LoadAcq(&ps.runqH) == atomic.Load(&ps.runqT) {
+						coroTryMarkPEmpty(ps)
+					}
+					releasem(mp)
+					if raceenabled {
+						raceacquire(unsafe.Pointer(t))
+					}
+					return t
 				}
-				return t
 			}
-			t := ps.runqT
+			t := atomic.Load(&ps.runqT)
 			for {
 				h := atomic.LoadAcq(&ps.runqH)
 				if h == t {
+					coroTryMarkPEmpty(ps)
 					break
 				}
 				task := ps.runq[h&(coroPRunqSize-1)]
 				if atomic.CasRel(&ps.runqH, h, h+1) {
-					coroSched.runnable.Add(-1)
+					if h+1 == t && ps.runnext.Load() == nil {
+						coroTryMarkPEmpty(ps)
+					}
 					releasem(mp)
 					if raceenabled {
 						raceacquire(unsafe.Pointer(task))
@@ -846,12 +909,13 @@ func coroDequeue() *coroTask {
 	}
 	releasem(mp)
 
-	if coroSched.runnable.Load() <= 0 {
+	// Fast exit: zero global or remote P work (1 ns, avoids allp scan on I/O paths).
+	if coroSched.runqLen.Load() == 0 && coroSched.nonEmptyP.Load() <= 0 {
 		return nil
 	}
 
 	// 2. Check global overflow queue (pull a small batch to local P).
-	if coroSched.runqLen > 0 {
+	if coroSched.runqLen.Load() > 0 {
 		lock(&coroSched.lock)
 		first := coroSched.runqHead
 		var batchHead, batchTail *coroTask
@@ -862,9 +926,9 @@ func coroDequeue() *coroTask {
 				coroSched.runqTail = nil
 			}
 			first.next = nil
-			coroSched.runqLen--
-			// Also grab up to min(runqLen/gomaxprocs+1, 64) tasks for local P.
-			want := coroSched.runqLen / max(gomaxprocs, 1)
+			remLen := coroSched.runqLen.Add(-1)
+			// Also grab up to min(runqLen/gomaxprocs, 64) tasks for local P.
+			want := remLen / max(gomaxprocs, 1)
 			if want > 64 {
 				want = 64
 			}
@@ -875,7 +939,7 @@ func coroDequeue() *coroTask {
 					coroSched.runqTail = nil
 				}
 				cur.next = nil
-				coroSched.runqLen--
+				coroSched.runqLen.Add(-1)
 				if batchTail == nil {
 					batchHead = cur
 				} else {
@@ -887,7 +951,6 @@ func coroDequeue() *coroTask {
 		}
 		unlock(&coroSched.lock)
 		if first != nil {
-			coroSched.runnable.Add(-1)
 			if batchHead != nil {
 				coroPutStolenToLocal(batchHead, batchTail, batchN)
 			}
@@ -899,6 +962,9 @@ func coroDequeue() *coroTask {
 	}
 
 	// 3. Steal half from another P's ring (lock-free).
+	if coroSched.nonEmptyP.Load() <= 0 {
+		return nil
+	}
 	return coroStealFromOtherP()
 }
 
@@ -910,7 +976,7 @@ func coroPutStolenToLocal(head, tail *coroTask, count int32) {
 	var stored int32
 	if ps != nil {
 		h := atomic.LoadAcq(&ps.runqH)
-		t := ps.runqT
+		t := atomic.Load(&ps.runqT)
 		avail := int32(coroPRunqSize - (t - h))
 		for stored < avail && head != nil {
 			cur := head
@@ -920,7 +986,8 @@ func coroPutStolenToLocal(head, tail *coroTask, count int32) {
 			stored++
 		}
 		if stored > 0 {
-			atomic.StoreRel(&ps.runqT, t+uint32(stored))
+			atomic.Xadd(&ps.runqT, stored)
+			coroMarkPNonEmpty(ps)
 		}
 	}
 	releasem(mp)
@@ -934,7 +1001,7 @@ func coroPutStolenToLocal(head, tail *coroTask, count int32) {
 			coroSched.runqTail.next = head
 		}
 		coroSched.runqTail = tail
-		coroSched.runqLen += rem
+		coroSched.runqLen.Add(rem)
 		unlock(&coroSched.lock)
 	}
 }
@@ -956,7 +1023,7 @@ func coroStealFromOtherP() *coroTask {
 			continue
 		}
 		vps := vp.coro.Load()
-		if vps == nil {
+		if vps == nil || vps.hasWork.Load() == 0 {
 			continue
 		}
 		for {
@@ -964,6 +1031,9 @@ func coroStealFromOtherP() *coroTask {
 			t := atomic.LoadAcq(&vps.runqT)
 			n := t - h
 			if n == 0 || n > coroPRunqSize {
+				if vps.runnext.Load() == nil {
+					coroTryMarkPEmpty(vps)
+				}
 				break
 			}
 			take := (n + 1) / 2
@@ -974,14 +1044,16 @@ func coroStealFromOtherP() *coroTask {
 				batch[i] = vps.runq[(h+i)&(coroPRunqSize-1)]
 			}
 			if atomic.CasRel(&vps.runqH, h, h+take) {
+				if h+take == t && vps.runnext.Load() == nil {
+					coroTryMarkPEmpty(vps)
+				}
 				first := batch[0]
-				coroSched.runnable.Add(-1)
 				if take > 1 {
 					var myps *coroPState
 					mp, myps = coroEnsurePState(mp)
 					if myps != nil {
 						mh := atomic.LoadAcq(&myps.runqH)
-						mt := myps.runqT
+						mt := atomic.Load(&myps.runqT)
 						avail := coroPRunqSize - (mt - mh)
 						stored := uint32(0)
 						for i := uint32(1); i < take && stored < avail; i++ {
@@ -989,7 +1061,8 @@ func coroStealFromOtherP() *coroTask {
 							stored++
 						}
 						if stored > 0 {
-							atomic.StoreRel(&myps.runqT, mt+stored)
+							atomic.Xadd(&myps.runqT, int32(stored))
+							coroMarkPNonEmpty(myps)
 						}
 						if stored+1 < take {
 							// Put leftovers onto global queue after releasem.
@@ -1014,7 +1087,7 @@ func coroStealFromOtherP() *coroTask {
 								coroSched.runqTail.next = lh
 							}
 							coroSched.runqTail = lt
-							coroSched.runqLen += ln
+							coroSched.runqLen.Add(ln)
 							unlock(&coroSched.lock)
 							if raceenabled {
 								raceacquire(unsafe.Pointer(first))
@@ -1028,6 +1101,18 @@ func coroStealFromOtherP() *coroTask {
 					raceacquire(unsafe.Pointer(first))
 				}
 				return first
+			}
+		}
+		if rn := vps.runnext.Load(); rn != nil {
+			if vps.runnext.CompareAndSwap(rn, nil) {
+				if atomic.LoadAcq(&vps.runqH) == atomic.LoadAcq(&vps.runqT) {
+					coroTryMarkPEmpty(vps)
+				}
+				releasem(mp)
+				if raceenabled {
+					raceacquire(unsafe.Pointer(rn))
+				}
+				return rn
 			}
 		}
 	}
@@ -1106,7 +1191,29 @@ func coroWorkerMain(wid int32) {
 }
 
 func coroHasWork() bool {
-	return coroSched.runnable.Load() > 0 || coroNetpollHasReady()
+	return coroSched.nonEmptyP.Load() > 0 || coroSched.runqLen.Load() > 0 || coroNetpollHasReady()
+}
+
+func coroRunnableCount() int32 {
+	total := coroSched.runqLen.Load()
+	mp := acquirem()
+	for _, pp := range allp {
+		if pp == nil {
+			continue
+		}
+		if ps := pp.coro.Load(); ps != nil {
+			if ps.runnext.Load() != nil {
+				total++
+			}
+			h := atomic.LoadAcq(&ps.runqH)
+			t := atomic.LoadAcq(&ps.runqT)
+			if t > h && t-h <= coroPRunqSize {
+				total += int32(t - h)
+			}
+		}
+	}
+	releasem(mp)
+	return total
 }
 
 type coroDriverParkArg struct {
@@ -1136,23 +1243,25 @@ func coroDriverParkCommit(gp *g, arg unsafe.Pointer) bool {
 	return true
 }
 
-func coroWakeRootOwner(root *coroTask) {
+func coroWakeRootOwner(root *coroTask) bool {
 	slotPlus1 := root.rootSlot.Load()
 	if slotPlus1 == 0 {
-		return
+		return false
 	}
 	idx := slotPlus1 - 1
 	if idx >= coroTotalDrivers {
-		return
+		return false
 	}
 	gp := coroSched.idleDrivers[idx].Load()
 	if gp == 0 || (*g)(unsafe.Pointer(gp)) == getg() {
-		return
+		return false
 	}
 	if coroSched.idleDrivers[idx].CompareAndSwap(gp, 0) {
 		coroSched.idleCount.Add(-1)
 		goready((*g)(unsafe.Pointer(gp)), 0)
+		return true
 	}
+	return false
 }
 
 func coroClaimRootSlot() int32 {
@@ -1241,7 +1350,7 @@ func coroSpawnFrame(ctx, frame unsafe.Pointer, resume func(unsafe.Pointer) uint8
 	task.state.Store(coroStateRunnable)
 	coroAddUnhosted(1)
 	coroEnqueue(task, false)
-	return coroSched.runnable.Load() >= 128
+	return false
 }
 
 // coroAwaitFrame initiates a compiler-lowered structured call from cur to child.

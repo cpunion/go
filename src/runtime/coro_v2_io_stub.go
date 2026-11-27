@@ -29,10 +29,10 @@ func (task *coroTask) ensureIOState() *coroIOState {
 	return task.ioState
 }
 
-func coroNetpollHasReady() bool                        { return false }
-func coroDrainNetpollOne() *coroTask                   { return nil }
-func coroTryPollParkedIO(e1, e2 *coroTask) *coroTask   { return nil }
-func coroCompleteIO(task *coroTask) bool               { return false }
+func coroNetpollHasReady() bool                                   { return false }
+func coroDrainNetpollOne() *coroTask                              { return nil }
+func coroTryPollParkedIO(e1, e2 *coroTask) *coroTask { return nil }
+func coroCompleteIO(task *coroTask) bool                          { return false }
 
 //go:nowritebarrier
 func coroNetpollWake(taskPtr uintptr) *g { return nil }

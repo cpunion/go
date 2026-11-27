@@ -132,9 +132,9 @@ func coroIOUnanchor(task *coroTask, io *coroIOState) {
 }
 
 // coroTryPollParkedIO claims one parked I/O task (other than exclude1/exclude2)
-// directly from the sharded anchor table before a driver enters gopark. This
-// lets peer pipe/TCP readiness produced on the same or sibling P complete
-// immediately without a kevent/epoll_wait + gopark/futex round trip.
+// directly from the sharded anchor table before a driver enters gopark, using a
+// per-driver cursor (zero global atomic bounce) so peer pipe/TCP readiness
+// completes immediately without a kevent/epoll_wait + gopark/futex round trip.
 func coroTryPollParkedIO(exclude1, exclude2 *coroTask) *coroTask {
 	if !netpollAnyWaiters() {
 		return nil
@@ -178,7 +178,7 @@ func coroTryPollParkedIO(exclude1, exclude2 *coroTask) *coroTask {
 				raceacquire(unsafe.Pointer(task))
 			}
 			// Move claimed task to shard tail so if it hits EAGAIN, the next
-			// probe tries a different oldest waiter first.
+			// probe tries a different oldest waiter first (FIFO fairness).
 			if io.anchorNext != nil {
 				if io.anchorPrev != nil {
 					io.anchorPrev.ioState.anchorNext = io.anchorNext
@@ -230,12 +230,22 @@ func coroNetpollWake(taskPtr uintptr) *g {
 }
 
 // coroDrainNetpollOne atomically detaches all pending netpoll completions via
-// ABA-free Swap(0), claims the first Parked task directly into Running for this
-// driver, and fans out any remaining ready tasks via coroEnqueueBatch.
+// ABA-free Swap(0), reverses the Treiber stack into FIFO arrival order so early
+// connections are never starved in batches, claims the first Parked task
+// directly into Running, and fans out the rest via coroEnqueueBatch.
 func coroDrainNetpollOne() *coroTask {
-	head := coroNetpollReady.Swap(0)
-	if head == 0 {
+	raw := coroNetpollReady.Swap(0)
+	if raw == 0 {
 		return nil
+	}
+	// Reverse LIFO Treiber stack into FIFO order in-place (zero allocation).
+	var head uintptr
+	for cur := raw; cur != 0; {
+		io := (*coroTask)(unsafe.Pointer(cur)).ioState
+		next := io.readyNext
+		io.readyNext = head
+		head = cur
+		cur = next
 	}
 	var first *coroTask
 	var batchHead, batchTail *coroTask
