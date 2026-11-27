@@ -9,5 +9,5 @@ package runtime
 // StacklessCoroRegisteredIOCountForTest returns the current registered I/O
 // operation count tracked for idle-poll short-circuiting.
 func StacklessCoroRegisteredIOCountForTest() int32 {
-	return stacklessCoroOperations.ioCount.Load()
+	return stacklessCoroRegisteredIOCount()
 }

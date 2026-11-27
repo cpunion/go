@@ -142,24 +142,27 @@ func stacklessCoroSocketWriteBuffer(fd int, buffer []byte, written int) (int, ui
 }
 
 func stacklessCoroSocketWriteAttempt(op *stacklessCoroOperation) {
+	stacklessCoroSocketWriteAttemptDirect(op, nil)
+}
+
+func stacklessCoroSocketWriteAttemptDirect(op *stacklessCoroOperation,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	res := op.resourceState()
 	pd := (*pollDesc)(unsafe.Pointer(uintptr(res.packet[stacklessCoroPollDescWord])))
 	if pd == nil || !res.pollWrite {
 		throw("runtime: invalid stackless coroutine socket write")
 	}
 	if err := poll_runtime_pollReset(pd, 'w'); err != pollNoError {
-		stacklessCoroSocketFinish(op, *res.n, stacklessCoroPollErrorTag|uintptr(err))
-		return
+		return stacklessCoroSocketFinishDirect(op, *res.n, stacklessCoroPollErrorTag|uintptr(err), wantSched)
 	}
 	for {
 		written, status, blocked := stacklessCoroSocketWriteBuffer(int(res.fd), res.buffer, *res.n)
 		if !blocked {
-			stacklessCoroSocketFinish(op, written, status)
-			return
+			return stacklessCoroSocketFinishDirect(op, written, status, wantSched)
 		}
 		*res.n = written
 		if stacklessCoroSocketWriteArm(op, pd) {
-			return
+			return nil
 		}
 	}
 }
