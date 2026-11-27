@@ -344,7 +344,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			sg.elem.set(nil)
 		}
 		if raceenabled {
-			racerelease(unsafe.Pointer(sg.coro))
+			racereleasemerge(unsafe.Pointer(sg.coro))
 		}
 		unlockf()
 		coroChanWake(sg, true)
@@ -463,7 +463,7 @@ func closechan(c *hchan) {
 		if goexperiment.Coro && sg.coro != nil {
 			sg.success = false
 			if raceenabled {
-				racerelease(unsafe.Pointer(sg.coro))
+				racereleasemerge(unsafe.Pointer(sg.coro))
 			}
 			sg.next = nil
 			if coroTail == nil {
@@ -496,7 +496,7 @@ func closechan(c *hchan) {
 		if goexperiment.Coro && sg.coro != nil {
 			sg.success = false
 			if raceenabled {
-				racerelease(unsafe.Pointer(sg.coro))
+				racereleasemerge(unsafe.Pointer(sg.coro))
 			}
 			sg.next = nil
 			if coroTail == nil {
@@ -784,7 +784,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	sg.elem.set(nil)
 	if goexperiment.Coro && sg.coro != nil {
 		if raceenabled {
-			racerelease(unsafe.Pointer(sg.coro))
+			racereleasemerge(unsafe.Pointer(sg.coro))
 		}
 		unlockf()
 		coroChanWake(sg, true)

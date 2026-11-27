@@ -54,7 +54,7 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 	}
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	t.init(coroTimerWake, task)
 	t.modify(when, 0, coroTimerWake, task, 0)

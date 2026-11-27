@@ -62,7 +62,7 @@ func coroChanSend(ctx unsafe.Pointer, c *hchan, elem unsafe.Pointer) bool {
 	task.flags |= coroFlagChanSend
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	c.sendq.enqueue(sg)
 	unlock(&c.lock)
@@ -77,9 +77,6 @@ func coroChanRecv(ctx unsafe.Pointer, c *hchan, elem unsafe.Pointer, ok *bool) b
 	if c == nil {
 		task.state.Store(coroStateWaiting)
 		return true
-	}
-	if raceenabled {
-		racereadpc(c.raceaddr(), sys.GetCallerPC(), abi.FuncPCABIInternal(coroChanRecv))
 	}
 	lock(&c.lock)
 	if c.closed != 0 {
@@ -143,7 +140,7 @@ func coroChanRecv(ctx unsafe.Pointer, c *hchan, elem unsafe.Pointer, ok *bool) b
 	task.flags &^= coroFlagChanSend
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	c.recvq.enqueue(sg)
 	if c.timer != nil {
@@ -245,6 +242,9 @@ func coroChanCloseWake(head *sudog) {
 
 		// Fast path: batch-collect already-Parked tasks for a single coroEnqueueBatch!
 		if task.state.CompareAndSwap(coroStateParked, coroStateRunnable) {
+			if raceenabled {
+				raceacquire(unsafe.Pointer(task))
+			}
 			task.next = nil
 			if readyTail == nil {
 				readyHead = task
@@ -443,7 +443,7 @@ func coroSelect(ctx unsafe.Pointer, cas0 *scase, nsends, nrecvs int, block bool,
 	task.selectDone.Store(0)
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 
 	var sglist *sudog

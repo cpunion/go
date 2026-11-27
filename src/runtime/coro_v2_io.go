@@ -359,7 +359,7 @@ func coroArmNetpoll(task *coroTask, io *coroIOState) (bool, int) {
 	task.flags |= coroFlagIOPending
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	tag := uintptr(unsafe.Pointer(task)) | 1
 	for {
@@ -595,7 +595,7 @@ func coroEnqueueBlockJob(task *coroTask, fn func()) {
 	job := &coroBlockJob{task: task, fn: fn}
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	lock(&coroBlockPool.lock)
 	if coroBlockPool.wake == nil {
@@ -647,7 +647,7 @@ func coroBlockWorkerLoop(wake chan struct{}) {
 		}
 		job.fn()
 		if raceenabled {
-			racerelease(unsafe.Pointer(job.task))
+			racereleasemerge(unsafe.Pointer(job.task))
 		}
 		coroReady(job.task)
 	}
@@ -709,7 +709,7 @@ func coroSleep(ctx unsafe.Pointer, ns int64) bool {
 	}
 	task.state.Store(coroStateWaiting)
 	if raceenabled {
-		racerelease(unsafe.Pointer(task))
+		racereleasemerge(unsafe.Pointer(task))
 	}
 	t.init(coroTimerWake, task)
 	t.modify(when, 0, coroTimerWake, task, 0)

@@ -1613,7 +1613,7 @@ func coroFinishTask(task, driverRoot *coroTask) *coroTask {
 	}
 	if task.flags&coroFlagRoot != 0 {
 		if raceenabled {
-			racerelease(unsafe.Pointer(task))
+			racereleasemerge(unsafe.Pointer(task))
 		}
 		task.state.Swap(coroStateDone)
 		coroWakeRootOwner(task)
@@ -1662,7 +1662,7 @@ func coroFinishTerminal(task, driverRoot *coroTask) *coroTask {
 	}
 	if task.flags&coroFlagRoot != 0 {
 		if raceenabled {
-			racerelease(unsafe.Pointer(task))
+			racereleasemerge(unsafe.Pointer(task))
 		}
 		task.state.Swap(coroStateDone)
 		coroWakeRootOwner(task)

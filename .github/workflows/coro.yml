@@ -1,0 +1,147 @@
+name: Coroutine compiler (v2-minimal)
+
+on:
+  pull_request:
+    branches:
+      - coro/v2-minimal
+      - coro/main
+  push:
+    branches:
+      - coro/v2-minimal
+      - coro/main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coro-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  focused:
+    name: Focused (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Build default toolchain (nocoro)
+        working-directory: src
+        run: ./make.bash
+
+      - name: Test default compiler and runtime
+        run: >-
+          ./bin/go test -count=1 -timeout=45m
+          cmd/compile/...
+          internal/buildcfg
+          runtime
+          runtime/metrics
+
+      - name: Build coroutine experiment toolchain
+        working-directory: src
+        env:
+          GOEXPERIMENT: coro
+        run: ./make.bash
+
+      - name: Test coroutine compiler, runtime, and poll
+        env:
+          GOEXPERIMENT: coro
+        run: >-
+          ./bin/go test -count=1 -timeout=45m
+          cmd/compile/...
+          internal/buildcfg
+          runtime
+          runtime/metrics
+          internal/poll
+
+      - name: Test coroutine os and net (short)
+        env:
+          GOEXPERIMENT: coro
+        run: ./bin/go test -short -count=1 -timeout=20m os net
+
+      - name: Test coroutine 5-mode E2E semantics
+        env:
+          GOEXPERIMENT: coro
+        run: ./bin/go test -v -count=1 -timeout=15m cmd/compile/internal/coro
+
+      - name: Test coroutine staticlockranking under GOGC=1
+        env:
+          GOEXPERIMENT: coro,staticlockranking
+          GODEBUG: asyncpreemptoff=1
+          GOGC: 1
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/coro-lockrank"
+          mkdir -p "$out"
+          ./bin/go test -c -o "$out/runtime.test" runtime
+          for procs in 1 4; do
+            GOMAXPROCS=$procs "$out/runtime.test" -test.v -test.run='^TestCoroV2' \
+              -test.count=10 -test.timeout=10m
+          done
+
+      - name: Test coroutine runtime races
+        env:
+          GOEXPERIMENT: coro
+        run: ./bin/go test -race -count=3 -timeout=15m runtime -run '^TestCoroV2'
+
+      - name: Cross-compile 32-bit Linux and Windows contracts
+        env:
+          GOEXPERIMENT: coro
+          CGO_ENABLED: '0'
+        shell: bash
+        run: |
+          GOOS=linux GOARCH=386 ./bin/go test -c -o "$RUNNER_TEMP/runtime-linux386.test" runtime
+          GOOS=linux GOARCH=386 ./bin/go build cmd/compile runtime net os internal/poll
+          GOOS=windows GOARCH=amd64 ./bin/go build cmd/compile runtime net os internal/poll
+
+  native-full:
+    name: Native all.bash (Linux)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install bootstrap Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache: false
+
+      - name: Select bootstrap GOROOT
+        shell: bash
+        run: echo "GOROOT_BOOTSTRAP=$(go env GOROOT)" >> "$GITHUB_ENV"
+
+      - name: Run native full test suite
+        working-directory: src
+        env:
+          GO_TEST_TIMEOUT_SCALE: '5'
+        run: ./all.bash
