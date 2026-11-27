@@ -585,9 +585,10 @@ type stacklessCoroTimerToken struct {
 }
 
 type stacklessCoroOperationBucketSlot struct {
-	lock mutex
-	head *stacklessCoroOperation
-	_    cpu.CacheLinePad
+	lock    mutex
+	head    *stacklessCoroOperation
+	ioCount int32
+	_       cpu.CacheLinePad
 }
 
 // The pointerful buckets live in one runtime-init allocation, leaving a single
@@ -601,7 +602,7 @@ type stacklessCoroOperationRegistry struct {
 var stacklessCoroOperations struct {
 	registry *stacklessCoroOperationRegistry
 	next     atomic.Uint64
-	ioCount  atomic.Int32
+	ioMask   atomic.Uint32
 }
 
 // stacklessCoroSharedOperations retains completed operations that exceeded a
@@ -1676,6 +1677,7 @@ func stacklessCoroHostRunnable() bool {
 // returns the last suspended task for an ordinary host to project while parked;
 // all other exits, including a recovered panic, return nil.
 func (s *stacklessCoroScheduler) runTasks(native, park, initial, public bool) *stacklessCoroTask {
+	var switchStreak uint8
 	var task *stacklessCoroTask
 	var idlePollSkip *stacklessCoroTask
 	var directInitialRoot bool
@@ -1773,9 +1775,16 @@ resumeActive:
 			throw("runtime: invalid stackless coroutine frame switch")
 		}
 		task.setFlag(stacklessCoroTaskSwitchPending, false)
-		// A validated frame switch keeps this running task on the same
-		// executor. Retain its scheduler link as for private yields.
-		goto resumeActive
+		switchStreak++
+		if switchStreak < 64 || (s.runnableState.Load() == 0 && !getg().preempt && gcBlackenEnabled == 0) {
+			// A validated frame switch keeps this running task on the same
+			// executor. Retain its scheduler link as for private yields.
+			goto resumeActive
+		}
+		switchStreak = 0
+		action = stacklessCoroActionYield
+	} else {
+		switchStreak = 0
 	}
 	// A waiting source retains its scheduler through this context. The
 	// source owns task until completion, then the ready queue owns it until
@@ -2913,7 +2922,7 @@ func coroAwaitFusedFrame(ctx, frame unsafe.Pointer,
 		parent.flags &^= stacklessCoroTaskFusedRequested | stacklessCoroTaskFusedPending
 		parent.flags |= stacklessCoroTaskFusedFrames
 		releasem(mp)
-		if s.runnableState.Load() == 0 {
+		if s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
 			parent.setFlag(stacklessCoroTaskSwitchPending, true)
 			return stacklessCoroActionSwitch
 		}
@@ -3111,6 +3120,11 @@ func coroCompleteFusedFrame(ctx unsafe.Pointer) uint8 {
 				cacheStacklessCoroNativeSelfFrame(completedResume, frame, allocation)
 			} else if cacheDirect && s.multiPFastPath() {
 				coroPFusedFramePut(stacklessCoroResumeIdentity(completedResume), frame)
+				if s.runnableState.Load()&stacklessCoroForeignReturnerBit == 0 {
+					task.setFlag(stacklessCoroTaskSwitchPending, true)
+					return stacklessCoroActionSwitch
+				}
+				return stacklessCoroActionYield
 			}
 			if s.runnableState.Load() == 0 {
 				task.setFlag(stacklessCoroTaskSwitchPending, true)
@@ -4627,11 +4641,30 @@ func cacheStacklessCoroSharedOperationLocked(op *stacklessCoroOperation) {
 }
 
 func completeStacklessCoroOperation(op *stacklessCoroOperation) {
+	completeStacklessCoroOperationDirect(op, nil)
+}
+
+func completeStacklessCoroOperationDirect(op *stacklessCoroOperation,
+	wantSched *stacklessCoroScheduler) *stacklessCoroTask {
 	isIO := op.registeredIO
 	s, task := clearStacklessCoroOperation(op)
 	if s.multiPFastPath() {
+		if wantSched != nil && s == wantSched &&
+			coroRunqEligible(s, task) && !s.driverDone(false) &&
+			task.takeIdleWaitingAtomic() {
+			var cached bool
+			if isIO {
+				cached = coroPIOOpCachePut(op)
+			} else {
+				cached = coroPOpCachePut(op)
+			}
+			if !cached {
+				cacheStacklessCoroSharedOperation(op)
+			}
+			return task
+		}
 		s.completeOperationMultiP(op, task, isIO)
-		return
+		return nil
 	}
 	lock(&s.lock)
 	completedDuringResume := task.resuming
@@ -4648,6 +4681,7 @@ func completeStacklessCoroOperation(op *stacklessCoroOperation) {
 			s.signalIfWaiting()
 		}
 	}
+	return nil
 }
 
 func panicStacklessCoroOperation(op *stacklessCoroOperation, value any) {
@@ -5602,6 +5636,14 @@ func (s *stacklessCoroScheduler) stopReplacementExecutors() {
 	}
 }
 
+const stacklessCoroOpIDBatch = 1024
+
+var stacklessCoroOpIDCache [256]struct {
+	next uint64
+	end  uint64
+	_    cpu.CacheLinePad
+}
+
 func nextStacklessCoroOperationID() uint64 {
 	for {
 		id := stacklessCoroOperations.next.Add(1)
@@ -5611,27 +5653,67 @@ func nextStacklessCoroOperationID() uint64 {
 	}
 }
 
+func nextStacklessCoroOperationIDMultiP() uint64 {
+	if !raceenabled && gomaxprocs > 1 {
+		mp := acquirem()
+		if pp := mp.p.ptr(); pp != nil && uint(pp.id) < uint(len(stacklessCoroOpIDCache)) {
+			cache := &stacklessCoroOpIDCache[pp.id]
+			if cache.next < cache.end {
+				id := cache.next
+				cache.next++
+				releasem(mp)
+				return id
+			}
+			base := stacklessCoroOperations.next.Add(stacklessCoroOpIDBatch)
+			start := base - stacklessCoroOpIDBatch + 1
+			if start == 0 {
+				start = 1
+			}
+			if base >= start {
+				cache.next = start + 1
+				cache.end = base + 1
+				releasem(mp)
+				return start
+			}
+		}
+		releasem(mp)
+	}
+	return nextStacklessCoroOperationID()
+}
+
 func registerStacklessCoroOperation(op *stacklessCoroOperation) uint64 {
 	// The source has not yet been published. IO storage already exists for
 	// every IO source and remains stable until registry removal. A channel
 	// may add its first waiter resources later, but cannot become IO while
 	// this source is live. Snapshot this before readers can observe the slot.
 	op.registeredIO = op.ioState() != nil
-	if op.registeredIO {
-		stacklessCoroOperations.ioCount.Add(1)
+	var id uint64
+	if s := op.scheduler(); s != nil && s.multiPFastPath() {
+		id = nextStacklessCoroOperationIDMultiP()
+	} else {
+		id = nextStacklessCoroOperationID()
 	}
-	id := nextStacklessCoroOperationID()
 	op.id = id
-	slot := stacklessCoroOperationBucketSlotFor(id)
+	registry := stacklessCoroOperations.registry
+	index := id % uint64(len(registry.buckets))
+	slot := &registry.buckets[index]
 	lock(&slot.lock)
 	op.next = slot.head
 	slot.head = op
+	if op.registeredIO {
+		slot.ioCount++
+		if slot.ioCount == 1 {
+			stacklessCoroOperations.ioMask.Or(uint32(1) << index)
+		}
+	}
 	unlock(&slot.lock)
 	return id
 }
 
 func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
-	slot := stacklessCoroOperationBucketSlotFor(id)
+	registry := stacklessCoroOperations.registry
+	index := id % uint64(len(registry.buckets))
+	slot := &registry.buckets[index]
 	lock(&slot.lock)
 	link := &slot.head
 	for *link != nil && (*link).id != id {
@@ -5642,11 +5724,30 @@ func takeStacklessCoroOperation(id uint64) *stacklessCoroOperation {
 		*link = op.next
 		op.next = nil
 		if op.registeredIO {
-			stacklessCoroOperations.ioCount.Add(-1)
+			slot.ioCount--
+			if slot.ioCount == 0 {
+				stacklessCoroOperations.ioMask.And(^(uint32(1) << index))
+			}
 		}
 	}
 	unlock(&slot.lock)
 	return op
+}
+
+func stacklessCoroHasRegisteredIO() bool {
+	return stacklessCoroOperations.ioMask.Load() != 0
+}
+
+func stacklessCoroRegisteredIOCount() int32 {
+	registry := stacklessCoroOperations.registry
+	var total int32
+	for i := range registry.buckets {
+		slot := &registry.buckets[i]
+		lock(&slot.lock)
+		total += slot.ioCount
+		unlock(&slot.lock)
+	}
+	return total
 }
 
 func stacklessCoroTimerReady(arg any, sequence uintptr, _ int64) {
