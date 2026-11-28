@@ -606,7 +606,7 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool, delta *int32) *g {
 			return nil
 		}
 		new := pdNil
-		if ioready {
+		if ioready && !(goexperiment.Coro && old&1 != 0) {
 			new = pdReady
 		}
 		if gpp.CompareAndSwap(old, new) {
