@@ -98,8 +98,8 @@ const (
 	coroPStealBatch      = 128
 	coroPCacheSlots      = 4
 	coroPCacheSlotCap    = 1024
-	coroPCacheSpillAt    = 64
-	coroPCacheSpillCnt   = 32
+	coroPCacheSpillAt    = 128
+	coroPCacheSpillCnt   = 64
 	coroGCacheSlots      = 4
 	coroCacheBudget      = 512 << 10
 	coroCacheCreditChunk = 32 << 10
@@ -143,6 +143,8 @@ var coroSched struct {
 	runqHead         *coroTask
 	runqTail         *coroTask
 	runqLen          atomic.Int32
+	_                cpu.CacheLinePad
+	cacheLock        mutex
 	globalCache      [coroGCacheSlots]coroTypeCacheSlot
 	globalCacheCount atomic.Int32
 	_                cpu.CacheLinePad
@@ -160,6 +162,7 @@ var coroSched struct {
 
 func init() {
 	lockInit(&coroSched.lock, lockRankCoroSched)
+	lockInit(&coroSched.cacheLock, lockRankCoroSched)
 	// Verify coroTask layout matches compiler's [7]unsafe.Pointer + [6]uint32 header.
 	wantSize := 7*unsafe.Sizeof(uintptr(0)) + 24
 	if unsafe.Sizeof(coroTask{}) != wantSize {
@@ -267,7 +270,7 @@ func coroSpillGlobalCache(typ *_type, allocSize uintptr, head, tail *coroTask, c
 	if head == nil || count == 0 {
 		return
 	}
-	lock(&coroSched.lock)
+	lock(&coroSched.cacheLock)
 	idx := -1
 	for i := range coroSched.globalCache {
 		if coroSched.globalCache[i].typ == typ {
@@ -286,7 +289,7 @@ func coroSpillGlobalCache(typ *_type, allocSize uintptr, head, tail *coroTask, c
 		}
 	}
 	if idx < 0 {
-		unlock(&coroSched.lock)
+		unlock(&coroSched.cacheLock)
 		coroEvictChain(head, count, allocSize)
 		return
 	}
@@ -295,14 +298,14 @@ func coroSpillGlobalCache(typ *_type, allocSize uintptr, head, tail *coroTask, c
 	gs.young = head
 	gs.youngCount += count
 	coroSched.globalCacheCount.Add(int32(count))
-	unlock(&coroSched.lock)
+	unlock(&coroSched.cacheLock)
 }
 
 func coroRefillFromGlobalCache(typ *_type) (*coroTask, *coroTask, *coroTask, uint16, uintptr) {
 	if coroSched.globalCacheCount.Load() <= 0 {
 		return nil, nil, nil, 0, 0
 	}
-	lock(&coroSched.lock)
+	lock(&coroSched.cacheLock)
 	var first, restHead, restTail *coroTask
 	var restCount uint16
 	var allocSize uintptr
@@ -350,7 +353,7 @@ func coroRefillFromGlobalCache(typ *_type) (*coroTask, *coroTask, *coroTask, uin
 		}
 		break
 	}
-	unlock(&coroSched.lock)
+	unlock(&coroSched.cacheLock)
 	return first, restHead, restTail, restCount, allocSize
 }
 
